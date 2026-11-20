@@ -56,7 +56,14 @@ pub const TxnStatusRequest = struct {
     restore_staging_plan_id: ?[16]u8 = null,
 };
 
+pub const DagOwnerPrepare = struct {
+    fence: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence,
+    domains: []const db_types.DagDomainPrepare,
+};
+
 pub const TableCommitRequest = struct {
+    /// Private plans supplied after the graph producer pins its source state.
+    dag_owners: []const DagOwnerPrepare = &.{},
     commit_requires: ?db_types.CommitRequires = null,
     /// Coordinator planning context, retained until cascade expansion finishes.
     /// A participant's explicit prerequisite always overrides this default.

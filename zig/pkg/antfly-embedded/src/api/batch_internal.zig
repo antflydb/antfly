@@ -26,6 +26,22 @@ test "ordered artifact inventory private batch roundtrip rejects public and mixe
     var parsed = try parseInternalBatchRequest(alloc, encoded);
     defer parsed.deinit(alloc);
     try std.testing.expectEqualDeep(request.artifact_catalog.?, parsed.req.artifact_catalog.?);
+    var dag_request = request;
+    dag_request.artifact_catalog.?.binding.effect_protocol = 16;
+    dag_request.artifact_catalog.?.dag_activations = &.{.{
+        .index_name = "g",
+        .table_identity = @splat(3),
+        .proofs = &.{.{ .edge_type = "links", .owner_epoch = 1, .proof = .{
+            .scanned = .{ .snapshot = @splat(7), .after = "\xff\x00" },
+        } }},
+    }};
+    const dag_bytes = try encodeBatchRequest(alloc, dag_request);
+    defer alloc.free(dag_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, dag_bytes, "artifact_catalog_dag_v1") != null);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, dag_bytes));
+    var dag_parsed = try parseInternalBatchRequest(alloc, dag_bytes);
+    defer dag_parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(dag_request.artifact_catalog, dag_parsed.req.artifact_catalog);
     var mixed = request;
     mixed.writes = &.{.{ .key = "key", .value = "{}" }};
     try std.testing.expectError(error.InvalidArtifactCatalogCommand, encodeBatchRequest(alloc, mixed));
@@ -59,6 +75,57 @@ test "ordered artifact inventory private batch roundtrip rejects public and mixe
     accept.merge_replication.?.transition_id += 1;
     try std.testing.expectError(error.InvalidArtifactCatalogCommand, encodeBatchRequest(alloc, accept));
 }
+
+test "distributed txn private control wire carries only an isolated DAG source fence" {
+    const alloc = std.testing.allocator;
+    const request: db_mod.types.BatchRequest = .{ .dag_source_fence = .{
+        .namespace = @splat(1),
+        .action = .acquire,
+        .fence = .{ .activation = @splat(2), .snapshot = @splat(3) },
+    } };
+    const encoded = try encodeBatchRequest(alloc, request);
+    defer alloc.free(encoded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+    var parsed = try parseInternalBatchRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(request.dag_source_fence, parsed.req.dag_source_fence);
+    var mixed = request;
+    mixed.writes = &.{.{ .key = "row", .value = "{}" }};
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, mixed));
+    var scan = request;
+    scan.dag_source_fence.?.action = .scan;
+    scan.dag_source_fence.?.scan = .{ .domain = @splat(4), .owner_epoch = 7, .page = .{
+        .after = "\x00\x00\x00\x00\x00\x00\xff",
+        .next = "\x00\x00\x00\x00\x00\x01\xff",
+        .replacements = &.{.{ .owner = @splat(5), .source = "\xfe", .targets = &.{"\xfd"} }},
+    } };
+    const scan_encoded = try encodeBatchRequest(alloc, scan);
+    defer alloc.free(scan_encoded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, scan_encoded));
+    var scan_parsed = try parseInternalBatchRequest(alloc, scan_encoded);
+    defer scan_parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(scan.dag_source_fence, scan_parsed.req.dag_source_fence);
+    scan.dag_source_fence.?.scan.?.previous_owner_epoch = 6;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, scan));
+    scan.dag_source_fence.?.scan.?.page = null;
+    const takeover_encoded = try encodeBatchRequest(alloc, scan);
+    defer alloc.free(takeover_encoded);
+    var takeover_parsed = try parseInternalBatchRequest(alloc, takeover_encoded);
+    defer takeover_parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(scan.dag_source_fence, takeover_parsed.req.dag_source_fence);
+    var job = request;
+    job.dag_source_fence.?.action = .activation_job;
+    job.dag_source_fence.?.activation_job = .{
+        .next = .{ .fence = job.dag_source_fence.?.fence, .catalog_digest = @splat(4), .catalog_epoch = 5, .owner_epoch = 6 },
+        .plan_json = "{\"id\":7}",
+    };
+    const job_encoded = try encodeBatchRequest(alloc, job);
+    defer alloc.free(job_encoded);
+    var job_parsed = try parseInternalBatchRequest(alloc, job_encoded);
+    defer job_parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(job.dag_source_fence, job_parsed.req.dag_source_fence);
+}
+
 test "internal isolated controls preserve neutral document versions across owner and forwarded codecs" {
     const a = std.testing.allocator;
     const inventory = @import("../storage/db/artifact_inventory.zig");
@@ -527,6 +594,7 @@ pub const OwnedBatchRequest = struct {
     // Only signed requests allocate this compact proof/database backing.
     row_policy_admission_bytes: ?[]u8 = null,
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
+    dag_source_fence: ?std.json.Parsed(@import("../graph/dag_authority.zig").SourceFenceCommand) = null,
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
     group_source: ?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command) = null,
     resolver_review: ?std.json.Parsed(@import("../storage/db/resolver_review.zig").Command) = null,
@@ -537,6 +605,7 @@ pub const OwnedBatchRequest = struct {
     leann_record_bytes: ?[]u8 = null,
     merge_proof_adoption: ?std.json.Parsed(@import("../storage/db/merge_proof_adoption.zig").Command) = null,
     transaction_participants: [][]const u8 = &.{},
+    dag_domains: ?std.json.Parsed([]const db_mod.types.DagDomainPrepare) = null,
     split_checkpoint_range_start: ?[]u8 = null,
     split_checkpoint_range_end: ?[]u8 = null,
     split_transition_key: ?[]u8 = null,
@@ -551,6 +620,7 @@ pub const OwnedBatchRequest = struct {
     req: db_mod.types.BatchRequest = .{},
 
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
+        if (self.dag_domains) |*domains| domains.deinit();
         if (self.prepared_enrichments_json) |json| alloc.free(json);
         @import("relational_integrity_wire.zig").free(alloc, self.integrity);
         if (self.integrity_commands) |*commands| commands.deinit();
@@ -565,6 +635,7 @@ pub const OwnedBatchRequest = struct {
         if (self.row_policy_install_bundle) |bundle| alloc.free(bundle);
         if (self.row_policy_admission_bytes) |bytes| alloc.free(bytes);
         if (self.restore_staging) |*control| control.deinit();
+        if (self.dag_source_fence) |*control| control.deinit();
         if (self.online_source) |*control| control.deinit();
         if (self.group_source) |*control| control.deinit();
         if (self.resolver_review) |*control| control.deinit();
@@ -934,13 +1005,26 @@ fn parseBatchRequestWithOptions(
         break :control @as(?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/online_source_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (online_source) |*control| control.deinit();
+    var dag_source_fence = if (root.get("_dag_source_fence")) |value| control: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "dag_source_fence_v1")) return error.InvalidBatchRequest;
+        break :control @as(?std.json.Parsed(@import("../graph/dag_authority.zig").SourceFenceCommand), try std.json.parseFromValue(@import("../graph/dag_authority.zig").SourceFenceCommand, alloc, value, .{ .allocate = .alloc_always }));
+    } else null;
+    errdefer if (dag_source_fence) |*control| control.deinit();
     var artifact_catalog = if (root.get("_artifact_catalog")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
         if (marker != .object) return error.InvalidBatchRequest;
         const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
         if (kind != .string) return error.InvalidBatchRequest;
-        break :control @as(?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command), try std.json.parseFromValue(@import("../storage/db/artifact_inventory.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
+        var parsed_catalog = try std.json.parseFromValue(@import("../storage/db/artifact_inventory.zig").Command, alloc, value, .{ .allocate = .alloc_always });
+        errdefer parsed_catalog.deinit();
+        if (std.mem.eql(u8, kind.string, "artifact_catalog_dag_v1") != (parsed_catalog.value.dag_activations != null))
+            return error.InvalidBatchRequest;
+        break :control @as(?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command), parsed_catalog);
     } else null;
     errdefer if (artifact_catalog) |*control| control.deinit();
     var group_source = if (root.get("_group_source")) |value| control: {
@@ -1403,7 +1487,11 @@ fn parseBatchRequestWithOptions(
             if (restore_staging == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
         }
-        if (std.mem.eql(u8, kind_value.string, "artifact_catalog_v1")) {
+        if (std.mem.eql(u8, kind_value.string, "dag_source_fence_v1")) {
+            if (dag_source_fence == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
+        if (std.mem.eql(u8, kind_value.string, "artifact_catalog_v1") or std.mem.eql(u8, kind_value.string, "artifact_catalog_dag_v1")) {
             if (artifact_catalog == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
         }
@@ -1529,6 +1617,8 @@ fn parseBatchRequestWithOptions(
         for (transaction_participants[0..transaction_participants_initialized]) |participant| alloc.free(participant);
         if (transaction_participants.len > 0) alloc.free(transaction_participants);
     }
+    var dag_domains: ?std.json.Parsed([]const db_mod.types.DagDomainPrepare) = null;
+    errdefer if (dag_domains) |*domains| domains.deinit();
     const transaction: ?db_mod.types.TransactionMutation = transaction: {
         const value = root.get("_transaction") orelse break :transaction null;
         if (!allow_internal or value != .object) return error.InvalidBatchRequest;
@@ -1559,11 +1649,21 @@ fn parseBatchRequestWithOptions(
                 .participants = transaction_participants,
             } };
         }
+        const dag_prepare = std.mem.eql(u8, phase_value.string, "prepare_dag_v1");
         const guarded_prepare = std.mem.eql(u8, phase_value.string, "prepare_ranges_v1");
-        if (guarded_prepare != (range_guards != null and range_guards.?.value.len != 0)) return error.InvalidBatchRequest;
-        if (std.mem.eql(u8, phase_value.string, "prepare") or guarded_prepare) break :transaction .{ .prepare = .{
+        if (!dag_prepare and guarded_prepare != (range_guards != null and range_guards.?.value.len != 0)) return error.InvalidBatchRequest;
+        if (dag_prepare) {
+            const domains = object.get("domains") orelse return error.InvalidBatchRequest;
+            if (domains != .array or domains.array.items.len == 0 or domains.array.items.len > 64) return error.InvalidBatchRequest;
+            dag_domains = std.json.parseFromValue([]const db_mod.types.DagDomainPrepare, alloc, domains, .{ .allocate = .alloc_always }) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return error.InvalidBatchRequest;
+            };
+        } else if (object.contains("domains")) return error.InvalidBatchRequest;
+        if (std.mem.eql(u8, phase_value.string, "prepare") or guarded_prepare or dag_prepare) break :transaction .{ .prepare = .{
             .txn_id = txn_id,
             .topology_epoch = try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest),
+            .dag_domains = if (dag_domains) |domains| domains.value else &.{},
         } };
         if (std.mem.eql(u8, phase_value.string, "resolve")) {
             const status_value = object.get("status") orelse return error.InvalidBatchRequest;
@@ -1698,6 +1798,7 @@ fn parseBatchRequestWithOptions(
         .row_policy_install_bundle = row_policy_install_bundle,
         .row_policy_admission_bytes = admission_bytes,
         .restore_staging = restore_staging,
+        .dag_source_fence = dag_source_fence,
         .online_source = online_source,
         .group_source = group_source,
         .resolver_review = resolver_review,
@@ -1708,6 +1809,7 @@ fn parseBatchRequestWithOptions(
         .leann_record_bytes = leann_record_bytes,
         .merge_proof_adoption = merge_proof_adoption,
         .transaction_participants = transaction_participants,
+        .dag_domains = dag_domains,
         .split_checkpoint_range_start = checkpoint_start,
         .split_checkpoint_range_end = checkpoint_end,
         .split_transition_key = transition_key,
@@ -1738,6 +1840,7 @@ fn parseBatchRequestWithOptions(
             .online_source = if (online_source) |control| control.value else null,
             .group_source = if (group_source) |control| control.value else null,
             .resolver_review = if (resolver_review) |control| control.value else null,
+            .dag_source_fence = if (dag_source_fence) |control| control.value else null,
             .artifact_catalog = if (artifact_catalog) |control| control.value else null,
             .artifact_publication = if (artifact_publication) |control| control.value else null,
             .artifact_publication_transport = if (artifact_publication_transport) |control| control.value else null,
@@ -1776,6 +1879,7 @@ fn parseBatchRequestWithOptions(
             .transaction = transaction,
         },
     };
+    try @import("../graph/dag_authority.zig").SourceFenceCommand.validateRequest(result_value.req);
     try @import("../storage/range_protection.zig").validateRequest(result_value.req);
     try db_mod.types.validateLeannRecordCommand(result_value.req);
     if (!allow_internal) {
@@ -2113,8 +2217,17 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
     }
+    try @import("../graph/dag_authority.zig").SourceFenceCommand.validateRequest(req);
+    if (req.dag_source_fence) |control| {
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"dag_source_fence_v1\"},\"_dag_source_fence\":");
+        try writer.print("{f}", .{std.json.fmt(control, .{ .emit_strings_as_arrays = control.activation_job == null })});
+    }
     if (req.artifact_catalog) |control| {
-        if (req.online_source == null and req.merge_checkpoint == null) try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"artifact_catalog_v1\"}");
+        if (control.dag_activations != null) {
+            if (req.online_source != null or req.merge_checkpoint != null) return error.InvalidBatchRequest;
+            try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"artifact_catalog_dag_v1\"}");
+        } else if (req.online_source == null and req.merge_checkpoint == null) try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"artifact_catalog_v1\"}");
+
         try writer.writeAll(",\"_artifact_catalog\":");
         const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
         defer alloc.free(encoded);
@@ -2366,7 +2479,11 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
             },
             .prepare => |prepare| {
                 const txn_hex = std.fmt.bytesToHex(prepare.txn_id, .lower);
-                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
+                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (prepare.dag_domains.len != 0) "prepare_dag_v1" else if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
+                if (prepare.dag_domains.len != 0) {
+                    if (prepare.dag_domains.len > 64 or req.restore_staging_scope != null) return error.InvalidBatchRequest;
+                    try writer.print(",\"domains\":{f}", .{std.json.fmt(prepare.dag_domains, .{ .emit_strings_as_arrays = true })});
+                }
             },
             .resolve => |resolve| {
                 const txn_hex = std.fmt.bytesToHex(resolve.txn_id, .lower);

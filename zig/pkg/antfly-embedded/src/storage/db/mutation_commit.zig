@@ -1404,8 +1404,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
                 var graph_sources: std.ArrayList(types.BatchWrite) = .empty;
                 defer graph_sources.deinit(S.ownerField(self, "alloc").*);
-                for (effective_req.graph_writes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.source, .value = "" });
-                for (effective_req.graph_deletes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.source, .value = "" });
+                for (effective_req.graph_writes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.producingDocument(), .value = "" });
+                for (effective_req.graph_deletes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.producingDocument(), .value = "" });
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(graph_sources.items, &.{});
             }
             try self.validateTransformReadSnapshot(transform_snapshot);
@@ -1524,25 +1524,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = ranges.activation_key, .value = ranges.activation_value });
                 }
             }
-            // A graph-only mutation changes the source's adjacency domain.
-            // Touch its primary storage key so existing SQL range observations
-            // detect graph phantoms and prepared graph writers fence outsiders.
+            // The producing document owns the physical relationship rows.
+            // Touch its primary storage key so range observations and prepared
+            // writers fence mutations to the same contribution.
             var touched_graph_sources = std.StringHashMapUnmanaged(void).empty;
             defer touched_graph_sources.deinit(S.ownerField(self, "alloc").*);
             inline for (.{ effective_req.graph_writes, effective_req.graph_deletes }) |edges| for (edges) |edge| {
-                if (touched_graph_sources.contains(edge.source)) continue;
-                try touched_graph_sources.put(S.ownerField(self, "alloc").*, edge.source, {});
+                const document = edge.producingDocument();
+                if (touched_graph_sources.contains(document)) continue;
+                try touched_graph_sources.put(S.ownerField(self, "alloc").*, document, {});
                 var primary_written = false;
-                for (effective_ops.writes) |write| if (std.mem.eql(u8, write.key, edge.source)) {
+                for (effective_ops.writes) |write| if (std.mem.eql(u8, write.key, document)) {
                     primary_written = true;
                     break;
                 };
-                for (effective_ops.deletes) |key| if (std.mem.eql(u8, key, edge.source)) {
+                for (effective_ops.deletes) |key| if (std.mem.eql(u8, key, document)) {
                     primary_written = true;
                     break;
                 };
                 if (primary_written) continue;
-                const key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, edge.source);
+                const key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, document);
                 defer S.ownerField(self, "alloc").*.free(key);
                 const existing = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, key) catch |err| switch (err) {
                     error.NotFound => continue,
@@ -2964,6 +2965,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var ordered_artifact_value: ?[]u8 = null;
             defer if (ordered_artifact_value) |value| S.ownerField(self, "alloc").*.free(value);
             if (req.artifact_catalog) |command| {
+                if (command.dag_activations != null) return error.InvalidArtifactCatalogCommand;
                 const entry = opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand;
                 var read = try S.ownerField(self, "core").*.store.beginReadTxn();
                 defer read.abort();
@@ -3927,6 +3929,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn isProtectedIntegrityKey(key: []const u8) bool {
+            if (transactions_mod.isDagAuthorityKey(key)) return true;
             if (@import("../artifact_footprint.zig").isKey(key)) return true;
             if (@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(key)) return true;
             if (@import("retirement_set_summary.zig").isKey(key)) return true;

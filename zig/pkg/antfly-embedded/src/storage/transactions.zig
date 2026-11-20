@@ -308,6 +308,7 @@ pub const RecoveryOptions = struct {
 
 pub const TxnSummary = struct {
     txn_id: TxnId,
+    dag_prepared: bool = false,
     status: TxnStatus,
     begin_timestamp: u64,
     commit_version: u64,
@@ -365,7 +366,45 @@ pub const ResolutionExtraBatch = struct {
 /// entry without a crash window between the transaction and its replay marker.
 const prepared_enrichments_prefix = "\x00\x00__txn_prepared_enrichments__:";
 
+const dag = @import("../graph/dag_authority.zig");
+const dag_validation = @import("../graph/dag_validation.zig");
+
+pub const DagDomainPrepare = struct {
+    domain: dag.Digest,
+    epoch: u64,
+    revision: u64,
+    attempt: dag.Attempt,
+    producer_versions: dag.Digest,
+    replacements: []const dag.Contributions.Replacement,
+
+    /// Stage a co-located authority decision in the publication writer.
+    /// The caller must abort this writer on any failure and stage the source
+    /// guards and publication effects in the same transaction.
+    pub fn stagePublication(self: DagDomainPrepare, alloc: Allocator, writer: anytype, budget: *dag_validation.Budget, witness: *dag_validation.Witness) !dag.Receipt {
+        witness.* = .{};
+        switch (try dag.Storage.beginUnreserved(writer, self.domain, self.epoch, self.revision, self.attempt)) {
+            .terminal => return self.requireAccepted(writer),
+            .reserved => |token| return dag.Contributions.prepareAndAccept(alloc, writer, token, self.producer_versions, self.replacements, budget, witness),
+        }
+    }
+
+    /// Resolve only against a trusted read of the authority ledger.
+    pub fn requireAccepted(self: DagDomainPrepare, authority_txn: anytype) !dag.Receipt {
+        const candidate = dag.Contributions.candidate(self.producer_versions, self.replacements);
+        if (!std.mem.eql(u8, &candidate, &self.attempt.candidate)) return error.GraphConstraintAttemptConflict;
+        return dag.Storage.requireAccepted(authority_txn, self.domain, self.revision, self.attempt);
+    }
+};
+
+pub const DagPrepare = struct {
+    domains: []const DagDomainPrepare,
+    budget: *dag_validation.Budget,
+    witness: *dag_validation.Witness,
+};
+
 pub const MutationExtraBatch = struct {
+    /// Authority-owner prepare data from the authenticated coordinator.
+    dag_prepare: ?DagPrepare = null,
     prepared_enrichments_json: ?[]const u8 = null,
     document_revisions: ?bool = null,
     writes: []const docstore.KVPair = &.{},
@@ -453,6 +492,7 @@ pub const IntentBatch = struct {
 };
 
 const TxnRecord = struct {
+    dag_prepared: bool = false,
     document_revisions: bool = false,
     status: TxnStatus,
     begin_timestamp: u64,
@@ -502,6 +542,7 @@ const txn_record_v4_size = 51;
 const txn_record_v5_size = 52;
 const txn_record_v6_size = 53;
 const txn_record_v7_size = 54;
+const txn_record_v8_size = 55;
 
 // ============================================================================
 // TxnManager
@@ -732,10 +773,24 @@ pub const TxnManager = struct {
         extra_batch: MutationExtraBatch,
     ) !void {
         if (extra_batch.index_span_digests.len > max_read_guards_per_transaction) return error.TransactionTooLarge;
-        for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
+        for (intents) |intent| {
+            if (isDagAuthorityKey(intent.key)) return error.InvalidIntegrityOperation;
+            if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
+        }
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
         const first_prepare = record.prepared_known and !record.prepared and record.intent_revision == 0;
+        if (record.dag_prepared) {
+            const replay = extra_batch.dag_prepare orelse return error.GraphConstraintAttemptConflict;
+            if (intents.len != 0 or predicates.len != 0 or extra_batch.graph_sources.len != 0 or
+                extra_batch.index_span_digests.len != 0 or extra_batch.prepared_enrichments_json != null or
+                try self.hasIntents(txn_id)) return error.GraphConstraintAttemptConflict;
+            return self.applyBatchWithParticipant(extra_batch.writes, extra_batch.deletes, null, null, null, .{
+                .repeat_vote = .{ .id = txn_id, .payload = replay },
+            });
+        }
+        if (!first_prepare and extra_batch.dag_prepare != null) return error.GraphConstraintAttemptConflict;
+        record.dag_prepared = extra_batch.dag_prepare != null;
         if (!first_prepare and extra_batch.prepared_enrichments_json == null) {
             if (try self.loadPreparedEnrichments(self.alloc, txn_id)) |packet| {
                 self.alloc.free(packet);
@@ -984,7 +1039,13 @@ pub const TxnManager = struct {
         }
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
-        try self.applyBatchWithReservation(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() });
+        const changes_sources = intents.len != 0 or extra_batch.graph_sources.len != 0 or extra_batch.prepared_enrichments_json != null;
+        try self.applyBatchWithParticipant(writes.items, extra_batch.deletes, null, .{
+            .previous = if (previous_admission) |old| old.reservation() else 0,
+            .next = admission.reservation(),
+        }, null, if (changes_sources or extra_batch.dag_prepare != null) .{
+            .prepare = .{ .id = txn_id, .payload = extra_batch.dag_prepare, .changes_sources = changes_sources },
+        } else null);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
     }
@@ -1074,6 +1135,9 @@ pub const TxnManager = struct {
             };
         }
 
+        const dag_batch: ?DagBatch = if (record.dag_prepared) .{ .resolve = .{ .id = txn_id, .status = status } } else null;
+        record.dag_prepared = false;
+
         // Scan all intents for this txn
         var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
         @memcpy(intent_prefix_buf[0..intents_prefix.len], intents_prefix);
@@ -1126,7 +1190,10 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &prepared_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyBatchWithReservation(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
+            try self.applyBatchWithParticipant(completion_writes.items, completion_deletes.items, null, .{
+                .previous = if (admission) |value| value.reservation() else 0,
+                .next = 0,
+            }, null, dag_batch);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -1272,7 +1339,7 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null);
+        try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, dag_batch);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -1531,6 +1598,18 @@ pub const TxnManager = struct {
         return readHasPrefix(&read, intents_prefix);
     }
 
+    /// Check drain and install the source fence in one serialized writer.
+    /// Idle transactions can remain open. A transaction with a durable vote
+    /// must have its coordinator resolve it before activation can proceed.
+    pub fn stageDagSourceFence(txn: anytype, fence: dag.SourceFence) !void {
+        try @import("db/relational_integrity_topology.zig").requireUnfenced(txn);
+        if (try txn.hasPrefix(intents_prefix) or
+            try txn.hasPrefix(intent_locks_prefix) or
+            try txn.hasPrefix(prepared_enrichments_prefix) or
+            try txn.hasPrefix(dag_domains_prefix)) return error.GraphConstraintBusy;
+        try fence.acquire(txn);
+    }
+
     /// Returns whether a topology transition would strand transaction state.
     /// This stays allocation-free and uses a single backend read snapshot:
     /// transitions are cold-path operations, but retained terminal decisions
@@ -1538,12 +1617,14 @@ pub const TxnManager = struct {
     pub fn hasTopologySensitiveTransactions(self: *TxnManager) !bool {
         var read = try self.store.beginRead();
         defer read.abort();
+        if (try dag.SourceFence.read(&read) != null) return true;
 
         // Resolution normally removes intents and HA outboxes atomically before
         // a transaction becomes quiescent. Check the global prefixes once rather
         // than opening an intent cursor for every retained terminal record.
         if (try readHasPrefix(&read, intents_prefix) or
             try readHasPrefix(&read, intent_locks_prefix) or
+            try readHasPrefix(&read, dag_domains_prefix) or
             try readHasPrefix(&read, read_guards_prefix) or
             try readHasPrefix(&read, read_members_prefix) or
             try readHasPrefix(&read, hot_standby_batch_outbox_prefix) or
@@ -1632,6 +1713,7 @@ pub const TxnManager = struct {
             const txn_id = record_entry.key[records_prefix.len..][0..16].*;
             try items.append(alloc, .{
                 .txn_id = txn_id,
+                .dag_prepared = record.dag_prepared,
                 .status = record.status,
                 .begin_timestamp = record.begin_timestamp,
                 .commit_version = record.commit_version,
@@ -1888,6 +1970,10 @@ pub const TxnManager = struct {
             stats.scanned_records += 1;
 
             if (summary.status == .pending) {
+                if (summary.dag_prepared) {
+                    stats.kept_recent_pending += 1;
+                    continue;
+                }
                 if (summary.created_at > 0 and summary.created_at < cutoff_timestamp) {
                     if (!options.presume_abort_distributed) {
                         const participants = try self.getParticipants(self.alloc, txn_id);
@@ -1924,7 +2010,7 @@ pub const TxnManager = struct {
                 continue;
             }
 
-            if (!(summary.intents_resolved_known and summary.intents_resolved) and try self.hasAnyIntents(txn_id)) {
+            if (!(summary.intents_resolved_known and summary.intents_resolved) and (summary.dag_prepared or try self.hasAnyIntents(txn_id))) {
                 const resolve_ts = switch (summary.status) {
                     .committed => if (summary.commit_version > 0) summary.commit_version else summary.begin_timestamp,
                     .aborted => if (summary.finalized_at > 0) summary.finalized_at else resolution_timestamp,
@@ -2390,7 +2476,8 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, if (record.document_revisions) txn_record_v7_size else txn_record_v6_size);
+        const len: usize = if (record.dag_prepared) txn_record_v8_size else if (record.document_revisions) txn_record_v7_size else txn_record_v6_size;
+        const buf = try self.alloc.alloc(u8, len);
         buf[0] = @backingInt(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -2402,7 +2489,8 @@ pub const TxnManager = struct {
         buf[50] = @intFromBool(record.coordinator);
         buf[51] = @intFromBool(record.retain_terminal);
         buf[52] = @intFromBool(record.intents_resolved);
-        if (record.document_revisions) buf[53] = 1;
+        if (len >= txn_record_v7_size) buf[53] = @intFromBool(record.document_revisions);
+        if (record.dag_prepared) buf[54] = 1;
         return buf;
     }
 
@@ -2440,7 +2528,7 @@ pub const TxnManager = struct {
             false
         else
             try self.hasAnyIntents(txn_id);
-        if (record.status == .pending or has_intents or try self.hasReplicationOutbox(txn_id)) {
+        if (record.status == .pending or record.dag_prepared or has_intents or try self.hasReplicationOutbox(txn_id)) {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
@@ -2714,10 +2802,10 @@ pub const TxnManager = struct {
 
     const ReservationChange = struct { previous: u64, next: u64 };
     fn applyBatchWithReservation(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange) !void {
-        return self.applyBatchWithParticipant(writes, deletes, replay, reservation, null);
+        return self.applyBatchWithParticipant(writes, deletes, replay, reservation, null, null);
     }
 
-    fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !void {
+    fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, dag_batch: ?DagBatch) !void {
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
@@ -2732,6 +2820,18 @@ pub const TxnManager = struct {
             try batch.put(kv.key, kv.value);
         }
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
+        if (dag_batch) |op| switch (op) {
+            .prepare => |prepare| {
+                try dag.SourceFence.requireWritable(&batch);
+                // A source participant must prove its final contribution before
+                // voting yes. Authority-only reservations carry no source writes.
+                if (prepare.changes_sources and try @import("db/artifact_publication.zig").LocalDagBinding.hasBindings(&batch))
+                    return error.GraphConstraintNotReady;
+                if (prepare.payload) |payload| try stageDagPrepare(self.alloc, &batch, prepare.id, payload);
+            },
+            .repeat_vote => |repeat| try requireSameDagVote(&batch, repeat.id, repeat.payload),
+            .resolve => |resolve| try stageDagResolution(self.alloc, &batch, resolve.id, resolve.status),
+        };
         try batch.commit();
     }
 
@@ -2756,6 +2856,105 @@ pub const TxnManager = struct {
         return @import("ttl.zig").writeVersion(val);
     }
 };
+
+const dag_domains_prefix = "\x00\x00__txn_dag_domains__:";
+pub fn isDagAuthorityKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, dag_domains_prefix) or
+        std.mem.startsWith(u8, key, "\x00\x00__metadata__:dag-");
+}
+
+const max_dag_domains_per_participant = 64;
+const DagBatch = union(enum) {
+    prepare: struct { id: TxnId, payload: ?DagPrepare, changes_sources: bool },
+    repeat_vote: struct { id: TxnId, payload: DagPrepare },
+    resolve: struct { id: TxnId, status: TxnStatus },
+};
+
+const dag_vote_magic = "DAGV\x01";
+const dag_vote_bytes = 32 + 32 + 32 + 8;
+
+fn stageDagPrepare(alloc: Allocator, batch: *backend_erased.Batch, id: TxnId, prepare: DagPrepare) !void {
+    const key = makeSidecarKey(dag_domains_prefix, id);
+    if (batch.get(&key)) |_| {
+        return error.GraphConstraintAttemptConflict;
+    } else |err| if (err != error.NotFound) return err;
+    if (prepare.domains.len == 0 or prepare.domains.len > max_dag_domains_per_participant) return error.InvalidDagMutation;
+    var packet: [dag_vote_magic.len + max_dag_domains_per_participant * dag_vote_bytes]u8 = undefined;
+    @memcpy(packet[0..dag_vote_magic.len], dag_vote_magic);
+    var previous: ?dag.Digest = null;
+    for (prepare.domains, 0..) |domain, index| {
+        if (!std.mem.eql(u8, &domain.attempt.transaction, &id)) return error.GraphConstraintAttemptConflict;
+        if (previous) |prior| if (std.mem.order(u8, &prior, &domain.domain) != .lt) return error.InvalidDagMutation;
+        previous = domain.domain;
+        const row = packet[dag_vote_magic.len + index * dag_vote_bytes ..][0..dag_vote_bytes];
+        row[0..32].* = domain.domain;
+        row[32..64].* = domain.attempt.id;
+        row[64..96].* = domain.attempt.candidate;
+        std.mem.writeInt(u64, row[96..104], domain.revision, .big);
+        const result = try dag.Storage.begin(batch, domain.domain, domain.epoch, domain.revision, domain.attempt);
+        const token = switch (result) {
+            .reserved => |token| token,
+            .terminal => return error.GraphConstraintAttemptConflict,
+        };
+        try dag.TransactionParticipant.prepare(alloc, batch, token, domain.producer_versions, domain.replacements, prepare.budget, prepare.witness);
+    }
+    try batch.put(&key, packet[0 .. dag_vote_magic.len + prepare.domains.len * dag_vote_bytes]);
+}
+
+// Retry a lost authority-only prepare acknowledgement without reserving or
+// validating the graph again. The ordered receipt shares this same writer.
+fn requireSameDagVote(batch: *backend_erased.Batch, id: TxnId, prepare: DagPrepare) !void {
+    if (prepare.domains.len == 0 or prepare.domains.len > max_dag_domains_per_participant) return error.InvalidDagMutation;
+    const raw = batch.get(&makeSidecarKey(dag_domains_prefix, id)) catch |err| if (err == error.NotFound) return error.InvalidTxnRecord else return err;
+    if (raw.len != dag_vote_magic.len + prepare.domains.len * dag_vote_bytes or
+        !std.mem.startsWith(u8, raw, dag_vote_magic)) return error.GraphConstraintAttemptConflict;
+    for (prepare.domains, 0..) |domain, index| {
+        const row = raw[dag_vote_magic.len + index * dag_vote_bytes ..][0..dag_vote_bytes];
+        if (!std.mem.eql(u8, row[0..32], &domain.domain) or
+            !std.mem.eql(u8, row[32..64], &domain.attempt.id) or
+            !std.mem.eql(u8, row[64..96], &domain.attempt.candidate) or
+            !std.mem.eql(u8, &domain.attempt.transaction, &id) or
+            std.mem.readInt(u64, row[96..104], .big) != domain.revision) return error.GraphConstraintAttemptConflict;
+        const candidate = dag.Contributions.candidate(domain.producer_versions, domain.replacements);
+        if (!std.mem.eql(u8, &candidate, &domain.attempt.candidate)) return error.GraphConstraintAttemptConflict;
+    }
+}
+
+fn stageDagResolution(alloc: Allocator, batch: *backend_erased.Batch, id: TxnId, status: TxnStatus) !void {
+    const key = makeSidecarKey(dag_domains_prefix, id);
+    const raw = batch.get(&key) catch |err| {
+        if (err == error.NotFound) return error.InvalidTxnRecord;
+        return err;
+    };
+    const legacy = raw.len % @sizeOf(dag.Digest) == 0;
+    if (!legacy and !std.mem.startsWith(u8, raw, dag_vote_magic)) return error.InvalidTxnRecord;
+    const body = if (legacy) raw else raw[dag_vote_magic.len..];
+    const row_bytes: usize = if (legacy) @sizeOf(dag.Digest) else dag_vote_bytes;
+    if (body.len == 0 or body.len % row_bytes != 0 or body.len / row_bytes > max_dag_domains_per_participant) return error.InvalidTxnRecord;
+    // The backend may invalidate the borrowed record on another read.
+    var scratch: [max_dag_domains_per_participant * dag_vote_bytes]u8 = undefined;
+    @memcpy(scratch[0..body.len], body);
+    const outcome: dag.Outcome = switch (status) {
+        .committed => .accepted,
+        .aborted => .aborted,
+        .pending => return error.InvalidTxnRecord,
+    };
+    var previous: ?dag.Digest = null;
+    for (0..body.len / row_bytes) |index| {
+        const row = scratch[index * row_bytes ..][0..row_bytes];
+        const domain = row[0..32].*;
+        if (previous) |prior| if (std.mem.order(u8, &prior, &domain) != .lt) return error.InvalidTxnRecord;
+        previous = domain;
+        const state = try dag.Storage.load(batch, domain);
+        const token = (try state.recoveryToken(state.owner_epoch)) orelse return error.GraphConstraintAttemptConflict;
+        if (!std.mem.eql(u8, &token.attempt.transaction, &id)) return error.GraphConstraintAttemptConflict;
+        if (!legacy and (!std.mem.eql(u8, row[32..64], &token.attempt.id) or
+            !std.mem.eql(u8, row[64..96], &token.attempt.candidate) or
+            std.mem.readInt(u64, row[96..104], .big) != token.revision)) return error.GraphConstraintAttemptConflict;
+        _ = try dag.TransactionParticipant.resolve(alloc, batch, domain, state.owner_epoch, token.attempt, outcome);
+    }
+    try batch.delete(&key);
+}
 
 fn emitWriteIntentTrace(
     alloc: std.mem.Allocator,
@@ -3063,6 +3262,14 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
 }
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
+    if (raw.len == txn_record_v8_size) {
+        if (raw[53] > 1 or raw[54] != 1) return error.InvalidTxnRecord;
+        var record = try decodeRecord(raw[0..txn_record_v6_size]);
+        if (!record.prepared or record.intents_resolved) return error.InvalidTxnRecord;
+        record.document_revisions = raw[53] == 1;
+        record.dag_prepared = true;
+        return record;
+    }
     if (raw.len == txn_record_v7_size) {
         if (raw[53] != 1) return error.InvalidTxnRecord;
         var record = try decodeRecord(raw[0..txn_record_v6_size]);
@@ -5163,4 +5370,309 @@ test "time series source language reserves signed source slots before voting" {
     try std.testing.expectEqual(legacy + 16, try retainedIntentBytesForLanguage(std.testing.allocator, intent, true));
     const deleted: WriteIntent = .{ .key = "row", .value = null };
     try std.testing.expectEqual(try retainedIntentBytes(std.testing.allocator, deleted), try retainedIntentBytesForLanguage(std.testing.allocator, deleted, true));
+}
+
+test "DAG activation fence drains prepared writers and rejects new votes" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-dag-source-fence");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+
+    const first: TxnId = @splat(1);
+    const second: TxnId = @splat(2);
+    const intents: []const WriteIntent = &.{.{ .key = "row", .value = "{}" }};
+    try manager.initTransaction(first, 100);
+    try manager.writeIntents(first, intents, &.{});
+    const fence: dag.SourceFence = .{ .activation = @splat(3), .snapshot = @splat(4) };
+    {
+        var writer = try store.beginWriteTxn();
+        defer writer.abort();
+        try std.testing.expectError(error.GraphConstraintBusy, TxnManager.stageDagSourceFence(&writer, fence));
+        try std.testing.expect((try dag.SourceFence.read(&writer)) == null);
+    }
+    try manager.resolveIntents(first, .committed, 101);
+    try std.testing.expect(!try manager.hasTopologySensitiveTransactions());
+    const topology = @import("db/relational_integrity_topology.zig");
+    var topology_fence: topology.Fence = .{
+        .transition_id = 1,
+        .attempt = 1,
+        .peer_group_id = 2,
+        .owner_group_id = 1,
+        .role = .backup_snapshot,
+        .namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .catalog_digest = undefined,
+    };
+    std.crypto.hash.Blake3.hash("", &topology_fence.catalog_digest, .{});
+    {
+        var writer = try store.beginWriteTxn();
+        defer writer.abort();
+        try topology.stageBegin(&writer, topology_fence);
+        try std.testing.expectError(error.IntegrityTopologyBusy, TxnManager.stageDagSourceFence(&writer, fence));
+    }
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try TxnManager.stageDagSourceFence(&writer, fence);
+        try std.testing.expectError(error.IntegrityTopologyBusy, topology.stageBegin(&writer, topology_fence));
+        try writer.commit();
+    }
+    try std.testing.expect(try manager.hasTopologySensitiveTransactions());
+    try manager.initTransaction(second, 102);
+    try std.testing.expectError(error.GraphConstraintBusy, manager.writeIntents(second, intents, &.{}));
+    try std.testing.expect(!(try manager.hasIntents(second)));
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try fence.release(&writer);
+        try writer.commit();
+    }
+    try manager.writeIntents(second, intents, &.{});
+    try manager.resolveIntents(second, .aborted, 103);
+    try std.testing.expect(!try manager.hasTopologySensitiveTransactions());
+    const publication = @import("db/artifact_publication.zig");
+    const binding: publication.LocalDagBinding = .{ .table_identity = @splat(5), .edge_types = &.{"links"} };
+    const domain = try dag.domain(binding.table_identity, 7, "g", "links");
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try dag.Storage.create(&writer, domain, 1);
+        try dag.Storage.activateNewIncarnation(&writer, domain, 1);
+        try binding.stage(alloc, &writer, .{
+            .producer_kind = .graph,
+            .namespace = @splat(6),
+            .authority_epoch = 1,
+            .catalog_digest = @splat(0),
+            .producer_name = "g",
+            .producer_generation = 7,
+            .sources = &.{},
+            .mutations = &.{},
+            .publication_digest = @splat(0),
+        });
+        try writer.commit();
+    }
+    const third: TxnId = @splat(7);
+    try manager.initTransaction(third, 104);
+    try std.testing.expectError(error.GraphConstraintNotReady, manager.writeIntents(third, intents, &.{}));
+    try std.testing.expect(!try manager.hasIntents(third));
+    try manager.resolveIntents(third, .aborted, 105);
+}
+
+test "DAG co-located publication rolls back authority and output together" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-dag-publication");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const domain: dag.Digest = @splat(1);
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try dag.Storage.create(&writer, domain, 1);
+        try dag.Storage.activateNewIncarnation(&writer, domain, 1);
+        try writer.commit();
+    }
+    const clock = struct {
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+    };
+    const versions: dag.Digest = @splat(2);
+    const replacements: []const dag.Contributions.Replacement = &.{.{ .owner = @splat(3), .source = "left", .targets = &.{"right"} }};
+    const vote: DagDomainPrepare = .{
+        .domain = domain,
+        .epoch = 1,
+        .revision = 0,
+        .producer_versions = versions,
+        .replacements = replacements,
+        .attempt = .{ .id = @splat(4), .transaction = @splat(5), .candidate = dag.Contributions.candidate(versions, replacements) },
+    };
+    {
+        var writer = try store.beginWriteTxn();
+        defer writer.abort();
+        _ = try dag.Storage.begin(&writer, domain, vote.epoch, vote.revision, vote.attempt);
+        var budget: dag_validation.Budget = .{ .clock = .{ .context = &store, .now = clock.now } };
+        var witness: dag_validation.Witness = .{};
+        try std.testing.expectError(error.GraphConstraintBusy, vote.stagePublication(alloc, &writer, &budget, &witness));
+    }
+    const output = "\x00\x00__metadata__:test-publication-output";
+    var witness: dag_validation.Witness = .{};
+    for ([_]bool{ false, true }) |commit| {
+        var writer = try store.beginWriteTxn();
+        var active = true;
+        defer if (active) writer.abort();
+        var budget: dag_validation.Budget = .{ .clock = .{ .context = &store, .now = clock.now } };
+        const receipt = try vote.stagePublication(alloc, &writer, &budget, &witness);
+        try std.testing.expectEqual(@as(u64, 1), receipt.revision);
+        try writer.put(output, "candidate");
+        if (commit) {
+            try writer.commit();
+            active = false;
+        } else {
+            writer.abort();
+            active = false;
+            var after_abort = try store.beginReadTxn();
+            defer after_abort.abort();
+            try std.testing.expectError(error.GraphConstraintNotValidated, vote.requireAccepted(&after_abort));
+            try std.testing.expectError(error.NotFound, after_abort.get(output));
+        }
+    }
+    var reader = try store.beginReadTxn();
+    defer reader.abort();
+    try std.testing.expectEqual(@as(u64, 1), (try vote.requireAccepted(&reader)).revision);
+    try std.testing.expectEqualStrings("candidate", try reader.get(output));
+}
+
+test "DAG transaction prepare and resolution share the primary transaction" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-dag-authority");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const domain: dag.Digest = @splat(2);
+    const earlier_domain: dag.Digest = @splat(1);
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        for ([_]dag.Digest{ earlier_domain, domain }) |domain_id| {
+            try dag.Storage.create(&writer, domain_id, 1);
+            try dag.Storage.activateNewIncarnation(&writer, domain_id, 1);
+        }
+        try writer.commit();
+    }
+    const clock = struct {
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+    };
+    var budget: dag_validation.Budget = .{ .clock = .{ .context = &store, .now = clock.now } };
+    var witness: dag_validation.Witness = .{};
+    const versions: dag.Digest = @splat(3);
+    const forward: []const dag.Contributions.Replacement = &.{
+        .{ .owner = @splat(4), .source = "left", .targets = &.{"right"} },
+    };
+    const reverse: []const dag.Contributions.Replacement = &.{
+        .{ .owner = @splat(5), .source = "right", .targets = &.{"left"} },
+    };
+
+    for ([_][]const dag.Contributions.Replacement{ forward, reverse }, 0..) |replacements, revision| {
+        const id: TxnId = @splat(@intCast(revision + 1));
+        const key = replacements[0].source;
+        const attempt: dag.Attempt = .{
+            .id = @splat(@intCast(revision + 1)),
+            .transaction = id,
+            .candidate = dag.Contributions.candidate(versions, replacements),
+        };
+        try manager.initTransaction(id, 100);
+        const current: DagDomainPrepare = .{
+            .domain = domain,
+            .epoch = 1,
+            .revision = revision,
+            .attempt = attempt,
+            .producer_versions = versions,
+            .replacements = replacements,
+        };
+        var earlier = current;
+        earlier.domain = earlier_domain;
+        earlier.revision = 0;
+        const extra: MutationExtraBatch = .{ .dag_prepare = .{
+            .domains = if (revision == 0) &.{current} else &.{ earlier, current },
+            .budget = &budget,
+            .witness = &witness,
+        } };
+        const intents: []const WriteIntent = &.{.{ .key = key, .value = "{}" }};
+        if (revision == 0) {
+            try manager.writeIntentsExtraBatch(id, intents, &.{}, extra);
+            try std.testing.expectError(error.GraphConstraintAttemptConflict, manager.writeIntents(id, intents, &.{}));
+            const vote_key = makeSidecarKey(dag_domains_prefix, id);
+            var vote: [dag_vote_magic.len + dag_vote_bytes]u8 = undefined;
+            {
+                var reader = try store.beginReadTxn();
+                defer reader.abort();
+                @memcpy(&vote, try reader.get(&vote_key));
+            }
+            vote[dag_vote_magic.len + 32] ^= 1;
+            try store.putBatch(&.{.{ .key = &vote_key, .value = &vote }}, &.{});
+            try std.testing.expectError(error.GraphConstraintAttemptConflict, manager.resolveIntents(id, .committed, 200));
+            try std.testing.expect(try manager.hasIntents(id));
+            vote[dag_vote_magic.len + 32] ^= 1;
+            try store.putBatch(&.{.{ .key = &vote_key, .value = &vote }}, &.{});
+            try manager.resolveIntents(id, .committed, 200);
+            try manager.resolveIntents(id, .committed, 200);
+            {
+                var reader = try store.beginReadTxn();
+                defer reader.abort();
+                const receipt = try current.requireAccepted(&reader);
+                try std.testing.expectEqual(@as(u64, 1), receipt.revision);
+                var different = current;
+                different.producer_versions[0] ^= 1;
+                try std.testing.expectError(error.GraphConstraintAttemptConflict, different.requireAccepted(&reader));
+            }
+            const value = try getVisibleDoc(&store, alloc, key);
+            defer alloc.free(value);
+            try std.testing.expectEqualStrings("{}", value);
+        } else {
+            try std.testing.expectError(error.GraphCycle, manager.writeIntentsExtraBatch(id, intents, &.{}, extra));
+            try std.testing.expect(!(try manager.hasIntents(id)));
+            try std.testing.expectError(error.NotFound, getVisibleDoc(&store, alloc, key));
+            {
+                var reader = try store.beginReadTxn();
+                defer reader.abort();
+                const state = try dag.Storage.load(&reader, domain);
+                try std.testing.expectEqual(@as(u64, 1), state.revision);
+                try std.testing.expect(state.pending == null);
+                const rolled_back = try dag.Storage.load(&reader, earlier_domain);
+                try std.testing.expect(rolled_back.pending == null);
+                try std.testing.expectEqual(@as(u64, 0), rolled_back.revision);
+            }
+            try manager.resolveIntents(id, .aborted, 200);
+        }
+    }
+
+    const id: TxnId = @splat(3);
+    const attempt: dag.Attempt = .{
+        .id = @splat(3),
+        .transaction = id,
+        .candidate = dag.Contributions.candidate(versions, &.{}),
+    };
+    try manager.initTransaction(id, 100);
+    const extra: MutationExtraBatch = .{ .dag_prepare = .{
+        .domains = &.{.{
+            .domain = domain,
+            .epoch = 1,
+            .revision = 1,
+            .attempt = attempt,
+            .producer_versions = versions,
+            .replacements = &.{},
+        }},
+        .budget = &budget,
+        .witness = &witness,
+    } };
+    try manager.writeIntentsExtraBatch(id, &.{}, &.{}, extra);
+    try manager.writeIntentsExtraBatch(id, &.{}, &.{}, extra);
+    var changed = extra.dag_prepare.?.domains[0];
+    changed.producer_versions[0] ^= 1;
+    var altered = extra;
+    altered.dag_prepare.?.domains = &.{changed};
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, manager.writeIntentsExtraBatch(id, &.{}, &.{}, altered));
+
+    const stats = try manager.recoverTransactions(std.math.maxInt(u64), 200);
+    try std.testing.expectEqual(@as(usize, 1), stats.kept_recent_pending);
+    var reader = try store.beginReadTxn();
+    const before = try dag.Storage.load(&reader, domain);
+    reader.abort();
+    try std.testing.expect(before.pending != null);
+    try manager.resolveIntents(id, .aborted, 200);
+    var after_abort = try store.beginReadTxn();
+    defer after_abort.abort();
+    const after = try dag.Storage.load(&after_abort, domain);
+    try std.testing.expect(after.pending == null);
+    try std.testing.expectEqual(before.revision, after.revision);
 }

@@ -3056,12 +3056,12 @@ pub const AntflyApiHandler = struct {
     fn internalGroupLookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, group_id: u64, table_name: []const u8, key: []const u8, query: []const u8) !httpx.Response {
         var lookup_options = http_route_helpers.parseInternalLookupOptions(ctx.allocator, query) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
-        if (lookup_options.opts.privacy_original or std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
+        if (lookup_options.opts.privacy_original or
+            @import("antfly_local_sources").storage_db_dag_activation_contract.isLookupControl(lookup_options.opts.relational_topology_json) or std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
             std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}"))
         {
-            // A legacy unauthenticated internal peer must never gain the
-            // hidden, unfenced receipt capability merely by setting a query
-            // parameter. Public route middleware is not sufficient here.
+            // These controls require a service credential even on the legacy
+            // internal lookup route.
             const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
             var identity = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
             defer identity.deinit(self.api_server.alloc);
@@ -4181,6 +4181,8 @@ pub const AntflyApiHandler = struct {
         err: internal_group_operations.Error,
         phase: InternalTxnPhase,
     ) !httpx.Response {
+        if (@import("dag_errors.zig").classify(err)) |reason|
+            return textResponse(ctx, 409, @errorName(reason));
         if (@import("relational_row_errors.zig").classify(err)) |reason|
             return textResponse(ctx, @import("relational_row_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_integrity_errors.zig").classify(err)) |relational_error|

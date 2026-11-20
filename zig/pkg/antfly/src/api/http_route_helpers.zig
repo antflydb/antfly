@@ -250,7 +250,9 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
             if (seen) return error.InvalidQueryRequest;
             seen = true;
             result.relational_topology_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_relational_topology=".len..]);
-            if (result.relational_topology_json.len == 0 or result.relational_topology_json.len > 4096) return error.InvalidQueryRequest;
+            const dag_activation = @import("antfly_local_sources").storage_db_dag_activation_contract;
+            const max_topology_bytes = if (dag_activation.isLookupControl(result.relational_topology_json)) dag_activation.max_lookup_control_bytes else 4096;
+            if (result.relational_topology_json.len == 0 or result.relational_topology_json.len > max_topology_bytes) return error.InvalidQueryRequest;
             result.opts.relational_topology_json = result.relational_topology_json;
         } else if (std.mem.startsWith(u8, part, "_restore_staging_scope=")) {
             if (result.opts.restore_staging_scope != null) return error.InvalidQueryRequest;

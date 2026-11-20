@@ -35,9 +35,36 @@ pub fn address(a: A, effect: Effect) ![]const u8 {
     @import("antfly_hash").Sha256.hash(json, &digest, .{});
     return std.fmt.allocPrint(a, "{s}{s}", .{ prefix, std.fmt.bytesToHex(digest, .lower) });
 }
-pub fn append(a: A, list_allocator: A, intents: *std.ArrayListUnmanaged(txn.WriteIntent), effect: Effect) !void {
-    try intents.append(list_allocator, .{ .key = try address(a, effect), .value = try std.json.Stringify.valueAlloc(a, Envelope{ .effect = effect }, .{}) });
-}
+pub const Prepare = struct {
+    owners: std.ArrayList(txn.WriteIntent) = .empty,
+    policy_sources: std.ArrayList(txn.WriteIntent) = .empty,
+    seen_owners: std.StringHashMapUnmanaged(void) = .empty,
+    seen_policy_sources: std.StringHashMapUnmanaged(void) = .empty,
+    include_policy_sources: bool,
+
+    /// Effects are already typed at prepare. Capture dependencies before
+    /// serializing the durable intent. Resolution still verifies the envelope.
+    pub fn append(self: *Prepare, a: A, list_allocator: A, intents: *std.ArrayListUnmanaged(txn.WriteIntent), effect: Effect) !void {
+        switch (effect) {
+            inline else => |edge| {
+                const owner = edge.producingDocument();
+                if (!(try self.seen_owners.getOrPut(a, owner)).found_existing)
+                    try self.owners.append(a, .{ .key = owner, .value = null });
+                if (self.include_policy_sources) {
+                    for ([_][]const u8{ owner, edge.source }) |document| {
+                        if (!(try self.seen_policy_sources.getOrPut(a, document)).found_existing)
+                            try self.policy_sources.append(a, .{ .key = document, .value = null });
+                    }
+                }
+            },
+        }
+        try intents.append(list_allocator, .{
+            .key = try address(a, effect),
+            .value = try std.json.Stringify.valueAlloc(a, Envelope{ .effect = effect }, .{}),
+        });
+    }
+};
+
 pub fn decode(a: A, key: []const u8, value: []const u8) !Effect {
     if (!isEffect(key)) return error.InvalidTxnRecord;
     const envelope = try std.json.parseFromSliceLeaky(Envelope, a, value, .{});
@@ -46,25 +73,6 @@ pub fn decode(a: A, key: []const u8, value: []const u8) !Effect {
     defer a.free(expected);
     if (!std.mem.eql(u8, expected, key)) return error.InvalidTxnRecord;
     return envelope.effect;
-}
-/// Logical write dependencies are conflict/range reservations only. Keeping
-/// them separate from primary intents preserves the original document bytes.
-/// Decode into the request preparation arena; returned keys borrow that arena.
-pub fn sources(a: A, intents: []const txn.WriteIntent) ![]const txn.WriteIntent {
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer seen.deinit(a);
-    var output: std.ArrayList(txn.WriteIntent) = .empty;
-    errdefer output.deinit(a);
-    for (intents) |intent| {
-        if (!isEffect(intent.key)) continue;
-        const effect = try decode(a, intent.key, intent.value orelse return error.InvalidTxnRecord);
-        const source = switch (effect) {
-            inline else => |edge| edge.source,
-        };
-        if ((try seen.getOrPut(a, source)).found_existing) continue;
-        try output.append(a, .{ .key = source, .value = null });
-    }
-    return output.toOwnedSlice(a);
 }
 pub const Batch = struct {
     writes: []const types.BatchWrite,

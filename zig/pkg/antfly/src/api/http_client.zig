@@ -542,7 +542,8 @@ pub const ApiHttpClient = struct {
         const special = group_source_query_json.len != 0 or relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
         // Routing uses the actual logical key, including empty first-range
         // boundaries. Only the already-routed HTTP path needs a placeholder.
-        const key_in_body = documentKeyNeedsBody(key);
+        const key_in_body = documentKeyNeedsBody(key) or
+            @import("antfly_local_sources").storage_db_dag_activation_contract.isLookupControl(relational_topology_json);
         const encoded_key = try percentEncodePathComponent(self.alloc, if (key_in_body) "" else if (special and key.len == 0) "\x00relational_control" else key);
         defer self.alloc.free(encoded_key);
         const encoded_consistency = try percentEncodePathComponent(self.alloc, read_consistency);
@@ -4517,6 +4518,7 @@ fn isTxnPreDecisionNotProposedResponse(resp: http_common.HttpResponse) bool {
 }
 
 fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
+    if (@import("dag_errors.zig").decode(body)) |err| return err;
     if (@import("relational_integrity_errors.zig").decode(body)) |err| return err;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
@@ -4988,6 +4990,52 @@ fn consumerTests() type {
                 "docs/tenant",
                 "\x01doc\x00\x00\x20asset",
                 "title,owner&admin",
+            );
+            defer response.deinit(std.testing.allocator);
+        }
+
+        test "api http client sends large DAG activation cursors in private POST bodies" {
+            const padding: [5000]u8 = @splat('x');
+
+            const control = "{\"mode\":\"dag_activation_source_page\",\"dag_source_page\":{\"after\":\"" ++ padding ++ "\"}}";
+            const Executor = struct {
+                fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, "/internal/v1/groups/9/tables/docs/document-read"));
+                    const request = try std.json.parseFromSlice(@import("http_routes.zig").DocumentReadRequest, alloc, req.body, .{});
+                    defer request.deinit();
+                    try std.testing.expectEqual(.lookup, request.value.operation);
+                    try std.testing.expectEqualStrings("", request.value.key_base64);
+                    var opts = try @import("http_route_helpers.zig").parseInternalLookupOptions(alloc, request.value.query);
+                    defer opts.deinit(alloc);
+                    try std.testing.expectEqualStrings(control, opts.opts.relational_topology_json);
+                    return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+                }
+            };
+            var context: u8 = 0;
+            const executor: http_common.RequestExecutor = .{ .ptr = &context, .vtable = &.{ .execute = Executor.execute } };
+            var client = ApiHttpClient.init(std.testing.allocator, executor);
+            var response = try client.fetchGroupLookupWithMode(
+                "http://127.0.0.1:1",
+                9,
+                "docs",
+                "",
+                null,
+                "read_index",
+                null,
+                null,
+                false,
+                false,
+                "",
+                "",
+                "",
+                control,
+                "",
+                null,
+                null,
+                false,
+                false,
+                null,
             );
             defer response.deinit(std.testing.allocator);
         }

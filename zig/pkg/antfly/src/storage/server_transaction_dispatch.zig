@@ -117,6 +117,7 @@ pub fn applyReplicatedTransactionMutationInternal(
         },
         .prepare => |prepare| {
             const intents: db_mod.types.TransactionIntentRequest = .{
+                .dag_domains = prepare.dag_domains,
                 .commit_requires = req.commit_requires,
                 .prepared_enrichments_json = req.prepared_enrichments_json,
                 .document_version_scheme = req.document_version_scheme,

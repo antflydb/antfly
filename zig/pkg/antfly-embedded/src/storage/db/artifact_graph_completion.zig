@@ -84,7 +84,7 @@ pub fn prepare(a: A, txn: anytype, root: u128, document: []const u8, node: *cons
         defer current.deinit();
         if (!std.mem.eql(u8, &current.owned.proof.publication_digest, &proof.publication_digest)) return error.ArtifactPublicationPending;
         try observation.observeProof(document, current.owned.proof);
-        try certificates.append(owned, try provenance.captureCurrentArtifactCertificate(txn, observation.authority, state_key.items, proof.publication_digest));
+        try certificates.append(owned, try provenance.captureCurrentArtifactCertificate(txn, observation.authority, state_key.items, proof));
     }
     try observation.requireCurrent(txn, document);
     const owned_document = try owned.dupe(u8, document);

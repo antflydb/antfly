@@ -1336,6 +1336,15 @@ const RaftTableApplyStateMachine = struct {
         SqlFeatureNotSupported,
         SqlArraySubscriptError,
 
+        GraphCycle,
+        GraphConstraintCapacity,
+        GraphConstraintNotReady,
+        GraphConstraintOwnerChanged,
+        GraphConstraintRevisionChanged,
+        GraphConstraintBusy,
+        GraphConstraintAttemptConflict,
+        InvalidDagMutation,
+
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
                 if (err == @field(@import("antfly_local_sources").storage_db_online_source_contract.Rejection, field)) return @field(ExpectedApplyFailure, field);
@@ -1401,6 +1410,9 @@ const RaftTableApplyStateMachine = struct {
             inline for (@typeInfo(@import("../api/relational_integrity_errors.zig").Error).error_set.error_names.?) |field| {
                 if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../api/relational_integrity_errors.zig").Error, field);
             }
+            inline for (@typeInfo(@import("../api/dag_errors.zig").Error).error_set.error_names.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../api/dag_errors.zig").Error, field);
+            }
             return switch (self) {
                 .InvalidArtifactCatalogCommand => error.InvalidArtifactCatalogCommand,
                 .ArtifactCatalogEpochChanged => error.ArtifactCatalogEpochChanged,
@@ -1432,6 +1444,34 @@ const RaftTableApplyStateMachine = struct {
         }
 
         fn forRequest(err: anyerror, req: antfly.db.types.BatchRequest) ?ExpectedApplyFailure {
+            if (req.dag_source_fence != null) switch (err) {
+                error.GraphConstraintAttemptConflict => return .GraphConstraintAttemptConflict,
+                error.GraphConstraintRevisionChanged => return .GraphConstraintRevisionChanged,
+                error.GraphConstraintNotReady => return .GraphConstraintNotReady,
+                error.IntegrityTopologyBusy => return .GraphConstraintBusy,
+                error.GraphConstraintOwnerChanged => return .GraphConstraintOwnerChanged,
+                error.GraphConstraintCapacity => return .GraphConstraintCapacity,
+                error.GraphCycle => return .GraphCycle,
+                error.InvalidDagMutation => return .invalid_batch_request,
+                else => {},
+            };
+            if (req.transaction == null) switch (err) {
+                error.GraphCycle => return .GraphCycle,
+                error.GraphConstraintCapacity => return .GraphConstraintCapacity,
+                error.GraphConstraintNotReady => return .GraphConstraintNotReady,
+                else => {},
+            };
+            if (err == error.GraphConstraintBusy) {
+                if (req.transaction) |control| {
+                    if (control == .resolve and control.resolve.status == .committed) return null;
+                }
+                return .GraphConstraintBusy;
+            }
+            if (req.transaction) |control| if (control == .prepare and control.prepare.dag_domains.len != 0) {
+                inline for (@typeInfo(@import("../api/dag_errors.zig").Error).error_set.error_names.?) |field| {
+                    if (err == @field(@import("../api/dag_errors.zig").Error, field)) return @field(ExpectedApplyFailure, field);
+                }
+            };
             // A committed transaction decision cannot be converted into a
             // rejected participant mutation by late retention pressure or a
             // newly retired FK generation. Both conditions must be prevented
@@ -5544,6 +5584,7 @@ pub const DataServer = struct {
     initial_fk_retirement_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
+    dag_activation_cursors: std.AutoHashMapUnmanaged(u64, [32]u8) = .empty,
     leann_replication_running: std.atomic.Value(bool) = .init(false),
     leann_replication_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     group_source_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
@@ -6712,11 +6753,38 @@ pub const DataServer = struct {
         if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
         if (server.hotStandbyWriteGate()) |gate| try gate.check();
         if (server.group_leadership_source) |leadership| if (!leadership.isLocalLeader(job.group_id)) return error.NotLeader;
+        server.runDiscoveredDagActivation(job.table, job.group_id) catch |err| {
+            std.log.debug("DAG activation deferred group={d} err={s}", .{ job.group_id, @errorName(err) });
+        };
         var response = (try server.read_source.source().lookupGroupLocal(server.alloc, job.group_id, job.table, "", .{ .relational_topology_json = "{\"mode\":\"graph_endpoint_cleanup\"}", .execution_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&server.background_jobs_shutdown) }, .leader_lease)) orelse return;
         defer response.deinit(server.alloc);
         var status = try std.json.parseFromSlice(antfly.db.types.GraphEndpointCleanupStatus, server.alloc, response.json, .{});
         defer status.deinit();
         if (status.value.pending) try server.proposeRaftBatchGroupWithLeaderWait(server.alloc, job.group_id, job.table, status.value.request(), .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&server.background_jobs_shutdown), .admission_deadline_ns = server.dataRaftMonotonicNs() +| 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
+    }
+
+    fn runDiscoveredDagActivation(self: *DataServer, table_name: []const u8, group_id: u64) !void {
+        const cancellation: antfly.db.types.CancellationToken = .fromAtomic(&self.background_jobs_shutdown);
+        try cancellation.check();
+        const catalog = self.write_source.catalog;
+        const deadline = catalog.budget(null).nowNs() +| 5 * std.time.ns_per_s;
+        const snapshot = try @import("../api/table_catalog.zig").routedGroupIdSnapshotUntil(self.alloc, catalog, table_name, group_id, catalog.deadlineFrom(.{ .deadline_ns = deadline }));
+        const fence = snapshot.fence() orelse return error.TopologyChanged;
+        const identity = fence.route.identity_namespace;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], identity.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
+        const route: DagActivationRoute = .{ .namespace = namespace, .fence = fence };
+        const attempts = try self.pendingDagActivationJobsOnRoute(self.alloc, table_name, route, self.dag_activation_cursors.get(group_id), cancellation);
+        defer self.alloc.free(attempts);
+        if (attempts.len == 0) {
+            _ = self.dag_activation_cursors.remove(group_id);
+            return;
+        }
+        // Advance the enumeration even when a job must retry.
+        try self.dag_activation_cursors.put(self.alloc, group_id, attempts[0]);
+        _ = try self.resumeDagActivationJob(self.alloc, table_name, route, attempts[0], cancellation);
     }
 
     const LeannReplicationJob = struct {
@@ -9957,6 +10025,7 @@ pub const DataServer = struct {
         self.group_source_sweep.deinit();
         if (self.group_source_worker) |*worker| worker.deinit();
         self.graph_cleanup_sweep.deinit();
+        self.dag_activation_cursors.deinit(self.alloc);
         self.leann_replication_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
         self.initial_fk_retirement_gc_cursor.deinit();
@@ -12340,6 +12409,419 @@ pub const DataServer = struct {
         });
     }
 
+    const DagEffects = @import("antfly_local_sources").storage_db_dag_activation_contract;
+    const DagAuthority = DagEffects.authority;
+
+    pub const DagActivationRoute = struct {
+        namespace: [24]u8,
+        fence: antfly.metadata_api.CatalogRouteFence,
+
+        fn validate(self_route: @This()) !void {
+            try self_route.fence.validate();
+            const identity = self_route.fence.route.identity_namespace;
+            if (std.mem.readInt(u64, self_route.namespace[0..8], .big) != identity.table_id or
+                std.mem.readInt(u64, self_route.namespace[8..16], .big) != identity.shard_id or
+                std.mem.readInt(u64, self_route.namespace[16..24], .big) != identity.range_id)
+                return error.GraphConstraintRevisionChanged;
+        }
+    };
+
+    /// Acquire the authority and all source cuts for a pinned activation.
+    /// Retrying the same manifest reuses acquired cuts. The durable activation
+    /// caller owns cleanup if it abandons a partially acquired attempt.
+    pub fn acquireDagActivationOnRoutes(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        manifest: DagEffects.ScanManifest,
+        authority_route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        return self.setDagActivationFencesOnRoutes(alloc, table_name, manifest, authority_route, source_routes, .acquire, cancellation);
+    }
+
+    /// Release source cuts after the caller records publication or abandonment.
+    /// Sources are released first so a new attempt cannot claim the authority
+    /// while cleanup still has outstanding source cuts.
+    pub fn releaseDagActivationOnRoutes(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        manifest: DagEffects.ScanManifest,
+        authority_route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        return self.setDagActivationFencesOnRoutes(alloc, table_name, manifest, authority_route, source_routes, .release, cancellation);
+    }
+
+    fn setDagActivationFencesOnRoutes(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        manifest: DagEffects.ScanManifest,
+        authority_route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+        action: enum { acquire, release },
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        try cancellation.check();
+        const ordered = try planDagActivationRoutes(alloc, manifest, authority_route, source_routes);
+        defer alloc.free(ordered);
+        for (0..ordered.len) |index| {
+            const route = ordered[if (action == .acquire) index else ordered.len - 1 - index];
+            try cancellation.check();
+            try localRaftBatchGroupRoutedWithCancellation(self, alloc, route.fence, table_name, .{
+                .dag_source_fence = .{ .namespace = route.namespace, .action = if (action == .acquire) .acquire else .release, .fence = manifest.fence },
+            }, cancellation);
+        }
+    }
+
+    fn planDagActivationRoutes(
+        alloc: std.mem.Allocator,
+        manifest: DagEffects.ScanManifest,
+        authority_route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+    ) ![]DagActivationRoute {
+        if (!std.mem.eql(u8, &manifest.authority_namespace, &authority_route.namespace))
+            return error.GraphConstraintRevisionChanged;
+        const SourceRoute = struct { route: DagActivationRoute, selected: bool = false };
+        var routes: std.AutoHashMapUnmanaged([24]u8, SourceRoute) = .empty;
+        defer routes.deinit(alloc);
+        for (source_routes) |route| {
+            try route.validate();
+            if (route.fence.table_id != authority_route.fence.table_id or
+                route.fence.metadata_group_id != authority_route.fence.metadata_group_id or
+                !std.meta.eql(route.fence.metadata_incarnation, authority_route.fence.metadata_incarnation) or
+                route.fence.topology_epoch != authority_route.fence.topology_epoch or
+                route.fence.catalog_revision != authority_route.fence.catalog_revision)
+                return error.TopologyChanged;
+            const slot = try routes.getOrPut(alloc, route.namespace);
+            if (slot.found_existing) return error.InvalidArgument;
+            slot.value_ptr.* = .{ .route = route };
+        }
+        // Resolve the entire ordered scan footprint before changing a root.
+        var ordered: std.ArrayList(DagActivationRoute) = .empty;
+        errdefer ordered.deinit(alloc);
+        try authority_route.validate();
+        try ordered.append(alloc, authority_route);
+        for (manifest.domains) |domain| {
+            for (domain.roots) |root| {
+                if (std.mem.eql(u8, &root.namespace, &authority_route.namespace)) continue;
+                const source = routes.getPtr(root.namespace) orelse return error.TopologyChanged;
+                if (source.selected) continue;
+                try ordered.append(alloc, source.route);
+                source.selected = true;
+            }
+        }
+        return ordered.toOwnedSlice(alloc);
+    }
+
+    fn readDagActivationControl(
+        self: *DataServer,
+        allocator: std.mem.Allocator,
+        table: []const u8,
+        cancellation: antfly.db.types.CancellationToken,
+        comptime T: type,
+        route: DagActivationRoute,
+        control: anytype,
+    ) !T {
+        try cancellation.check();
+        try route.validate();
+        const json = try std.json.Stringify.valueAlloc(allocator, control, .{ .emit_strings_as_arrays = true });
+        defer allocator.free(json);
+        var reads = self.read_source.source();
+        reads.route_fence = route.fence;
+        var response = (try reads.lookupGroupLocal(allocator, route.fence.route.group_id, table, "", .{
+            .relational_topology_json = json,
+            .cancellation = cancellation,
+        }, .read_index)) orelse return error.GraphConstraintNotReady;
+        defer response.deinit(allocator);
+        return std.json.parseFromSliceLeaky(T, allocator, response.json, .{ .allocate = .alloc_always });
+    }
+
+    /// Advance an activation whose source fences have already been installed.
+    /// The caller supplies the pinned catalog routes and owns publication of
+    /// the terminal catalog decision.
+    pub fn advanceDagActivationOnRoutes(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        manifest: DagEffects.ScanManifest,
+        authority_route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+        domain: DagAuthority.Digest,
+        owner_epoch: u64,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !bool {
+        const Port = struct {
+            server: *DataServer,
+            alloc: std.mem.Allocator,
+            table: []const u8,
+            target: DagActivationRoute,
+            sources: []const DagActivationRoute,
+            cancellation: antfly.db.types.CancellationToken,
+
+            fn read(self_port: @This(), comptime T: type, route: DagActivationRoute, control: anytype) !T {
+                return self_port.server.readDagActivationControl(self_port.alloc, self_port.table, self_port.cancellation, T, route, control);
+            }
+
+            pub fn readSource(self_port: @This(), _: std.mem.Allocator, source: DagEffects.ScanRequest) !DagEffects.ScanPage {
+                const route = for (self_port.sources) |candidate| {
+                    if (std.mem.eql(u8, &candidate.namespace, &source.namespace)) break candidate;
+                } else return error.TopologyChanged;
+                return self_port.read(DagEffects.ScanPage, route, .{
+                    .mode = @as(enum { dag_activation_source_page }, .dag_activation_source_page),
+                    .dag_source_page = source,
+                });
+            }
+
+            pub fn writePage(self_port: @This(), command: DagAuthority.SourceFenceCommand) !void {
+                try self_port.cancellation.check();
+                try localRaftBatchGroupRoutedWithCancellation(self_port.server, self_port.alloc, self_port.target.fence, self_port.table, .{
+                    .dag_source_fence = command,
+                }, self_port.cancellation);
+            }
+        };
+        if (!std.mem.eql(u8, &manifest.authority_namespace, &authority_route.namespace))
+            return error.GraphConstraintRevisionChanged;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const port: Port = .{
+            .server = self,
+            .alloc = scratch,
+            .table = table_name,
+            .target = authority_route,
+            .sources = source_routes,
+            .cancellation = cancellation,
+        };
+        var command = try manifest.beginScanCommand(domain, owner_epoch);
+        const checkpoint = (try port.read(?DagAuthority.Contributions.ScanCheckpoint, authority_route, .{
+            .mode = @as(enum { dag_activation_checkpoint }, .dag_activation_checkpoint),
+            .dag_scan = .{ .namespace = authority_route.namespace, .domain = domain, .fence = manifest.fence },
+        })) orelse {
+            try port.writePage(command);
+            return false;
+        };
+        if (checkpoint.owner_epoch < owner_epoch) {
+            command.scan.?.previous_owner_epoch = checkpoint.owner_epoch;
+            command.scan.?.root_count = null;
+            try port.writePage(command);
+            return false;
+        }
+        return DagEffects.advanceScan(scratch, port, manifest, command, checkpoint);
+    }
+
+    const DagInventory = @import("antfly_local_sources").storage_db_artifact_inventory;
+
+    /// Publish the activated catalog on the authority while source roots are
+    /// fenced. Ordered apply certifies every domain before making it visible.
+    pub fn publishDagActivationOnRoute(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        manifest: DagEffects.ScanManifest,
+        route: DagActivationRoute,
+        catalog: DagInventory.Command,
+        targets: []const DagInventory.DagActivationTarget,
+        owner_epoch: u64,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        if (!std.mem.eql(u8, &manifest.authority_namespace, &route.namespace))
+            return error.GraphConstraintRevisionChanged;
+        try route.validate();
+        try cancellation.check();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const command = try DagInventory.planDagActivationPublication(arena.allocator(), manifest, catalog, targets, owner_epoch);
+        return localRaftBatchGroupRoutedWithCancellation(self, alloc, route.fence, table_name, .{
+            .artifact_catalog = command,
+        }, cancellation);
+    }
+
+    const StoredDagActivationPlan = struct {
+        domains: []const DagEffects.ScanDomain,
+        authority_route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+        catalog: DagInventory.Command,
+        targets: []const DagInventory.DagActivationTarget,
+    };
+
+    /// Discover unfinished jobs on this authority. The returned slice is
+    /// owned by the caller and ordered by attempt ID.
+    pub fn pendingDagActivationJobsOnRoute(
+        self: *DataServer,
+        allocator: std.mem.Allocator,
+        table_name: []const u8,
+        route: DagActivationRoute,
+        after: ?DagAuthority.Digest,
+        cancellation: antfly.db.types.CancellationToken,
+    ) ![]DagAuthority.Digest {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const attempts = try self.readDagActivationControl(arena.allocator(), table_name, cancellation, []DagAuthority.Digest, route, .{
+            .mode = @as(enum { dag_activation_pending_jobs }, .dag_activation_pending_jobs),
+            .dag_pending = .{ .namespace = route.namespace, .after = after },
+        });
+        if (attempts.len > DagAuthority.ActivationJobUpdate.pending_page_size) return error.InvalidDagAuthority;
+        return allocator.dupe(DagAuthority.Digest, attempts);
+    }
+
+    /// Recover a known attempt using only its authority route and identity.
+    pub fn resumeDagActivationJob(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        route: DagActivationRoute,
+        attempt: DagAuthority.Digest,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !DagEffects.JobProgress {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const scope = .{ .namespace = route.namespace, .attempt = attempt };
+        const raw = (try self.readDagActivationControl(scratch, table_name, cancellation, ?[]const u8, route, .{
+            .mode = @as(enum { dag_activation_job_plan }, .dag_activation_job_plan),
+            .dag_job = scope,
+        })) orelse return error.GraphConstraintNotReady;
+        const plan = try std.json.parseFromSliceLeaky(StoredDagActivationPlan, scratch, raw, .{});
+        if (!std.mem.eql(u8, &route.namespace, &plan.authority_route.namespace))
+            return error.GraphConstraintRevisionChanged;
+        const progress = (try self.readDagActivationControl(scratch, table_name, cancellation, ?DagEffects.JobProgress, route, .{
+            .mode = @as(enum { dag_activation_job_status }, .dag_activation_job_status),
+            .dag_job = scope,
+        })) orelse return error.GraphConstraintNotReady;
+        const manifest = try DagEffects.ScanManifest.init(plan.domains, route.namespace, attempt);
+        const pinned = plan.authority_route.fence;
+        if (route.fence.topology_epoch != pinned.topology_epoch or route.fence.table_id != pinned.table_id or
+            route.fence.metadata_group_id != pinned.metadata_group_id or !std.meta.eql(route.fence.metadata_incarnation, pinned.metadata_incarnation))
+            return error.TopologyChanged;
+        const sources = try scratch.dupe(DagActivationRoute, plan.source_routes);
+        for (sources) |*source| source.fence.catalog_revision = route.fence.catalog_revision;
+        return self.advanceDagActivationJob(alloc, table_name, manifest, route, sources, plan.catalog, plan.targets, progress, cancellation);
+    }
+
+    /// Resume from the authority's ordered job record. The caller provides the
+    /// pinned plan and an initial progress value for a new attempt.
+    pub fn advanceDagActivationJob(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        manifest: DagEffects.ScanManifest,
+        route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+        catalog: DagInventory.Command,
+        targets: []const DagInventory.DagActivationTarget,
+        progress: DagEffects.JobProgress,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !DagEffects.JobProgress {
+        const Port = struct {
+            server: *DataServer,
+            allocator: std.mem.Allocator,
+            table: []const u8,
+            manifest: DagEffects.ScanManifest,
+            route: DagActivationRoute,
+            sources: []const DagActivationRoute,
+            catalog: DagInventory.Command,
+            targets: []const DagInventory.DagActivationTarget,
+            cancellation: antfly.db.types.CancellationToken,
+
+            pub fn acquire(p: @This()) !void {
+                try p.server.acquireDagActivationOnRoutes(p.allocator, p.table, p.manifest, p.route, p.sources, p.cancellation);
+            }
+
+            pub fn scan(p: @This(), domain: DagAuthority.Digest, epoch: u64) !bool {
+                return p.server.advanceDagActivationOnRoutes(p.allocator, p.table, p.manifest, p.route, p.sources, domain, epoch, p.cancellation);
+            }
+
+            pub fn publish(p: @This(), epoch: u64) !void {
+                try p.server.publishDagActivationOnRoute(p.allocator, p.table, p.manifest, p.route, p.catalog, p.targets, epoch, p.cancellation);
+            }
+
+            pub fn release(p: @This()) !void {
+                try p.server.releaseDagActivationOnRoutes(p.allocator, p.table, p.manifest, p.route, p.sources, p.cancellation);
+            }
+        };
+        if (!std.mem.eql(u8, &manifest.authority_namespace, &route.namespace) or
+            !std.meta.eql(progress.fence, manifest.fence)) return error.GraphConstraintRevisionChanged;
+        if (!std.mem.eql(u8, &progress.catalog_digest, &catalog.binding.digest) or progress.catalog_epoch != catalog.binding.epoch)
+            return error.GraphConstraintRevisionChanged;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const current = try self.readDagActivationControl(arena.allocator(), table_name, cancellation, ?DagEffects.JobProgress, route, .{
+            .mode = @as(enum { dag_activation_job_status }, .dag_activation_job_status),
+            .dag_job = .{ .namespace = route.namespace, .attempt = manifest.fence.activation },
+        });
+        if (current == null) {
+            const scratch = arena.allocator();
+            _ = try planDagActivationRoutes(scratch, manifest, route, source_routes);
+            _ = try DagInventory.planDagActivationPublication(scratch, manifest, catalog, targets, progress.owner_epoch);
+            const source_catalog = self.write_source.catalog;
+            const deadline = source_catalog.budget(null).nowNs() +| 5 * std.time.ns_per_s;
+            var footprint = try @import("../api/table_catalog.zig").routedSpanSnapshotUntil(scratch, source_catalog, table_name, "", "", source_catalog.deadlineFrom(.{ .deadline_ns = deadline }));
+            defer footprint.deinit(scratch);
+            if (footprint.table_id != route.fence.table_id or footprint.topology_epoch != route.fence.topology_epoch or
+                footprint.catalog_revision != route.fence.catalog_revision or footprint.metadata_group_id != route.fence.metadata_group_id or
+                !std.meta.eql(footprint.metadata_incarnation, route.fence.metadata_incarnation))
+                return error.TopologyChanged;
+            var namespaces: std.AutoHashMapUnmanaged([24]u8, usize) = .empty;
+            defer namespaces.deinit(scratch);
+            for (footprint.routes, 0..) |group, index| {
+                var identity: [24]u8 = undefined;
+                std.mem.writeInt(u64, identity[0..8], group.identity_namespace.table_id, .big);
+                std.mem.writeInt(u64, identity[8..16], group.identity_namespace.shard_id, .big);
+                std.mem.writeInt(u64, identity[16..24], group.identity_namespace.range_id, .big);
+                const slot = try namespaces.getOrPut(scratch, identity);
+                if (slot.found_existing) return error.TopologyChanged;
+                slot.value_ptr.* = index;
+            }
+            const visited = try scratch.alloc(bool, footprint.routes.len);
+            for (manifest.domains) |domain| {
+                if (domain.roots.len != namespaces.count()) return error.TopologyChanged;
+                @memset(visited, false);
+                for (domain.roots) |root| {
+                    const slot = namespaces.get(root.namespace) orelse return error.TopologyChanged;
+                    if (visited[slot]) return error.TopologyChanged;
+                    visited[slot] = true;
+                }
+            }
+        }
+        const next = if (current) |previous|
+            try previous.advance(manifest, catalog.binding.digest, catalog.binding.epoch, Port{
+                .server = self,
+                .allocator = alloc,
+                .table = table_name,
+                .manifest = manifest,
+                .route = route,
+                .sources = source_routes,
+                .catalog = catalog,
+                .targets = targets,
+                .cancellation = cancellation,
+            })
+        else
+            progress;
+        if (!std.meta.eql(current, @as(?DagEffects.JobProgress, next))) {
+            const plan_json = if (current == null) try std.json.Stringify.valueAlloc(arena.allocator(), StoredDagActivationPlan{
+                .domains = manifest.domains,
+                .authority_route = route,
+                .source_routes = source_routes,
+                .catalog = catalog,
+                .targets = targets,
+            }, .{ .emit_strings_as_arrays = true }) else null;
+            try localRaftBatchGroupRoutedWithCancellation(self, alloc, route.fence, table_name, .{
+                .dag_source_fence = .{
+                    .namespace = route.namespace,
+                    .action = .activation_job,
+                    .fence = manifest.fence,
+                    .activation_job = .{ .expected = current, .next = next, .plan_json = plan_json },
+                },
+            }, cancellation);
+        }
+        return next;
+    }
+
     fn localRaftBatchGroupRoutedWithCancellation(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -12682,7 +13164,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.row_policy_publication != null) return proposal_req;
+        if (proposal_req.dag_source_fence != null or proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.row_policy_publication != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -12715,6 +13197,8 @@ pub const DataServer = struct {
     }
 
     fn raftBatchRequestForActiveProtocol(req: antfly.db.types.BatchRequest, active_protocol_version: u16, realtime_ns: u64) !antfly.db.types.BatchRequest {
+        if (batchRequiresDagConstraintProtocol(req) and active_protocol_version < @import("../common/data_raft_protocol.zig").batch_dag_constraint_protocol_version)
+            return error.Unavailable;
         // Old v27 decoders reinterpret the neutral cleanup scheme as legacy
         // and reject it. Never prepare such a proposal before its all-member
         // barrier; matching document-revision support is insufficient.
@@ -12731,7 +13215,15 @@ pub const DataServer = struct {
         return proposal;
     }
 
+    fn batchRequiresDagConstraintProtocol(req: antfly.db.types.BatchRequest) bool {
+        if (req.dag_source_fence != null) return true;
+        if (req.artifact_catalog) |catalog| if (catalog.dag_activations != null) return true;
+        if (req.transaction) |txn| if (txn == .prepare) return txn.prepare.dag_domains.len != 0;
+        return false;
+    }
+
     pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (batchRequiresDagConstraintProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_dag_constraint_protocol_version;
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
@@ -42900,6 +43392,73 @@ fn consumerTests() type {
                 invalid.writes = &.{.{ .key = "ordinary", .value = "{}" }};
                 try std.testing.expectError(error.InvalidBatchRequest, antfly.db.types.validateGraphEndpointCleanupCommand(invalid));
             }
+        }
+
+        test "hosted DAG activation rejects a route for a different authority root" {
+            const manifest = try DataServer.DagEffects.ScanManifest.init(&.{.{
+                .id = @splat(2),
+                .roots = &.{.{ .namespace = @splat(3), .index_name = "g", .edge_type = "R", .generation = 1 }},
+            }}, @splat(3), @splat(4));
+            var server: DataServer = undefined;
+            try std.testing.expectError(error.GraphConstraintRevisionChanged, server.advanceDagActivationJob(
+                std.testing.allocator,
+                "docs",
+                manifest,
+                .{ .namespace = @splat(9), .fence = undefined },
+                &.{},
+                .{ .namespace = @splat(3), .binding = .{ .epoch = 0, .digest = @splat(0), .semantic_digest = @splat(0) }, .catalogs = .{} },
+                &.{},
+                .{ .fence = manifest.fence, .catalog_digest = @splat(0), .catalog_epoch = 0, .owner_epoch = 1 },
+                .none,
+            ));
+            try std.testing.expectError(error.GraphConstraintRevisionChanged, server.acquireDagActivationOnRoutes(
+                std.testing.allocator,
+                "docs",
+                manifest,
+                .{ .namespace = @splat(9), .fence = undefined },
+                &.{},
+                .none,
+            ));
+            try std.testing.expectError(error.GraphConstraintRevisionChanged, server.publishDagActivationOnRoute(
+                std.testing.allocator,
+                "docs",
+                manifest,
+                .{ .namespace = @splat(9), .fence = undefined },
+                undefined,
+                &.{},
+                1,
+                .none,
+            ));
+            try std.testing.expectError(error.GraphConstraintRevisionChanged, server.releaseDagActivationOnRoutes(
+                std.testing.allocator,
+                "docs",
+                manifest,
+                .{ .namespace = @splat(9), .fence = undefined },
+                &.{},
+                .none,
+            ));
+            try std.testing.expectError(error.GraphConstraintRevisionChanged, server.advanceDagActivationOnRoutes(
+                std.testing.allocator,
+                "docs",
+                manifest,
+                .{ .namespace = @splat(9), .fence = undefined },
+                &.{},
+                @splat(2),
+                1,
+                .none,
+            ));
+        }
+
+        test "raft DAG source fence waits for a compatible protocol without assigning document versions" {
+            const dag = @import("../common/data_raft_protocol.zig").batch_dag_constraint_protocol_version;
+            const request: antfly.db.types.BatchRequest = .{ .dag_source_fence = .{
+                .namespace = @splat(1),
+                .action = .acquire,
+                .fence = .{ .activation = @splat(2), .snapshot = @splat(3) },
+            } };
+            try std.testing.expectEqual(dag, DataServer.requiredRaftBatchProtocolVersion(request));
+            try std.testing.expectError(error.Unavailable, DataServer.raftBatchRequestForActiveProtocol(request, dag - 1, 999));
+            try std.testing.expectEqualDeep(request, try DataServer.raftBatchRequestForActiveProtocol(request, dag, 999));
         }
 
         test "raft cleanup protocol preflight rejects mixed decoders and rechecks upgraded peers" {

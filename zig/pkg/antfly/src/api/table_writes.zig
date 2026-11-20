@@ -22491,7 +22491,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         const table_req = tables[0];
         if (table_req.graph_writes.len != 0 or table_req.graph_deletes.len != 0) return null;
-        if (table_req.range_guards.len != 0) return null;
+        if (table_req.range_guards.len != 0 or table_req.dag_owners.len != 0) return null;
         if (table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         const has_mutations = table_req.writes.len != 0 or
             table_req.deletes.len != 0 or
@@ -22577,7 +22577,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len != 1) return null;
         const table_req = tables[0];
         if (table_req.graph_writes.len != 0 or table_req.graph_deletes.len != 0) return null;
-        if (table_req.range_guards.len != 0) return null;
+        if (table_req.range_guards.len != 0 or table_req.dag_owners.len != 0) return null;
         if (table_req.predicates.len != 0 or table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         if (try tableCommitHasGraphProjectionTransform(table_req)) return null;
 
@@ -23580,7 +23580,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
-        if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
+        if ((req.range_guards.len != 0 or req.dag_domains.len != 0) and context.route_fence == null) return error.CatalogRouteFenceRequired;
         var guarded_admission: ?RoutedWriteAdmission = null;
         defer if (guarded_admission) |*admission| admission.deinit();
         if (context.route_fence) |fence| {
@@ -23610,7 +23610,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .graph_writes = req.graph_writes,
                 .graph_deletes = req.graph_deletes,
                 .predicates = req.predicates,
-                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .dag_domains = req.dag_domains } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
                 .range_guards = req.range_guards,
@@ -23642,7 +23642,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .graph_writes = req.graph_writes,
                 .graph_deletes = req.graph_deletes,
                 .predicates = req.predicates,
-                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .dag_domains = req.dag_domains } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
                 .range_guards = req.range_guards,
@@ -26966,7 +26966,8 @@ pub const HostedProvisionedTableWriteSource = struct {
         // Keep the catalog fence and transaction mutation inside one root
         // writer lease. Split/merge cannot snapshot this root between the
         // epoch check and making the transaction durable.
-        if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
+        const dag_prepare = if (req.transaction) |mutation| mutation == .prepare and mutation.prepare.dag_domains.len != 0 else false;
+        if ((req.range_guards.len != 0 or dag_prepare) and context.route_fence == null) return error.CatalogRouteFenceRequired;
         if (context.route_fence) |fence| {
             if (fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
             try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }));
@@ -27060,7 +27061,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             .graph_writes = req.graph_writes,
             .graph_deletes = req.graph_deletes,
             .predicates = req.predicates,
-            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .dag_domains = req.dag_domains } },
             .integrity = req.integrity,
             .integrity_commands = req.integrity_commands,
             .range_guards = req.range_guards,
@@ -28147,7 +28148,7 @@ fn sleepStatelessBatchRetry(source: anytype, attempt: u8) !void {
 
 fn statelessBatchMayRetry(tables: []const distributed_txn.TableCommitRequest) bool {
     for (tables) |table| {
-        if (table.range_guards.len != 0) return false;
+        if (table.range_guards.len != 0 or table.dag_owners.len != 0) return false;
         if (table.predicates.len != 0 or table.integrity.len != 0 or table.integrity_commands.len != 0 or table.relational_activation != null or table.relational_retirement != null or table.relational_index_maintenance != null) return false;
     }
     return true;

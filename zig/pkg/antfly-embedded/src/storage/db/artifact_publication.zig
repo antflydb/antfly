@@ -513,7 +513,23 @@ pub const Command = struct {
 };
 
 pub const Receipt = struct { publication_digest: Digest, sequence: u64 };
-pub const Rejection = enum(u8) { stale_source = 1, stale_catalog = 2, sealed_source = 3, invalid_output = 4, baseline_pending = 5 };
+pub const Rejection = enum(u8) {
+    stale_source = 1,
+    stale_catalog = 2,
+    sealed_source = 3,
+    invalid_output = 4,
+    baseline_pending = 5,
+    graph_cycle = 6,
+    graph_constraint_capacity = 7,
+    graph_constraint_pending = 8,
+
+    pub fn preservesUpload(self: Rejection) bool {
+        return switch (self) {
+            .baseline_pending, .graph_constraint_capacity, .graph_constraint_pending => true,
+            else => false,
+        };
+    }
+};
 pub const Rejected = struct { publication_digest: Digest, applied_index: u64, reason: Rejection };
 const receipt_prefix = "\x00\x00__artifact_publication__:receipt:";
 const receipt_bytes = 4 + 32 + 32 + 8 + 8 + Position.encoded_len + 32 + 32;
@@ -820,17 +836,26 @@ pub fn receiptKey(command: Command, source: Source) [receipt_prefix.len + 32]u8 
     return result;
 }
 
-fn rejectionKey(command: Command) [receipt_prefix.len + 33]u8 {
-    const source: Source = if (command.sources.len != 0) command.sources[0] else .{
+const RejectionSlot = enum(u8) { retry = 0xff, cycle = 0xfe, output_cycle = 0xfd };
+
+fn responseSource(command: Command) Source {
+    return if (command.sources.len != 0) command.sources[0] else .{
         .document_key = "",
         .content_digest = @splat(0),
         .timestamp = 0,
         .input_position = null,
     };
+}
+
+fn rejectionKeyForSource(command: Command, source: Source, slot: RejectionSlot) [receipt_prefix.len + 33]u8 {
     var key: [receipt_prefix.len + 33]u8 = undefined;
     @memcpy(key[0 .. key.len - 1], &receiptKey(command, source));
-    key[key.len - 1] = 0xff;
+    key[key.len - 1] = @backingInt(slot);
     return key;
+}
+
+fn rejectionKey(command: Command, slot: RejectionSlot) [receipt_prefix.len + 33]u8 {
+    return rejectionKeyForSource(command, responseSource(command), slot);
 }
 
 /// A separate bounded response slot must never overwrite accepted provenance
@@ -843,11 +868,83 @@ pub fn stageRejection(txn: anytype, command: Command, index: u64, reason: Reject
     @memcpy(raw[5..37], &command.publication_digest);
     std.mem.writeInt(u64, raw[37..45], index, .little);
     std.crypto.hash.Blake3.hash(raw[0..45], raw[45..77], .{});
-    try txn.put(&rejectionKey(command), &raw);
+    if (reason != .graph_cycle) return txn.put(&rejectionKey(command, .retry), &raw);
+    try stageCycleSlot(txn, command, responseSource(command), .cycle, index, &raw);
+    if (command.producer_kind != .graph) return;
+    const owners = try command.outputSources();
+    for (command.sources, 0..) |source, source_index| {
+        if (owners.isSet(source_index)) try stageCycleSlot(txn, command, source, .output_cycle, index, &raw);
+    }
+}
+
+fn stageCycleSlot(txn: anytype, command: Command, source: Source, slot: RejectionSlot, index: u64, raw: *const [77]u8) !void {
+    const key = rejectionKeyForSource(command, source, slot);
+    if (try readRejectionSlot(txn, &key, slot)) |existing| {
+        // Preserve the first terminal response and keep newer source failures.
+        if (std.mem.eql(u8, &existing.publication_digest, &command.publication_digest) or existing.applied_index >= index) return;
+    }
+    try txn.put(&key, raw);
+}
+
+/// Read the last terminal DAG rejection for the command's response slot.
+pub fn latestGraphCycle(txn: anytype, command: Command) !?Rejected {
+    return readRejectionSlot(txn, &rejectionKey(command, .cycle), .cycle);
+}
+
+pub fn latestGraphCycleForSource(txn: anytype, command: Command, source: Source) !?Rejected {
+    return readRejectionSlot(txn, &rejectionKeyForSource(command, source, .output_cycle), .output_cycle);
+}
+
+/// Point fence for a previously accepted graph output in this Raft history.
+pub const GraphOutputFence = struct {
+    rejection_key: [receipt_prefix.len + 33]u8,
+    accepted_index: u64,
+
+    pub fn init(command: Command, source: Source, position: Position) ?GraphOutputFence {
+        if (command.producer_kind != .graph or position != .raft) return null;
+        return .{
+            .rejection_key = rejectionKeyForSource(command, source, .output_cycle),
+            .accepted_index = position.raft.index,
+        };
+    }
+
+    pub fn requireCurrent(self: GraphOutputFence, txn: anytype) !void {
+        const rejection = (try readRejectionSlot(txn, &self.rejection_key, .output_cycle)) orelse return;
+        if (rejection.applied_index >= self.accepted_index) return error.EnrichmentSourceChanged;
+    }
+};
+
+fn matchingGraphCycle(txn: anytype, command: Command) !?Rejected {
+    if (try latestGraphCycle(txn, command)) |cycle| {
+        if (std.mem.eql(u8, &command.publication_digest, &cycle.publication_digest)) return cycle;
+    }
+    if (command.producer_kind != .graph or command.mode != .publish) return null;
+    const owners = try command.outputSources();
+    for (command.sources, 0..) |source, source_index| {
+        if (!owners.isSet(source_index)) continue;
+        if (try latestGraphCycleForSource(txn, command, source)) |cycle| {
+            if (std.mem.eql(u8, &command.publication_digest, &cycle.publication_digest)) return cycle;
+        }
+    }
+    return null;
+}
+
+pub fn requireUnrejectedGraphCandidate(txn: anytype, command: Command) !void {
+    if (command.producer_kind == .graph and try matchingGraphCycle(txn, command) != null) return error.GraphCycle;
 }
 
 pub fn rejected(txn: anytype, command: Command) !?Rejected {
-    const raw = txn.get(&rejectionKey(command)) catch |err| switch (err) {
+    if (try matchingGraphCycle(txn, command)) |cycle| return cycle;
+    return matchingRetryRejection(txn, command);
+}
+
+fn matchingRetryRejection(txn: anytype, command: Command) !?Rejected {
+    const response = (try readRejectionSlot(txn, &rejectionKey(command, .retry), .retry)) orelse return null;
+    return if (std.mem.eql(u8, &command.publication_digest, &response.publication_digest)) response else null;
+}
+
+fn readRejectionSlot(txn: anytype, key: []const u8, slot: RejectionSlot) !?Rejected {
+    const raw = txn.get(key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
@@ -858,7 +955,7 @@ pub fn rejected(txn: anytype, command: Command) !?Rejected {
     const reason = std.enums.fromInt(Rejection, raw[4]) orelse return error.ArtifactCatalogCorrupt;
     const index = std.mem.readInt(u64, raw[37..45], .little);
     if (index == 0) return error.ArtifactCatalogCorrupt;
-    if (!std.mem.eql(u8, &command.publication_digest, raw[5..37])) return null;
+    if ((reason == .graph_cycle) != (slot != .retry)) return error.ArtifactCatalogCorrupt;
     return .{ .publication_digest = raw[5..37].*, .applied_index = index, .reason = reason };
 }
 
@@ -928,7 +1025,7 @@ pub fn stageSelectedReceipts(txn: anytype, command: Command, input_digest: Diges
     }
     // A successful retry supersedes its temporary rejection, atomically with
     // acceptance. Do not erase another command's response in the shared slot.
-    if (try rejected(txn, command) != null) try txn.delete(&rejectionKey(command));
+    if (try matchingRetryRejection(txn, command) != null) try txn.delete(&rejectionKey(command, .retry));
 }
 
 pub fn validateRequest(alloc: std.mem.Allocator, request: anytype) !void {
@@ -1104,19 +1201,242 @@ test "privacy publication callback carries stable backpressure statuses" {
 pub const PreparedEffects = struct {
     arena: std.heap.ArenaAllocator,
     batch: @import("derived/derived_types.zig").DerivedBatch,
+    graph_publication_digest: ?Digest = null,
     coverage: []const Coverage = &.{},
     chunk_fence: ?@import("artifact_chunk_publication.zig").Fence = null,
     chunk_vector_fence: ?@import("artifact_chunk_vector_publication.zig").Fence = null,
     asset_upstream_fences: []@import("artifact_asset_publication.zig").UpstreamFence = &.{},
     target_hints: ?[]const @import("derived/change_journal.zig").TargetHint = null,
+    /// Derive authority inputs from the authenticated final graph replay
+    /// effects. The caller supplies the constrained index and edge type.
+    pub fn dagReplacements(self: *@This(), index: []const u8, edge_type: []const u8) ![]const @import("../../graph/dag_authority.zig").Contributions.Replacement {
+        return @import("dag_graph_effects.zig").collect(self.arena.allocator(), index, edge_type, self.batch.graph_writes, self.batch.graph_deletes);
+    }
+
+    /// Construct the authority vote for this immutable publication and
+    /// reserved domain revision. The coordinator owns the pinned owner route.
+    pub fn dagPrepare(
+        self: *@This(),
+        command: Command,
+        table_identity: [16]u8,
+        edge_type: []const u8,
+        owner_epoch: u64,
+        revision: u64,
+        transaction: @import("../transactions.zig").TxnId,
+    ) !?@import("../transactions.zig").DagDomainPrepare {
+        const dag = @import("../../graph/dag_authority.zig");
+        if (command.mode != .publish or command.producer_kind != .graph) return error.InvalidBatchRequest;
+        const prepared_digest = self.graph_publication_digest orelse return error.InvalidBatchRequest;
+        const versions = command.digest();
+        if (!std.mem.eql(u8, &versions, &command.publication_digest) or
+            !std.mem.eql(u8, &versions, &prepared_digest)) return error.InvalidBatchRequest;
+        const domain_id = try dag.domain(table_identity, command.producer_generation, command.producer_name, edge_type);
+        const replacements = try self.dagReplacements(command.producer_name, edge_type);
+        if (replacements.len == 0) return null;
+        const candidate = dag.Contributions.candidate(versions, replacements);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly/graph-publication-dag-attempt/v1");
+        hash.update(&domain_id);
+        hash.update(&transaction);
+        hash.update(&candidate);
+        var id: dag.Digest = undefined;
+        hash.final(&id);
+        return .{
+            .domain = domain_id,
+            .epoch = owner_epoch,
+            .revision = revision,
+            .attempt = .{ .id = id, .transaction = transaction, .candidate = candidate },
+            .producer_versions = versions,
+            .replacements = replacements,
+        };
+    }
+
+    /// Bind the guarded publication to the physical writer. Authority validation
+    /// runs once, after the writer has staged all final primary effects.
+    pub fn bindDagPublication(self: *const @This(), txn: anytype, command: Command) !void {
+        if (command.mode != .publish or command.producer_kind != .graph) return;
+        const bound = txn.artifact_inputs.dag_bindings orelse try LocalDagBinding.hasBindings(txn);
+        txn.artifact_inputs.dag_bindings = bound;
+        if (!bound) return;
+        const prepared_digest = self.graph_publication_digest orelse return error.InvalidBatchRequest;
+        if (!std.mem.eql(u8, &prepared_digest, &command.publication_digest) or
+            !std.mem.eql(u8, &prepared_digest, &command.digest())) return error.InvalidBatchRequest;
+        if (txn.artifact_inputs.dag_publication != null) return error.InvalidBatchRequest;
+        txn.artifact_inputs.dag_publication = prepared_digest;
+    }
+
     pub fn deinit(self: *@This()) void {
         self.arena.deinit();
         self.* = undefined;
     }
 };
 
+const local_dag_prefix = "\x00\x00__metadata__:dag-publication-owner:";
+const local_dag_max_bytes = 64 * 1024;
+
+/// The catalog installs this binding in the same transaction as the co-located
+/// authority. Shard-separated owners use transaction enlistment.
+pub const LocalDagBinding = struct {
+    table_identity: [16]u8,
+    edge_types: []const []const u8,
+
+    const present_key = "\x00\x00__metadata__:dag-publication-owner-present";
+
+    pub fn hasBindings(txn: anytype) !bool {
+        const raw = txn.get(present_key) catch |err| {
+            if (err == error.NotFound) return false;
+            return err;
+        };
+        if (!std.mem.eql(u8, raw, "1")) return error.InvalidDagAuthority;
+        return true;
+    }
+
+    fn read(alloc: std.mem.Allocator, txn: anytype, command: Command) !?std.json.Parsed(LocalDagBinding) {
+        return readForProducer(alloc, txn, command.namespace, command.producer_name, command.producer_generation);
+    }
+
+    pub fn readForProducer(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8, name: []const u8, generation: u64) !?std.json.Parsed(LocalDagBinding) {
+        const raw = txn.get(&localDagBindingKeyFor(namespace, name, generation)) catch |err| {
+            if (err == error.NotFound) return null;
+            return err;
+        };
+        if (raw.len > local_dag_max_bytes) return error.InvalidDagAuthority;
+        const parsed = std.json.parseFromSlice(LocalDagBinding, alloc, raw, .{ .allocate = .alloc_always }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.InvalidDagAuthority;
+        };
+        errdefer parsed.deinit();
+        try parsed.value.validate();
+        return parsed;
+    }
+
+    /// Catalog refreshes can reuse a binding for the same incarnation, but
+    /// every declared type must still have an active certified authority.
+    pub fn requireDeclared(alloc: std.mem.Allocator, txn: anytype, command: Command, config_json: []const u8) !void {
+        const syntax = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{ .parse_numbers = false });
+        defer syntax.deinit();
+        var constrained: usize = 0;
+        const edges = if (syntax.value == .object) syntax.value.object.get("edge_types") else null;
+        if (edges) |edge_types| {
+            if (edge_types == .array) for (edge_types.array.items) |edge| {
+                if (edge != .object) continue;
+                const topology = edge.object.get("topology") orelse continue;
+                if (topology == .string and std.mem.eql(u8, topology.string, "dag")) constrained += 1;
+            };
+        }
+        if (constrained == 0 and !try hasBindings(txn)) return;
+        const parsed = (try read(alloc, txn, command)) orelse {
+            if (constrained == 0) return;
+            return error.GraphConstraintNotReady;
+        };
+        // A certified generation keeps its original domain membership.
+        // Publishing a replacement configuration requires a new generation.
+        defer parsed.deinit();
+        if (constrained != parsed.value.edge_types.len) return error.InvalidDagDomain;
+        var config = try @import("catalog/index_manager.zig").parseGraphActivationConfig(alloc, config_json);
+        defer config.deinit(alloc);
+        const dag = @import("../../graph/dag_authority.zig");
+        for (config.edge_type_configs) |edge| {
+            if (edge.topology != .dag) continue;
+            const found = for (parsed.value.edge_types) |name| {
+                if (std.mem.eql(u8, name, edge.name)) break true;
+            } else false;
+            if (!found) return error.InvalidDagDomain;
+            const id = try dag.domain(parsed.value.table_identity, command.producer_generation, command.producer_name, edge.name);
+            _ = try dag.Storage.requireActive(txn, id);
+        }
+    }
+
+    fn validate(self: LocalDagBinding) !void {
+        if (self.edge_types.len == 0 or self.edge_types.len > 64) return error.InvalidDagAuthority;
+        for (self.edge_types, 0..) |edge_type, i| {
+            if (edge_type.len == 0) return error.InvalidDagAuthority;
+            if (i != 0 and std.mem.order(u8, self.edge_types[i - 1], edge_type) != .lt) return error.InvalidDagAuthority;
+        }
+    }
+
+    pub const Activation = struct {
+        edge_type: []const u8,
+        owner_epoch: u64,
+        proof: union(enum) {
+            empty,
+            scanned: struct { snapshot: Digest, after: []const u8 },
+        },
+    };
+
+    /// Finish exactly the constrained types declared for this incarnation and
+    /// install their publication binding in the same writer. The catalog must
+    /// already fence source writes and prove empty input or scan completion.
+    pub fn stageFromConfig(alloc: std.mem.Allocator, txn: anytype, command: Command, table_identity: [16]u8, config_json: []const u8, activations: []const Activation) !void {
+        var config = try @import("catalog/index_manager.zig").parseGraphActivationConfig(alloc, config_json);
+        defer config.deinit(alloc);
+        var edge_types: std.ArrayList([]const u8) = .empty;
+        defer edge_types.deinit(alloc);
+        for (config.edge_type_configs) |edge| {
+            if (edge.topology == .dag) try edge_types.append(alloc, edge.name);
+        }
+        if (edge_types.items.len != activations.len) return error.InvalidDagMutation;
+        if (edge_types.items.len == 0) return;
+        std.mem.sort([]const u8, edge_types.items, {}, struct {
+            fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.lessThan);
+        if (command.producer_kind != .graph or command.producer_generation == 0) return error.InvalidDagDomain;
+        for (edge_types.items, activations) |edge_type, activation| {
+            if (!std.mem.eql(u8, edge_type, activation.edge_type)) return error.InvalidDagMutation;
+        }
+        const dag = @import("../../graph/dag_authority.zig");
+        for (activations) |activation| {
+            const domain = try dag.domain(table_identity, command.producer_generation, command.producer_name, activation.edge_type);
+            switch (activation.proof) {
+                .empty => try dag.Storage.activateNewIncarnation(txn, domain, activation.owner_epoch),
+                .scanned => |scan| try dag.Contributions.finishActivation(txn, domain, activation.owner_epoch, scan.snapshot, scan.after),
+            }
+        }
+        try (LocalDagBinding{ .table_identity = table_identity, .edge_types = edge_types.items }).stage(alloc, txn, command);
+    }
+
+    pub fn stage(self: LocalDagBinding, alloc: std.mem.Allocator, txn: anytype, command: Command) !void {
+        if (command.producer_kind != .graph or command.producer_generation == 0) return error.InvalidDagDomain;
+        try self.validate();
+        const dag = @import("../../graph/dag_authority.zig");
+        for (self.edge_types) |edge_type| {
+            const domain = try dag.domain(self.table_identity, command.producer_generation, command.producer_name, edge_type);
+            _ = try dag.Storage.requireActive(txn, domain);
+        }
+        const raw = try std.json.Stringify.valueAlloc(alloc, self, .{ .emit_strings_as_arrays = true });
+        defer alloc.free(raw);
+        if (raw.len > local_dag_max_bytes) return error.GraphConstraintCapacity;
+        const key = localDagBindingKey(command);
+        if (txn.get(&key)) |old| {
+            if (!std.mem.eql(u8, old, raw)) return error.GraphConstraintAttemptConflict;
+        } else |err| {
+            if (err != error.NotFound) return err;
+            try txn.put(&key, raw);
+        }
+        if (!try hasBindings(txn)) try txn.put(present_key, "1");
+    }
+};
+
+fn localDagBindingKey(command: Command) [local_dag_prefix.len + 32]u8 {
+    return localDagBindingKeyFor(command.namespace, command.producer_name, command.producer_generation);
+}
+
+fn localDagBindingKeyFor(namespace: [24]u8, name: []const u8, generation: u64) [local_dag_prefix.len + 32]u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update(local_dag_prefix);
+    hash.update(&namespace);
+    bytes(&hash, name);
+    number(&hash, generation);
+    var key: [local_dag_prefix.len + 32]u8 = undefined;
+    key[0..local_dag_prefix.len].* = local_dag_prefix.*;
+    hash.final(key[local_dag_prefix.len..]);
+    return key;
+}
+
 pub const PreparedBaseVectors = PreparedEffects;
-pub const Coverage = struct { index_name: []const u8, generation: u64, document_key: []const u8, artifact_names: []const []const u8 = &.{}, artifact_keys: []const []const u8 = &.{}, outcome: ?enum { produced, skipped } = null };
+pub const Coverage = struct { index_name: []const u8, generation: u64, document_key: []const u8, artifact_names: []const []const u8 = &.{}, artifact_keys: []const []const u8 = &.{}, outcome: ?enum { produced, skipped, terminal_failed } = null };
 
 pub fn prepareEffects(alloc: std.mem.Allocator, command: Command, catalogs: @import("artifact_inventory.zig").Catalogs) !PreparedEffects {
     return switch (command.producer_kind) {
@@ -1235,7 +1555,11 @@ pub fn stageCoverage(alloc: std.mem.Allocator, txn: anytype, command: Command, c
                 break;
             }
         }
-        const target: ?usize = if (tombstonedSource(command.sources, item.document_key)) null else if (item.outcome) |outcome| (if (outcome == .produced) @as(usize, 0) else 1) else if (produced) 0 else 1;
+        const target: ?usize = if (tombstonedSource(command.sources, item.document_key)) null else if (item.outcome) |outcome| switch (outcome) {
+            .produced => 0,
+            .skipped => 1,
+            .terminal_failed => 2,
+        } else if (produced) 0 else 1;
         const marker = try epoch.marker(alloc, scope, item.index_name, item.generation, item.document_key);
         defer alloc.free(marker);
         const previous_raw = txn.get(marker) catch |err| switch (err) {
@@ -1274,6 +1598,32 @@ pub fn stageCoverage(alloc: std.mem.Allocator, txn: anytype, command: Command, c
         }
         if (target) |index| try txn.put(marker, outcomes[index]) else try txn.delete(marker);
     }
+}
+
+/// A cyclic candidate never changes accepted artifacts. Its output owners
+/// still become incomplete for coordinated publication until a repair succeeds.
+pub fn stageGraphCycleCoverage(alloc: std.mem.Allocator, txn: anytype, command: Command) !void {
+    if (command.mode != .publish or command.producer_kind != .graph) return error.InvalidBatchRequest;
+    const owners = try command.outputSources();
+    const coverage = try alloc.alloc(Coverage, owners.count());
+    defer alloc.free(coverage);
+    var count: usize = 0;
+    for (command.sources, 0..) |source, source_index| {
+        if (!owners.isSet(source_index)) continue;
+        coverage[count] = .{
+            .index_name = command.producer_name,
+            .generation = command.producer_generation,
+            .document_key = source.document_key,
+            .outcome = .terminal_failed,
+        };
+        count += 1;
+    }
+    stageCoverage(alloc, txn, command, coverage) catch |err| switch (err) {
+        // All items share the same counter baseline. An absent baseline
+        // blocks publication on its own and leaves receipts inspectable.
+        error.ArtifactCoverageBaselinePending => {},
+        else => return err,
+    };
 }
 
 fn tombstonedSource(sources: []const Source, document: []const u8) bool {
@@ -1584,6 +1934,17 @@ test "ordered artifact inventory publication coverage is point bounded idempoten
     try std.testing.expectEqualStrings("produced", try txn.get(marker));
     const missing = try epoch.counter(alloc, scope, "shared", 1, "terminal_failed");
     defer alloc.free(missing);
+    var failed_graph = command;
+    failed_graph.producer_kind = .graph;
+    failed_graph.sources = &.{.{ .document_key = "doc", .content_digest = @splat(3), .timestamp = 1, .input_position = null }};
+    try stageGraphCycleCoverage(alloc, &txn, failed_graph);
+    try stageGraphCycleCoverage(alloc, &txn, failed_graph);
+    try std.testing.expectEqualStrings("existing sibling output", try txn.get(second));
+    try std.testing.expectEqualStrings("terminal_failed", try txn.get(marker));
+    try std.testing.expectEqual(@as(u64, 1), try keys.decodeDerivedCoverageOutcomeCount(try txn.get(missing)));
+    try stageCoverage(alloc, &txn, command, &transitions);
+    try std.testing.expectEqualStrings("produced", try txn.get(marker));
+    try std.testing.expectEqual(@as(u64, 0), try keys.decodeDerivedCoverageOutcomeCount(try txn.get(missing)));
     try txn.delete(missing);
     try std.testing.expectError(error.ArtifactCoverageBaselinePending, stageCoverage(alloc, &txn, command, &transitions));
     try txn.put(missing, &@as([8]u8, @splat(0)));
@@ -1627,6 +1988,62 @@ test "ordered artifact inventory publication coverage is point bounded idempoten
     try stageRejection(&txn, changed, 9, .stale_source);
     try stageReceipts(&txn, command, 10);
     try std.testing.expect((try rejected(&txn, changed)) != null);
+    try stageRejection(&txn, changed, 11, .graph_cycle);
+    try stageRejection(&txn, changed, 12, .baseline_pending);
+    try stageRejection(&txn, changed, 13, .graph_cycle);
+    try stageReceipts(&txn, command, 14);
+    const cycle = (try rejected(&txn, changed)).?;
+    try std.testing.expectEqual(.graph_cycle, cycle.reason);
+    try std.testing.expectEqual(@as(u64, 11), cycle.applied_index);
+    try std.testing.expectEqualDeep(cycle, (try latestGraphCycle(&txn, command)).?);
+    try std.testing.expect((try rejected(&txn, command)) == null);
+    var graph = changed;
+    graph.producer_kind = .graph;
+    graph.publication_digest = graph.digest();
+    try stageRejection(&txn, graph, 14, .graph_constraint_capacity);
+    const capacity = (try rejected(&txn, graph)).?;
+    try std.testing.expectEqual(.graph_constraint_capacity, capacity.reason);
+    try std.testing.expect(capacity.reason.preservesUpload());
+    try requireUnrejectedGraphCandidate(&txn, graph);
+    try stageRejection(&txn, graph, 15, .graph_cycle);
+    try stageRejection(&txn, graph, 16, .graph_constraint_pending);
+    try std.testing.expectEqual(.graph_cycle, (try rejected(&txn, graph)).?.reason);
+    try std.testing.expectError(error.GraphCycle, requireUnrejectedGraphCandidate(&txn, graph));
+    try std.testing.expect((try latestGraphCycleForSource(&txn, graph, sources[1])) == null);
+    var multi = graph;
+    multi.mutations = &.{
+        graph.mutations[0],
+        .{ .family = .graph, .key = second, .value = null, .source_index = 1 },
+    };
+    multi.publication_digest = multi.digest();
+    const prior_position: Position = .{ .raft = .{ .term = 1, .index = 16 } };
+    const prior_output = GraphOutputFence.init(multi, sources[1], prior_position).?;
+    try prior_output.requireCurrent(&txn);
+    try stageRejection(&txn, multi, 17, .graph_cycle);
+    try std.testing.expectError(error.EnrichmentSourceChanged, prior_output.requireCurrent(&txn));
+    const repaired_position: Position = .{ .raft = .{ .term = 2, .index = 18 } };
+    try GraphOutputFence.init(multi, sources[1], repaired_position).?.requireCurrent(&txn);
+    var dependency_first = multi;
+    dependency_first.producer_scope_key = "another-scope";
+    dependency_first.mutations = multi.mutations[1..];
+    dependency_first.publication_digest = dependency_first.digest();
+    try stageRejection(&txn, dependency_first, 17, .graph_cycle);
+    try GraphOutputFence.init(dependency_first, sources[0], prior_position).?.requireCurrent(&txn);
+    try std.testing.expectError(error.EnrichmentSourceChanged, GraphOutputFence.init(dependency_first, sources[1], prior_position).?.requireCurrent(&txn));
+    try std.testing.expectEqual(multi.publication_digest, (try latestGraphCycleForSource(&txn, multi, sources[1])).?.publication_digest);
+    // Updating the first source's response slot keeps the second source's
+    // terminal response available to a retry of the original batch.
+    try stageRejection(&txn, graph, 18, .graph_cycle);
+    try std.testing.expectError(error.GraphCycle, requireUnrejectedGraphCandidate(&txn, multi));
+    try std.testing.expectEqual(@as(u64, 17), (try rejected(&txn, multi)).?.applied_index);
+    var second_owner_only = multi;
+    second_owner_only.mutations = multi.mutations[1..];
+    second_owner_only.publication_digest = second_owner_only.digest();
+    try stageRejection(&txn, second_owner_only, 19, .graph_cycle);
+    try std.testing.expectError(error.GraphCycle, requireUnrejectedGraphCandidate(&txn, graph));
+
+    graph.publication_digest = @splat(92);
+    try requireUnrejectedGraphCandidate(&txn, graph);
 }
 
 test "ordered artifact inventory producer dispatch preserves foreign named failures" {

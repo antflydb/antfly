@@ -855,28 +855,40 @@ pub fn readCurrentArtifactMetadata(alloc: std.mem.Allocator, txn: anytype, artif
 pub const ArtifactCertificate = struct {
     reference: [artifact_prefix.len + 24 + 8 + 32]u8,
     value: [32 + publication.Position.encoded_len]u8,
+    graph_output: ?publication.GraphOutputFence = null,
+
     pub fn requireCurrent(self: ArtifactCertificate, txn: anytype) !void {
         const current = txn.get(&self.reference) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
         if (!std.mem.eql(u8, current, &self.value)) return error.EnrichmentSourceChanged;
+        if (self.graph_output) |fence| try fence.requireCurrent(txn);
     }
 };
 
 /// Capture the fixed receiver-local reference after the caller has validated
 /// the current artifact proof and its inputs in the same pinned snapshot.
 /// Final apply checks this CAS value without decoding the proof again.
-pub fn captureCurrentArtifactCertificate(txn: anytype, authority: publication.Authority, artifact: []const u8, expected_digest: publication.Digest) !ArtifactCertificate {
+pub fn captureCurrentArtifactCertificate(txn: anytype, authority: publication.Authority, artifact: []const u8, proof: Proof) !ArtifactCertificate {
     const reference = artifactReferenceKey(authority, artifact);
     const raw = txn.get(&reference) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
     if (raw.len != 32 + publication.Position.encoded_len) return error.ArtifactCatalogCorrupt;
-    if (!std.mem.eql(u8, raw[0..32], &expected_digest)) return error.EnrichmentSourceChanged;
-    return .{ .reference = reference, .value = raw[0 .. 32 + publication.Position.encoded_len].* };
+    if (!std.mem.eql(u8, raw[0..32], &proof.publication_digest)) return error.EnrichmentSourceChanged;
+    const value = raw[0 .. 32 + publication.Position.encoded_len].*;
+    const position = publication.Position.decode(value[32..]) catch return error.ArtifactCatalogCorrupt;
+    const graph_output = if (proof.producer_kind == .graph) blk: {
+        const effect = for (proof.effects) |candidate| {
+            if (std.mem.eql(u8, candidate.key, artifact)) break candidate;
+        } else return error.ArtifactCatalogCorrupt;
+        break :blk try graphOutputFence(proof, effect, position);
+    } else null;
+    if (graph_output) |fence| try fence.requireCurrent(txn);
+    return .{ .reference = reference, .value = value, .graph_output = graph_output };
 }
 
 pub fn certifyInheritedArtifact(alloc: std.mem.Allocator, txn: anytype, artifact: []const u8, expected_value: ?[]const u8, consumer: publication.Command) !ArtifactCertificate {
     var accepted = (try readCurrentForArtifact(alloc, txn, artifact, expected_value)) orelse return error.ArtifactCoverageBaselinePending;
     defer accepted.deinit();
     try accepted.proof.requireInheritedBy(consumer);
-    return captureCurrentArtifactCertificate(txn, .{ .namespace = consumer.namespace, .epoch = consumer.authority_epoch, .catalog_digest = consumer.catalog_digest }, artifact, accepted.proof.publication_digest);
+    return captureCurrentArtifactCertificate(txn, .{ .namespace = consumer.namespace, .epoch = consumer.authority_epoch, .catalog_digest = consumer.catalog_digest }, artifact, accepted.proof);
 }
 
 /// Availability for authoritative projection accounting. Exact revision
@@ -890,6 +902,12 @@ pub fn currentArtifactProduced(alloc: std.mem.Allocator, txn: anytype, artifact:
     defer owned.deinit();
     for (owned.proof.effects) |effect| if (std.mem.eql(u8, effect.key, artifact)) return effect.value_digest != null;
     return error.ArtifactCatalogCorrupt;
+}
+
+fn graphOutputFence(proof: Proof, effect: Effect, position: publication.Position) !?publication.GraphOutputFence {
+    if (proof.producer_kind != .graph) return null;
+    if (effect.source_index >= proof.sources.len) return error.ArtifactCatalogCorrupt;
+    return publication.GraphOutputFence.init(proof.inputCommand(), proof.sources[effect.source_index], position);
 }
 
 fn readCurrentArtifactProof(alloc: std.mem.Allocator, txn: anytype, artifact: []const u8, expected_value: ?[]const u8, comptime verify_value: bool) !?Owned {
@@ -912,6 +930,7 @@ fn readCurrentArtifactProof(alloc: std.mem.Allocator, txn: anytype, artifact: []
     const effect = for (proof.effects) |candidate| {
         if (std.mem.eql(u8, candidate.key, artifact)) break candidate;
     } else return error.ArtifactCatalogCorrupt;
+    if (try graphOutputFence(proof, effect, position)) |fence| try fence.requireCurrent(txn);
     if (verify_value) if (effect.value_digest) |expected| {
         const value = expected_value orelse return error.EnrichmentSourceChanged;
         if (value.len != effect.value_bytes) return error.EnrichmentSourceChanged;
@@ -1719,10 +1738,10 @@ test "ordered artifact inventory document proof pages seek binary ranges and rej
 test "ordered artifact inventory provenance shares receipts and reclaims superseded proof" {
     const Fake = struct {
         values: std.StringHashMap([]u8),
-        fn get(self: *@This(), name: []const u8) anyerror![]const u8 {
+        pub fn get(self: *@This(), name: []const u8) anyerror![]const u8 {
             return self.values.get(name) orelse error.NotFound;
         }
-        fn put(self: *@This(), name: []const u8, value: []const u8) !void {
+        pub fn put(self: *@This(), name: []const u8, value: []const u8) !void {
             const owned_value = try std.testing.allocator.dupe(u8, value);
             errdefer std.testing.allocator.free(owned_value);
             const entry = try self.values.getOrPut(name);
@@ -1770,6 +1789,14 @@ test "ordered artifact inventory provenance shares receipts and reclaims superse
     const prepared_raw = try txn.get(&prepared_reference);
     const certificate: ArtifactCertificate = .{ .reference = prepared_reference, .value = prepared_raw[0 .. 32 + publication.Position.encoded_len].* };
     try certificate.requireCurrent(&txn);
+    var graph = command;
+    graph.producer_kind = .graph;
+    var graph_certificate = certificate;
+    graph_certificate.graph_output = publication.GraphOutputFence.init(graph, sources[0], position);
+    try graph_certificate.requireCurrent(&txn);
+    try publication.stageRejection(&txn, graph, 2, .graph_cycle);
+    try std.testing.expectError(error.EnrichmentSourceChanged, graph_certificate.requireCurrent(&txn));
+    try std.testing.expectEqualSlices(u8, &certificate.value, try txn.get(&prepared_reference));
     try txn.put("unrelated", "write");
     try certificate.requireCurrent(&txn);
     var changed_position = certificate.value;

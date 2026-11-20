@@ -37738,6 +37738,17 @@ pub fn graphConfigConsumesArtifact(alloc: Allocator, raw: []const u8, artifact_n
 }
 
 pub fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
+    return parseGraphConfigInternal(alloc, raw, false);
+}
+
+/// Catalog activation inspects requested DAG domains before making them
+/// available to the runtime. Normal index admission remains fenced until
+/// every producer and runtime honors the active authority.
+pub fn parseGraphActivationConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
+    return parseGraphConfigInternal(alloc, raw, true);
+}
+
+fn parseGraphConfigInternal(alloc: Allocator, raw: []const u8, allow_dag_declarations: bool) !GraphConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed.deinit();
     const root = parsed.value;
@@ -37816,6 +37827,8 @@ pub fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         alloc.free(configs);
     }
 
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(alloc);
     for (edge_types.array.items, 0..) |item, i| {
         if (item != .object) return error.InvalidIndexConfig;
         var fields = item.object.iterator();
@@ -37828,20 +37841,24 @@ pub fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         const name = item.object.get("name") orelse return error.InvalidIndexConfig;
         if (name != .string) return error.InvalidIndexConfig;
 
+        if (allow_dag_declarations and (try names.getOrPut(alloc, name.string)).found_existing) return error.InvalidIndexConfig;
         const topology = if (item.object.get("topology")) |value| blk: {
             if (value != .string) return error.InvalidIndexConfig;
             if (std.mem.eql(u8, value.string, "graph")) break :blk graph_mod.TopologyMode.graph;
             if (std.mem.eql(u8, value.string, "tree")) break :blk graph_mod.TopologyMode.tree;
+            if (allow_dag_declarations and name.string.len != 0 and std.mem.eql(u8, value.string, "dag")) break :blk graph_mod.TopologyMode.dag;
             return error.InvalidIndexConfig;
         } else graph_mod.TopologyMode.graph;
 
+        const owned_name = try alloc.dupe(u8, name.string);
+        errdefer alloc.free(owned_name);
         const field_name = if (item.object.get("field")) |value| blk: {
             if (value != .string) return error.InvalidIndexConfig;
             break :blk try alloc.dupe(u8, value.string);
         } else null;
 
         configs[i] = .{
-            .name = try alloc.dupe(u8, name.string),
+            .name = owned_name,
             .field_name = field_name,
             .topology = topology,
         };
@@ -38273,6 +38290,26 @@ fn parseGraphAlgebraicSemiringTraversal(root: std.json.Value) !bool {
         return enabled.bool;
     }
     return true;
+}
+
+test "graph config inspects DAG declarations for catalog activation only" {
+    const alloc = std.testing.allocator;
+    const config =
+        \\{"edge_types":[{"name":"mentions","field":"refs","topology":"dag"},{"name":"parent","topology":"tree"},{"name":"related"}]}
+    ;
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc, config));
+    var activation = try parseGraphActivationConfig(alloc, config);
+    defer activation.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.TopologyMode.dag, activation.edge_type_configs[0].topology);
+    try std.testing.expectEqualStrings("refs", activation.edge_type_configs[0].field_name.?);
+    try std.testing.expectEqual(graph_mod.TopologyMode.tree, activation.edge_type_configs[1].topology);
+    try std.testing.expectEqual(graph_mod.TopologyMode.graph, activation.edge_type_configs[2].topology);
+    try std.testing.expectError(error.GraphConstraintNotReady, graph_mod.GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "g", .{
+        .edge_type_configs = activation.edge_type_configs,
+    }));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphActivationConfig(alloc,
+        \\{"edge_types":[{"name":"mentions","topology":"dag"},{"name":"mentions"}]}
+    ));
 }
 
 test "graph config declares algebraic provenance semiring traversal law" {

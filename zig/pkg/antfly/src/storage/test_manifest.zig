@@ -523,6 +523,8 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_extraction_generation;
     _ = @import("antfly_local_sources").storage_db_artifact_generation_scope;
     _ = @import("antfly_local_sources").storage_db_artifact_graph_publication;
+    _ = @import("antfly_local_sources").storage_db_dag_activation_contract;
+    _ = @import("antfly_local_sources").storage_db_dag_graph_effects;
     _ = @import("antfly_local_sources").storage_db_artifact_inventory;
     _ = @import("antfly_local_sources").storage_db_artifact_native_stream;
     _ = @import("antfly_local_sources").storage_db_prepared_producer_acceptance;

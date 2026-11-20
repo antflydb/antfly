@@ -63,7 +63,7 @@ fn runRecoveryPageWithConfig(
             admitted += 1;
             continue;
         }
-        if (try manager.hasIntents(txn.txn_id) or try manager.hasReplicationOutbox(txn.txn_id)) {
+        if (txn.dag_prepared or try manager.hasIntents(txn.txn_id) or try manager.hasReplicationOutbox(txn.txn_id)) {
             const resolve = config.resolve_local_fn orelse return error.MissingLocalTransactionResolver;
             resolve(config.local_resolution_ctx orelse return error.MissingLocalTransactionResolver, txn.txn_id, txn.status, txn.commit_version) catch {
                 summary.record_failures += 1;

@@ -49,7 +49,7 @@ fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAct
     std.log.warn("private transition failed group_id={} action={s} err={s}", .{ group_id, @tagName(action), @errorName(err) });
 }
 
-pub const Error = operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+pub const Error = operation.ApiError || @import("dag_errors.zig").Error || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
     ResourceBudgetExceeded,
     RetainedEffectsFull,
     AuthoritativeLookupMissing,
@@ -735,7 +735,7 @@ pub const Operations = struct {
 
     pub fn txnPrepare(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnPrepareRequest) Error!void {
         try ensurePreDecisionRequestActive(request);
-        if (input.req.range_guards.len != 0 and input.route_fence == null) return error.InvalidArgument;
+        if ((input.req.range_guards.len != 0 or input.req.dag_domains.len != 0) and input.route_fence == null) return error.InvalidArgument;
         if (input.route_fence) |fence| {
             if (fence.route.group_id != group_id or fence.topology_epoch != input.topology_epoch) return error.TopologyChanged;
         }
@@ -790,6 +790,7 @@ pub const Operations = struct {
                 // One registry drives Raft terminal results and participant
                 // transport; adding a lifecycle fence must not silently turn
                 // its recoverable typed rejection into an HTTP 500.
+                if (@import("dag_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 return error.Internal;
@@ -1067,10 +1068,27 @@ pub const Operations = struct {
     ) Error!table_reads.LookupResponse {
         try request.ensureActive();
         if (input.options.relational_topology_json.len != 0) {
-            if (input.options.relational_topology_json.len > 4096) return error.InvalidArgument;
+            const dag_activation = @import("antfly_local_sources").storage_db_dag_activation_contract;
+            const max_topology_bytes = if (dag_activation.isLookupControl(input.options.relational_topology_json)) dag_activation.max_lookup_control_bytes else 4096;
+            if (input.options.relational_topology_json.len > max_topology_bytes) return error.InvalidArgument;
             const Probe = struct { transition_id: ?u64 = null, mode: ?[]const u8 = null };
             var probe = std.json.parseFromSlice(Probe, alloc, input.options.relational_topology_json, .{ .ignore_unknown_fields = true }) catch return error.InvalidArgument;
             defer probe.deinit();
+            if (probe.value.mode) |mode| {
+                if (std.mem.eql(u8, mode, "dag_activation_checkpoint") or std.mem.eql(u8, mode, "dag_activation_source_page") or
+                    std.mem.eql(u8, mode, "dag_activation_job_status") or
+                    std.mem.eql(u8, mode, "dag_activation_job_plan") or
+                    std.mem.eql(u8, mode, "dag_activation_pending_jobs"))
+                {
+                    if (!dag_activation.isLookupControl(input.options.relational_topology_json) or
+                        input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
+                        input.options.restore_staging_plan_id != null or input.options.include_primary_digest or
+                        input.options.fields.len != 0 or input.options.relational_integrity_catalog or
+                        input.options.relational_integrity_action or input.options.relational_integrity_jobs_json.len != 0 or
+                        input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or
+                        input.options.relational_activation_json.len != 0 or probe.value.transition_id != null) return error.InvalidArgument;
+                }
+            }
             if (probe.value.mode) |mode| if (std.mem.eql(u8, mode, "online_source_status")) {
                 const StatusRequest = struct { mode: enum { online_source_status }, scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope };
                 var scoped = std.json.parseFromSlice(StatusRequest, alloc, input.options.relational_topology_json, .{}) catch return error.InvalidArgument;

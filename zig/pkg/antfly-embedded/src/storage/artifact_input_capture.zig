@@ -16,6 +16,8 @@
 //! Source input versions are captured at the physical transaction boundary,
 //! including coordinated transaction resolution, rather than at one API path.
 const std = @import("std");
+const dag_effects = @import("db/dag_graph_effects.zig");
+const DagSourceFence = @import("../graph/dag_authority.zig").SourceFence;
 const keys = @import("internal_keys.zig");
 const publication = @import("db/artifact_publication.zig");
 const authority = @import("source_authority.zig");
@@ -50,6 +52,11 @@ pub const Capture = struct {
     replay_sequence: ?u64 = null,
     replay_next: ?u64 = null,
     replay_ambiguous: bool = false,
+    dag_bindings: ?bool = null,
+    dag_publication: ?publication.Digest = null,
+    dag_graph_preimages: std.StringHashMapUnmanaged(?u64) = .empty,
+    dag_source_mutation: bool = false,
+    dag_fence_changed: bool = false,
     staging: bool = false,
     staged: bool = false,
     poisoned: bool = false,
@@ -70,6 +77,9 @@ pub const Capture = struct {
         var owners = self.artifact_owners.keyIterator();
         while (owners.next()) |key| alloc.free(key.*);
         self.artifact_owners.deinit(alloc);
+        var graph_keys = self.dag_graph_preimages.keyIterator();
+        while (graph_keys.next()) |key| alloc.free(key.*);
+        self.dag_graph_preimages.deinit(alloc);
     }
 
     fn rememberArtifact(self: *Capture, alloc: std.mem.Allocator, key: []const u8) !void {
@@ -83,6 +93,7 @@ pub const Capture = struct {
         errdefer self.poisoned = true;
         if (self.participant) |participant| if (participant.charge) |charge| try charge(participant.ptr, key, value);
         if (self.staging) return;
+        if (std.mem.eql(u8, key, DagSourceFence.key)) self.dag_fence_changed = true;
         if (self.participant) |participant| participant.observe(participant.ptr, key, value);
         self.allocator = alloc;
         errdefer self.poisoned = true;
@@ -130,8 +141,24 @@ pub const Capture = struct {
             }
             return;
         }
+        if (keys.isGraphEdgeArtifactKey(key)) {
+            const bound = self.dag_bindings orelse try publication.LocalDagBinding.hasBindings(txn);
+            self.dag_bindings = bound;
+            if (bound and !self.dag_graph_preimages.contains(key)) {
+                const raw: ?[]const u8 = txn.get(key) catch |err| blk: {
+                    if (err != error.NotFound) return err;
+                    break :blk null;
+                };
+                const generation = try dag_effects.artifactGeneration(raw);
+                const owned_key = try alloc.dupe(u8, key);
+                errdefer alloc.free(owned_key);
+                try self.dag_graph_preimages.put(alloc, owned_key, generation);
+            }
+        }
         const artifact = publication.guardedArtifactKey(key);
-        if (!artifact and !keys.isStoredSourceRowKey(key) and !keys.isTtlKey(key)) return;
+        const source = keys.isStoredSourceRowKey(key) or keys.isTtlKey(key);
+        self.dag_source_mutation = self.dag_source_mutation or artifact or source or keys.isInternalUserKey(key);
+        if (!artifact and !source) return;
         if (self.staged) return error.RetainedEffectsMixedControl;
         if (!self.checked) {
             self.selected = try publication.authority(txn);
@@ -186,6 +213,45 @@ pub const Capture = struct {
     pub fn stage(self: *Capture, txn: anytype, retained_advanced: bool) !void {
         if (self.poisoned) return error.RetainedEffectsTransactionFailed;
         if (self.staged) return;
+        if (self.dag_source_mutation) {
+            if (self.dag_fence_changed) return error.GraphConstraintBusy;
+            try DagSourceFence.requireWritable(txn);
+        }
+        if (self.dag_graph_preimages.count() != 0) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator orelse return error.InvalidDagAuthority);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const owner = (try authority.load(txn)) orelse return error.GraphConstraintNotReady;
+            const validation = @import("../graph/dag_validation.zig");
+            const OrderedClock = struct {
+                fn now(_: *anyopaque) u64 {
+                    return 0;
+                }
+            };
+            var budget: validation.Budget = .{ .clock = .{ .context = self, .now = OrderedClock.now } };
+            try budget.consume(.requests, self.dag_graph_preimages.count());
+            const changes = try scratch.alloc(dag_effects.ArtifactChange, self.dag_graph_preimages.count());
+            var graph = self.dag_graph_preimages.iterator();
+            for (changes) |*change| {
+                const item = graph.next().?;
+                try budget.consume(.bytes, item.key_ptr.*.len);
+                const raw: ?[]const u8 = txn.get(item.key_ptr.*) catch |err| blk: {
+                    if (err != error.NotFound) return err;
+                    break :blk null;
+                };
+                change.* = .{ .key = item.key_ptr.*, .before = item.value_ptr.*, .after = try dag_effects.artifactGeneration(raw) };
+            }
+            self.staging = true;
+            defer self.staging = false;
+            const Handle = switch (@typeInfo(@TypeOf(txn))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(txn),
+            };
+            if (comptime @hasDecl(Handle, "openCursor"))
+                try dag_effects.stageLocalArtifactChanges(scratch, txn, owner.namespace, changes, self.dag_publication, &budget)
+            else
+                return error.GraphConstraintNotReady;
+        }
         // Prepared primary writers freeze the retirement footprint too.
         // Background producers may not expand the old postimage after a yes
         // vote. Resolution removes its own intent locks in this same writer,

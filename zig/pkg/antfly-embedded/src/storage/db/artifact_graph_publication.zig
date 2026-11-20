@@ -81,7 +81,7 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
         const count = (contenders.decodeVisibleCount(raw, producer.coverage_generation) catch |err| return authoredOutputError(err)) orelse return error.InvalidBatchRequest;
         try coverage.append(owned, .{ .index_name = producer.name, .generation = producer.coverage_generation, .document_key = try owned.dupe(u8, source.document_key), .artifact_names = &.{}, .outcome = if (count == 0) .skipped else .produced });
     }
-    return .{ .arena = arena, .batch = .{ .changed_artifact_keys = changed.items, .graph_writes = writes.items, .graph_deletes = deletes.items }, .coverage = coverage.items };
+    return .{ .arena = arena, .graph_publication_digest = command.publication_digest, .batch = .{ .changed_artifact_keys = changed.items, .graph_writes = writes.items, .graph_deletes = deletes.items }, .coverage = coverage.items };
 }
 
 fn authoredOutputError(err: anyerror) anyerror {
@@ -136,12 +136,185 @@ test "ordered artifact inventory graph publication validates guards generations 
         .publication_digest = @splat(0),
     };
     {
+        command.publication_digest = command.digest();
         var result = try prepare(alloc, command, catalogs);
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.batch.graph_writes.len);
         try std.testing.expectEqualStrings("owner", result.batch.graph_writes[0].owner);
         try std.testing.expectEqualStrings("entity", result.batch.graph_writes[0].source);
         try std.testing.expect(result.coverage[0].outcome.? == .produced);
+        const replacements = try result.dagReplacements("g", "links");
+        try std.testing.expectEqual(@as(usize, 1), replacements.len);
+        try std.testing.expectEqualStrings("entity", replacements[0].source);
+        try std.testing.expectEqualStrings("target", replacements[0].targets[0]);
+        var different = command;
+        different.authority_epoch += 1;
+        different.publication_digest = different.digest();
+        try std.testing.expectError(error.InvalidBatchRequest, result.dagPrepare(different, @splat(2), "links", 1, 0, @splat(3)));
+        const request = (try result.dagPrepare(command, @splat(2), "links", 1, 0, @splat(3))).?;
+        try std.testing.expectEqualDeep(command.publication_digest, request.producer_versions);
+        try std.testing.expectEqualDeep(replacements, request.replacements);
+        const retry = (try result.dagPrepare(command, @splat(2), "links", 2, 1, @splat(3))).?;
+        try std.testing.expectEqualDeep(request.attempt, retry.attempt);
+        const next = (try result.dagPrepare(command, @splat(2), "links", 2, 1, @splat(4))).?;
+        try std.testing.expect(!std.mem.eql(u8, &request.attempt.id, &next.attempt.id));
+        try std.testing.expect((try result.dagPrepare(command, @splat(2), "unknown", 1, 0, @splat(3))) == null);
+        const memory = @import("../mem_backend.zig");
+        const docstore = @import("../docstore.zig");
+        const dag = @import("../../graph/dag_authority.zig");
+        var backend = memory.Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try docstore.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        {
+            var writer = try store.beginWriteTxn();
+            errdefer writer.abort();
+            const binding: publication.LocalDagBinding = .{ .table_identity = @splat(2), .edge_types = &.{"links"} };
+            try std.testing.expectError(error.GraphConstraintNotReady, binding.stage(alloc, &writer, command));
+            try dag.Storage.create(&writer, request.domain, 1);
+            try std.testing.expectError(error.GraphConstraintNotReady, binding.stage(alloc, &writer, command));
+            const config_json =
+                \\{"edge_types":[{"name":"unconstrained","topology":"graph"},{"name":"links","topology":"dag"}]}
+            ;
+            try std.testing.expectError(error.InvalidDagMutation, publication.LocalDagBinding.stageFromConfig(alloc, &writer, command, @splat(2), config_json, &.{}));
+            try std.testing.expectEqual(.validating, (try dag.Storage.load(&writer, request.domain)).phase);
+            const activation = @import("dag_activation_contract.zig");
+            const manifest = try activation.ScanManifest.init(&.{.{
+                .id = request.domain,
+                .roots = &.{.{
+                    .namespace = command.namespace,
+                    .index_name = "g",
+                    .edge_type = "links",
+                    .generation = command.producer_generation,
+                }},
+            }}, command.namespace, @splat(3));
+            const fence = manifest.fence;
+            var declared: std.ArrayList(u8) = .empty;
+            defer declared.deinit(alloc);
+            try declared.appendSlice(alloc, bytes.items[0 .. bytes.items.len - config.len - 12]);
+            var config_size: [4]u8 = undefined;
+            std.mem.writeInt(u32, &config_size, config_json.len, .little);
+            try declared.appendSlice(alloc, &config_size);
+            try declared.appendSlice(alloc, config_json);
+            try declared.appendSlice(alloc, bytes.items[bytes.items.len - 8 ..]);
+            const declaration: inventory.Catalogs = .{ .indexes = declared.items };
+            const candidate_catalog: inventory.Command = .{
+                .namespace = command.namespace,
+                .catalogs = declaration,
+                .binding = .{ .epoch = 1, .digest = declaration.digest(), .semantic_digest = try declaration.semanticDigest(alloc), .effect_protocol = 16 },
+            };
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            var ordered = try inventory.planDagActivationPublication(scratch.allocator(), manifest, candidate_catalog, &.{.{
+                .index_name = "g",
+                .table_identity = @splat(2),
+                .edge_types = &.{"links"},
+            }}, 1);
+            const activations = ordered.dag_activations.?[0].proofs;
+            try @import("../source_authority.zig").bind(&writer, .native, command.namespace);
+            var missing = ordered;
+            missing.dag_activations = null;
+            try std.testing.expectError(error.InvalidArtifactCatalogCommand, inventory.stageOrdered(alloc, &writer, missing, 1));
+            try std.testing.expect((try inventory.load(alloc, &writer)) == null);
+            try std.testing.expectEqual(.validating, (try dag.Storage.load(&writer, request.domain)).phase);
+            try std.testing.expectError(error.InvalidArtifactCatalogCommand, inventory.stageOrdered(alloc, &writer, ordered, 1));
+            try fence.acquire(&writer);
+            var scan = try manifest.beginScanCommand(request.domain, 1);
+            try scan.stageScan(alloc, &writer);
+            try std.testing.expectError(error.InvalidArtifactCatalogCommand, inventory.stageOrdered(alloc, &writer, ordered, 1));
+            const end = try manifest.terminalCursor(request.domain);
+            scan.scan.?.root_count = null;
+            scan.scan.?.page = .{ .next = &end, .replacements = &.{} };
+            try scan.stageScan(alloc, &writer);
+            try inventory.stageOrdered(alloc, &writer, ordered, 1);
+            try inventory.stageOrdered(alloc, &writer, ordered, 1);
+            ordered.dag_activations = &.{.{ .index_name = "g", .table_identity = @splat(9), .proofs = activations }};
+            try std.testing.expectError(error.ArtifactCatalogEpochChanged, inventory.stageOrdered(alloc, &writer, ordered, 1));
+            missing.previous = ordered.binding;
+            missing.binding.epoch += 1;
+            try std.testing.expectError(error.GraphConstraintBusy, inventory.stageOrdered(alloc, &writer, missing, 2));
+            try fence.release(&writer);
+            try inventory.stageOrdered(alloc, &writer, missing, 2);
+            try publication.LocalDagBinding.requireDeclared(alloc, &writer, command, config_json);
+            try std.testing.expectError(error.InvalidDagDomain, publication.LocalDagBinding.requireDeclared(alloc, &writer, command,
+                \\{"edge_types":[{"name":"links","topology":"graph"}]}
+            ));
+            var new_generation = command;
+            new_generation.producer_generation += 1;
+            try publication.LocalDagBinding.requireDeclared(alloc, &writer, new_generation, "{}");
+            try binding.stage(alloc, &writer, command);
+            try writer.commit();
+        }
+        {
+            var writer = try store.beginWriteTxn();
+            errdefer writer.abort();
+            try result.bindDagPublication(&writer, command);
+            try writer.put(edge_key, edge);
+            try writer.commit();
+        }
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 1), (try dag.Storage.load(&read, request.domain)).revision);
+            try std.testing.expectEqualSlices(u8, edge, try read.get(edge_key));
+        }
+        {
+            // Replaying the same relationship afterimage has no topology effect.
+            var writer = try store.beginWriteTxn();
+            errdefer writer.abort();
+            try result.bindDagPublication(&writer, command);
+            try writer.put(edge_key, edge);
+            try writer.commit();
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 1), (try dag.Storage.load(&read, request.domain)).revision);
+        }
+        const reverse = try keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "owner", "g", "links", "entity", "target");
+        defer alloc.free(reverse);
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const effects = @import("dag_graph_effects.zig");
+            const validation = @import("../../graph/dag_validation.zig");
+            const Clock = struct {
+                fn now(_: *anyopaque) u64 {
+                    return 0;
+                }
+            };
+            var budget: validation.Budget = .{
+                .limits = .{ .requests = 1 },
+                .clock = .{ .context = &read, .now = Clock.now },
+            };
+            const normalized = try effects.collectBoundArtifactChanges(arena.allocator(), &read, command.namespace, &.{
+                .{ .key = edge_key, .before = command.producer_generation, .after = null },
+                .{ .key = reverse, .before = null, .after = command.producer_generation },
+            }, &budget);
+            try std.testing.expectEqual(@as(usize, 1), budget.stats.requests);
+            try std.testing.expectEqual(@as(usize, 2), normalized.len);
+            for (normalized) |item| try std.testing.expectEqual(request.domain, item.domain);
+        }
+        {
+            var writer = try store.beginWriteTxn();
+            defer writer.abort();
+            try writer.put(reverse, edge);
+            try std.testing.expectError(error.GraphCycle, writer.commit());
+        }
+        {
+            var writer = try store.beginWriteTxn();
+            errdefer writer.abort();
+            try writer.delete(edge_key);
+            try writer.put(reverse, edge);
+            try writer.commit();
+        }
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 2), (try dag.Storage.load(&read, request.domain)).revision);
+            try std.testing.expectError(error.NotFound, read.get(edge_key));
+            try std.testing.expectEqualSlices(u8, edge, try read.get(reverse));
+        }
     }
     const guards = command.mutation_preconditions;
     command.mutation_preconditions = guards[0..1];

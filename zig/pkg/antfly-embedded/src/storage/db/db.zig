@@ -9210,6 +9210,7 @@ pub const DB = struct {
         }
         if (req.leann_record != null) return self.applyLeannRecordBatch(req, opts);
         if (req.merge_proof_adoption != null) return self.applyMergeProofAdoptionBatch(req, opts);
+        if (req.dag_source_fence != null) return self.applyDagSourceFence(req, opts);
         if (req.artifact_catalog != null and req.online_source == null and req.merge_checkpoint == null) return self.applyArtifactCatalogBatch(req, opts);
         if (req.artifact_publication != null) return self.applyArtifactPublicationBatch(req, opts);
         if (req.artifact_publication_transport != null) return self.applyArtifactPublicationTransportBatch(req, opts);
@@ -26173,6 +26174,7 @@ pub const DB = struct {
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
     ) !void {
+        if (incoming_req.dag_domains.len != 0 and incoming_req.restore_staging_scope != null) return error.InvalidBatchRequest;
         var req = incoming_req;
         var packet = if (req.prepared_enrichments_json) |json|
             try std.json.parseFromSlice(execution_resources.PreparedEnrichments, preparation_alloc, json, .{ .allocate = .alloc_always })
@@ -26253,19 +26255,20 @@ pub const DB = struct {
         defer graph_effects.deinit();
         const graph_alloc = graph_effects.allocator();
         const graph_contract = @import("graph_transaction_effects.zig");
+        var graph_prepare: graph_contract.Prepare = .{ .include_policy_sources = row_policy_principal != null };
         var intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
         defer intents.deinit(preparation_alloc);
         for (req.graph_writes) |edge| {
             try types.validateGraphEndpointCleanupCommand(.{ .graph_writes = &.{edge} });
-            try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
+            try graph_prepare.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
         }
         for (req.graph_deletes) |edge| {
             try types.validateGraphEndpointCleanupCommand(.{ .graph_deletes = &.{edge} });
-            try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
+            try graph_prepare.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
         }
-        for (effective_ops.graph_writes.items) |edge| try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
-        for (effective_ops.graph_deletes.items) |edge| try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
-        const graph_sources = try graph_contract.sources(graph_alloc, intents.items);
+        for (effective_ops.graph_writes.items) |edge| try graph_prepare.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
+        for (effective_ops.graph_deletes.items) |edge| try graph_prepare.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
+        const graph_sources = graph_prepare.owners.items;
         var predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
         defer predicates.deinit(preparation_alloc);
 
@@ -26439,7 +26442,9 @@ pub const DB = struct {
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         if (row_policy_principal) |principal| {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
-            try self.enforceRowPolicyIntentsLocked(view, intents.items, graph_sources, principal, graph_alloc, &predicates, preparation_alloc);
+            // Preserve authorization on the logical endpoint as well as the
+            // document that owns the durable graph contribution.
+            try self.enforceRowPolicyIntentsLocked(view, intents.items, graph_prepare.policy_sources.items, principal, graph_alloc, &predicates, preparation_alloc);
         }
         const integrity_mod = @import("relational_integrity.zig");
         const activation_mod = @import("relational_integrity_activation.zig");
@@ -26579,6 +26584,20 @@ pub const DB = struct {
             }
         };
 
+        const dag_validation = @import("../../graph/dag_validation.zig");
+        const DagClock = struct {
+            fn now(_: *anyopaque) u64 {
+                return 0;
+            }
+        };
+        var dag_budget: dag_validation.Budget = .{ .clock = .{ .context = self, .now = DagClock.now } };
+        var dag_witness: dag_validation.Witness = .{};
+        const dag_prepare: ?transactions_mod.DagPrepare = if (req.dag_domains.len != 0) .{
+            .domains = req.dag_domains,
+            .budget = &dag_budget,
+            .witness = &dag_witness,
+        } else null;
+
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         if (ordered_receipt) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
@@ -26591,10 +26610,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .prepared_enrichments_json = req.prepared_enrichments_json, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .dag_prepare = dag_prepare, .prepared_enrichments_json = req.prepared_enrichments_json, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .dag_prepare = dag_prepare,
                 .prepared_enrichments_json = req.prepared_enrichments_json,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
@@ -27082,11 +27102,23 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
+            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, dag_activation_checkpoint, dag_activation_source_page, dag_activation_job_status, dag_activation_job_plan, dag_activation_pending_jobs, merge_copy_receipt },
             scope: ?@import("online_source_contract.zig").Scope = null,
+            dag_source_page: ?@import("dag_activation_contract.zig").ScanRequest = null,
+            dag_job: ?struct { namespace: [24]u8, attempt: [32]u8 } = null,
+            dag_pending: ?struct { namespace: [24]u8, after: ?[32]u8 = null } = null,
+            dag_scan: ?struct {
+                namespace: [24]u8,
+                domain: [32]u8,
+                fence: @import("../../graph/dag_authority.zig").SourceFence,
+            } = null,
         }, alloc, request_json, .{});
         defer request.deinit();
         if ((request.value.mode == .online_source_status) != (request.value.scope != null)) return error.InvalidOnlineSourceCommand;
+        if ((request.value.mode == .dag_activation_checkpoint) != (request.value.dag_scan != null)) return error.InvalidBatchRequest;
+        if ((request.value.mode == .dag_activation_source_page) != (request.value.dag_source_page != null)) return error.InvalidBatchRequest;
+        if ((request.value.mode == .dag_activation_job_status or request.value.mode == .dag_activation_job_plan) != (request.value.dag_job != null)) return error.InvalidBatchRequest;
+        if ((request.value.mode == .dag_activation_pending_jobs) != (request.value.dag_pending != null)) return error.InvalidBatchRequest;
         var output: std.Io.Writer.Allocating = .init(alloc);
         errdefer output.deinit();
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
@@ -27112,6 +27144,48 @@ pub const DB = struct {
             },
             .status => try @import("relational_integrity_json.zig").write(try self.relationalTopologyStatus(), &stream),
             .online_source_status => try @import("relational_integrity_json.zig").write(try self.onlineSourceStatus(request.value.scope.?), &stream),
+            .dag_activation_source_page => {
+                const scan_request = request.value.dag_source_page.?;
+                if (!std.mem.eql(u8, &scan_request.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace)))
+                    return error.GraphConstraintRevisionChanged;
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                const range = self.core.byteRange();
+                const page = try @import("dag_graph_effects.zig").scanAccepted(scratch.allocator(), &read, scan_request, range.start, range.end);
+                try @import("relational_integrity_json.zig").write(page, &stream);
+            },
+            .dag_activation_pending_jobs => {
+                const pending_request = request.value.dag_pending.?;
+                if (!std.mem.eql(u8, &pending_request.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace)))
+                    return error.GraphConstraintRevisionChanged;
+                const update = @import("../../graph/dag_authority.zig").ActivationJobUpdate;
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                var buffer: [update.pending_page_size][32]u8 = undefined;
+                const page = try update.pendingPage(&read, pending_request.after, &buffer);
+                try @import("relational_integrity_json.zig").write(page, &stream);
+            },
+            .dag_activation_job_status, .dag_activation_job_plan => {
+                const job = request.value.dag_job.?;
+                if (!std.mem.eql(u8, &job.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace)))
+                    return error.GraphConstraintRevisionChanged;
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                const update = @import("../../graph/dag_authority.zig").ActivationJobUpdate;
+                if (request.value.mode == .dag_activation_job_plan) {
+                    try stream.write(try update.readPlan(&read, job.attempt));
+                } else {
+                    try @import("relational_integrity_json.zig").write(try update.read(alloc, &read, job.attempt), &stream);
+                }
+            },
+            .dag_activation_checkpoint => {
+                const scan_request = request.value.dag_scan.?;
+                const checkpoint = try self.dagActivationCheckpoint(alloc, scan_request.namespace, scan_request.domain, scan_request.fence);
+                defer if (checkpoint) |value| value.deinit(alloc);
+                try @import("relational_integrity_json.zig").write(checkpoint, &stream);
+            },
             .merge_copy_receipt => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
@@ -28400,12 +28474,12 @@ pub const DB = struct {
         const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
-        try @import("artifact_publication.zig").stageRejection(&txn, command, entry.index, reason);
+        const publication = @import("artifact_publication.zig");
+        try publication.stageRejection(&txn, command, entry.index, reason);
+        if (reason == .graph_cycle) try publication.stageGraphCycleCoverage(self.alloc, &txn, command);
         std.log.debug("artifact publication rejected mode={s} producer={s} index={d} reason={s}", .{ @tagName(command.mode), command.producer_name, entry.index, @tagName(reason) });
-        // Baseline readiness is temporary: keep the immutable upload so the
-        // same logical publication can finalize after reconciliation. A
-        // terminal upload record here would strand its retry forever.
-        if (reason != .baseline_pending) try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
+        // Retryable outcomes retain the immutable upload for a later apply.
+        if (!reason.preservesUpload()) try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
         var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(entry, &marker_buf);
         try txn.put(marker.key, marker.value);
@@ -28890,6 +28964,7 @@ pub const DB = struct {
             replication_payload: ?[]const u8,
             command: publication.Command,
             sequence: u64,
+            prepared: *publication.PreparedEffects,
             coverage: []const publication.Coverage,
             chunk_fence: ?@import("artifact_chunk_publication.zig").Fence,
             chunk_vector_fence: ?@import("artifact_chunk_vector_publication.zig").Fence,
@@ -28906,6 +28981,8 @@ pub const DB = struct {
                 if (guard.chunk_fence) |fence| try fence.requireCurrent(txn);
                 if (guard.chunk_vector_fence) |fence| try fence.requireCurrent(txn);
                 for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
+                try publication.requireUnrejectedGraphCandidate(txn, guard.command);
+                try guard.prepared.bindDagPublication(txn, guard.command);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);
                 try @import("artifact_producer_provenance.zig").stageIndexed(txn, guard.command, guard.proof, guard.position, guard.document_references);
@@ -28915,8 +28992,11 @@ pub const DB = struct {
                 try guard.db.stageRestoreStagingReplicationOutbox(txn, guard.replication_payload);
             }
         };
-        var guard: Guard = .{ .db = self, .replication_payload = replication_payload, .command = command, .sequence = sequence, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .document_references = if (prepared_document_refs) |*value| value else return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
+        var guard: Guard = .{ .db = self, .replication_payload = replication_payload, .command = command, .sequence = sequence, .prepared = prepared_value, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .document_references = if (prepared_document_refs) |*value| value else return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
         _ = self.core.store.putBatchWithPromotionsReplayAndBuiltWrite(batch_ctx.io, writes.items, deletes.items, &.{}, .{ .sequence = sequence, .payload = replay }, null, .{ .ptr = &guard, .validate = Guard.validate }) catch |err| switch (err) {
+            error.GraphCycle => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .graph_cycle, &apply_held),
+            error.GraphConstraintCapacity => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .graph_constraint_capacity, &apply_held),
+            error.GraphConstraintBusy, error.GraphConstraintNotReady => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .graph_constraint_pending, &apply_held),
             error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held),
             error.ArtifactCoverageBaselinePending, error.ArtifactPublicationPending => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .baseline_pending, &apply_held),
             else => return err,
@@ -28943,6 +29023,61 @@ pub const DB = struct {
             defer self.core.unlockApply();
             try applyDerivedBatchInlineAssumeApply(&batch_ctx, prepared_value.batch);
         }
+    }
+
+    /// Read a private activation checkpoint after the caller has established
+    /// an owner read barrier for this physical root.
+    fn dagActivationCheckpoint(
+        self: *DB,
+        alloc: Allocator,
+        namespace: [24]u8,
+        domain: [32]u8,
+        fence: @import("../../graph/dag_authority.zig").SourceFence,
+    ) !?@import("../../graph/dag_authority.zig").Contributions.ScanCheckpoint {
+        if (!std.mem.eql(u8, &namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace)))
+            return error.GraphConstraintRevisionChanged;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return @import("../../graph/dag_authority.zig").Contributions.scanCheckpoint(alloc, &read, domain, fence);
+    }
+
+    fn applyDagSourceFence(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        try @import("../../graph/dag_authority.zig").SourceFenceCommand.validateRequest(req);
+        const command = req.dag_source_fence orelse return error.InvalidBatchRequest;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
+        if (opts.replication_applied_lsn_marker != null or self.local_execution.replication_async_batch_mirror != null)
+            return error.GraphConstraintNotReady;
+
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.tryLockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
+        if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace)))
+            return error.GraphConstraintRevisionChanged;
+
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        switch (command.action) {
+            .acquire => {
+                try command.requireIncomplete(&txn);
+                try transactions_mod.TxnManager.stageDagSourceFence(&txn, command.fence);
+            },
+            .release => try command.stageRelease(&txn),
+            .scan => try command.stageScan(self.alloc, &txn),
+            .activation_job => try command.activation_job.?.stage(self.alloc, &txn, command.fence),
+        }
+        for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+        for (opts.extra_store_deletes) |key| try txn.delete(key);
+        if (opts.outcome_marker_write) |write| try txn.put(write.key, write.value);
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
     }
 
     fn applyArtifactCatalogBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
@@ -29744,7 +29879,7 @@ pub const DB = struct {
         var resolved_finalized: u64 = 0;
         for (txns) |txn| {
             if (txn.status == .pending or
-                (!(try self.core.transactionHasIntents(txn.txn_id)) and !(try self.core.transactionHasReplicationOutbox(txn.txn_id)))) continue;
+                (!txn.dag_prepared and !(try self.core.transactionHasIntents(txn.txn_id)) and !(try self.core.transactionHasReplicationOutbox(txn.txn_id)))) continue;
             const resolve_version = if (txn.status == .committed and txn.commit_version != 0)
                 txn.commit_version
             else
@@ -148016,11 +148151,11 @@ test "db graph endpoint cleanup transaction graph effects advance source ranges 
     try db.batch(.{ .graph_writes = &.{.{ .edge_id = "second", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} });
 }
 
-test "db graph endpoint cleanup graph-only prepares reserve source ranges across reopen" {
+test "db graph endpoint cleanup graph-only prepares reserve producing document ranges across reopen" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("cypher-graph-only-prepare-range");
     defer directory.cleanup();
-    const edge: types.GraphEdgeWrite = .{ .edge_id = "explicit", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" };
+    const edge: types.GraphEdgeWrite = .{ .edge_id = "explicit", .owner_document = "fact", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" };
     const tracking = @import("../range_protection.zig");
     var writer: types.TxnId = undefined;
     var generation: u64 = undefined;
@@ -148029,10 +148164,10 @@ test "db graph endpoint cleanup graph-only prepares reserve source ranges across
         defer db.close();
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
         try db.batch(.{ .activate_range_tracking = true });
-        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" } } });
+        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" }, .{ .key = "fact", .value = "{}" } } });
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        generation = (try tracking.generation(&read, tracking.bucket("a"))).?;
+        generation = (try tracking.generation(&read, tracking.bucket("fact"))).?;
         writer = try db.beginTransaction(100);
         try db.writeTransaction(writer, .{ .graph_writes = &.{edge} });
     }
@@ -148040,7 +148175,7 @@ test "db graph endpoint cleanup graph-only prepares reserve source ranges across
         var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
         defer db.close();
         const reader = try db.beginTransaction(101);
-        const request: types.TransactionIntentRequest = .{ .range_guards = &.{.{ .bucket = tracking.bucket("a"), .generation = generation }} };
+        const request: types.TransactionIntentRequest = .{ .range_guards = &.{.{ .bucket = tracking.bucket("fact"), .generation = generation }} };
         try std.testing.expectError(error.IntentConflict, db.writeTransaction(reader, request));
         try db.abortTransaction(writer, 102);
         try db.writeTransaction(reader, request);
@@ -156240,4 +156375,202 @@ test "privacy scoped readiness status isolates shared catch-up telemetry" {
     pending.projection_checkpoint_status = "rebuilding";
     try std.testing.expect(DB.denseCatchUpAffectsIndex(pending, progress));
     try std.testing.expect(!DB.denseCatchUpAffectsIndex(pending, .{}));
+}
+
+test "db ordered DAG source fence persists with the apply receipt" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("dag-source-fence-ordered");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    const dag = @import("../../graph/dag_authority.zig");
+    const effects = @import("dag_activation_contract.zig");
+    const domain: dag.Digest = @splat(5);
+    const namespace = @import("online_source_contract.zig").namespaceBytes(db.core.identity_namespace);
+    const roots: []const effects.ScanRoot = &.{.{
+        .namespace = namespace,
+        .index_name = "g",
+        .edge_type = "R",
+        .generation = 7,
+    }};
+    const manifest = try effects.ScanManifest.init(&.{.{ .id = domain, .roots = roots }}, namespace, @splat(3));
+    const fence = manifest.fence;
+    var request: types.BatchRequest = .{ .dag_source_fence = .{
+        .namespace = namespace,
+        .action = .acquire,
+        .fence = fence,
+    } };
+    const graph_key = try internal_keys.graphRelationshipArtifactKeyAlloc(a, "producer", "g", "R", "b", "a", "edge");
+    defer a.free(graph_key);
+    const graph_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(a, null, 7, 1, 0, 0, "{}");
+    defer a.free(graph_value);
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        const inventory = @import("artifact_inventory.zig");
+        const catalogs: inventory.Catalogs = .{
+            .indexes = "AIDX\x02\x00\x00\x00\x01\x00\x00\x00" ++
+                "\x01\x00\x00\x00g\x03\x02\x00\x00\x00{}\x07\x00\x00\x00\x00\x00\x00\x00",
+        };
+        try inventory.stageOrdered(a, &writer, .{
+            .namespace = namespace,
+            .catalogs = catalogs,
+            .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(a) },
+        }, 1);
+        try writer.put(graph_key, graph_value);
+        try writer.commit();
+    }
+    const source_query = try std.json.Stringify.valueAlloc(a, .{
+        .mode = @as(enum { dag_activation_source_page }, .dag_activation_source_page),
+        .dag_source_page = @as(effects.ScanRequest, .{
+            .namespace = request.dag_source_fence.?.namespace,
+            .fence = fence,
+            .index_name = "g",
+            .edge_type = "R",
+            .generation = 7,
+        }),
+    }, .{ .emit_strings_as_arrays = true });
+    defer a.free(source_query);
+    try std.testing.expectError(error.GraphConstraintNotReady, db.lookup(a, "", .{ .relational_topology_json = source_query }));
+    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 1 }, true);
+    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 1 }, true);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(fence, (try dag.SourceFence.read(&read)).?);
+    }
+    request.dag_source_fence = try manifest.beginScanCommand(domain, 1);
+    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
+    request.dag_source_fence.?.scan.?.root_count = null;
+    const owner: dag.Digest = @splat(6);
+    const stale_query = try std.json.Stringify.valueAlloc(a, .{
+        .mode = @as(enum { dag_activation_source_page }, .dag_activation_source_page),
+        .dag_source_page = @as(effects.ScanRequest, .{
+            .namespace = namespace,
+            .fence = fence,
+            .index_name = "g",
+            .edge_type = "R",
+            .generation = 8,
+        }),
+    }, .{ .emit_strings_as_arrays = true });
+    defer a.free(stale_query);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, db.lookup(a, "", .{ .relational_topology_json = stale_query }));
+    var source_result = (try db.lookup(a, "", .{ .relational_topology_json = source_query })).?;
+    defer source_result.deinit(a);
+    const source_page = try std.json.parseFromSlice(effects.ScanPage, a, source_result.json, .{});
+    defer source_page.deinit();
+    try std.testing.expect(source_page.value.exhausted);
+    try std.testing.expectEqualSlices(u8, graph_key, source_page.value.next.?);
+    try std.testing.expectEqual(@as(usize, 1), source_page.value.replacements.len);
+    try std.testing.expectEqualStrings("a", source_page.value.replacements[0].source);
+    try std.testing.expectEqualStrings("b", source_page.value.replacements[0].targets[0]);
+    const Port = struct {
+        db: *DB,
+        source_page: effects.ScanPage,
+
+        pub fn readSource(self: @This(), _: Allocator, source: effects.ScanRequest) !effects.ScanPage {
+            try std.testing.expect(source.after == null);
+            return self.source_page;
+        }
+
+        pub fn writePage(self: @This(), command: dag.SourceFenceCommand) !void {
+            const batch: types.BatchRequest = .{ .dag_source_fence = command };
+            try self.db.applyOrderedCommittedMutation(batch, .{ .term = 1, .index = 3 }, true);
+            try self.db.applyOrderedCommittedMutation(batch, .{ .term = 1, .index = 3 }, true);
+        }
+    };
+    const port: Port = .{ .db = &db, .source_page = source_page.value };
+    var partial_page = source_page.value;
+    partial_page.exhausted = false;
+    const partial_port: Port = .{ .db = &db, .source_page = partial_page };
+    const initial_checkpoint = (try db.dagActivationCheckpoint(a, namespace, domain, fence)).?;
+    defer initial_checkpoint.deinit(a);
+    var mismatched = initial_checkpoint;
+    mismatched.root_count = 2;
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, effects.advanceScan(a, partial_port, manifest, request.dag_source_fence.?, mismatched));
+    try std.testing.expect(!try effects.advanceScan(a, partial_port, manifest, request.dag_source_fence.?, initial_checkpoint));
+    const committed = (try db.dagActivationCheckpoint(a, request.dag_source_fence.?.namespace, domain, fence)).?;
+    defer committed.deinit(a);
+    try std.testing.expectEqualSlices(u8, graph_key, committed.after.?[5..]);
+    var changed_root = roots[0];
+    changed_root.generation += 1;
+    const changed = try effects.ScanManifest.init(&.{.{ .id = domain, .roots = &.{changed_root} }}, namespace, fence.activation);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, effects.advanceScan(a, port, changed, request.dag_source_fence.?, committed));
+    const cursor = committed.after.?;
+    request.dag_source_fence.?.scan.?.page = .{
+        .after = cursor,
+        .next = "\x00\x00\x00\x01\x01",
+        .replacements = &.{.{ .owner = owner, .source = "b", .targets = &.{"a"} }},
+    };
+    try std.testing.expectError(error.InvalidDagMutation, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 4 }, true));
+    request.dag_source_fence.?.scan.?.page.?.next = "\x00\x00\x00\x00\x01";
+    try std.testing.expectError(error.GraphCycle, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 4 }, true));
+    const checkpoint = (try db.dagActivationCheckpoint(a, request.dag_source_fence.?.namespace, domain, fence)).?;
+    defer checkpoint.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), checkpoint.owner_epoch);
+    try std.testing.expectEqualSlices(u8, cursor, checkpoint.after.?);
+    const lookup_control = try std.json.Stringify.valueAlloc(a, .{
+        .mode = @as(enum { dag_activation_checkpoint }, .dag_activation_checkpoint),
+        .dag_scan = .{ .namespace = request.dag_source_fence.?.namespace, .domain = domain, .fence = fence },
+    }, .{ .emit_strings_as_arrays = true });
+    defer a.free(lookup_control);
+    var result = (try db.lookup(a, "", .{ .relational_topology_json = lookup_control })).?;
+    defer result.deinit(a);
+    const decoded = try std.json.parseFromSlice(dag.Contributions.ScanCheckpoint, a, result.json, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(checkpoint, decoded.value);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, db.dagActivationCheckpoint(a, @splat(255), domain, fence));
+    request.dag_source_fence.?.scan = null;
+    request.dag_source_fence.?.action = .release;
+    try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 5 }, true);
+    request.dag_source_fence.?.action = .acquire;
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 6 }, true));
+    try std.testing.expectEqualDeep(@as(OrderedApplyReceipt, .{ .term = 1, .index = 5 }), (try db.orderedApplyReceipt()).?);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect((try dag.SourceFence.read(&read)) == null);
+}
+
+test "db DAG authority prepare commits through the native transaction path" {
+    const a = std.testing.allocator;
+    const dag = @import("../../graph/dag_authority.zig");
+    var directory = try TestDirectory.init("dag-authority-prepare");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    const domain: dag.Digest = @splat(1);
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        try dag.Storage.create(&writer, domain, 1);
+        try dag.Storage.activateNewIncarnation(&writer, domain, 1);
+        try writer.commit();
+    }
+    const producer_versions: dag.Digest = @splat(2);
+    const txn_id = try db.beginTransaction(100);
+    const replacements: []const dag.Contributions.Replacement = &.{.{ .owner = @splat(3), .source = "left", .targets = &.{"right"} }};
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "left", .value = "{}" }},
+        .dag_domains = &.{.{
+            .domain = domain,
+            .epoch = 1,
+            .revision = 0,
+            .attempt = .{
+                .id = @splat(4),
+                .transaction = txn_id,
+                .candidate = dag.Contributions.candidate(producer_versions, replacements),
+            },
+            .producer_versions = producer_versions,
+            .replacements = replacements,
+        }},
+    });
+    try db.commitTransaction(txn_id, 200);
+    const value = (try db.get(a, "left")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("{}", value);
+    var reader = try db.core.store.beginReadTxn();
+    defer reader.abort();
+    const state = try dag.Storage.load(&reader, domain);
+    try std.testing.expectEqual(@as(u64, 1), state.revision);
+    try std.testing.expect(state.pending == null);
 }

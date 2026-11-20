@@ -205,6 +205,8 @@ pub const MergeReplicationCheckpoint = struct {
 /// Private data-Raft command used by the distributed transaction protocol.
 /// Every value that can affect durable state is carried in the command so
 /// replay is deterministic on followers and after restart.
+pub const DagDomainPrepare = transactions_mod.DagDomainPrepare;
+
 pub const TransactionMutation = union(enum) {
     begin: struct {
         txn_id: TxnId,
@@ -220,6 +222,7 @@ pub const TransactionMutation = union(enum) {
     prepare: struct {
         txn_id: TxnId,
         topology_epoch: u64,
+        dag_domains: []const DagDomainPrepare = &.{},
     },
     resolve: struct {
         txn_id: TxnId,
@@ -278,6 +281,7 @@ pub const BatchRequest = struct {
     online_source: ?@import("online_source_contract.zig").Command = null,
     /// Ordered complete artifact catalog; accepted only by private Raft ingress.
     artifact_catalog: ?@import("artifact_inventory.zig").Command = null,
+    dag_source_fence: ?@import("../../graph/dag_authority.zig").SourceFenceCommand = null,
     /// Private grouped-source control; public batch JSON cannot populate it.
     group_source: ?@import("group_source_contract.zig").Command = null,
     /// Exact producer result; only authenticated owner-leader Raft ingress.
@@ -1758,6 +1762,7 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    dag_domains: []const DagDomainPrepare = &.{},
     commit_requires: ?CommitRequires = null,
     prepared_enrichments_json: ?[]const u8 = null,
     document_version_scheme: DocumentVersionScheme = .admit_current,

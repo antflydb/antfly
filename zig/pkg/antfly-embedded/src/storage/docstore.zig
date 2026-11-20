@@ -5711,6 +5711,46 @@ test "docstore runtime lsm persists replay rows across namespace reopen" {
     try std.testing.expectEqualStrings("replay:1", entries[0].payload);
 }
 
+test "DAG source fence prevents primary and artifact writes until released" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const document = try internal_keys.documentKeyAlloc(alloc, "source");
+    defer alloc.free(document);
+    const edge = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "source", "g", "R", "target");
+    defer alloc.free(edge);
+    const dag = @import("../graph/dag_authority.zig");
+    const fence: dag.SourceFence = .{ .activation = @splat(1), .snapshot = @splat(2) };
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try fence.acquire(&writer);
+        try writer.commit();
+    }
+    try std.testing.expectError(error.GraphConstraintBusy, store.put(document, "{}"));
+    try std.testing.expectError(error.GraphConstraintBusy, store.putBatch(&.{.{ .key = edge, .value = "edge" }}, &.{}));
+    {
+        var writer = try store.beginWriteTxn();
+        defer writer.abort();
+        try fence.release(&writer);
+        try writer.put(document, "{}");
+        try std.testing.expectError(error.GraphConstraintBusy, writer.commit());
+    }
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        const stale: dag.SourceFence = .{ .activation = @splat(3), .snapshot = fence.snapshot };
+        try std.testing.expectError(error.GraphConstraintAttemptConflict, stale.release(&writer));
+        try fence.release(&writer);
+        try writer.commit();
+    }
+    try store.put(document, "{}");
+    try store.putBatch(&.{.{ .key = edge, .value = "edge" }}, &.{});
+}
+
 test "graph incoming directory follows primary transaction commit and rollback" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;

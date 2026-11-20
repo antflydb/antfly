@@ -7749,6 +7749,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_extraction_generation.",
             "storage.db.artifact_generation_scope.",
             "storage.db.artifact_graph_publication.",
+            "storage.db.dag_activation_contract.",
+            "storage.db.dag_graph_effects.",
             "storage.db.artifact_inventory.",
             "storage.db.artifact_native_stream.",
             "storage.db.prepared_producer_acceptance.",
