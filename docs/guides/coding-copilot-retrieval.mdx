@@ -57,7 +57,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
 
 ## Before You Start
 
-Antfly running in standalone mode with the embedding and reranking models pulled, which the [Quickstart](/docs/guides/quickstart) leaves you with:
+Antfly running in standalone mode with the embedding and reranking models pulled, which the [optional AI steps in the Quickstart](/docs/guides/quickstart#optional-local-ai) leave you with:
 
 ```bash
 curl -s http://127.0.0.1:8080/db/v1/status | head -c 200
@@ -185,4 +185,4 @@ Then prompt it with the outcome, for example "Index this repository into Antfly 
 ## Next Steps
 
 - [Tune Hybrid Search](/docs/guides/hybrid-search): fusion weights, reranking, and pruning in depth
-- [Quickstart](/docs/guides/quickstart): the same queries in the TypeScript, Python, and Go SDKs
+- [SDKs](/docs/reference/sdks): application clients for the same query API

@@ -18,7 +18,7 @@ order: 5
 - Does Antfly Lite need an inference runtime?
 </Questions>
 
-Antfly Lite is Antfly in one file. Documents, schemas, indexes, enrichments, and query-visible artifacts live in a local `.aflite` database that an application opens directly, with no server process. Choose Lite for development, desktop apps, edge workers, tests, and single-user deployments. Choose a normal instance when you need replication, shard placement, multi-node scaling, or cluster metadata. Everything else, from the index model to the query API, is the same code.
+Antfly Lite is Antfly in one file. Documents, schemas, indexes, enrichments, and query-visible artifacts live in a local `.aflite` database that an application opens directly, with no server process. Choose Lite for development, desktop apps, edge workers, tests, and managed databases in Antfly Cloud. Choose a normal instance when you need replication, shard placement, multi-node scaling, or cluster metadata. Everything else, from the index model to the query API, is the same code.
 
 Embedded storage query execution rejects non-null `evaluate`; use the
 [supported embedded API surface](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfly-embedded/WASM.md#hosted-entry-points)
@@ -517,6 +517,7 @@ Then prompt it with the outcome, for example "Embed Antfly Lite in my Go applica
 
 ## Next Steps
 
-- [Quickstart](/docs/guides/quickstart): the same queries against a normal standalone instance
+- [Quickstart](/docs/guides/quickstart): search Wikipedia locally, with optional AI steps
+- [Move a database to Antfly Cloud](/docs/guides/cloud-migration): import and export a complete Lite database
 - [Document Engine](/docs/guides/document-engine): how mappings, full-text, vector, and graph indexes compose under one query, in Lite and everywhere else
 - [Backup and Restore](/docs/api/data-operations): the `.afb` format and restore options on a normal instance

@@ -1,198 +1,162 @@
 ---
 title: Quickstart
-description: Install Antfly, load data, and run your first queries
+description: Search 10,000 Wikipedia articles in Lite, then optionally move to Cloud or add local AI
 prerequisites:
-  - "curl and jq (for sample data)"
+  - "Bash and curl for downloading the sample data"
 difficulty: beginner
-estimatedTime: "45–90 min"
-tags: [getting-started, setup, quickstart]
+estimatedTime: "15 min for keyword search; 45–90 min with optional models"
+tags: [getting-started, setup, quickstart, lite]
 sidebar: getting-started
 order: 2
 ---
 
-By the end of this page you have Antfly running on your machine with 10,000 Wikipedia articles loaded, and you have searched them by keyword, by meaning, and by what their pictures show, then asked a local model to answer a question from them, all on your own machine with no hosted service involved.
-
-Allow 45 to 90 minutes on a laptop. The first full-text check takes seconds; model downloads and background indexing take most of the time, and slower hardware may need longer timeouts.
+Load 10,000 Wikipedia articles into a local `.aflite` database and search them by
+keyword with the Antfly CLI. No model download or Cloud account is required.
+After that, you can [move the database to Cloud](#move-this-database-to-cloud) or
+continue with the [optional AI steps](#optional-local-ai) on this page.
 
 ## Install Antfly
 
-<Tabs defaultValue="macos">
-  <TabsList>
-    <TabsTrigger value="macos">macOS</TabsTrigger>
-    <TabsTrigger value="linux">Linux</TabsTrigger>
-    <TabsTrigger value="docker">Docker</TabsTrigger>
-  </TabsList>
+Download [Antfly v0.3.1](https://github.com/antflydb/antfly/releases/tag/v0.3.1)
+for your OS and architecture, verify its published checksum, and extract the
+archive. Keep its supporting files beside the binary and add that directory to
+`PATH`. See [Downloads](/docs/downloads) for installation options.
 
-  <TabsContent value="macos">
 ```bash
-brew install antflydb/taps/antfly
-
-# Verify
 antfly --version
 ```
-  </TabsContent>
 
-  <TabsContent value="linux">
-```bash
-curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-
-# Verify
-antfly --version
-```
-  </TabsContent>
-
-  <TabsContent value="docker">
-See the [Downloads page](/docs/downloads) for a complete Docker Compose setup with Antfly.
-  </TabsContent>
-</Tabs>
+This walkthrough uses `0.3.1`. Check file compatibility before opening an existing
+Lite database with another runtime version.
 
 ## Start Antfly
 
-Start Antfly in standalone mode:
+In a new directory, start Antfly with Lite storage:
 
 ```bash
-antfly standalone --inference-host-budget-mb 8192 2>&1 | tee "antfly.log"
+mkdir antfly-quickstart
+cd antfly-quickstart
+antfly standalone --storage-engine lite --storage-path "$PWD/quickstart.aflite"
 ```
 
-If you installed with Homebrew, you can run Antfly as a service instead:
-
-```bash
-brew services start antfly
-```
-
-Standalone mode runs metadata, data, and Antfly Inference together. On macOS (Metal) and other GPU builds, model execution runs in a supervised child worker that standalone starts and restarts for you. The 8 GiB inference budget is what lets the all-local RAG step at the end run the embedding, reranking, and Gemma models in one request; drop the flag if you plan to use a hosted generator. The web dashboard is at `http://127.0.0.1:8080` once it is up. Every command on this page uses the numeric loopback address because it matches standalone's default bind on systems where `localhost` resolves to IPv6 first.
-
-### Verify the basic data path
-
-One document in, one document out, before anything expensive:
-
-```bash
-curl -fsS -X POST http://127.0.0.1:8080/db/v1/tables/hello \
-  -H "Content-Type: application/json" \
-  -d '{}'
-
-curl -fsS -X POST http://127.0.0.1:8080/db/v1/tables/hello/batch \
-  -H "Content-Type: application/json" \
-  -d '{"inserts":{"first":{"title":"Hello","body":"Antfly is ready."}},"sync_level":"full_text"}'
-
-antfly query --table hello \
-  --full-text-search 'body:Antfly' \
-  --fields 'title,body'
-```
-
-The last command returns the document with key `first`. If it does not, stop here and see [Troubleshooting](#troubleshooting).
-
-### Install the text embedding model
-
-Pull the text embedding model used for semantic search. [Antfly Inference](/docs/guides/inference) runs it locally under standalone, with no external API:
-
-```bash
-antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
-antfly inference list
-```
-
-EmbeddingGemma2 embeds text, images, audio, and video in the same 768-dimensional space and runs on CPU, Metal, or CUDA.
-
-<Callout type="info">
-The running process picks up the new model on its next model-list or inference
-request. The Antfarm dashboard refreshes its model list about every 30 seconds,
-so allow up to a minute for it to appear there.
-</Callout>
-
-## Download Sample Data
-
-In a new terminal, download 10,000 Wikipedia articles enriched with thumbnail images:
-
-```bash
-curl -L -o wiki-articles.jsonl https://cdn.antfly.io/datasets/wiki-articles-10k-v001.json
-head -n 1 wiki-articles.jsonl | jq '.'
-```
-
-One article per line, each with `title`, `body`, and `url`. 2,446 of the 10,000 also carry a `thumbnail_url`, which the image search step uses later.
+Leave this terminal running. The API and dashboard are at
+[http://127.0.0.1:8080](http://127.0.0.1:8080), and fsync is enabled by default.
+`--storage-path` selects the database file. Other server state uses `~/.antfly`;
+add `--data-dir "$PWD/state"` if you want a separate server-state directory.
 
 ## Create a Table
 
-Create a table with a text embedding index for semantic search. Each step shows the CLI and the equivalent HTTP request; the [SDKs](/docs/reference/sdks) for Go, TypeScript, Python, and Rust take the same request bodies.
-
-<Tabs defaultValue="cli">
-  <TabsList>
-    <TabsTrigger value="cli">CLI</TabsTrigger>
-    <TabsTrigger value="curl">cURL</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="cli">
-```bash
-antfly table create --table wikipedia \
-  --index '{
-    "name": "title_body",
-    "type": "embeddings",
-    "template": "{{title}} {{body}}",
-    "embedder": {
-      "provider": "antfly",
-      "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
-    },
-    "chunker": {
-      "provider": "antfly",
-      "text": {
-        "target_tokens": 200,
-        "overlap_tokens": 25
-      }
-    }
-  }'
-```
-  </TabsContent>
-
-  <TabsContent value="curl">
-```bash
-curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia \
-  -H "Content-Type: application/json" \
-  -d '{
-    "indexes": {
-      "title_body": {
-        "type": "embeddings",
-        "template": "{{title}} {{body}}",
-        "embedder": {
-          "provider": "antfly",
-          "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
-        },
-        "chunker": {
-          "provider": "antfly",
-          "text": {
-            "target_tokens": 200,
-            "overlap_tokens": 25
-          }
-        }
-      }
-    }
-  }'
-```
-  </TabsContent>
-
-</Tabs>
-
-Verify the table and index were created:
+Open a second terminal in the same directory. The CLI defaults to the local
+server; clear any Cloud connection settings from an earlier session:
 
 ```bash
-antfly table list
-antfly index list --table wikipedia
+unset ANTFLY_URL ANTFLY_TOKEN ANTFLY_USERNAME ANTFLY_PASSWORD
+unset ANTFLY_DATABASE ANTFLY_NAMESPACE
+antfly table create --table wikipedia
 ```
 
-`title_body` is the embeddings index you created. `full_text_index_v0` came free: every table gets one, and it is what the keyword query below runs against.
+Every table has a full-text index, `full_text_index_v0`. No embedding index is
+needed for the first query. The [SDKs](/docs/reference/sdks) use the same query API.
+
+## Download Sample Data
+
+```bash
+curl --fail --location --output wiki-articles.jsonl \
+  https://cdn.antfly.io/datasets/wiki-articles-10k-v001.json
+```
+
+The download is about 12 MB, with one JSON document per line: `title`, `body`,
+and `url`. Of these articles, 2,446 of the 10,000 also have `thumbnail_url`.
+The keyword steps do not download images or models.
 
 ## Load Data
 
 ```bash
-# Load all 10,000 articles using the title as the document ID
 antfly load --table wikipedia \
   --file wiki-articles.jsonl \
   --id-field title \
   --sync-level full_text
 ```
 
-The CLI reads the JSONL and batches it for you. `--sync-level full_text` returns once each batch is keyword-searchable; embeddings keep generating in the background. (An application that owns its own ingestion uses the SDK [batch operations](/docs/api/data-operations) with bounded batches and retries.)
+Wait for the load to finish successfully with 10,000 documents. The CLI batches
+the writes and waits for keyword-search visibility. Titles become stable IDs;
+loading again replaces documents with the same IDs.
 
-Wait until 10% of documents have searchable embeddings:
+## Search
+
+### Full-Text Search
+
+Find articles mentioning Korea:
+
+```bash
+antfly query --table wikipedia \
+  --full-text-search 'body:"Korea"' \
+  --fields "title,url" \
+  --limit 5
+```
+
+The results include article titles and source links. Add the global option
+`antfly --output json query ...` when you need the complete JSON response.
+Try another word or phrase, or continue to Cloud or local AI below.
+
+## Move this database to Cloud
+
+Follow [Move a database to Antfly Cloud](/docs/guides/cloud-migration) to take a
+consistent `.aflite` snapshot, upload it, and run the same CLI query against the
+managed copy. Import creates a new database; it does not require reloading
+Wikipedia. Your local copy remains independent.
+
+## Optional local AI
+
+The remaining steps add embeddings, semantic and image search, reranking, and RAG
+to the same local table. They are optional and can take 45–90 minutes, mainly for
+model downloads and background indexing. Their model and memory requirements are
+separate from the managed Cloud Lite package.
+
+If you followed the migration guide, reconnect the CLI to your local server:
+
+```bash
+unset ANTFLY_URL ANTFLY_TOKEN
+```
+
+For the all-local RAG example, stop the server with <kbd>Ctrl</kbd>+<kbd>C</kbd>,
+then restart the same file with an 8 GiB inference budget and a captured log:
+
+```bash
+antfly standalone --storage-engine lite --storage-path "$PWD/quickstart.aflite" \
+  --inference-host-budget-mb 8192 2>&1 | tee antfly.log
+```
+
+If you chose a separate `--data-dir` earlier, use the same path when restarting.
+Skip the larger budget if you plan to use a hosted generator. In the second
+terminal, continue with the model and index setup.
+
+### Install the text embedding model
+
+```bash
+antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
+antfly inference list
+```
+
+EmbeddingGemma2 embeds text, images, audio, and video in the same 768-dimensional
+space and runs on CPU, Metal, or CUDA. The running process picks up the new model
+on its next model-list or inference request.
+
+### Add text embeddings
+
+Add an index to the table you already loaded:
+
+```bash
+antfly index create --table wikipedia \
+  --index title_body \
+  --type embeddings \
+  --template '{{title}} {{body}}' \
+  --embedder '{"provider":"antfly","model":"google/embeddinggemma-2:bf16-safetensors-bundle-v1"}' \
+  --chunker '{"provider":"antfly","text":{"target_tokens":200,"overlap_tokens":25}}'
+```
+
+Antfly backfills the existing articles; do not reload them. Wait until 10% of
+source documents have searchable embeddings:
 
 ```bash
 antfly index wait --table wikipedia \
@@ -201,43 +165,8 @@ antfly index wait --table wikipedia \
   --timeout 45m
 ```
 
-Continue as soon as it returns; results improve as the rest of the corpus is indexed, and `antfly index list --table wikipedia` shows progress (counts are per chunk, so they can exceed the article count). Use `--until complete` to wait for everything. If the wait times out, see [Troubleshooting](#troubleshooting).
-
-## Search
-
-### Full-Text Search
-
-Search for articles containing specific terms. Each `antfly query` flag maps to the matching snake_case field on `POST /db/v1/query`, so the remaining searches show only the CLI:
-
-<Tabs defaultValue="cli">
-  <TabsList>
-    <TabsTrigger value="cli">CLI</TabsTrigger>
-    <TabsTrigger value="curl">cURL</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="cli">
-```bash
-antfly query --table wikipedia \
-  --full-text-search 'body:"Korea"' \
-  --fields "title,url" \
-  --limit 5
-```
-  </TabsContent>
-
-  <TabsContent value="curl">
-```bash
-curl -X POST http://127.0.0.1:8080/db/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "table": "wikipedia",
-    "full_text_search": {"query": "body:\"Korea\""},
-    "fields": ["title", "url"],
-    "limit": 5
-  }'
-```
-  </TabsContent>
-
-</Tabs>
+Index artifact counts are per chunk, so they can exceed the article count.
+Coverage continues growing while you try the following searches.
 
 ### Semantic Search
 
@@ -343,13 +272,6 @@ antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 \
 Give Gemma an intent and a table. The retrieval agent delegates query planning
 to the query builder, searches, and answers from the results.
 
-<Tabs defaultValue="cli">
-  <TabsList>
-    <TabsTrigger value="cli">CLI</TabsTrigger>
-    <TabsTrigger value="curl">cURL</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="cli">
 ```bash
 antfly agents retrieval --table wikipedia \
   --intent "What are the major events in Korean history?" \
@@ -363,37 +285,8 @@ antfly agents retrieval --table wikipedia \
   --max-internal-iterations 8 \
   --streaming
 ```
-  </TabsContent>
 
-  <TabsContent value="curl">
-```bash
-curl -N -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
-  -H "Content-Type: application/json" \
-  -H "Accept: text/event-stream" \
-  -d '{
-    "query": "What are the major events in Korean history?",
-    "queries": [{
-      "table": "wikipedia",
-      "fields": ["title", "body"],
-      "limit": 5
-    }],
-    "generator": {
-      "provider": "antfly",
-      "model": "ggml-org/gemma-4-E4B-it-GGUF",
-      "max_tokens": 512
-    },
-    "max_internal_iterations": 8,
-    "stream": true,
-    "steps": {
-      "generation": {"enabled": true}
-    }
-  }'
-```
-  </TabsContent>
-
-</Tabs>
-
-Both commands stream Server-Sent Events as each step completes and end with `event: done`. Use `--no-streaming` (or `"stream": false`) to get one JSON body with the answer and its sources. To see the query the agent would run without running it, use `antfly agents query-builder` with the same `--table`, `--intent`, and `--generator`.
+The command streams Server-Sent Events as each step completes and ends with `event: done`. Use `--no-streaming` to get one JSON body with the answer and its sources. To see the query the agent would run without running it, use `antfly agents query-builder` with the same `--table`, `--intent`, and `--generator`.
 
 ### RAG with alternative providers
 
@@ -463,91 +356,30 @@ Local models need no key and keep data on the machine; hosted ones are faster on
 
 ### Evaluation
 
-`steps.eval` scores retrieval and generation quality in the same request. The
-CLI has no evaluation flag, so send it on the API request:
-
-```bash
-curl -N -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
-  -H "Content-Type: application/json" \
-  -H "Accept: text/event-stream" \
-  -d '{
-    "query": "What are the major events in Korean history?",
-    "queries": [{
-      "table": "wikipedia",
-      "semantic_search": "What are the major events in Korean history?",
-      "indexes": ["title_body"],
-      "fields": ["title", "body"],
-      "limit": 5
-    }],
-    "generator": {"provider": "gemini", "model": "gemini-2.5-flash"},
-    "stream": true,
-    "steps": {
-      "generation": {"enabled": true},
-      "eval": {
-        "evaluators": ["faithfulness", "relevance"],
-        "judge": {"provider": "gemini", "model": "gemini-2.5-flash"}
-      }
-    }
-  }'
-```
-
-The scores arrive as an `eval` event in the stream. Judge metrics include `relevance`, `faithfulness`, `completeness`, and `citation_quality`; with `ground_truth.relevant_ids` you also get retrieval metrics such as `recall`, `ndcg`, and `mrr`.
+The retrieval API also supports quality evaluation. See the [API reference](/docs/api)
+when you need retrieval or generation scores in your application.
 </Steps>
 
 ## Troubleshooting
 
-### `antfly` is not found after the Linux install
+- **Wrong runtime or command not found:** check `antfly --version` and the extracted
+  binary's location on `PATH`. Keep the archive's supporting files beside it.
+- **Port conflict:** choose another `--port` and, if needed, `--health-port`.
+  Set `ANTFLY_URL` to the matching server base URL in the CLI terminal.
+- **Table already exists:** skip creation when continuing this example, or use a
+  fresh directory and `.aflite` path. Do not overwrite a database you want to keep.
+- **Legacy server state:** use a fresh `--data-dir` and preserve the old directory.
+- **Model not found:** run `antfly inference list` and inspect the
+  `standalone inference paths` line in `antfly.log`. Confirm that the server and
+  CLI use the same model directory.
+- **Index wait timed out:** capture `antfly index list --table wikipedia --output json`
+  and the recent server log. Counts that keep growing on unchanged data or
+  coverage that never advances need investigation.
+- **Memory errors:** stop other large local models, use a hosted generator, or
+  increase `--inference-host-budget-mb` if your machine has capacity.
 
-The installer puts the binary in `~/.local/bin`. Add it to the current shell and retry:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-antfly --version
-```
-
-### Antfly reports a legacy data directory
-
-Antfly will not overwrite a data directory from the old Go runtime. Leave it in place, back it up with that runtime if you need it, and start this quickstart on a fresh directory:
-
-```bash
-antfly standalone --data-dir "$HOME/.antfly-zig" 2>&1 | tee antfly.log
-```
-
-Models stay in `~/.antfly/inference/models` unless you pass `--models-dir` or set `ANTFLY_INFERENCE_MODELS_DIR`.
-
-### `MODEL_NOT_FOUND`
-
-Confirm the model is installed and check the model directory the startup log printed:
-
-```bash
-antfly inference list
-grep -F 'standalone inference paths' antfly.log
-```
-
-Pull it again, or point at the right directory with `antfly standalone --models-dir <path>`.
-
-### An index remains pending or `index wait` times out
-
-Wait for the readiness threshold each step names before moving on. `queryable_partial` is safe to query while coverage grows, but an empty published generation cannot produce results. If `index wait` times out, capture the full status and the recent log:
-
-```bash
-antfly index list --table wikipedia --output json | jq '.'
-grep -E 'watchdog|derived worker|NotFound|EnrichmentWaitTimeout' antfly.log | tail -n 100
-```
-
-Chunk and vector counts exceeding the article count is normal. Counts that keep growing on unchanged data, coverage that never advances, or a `ready` index dropping back to `pending` is a bug: report it with the JSON status, the log excerpt, the Antfly version, and the startup command.
-
-### Startup reports a port conflict or memory error
-
-Stop whatever holds ports 8080 or 4200, or pick others with `--port` and `--health-port`. For memory errors, stop other large local models, or retry with a smaller model or a larger `--inference-host-budget-mb`.
-
-### Stop the quickstart
-
-Press <kbd>Ctrl</kbd>+<kbd>C</kbd> in the standalone terminal, or with Homebrew services:
-
-```bash
-brew services stop antfly
-```
+Stop the server with <kbd>Ctrl</kbd>+<kbd>C</kbd>. The `.aflite` file remains on disk.
+Stopping this local process does not delete a managed Cloud copy or stop its billing.
 
 ## Give Your Agent the Antfly Skill
 
@@ -561,6 +393,8 @@ From here your agent can create tables, build indexes, and write queries against
 
 ## Next Steps
 
+- [Move a database to Antfly Cloud](/docs/guides/cloud-migration): snapshot, import, and verify the managed copy.
+
 You have a running instance, an indexed table, and an agent that knows Antfly. Each of these guides builds one thing on top of that and ends with a prompt you can hand to the agent:
 
 - [Build a Support Answer Agent](/docs/guides/support-answer-agent): one call that answers a customer's question from your help articles
@@ -571,4 +405,4 @@ You have a running instance, an indexed table, and an agent that knows Antfly. E
 - [Tune Hybrid Search](/docs/guides/hybrid-search): fusion, reranking, and pruning, and which of them your data needs
 - [Multimodal Embeddings](/docs/guides/multimodal): the image index from this page in depth, plus audio and your own vectors
 
-For production, the [Antfly Operator](/docs/operator/getting-started/quickstart) deploys on Kubernetes, and [backup and restore](/docs/api/data-operations) protects what you loaded.
+See [Deployment options](/docs/guides/deployment-options) for ways to run Antfly and [backup and restore](/docs/api/data-operations) to protect what you loaded.

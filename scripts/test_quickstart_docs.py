@@ -35,6 +35,7 @@ LAUNCH_PAGES = (
     REPO / "docs" / "downloads.mdx",
     REPO / "docs" / "guides" / "inference.mdx",
     REPO / "docs" / "guides" / "hybrid-search.mdx",
+    REPO / "docs" / "guides" / "cloud-migration.mdx",
 )
 DOCS_DIR = REPO / "docs"
 # Terminology is fixed, not decorative. Prose must not use these forms.
@@ -93,14 +94,18 @@ def check_shell(block: str, index: object) -> None:
 
 
 def check_json_payloads(source: str) -> None:
-    payloads = re.findall(r"\s-d '(\{.*?\})'", source, re.DOTALL)
+    payloads = re.findall(
+        r"(?:\s-d|--(?:embedder|chunker|reranker|pruner|generator|index|schema|filter-query|aggregations)) '(\{.*?\})'",
+        source,
+        re.DOTALL,
+    )
     if not payloads:
-        fail("no cURL JSON payloads found")
+        fail("no request JSON payloads found")
     for index, payload in enumerate(payloads, start=1):
         try:
             json.loads(payload)
         except json.JSONDecodeError as error:
-            fail(f"cURL JSON payload {index} is invalid: {error}")
+            fail(f"request JSON payload {index} is invalid: {error}")
 
 
 def check_page_blocks(path: Path) -> None:
@@ -120,7 +125,7 @@ def check_page_blocks(path: Path) -> None:
         try:
             json.loads(payload)
         except json.JSONDecodeError as error:
-            fail(f"{path.name} cURL JSON payload {index} is invalid: {error}")
+            fail(f"{path.name} request JSON payload {index} is invalid: {error}")
 
 
 def check_terminology() -> None:
@@ -275,7 +280,6 @@ def main() -> int:
             fail(f"{message}: found {token!r}")
 
     required = (
-        'export PATH="$HOME/.local/bin:$PATH"',
         "wiki-articles.jsonl",
         "2,446 of the 10,000",
         "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank",
