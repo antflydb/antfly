@@ -2295,6 +2295,13 @@ pub const KernelModule = struct {
     runtime_jit_pending_routes: JitProductionRoutes = .{},
     runtime_jit_qualified_scope: JitRouteScope = .{},
     runtime_jit_stats: RuntimeJitStats = .{},
+    gemma4_small_decode_tiles: bool = false,
+    gemma4_small_ffn_calls: usize = 0,
+    gemma4_small_ple_calls: usize = 0,
+    gemma4_small_ffn_pair: driver_mod.CUfunction = null,
+    gemma4_small_ffn_down: driver_mod.CUfunction = null,
+    gemma4_small_ple_gate: driver_mod.CUfunction = null,
+    gemma4_small_ple_projection: driver_mod.CUfunction = null,
     fill_f32: driver_mod.CUfunction = null,
     copy_f32: driver_mod.CUfunction = null,
     copy_u8: driver_mod.CUfunction = null,
@@ -4296,6 +4303,10 @@ pub const KernelModule = struct {
             .linear_q4_0_generated_down_f32_e2b_12288_exact = linear_q4_0_generated_down_f32_e2b_12288_exact,
             .linear_q4_0_f32_tile4 = linear_q4_0_f32_tile4,
             .linear_q4_0_f32_tile4_w4 = linear_q4_0_f32_tile4_w4,
+            .gemma4_small_ffn_pair = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9) loadOptionalFunction(ctx, module, "termite_gemma4_small_ffn_pair_q8_1_f32") else null,
+            .gemma4_small_ffn_down = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9) loadOptionalFunction(ctx, module, "termite_gemma4_small_ffn_down_q8_1_f32") else null,
+            .gemma4_small_ple_gate = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9) loadOptionalFunction(ctx, module, "termite_gemma4_small_ple_gate_q8_1_f32") else null,
+            .gemma4_small_ple_projection = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9) loadOptionalFunction(ctx, module, "termite_gemma4_small_ple_projection_q8_1_f32") else null,
             .linear_q4_0_q8_1_f32_tile4 = linear_q4_0_q8_1_f32_tile4,
             .linear_q4_0_q8_1_f32_tile4_e4b_attn_2048 = linear_q4_0_q8_1_f32_tile4_e4b_attn_2048,
             .linear_q4_0_q8_1_f32_tile4_e4b_attn_4096 = linear_q4_0_q8_1_f32_tile4_e4b_attn_4096,
@@ -15215,6 +15226,17 @@ pub const KernelModule = struct {
             }
         }
 
+        if (self.gemma4_small_decode_tiles and rows == 1 and in_dim == 256 and out_dim == 2560) {
+            if (self.gemma4_small_ple_projection) |small| {
+                var rows_u32: u32 = 1;
+                var in_dim_u32: u32 = 256;
+                var out_dim_u32: u32 = 2560;
+                var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&input_ptr), @ptrCast(&weight_ptr), @ptrCast(&rows_u32), @ptrCast(&in_dim_u32), @ptrCast(&out_dim_u32) };
+                try launchBlocks(small, ctx, out_dim / 8, q4_0_tiled_threads_w4, &params);
+                self.gemma4_small_ple_calls += 1;
+                return;
+            }
+        }
         const function = self.linear_q4_0_q8_1_f32_tile4 orelse return error.CudaKernelUnavailable;
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
@@ -15251,6 +15273,26 @@ pub const KernelModule = struct {
         var dst_ptr = dst.ptr;
         var input_ptr = input_q8_1.ptr;
         var weight_ptr = weight_raw.ptr;
+        if (self.gemma4_small_decode_tiles and rows == 1) {
+            if (in_dim == 2560 and out_dim == 256) {
+                if (self.gemma4_small_ple_gate) |small| {
+                    var rows_u32: u32 = 1;
+                    var in_dim_u32: u32 = 2560;
+                    var out_dim_u32: u32 = 256;
+                    var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&input_ptr), @ptrCast(&weight_ptr), @ptrCast(&rows_u32), @ptrCast(&in_dim_u32), @ptrCast(&out_dim_u32) };
+                    try launchBlocks(small, ctx, out_dim, q4_0_tiled_threads, &params);
+                    self.gemma4_small_ple_calls += 1;
+                    return;
+                }
+            } else if (in_dim == 10240 and out_dim == 2560) {
+                if (self.gemma4_small_ffn_down) |small| {
+                    var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&input_ptr), @ptrCast(&weight_ptr) };
+                    try launchBlocks(small, ctx, out_dim, q4_0_tiled_threads, &params);
+                    self.gemma4_small_ffn_calls += 1;
+                    return;
+                }
+            }
+        }
         if (rows > 1) {
             if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_ROWS8_C4", false)) {
                 if (self.linear_q4_0_q8_1_f32_tile4_w8_rows8_c4) |function| {
@@ -15536,7 +15578,10 @@ pub const KernelModule = struct {
         source_cols: usize,
         source_start: usize,
         activation: u8,
+        exact_e4b_reduction: bool,
     ) driver_mod.Error!void {
+        if (exact_e4b_reduction and (ctx.info.compute_major != 8 or ctx.info.compute_minor != 9 or
+            rows != 1 or in_dim != 2560 or out_dim != 256)) return error.InvalidCudaState;
         const function = self.linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4 orelse return error.CudaKernelUnavailable;
         if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
         if (source_start > source_cols or out_dim > source_cols - source_start) return error.InvalidCudaState;
@@ -15570,7 +15615,8 @@ pub const KernelModule = struct {
             @ptrCast(&source_start_u32),
             @ptrCast(&activation_u32),
         };
-        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
+        const threads = if (exact_e4b_reduction) q4_0_tiled_threads else q4_0_tiled_threads_w4;
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, threads, &params);
     }
 
     pub fn launchLinearQ4KF32(
@@ -17246,6 +17292,14 @@ pub const KernelModule = struct {
         var weight_gate_ptr = weight_gate.ptr;
         var weight_up_ptr = weight_up.ptr;
         var activation_u32: u32 = activation;
+        if (self.gemma4_small_decode_tiles and rows == 1 and in_dim == 2560 and out_dim == 10240) {
+            if (self.gemma4_small_ffn_pair) |small| {
+                var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&input_ptr), @ptrCast(&weight_gate_ptr), @ptrCast(&weight_up_ptr), @ptrCast(&activation_u32) };
+                try launchBlocks(small, ctx, out_dim, q4_0_tiled_threads_w5, &params);
+                self.gemma4_small_ffn_calls += 1;
+                return;
+            }
+        }
         if (rows == 1 and in_dim == 2560 and out_dim == 10240) {
             if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_TILE4_W5_E4B_FFN", true)) {
                 if (self.linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn) |function| {
