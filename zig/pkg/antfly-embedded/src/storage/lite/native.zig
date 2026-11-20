@@ -4973,6 +4973,7 @@ const RedoCommitState = struct {
         record.appendSliceAssumeCapacity(self.logical_pending.items);
         record.appendSliceAssumeCapacity(self.pending.items);
         try self.writer.append(commit_sequence, record.items);
+        self.shared.stampPendingPages(self.writer.io, commit_sequence);
         self.shared.noteApplied(commit_sequence);
     }
 
@@ -7864,7 +7865,7 @@ pub const NativeFile = struct {
                 const logical_start = CompactCheckpoint.encoded_size + 4;
                 if (logical_start + logical_len > record.payload.len) return error.InvalidNativeRedoRecord;
                 try ac.overlay.decodeLogicalMutationsPayload(std.heap.page_allocator, record.payload[logical_start..][0..logical_len], record.commit_sequence);
-                try ac.overlay.decodeRedoGroupPayload(std.heap.page_allocator, record.payload[logical_start + logical_len ..]);
+                try ac.overlay.decodeRedoGroupPayload(std.heap.page_allocator, record.payload[logical_start + logical_len ..], record.commit_sequence);
             }
         };
         var apply: Apply = .{ .overlay = overlay, .io = io };
@@ -8114,7 +8115,7 @@ pub const NativeFile = struct {
                         const logical_start = CompactCheckpoint.encoded_size + 4;
                         if (logical_start + logical_len > record.payload.len) return error.InvalidNativeRedoRecord;
                         try rc.overlay.decodeLogicalMutationsPayload(rc.pop_allocator, record.payload[logical_start..][0..logical_len], record.commit_sequence);
-                        try rc.overlay.decodeRedoGroupPayload(rc.pop_allocator, record.payload[logical_start + logical_len ..]);
+                        try rc.overlay.decodeRedoGroupPayload(rc.pop_allocator, record.payload[logical_start + logical_len ..], record.commit_sequence);
                         rc.overlay.noteApplied(record.commit_sequence);
                     }
                 };
@@ -9523,6 +9524,12 @@ pub const NativeFile = struct {
         if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain or
             self.header.page_size != header.page_size or self.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
         if (std.meta.eql(self.header, header)) return;
+        // A peer's fold wrote every staged page image its records carried;
+        // this file's copies are stale once the peer may retire or reuse
+        // those pages. Drop them rather than fold them a second time.
+        const adopted_folded_through = header.checkpoints[header.active_checkpoint].redo_folded_through;
+        if (self.redo) |*redo| if (adopted_folded_through > self.header.checkpoints[self.header.active_checkpoint].redo_folded_through)
+            redo.shared.dropPagesFoldedThrough(self.runtimeIo(), adopted_folded_through);
         // perf/lwa-fold-churn: under the redo log, this rebind runs on
         // essentially every commit (`self.header` changes every commit --
         // `commit_sequence` alone guarantees that), but almost none of
