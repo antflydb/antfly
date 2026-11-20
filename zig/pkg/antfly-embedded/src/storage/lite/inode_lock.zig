@@ -441,6 +441,14 @@ pub fn publishCommittedSequence(entry: *Entry, sequence: u64) void {
 
 /// This inode's latest known-durable commit sequence in this process (0 if
 /// nothing has published yet). See `publishCommittedSequence`.
+/// The highest sequence this process's shared redo overlay holds (its own
+/// commits, durable or not, and what it replayed), or 0 before it exists.
+pub fn redoOverlayAppliedThrough(entry: *Entry, io: Io) u64 {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    return if (entry.redo_overlay) |*overlay| overlay.appliedThrough() else 0;
+}
+
 pub fn committedSequence(entry: *Entry) u64 {
     return entry.last_committed_sequence.load(.monotonic);
 }
