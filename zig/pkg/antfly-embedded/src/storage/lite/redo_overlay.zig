@@ -261,6 +261,11 @@ pub const SharedRedoOverlay = struct {
     /// written-once, never-updated-in-place chain has no "older version a
     /// pinned reader might still need" to preserve individually.
     pages: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+    /// The commit sequence of the record that staged each page in `pages`,
+    /// or `unstamped_page` for this process's own staged write before its
+    /// record is appended (`stampPendingPages`). Lets a peer's fold drop the
+    /// images it already wrote (`dropPagesFoldedThrough`). Under `mutex`.
+    page_sequences: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Highest commit sequence replayed from the log under each root: a
     /// commit this process did not make itself (its own commits go through
     /// `appendVersion`). A redo commit leaves the catalog roots in place, so
@@ -346,6 +351,7 @@ pub const SharedRedoOverlay = struct {
         var pages_it = self.pages.valueIterator();
         while (pages_it.next()) |bytes| allocator.free(bytes.*);
         self.pages.deinit(allocator);
+        self.page_sequences.deinit(allocator);
         self.pins.deinit(allocator);
         self.entry_pool.deinit(allocator);
         self.* = undefined;
@@ -374,7 +380,54 @@ pub const SharedRedoOverlay = struct {
         const allocator = owned_allocator;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        try self.page_sequences.put(allocator, page_id, unstamped_page);
         if (try self.pages.fetchPut(allocator, page_id, bytes)) |old| allocator.free(old.value);
+    }
+
+    pub const unstamped_page: u64 = std.math.maxInt(u64);
+
+    /// Gives this process's own staged pages the sequence of the record that
+    /// just carried them.
+    pub fn stampPendingPages(self: *SharedRedoOverlay, io: std.Io, sequence: u64) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var it = self.page_sequences.valueIterator();
+        while (it.next()) |seq| if (seq.* == unstamped_page) {
+            seq.* = sequence;
+        };
+    }
+
+    /// Drops staged page images whose records a fold through
+    /// `folded_through` has written to the file -- a peer's fold, which
+    /// this process adopts instead of folding them itself. Left staged, a
+    /// later fold here would write the stale image over a page the peer
+    /// has since retired or reused.
+    pub fn dropPagesFoldedThrough(self: *SharedRedoOverlay, io: std.Io, folded_through: u64) void {
+        const allocator = owned_allocator;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var dropped = false;
+        var it = self.page_sequences.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.* == unstamped_page or kv.value_ptr.* > folded_through) continue;
+            if (self.pages.fetchRemove(kv.key_ptr.*)) |page| allocator.free(page.value);
+            dropped = true;
+        }
+        if (!dropped) return;
+        // Rebuild the sequence map from the pages that remain.
+        var kept: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+        var keep_it = self.page_sequences.iterator();
+        while (keep_it.next()) |kv| if (self.pages.contains(kv.key_ptr.*)) {
+            kept.put(allocator, kv.key_ptr.*, kv.value_ptr.*) catch {
+                // Out of memory: keep the old map; stale entries for removed
+                // pages are harmless (they name no image).
+                kept.deinit(allocator);
+                return;
+            };
+        };
+        self.page_sequences.deinit(allocator);
+        self.page_sequences = kept;
+        compactAfterRemovals(&self.pages, std.hash_map.AutoContext(u64){});
     }
 
     /// Returns a *copy* of the staged page's bytes, or null if nothing is
@@ -465,6 +518,7 @@ pub const SharedRedoOverlay = struct {
         defer self.mutex.unlock(io);
         for (flushed) |p| {
             if (self.pages.fetchRemove(p.page_id)) |kv| allocator.free(kv.value);
+            _ = self.page_sequences.remove(p.page_id);
         }
         if (flushed.len != 0) compactAfterRemovals(&self.pages, std.hash_map.AutoContext(u64){});
     }
@@ -490,6 +544,7 @@ pub const SharedRedoOverlay = struct {
         var it = self.pages.valueIterator();
         while (it.next()) |bytes| allocator.free(bytes.*);
         self.pages.clearAndFree(allocator);
+        self.page_sequences.clearAndFree(allocator);
     }
 
     /// Pushes a new version onto `key`'s chain for `root` (0=metadata,
@@ -639,6 +694,7 @@ pub const SharedRedoOverlay = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.pages.fetchRemove(page_id)) |kv| allocator.free(kv.value);
+        _ = self.page_sequences.remove(page_id);
     }
 
     /// The number of superseded-but-not-yet-reclaimed versions across
@@ -1246,7 +1302,7 @@ pub const SharedRedoOverlay = struct {
     /// own shape) back into `pages`, replacing (and freeing) any earlier
     /// entry for the same page id. Used only during initial population
     /// from the log, same posture as `decodeLogicalMutationsPayload`.
-    pub fn decodeRedoGroupPayload(self: *SharedRedoOverlay, _: Allocator, payload: []const u8) !void {
+    pub fn decodeRedoGroupPayload(self: *SharedRedoOverlay, _: Allocator, payload: []const u8, sequence: u64) !void {
         const allocator = owned_allocator;
         var pos: usize = 0;
         while (pos < payload.len) {
@@ -1258,10 +1314,39 @@ pub const SharedRedoOverlay = struct {
             const owned = try allocator.dupe(u8, payload[pos..][0..len]);
             errdefer allocator.free(owned);
             pos += len;
+            try self.page_sequences.put(allocator, page_id, sequence);
             if (try self.pages.fetchPut(allocator, page_id, owned)) |old| allocator.free(old.value);
         }
     }
 };
+
+test "redo overlay drops the page images a peer's fold already wrote" {
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(std.testing.allocator);
+    const io = std.testing.io;
+    // A peer's records at sequences 5 and 9, each carrying one page image.
+    var group: [12 + 3]u8 = undefined;
+    std.mem.writeInt(u64, group[0..8], 40, .little);
+    std.mem.writeInt(u32, group[8..12], 3, .little);
+    @memcpy(group[12..15], "old");
+    try overlay.decodeRedoGroupPayload(std.testing.allocator, &group, 5);
+    std.mem.writeInt(u64, group[0..8], 41, .little);
+    @memcpy(group[12..15], "new");
+    try overlay.decodeRedoGroupPayload(std.testing.allocator, &group, 9);
+    // This process's own staged page, before its record is appended.
+    try overlay.appendPage(std.testing.allocator, io, 42, try owned_allocator.dupe(u8, "own"));
+    // The peer folded through 7: page 40 is on disk now, and may be retired
+    // or reused there; pages 41 and 42 are not covered.
+    overlay.dropPagesFoldedThrough(io, 7);
+    try std.testing.expect(!overlay.pages.contains(40));
+    try std.testing.expect(overlay.pages.contains(41));
+    try std.testing.expect(overlay.pages.contains(42));
+    // Once stamped with its record's sequence, the own page drops too when a
+    // later fold covers it.
+    overlay.stampPendingPages(io, 10);
+    overlay.dropPagesFoldedThrough(io, 10);
+    try std.testing.expect(overlay.pagesEmpty(io));
+}
 
 test "redo overlay versioned resolve sees the newest version at or before a pinned sequence" {
     const a = std.testing.allocator;
