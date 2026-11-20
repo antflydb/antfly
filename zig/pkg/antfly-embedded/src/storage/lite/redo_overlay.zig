@@ -266,6 +266,9 @@ pub const SharedRedoOverlay = struct {
     /// record is appended (`stampPendingPages`). Lets a peer's fold drop the
     /// images it already wrote (`dropPagesFoldedThrough`). Under `mutex`.
     page_sequences: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// Own pages staged since the last appended record: the ones
+    /// `stampPendingPages` stamps, without walking every staged page.
+    unstamped_pages: std.ArrayListUnmanaged(u64) = .empty,
     /// Highest commit sequence replayed from the log under each root: a
     /// commit this process did not make itself (its own commits go through
     /// `appendVersion`). A redo commit leaves the catalog roots in place, so
@@ -352,6 +355,7 @@ pub const SharedRedoOverlay = struct {
         while (pages_it.next()) |bytes| allocator.free(bytes.*);
         self.pages.deinit(allocator);
         self.page_sequences.deinit(allocator);
+        self.unstamped_pages.deinit(allocator);
         self.pins.deinit(allocator);
         self.entry_pool.deinit(allocator);
         self.* = undefined;
@@ -380,7 +384,9 @@ pub const SharedRedoOverlay = struct {
         const allocator = owned_allocator;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        try self.unstamped_pages.ensureUnusedCapacity(allocator, 1);
         try self.page_sequences.put(allocator, page_id, unstamped_page);
+        self.unstamped_pages.appendAssumeCapacity(page_id);
         if (try self.pages.fetchPut(allocator, page_id, bytes)) |old| allocator.free(old.value);
     }
 
@@ -391,10 +397,12 @@ pub const SharedRedoOverlay = struct {
     pub fn stampPendingPages(self: *SharedRedoOverlay, io: std.Io, sequence: u64) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        var it = self.page_sequences.valueIterator();
-        while (it.next()) |seq| if (seq.* == unstamped_page) {
-            seq.* = sequence;
-        };
+        for (self.unstamped_pages.items) |page_id| {
+            if (self.page_sequences.getPtr(page_id)) |seq| if (seq.* == unstamped_page) {
+                seq.* = sequence;
+            };
+        }
+        self.unstamped_pages.clearRetainingCapacity();
     }
 
     /// Drops staged page images whose records a fold through
@@ -545,6 +553,7 @@ pub const SharedRedoOverlay = struct {
         while (it.next()) |bytes| allocator.free(bytes.*);
         self.pages.clearAndFree(allocator);
         self.page_sequences.clearAndFree(allocator);
+        self.unstamped_pages.clearRetainingCapacity();
     }
 
     /// Pushes a new version onto `key`'s chain for `root` (0=metadata,

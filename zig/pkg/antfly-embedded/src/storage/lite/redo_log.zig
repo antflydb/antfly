@@ -303,6 +303,10 @@ pub const StopReason = enum {
     /// validation. Not expected; callers must stop here and must not
     /// trust anything from this record onward.
     corrupt_record,
+    /// The next record is valid so far but lies past the caller's
+    /// `max_sequence`: not yet published as durable, so not delivered.
+    /// The valid prefix ends before it.
+    durable_ceiling,
 };
 
 pub const ReplayOutcome = struct {
@@ -384,6 +388,24 @@ pub fn replay(
     on_record: ?Callback,
     ctx: ?*anyopaque,
 ) anyerror!ReplayOutcome {
+    return replayBounded(allocator, file, io, base_offset, capacity, start_after_sequence, null, on_record, ctx);
+}
+
+/// `replay`, stopping (`durable_ceiling`) before any new record whose
+/// sequence exceeds `max_sequence`. A reader that is not the writer bounds
+/// its scan by the writer's published durable sequence: records past it may
+/// still be unsynced, and a crash can lose them.
+pub fn replayBounded(
+    allocator: Allocator,
+    file: File,
+    io: Io,
+    base_offset: u64,
+    capacity: u64,
+    start_after_sequence: ?u64,
+    max_sequence: ?u64,
+    on_record: ?Callback,
+    ctx: ?*anyopaque,
+) anyerror!ReplayOutcome {
     var pos: u64 = 0;
     var count: u64 = 0;
     var last_sequence = start_after_sequence;
@@ -428,6 +450,13 @@ pub fn replay(
         const header = RecordHeader.decode(&header_buf);
         if (header.magic != magic or header.format_version != format_version or header.header_len != header_len) {
             return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+        }
+
+        if (max_sequence) |ceiling| {
+            const new_record = start_after_sequence == null or header.commit_sequence > start_after_sequence.?;
+            if (new_record and header.commit_sequence > ceiling) {
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .durable_ceiling };
+            }
         }
 
         const payload_len: u64 = header.payload_len;
@@ -655,6 +684,33 @@ test "replay resumes continuity from a checkpoint baseline" {
     const superseded = try replay(testing.allocator, region.file, io, 0, capacity, 12, null, null);
     try testing.expectEqual(@as(u64, 0), superseded.valid_count);
     try testing.expectEqual(StopReason.end_of_region, superseded.stop_reason);
+}
+
+test "bounded replay stops before records past the durable ceiling" {
+    const io = testing.io;
+    const capacity: u64 = 2048;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(11, "x");
+    try writer.append(12, "y");
+    try writer.append(13, "z");
+    try writer.sync();
+
+    const bounded = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, 12, null, null);
+    try testing.expectEqual(@as(u64, 2), bounded.valid_count);
+    try testing.expectEqual(@as(?u64, 12), bounded.last_sequence);
+    try testing.expectEqual(StopReason.durable_ceiling, bounded.stop_reason);
+
+    // Superseded records past the ceiling never stop the scan early.
+    const past = try replayBounded(testing.allocator, region.file, io, 0, capacity, 12, 12, null, null);
+    try testing.expectEqual(@as(u64, 0), past.valid_count);
+    try testing.expectEqual(StopReason.durable_ceiling, past.stop_reason);
+    try testing.expectEqual(@as(?u64, 12), past.last_sequence);
+
+    const unbounded = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null);
+    try testing.expectEqual(@as(u64, 3), unbounded.valid_count);
 }
 
 test "a superseded run can be followed by genuinely new records" {

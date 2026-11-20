@@ -1210,7 +1210,14 @@ pub const Region = struct {
         // share: the per-fd setup mutex serializes them as well, or two
         // could both sample a fresh file and one truncate a region the
         // other already mapped.
-        fd_entry.setup_mutex.lockUncancelable(io);
+        // One deadline covers this wait and the fcntl one: a same-process
+        // opener can hold the mutex while it waits on another process.
+        if (deadline) |d| {
+            while (!fd_entry.setup_mutex.tryLock()) {
+                if (Io.Clock.now(.awake, io).compare(.gte, d)) return error.Timeout;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        } else fd_entry.setup_mutex.lockUncancelable(io);
         defer fd_entry.setup_mutex.unlock(io);
         try fcntlLockUntil(io, raw_fd, setup_lock_offset, std.c.F.WRLCK, deadline);
         errdefer fcntlUnlock(raw_fd, setup_lock_offset);
@@ -2213,8 +2220,10 @@ pub const Region = struct {
     /// Records the `commit_sequence` this reader will not let the writer
     /// reclaim pages behind. Written once per pin by the slot's own
     /// owner.
+    /// Sequentially consistent, as the watermark read that follows it is:
+    /// see `publishLogState`.
     pub fn pinReader(self: *Region, slot_index: u32, sequence: u64) void {
-        self.readerSlots()[slot_index].pinned_sequence.store(sequence, .release);
+        self.readerSlots()[slot_index].pinned_sequence.store(sequence, .seq_cst);
     }
 
     /// Clears the pin recorded by `pinReader`, without releasing the slot
@@ -2295,7 +2304,7 @@ pub const Region = struct {
         for (self.readerSlots()) |*slot| {
             const word = readerSlotWord(slot);
             if (!self.readerWordLive(word)) continue;
-            const seq = slot.pinned_sequence.load(.acquire);
+            const seq = slot.pinned_sequence.load(.seq_cst);
             if (seq == 0) continue;
             if (holderPid(word) == own_pid) if (overlay_floor) |floor| if (floor <= seq) continue;
             if (min == null or seq < min.?) min = seq;
@@ -2306,20 +2315,22 @@ pub const Region = struct {
     pub fn minimumPinnedSequence(self: *Region) ?u64 {
         var min: ?u64 = null;
         for (self.readerSlots()) |*slot| {
-            const word = readerSlotWord(slot);
-            if (word == 0 or word & reader_slot_cleaning != 0) continue;
-            // §8.4: a dead reader's never-cleared pin cannot block
-            // reclamation forever. Probing costs a syscall per occupied
-            // slot, same as the writer side's `writerHolderDead` -- paid
-            // only here, in the writer's own reuse-frontier scan (which
-            // already costs more than a warm write's own acquire/release
-            // ever does), never on a reader's own pin/unpin path.
-            if (self.readerWordDead(word)) {
-                if (comptime builtin.is_test) if (self.test_after_reader_dead_probe) |hook| hook(self);
-                // Own the dead claim first, so a takeover cannot slip in
-                // between clearing its pins and freeing the slot.
-                const cleaning = reader_slot_cleaning | packHolderGen(antfly_platform.process.currentId() orelse 0, self.own_liveness_slot, self.own_liveness_generation);
-                if (casReaderSlotWord(slot, word, cleaning)) {
+            // Re-read the slot when a cleanup loses its compare-and-swap: a
+            // takeover won, and its new pin belongs in this frontier.
+            while (true) {
+                const word = readerSlotWord(slot);
+                if (word == 0 or word & reader_slot_cleaning != 0) break;
+                // §8.4: a dead reader's never-cleared pin cannot block
+                // reclamation forever. Probing costs a syscall per occupied
+                // slot, same as the writer side's `writerHolderDead` -- paid
+                // only here, in the writer's own reuse-frontier scan, never on
+                // a reader's own pin/unpin path.
+                if (self.readerWordDead(word)) {
+                    if (comptime builtin.is_test) if (self.test_after_reader_dead_probe) |hook| hook(self);
+                    // Own the dead claim first, so a takeover cannot slip in
+                    // between clearing its pins and freeing the slot.
+                    const cleaning = reader_slot_cleaning | packHolderGen(antfly_platform.process.currentId() orelse 0, self.own_liveness_slot, self.own_liveness_generation);
+                    if (!casReaderSlotWord(slot, word, cleaning)) continue;
                     slot.pinned_sequence.store(0, .monotonic);
                     slot.metadata_pinned_sequence.store(0, .monotonic);
                     slot.owner.store(0, .release);
@@ -2327,12 +2338,12 @@ pub const Region = struct {
                     const hdr = self.header();
                     _ = hdr.reader_slot_released.fetchAdd(1, .release);
                     futexWakeShared(&hdr.reader_slot_released.raw);
+                    break;
                 }
-                continue;
+                const seq = slot.pinned_sequence.load(.seq_cst);
+                if (seq != 0 and (min == null or seq < min.?)) min = seq;
+                break;
             }
-            const seq = slot.pinned_sequence.load(.acquire);
-            if (seq == 0) continue;
-            if (min == null or seq < min.?) min = seq;
         }
         return min;
     }
@@ -2376,22 +2387,45 @@ pub const Region = struct {
     /// syscalls, just atomic stores into the already-mapped region,
     /// exactly like every other steady-state write this file makes.
     ///
-    /// Caller holds writer authority (the path-writer lease), so it is the
-    /// only publisher. An odd generation found here means a publisher died
-    /// mid-publish; this one repairs it by publishing a complete tuple. A
+    /// Usually called under writer authority (the path-writer lease); a
+    /// cold opener that found no publication at all also publishes. A
     /// tuple older than the published one (a lower durable or checkpoint
     /// sequence) is dropped: the watermark never moves backwards.
     pub fn publishLogState(self: *Region, state: LogState) void {
         const hdr = self.header();
-        const generation = hdr.log_generation.load(.acquire);
-        if (generation & 1 == 0 and (state.durable_sequence < hdr.log_durable_sequence.load(.monotonic) or
-            state.checkpoint_sequence < hdr.log_checkpoint_sequence.load(.monotonic))) return;
-        const publishing = generation | 1;
-        hdr.log_generation.store(publishing, .release);
-        hdr.log_checkpoint_sequence.store(state.checkpoint_sequence, .monotonic);
-        hdr.log_durable_sequence.store(state.durable_sequence, .monotonic);
-        hdr.log_durable_offset.store(state.durable_offset, .monotonic);
-        hdr.log_generation.store(publishing +% 1, .release);
+        // Sequentially consistent throughout: the generation brackets the
+        // payload in one total order, and a fold's publish followed by its
+        // pin scan (`minimumUncoveredPinnedSequence`) cannot both miss a
+        // reader's pin followed by its watermark read (`pinReader`).
+        //
+        // The even-to-odd CAS makes publishers mutually exclusive, so two
+        // publishers (a writer and a recovering opener) can never
+        // interleave their stores under one generation. An odd generation
+        // that never moves belongs to a publisher that died mid-publish;
+        // this one takes it over and repairs it with a complete tuple.
+        var stuck: u32 = 0;
+        var last_odd: u32 = 0;
+        const publishing: u32 = while (true) {
+            const generation = hdr.log_generation.load(.seq_cst);
+            if (generation & 1 != 0) {
+                if (generation != last_odd) {
+                    last_odd = generation;
+                    stuck = 0;
+                } else {
+                    stuck += 1;
+                    if (stuck >= log_state_stuck_spins) break generation;
+                }
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            if (state.durable_sequence < hdr.log_durable_sequence.load(.seq_cst) or
+                state.checkpoint_sequence < hdr.log_checkpoint_sequence.load(.seq_cst)) return;
+            if (hdr.log_generation.cmpxchgWeak(generation, generation | 1, .seq_cst, .seq_cst) == null) break generation | 1;
+        };
+        hdr.log_checkpoint_sequence.store(state.checkpoint_sequence, .seq_cst);
+        hdr.log_durable_sequence.store(state.durable_sequence, .seq_cst);
+        hdr.log_durable_offset.store(state.durable_offset, .seq_cst);
+        hdr.log_generation.store(publishing +% 1, .seq_cst);
     }
 
     /// Test support: a region whose log publication was never made (one
@@ -2428,28 +2462,35 @@ pub const Region = struct {
     /// region, rather than spinning forever; the next lease holder's
     /// publish repairs it.
     pub fn readLogState(self: *const Region) LogState {
+        return self.readLogStateChecked() orelse .{ .checkpoint_sequence = 0, .durable_sequence = 0, .durable_offset = 0 };
+    }
+
+    /// `readLogState`, or null when the publication is torn (a publisher
+    /// died mid-publish): a writer must then treat peer progress as unknown
+    /// rather than as none.
+    pub fn readLogStateChecked(self: *const Region) ?LogState {
         const hdr = self.header();
         var stuck: u32 = 0;
         var last_odd: u32 = 0;
         while (true) {
-            const before = hdr.log_generation.load(.acquire);
+            const before = hdr.log_generation.load(.seq_cst);
             if (before & 1 != 0) {
                 if (before != last_odd) {
                     last_odd = before;
                     stuck = 0;
                 } else {
                     stuck += 1;
-                    if (stuck >= log_state_stuck_spins) return .{ .checkpoint_sequence = 0, .durable_sequence = 0, .durable_offset = 0 };
+                    if (stuck >= log_state_stuck_spins) return null;
                 }
                 std.atomic.spinLoopHint();
                 continue;
             }
             const state: LogState = .{
-                .checkpoint_sequence = hdr.log_checkpoint_sequence.load(.monotonic),
-                .durable_sequence = hdr.log_durable_sequence.load(.monotonic),
-                .durable_offset = hdr.log_durable_offset.load(.monotonic),
+                .checkpoint_sequence = hdr.log_checkpoint_sequence.load(.seq_cst),
+                .durable_sequence = hdr.log_durable_sequence.load(.seq_cst),
+                .durable_offset = hdr.log_durable_offset.load(.seq_cst),
             };
-            const after = hdr.log_generation.load(.acquire);
+            const after = hdr.log_generation.load(.seq_cst);
             if (before == after) return state;
         }
     }
@@ -4341,8 +4382,11 @@ test "shared lock region: dead-reader cleanup cannot erase a pin taken over in b
         }
     };
     region.test_after_reader_dead_probe = Takeover.run;
-    _ = region.minimumPinnedSequence();
+    // The raced scan itself, the one a writer chooses reuse from, must
+    // include the replacement's pin.
+    const raced = region.minimumPinnedSequence();
     region.test_after_reader_dead_probe = null;
+    try std.testing.expectEqual(@as(?u64, 42), raced);
     const taken = Takeover.slot.?;
     try std.testing.expect(region.isReaderSlotLive(taken));
     try std.testing.expectEqual(@as(u64, 42), region.readerSlots()[taken].pinned_sequence.load(.acquire));
@@ -4366,6 +4410,43 @@ test "shared lock region: the log watermark never moves backwards and a torn pub
     const repaired = region.readLogState();
     try std.testing.expectEqual(@as(u64, 43), repaired.durable_sequence);
     try std.testing.expectEqual(@as(u64, 128), repaired.durable_offset);
+}
+
+test "shared lock region: concurrent watermark publishers never interleave a tuple" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var fixture = try TicketFixture.init("region-log-state-concurrent.aflite");
+    defer fixture.deinit();
+    const region = &fixture.region;
+    const rounds: u64 = 4000;
+    const Publisher = struct {
+        fn run(r: *Region, lane: u64) void {
+            var k: u64 = 1;
+            while (k <= rounds) : (k += 1) {
+                const n = k * 4 + lane;
+                r.publishLogState(.{ .checkpoint_sequence = n, .durable_sequence = n, .durable_offset = n * 16 });
+            }
+        }
+    };
+    const Reader = struct {
+        fn run(r: *Region, stop: *std.atomic.Value(bool), torn: *std.atomic.Value(bool)) void {
+            while (!stop.load(.acquire)) {
+                const state = r.readLogStateChecked() orelse continue;
+                if (state.checkpoint_sequence != state.durable_sequence or state.durable_offset != state.durable_sequence * 16) torn.store(true, .release);
+            }
+        }
+    };
+    var stop: std.atomic.Value(bool) = .init(false);
+    var torn: std.atomic.Value(bool) = .init(false);
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ region, &stop, &torn });
+    var publishers: [4]std.Thread = undefined;
+    for (&publishers, 0..) |*thread, lane| thread.* = try std.Thread.spawn(.{}, Publisher.run, .{ region, @as(u64, lane) });
+    for (publishers) |thread| thread.join();
+    stop.store(true, .release);
+    reader.join();
+    try std.testing.expect(!torn.load(.acquire));
+    const final = region.readLogStateChecked().?;
+    try std.testing.expectEqual(final.durable_sequence, final.checkpoint_sequence);
+    try std.testing.expectEqual(final.durable_sequence * 16, final.durable_offset);
 }
 
 test "shared lock region: concurrent same-process opens of a fresh region share one mapping" {
