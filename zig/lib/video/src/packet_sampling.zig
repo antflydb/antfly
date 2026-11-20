@@ -32,17 +32,36 @@ pub fn presentationUs(pts: i64, origin: i64, scale: u32) !i64 {
 /// buckets backwards implements first-at-or-after for VFR and B-frame order.
 /// Packet IDs break ties before conversion to microseconds at the API boundary.
 pub fn gemma4Pictures(reader: *const media.mp4.Reader, pictures: anytype, control: media.source.Control) !Gemma4Plan {
+    return planPictures(reader.track.timescale, reader.track.edit, pictures, null, control);
+}
+
+/// Select visible AV1 output ordinals in the original MP4 clock. Codec replay
+/// still sees every packet, including references outside the presentation edit.
+pub fn gemma4AdaptedPictures(timeline: media.webm.SourceTimeline, pictures: []const @import("webm_pictures.zig").Picture, control: media.source.Control) !Gemma4Plan {
+    return planPictures(timeline.timescale, timeline.edit, pictures, timeline.samples, control);
+}
+
+fn pictureTime(pic: anytype, samples: ?[]const media.webm.SourceTimeline.Sample) !media.webm.SourceTimeline.Sample {
+    if (comptime @hasField(@TypeOf(pic), "packet_index")) {
+        const index = pic.packet_index orelse return error.InvalidVideoIndex;
+        if (index >= samples.?.len) return error.InvalidVideoIndex;
+        return samples.?[index];
+    }
+    return .{ .pts = pic.pts, .duration = pic.duration };
+}
+
+fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, samples: ?[]const media.webm.SourceTimeline.Sample, control: media.source.Control) !Gemma4Plan {
     try control.check();
-    const scale = reader.track.timescale;
     if (scale == 0 or pictures.len == 0) return error.EmptyVideo;
-    var origin = reader.track.edit.source_start;
-    const duration: i128 = reader.track.edit.source_duration orelse infer: {
-        origin = pictures[0].pts;
+    var origin = edit.source_start;
+    const duration: i128 = edit.source_duration orelse infer: {
+        origin = (try pictureTime(pictures[0], samples)).pts;
         var end: i128 = origin;
         for (pictures, 0..) |pic, i| {
             if (i % 256 == 0) try control.check();
-            origin = @min(origin, pic.pts);
-            end = @max(end, @as(i128, pic.pts) + pic.duration);
+            const time = try pictureTime(pic, samples);
+            origin = @min(origin, time.pts);
+            end = @max(end, @as(i128, time.pts) + time.duration);
         }
         break :infer end - origin;
     };
@@ -52,14 +71,16 @@ pub fn gemma4Pictures(reader: *const media.mp4.Reader, pictures: anytype, contro
     var best: [gemma4_max_frames]?usize = @splat(null);
     for (pictures, 0..) |pic, id| {
         if (id % 256 == 0) try control.check();
-        const tick = @as(i128, pic.pts) - origin;
+        const pts = (try pictureTime(pic, samples)).pts;
+        const tick = @as(i128, pts) - origin;
         if (tick < 0 or tick >= duration) continue;
         const second = @divFloor(tick, scale);
         // Target j occurs at floor(j * (seconds-1) / (count-1)).
         const bucket: usize = if (seconds <= count) @intCast(second) else @intCast(@divFloor((second + 1) * (count - 1) - 1, seconds - 1));
         if (best[bucket]) |previous| {
             const prior = pictures[previous];
-            if (pic.pts > prior.pts or (pic.pts == prior.pts and packetId(pic, id) >= packetId(prior, previous))) continue;
+            const prior_pts = (try pictureTime(prior, samples)).pts;
+            if (pts > prior_pts or (pts == prior_pts and packetId(pic, id) >= packetId(prior, previous))) continue;
         }
         best[bucket] = id;
     }
@@ -77,7 +98,7 @@ pub fn gemma4Pictures(reader: *const media.mp4.Reader, pictures: anytype, contro
         previous = id;
         const pic = pictures[id];
         plan.packet_ids[plan.len] = packetId(pic, id);
-        plan.timestamps_us[plan.len] = try presentationUs(pic.pts, origin, scale);
+        plan.timestamps_us[plan.len] = try presentationUs((try pictureTime(pic, samples)).pts, origin, scale);
         plan.len += 1;
     };
     if (plan.len == 0) return error.EmptyVideo;
@@ -106,7 +127,7 @@ pub const Gemma4Plan = struct {
 /// The decoder validates entropy and pixels later, under its own admission.
 pub fn gemma4PortablePlan(a: std.mem.Allocator, reader: *media.mp4.Reader, registry: ?*@import("h264_dynamic.zig").Session) !Gemma4Plan {
     if (reader.track.codec == .avc) {
-        const complex = if (registry != null or reader.track.inband_parameter_sets or reader.track.multiple_avc_parameter_sets) true else blk: {
+        const complex = if (registry != null or reader.track.requiresAvcRegistry()) true else blk: {
             const cfg = try h264.configParse(a, reader.track.avcc);
             defer cfg.groups.deinit(a);
             break :blk !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes or cfg.groups.count > 1 or cfg.redundant;
@@ -154,21 +175,23 @@ pub fn selectLogical(a: std.mem.Allocator, reader: *const media.mp4.Reader, logi
 }
 
 pub fn selectWithSampling(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling) ![]usize {
+    return selectConfigured(a, reader, sampling, null);
+}
+
+pub fn selectConfigured(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, registry: ?*@import("h264_dynamic.zig").Session) ![]usize {
+    var mutable = reader.*;
     if (sampling == .gemma4) {
-        var mutable = reader.*;
-        const plan = try gemma4PortablePlan(a, &mutable, null);
+        const plan = try gemma4PortablePlan(a, &mutable, registry);
         return a.dupe(usize, plan.ids());
     }
     if (reader.track.codec == .avc) {
-        const cfg = try h264.configParse(a, reader.track.avcc);
-        defer cfg.groups.deinit(a);
-        if (reader.track.inband_parameter_sets or !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes or cfg.groups.count > 1 or cfg.redundant) {
-            // Index completed assemblies rather than transport members.
-            var mutable = reader.*;
-            var logical = if (sampling == .source_timestamps)
-                try h264_pictures.streaming(a, &mutable, .{})
-            else
-                try h264_pictures.index(a, &mutable, .{});
+        const complex = if (reader.track.requiresAvcRegistry()) true else blk: {
+            const cfg = try h264.configParse(a, reader.track.avcc);
+            defer cfg.groups.deinit(a);
+            break :blk !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes or cfg.groups.count > 1 or cfg.redundant;
+        };
+        if (complex) {
+            var logical = try h264_pictures.indexMode(a, &mutable, .{}, sampling == .source_timestamps, registry);
             defer logical.deinit();
             return selectLogical(a, reader, logical, sampling, reader.input.control);
         }

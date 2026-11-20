@@ -208,7 +208,8 @@ pub const Inspection = struct {
             self.webm_index = if (configuration.webm) |input| input.index.* else try video.webm_pictures.index(a, &self.webm_reader, webmDecodeOptions(self.source.control, &self.pool));
             self.owns_webm_index = configuration.webm == null;
             self.webm_index.?.reader = &self.webm_reader;
-            self.selected = try selectWebm(a, self.webm_index.?, configuration.sampling, self.source.control, if (configuration.webm) |input| input.timeline else null);
+            self.gemma4_plan = try adaptedPlan(self.webm_index.?, configuration.sampling, self.source.control);
+            self.selected = if (self.gemma4_plan) |*plan| try a.dupe(usize, plan.ids()) else try selectWebm(a, self.webm_index.?, configuration.sampling, self.source.control, if (configuration.webm) |input| input.timeline else null);
             self.plan = try inspectSelectedWebmPlan(&self.webm_reader, self.webm_index.?, metal, self.selected.?);
         } else {
             if (borrowed) |reader| {
@@ -226,7 +227,7 @@ pub const Inspection = struct {
             self.selected = if (self.gemma4_plan != null and configuration.selection == null)
                 try a.dupe(usize, self.gemma4_plan.?.ids())
             else
-                try selectReader(a, &self.reader, configuration.sampling, self.source.control, configuration.selection);
+                try selectReader(a, &self.reader, configuration.sampling, self.source.control, configuration.selection, self.configurations);
             self.plan = try inspectSelectedPacketPlan(a, &self.reader, control, metal, self.selected.?, self.configurations);
             if (self.reader.track.codec == .avc and self.configurations == null) {
                 const cfg = try video.h264.configParse(a, self.reader.track.avcc);
@@ -367,7 +368,7 @@ pub const DecoderContinuation = struct {
             self.reused_windows += @intFromBool(warm);
             return true;
         }
-        if (self.reader.track.inband_parameter_sets) return false;
+        if (self.reader.track.requiresAvcRegistry()) return false;
         if (self.decoder) |decoder| {
             for (absolute[0..selected.len]) |index| if (index < decoder.cursor()) return false;
         } else {
@@ -664,8 +665,8 @@ fn readerBinding(reader: *const media.mp4.Reader, sampling: Sampling, control: m
     return hash.finalResult();
 }
 const selectLogical = video.packet_sampling.selectLogical;
-fn selectReader(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control, selection: ?*const ReaderSelection) ![]usize {
-    return if (selection) |bound| bound.select(a, reader, sampling, control) else selectWithSampling(a, reader, sampling);
+fn selectReader(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control, selection: ?*const ReaderSelection, registry: ?*video.h264_dynamic.Session) ![]usize {
+    return if (selection) |bound| bound.select(a, reader, sampling, control) else video.packet_sampling.selectConfigured(a, reader, sampling, registry);
 }
 const timestampSelect = video.packet_sampling.timestampSelect;
 pub const selectWithSampling = video.packet_sampling.selectWithSampling;
@@ -739,8 +740,9 @@ fn hevcPolicy(a: std.mem.Allocator, track: media.mp4.Track, width: u32, height: 
 
 fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader, cache_headers: bool) !?*video.h264_dynamic.Session {
     if (reader.track.codec != .avc) return null;
-    if (reader.track.inband_parameter_sets or reader.track.multiple_avc_parameter_sets) {
-        const session = if (cache_headers) try video.h264_dynamic.Session.initPlanning(a, reader, .{}) else try video.h264_dynamic.Session.init(a, reader, .{});
+    if (reader.track.requiresAvcRegistry()) {
+        const limits = (video.h264_pictures.Options{}).decode;
+        const session = if (cache_headers) try video.h264_dynamic.Session.initPlanning(a, reader, limits) else try video.h264_dynamic.Session.init(a, reader, limits);
         errdefer session.deinit();
         for (session.entries.items) |entry| {
             _ = try policySignal(reader.track, @intCast(entry.config.width), @intCast(entry.config.height), entry.config.color);
@@ -1211,10 +1213,10 @@ fn inspectPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, control: C
     if (reader.track.codec == .hevc) {
         _ = try hevcPolicy(a, reader.track, reader.track.width, reader.track.height);
     } else if (reader.track.codec != .avc) _ = try policy(reader.track, reader.track.width, reader.track.height);
-    const selected = try selectReader(a, reader, sampling, reader.input.control, selection);
-    defer a.free(selected);
     const configurations = try parameterSession(a, reader, false);
     defer if (configurations) |session| session.deinit();
+    const selected = try selectReader(a, reader, sampling, reader.input.control, selection, configurations);
+    defer a.free(selected);
     return inspectSelectedPacketPlan(a, reader, control, metal, selected, configurations);
 }
 fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, control: Control, metal: bool, selected: []const usize, configurations: ?*video.h264_dynamic.Session) !Plan {
@@ -1283,6 +1285,7 @@ pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: 
         defer reader.deinit();
         var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(source.control, pool));
         defer index.deinit();
+        if (try adaptedPlan(index, sampling, source.control)) |plan| return a.dupe(i64, plan.timestamps());
         const selected = try selectWebm(a, index, sampling, source.control, null);
         defer a.free(selected);
         var first: i64 = std.math.maxInt(i64);
@@ -1308,7 +1311,13 @@ pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: 
     }
     return output;
 }
+fn adaptedPlan(index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control) !?video.packet_sampling.Gemma4Plan {
+    if (sampling == .gemma4) if (index.reader) |reader| if (reader.source_timeline) |timeline|
+        return try video.packet_sampling.gemma4AdaptedPictures(timeline, index.pictures, control);
+    return null;
+}
 fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control, timeline: ?*const video.sampling.Timeline) ![]usize {
+    if (try adaptedPlan(index, sampling, control)) |plan| return a.dupe(usize, plan.ids());
     if (sampling == .reference) return index.select();
     if (timeline) |cached| return switch (sampling) {
         .gemma4 => cached.select(a, 1_000_000_000, .{}, control, true),
@@ -1535,13 +1544,13 @@ pub const Prefetch = struct {
         defer if (inspection == null and self.webm_input == null) {
             if (webm_index) |*index| index.deinit();
         };
-        const selected = if (inspection) |owner| try a.dupe(usize, owner.selected.?) else if (webm_index) |index| try selectWebm(a, index, sampling, source.control, if (self.webm_input) |input| input.timeline else null) else try selectReader(a, &reader, sampling, source.control, self.reader_selection);
-        self.selected = selected;
-        const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
         const configurations = if (inspection) |owner| owner.configurations else if (webm) null else try parameterSession(a, &reader, false);
         defer if (inspection == null) {
             if (configurations) |session| session.deinit();
         };
+        const selected = if (inspection) |owner| try a.dupe(usize, owner.selected.?) else if (webm_index) |index| try selectWebm(a, index, sampling, source.control, if (self.webm_input) |input| input.timeline else null) else try selectReader(a, &reader, sampling, source.control, self.reader_selection, configurations);
+        self.selected = selected;
+        const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
         var signal = if (inspection) |owner| owner.signal else video.h264.Color{};
         if (inspection == null and !webm and reader.track.codec == .avc and configurations == null) {
             const cfg = try video.h264.configParse(a, reader.track.avcc);
@@ -2037,13 +2046,13 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     defer if (inspection == null and webm_input == null) {
         if (webm_index) |*index| index.deinit();
     };
-    const selected = if (inspection) |owner| try a.dupe(usize, owner.selected.?) else if (webm_index) |index| try selectWebm(a, index, sampling, source.control, if (webm_input) |input| input.timeline else null) else try selectReader(a, &reader, sampling, source.control, selection);
-    defer a.free(selected);
-    const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
     const configurations = if (inspection) |owner| owner.configurations else if (webm) null else try parameterSession(a, &reader, false);
     defer if (inspection == null) {
         if (configurations) |session| session.deinit();
     };
+    const selected = if (inspection) |owner| try a.dupe(usize, owner.selected.?) else if (webm_index) |index| try selectWebm(a, index, sampling, source.control, if (webm_input) |input| input.timeline else null) else try selectReader(a, &reader, sampling, source.control, selection, configurations);
+    defer a.free(selected);
+    const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
     var signal = if (inspection) |owner| owner.signal else video.h264.Color{};
     if (inspection == null and !webm and reader.track.codec == .avc and configurations == null) {
         const cfg = try video.h264.configParse(a, reader.track.avcc);

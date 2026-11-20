@@ -169,15 +169,16 @@ pub fn messagesHaveAudio(messages: []const Message) bool {
 pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
     var allowance: usize = if (config.mm_tokens_per_image == 0) 0 else nativeGenerationImageCount(messages) *| (@as(usize, config.mm_tokens_per_image) + 1);
     for (messages) |message| if (message.video_bytes != null) {
-        allowance +|= 60 * (70 + 10);
+        allowance +|= gemma4_video.token_allowance;
     };
     return allowance;
 }
 
 test "video prompt allowance is independent of the image token setting" {
     const messages = [_]Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
-    try std.testing.expectEqual(@as(usize, 4800), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma }));
-    try std.testing.expectEqual(@as(usize, 4800), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma, .mm_tokens_per_image = 280 }));
+    try std.testing.expectEqual(@as(usize, 2560), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma }));
+    try std.testing.expectEqual(@as(usize, 2560), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma, .mm_tokens_per_image = 280 }));
+    try std.testing.expectEqual(@as(usize, 1408), try nativeGenerationPromptTokenLimit(.{ .family = .gemma, .max_position_embeddings = 4096 }, null, 128, 0, nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma })));
     const rendered = try formatMessages(std.testing.allocator, &messages);
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "<|video|> describe") != null);

@@ -60,10 +60,11 @@ pub const Cache = struct {
             track: media.webm.Track,
             packets: []media.webm.Packet,
             cues: []media.webm.Cue,
+            source_timeline: ?media.webm.SourceTimeline,
             timestamp_scale_ns: u64,
             duration_seconds: ?f64,
             pub fn reader(self: @This(), a: std.mem.Allocator, source: *media.source.Source) media.webm.Reader {
-                return .{ .allocator = a, .input = source, .metadata = .{ .bytes = &.{}, .source = null }, .track = self.track, .packets = self.packets, .cues = self.cues, .timestamp_scale_ns = self.timestamp_scale_ns, .duration_seconds = self.duration_seconds };
+                return .{ .allocator = a, .input = source, .metadata = .{ .bytes = &.{}, .source = null }, .track = self.track, .packets = self.packets, .cues = self.cues, .source_timeline = self.source_timeline, .timestamp_scale_ns = self.timestamp_scale_ns, .duration_seconds = self.duration_seconds };
             }
         },
     };
@@ -277,7 +278,7 @@ pub const Cache = struct {
             .aac => |owner| @import("media_chunking_audio_source.zig").Mp4.Snapshot.estimatedBytes(owner),
             .audio => |index| index.estimatedBytes(),
             .mp4 => |r| std.math.mul(usize, r.packets.len, @sizeOf(media.mp4.Packet)) catch return null,
-            .webm => |r| (std.math.mul(usize, r.packets.len, @sizeOf(media.webm.Packet)) catch return null) +| (std.math.mul(usize, r.cues.len, @sizeOf(media.webm.Cue)) catch return null),
+            .webm => |r| (std.math.mul(usize, r.packets.len, @sizeOf(media.webm.Packet)) catch return null) +| (std.math.mul(usize, r.cues.len, @sizeOf(media.webm.Cue)) catch return null) +| (if (r.source_timeline) |timeline| timeline.samples.len *| @sizeOf(media.webm.SourceTimeline.Sample) else 0),
         };
         if (estimate > max_bytes) return null;
         var header_lease = admission.acquire(admission.context, @sizeOf(Entry)) catch return null;
@@ -398,7 +399,9 @@ pub const Cache = struct {
                 track.codec_private = try a.dupe(u8, track.codec_private);
                 track.presentation.projection_private = try a.dupe(u8, track.presentation.projection_private);
                 track.colour.mastering = try a.dupe(u8, track.colour.mastering);
-                entry.data = .{ .webm = .{ .track = track, .packets = try a.dupe(media.webm.Packet, original.packets), .cues = try a.dupe(media.webm.Cue, original.cues), .timestamp_scale_ns = original.timestamp_scale_ns, .duration_seconds = original.duration_seconds } };
+                var timeline = original.source_timeline;
+                if (timeline) |*clock| clock.samples = try a.dupe(media.webm.SourceTimeline.Sample, clock.samples);
+                entry.data = .{ .webm = .{ .source_timeline = timeline, .track = track, .packets = try a.dupe(media.webm.Packet, original.packets), .cues = try a.dupe(media.webm.Cue, original.cues), .timestamp_scale_ns = original.timestamp_scale_ns, .duration_seconds = original.duration_seconds } };
             },
         }
     }
@@ -465,11 +468,17 @@ test "model aware media immutable container cache owns metadata and fences sourc
         source.storage.range.immutable_binding = @splat(3);
         const webm_identity = Cache.key(&source, true, 100, 1024).?;
         private = .{ 4, 5, 6 };
-        const webm_reader = media.webm.Reader{ .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .number = 1, .codec = .vp9, .width = 1, .height = 1, .codec_private = &private, .presentation = .{ .projection_private = &private }, .colour = .{ .mastering = &private } }, .packets = &.{}, .cues = &.{}, .timestamp_scale_ns = 1_000_000 };
+        var samples = [_]media.webm.SourceTimeline.Sample{.{ .pts = -7, .duration = 11 }};
+        var webm_packets = [_]media.webm.Packet{.{ .cluster_offset = 20, .offset = 20, .size = 4, .pts = -70_000_000, .duration_ns = 110_000_000, .sync = true, .discardable = false, .invisible = false }};
+        const webm_reader = media.webm.Reader{ .source_timeline = .{ .timescale = 100, .edit = .{ .source_duration = 25 }, .samples = &samples }, .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .number = 1, .codec = .av1, .width = 1, .height = 1, .codec_private = &private, .presentation = .{ .projection_private = &private }, .colour = .{ .mastering = &private } }, .packets = &webm_packets, .cues = &.{}, .timestamp_scale_ns = 1_000_000 };
         cache.remember(a, webm_identity, .{ .webm = webm_reader }, .{ .context = &provider, .acquire = Provider.acquire });
         @memset(&private, 0);
+        samples[0].pts = 0;
         const webm_hit = cache.get(webm_identity).?;
         defer cache.release(webm_hit);
+        const copied = webm_hit.data.webm.reader(a, &source).source_timeline.?;
+        try std.testing.expectEqual(@as(i64, -7), copied.samples[0].pts);
+        try std.testing.expectEqual(@as(?i64, 25), copied.edit.source_duration);
         try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, webm_hit.data.webm.track.codec_private);
         try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, webm_hit.data.webm.track.presentation.projection_private);
         try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, webm_hit.data.webm.track.colour.mastering);

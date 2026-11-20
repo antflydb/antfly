@@ -1148,7 +1148,7 @@ pub fn decodeFrame(allocator: std.mem.Allocator, reader: *media.mp4.Reader, inde
     try reader.input.control.check();
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
     if (index >= reader.packets.len) return error.InvalidPacketIndex;
-    if (reader.track.inband_parameter_sets) {
+    if (reader.track.requiresAvcRegistry()) {
         const session = try @import("h264_dynamic.zig").Session.init(allocator, reader, options);
         defer session.deinit();
         return session.decodeFrame(index);
@@ -1171,7 +1171,7 @@ pub fn decodeSelected(allocator: std.mem.Allocator, reader: *media.mp4.Reader, i
     for (indexes) |index| if (index >= reader.packets.len) {
         return error.InvalidPacketIndex;
     };
-    if (reader.track.inband_parameter_sets) {
+    if (reader.track.requiresAvcRegistry()) {
         const session = try @import("h264_dynamic.zig").Session.init(allocator, reader, options);
         defer session.deinit();
         return session.decodeSelected(indexes, callback_context, callback);
@@ -1326,7 +1326,7 @@ pub const Incremental = struct {
     lanes: union(enum) { eight: [3]Continuation(u8), wide: [3]Continuation(u16) } = .{ .eight = .{ .{}, .{}, .{} } },
     valid: bool = true,
     pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !*Incremental {
-        if (reader.track.codec != .avc or reader.track.inband_parameter_sets) return error.UnsupportedIncrementalConfiguration;
+        if (reader.track.codec != .avc or reader.track.requiresAvcRegistry()) return error.UnsupportedIncrementalConfiguration;
         var owner = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(Incremental) }) else media.admission.Token{};
         errdefer owner.deinit();
         const self = try a.create(Incremental);

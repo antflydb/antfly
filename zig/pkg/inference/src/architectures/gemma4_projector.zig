@@ -40,6 +40,7 @@ const CT = ops.CT;
 const default_spatial_merge_size: usize = @intCast(
     projector_format_mod.gemma4_spatial_merge_size,
 );
+pub const video_tokens_per_frame: usize = 70;
 const default_max_image_tokens: usize = 280;
 const default_max_direct_audio_tokens: usize = 16_384;
 
@@ -269,7 +270,7 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
     var weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector);
     defer weights.deinit();
     var cfg = try parseConfig(&projector.gguf.parsed);
-    cfg.max_image_tokens = 70;
+    cfg.max_image_tokens = video_tokens_per_frame;
     var preprocessor = try video.Preprocessor.init(allocator, &compute.ctx);
     defer preprocessor.deinit();
     const max_frames = @import("antfly_video").packet_sampling.gemma4_max_frames;
@@ -351,7 +352,7 @@ pub const PortableVideoFrames = struct {
 
     pub fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, frames: usize) !PortableVideoFrames {
         var cfg = try parseConfig(&projector.gguf.parsed);
-        cfg.max_image_tokens = 70;
+        cfg.max_image_tokens = video_tokens_per_frame;
         const prepared = try allocator.alloc(?PreparedImage, frames);
         @memset(prepared, null);
         return .{ .allocator = allocator, .weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector), .cfg = cfg, .resample = videoResample(cb, cfg), .prepared = prepared };
@@ -380,35 +381,16 @@ pub const PortableVideoFrames = struct {
         var frames: std.ArrayList(PreparedImage) = .empty;
         defer frames.deinit(a);
         var kept: usize = 0;
-        var planned_rows: usize = 0;
         for (self.prepared, 0..) |item, slot| if (item) |value| {
             try frames.append(a, value);
-            planned_rows += value.geometry.tokenCount();
             timestamps_us[kept] = timestamps_us[slot];
             kept += 1;
         };
         if (kept == 0) return error.EmptyVideo;
-        const output = (try cb.allocUninitF32Shape(&.{ @intCast(planned_rows), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
-        errdefer cb.free(output);
-        const counts = try a.alloc(usize, kept);
-        errdefer a.free(counts);
-        var rows: usize = 0;
-        var done: usize = 0;
-        while (done < kept) {
-            try cb.checkExecutionControl();
-            const cohort = frames.items[done..@min(done + 8, kept)];
-            var projected = try encodePreparedImagesResidentWithWeights(cb, a, &self.weights, self.cfg, cohort, .{});
-            defer projected.deinit();
-            const added = sumUsize(projected.tokens_per_image);
-            if (!try cb.copyRows2D(a, output, rows, projected.embeddings, 0, added, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
-            @memcpy(counts[done..][0..cohort.len], projected.tokens_per_image);
-            rows += added;
-            done += cohort.len;
-        }
-        if (rows != planned_rows) return error.InvalidVideoFrame;
-        const embeddings = output;
         const timestamps = try a.dupe(i64, timestamps_us[0..kept]);
-        return .{ .images = .{ .allocator = a, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = self.cfg.text_hidden, .batches_executed = (kept + 7) / 8, .max_batch_executed = @min(kept, 8) }, .timestamps_us = timestamps, .stats = .{ .decoded_frames = kept, .selected_frames = kept } };
+        errdefer a.free(timestamps);
+        const images = try projectPreparedSequence(cb, a, &self.weights, self.cfg, frames.items, .{});
+        return .{ .images = images, .timestamps_us = timestamps, .stats = .{ .decoded_frames = kept, .selected_frames = kept } };
     }
 };
 fn portableFrameGeometry(cfg: Config, frame: image.ImageU8, presentation_width: u32, presentation_height: u32) Geometry {
@@ -418,7 +400,7 @@ fn portableFrameGeometry(cfg: Config, frame: image.ImageU8, presentation_width: 
 
 test "gemma4 video frame geometry follows presentation size for non-square pixels" {
     var cfg = embeddingGemma2ImageConfig();
-    cfg.max_image_tokens = 70;
+    cfg.max_image_tokens = video_tokens_per_frame;
     const raster: image.ImageU8 = .{ .data = &.{}, .width = 640, .height = 480, .format = .rgb8 };
     const coded = portableFrameGeometry(cfg, raster, 0, 0);
     const anamorphic = portableFrameGeometry(cfg, raster, 1280, 480);
@@ -2973,12 +2955,15 @@ fn encodePreparedImagesWithWeights(cb: *const ComputeBackend, allocator: std.mem
 }
 
 fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem.Allocator, weights: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !ResidentProjectedImages {
+    if (prepared.len > 8) return error.InvalidImageBatch;
+    return projectPreparedSequence(cb, a, weights, cfg, prepared, options);
+}
+
+fn projectPreparedSequence(cb: *const ComputeBackend, a: std.mem.Allocator, weights: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !ResidentProjectedImages {
     try options.validate();
+    if (prepared.len == 0) return error.InvalidImageBatch;
     var execution_cfg = cfg;
     execution_cfg.require_prepared_vision = options.require_prepared_vision;
-    if (prepared.len == 0 or prepared.len > 8) return error.InvalidImageBatch;
-    // Joining heterogeneous cohorts must never invoke the download fallback.
-    if (!cb.supportsCopyRows2D()) return error.ResidentImageOperationUnavailable;
     const lengths = try a.alloc(usize, prepared.len);
     errdefer a.free(lengths);
     var total: usize = 0;
@@ -2987,6 +2972,15 @@ fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem
         length.* = item.geometry.tokenCount();
         total = try std.math.add(usize, total, length.*);
     }
+    const first_count = try imageBatchCount(cfg, prepared[0..@min(options.max_batch, prepared.len)], options, cb.kind() == .metal);
+    if (first_count == prepared.len) {
+        try cb.checkExecutionControl();
+        const batch = try encodePreparedImageBatchResident(cb, a, weights, execution_cfg, prepared);
+        errdefer cb.free(batch.embeddings);
+        if (batch.tokens != lengths[0]) return error.InvalidImageBatch;
+        return .{ .allocator = a, .backend = cb, .embeddings = batch.embeddings, .tokens_per_image = lengths, .hidden_size = cfg.text_hidden, .batches_executed = 1, .max_batch_executed = first_count };
+    }
+    if (!cb.supportsCopyRows2D()) return error.ResidentImageOperationUnavailable;
     const tensor = (try cb.allocUninitF32Shape(&.{ std.math.cast(i32, total) orelse return error.InvalidImageBatch, @intCast(cfg.text_hidden) })) orelse return error.ResidentImageOperationUnavailable;
     errdefer cb.free(tensor);
     var rows: usize = 0;
@@ -2995,10 +2989,12 @@ fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem
     var maximum: usize = 0;
     while (offset < prepared.len) {
         try cb.checkExecutionControl();
-        const count = try imageBatchCount(cfg, prepared[offset..], options, cb.kind() == .metal);
+        const remaining = prepared[offset..];
+        const count = if (offset == 0) first_count else try imageBatchCount(cfg, remaining[0..@min(options.max_batch, remaining.len)], options, cb.kind() == .metal);
         const result = try encodePreparedImageBatchResident(cb, a, weights, execution_cfg, prepared[offset..][0..count]);
         const added = count * result.tokens;
         defer cb.free(result.embeddings);
+        if (result.tokens != lengths[offset]) return error.InvalidImageBatch;
         if (!try cb.copyRows2D(a, tensor, rows, result.embeddings, 0, added, cfg.text_hidden)) return error.ResidentImageOperationUnavailable;
         rows += added;
         offset += count;
@@ -7396,6 +7392,8 @@ fn checkGemma4ImageBatch(cb: ComputeBackend, reference: ComputeBackend) !void {
         const resident_before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
         var resident = try encodePreparedImagesResidentWithWeights(&resident_cb, a, &resident_weights, cfg, prepared[0..batch], .{ .max_batch = @min(batch, 2) });
         defer resident.deinit();
+        try std.testing.expectEqual(@min(batch, 2), resident.max_batch_executed);
+        try std.testing.expectEqual((batch + 1) / 2, resident.batches_executed);
         try resident_before.expectUnchanged(cb);
         const exported = try cb.toFloat32(resident.embeddings, a);
         defer a.free(exported);
@@ -7805,7 +7803,7 @@ test "gemma4 video CUDA bicubic projection matches native embeddings for both pr
         const projector = try ProjectorStore.open(a, absolute);
         defer projector.close();
         var cfg = try parseConfig(&projector.gguf.parsed);
-        cfg.max_image_tokens = 70;
+        cfg.max_image_tokens = video_tokens_per_frame;
         if (videoResample(&cb, cfg) != .torchvision_bicubic) return error.SkipZigTest;
         var vtable = cb.vtable.*;
         if (unified) vtable.layerNorm = Oracle.checkUnifiedInput;

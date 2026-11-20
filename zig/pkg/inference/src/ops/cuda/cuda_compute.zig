@@ -13561,9 +13561,9 @@ fn allocPinnedTempSlot(
         return null;
     }
     if (slot.buffer.ptr == 0) {
-        slot.requested_len = len;
         if (findExactTempBufferIndex(self, len)) |i| {
             slot.buffer = self.temp_buffers.orderedRemove(i);
+            slot.requested_len = len;
             self.stats.temp_buffer_hits += 1;
             slot.in_use = true;
             traceCudaTempAlloc(self, seq, "alloc_slot_seed", len, slot.buffer);
@@ -13571,6 +13571,7 @@ fn allocPinnedTempSlot(
         }
         self.stats.temp_buffer_misses += 1;
         slot.buffer = try buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
+        slot.requested_len = len;
         self.noteDeviceBytes(len);
         self.stats.device_alloc_calls += 1;
         slot.in_use = true;
@@ -14013,15 +14014,18 @@ fn allocDeviceBufferOrdinaryWithPolicy(self: *CudaCompute, len: usize, policy: e
     if (self.temp_scan_profile.enabled) self.temp_scan_profile.sections[2].operations += 1;
     if (lock_sample) |sample| self.temp_scan_profile.end(2, sample, 0);
     const seq = self.temp_trace_seq;
-    self.temp_trace_seq = seq + 1;
-    if (self.temp_slot_config.autoplan_enabled) {
-        self.temp_arena_planner.noteAllocation(self.allocator, len, max_temp_pinned_slots) catch {
-            self.temp_arena_planner.disabled = true;
-            self.temp_arena_planner.active = false;
-            self.temp_arena_planner.ready_for_capture = false;
-        };
+    // Optional scratch must stay reclaimable and must not shift graph slot numbering.
+    if (policy == .required) {
+        self.temp_trace_seq = seq + 1;
+        if (self.temp_slot_config.autoplan_enabled) {
+            self.temp_arena_planner.noteAllocation(self.allocator, len, max_temp_pinned_slots) catch {
+                self.temp_arena_planner.disabled = true;
+                self.temp_arena_planner.active = false;
+                self.temp_arena_planner.ready_for_capture = false;
+            };
+        }
+        if (try allocPinnedTempSlot(self, seq, len)) |buffer| return buffer;
     }
-    if (try allocPinnedTempSlot(self, seq, len)) |buffer| return buffer;
     if (self.debug_cuda_graph_capture_active and cudaEffectiveTempSlotPeriod(self) != 0) {
         // Falling through to the ordinary cache would let a graph retain an
         // address that can be reused immediately after capture. Captures with
@@ -39733,6 +39737,28 @@ test "Gemma4 CUDA temporary LRU bounds bytes and entries while preserving live t
     defer a.free(actual);
     try std.testing.expectEqualSlices(f32, &values, actual);
 }
+test "Gemma4 CUDA projector optional scratch leaves graph slots available after admission and denial" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.initWithKernelJitForProfile(std.testing.allocator, .{}, .gemma4);
+    defer compute.deinit();
+    compute.temp_slot_config = .{ .configured_period = 1 };
+    const seq = compute.temp_trace_seq;
+    var scratch = try allocDeviceBufferOrdinaryWithPolicy(&compute, 512, .optional);
+    releaseDeviceBuffer(&compute, &scratch);
+    try std.testing.expectEqual(seq, compute.temp_trace_seq);
+    try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items.len);
+    const budget = &compute.ctx.device_allocations;
+    const before = budget.snapshot();
+    try budget.setLimit(before.live);
+    try std.testing.expectError(error.CudaMemoryLimitExceeded, allocDeviceBufferOrdinaryWithPolicy(&compute, 1024, .optional));
+    try std.testing.expectError(error.CudaMemoryLimitExceeded, allocDeviceBufferOrdinaryWithPolicy(&compute, 1024, .required));
+    try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items[0].requested_len);
+    try budget.setLimit(before.limit);
+    var required = try allocDeviceBufferOrdinaryWithPolicy(&compute, 256, .required);
+    defer releaseDeviceBuffer(&compute, &required);
+    try std.testing.expectEqual(required.ptr, compute.temp_pinned_slots.items[0].buffer.ptr);
+}
+
 test "Gemma4 CUDA projector fits the weight-only budget and falls back under residual scratch pressure" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;

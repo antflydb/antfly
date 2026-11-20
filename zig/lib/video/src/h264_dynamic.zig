@@ -70,6 +70,7 @@ pub const Continuation = struct {
                 self.deinit();
                 var initial = view;
                 initial.track.inband_parameter_sets = false;
+                initial.track.multiple_avc_parameter_sets = false;
                 var options = registry.options;
                 if (registry.budget.live >= options.max_decode_bytes) return error.ResourceLimitExceeded;
                 options.max_decode_bytes -= registry.budget.live;
@@ -105,6 +106,7 @@ pub const Session = struct {
     picture: [256]?PPS = @splat(null),
     entries: std.ArrayList(Entry) = .empty,
     epochs: std.ArrayList(Epoch) = .empty,
+    progressive_idrs: std.ArrayList(usize) = .empty,
     packet_configs: []usize = &.{},
     header_budget: Budget,
     header_packets: std.ArrayList([]u8) = .empty,
@@ -138,6 +140,7 @@ pub const Session = struct {
         }
         self.entries.deinit(allocator);
         self.epochs.deinit(allocator);
+        self.progressive_idrs.deinit(allocator);
         for (self.history.items) |parameter| allocator.free(parameter.bytes);
         self.history.deinit(allocator);
         allocator.free(self.packet_configs);
@@ -256,6 +259,8 @@ pub const Session = struct {
             try @import("avc.zig").validatePortablePacket(lease.bytes, self.reader.track.nal_length_bytes);
             var cursor: usize = 0;
             var selected: ?usize = null;
+            var idr_start = false;
+            var non_idr_slice = false;
             while (cursor < lease.bytes.len) {
                 try self.reader.input.control.check();
                 var size: usize = 0;
@@ -263,11 +268,14 @@ pub const Session = struct {
                 cursor += self.reader.track.nal_length_bytes;
                 const nal = lease.bytes[cursor..][0..size];
                 cursor += size;
-                switch (nal[0] & 31) {
+                const kind = nal[0] & 31;
+                non_idr_slice = non_idr_slice or (kind >= 1 and kind <= 4);
+                switch (kind) {
                     7, 8 => try self.install(nal, i),
                     1, 2, 5 => {
                         var bits = @import("h264_prefix.zig").Bits{ .bytes = nal };
-                        _ = try bits.ue();
+                        const first_mb = try bits.ue();
+                        if (kind == 5 and first_mb == 0) idr_start = true;
                         const slice_type = try bits.ue();
                         const index = try self.entry(try bits.ue());
                         if (selected) |previous| if (previous != index) return error.MixedVideoPictures;
@@ -289,6 +297,13 @@ pub const Session = struct {
                     },
                     else => {},
                 }
+            }
+            if (idr_start and !non_idr_slice) {
+                const cfg = self.entries.items[selected.?].config;
+                // Only complete progressive access units can split a run here.
+                // Fields, partitions and separate planes share assembly state.
+                if (cfg.frame_only and !cfg.separate_planes and cfg.profile != 88)
+                    try self.progressive_idrs.append(allocator, i);
             }
             self.packet_configs[i] = selected orelse self.active orelse std.math.maxInt(usize);
         }
@@ -417,6 +432,12 @@ pub const Session = struct {
         if (self.active) |id| self.active = remap[id];
         allocator.free(self.packet_configs);
         self.packet_configs = selectors;
+        var kept_idrs: usize = 0;
+        for (self.progressive_idrs.items) |packet| if (packet >= removed) {
+            self.progressive_idrs.items[kept_idrs] = packet - removed;
+            kept_idrs += 1;
+        };
+        self.progressive_idrs.items.len = kept_idrs;
     }
     pub fn configAt(self: *const Session, index: usize) !h264.Config {
         if (index >= self.packet_configs.len or self.packet_configs[index] == std.math.maxInt(usize)) return error.MissingVideoParameterSet;
@@ -431,9 +452,13 @@ pub const Session = struct {
     /// and decoder allocation ownership. Only metadata slices are shared; this
     /// temporary view is never deinitialized as a registry owner.
     pub fn decodeSelectedBorrowed(self: *const Session, allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, context: *anyopaque, callback: h264.SelectionCallback) !h264.Statistics {
+        return self.decodeSelectedBorrowedWithOptions(allocator, reader, indexes, self.options, context, callback);
+    }
+    pub fn decodeSelectedBorrowedWithOptions(self: *const Session, allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: h264.Options, context: *anyopaque, callback: h264.SelectionCallback) !h264.Statistics {
         if (reader.packets.ptr != self.reader.packets.ptr or reader.packets.len != self.reader.packets.len) return error.InvalidPacketIndex;
         var borrowed = self.*;
         borrowed.reader = reader;
+        borrowed.options = options;
         borrowed.backing = allocator;
         borrowed.budget.backing = allocator;
         const live = borrowed.budget.live;
@@ -452,14 +477,19 @@ pub const Session = struct {
         if (self.budget.peak >= options.max_decode_bytes) return error.ResourceLimitExceeded;
         options.max_decode_bytes -= self.budget.peak;
         var stats = h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = self.budget.peak };
+        for (slots, 0..) |*slot, i| slot.* = i;
+        std.mem.sort(usize, slots, indexes, struct {
+            fn less(ids: []const usize, left: usize, right: usize) bool {
+                return ids[left] < ids[right];
+            }
+        }.less);
+        var first: usize = 0;
         for (self.epochs.items) |epoch| {
-            var count: usize = 0;
-            for (indexes, 0..) |index, slot| if (index >= epoch.start and index < epoch.end) {
-                selected[count] = index - epoch.start;
-                slots[count] = slot;
-                count += 1;
-            };
-            if (count == 0) continue;
+            const begin = first;
+            while (first < slots.len and indexes[slots[first]] < epoch.end) : (first += 1) {
+                selected[first] = indexes[slots[first]] - epoch.start;
+            }
+            if (begin == first) continue;
             var view = self.reader.*;
             view.packets = self.reader.packets[epoch.start..epoch.end];
             const value = self.entries.items[epoch.entry];
@@ -475,12 +505,29 @@ pub const Session = struct {
                     try capture.callback(capture.context, capture.slots[slot], frame);
                 }
             };
-            var capture = Capture{ .slots = slots[0..count], .context = context, .callback = callback };
-            var frame = try h264.decodeWithConfigurations(self.backing, &view, selected[0..count], options, &capture, Capture.publish, .{ .session = self, .base = epoch.start, .independent_start = epoch.independent, .max_refs = epoch.max_refs });
-            defer frame.deinit();
-            stats.decoded_packets += frame.decoded_packets;
-            stats.payload_bytes += frame.payload_bytes;
-            stats.decode_high_water = @max(stats.decode_high_water, frame.decode_high_water + self.budget.peak);
+            const configurations = Context{ .session = self, .base = epoch.start, .independent_start = epoch.independent, .max_refs = epoch.max_refs };
+            var start = begin;
+            while (start < first) {
+                var end = first;
+                // An indexing observer needs every intervening picture. For
+                // sparse output, split only when a verified IDR skips work.
+                if (options.picture_observer == null) {
+                    end = start + 1;
+                    while (end < first) : (end += 1) {
+                        const after = std.sort.upperBound(usize, self.progressive_idrs.items, indexes[slots[end]], packetOrder);
+                        if (after != 0 and self.progressive_idrs.items[after - 1] > indexes[slots[end - 1]] + 1) break;
+                    }
+                }
+                var capture = Capture{ .slots = slots[start..end], .context = context, .callback = callback };
+                var remaining = options;
+                remaining.max_dependency_packets -|= stats.decoded_packets;
+                var frame = try h264.decodeWithConfigurations(self.backing, &view, selected[start..end], remaining, &capture, Capture.publish, configurations);
+                defer frame.deinit();
+                stats.decoded_packets += frame.decoded_packets;
+                stats.payload_bytes += frame.payload_bytes;
+                stats.decode_high_water = @max(stats.decode_high_water, frame.decode_high_water + self.budget.peak);
+                start = end;
+            }
         }
         return stats;
     }
@@ -500,6 +547,10 @@ pub const Session = struct {
         return frame;
     }
 };
+fn packetOrder(left: usize, right: usize) std.math.Order {
+    return std.math.order(left, right);
+}
+
 fn nalSet(bytes: []const u8, cursor: *usize) ![]const u8 {
     if (cursor.* > bytes.len or bytes.len - cursor.* < 2) return error.MalformedVideoConfig;
     const size = std.mem.readInt(u16, bytes[cursor.*..][0..2], .big);

@@ -26,6 +26,8 @@ const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Session = @import("../backends/session.zig").Session;
 const memory = @import("../runtime/tier/memory.zig");
 
+pub const token_allowance = video.packet_sampling.gemma4_max_frames * (projector_mod.video_tokens_per_frame + 10);
+
 const sampling: embedding_video.Sampling = .gemma4;
 
 /// Decoder and indexing memory, shared through one pool per request.
@@ -432,7 +434,7 @@ test "gemma4 video reserves portable memory through generation admission" {
     const messages = [_]generation.Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
     const portable = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .generic);
     try std.testing.expectEqual(portable_host_bytes, portable.host_scratch_bytes);
-    try std.testing.expect(portable.token_allowance >= 60 * 80);
+    try std.testing.expectEqual(token_allowance, portable.token_allowance);
     const cuda = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .cuda);
     try std.testing.expectEqual(@as(usize, 0), cuda.host_scratch_bytes);
     const text = [_]generation.Message{.{ .role = "user", .content = "describe" }};
@@ -846,4 +848,83 @@ test "gemma4 video portable decoder delivers the planned slots across NVDEC limi
             try std.testing.expectEqual(@as(i64, 60000000), timestamps[31]);
         }
     }
+}
+
+test "gemma4 video AV1 MP4 preserves the edit across portable selection and decoder preroll" {
+    const a = std.testing.allocator;
+    const bytes = try a.dupe(u8, @embedFile("../testdata/video/codecs/av1.mp4"));
+    defer a.free(bytes);
+    const edit = std.mem.indexOf(u8, bytes, "elst").? + 4;
+    // Movie clock 1000 Hz, track clock 16384 Hz, four pictures per second.
+    // Start between frames at 0.375 s and retain exactly two seconds.
+    std.mem.writeInt(u32, bytes[edit + 8 ..][0..4], 2000, .big);
+    std.mem.writeInt(i32, bytes[edit + 12 ..][0..4], 6144, .big);
+    var scope = embedding_video.InspectionScope{ .allocator = a };
+    defer scope.deinit();
+    const config = embedding_video.Configuration{ .sampling = .gemma4, .inspection_scope = &scope, .decoder = .{ .policy = .portable } };
+    const times = try embedding_video.selectedConfiguredPresentationUs(a, bytes, .{}, config);
+    defer a.free(times);
+    try std.testing.expectEqualSlices(i64, &.{ 125000, 1125000 }, times);
+    const direct = try embedding_video.selectedPresentationUs(a, bytes, .{}, .gemma4, null);
+    defer a.free(direct);
+    try std.testing.expectEqualSlices(i64, times, direct);
+    const entry = scope.find(bytes, null, config).?;
+    try std.testing.expectEqualSlices(usize, &.{ 2, 6 }, entry.selected.?);
+    try std.testing.expectEqual(@as(usize, 16), entry.webm_reader.packets.len);
+    const Counter = struct {
+        seen: [2]bool = @splat(false),
+        fn accept(raw: *anyopaque, slot: usize, _: video.preparation.BorrowedFrame, _: video.preparation.Options, _: media.source.Control) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(slot < 2 and !self.seen[slot]);
+            self.seen[slot] = true;
+        }
+    };
+    var counter = Counter{};
+    var observed = config;
+    observed.observer = .{ .context = &counter, .accept = Counter.accept };
+    try embedding_video.observeConfigured(a, bytes, null, .{}, observed);
+    try std.testing.expectEqual([2]bool{ true, true }, counter.seen);
+}
+
+test "gemma4 video multi-PPS supports embedding sampling and sparse long-clip decode" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/h264-two-pps.mp4");
+    var source = media.source.Source{ .allocator = a, .identity = "multi-PPS", .storage = .{ .borrowed = bytes } };
+    var original = try media.mp4.Reader.init(a, &source, .{});
+    defer original.deinit();
+    const policies = [_]embedding_video.Sampling{ .reference, .{ .timestamps = .{} }, .{ .source_timestamps = .{ .end_ns = std.time.ns_per_s } } };
+    for (policies) |policy| {
+        const selected = try embedding_video.selectWithSampling(a, &original, policy);
+        defer a.free(selected);
+        try std.testing.expect(selected.len != 0);
+    }
+    // Repeat an independently coded GOP by borrowing its payloads. This spans
+    // both previous limits without a second large checked-in bitstream.
+    var reader = original;
+    reader.track.timescale = 30;
+    reader.packets = try a.alloc(media.mp4.Packet, 4200);
+    defer a.free(reader.packets);
+    for (reader.packets, 0..) |*packet, i| {
+        packet.* = original.packets[i % original.packets.len];
+        packet.pts = @intCast(i);
+        packet.duration = 1;
+        packet.sync = false; // Prove restart decisions come from the active slice headers.
+    }
+    var scope = embedding_video.InspectionScope{ .allocator = a };
+    defer scope.deinit();
+    const config = embedding_video.Configuration{ .sampling = .gemma4 };
+    _ = try scope.inspect(bytes, &reader, .{}, config, false);
+    const entry = scope.find(bytes, &reader, config).?;
+    const Counter = struct {
+        seen: std.StaticBitSet(32) = .empty,
+        fn publish(raw: *anyopaque, slot: usize, _: *const video.h264.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.seen.isSet(slot));
+            self.seen.set(slot);
+        }
+    };
+    var counter = Counter{};
+    const stats = try entry.configurations.?.decodeSelectedBorrowed(a, &reader, entry.selected.?, &counter, Counter.publish);
+    try std.testing.expectEqual(@as(usize, 32), counter.seen.count());
+    try std.testing.expect(stats.decoded_packets <= 32 * original.packets.len);
 }

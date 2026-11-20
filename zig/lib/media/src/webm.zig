@@ -130,7 +130,15 @@ const Scan = struct {
         return ebml.readUint(lease.bytes);
     }
 };
+/// Original clock of an adapted track. Packet timestamps for codec callbacks stay in nanoseconds.
+pub const SourceTimeline = struct {
+    pub const Sample = struct { pts: i64, duration: u32 };
+    timescale: u32,
+    edit: @import("timeline.zig").Edit,
+    samples: []Sample,
+};
 pub const Reader = struct {
+    source_timeline: ?SourceTimeline = null,
     allocator: std.mem.Allocator,
     input: *source.Source,
     metadata: source.Lease,
@@ -269,6 +277,7 @@ pub const Reader = struct {
         return .{ .cues = owned_cues, .index_reservation = index_reservation, .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = try packets.toOwnedSlice(allocator), .timestamp_scale_ns = scale, .duration_seconds = duration_seconds };
     }
     pub fn deinit(self: *Reader) void {
+        if (self.source_timeline) |timeline| self.allocator.free(timeline.samples);
         self.allocator.free(self.packets);
         self.allocator.free(self.cues);
         self.metadata.deinit();

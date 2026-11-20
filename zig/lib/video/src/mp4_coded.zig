@@ -62,26 +62,31 @@ pub fn openWebm(a: std.mem.Allocator, source: *media.source.Source) !media.webm.
     return intoWebm(a, &reader);
 }
 
+const adapted_sample_bytes = @sizeOf(media.webm.Packet) + @sizeOf(media.webm.SourceTimeline.Sample);
+
 /// Consumes the MP4 owner on success; errors preserve it for caller cleanup.
 fn intoWebm(a: std.mem.Allocator, reader: *media.mp4.Reader) !media.webm.Reader {
     try reader.input.control.check();
     if (reader.track.codec != .av1) return error.UnsupportedVideoCodec;
     if (reader.track.timescale == 0) return error.InvalidTimebase;
     const track = try webmTrack(reader.track);
-    if (reader.packets.len > limits.max_index_bytes / @sizeOf(media.webm.Packet)) return error.ResourceLimitExceeded;
-    const index_bytes = reader.packets.len * @sizeOf(media.webm.Packet);
+    if (reader.packets.len > limits.max_index_bytes / adapted_sample_bytes) return error.ResourceLimitExceeded;
+    const index_bytes = reader.packets.len * adapted_sample_bytes;
     // The old index remains live throughout translation. Admit this moving
     // overlap before allocation, and retain the replacement's exact charge.
     var replacement = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = index_bytes }) else media.admission.Token{};
     errdefer replacement.deinit();
     const packets = try a.alloc(media.webm.Packet, reader.packets.len);
     errdefer a.free(packets);
+    const samples = try a.alloc(media.webm.SourceTimeline.Sample, reader.packets.len);
+    errdefer a.free(samples);
     var start: i128 = std.math.maxInt(i64);
     var end: i128 = std.math.minInt(i64);
     for (reader.packets, packets, 0..) |packet, *out, index| {
         if (index % 256 == 0) try reader.input.control.check();
         start = @min(start, packet.pts);
         end = @max(end, @as(i128, packet.pts) + packet.duration);
+        samples[index] = .{ .pts = packet.pts, .duration = packet.duration };
         out.* = .{
             .cluster_offset = packet.offset,
             .offset = packet.offset,
@@ -106,6 +111,7 @@ fn intoWebm(a: std.mem.Allocator, reader: *media.mp4.Reader) !media.webm.Reader 
         .cues = cues,
         .timestamp_scale_ns = 1,
         .duration_seconds = span,
+        .source_timeline = .{ .timescale = reader.track.timescale, .edit = reader.track.edit, .samples = samples },
     };
     reader.allocator.free(reader.packets);
     reader.index_reservation.deinit();
@@ -248,7 +254,7 @@ test "AV1 MP4 bridge admits index overlap before allocation and transfers exact 
     const a = std.testing.allocator;
     const count = 400;
     const old_bytes = count * @sizeOf(media.mp4.Packet);
-    const new_bytes = count * @sizeOf(media.webm.Packet);
+    const new_bytes = count * adapted_sample_bytes;
     const peak = "metadata".len + old_bytes + new_bytes;
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = peak - 1 } };
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = "metadata" }, .identity = "index-overlap", .admission_pool = &pool };
@@ -331,7 +337,7 @@ test "AV1 MP4 bridge retains only translated index admission on real input" {
     {
         var reader = try openWebm(a, &source);
         defer reader.deinit();
-        const new_bytes = reader.packets.len * @sizeOf(media.webm.Packet);
+        const new_bytes = reader.packets.len * adapted_sample_bytes;
         const old_bytes = reader.packets.len * @sizeOf(media.mp4.Packet);
         try std.testing.expectEqual(@as(u64, new_bytes), reader.index_reservation.resources.host_bytes);
         try std.testing.expectEqual(@as(u64, reader.metadata.bytes.len + new_bytes), pool.snapshot().host_bytes);

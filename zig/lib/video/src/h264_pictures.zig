@@ -154,7 +154,7 @@ pub const Stream = struct {
         const self = try a.create(Stream);
         errdefer a.destroy(self);
         const prefix = try prefixHash(reader, 0, options.decode.max_packet_bytes);
-        const registry = if (reader.track.inband_parameter_sets) try dynamic.Session.init(a, reader, options.decode) else null;
+        const registry = if (reader.track.requiresAvcRegistry()) try dynamic.Session.init(a, reader, options.decode) else null;
         errdefer if (registry) |owner| owner.deinit();
         var view = reader.*;
         if (registry) |owner| {
@@ -163,6 +163,7 @@ pub const Stream = struct {
             view.track.width = @intCast(entry.config.width);
             view.track.height = @intCast(entry.config.height);
             view.track.inband_parameter_sets = false;
+            view.track.multiple_avc_parameter_sets = false;
         }
         const core = try h264.Incremental.init(a, &view, options.decode);
         errdefer core.deinit();
@@ -230,6 +231,7 @@ pub const Stream = struct {
                 if (self.core.hasPending()) return error.UnfinishedVideoPictureAtReset;
                 var initial = view;
                 initial.track.inband_parameter_sets = false;
+                initial.track.multiple_avc_parameter_sets = false;
                 const replacement = try h264.Incremental.init(self.allocator, &initial, self.options.decode);
                 self.core.deinit();
                 self.core = replacement;
@@ -422,7 +424,7 @@ fn discard(_: *anyopaque, _: usize, _: *const h264.Frame) !void {}
 /// when selected dependency spans are decoded. Live ingestion keeps the strict
 /// reconstruction index because publication requires completed pictures.
 pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, registry: ?*dynamic.Session) !Index {
-    const owned = if (registry == null and (reader.track.inband_parameter_sets or reader.track.multiple_avc_parameter_sets)) try dynamic.Session.initPlanning(a, reader, options.decode) else null;
+    const owned = if (registry == null and reader.track.requiresAvcRegistry()) try dynamic.Session.initPlanning(a, reader, options.decode) else null;
     defer if (owned) |owner| owner.deinit();
     defer if (registry orelse owned) |owner| owner.releasePlanningHeaders();
     var result = try @import("h264_headers.zig").planning(a, reader, options, registry orelse owned);
@@ -431,14 +433,14 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Option
     return result;
 }
 pub fn index(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !Index {
-    return indexMode(a, reader, options, false);
+    return indexMode(a, reader, options, false, null);
 }
 /// Completed logical pictures plus a conservative pending-picture barrier.
 /// Corruption, resource failures and abandoned pictures at reset remain errors.
 pub fn streaming(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !Index {
-    return indexMode(a, reader, options, true);
+    return indexMode(a, reader, options, true, null);
 }
-fn indexMode(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, partial: bool) !Index {
+pub fn indexMode(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, partial: bool, registry: ?*dynamic.Session) !Index {
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
     if (reader.packets.len == 0) return error.EmptyVideo;
     if (options.max_pictures == 0) return error.ResourceLimitExceeded;
@@ -455,16 +457,17 @@ fn indexMode(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, 
     var decode = options.decode;
     decode.picture_observer = .{ .context = &collector, .accept = Collector.accept, .pending = if (partial) Collector.pending else null };
     var stats = h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 };
-    if (reader.track.inband_parameter_sets) {
-        const session = try dynamic.Session.init(a, reader, decode);
-        defer session.deinit();
+    if (reader.track.requiresAvcRegistry()) {
+        const owned = if (registry == null) try dynamic.Session.init(a, reader, decode) else null;
+        defer if (owned) |session| session.deinit();
+        const session = registry orelse owned.?;
         var selectors: std.ArrayList(usize) = .empty;
         defer selectors.deinit(a);
         for (session.epochs.items) |epoch| if (try codedEnds(reader, epoch.start, epoch.end, decode.max_packet_bytes)) |ends| {
             try selectors.appendSlice(a, &ends);
         };
         if (selectors.items.len == 0) return error.EmptyVideo;
-        stats = session.decodeSelected(selectors.items, &collector, discard) catch |err| caught: {
+        stats = session.decodeSelectedBorrowedWithOptions(a, reader, selectors.items, decode, &collector, discard) catch |err| caught: {
             if (!partial or err != error.PendingVideoPicture or collector.pending_first_packet == null) return err;
             break :caught h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 };
         };

@@ -31,7 +31,7 @@ pub const Picture = struct {
     height: u32,
     bit_depth: u8 = 8,
     chroma_format: u8 = 1,
-    /// Present for header indexes; reconstructed indexes remain portable-only.
+    /// Source packet carrying this visible output.
     packet_index: ?usize = null,
     color: frames.Color = .{},
     profile: u8 = 0,
@@ -107,7 +107,7 @@ const Collect = struct {
     }
     fn accept(raw: *anyopaque, _: usize, frame: *const codecs.Frame) !void {
         const self: *Collect = @ptrCast(@alignCast(raw));
-        try self.push(.{ .pts = frame.pts_ns, .duration = frame.duration_ns, .width = frame.width, .height = frame.height, .bit_depth = frame.bit_depth, .chroma_format = frame.chroma_format, .color = frame.color });
+        try self.push(.{ .pts = frame.pts_ns, .duration = frame.duration_ns, .packet_index = frame.source_packet, .width = frame.width, .height = frame.height, .bit_depth = frame.bit_depth, .chroma_format = frame.chroma_format, .color = frame.color });
     }
     fn push(self: *Collect, picture: Picture) !void {
         if (self.pictures.items.len >= self.limit) return error.ResourceLimitExceeded;
@@ -443,6 +443,7 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
                 const p = decoded.planes;
                 var frame = try frames.copy(a, options.decoder.admission_pool, @intCast(p.width), @intCast(p.height), 8, 1, .{ .matrix = 6 }, .{ p.y.ptr, p.u.ptr, p.v.ptr }, .{ p.y_stride, p.uv_stride, p.uv_stride }, options.decoder.max_output_bytes);
                 defer frame.deinit();
+                frame.source_packet = packet_id;
                 frame.pts_ns = decoded.pts_ns;
                 frame.duration_ns = decoded.duration_ns;
                 try accept(context, logical, &frame);
@@ -512,6 +513,7 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
             const consumed = if (selected != null and logical <= last) @min(batch.output_count, last - logical +| 1) else batch.output_count;
             if (consumed > options.max_pictures -| logical) return error.ResourceLimitExceeded;
             for (batch.frames) |*frame| {
+                frame.source_packet = packet_id;
                 const id = try std.math.add(usize, logical, frame.output_index);
                 if (selected == null or std.mem.indexOfScalar(usize, selected.?, id) != null) try accept(context, id, frame);
             }

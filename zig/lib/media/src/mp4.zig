@@ -60,6 +60,10 @@ pub const Track = struct {
     decode_preroll_ticks: u32 = 0,
     /// Exact tkhd display matrix; interpretation belongs to display preparation.
     display_matrix: [9]i32,
+
+    pub fn requiresAvcRegistry(self: Track) bool {
+        return self.codec == .avc and (self.inband_parameter_sets or self.multiple_avc_parameter_sets);
+    }
 };
 pub const Packet = struct {
     offset: u64,
