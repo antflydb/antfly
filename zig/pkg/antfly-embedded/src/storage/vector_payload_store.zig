@@ -1395,13 +1395,14 @@ pub const Store = struct {
             try result.configureDirectory();
             return result;
         }
-        var writer = try native.Store.open(alloc, storage, root);
-        defer writer.deinit();
-        if (writer.manifest == null) {
-            if (read_only) return error.MissingVectorPayloadStore;
-            try writer.publishEmptyBase(1, 0, .{ .shard_count = if (sizing.target_bytes == 0) 128 else sizing.min_shards, .encoding = encoding });
-        }
-        var result: Store = .{ .alloc = alloc, .opened = try native.Store.openWithBlocks(alloc, storage, root), .read_only = read_only, .segment_sizing = sizing, .snapshot_reads = snapshot_reads, .checkpoint_receipts = policy.checkpoint_receipts };
+        const opened = blk: {
+            var current = try native.Store.openWithBlocks(alloc, storage, root);
+            if (current.store.manifest != null) break :blk current;
+            defer current.deinit();
+            try current.store.publishEmptyBase(1, 0, .{ .shard_count = if (sizing.target_bytes == 0) 128 else sizing.min_shards, .encoding = encoding });
+            break :blk try native.Store.openWithBlocks(alloc, storage, root);
+        };
+        var result: Store = .{ .alloc = alloc, .opened = opened, .read_only = false, .segment_sizing = sizing, .snapshot_reads = snapshot_reads, .checkpoint_receipts = policy.checkpoint_receipts };
         errdefer result.deinit();
         if (!try result.loadCheckpointReceipt() and !experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY")) try result.inventoryRetainedPayloads();
         // This is the table's writable startup owner, before any builder can
@@ -3645,16 +3646,60 @@ test "source vector payloads retain accounting across reopen before collection o
     }
 }
 
+test "source vector payloads retry descriptor pressure before appending" {
+    const alloc = std.testing.allocator;
+    const Fault = struct {
+        fn rejectBeforeAppend(_: *anyopaque, _: []const u8, _: []const u8, _: bool, may_have_appended: *bool) !void {
+            may_have_appended.* = false;
+            return error.ProcessFdQuotaExceeded;
+        }
+    };
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const keys = @import("internal_keys.zig");
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 23, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    var reference: [payload.reference_len]u8 = undefined;
+    {
+        var source = try Store.open(alloc, memory.storage(), "/descriptor-retry", false);
+        defer source.deinit();
+        var faulty_vtable = memory.storage().vtable.*;
+        faulty_vtable.append_file_absolute_checked = Fault.rejectBeforeAppend;
+        source.opened.store.storage.vtable = &faulty_vtable;
+        const session = try payload.Session.create(alloc, source.interface());
+        defer session.release();
+        @memcpy(&reference, try session.put(key, artifact));
+        const prior_batch = source.opened.store.last_committed_batch;
+        try std.testing.expectError(error.ProcessFdQuotaExceeded, session.prepareCommit());
+        try std.testing.expect(!source.poisoned);
+        try std.testing.expectEqual(prior_batch, source.opened.store.last_committed_batch);
+        source.opened.store.storage.vtable = memory.storage().vtable;
+        try session.prepareCommit();
+        session.committed = true;
+    }
+    var reopened = try Store.open(alloc, memory.storage(), "/descriptor-retry", false);
+    defer reopened.deinit();
+    const session = try payload.Session.create(alloc, reopened.interface());
+    defer session.release();
+    try std.testing.expectEqualSlices(u8, artifact, try session.get(key, &reference));
+}
+
 test "source vector payloads fence ambiguous durable preparations and recover retries" {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
     const keys = @import("internal_keys.zig");
     const Fault = struct {
-        fn appendThenFail(ptr: *anyopaque, path: []const u8, bytes: []const u8, sync: bool) !void {
+        fn appendThenFail(ptr: *anyopaque, path: []const u8, bytes: []const u8, _: bool, may_have_appended: *bool) !void {
+            may_have_appended.* = true;
             const memory: *lsm.MemoryStorage = @ptrCast(@alignCast(ptr));
-            try memory.storage().vtable.append_file_absolute.?(ptr, path, bytes, sync);
-            return error.InjectedLostAcknowledgement;
+            try memory.storage().vtable.append_file_absolute.?(ptr, path, bytes, false);
+            return error.InputOutput;
+        }
+        fn failSync(_: *anyopaque, _: []const u8) !void {
+            return error.InputOutput;
         }
     };
     var memory = lsm.MemoryStorage.init(alloc);
@@ -3668,19 +3713,26 @@ test "source vector payloads fence ambiguous durable preparations and recover re
         var source = try Store.open(alloc, memory.storage(), "/ambiguous", false);
         defer source.deinit();
         var faulty_vtable = memory.storage().vtable.*;
-        faulty_vtable.append_file_absolute = Fault.appendThenFail;
+        faulty_vtable.append_file_absolute_checked = Fault.appendThenFail;
         source.opened.store.storage.vtable = &faulty_vtable;
         const session = try payload.Session.create(alloc, source.interface());
         defer session.release();
         @memcpy(&reference, try session.put(key, artifact));
-        try std.testing.expectError(error.InjectedLostAcknowledgement, session.prepareCommit());
+        try std.testing.expectError(error.InputOutput, session.prepareCommit());
         try std.testing.expect(source.poisoned);
         try std.testing.expectError(error.VectorPayloadStorePoisoned, session.prepareCommit());
     }
-    // A successful durable append with a lost acknowledgement is recovered;
-    // retry reuses its identity without another append or revision change.
+    var fault_storage = memory.storage();
+    var fault_vtable = fault_storage.vtable.*;
+    fault_vtable.sync_contents_absolute = Fault.failSync;
+    fault_storage.vtable = &fault_vtable;
+    try std.testing.expectError(error.InputOutput, Store.open(alloc, fault_storage, "/ambiguous", false));
+
+    // Once recovery sync succeeds, retry can reuse the payload without an append.
+    const syncs_before = memory.sync_contents_calls;
     var reopened = try Store.open(alloc, memory.storage(), "/ambiguous", false);
     defer reopened.deinit();
+    try std.testing.expectEqual(syncs_before + 1, memory.sync_contents_calls);
     const session = try payload.Session.create(alloc, reopened.interface());
     defer session.release();
     try std.testing.expectEqualSlices(u8, artifact, try session.get(key, &reference));

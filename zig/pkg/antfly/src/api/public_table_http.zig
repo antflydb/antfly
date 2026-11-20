@@ -2144,11 +2144,15 @@ pub fn handleTableQueryRequest(
                 return try queryDependencyErrorOwnedResponse(alloc, 429, "query_embedding_overloaded", "query embedding overloaded", true);
             },
             error.EmbedRateLimited => {
-                return try queryDependencyErrorOwnedResponse(alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true);
+                var response = try queryDependencyErrorOwnedResponse(alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true);
+                if (api.request.diagnostics) |diagnostics| response.retry_after_seconds = operation.remainingRetryAfterSeconds(diagnostics.query_embedding_retry_not_before_ns) orelse response.retry_after_seconds;
+                return response;
             },
             error.EmbedTransientFailure => {
                 std.log.warn("public table query embedding temporarily unavailable table={s}", .{table_name});
-                return try queryTemporarilyUnavailableOwnedResponse(alloc, .query_embedding_temporarily_unavailable);
+                var response = try queryTemporarilyUnavailableOwnedResponse(alloc, .query_embedding_temporarily_unavailable);
+                if (api.request.diagnostics) |diagnostics| response.retry_after_seconds = operation.remainingRetryAfterSeconds(diagnostics.query_embedding_retry_not_before_ns) orelse response.retry_after_seconds;
+                return response;
             },
             error.EmbedUpstreamFailure => {
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});

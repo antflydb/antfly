@@ -40,6 +40,10 @@ pub const Options = struct {
     deployment: local.common_config.DeploymentMode,
     local_base_dir: ?[]const u8 = null,
     graph_execution_limits: local.graph_work_budget.Limits = .{},
+    embedding_cache: ?@import("internal_query_operations.zig").QueryEmbeddingCache = null,
+    embedding_runtime: ?*@import("antfly_local_sources").inference_managed_embedder.ProviderRuntime = null,
+    inference_api_url: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
     remote_content: ?*const @import("antfly_scraping").RemoteContentConfig = null,
 };
 
@@ -77,6 +81,10 @@ const Entry = struct {
             .secret_store = options.secrets,
             .graph_execution_limits = options.graph_execution_limits,
             .remote_content = options.remote_content,
+            .embedding_cache = options.embedding_cache,
+            .query_embedding_runtime = options.embedding_runtime,
+            .inference_api_url = options.inference_api_url,
+            .inference_api_key = options.inference_api_key,
         }, io);
         errdefer self.stack.deinit();
         try context.ensureActive();
@@ -196,7 +204,7 @@ pub const Manager = struct {
         var bound_body: ?[]u8 = null;
         defer if (bound_body) |bytes| a.free(bytes);
         if (std.mem.eql(u8, suffix, "query")) bound_body = try stripAliasFences(a, body, entry.indexes);
-        var response = entry.stack.handler.handle(.{ .method = method, .path = path, .body = bound_body orelse body, .cancellation = context.cancellation, .deadline_ns = guard.context.deadline_ns }) catch |err| {
+        var response = entry.stack.handler.handle(.{ .method = method, .path = path, .body = bound_body orelse body, .cancellation = guard.token(), .deadline_ns = guard.context.deadline_ns, .request_id = context.request_id, .query_started_ns = context.query_started_ns, .principal = context.principal }) catch |err| {
             // Transport-only cancellation adapters may report Canceled when
             // the request deadline expired. Preserve the native error kind.
             if (method == .get or std.mem.eql(u8, suffix, "query")) try guard.context.ensureActive();

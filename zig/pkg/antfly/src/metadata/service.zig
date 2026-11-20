@@ -574,6 +574,15 @@ fn requireRelationMutationOwnerWithContext(service: anytype, expected: metadata_
     if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
     try service.ensureLinearizableReadWithContext(context);
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (guard.qualified_table) {
+        const scope: relation_catalog.Target = .{ .database = guard.target.database, .namespace = guard.target.namespace, .table = guard.target.name };
+        const pin_incarnation = !std.mem.allEqual(u8, &guard.incarnation, 0);
+        const cut = try store.resolveSystemCatalogIdentities(service.alloc, service.metadata_group_id, .{ .targets = &.{scope}, .include_source_epoch = pin_incarnation });
+        defer cut.deinit(service.alloc);
+        if (cut.tables.len != 1 or cut.tables[0] == null or cut.tables[0].?.table_id != expected.table_id or !std.mem.eql(u8, cut.tables[0].?.name, expected.name)) return error.CatalogGenerationChanged;
+        if (pin_incarnation and (cut.source_epoch == null or !std.mem.eql(u8, &cut.source_epoch.?.incarnation, &guard.incarnation))) return error.CatalogGenerationChanged;
+        return;
+    }
     const request: relation_catalog.ResolveMany = .{ .relations = &.{guard.target} };
     const resolved = try store.resolveSystemCatalogIdentities(service.alloc, service.metadata_group_id, request);
     defer resolved.deinit(service.alloc);
@@ -3648,6 +3657,66 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command: metadata_storage.TransitionCommand) std.mem.Allocator.Error!u16 {
     var required = (try transitionBaseDecoderVersion(a, command));
     switch (command) {
+        .apply_system_catalog => |bytes| {
+            const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind, expected_incarnation: ?[16]u8 = null, expected_resource_id: ?u64 = null, expected_parent_id: ?u64 = null, expected_tablespace_id: ?u64 = null } };
+            var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return metadata_topology_protocol.current_version,
+            };
+            defer parsed.deinit();
+            if (parsed.value.mutation.expected_parent_id != null) required = @max(required, metadata_topology_protocol.bound_create_parent_version);
+            if (parsed.value.mutation.expected_incarnation != null) required = @max(required, metadata_topology_protocol.bound_catalog_incarnation_version);
+            if (parsed.value.mutation.expected_resource_id != null or parsed.value.mutation.expected_tablespace_id != null) required = @max(required, metadata_topology_protocol.bound_ddl_version);
+            if (parsed.value.mutation.kind == .graph) required = @max(required, metadata_topology_protocol.graph_definition_version);
+        },
+        .apply_fk_initial_create => |bytes| {
+            const Parent = struct { support_after: ?struct { schema_json: []const u8 } = null };
+            const Header = struct { plan: ?struct {
+                expected_incarnation: ?[32]u8 = null,
+                support_schema_format: ?@import("../api/tables.zig").SchemaRecordFormat = null,
+                parents: []const Parent = &.{},
+            } = null };
+            var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return metadata_topology_protocol.current_version,
+            };
+            defer parsed.deinit();
+            if (parsed.value.plan) |plan| {
+                if (plan.expected_incarnation != null) required = @max(required, metadata_topology_protocol.guarded_generation_admission_version);
+                if (plan.support_schema_format != null or fk_generation_publication.hasStampedSupport(plan.parents))
+                    required = @max(required, metadata_topology_protocol.guarded_publication_version);
+            }
+        },
+        .apply_fk_generation_publication, .apply_restore_staging => |bytes| {
+            const Header = struct { plan: ?@import("restore_staging.zig").PlanGuard = null };
+            var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return metadata_topology_protocol.current_version,
+            };
+            defer parsed.deinit();
+            if (parsed.value.plan) |plan| if (plan.expected_incarnation != null) {
+                required = @max(required, metadata_topology_protocol.guarded_generation_admission_version);
+            };
+        },
+        .create_restore_job_with_staging => |record| {
+            const guard = @import("restore_staging.zig").PlanGuard.read(a, record.plan_json) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return metadata_topology_protocol.current_version,
+            };
+            if (guard.expected_incarnation != null) required = @max(required, metadata_topology_protocol.guarded_generation_admission_version);
+        },
+        .apply_sql_policies, .apply_sql_policy_publication => |bytes| {
+            const Header = struct { version: u16 = 1, expected_incarnation: ?[16]u8 = null, expected_schema_version: ?u32 = null };
+            var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return metadata_topology_protocol.current_version,
+            };
+            defer parsed.deinit();
+            if (command == .apply_sql_policies and parsed.value.version >= @import("antfly_local_sources").system_catalog_policies.capacity_checked_version)
+                required = @max(required, metadata_topology_protocol.guarded_generation_admission_version);
+            if (parsed.value.expected_incarnation != null or parsed.value.expected_schema_version != null)
+                required = @max(required, if (command == .apply_sql_policy_publication) metadata_topology_protocol.guarded_publication_version else metadata_topology_protocol.bound_catalog_incarnation_version);
+        },
         .register_store, .upsert_store, .upsert_store_heartbeat => |record| {
             if (record.artifact_sources_protocol_version >= 4) {
                 required = @max(required, metadata_topology_protocol.index_alias_lifecycle_version);
@@ -3680,6 +3749,22 @@ fn tableDecoderVersion(a: std.mem.Allocator, table: metadata_table_manager.Table
     return required;
 }
 
+test "relation mutation admission requires guarded plan decoders only for incarnation-bound plans" {
+    const guarded_create: metadata_storage.TransitionCommand = .{ .apply_system_catalog = "{\"mutation\":{\"kind\":\"namespace\",\"expected_parent_id\":7}}" };
+    try std.testing.expectEqual(metadata_topology_protocol.bound_create_parent_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, guarded_create));
+    const plan = "{\"expected_incarnation\":\"0123456789abcdef0123456789abcdef\"}";
+    const nested = "{\"plan\":" ++ plan ++ "}";
+    const commands = [_]metadata_storage.TransitionCommand{
+        .{ .apply_sql_policies = "{\"version\":2}" },
+        .{ .apply_fk_generation_publication = nested },
+        .{ .apply_fk_initial_create = nested },
+        .{ .apply_restore_staging = nested },
+        .{ .create_restore_job_with_staging = .{ .key = "job", .value = "{}", .plan_json = plan } },
+    };
+    for (commands) |command| try std.testing.expectEqual(metadata_topology_protocol.guarded_generation_admission_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, command));
+    try std.testing.expect((try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_fk_generation_publication = "{\"plan\":{}}" })) < metadata_topology_protocol.guarded_generation_admission_version);
+}
+
 test "index alias decoder floor composes with table features and preserves CAS history" {
     const aliases: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs", .indexes_json = "{\"_index_aliases\":{},\"_privacy\":{}}", .storage = .{ .engine = .object }, .lake_index_catalog_json = "{}" };
     const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
@@ -3703,6 +3788,12 @@ test "index alias decoder floor composes with table features and preserves CAS h
     const escaped: metadata_table_manager.TableRecord = .{ .table_id = 2, .name = "plain", .indexes_json = "{\"text\":{\"type\":\"full_text\",\"description\":\"line\\nnext\"}}" };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .upsert_table = escaped }, @as(u16, 0) });
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .apply_system_catalog = envelope }, floor });
+}
+
+test "relation mutation admission gates bound transaction sessions independently of ordinary sessions" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(metadata_topology_protocol.transaction_sessions_version, try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_transaction_sessions = &.{1} }));
+    try std.testing.expectEqual(metadata_topology_protocol.bound_session_version, try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_transaction_sessions = &.{2} }));
 }
 
 fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.TransitionCommand) std.mem.Allocator.Error!u16 {
@@ -3732,19 +3823,18 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
         },
         else => {},
     }
-    if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
-    if (command == .apply_system_catalog) {
-        const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind } };
-        var parsed = std.json.parseFromSlice(Header, a, command.apply_system_catalog, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return metadata_topology_protocol.current_version,
+    if (command == .apply_transaction_sessions) {
+        const frame = command.apply_transaction_sessions;
+        if (frame.len == 0) return metadata_topology_protocol.current_version;
+        return switch (frame[0]) {
+            1 => metadata_topology_protocol.transaction_sessions_version,
+            2 => metadata_topology_protocol.bound_session_version,
+            else => metadata_topology_protocol.current_version,
         };
-        defer parsed.deinit();
-        if (parsed.value.mutation.kind == .graph) return metadata_topology_protocol.graph_definition_version;
     }
     if (command == .apply_resolver_authority or command == .advance_resolver_namespace) return metadata_topology_protocol.resolver_records_version;
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
-        return metadata_topology_protocol.relation_mutation_version;
+        return if (command.compare_and_replace_table.relation_guard.?.qualified_table) metadata_topology_protocol.bound_ddl_version else metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {
         const intent = @import("relation_reconciliation_command.zig").Command.decode(command.apply_relation_reconciliation) catch return metadata_topology_protocol.current_version;
         return intent.requiredDecoderVersion();
@@ -6213,6 +6303,7 @@ pub const MetadataService = struct {
         };
         read_tracker_owned = false;
         errdefer service.deinit();
+        if (service.projectedStore()) |store| try store.ensureDerivedCatalogIndexes(metadata_group_id);
         try foreign_mod.registerDefaultPostgresExecutor(alloc, &service.cdc_backfill_registry);
         return service;
     }
@@ -9042,6 +9133,7 @@ pub const MetadataHttpService = struct {
         owned_backend_runtime = null;
         errdefer service.deinit();
         service.publishTransitionMetricsLocked();
+        if (service.projectedStore()) |store| try store.ensureDerivedCatalogIndexes(metadata_group_id);
         try foreign_mod.registerDefaultPostgresExecutor(alloc, &service.cdc_backfill_registry);
         return service;
     }
@@ -13788,7 +13880,7 @@ test "metadata service reallocation barrier requires a current protocol from the
 test "metadata table topology protocol fences namespace writers and restored declarations" {
     const version = metadata_topology_protocol.resolver_namespaces_version;
     const table: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "source", .indexes_json = "{\"knowledge\":{\"resolvers\":[]}}" };
-    try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = "{\"topology\":{\"create\":{\"table\":{\"indexes_json\":\"{\\\"resolvers\\\":[]}\"}}}}" })));
+    try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = "{\"mutation\":{\"kind\":\"table\"},\"topology\":{\"create\":{\"table\":{\"indexes_json\":\"{\\\"resolvers\\\":[]}\"}}}}" })));
     try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = table })));
     try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = table, .replacement = table } })));
     try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } })));
@@ -13811,7 +13903,9 @@ test "metadata table topology protocol fences namespace writers and restored dec
         const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .indexes_json = indexes }, .{});
         defer std.testing.allocator.free(encoded);
         try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_restore_staging = encoded })));
-        try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = encoded })));
+        const catalog = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = .{ .indexes_json = indexes } } } }, .{});
+        defer std.testing.allocator.free(catalog);
+        try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = catalog })));
     }
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var predecessor = MetadataStatus{
@@ -13829,7 +13923,7 @@ test "metadata table topology protocol fences namespace writers and restored dec
     try std.testing.expect(tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
 }
 
-test "metadata table topology protocol checks the command's required version and exact replica" {
+test "metadata service table topology protocol checks the command's required version and exact replica" {
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status = MetadataStatus{
         .metadata_group_id = 42,
@@ -13837,6 +13931,13 @@ test "metadata table topology protocol checks the command's required version and
         .metadata_raft_local_node_id = 7,
         .metrics = .{},
     };
+    const pinned_restore_version = metadata_topology_protocol.pinned_restore_job_version;
+    status.table_topology_protocol_version = pinned_restore_version - 1;
+    try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 7, incarnation, pinned_restore_version));
+    try std.testing.expect(tableTopologyProtocolCompatible(status, 42, 7, incarnation, metadata_topology_protocol.restore_job_admission_version));
+    status.table_topology_protocol_version = pinned_restore_version;
+    try std.testing.expect(tableTopologyProtocolCompatible(status, 42, 7, incarnation, pinned_restore_version));
+    status.table_topology_protocol_version = 0;
     try std.testing.expect(!tableTopologyProtocolCompatible(
         status,
         42,
@@ -14059,6 +14160,13 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try signing_service.propose(&.{signing_command});
     try std.testing.expectEqual(@as(usize, 1), signing_service.appended);
     const initial_create_command: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{}" };
+    const versioned_plan: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{\"plan\":{\"support_schema_format\":\"lineage_v1\"}}" };
+    var upgrading: Fake = .{ .member_versions = &.{ 97, 96, 97 } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&upgrading, versioned_plan, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, upgrading.propose(&.{versioned_plan}));
+    upgrading.member_versions = &.{ 97, 97, 97 };
+    try ensureCoordinatedDecoderWithContext(&upgrading, versioned_plan, .{});
+    try upgrading.propose(&.{versioned_plan});
     const generation_command: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{}" };
     try std.testing.expectEqual(metadata_topology_protocol.fk_generation_publication_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, generation_command)));
     var mixed_generation: Fake = .{ .member_versions = &.{ 19, 18, 19 } };
@@ -18404,6 +18512,7 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         hasher.update(std.mem.asBytes(&range.restore_native_manifest_size_bytes));
         hashProjectedProvisioningBytes(&hasher, range.restore_native_manifest_sha256);
         hasher.update(&range.completed_restore_fingerprint);
+        hasher.update(&range.restore_admission_fingerprint);
     }
 
     const placements = try service.listProjectedPlacementIntents(alloc);

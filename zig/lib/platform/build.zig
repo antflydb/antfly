@@ -19,6 +19,7 @@ pub const ModuleOptions = platform_build.ModuleOptions;
 pub const createModule = platform_build.createModule;
 pub const addModule = platform_build.addModule;
 pub const addFilesystemCapacitySource = platform_build.addFilesystemCapacitySource;
+pub const addNativeFdCacheSource = platform_build.addNativeFdCacheSource;
 pub const addTests = platform_build.addTests;
 pub const canRunNativeProcess = platform_build.canRunNativeProcess;
 pub const addNativeProcessTest = platform_build.addNativeProcessTest;

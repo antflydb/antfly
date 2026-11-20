@@ -466,12 +466,14 @@ pub const Client = struct {
                 received_lsn: u64,
                 applied_lsn: u64,
                 safe_read_lsn: u64,
+                restore_job_format: u32,
             }{
                 .slot_name = slot_name,
                 .timeline_id = identity.timeline_id,
                 .received_lsn = progress.received_lsn,
                 .applied_lsn = progress.applied_lsn,
                 .safe_read_lsn = progress.safe_read_lsn,
+                .restore_job_format = @import("../../api/restore_jobs.zig").pinned_restore_job_format_version,
             },
             .{},
         );

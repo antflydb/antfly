@@ -304,8 +304,30 @@ filename. You can also restore directly from the original repository with
 can still be opened in Lite to access its data.
 
 When selecting tables from a cluster backup, use the `selector` in
-`backup --list --output json` under `table_selectors` if display names
-collide. Pass it unchanged to `restore --tables`.
+`backup --list --output json` under `table_selectors`. Pass it unchanged to
+`restore --tables` for the same backup. Selectors work for tables with
+ambiguous display names, commas, or surrounding whitespace. If a literal table
+name has the same format as a selector, use the listed selector for that table.
+
+New cluster restore jobs use a durable format that requires workers with
+manifest binding support. In standalone hot-standby deployments, the primary
+waits for the standby replication slots on its timeline to report support
+before admitting these jobs. Immutable source identities and the aggregate
+manifest are retained with the job. Progress checkpoints reference those inputs,
+and recovery can finish a published restore after its repository is removed.
+Distributed legacy restores also retain an admission fingerprint on their ranges,
+so recovery cannot adopt another job's publication of the same archive. These
+jobs require metadata protocol version 94 before admission. Empty range fingerprints
+keep the canonical encoding and digest of existing staged plans. Plans that
+carry admission fingerprints are placed only on data workers advertising native
+restore reader version 2. Existing staged restores consult their durable plan
+before resolving the archive connection, including recovery after metadata
+publication and before the job checkpoint.
+
+For paginated backup listings, keep following `next_cursor` until it is
+absent. A page can be empty if its window contains only skipped manifests.
+When a backup's table details exceed the page size, its entry sets
+`table_details_omitted`. Use the backup ID to restore the entire backup.
 
 For an offline source inventory and compatibility report, use:
 

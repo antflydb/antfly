@@ -138,6 +138,10 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Prepare verified Zig source dependencies
         uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+      - name: Check shared descriptor accounting without libc
+        if: runner.os == 'Linux'
+        working-directory: zig
+        run: zig build storage-fd-admission-link-test -Dtarget=x86_64-linux-none -Dlink-libc=false -Doptimize=debug
       - name: Negative guard and transport receipt tests
         run: |
           python3 -m unittest discover -s zig/tools -p 'test_check_image_owner*.py'

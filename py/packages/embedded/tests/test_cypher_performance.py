@@ -87,6 +87,19 @@ def populate(db, count):
     db.run_until_idle()
 
 
+def write_indexed_scores(db, count, *, key=lambda i: f"n{i}", id_for=None, score=int, timestamp=1):
+    # Publish each fixture state in one typed batch and fully advance its
+    # indexes before measuring query work.
+    if id_for is None:
+        id_for = key
+    with db.open_table("docs") as table:
+        table.batch(
+            [af.WriteIntent(key=key(i), value={"id": id_for(i), "score": score(i)}) for i in range(count)],
+            timestamp=timestamp,
+        )
+    db.run_until_idle()
+
+
 @pytest.fixture(scope="module", params=[af.Storage.LITE, af.Storage.DIRECTORY])
 def ranked_graph_db(require_native, tmp_path_factory, request):
     """Query-only planner consumers share the same complete indexed corpus."""
@@ -7716,16 +7729,10 @@ def test_sql_graph_order_certificates_keep_null_order_and_source_ordinals(graph_
 
 
 def test_composite_ordered_seeks_merge_disjoint_in_domains(graph_db):
-    for start in range(0, 13000, 500):
-        graph_db.sql(
-            "INSERT INTO docs (_id,id,score) VALUES "
-            + ",".join(f"('n{i:05}','{'a' if i % 2 == 0 else 'b'}',{i})" for i in range(start, start + 500))
-        )
     # Both candidate orders must be considered regardless of catalog ordering.
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
-    graph_db.run_until_idle()
     graph_db.sql("CREATE INDEX bucket_score ON docs(id,score DESC)")
-    graph_db.run_until_idle()
+    write_indexed_scores(graph_db, 13000, key=lambda i: f"n{i:05}", id_for=lambda i: "a" if i % 2 == 0 else "b")
     for predicate, expected, ceiling in (
         ("n.id='a'", list(range(12998, 12989, -2)), 5),
         ("n.id IN ['b','a','b',null]", list(range(12999, 12994, -1)), 12),
@@ -7743,6 +7750,7 @@ def test_composite_ordered_seeks_merge_disjoint_in_domains(graph_db):
         assert result["stats"]["scanned_anchors"] <= ceiling
     # Partition input order and duplicate operands must not change tie order.
     graph_db.sql("UPDATE docs SET score=20000 WHERE score>=12936")
+    graph_db.run_until_idle()
     # Larger windows also cross native merge page/refill boundaries.
     for skip, limit in ((3, 17), (0, 193), (127, 65)):
         query = f"MATCH (n:D) WHERE n.id IN ['b','a','b',null] RETURN n ORDER BY n.score DESC SKIP {skip} LIMIT {limit}"
@@ -7866,13 +7874,8 @@ def test_ordered_in_partitions_keep_required_conditions_on_storage_coercion(grap
 
 
 def test_wide_ordered_in_domains_keep_bounded_planning_cost(graph_db):
-    for start in range(0, 13000, 500):
-        graph_db.sql(
-            "INSERT INTO docs (_id,id,score) VALUES "
-            + ",".join(f"('n{i:05}','b{i % 256}',{i})" for i in range(start, start + 500))
-        )
     graph_db.sql("CREATE INDEX bucket_score ON docs(id,score DESC)")
-    graph_db.run_until_idle()
+    write_indexed_scores(graph_db, 13000, key=lambda i: f"n{i:05}", id_for=lambda i: f"b{i % 256}")
     result = graph_db.cypher_json(
         "g",
         {
@@ -8196,9 +8199,8 @@ def test_reverse_index_windows_preserve_ties_nulls_and_bounds(graph_db):
 
 
 def test_indexed_extrema_use_authorized_nonnull_boundaries(graph_db):
-    populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
-    graph_db.run_until_idle()
+    write_indexed_scores(graph_db, 13000)
     for stage, arg in (("", "n.score"), ("WITH DISTINCT n", "n.score"), ("WITH n.score AS s", "s")):
         actual = graph_db.cypher_json(
             "g",
@@ -8214,7 +8216,7 @@ def test_indexed_extrema_use_authorized_nonnull_boundaries(graph_db):
                 {"type": "integer", "value": "0"},
             ]
         ]
-    graph_db.sql("UPDATE docs SET score=NULL WHERE score>=12000")
+    write_indexed_scores(graph_db, 1000, key=lambda i: f"n{i + 12000}", score=lambda _: None, timestamp=2)
     actual = graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN max(n.score)", "limits": {"scanned_anchors": 1}})
     assert actual["rows"] == [[{"type": "integer", "value": "11999"}]]
     for predicate in ("WHERE n.score IS NULL", "WHERE n.score<0"):
@@ -8235,8 +8237,7 @@ def test_indexed_extrema_use_authorized_nonnull_boundaries(graph_db):
 
     # A coarse extremum that exhausted its sole non-NULL key must retain the
     # opposite NULL bound when it seeks past that complete duplicate group.
-    for start in range(0, 12000, 1000):
-        graph_db.sql(f"UPDATE docs SET score=7 WHERE score>={start} AND score<{start + 1000}")
+    write_indexed_scores(graph_db, 12000, score=lambda _: 7, timestamp=3)
     tied = graph_db.cypher_json(
         "g", {"query": "MATCH (n:D) RETURN min(n.score),max(n.score)", "limits": {"scanned_anchors": 3}}
     )
@@ -8396,9 +8397,8 @@ def test_tuple_distinct_and_singleton_domains_skip_duplicate_runs(graph_db):
 
 
 def test_ordered_group_aggregates_only_observe_selected_domains(graph_db):
-    populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
-    graph_db.run_until_idle()
+    write_indexed_scores(graph_db, 13000)
     for observers, anchors in (
         ("count(*)", 16),
         ("max(n.score)", 16),
@@ -8527,11 +8527,9 @@ def test_broad_ordered_groups_use_one_source_pass(graph_db):
 
 
 def test_unbounded_key_domains_and_cardinality_skip_duplicate_runs(graph_db):
-    populate(graph_db, 13000)
-    for start in range(0, 13000, 1000):
-        graph_db.sql(f"UPDATE docs SET score=score%3 WHERE score>={start} AND score<{start + 1000}")
+    count = 13000
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
-    graph_db.run_until_idle()
+    write_indexed_scores(graph_db, count, score=lambda i: i % 3)
     partial = "MATCH (n:D) RETURN DISTINCT n.id,n.score ORDER BY n.score DESC LIMIT 5"
     assert (
         graph_db.cypher_json("g", {"query": partial})["rows"]
@@ -8560,9 +8558,10 @@ def test_unbounded_key_domains_and_cardinality_skip_duplicate_runs(graph_db):
         assert result["stats"]["scanned_anchors"] <= anchors
         if expression == "count(null)":
             assert result["stats"]["scanned_anchors"] == 0
-    for start in range(0, 13000, 1000):
-        keys = ",".join(repr(f"n{i}") for i in range(start, min(start + 1000, 13000)))
-        graph_db.sql(f"UPDATE docs SET score=NULL WHERE score=0 AND _id IN ({keys})")
+    zero_score_rows = range(0, count, 3)
+    write_indexed_scores(
+        graph_db, len(zero_score_rows), key=lambda i: f"n{zero_score_rows[i]}", score=lambda _: None, timestamp=2
+    )
     nonnull = graph_db.cypher_json(
         "g", {"query": "MATCH (n:D) RETURN count(DISTINCT n.score)", "limits": {"scanned_anchors": 8}}
     )
@@ -8890,16 +8889,8 @@ def test_total_group_wrappers_preserve_bounded_high_cardinality_windows(graph_db
 
 
 def test_bounded_group_obligations_stop_after_accepted_groups(graph_db):
-    with graph_db.open_table("docs") as table:
-        table.batch(
-            [
-                af.WriteIntent(key=f"u{i:06}", value={"id": f"u{i:06}", "score": i % 3})
-                for i in range(OBSERVER_DOMAIN_ROWS)
-            ],
-            timestamp=1,
-        )
     graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
-    graph_db.run_until_idle()
+    write_indexed_scores(graph_db, OBSERVER_DOMAIN_ROWS, key=lambda i: f"u{i:06}", score=lambda i: i % 3)
     limits = {"scanned_anchors": 256, "memory_bytes": 2 << 20}
     for expression, value in (("count(DISTINCT n.score)+1", "2"), ("100-count(DISTINCT n.score)", "99")):
         result = graph_db.cypher_json(

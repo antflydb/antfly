@@ -136,6 +136,7 @@ pub const Runtime = struct {
         cache: remote_capabilities.Cache,
         name: []const u8,
         source_table: []const u8,
+        media: ?bool,
         generator: @import("../generating/mod.zig").GeneratorConfig,
         capabilities: @import("antfly_structured").Capabilities,
     };
@@ -156,17 +157,24 @@ pub const Runtime = struct {
         self.resolved_generators = .empty;
     }
 
-    fn resolveGenerator(self: *Runtime, name: []const u8, source_table: []const u8) !*ResolvedGenerator {
+    fn generatorUsesRemoteAntfly(self: *const Runtime, cfg: @import("../generating/mod.zig").GeneratorConfig) bool {
+        if (cfg.provider != .antfly) return false;
+        return cfg.url.len > 0 or (if (self.antfly_url) |url| url.len > 0 else false);
+    }
+
+    fn resolveGenerator(self: *Runtime, name: []const u8, source_table: []const u8, invocation_media: ?bool) !*ResolvedGenerator {
         @import("antfly_platform").sync.lockYielding(&self.resolution_mutex);
         defer self.resolution_mutex.unlock();
-        for (self.resolved_generators.items) |entry| {
-            if (std.mem.eql(u8, entry.name, name) and std.mem.eql(u8, entry.source_table, source_table)) return entry;
-        }
         const cfg = try self.registry.getDeciderConfig(name);
+        const configured = cfg.generator orelse return error.InvalidDeciderConfig;
+        const media = if (self.generatorUsesRemoteAntfly(configured)) invocation_media else null;
+        for (self.resolved_generators.items) |entry| {
+            if (std.mem.eql(u8, entry.name, name) and std.mem.eql(u8, entry.source_table, source_table) and entry.media == media) return entry;
+        }
         var arena = std.heap.ArenaAllocator.init(self.resolution_allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        var generator = try (cfg.generator orelse return error.InvalidDeciderConfig).clone(a);
+        var generator = try configured.clone(a);
         if (generator.provider == .antfly and generator.url.len == 0) {
             generator.url = try a.dupe(u8, self.antfly_url orelse "");
             if (generator.url.len > 0 and generator.api_key == null) {
@@ -180,12 +188,16 @@ pub const Runtime = struct {
         var engine = self.constrainedRuntime(&entry.cache);
         engine.options.source_table = source_table;
         engine.options.execution.routing.source_table = source_table;
-        const caps = try engine.capabilities(a, &generator);
+        const caps = if (media) |has_media|
+            try engine.capabilitiesForMedia(a, &generator, has_media)
+        else
+            try engine.capabilities(a, &generator);
         const owned_name = try a.dupe(u8, name);
         const owned_table = try a.dupe(u8, source_table);
         entry.arena = arena;
         entry.name = owned_name;
         entry.source_table = owned_table;
+        entry.media = media;
         entry.generator = generator;
         entry.capabilities = caps;
         try self.resolved_generators.append(self.resolution_allocator, entry);
@@ -207,32 +219,31 @@ pub const Runtime = struct {
         try self.provenance.append(stats_a, .{ .decider = decider, .provider = provider_name, .model = owned_model, .rows = 1 });
     }
     pub fn provider(self: *@This()) decisions.DecisionProvider {
-        return .{ .ptr = self, .validate_fn = validatePublic, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint, .capabilities_fn = resolvedCapabilities };
+        return .{ .ptr = self, .validate_fn = validatePublic, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint, .capabilities_fn = resolvedCapabilities, .validate_request_fn = validateRequest };
     }
-    fn resolvedCapabilities(ptr: *anyopaque, name: []const u8, source_table: []const u8) !decisions.Capabilities {
+    fn resolvedCapabilities(ptr: *anyopaque, name: []const u8, _: []const u8) !decisions.Capabilities {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
-        var result = try self.registry.getDeciderCapabilities(name);
-        const cfg = try self.registry.getDeciderConfig(name);
-        if (cfg.decision_method == .cascade) {
-            // Composite admission uses the registered static contract. Native
-            // model discovery belongs to the stage that actually executes.
-            return result;
-        }
-        if (cfg.decision_method == .generated and cfg.generator.?.provider == .antfly and result.images) {
-            result.images = (try self.resolveGenerator(name, if (source_table.len > 0) source_table else self.source_table)).capabilities.images;
-        }
-        return result;
+        return self.registry.getDeciderCapabilities(name);
     }
+
+    fn validateRequest(ptr: *anyopaque, request: decisions.Request, source_table: []const u8) !decisions.Capabilities {
+        if (registry_mod.Registry.isCascadeStageName(request.decider)) return error.UnknownDecider;
+        const resolved = try validate(ptr, request.decider, request.questions, source_table, request.input.imageCount() > 0);
+        var declared = try resolvedCapabilities(ptr, request.decider, source_table);
+        declared.images = declared.images and resolved.images;
+        return declared;
+    }
+
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         if (self.context) |ctx| try ctx.check();
     }
     fn validatePublic(ptr: *anyopaque, name: []const u8, questions: decisions.Json, source_table: []const u8) !void {
         if (registry_mod.Registry.isCascadeStageName(name)) return error.UnknownDecider;
-        return validate(ptr, name, questions, source_table);
+        _ = try validate(ptr, name, questions, source_table, null);
     }
 
-    fn validate(ptr: *anyopaque, name: []const u8, questions: decisions.Json, source_table: []const u8) !void {
+    fn validate(ptr: *anyopaque, name: []const u8, questions: decisions.Json, source_table: []const u8, media: ?bool) !decisions.Capabilities {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         const cfg = try self.registry.getDeciderConfig(name);
         if (cfg.decision_method == .cascade) {
@@ -250,23 +261,27 @@ pub const Runtime = struct {
                     try c.validateProviderSchema(generator, try c.hostedCapabilities(generator).select(stage_cfg.output, stage_cfg.probabilities), try generated.questionSchema(arena.allocator(), questions));
                 };
             }
-            return;
+            return compiled.capabilities;
         }
         try cfg.validate();
         _ = try quotas.Policy.fromConfig(cfg.rate_limit);
-        try decisions.validateQuestions(questions, cfg.resolvedCapabilities());
+        var caps = cfg.resolvedCapabilities();
+        try decisions.validateQuestions(questions, caps);
         if (cfg.decision_method == .generated) {
-            var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
-            defer arena.deinit();
-            const resolved = try self.resolveGenerator(name, if (source_table.len > 0) source_table else self.source_table);
-            const generator = resolved.generator;
-            const mode = try resolved.capabilities.select(cfg.output, cfg.probabilities);
-            try @import("antfly_structured").validateProviderSchema(generator, mode, try generated.questionSchema(arena.allocator(), questions));
             if (cfg.probabilities == .token_logprobs) for (questions.object.values()) |question| {
                 const kind = question.object.get("type").?.string;
                 if (std.mem.eql(u8, kind, "multi_choice") or std.mem.eql(u8, kind, "score")) return error.UnsupportedConstrainedProbabilities;
             };
+            if (media != true and self.generatorUsesRemoteAntfly(cfg.generator.?)) return caps;
+            var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+            defer arena.deinit();
+            const resolved = try self.resolveGenerator(name, if (source_table.len > 0) source_table else self.source_table, media);
+            if (media == true) caps.images = caps.images and resolved.capabilities.images;
+            const generator = resolved.generator;
+            const mode = try resolved.capabilities.select(cfg.output, cfg.probabilities);
+            try @import("antfly_structured").validateProviderSchema(generator, mode, try generated.questionSchema(arena.allocator(), questions));
         }
+        return caps;
     }
     fn constrainedRuntime(self: *Runtime, cache: *remote_capabilities.Cache) constrained_runtime.Runtime {
         return .{ .http = self.http, .cache = cache, .options = .{
@@ -284,7 +299,7 @@ pub const Runtime = struct {
     pub fn evaluateGeneratedPartial(self: *Runtime, a: std.mem.Allocator, name: []const u8, requests: []const decisions.Request) !GeneratedBatch {
         if (requests.len == 0) return error.InvalidDecisionSpecification;
         try self.provider().validateRequests(a, requests);
-        try self.provider().withSourceTable(requests[0].source_table).validate(name, requests[0].questions);
+        _ = try validate(self, name, requests[0].questions, requests[0].source_table, batchHasImages(requests));
         const cfg = try self.registry.getDeciderConfig(name);
         if (cfg.decision_method != .generated) return error.InvalidDeciderConfig;
         var lease = admission.tryAcquireLease() orelse return error.DecisionRateLimited;
@@ -324,11 +339,18 @@ pub const Runtime = struct {
         }
     };
 
+    fn batchHasImages(requests: []const decisions.Request) bool {
+        for (requests) |request| if (request.input.imageCount() > 0) return true;
+        return false;
+    }
+
     fn generateBatchPartial(self: *Runtime, a: std.mem.Allocator, cfg: decisions.DeciderConfig, requests: []const decisions.Request, remaining_input_tokens: u64) !GeneratedBatch {
         const source_table = if (requests[0].source_table.len > 0) requests[0].source_table else self.source_table;
-        const resolved = try self.resolveGenerator(requests[0].decider, source_table);
+        const media = batchHasImages(requests);
+        const resolved = try self.resolveGenerator(requests[0].decider, source_table, media);
         var engine = self.constrainedRuntime(&resolved.cache);
         engine.capability_snapshot = resolved.capabilities;
+        engine.required_media = media;
         engine.require_execution_lease = resolved.generator.capability_token != null;
         engine.options.source_table = source_table;
         engine.options.execution.routing.source_table = source_table;
@@ -337,6 +359,7 @@ pub const Runtime = struct {
         const caps = resolved.capabilities;
         engine.limits = caps.limits;
         const mode = try caps.select(cfg.output, cfg.probabilities);
+        try @import("antfly_structured").validateProviderSchema(generator, mode, try generated.questionSchema(a, requests[0].questions));
         generator.logprobs = cfg.probabilities == .token_logprobs;
         const inputs = try a.alloc(decisions.Json, requests.len);
         defer a.free(inputs);
@@ -594,7 +617,6 @@ pub const Runtime = struct {
         var estimated = budget.estimated_input_tokens;
         for (requests) |request| {
             const cfg = try self.registry.getDeciderConfig(request.decider);
-            if (cfg.decision_method == .generated) _ = try self.resolveGenerator(request.decider, if (request.source_table.len > 0) request.source_table else self.source_table);
             if (budget.reserved_rows + requests.len > cfg.max_rows or budget.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
             try request.input.checkLimit(a, cfg.resolvedCapabilities().max_input_bytes);
             // Reserve text bytes plus the configured visual token bound before
@@ -819,12 +841,12 @@ pub const Runtime = struct {
             const first = self.requests[self.group[indices[0]]];
             // Discovery and dynamic schema checks run under the cascade's
             // bounded context and its explicit failure policy.
-            try validate(self.runtime, stage_name, first.questions, first.source_table);
             const stage_requests = try a.alloc(decisions.Request, indices.len);
             for (indices, stage_requests) |index, *request| {
                 request.* = self.requests[self.group[index]];
                 request.decider = stage_name;
             }
+            _ = try validate(self.runtime, stage_name, first.questions, first.source_table, batchHasImages(stage_requests));
             const partial = try self.runtime.evaluateCore(a, stage_requests, true);
             const usage = if (partial.item_usage) |measured| blk: {
                 const items = try a.alloc(decisions.Json, measured.len);
@@ -1970,6 +1992,9 @@ test "decision functions generated statement renews revoked leases without chang
             try authority(req);
             // The concrete execution is /generate, not /generate/batch.
             try std.testing.expectEqualStrings("model=vision&task=generate&operation=generate", req.query);
+            if (req.header(remote_capabilities.discovery_shape_header)) |shape| {
+                try std.testing.expectEqualStrings("2:1:1:256", shape);
+            }
             if (revoked and scenario == .cancelled_discovery) cancellation.store(true, .release);
         }
         fn request(req: httpx.testing_mod.RequestInfo) !void {
@@ -2062,6 +2087,19 @@ test "decision functions generated statement renews revoked leases without chang
                 try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
                 try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
                 routes[0].respond.status = 200;
+                // A failed cold flight imposes a cooldown even after the
+                // endpoint recovers. Advance just that entry's clock.
+                try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, runtime.provider().evaluateBatch(alloc, &requests));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                const cache = &runtime.resolved_generators.items[0].cache;
+                {
+                    cache.mutex.lockUncancelable(io);
+                    defer cache.mutex.unlock(io);
+                    var entries = cache.entries.valueIterator();
+                    while (entries.next()) |entry| {
+                        if (entry.cold_failure != null) entry.refresh_not_before_ns = 0;
+                    }
+                }
                 _ = try runtime.provider().evaluateBatch(alloc, &requests);
                 try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
                 try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(1));
@@ -2104,6 +2142,7 @@ test "decision functions scoped generated image validation and execution share a
         fn catalog(req: httpx.testing_mod.RequestInfo) !void {
             const table = req.header("X-Antfly-Source-Table") orelse return error.MissingScope;
             try std.testing.expectEqualStrings("model=vision&task=generate&operation=generate", req.query);
+            try std.testing.expectEqualStrings("2:1:3:256", req.header(remote_capabilities.discovery_shape_header) orelse return error.MissingDiscoveryShape);
             routes[0].respond.body = if (std.mem.eql(u8, table, "photos")) vision_catalog else text_catalog;
         }
         fn generate(req: httpx.testing_mod.RequestInfo) !void {
@@ -2150,6 +2189,10 @@ test "decision functions scoped generated image validation and execution share a
         \\[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]
     , .{}));
     const request = decisions.Request{ .decider = "judge", .questions = questions, .input = input };
+    var text_request = request;
+    text_request.input = .{ .text = "Compare this text row" };
+    try runtime.provider().withSourceTable("photos").validateRequests(alloc, &.{ text_request, request });
+    try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
     const first = try runtime.provider().withSourceTable("photos").evaluateBatch(alloc, &.{request});
     try std.testing.expectEqualStrings("same", first[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
     try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
@@ -2258,7 +2301,11 @@ test "decision functions late stale responses preserve a renewed execution lease
         // while the first invocation's stale response is still in flight.
         try servers.concurrent(io, Fixture.serve, .{ &server, &server_failure });
         const cache = &runtime.resolved_generators.items[0].cache;
-        const headers: []const [2][]const u8 = &.{ .{ "Authorization", "Bearer fixture" }, .{ "X-Antfly-Source-Table", "docs" } };
+        const headers: []const [2][]const u8 = &.{
+            .{ "Authorization", "Bearer fixture" },
+            .{ "X-Antfly-Source-Table", "docs" },
+            .{ remote_capabilities.discovery_shape_header, "2:1:1:256" },
+        };
         try cache.invalidateLease(server.baseUrl(), "vision", .generate, headers, try remote_capabilities.LeaseIdentity.init("old-token", Fixture.revision));
         const replacement_token = if (rotate_revision_only) "old-token" else "new-token";
         const replacement_revision = if (rotate_revision_only) "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" else Fixture.revision;

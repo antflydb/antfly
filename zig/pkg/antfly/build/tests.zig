@@ -267,9 +267,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "PDF embedding input public contract",
             "public table query returns hierarchy validation pointers",
             "embedding validation failures share",
+            "api http query parsing preserves operational embedding failures",
             "hierarchy validation body survives",
             "serverless create index normalization resolves and persists",
             "serverless aggregation errors preserve invalid and unsupported classes",
+            "serverless public table query adapter preserves structured error content type",
+            "serverless fallback semantic query reuses embeddings",
             "time series public aggregation failures retain client and operational classes",
         },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
@@ -572,7 +575,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
-    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
+    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL policy DDL", "SQL pgwire", "SQL rewrite response" } });
     b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
         .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
     const sql_native_cells_tests = b.addTest(.{
@@ -781,6 +784,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api http client encodes table name for repair cancel callback",
             "public api routes compile",
             "table repair job records bounded pass and continuation",
+            "table repair job continues bounded passes across restart",
+            "table repair job verifies earlier pending shards before success",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
@@ -1594,6 +1599,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "managed embedder deadlines bound provider pacing and transport",
         "remote capability invalidation fences active discovery",
         "managed embedder dimension probe validation modes",
+        "split text windows compare pinned output identity across placement contracts",
         "managed embedding request overlays borrow capability cache synchronization",
         "managed embedder rejects malformed provider vectors",
         "managed embedder rejects unsupported execution namespaces",
@@ -1614,6 +1620,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "capability lease HTTP fields own storage",
         "asset producer runtime rejects empty borrowed media",
         "asset producer runtime derives coherent logical and wire result ceilings",
+        "reader split windows share the original response budget",
         "asset producer runtime applies result ceilings to non-model producers",
         "remote chunk runtime services do not require a local callback provider",
         "asset producer media invocation memory fails closed",
@@ -2552,6 +2559,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     query_embedding_cache_test_mod.addImport("antfly_cache_budget", antfly_imports.cache_budget);
     query_embedding_cache_test_mod.addImport("antfly_platform", platform_mod);
+    query_embedding_cache_test_mod.addImport("antfly_cancellation", antfly_imports.cancellation);
     query_embedding_cache_test_mod.addImport("vopr", vopr_mod);
     const query_embedding_cache_tests = b.addTest(.{ .root_module = query_embedding_cache_test_mod });
     const run_query_embedding_cache_tests = b.addRunArtifact(query_embedding_cache_tests);
@@ -3860,6 +3868,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
     lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
+
+    if (target.result.os.tag == .linux or (antfly_imports.platform_link_libc and target.result.os.tag == .macos)) {
+        var modules: [2]*std.Build.Module = undefined;
+        for (&modules) |*module| {
+            module.* = b.createModule(.{
+                .root_source_file = b.path("pkg/antfly-embedded/src/storage_fd_cache_link_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = antfly_imports.platform_link_libc,
+            });
+            module.*.addImport("antfly_platform", platform_mod);
+            module.*.addImport("antfly_hash", hash_mod);
+            antfly_imports.configureRuntimeContracts(module.*);
+        }
+        const provider = b.addLibrary(.{ .name = "descriptor-admission-test-provider", .root_module = modules[0] });
+        modules[1].linkLibrary(provider);
+        const linked = b.addTest(.{
+            .name = "descriptor-admission-link-tests",
+            .root_module = modules[1],
+            .filters = &.{"native fd admission is visible across separately compiled archives"},
+        });
+        const run = b.addRunArtifact(linked);
+        b.step("storage-fd-admission-link-test", "Verify native descriptor accounting across archives").dependOn(&run.step);
+        lsm_backend_test_step.dependOn(&run.step);
+    }
 
     const lsm_checkpoint_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -6064,6 +6097,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     shared_inference_contract_step.dependOn(&run_redirect_tests.step);
     unit_test_step.dependOn(&run_redirect_tests.step);
 
+    const capability_discovery_tests = b.addTest(.{ .root_module = antfly_imports.inference_remote_capabilities });
+    const run_capability_discovery_tests = b.addRunArtifact(capability_discovery_tests);
+    b.step("antfly-inference-capability-discovery-test", "Run remote capability discovery and activation contracts").dependOn(&run_capability_discovery_tests.step);
+    shared_inference_contract_step.dependOn(&run_capability_discovery_tests.step);
+    unit_test_step.dependOn(&run_capability_discovery_tests.step);
+
     inline for (.{ antfly_imports.cache_budget, antfly_imports.inference_types, antfly_imports.inference_work, antfly_imports.inference_local, antfly_imports.inference_vertex }) |mod| {
         const tests = b.addTest(.{ .root_module = mod });
         const run = b.addRunArtifact(tests);
@@ -7142,6 +7181,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "model aware media fused reuse rejects a changed provider generation with the same alias",
             "model aware media retained named text permits a changed embedding generation",
             "model aware media vocabulary inference rejects a producing generation change hidden by rollback",
+            "PDF page publication fences stale windows",
+            "source grouping trusts a whole document embedding",
             "shared PDF page embedding checkpoints successful siblings before retry",
             "cached content authority fences legacy writes",
             "backfill skips cached bodies and publishes metadata only",
@@ -7170,7 +7211,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const repair_publication_tests = b.addTest(.{
         .name = "artifact-repair-publication-tests",
         .root_module = db_test_mod,
-        .filters = &.{ "successful forced document reprocess", "successful asset publication clears terminal debt", "public artifact reprocess accepts durable work", "managed index repair observes terminal replay failure", "metadata replay progress", "document extraction manifest inspection and reprocess API", "document quality policy reprocess retires", "OCR sampling byte fingerprints", "managed index repair keeps failed OCR manifests as debt", "managed index repair queues providers outside the request guard and survives reopen" },
+        .filters = &.{ "successful forced document reprocess", "successful asset publication clears terminal debt", "public artifact reprocess accepts durable work", "managed index repair observes terminal replay failure", "metadata replay progress", "document extraction manifest inspection and reprocess API", "document quality policy reprocess retires", "OCR sampling byte fingerprints", "shared repair completion reprocesses consumer with terminal coverage", "managed index repair keeps failed OCR manifests as debt", "managed index repair queues providers outside the request guard and survives reopen" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         // This focused Safe owner measured 13.9 GB peak with extraction
         // inspection included. Reserve at least 25% headroom, not the full
@@ -7227,7 +7268,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const relational_index_lifecycle_step = b.step("antfly-relational-index-lifecycle-test", "Run relational index dependency and retirement admission tests");
     relational_index_lifecycle_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_lifecycle_tests).step);
 
-    const generated_vector_contract_filters = &.{ "ordered artifact inventory publication projects every shared consumer", "embedding input kind generated selectors" };
+    const generated_vector_contract_filters = &.{ "ordered artifact inventory publication projects every shared consumer", "ordered artifact inventory compact proof preserves output CAS history", "embedding input kind generated selectors" };
     const generated_vector_contract_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = generated_vector_contract_filters,
