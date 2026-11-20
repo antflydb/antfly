@@ -484,23 +484,60 @@ fn orContainers(alloc: Allocator, self: *Container, other: *const Container) !vo
                 self.* = .{ .bitmap = bm };
             },
             .array => |*oa| {
-                for (oa.items) |v| {
-                    const pos = arraySearchPos(sa.items, v);
-                    if (pos >= sa.items.len or sa.items[pos] != v) {
-                        try sa.insert(alloc, pos, v);
-                    }
-                }
-                // Check if should convert to bitmap
-                if (sa.items.len > array_max) {
+                const count = arrayUnionCount(sa.items, oa.items);
+                if (count > array_max) {
                     const bm = try alloc.alloc(u64, bitmap_words);
                     @memset(bm, 0);
                     for (sa.items) |v| bitmapSet(bm, v);
+                    for (oa.items) |v| bitmapSet(bm, v);
                     sa.deinit(alloc);
                     self.* = .{ .bitmap = bm };
+                } else if (count != sa.items.len) {
+                    var left = sa.items.len;
+                    try sa.ensureTotalCapacity(alloc, count);
+                    sa.items.len = count;
+                    var write = count;
+                    var right = oa.items.len;
+                    while (right != 0) {
+                        right -= 1;
+                        const value = oa.items[right];
+                        while (left != 0 and sa.items[left - 1] > value) {
+                            left -= 1;
+                            write -= 1;
+                            sa.items[write] = sa.items[left];
+                        }
+                        if (left != 0 and sa.items[left - 1] == value) left -= 1;
+                        write -= 1;
+                        sa.items[write] = value;
+                    }
+                    std.debug.assert(write == left);
                 }
             },
         },
     }
+}
+
+fn arrayUnionCount(left: []const u16, right: []const u16) usize {
+    if (left.len == 0 or right.len == 0 or left[left.len - 1] < right[0] or right[right.len - 1] < left[0]) {
+        return left.len + right.len;
+    }
+    if (right.len == 1) return left.len + @intFromBool(!arrayContains(left, right[0]));
+
+    var total = left.len + right.len;
+    var li: usize = 0;
+    var ri: usize = 0;
+    while (li < left.len and ri < right.len) {
+        if (left[li] < right[ri]) {
+            li += 1;
+        } else if (right[ri] < left[li]) {
+            ri += 1;
+        } else {
+            total -= 1;
+            li += 1;
+            ri += 1;
+        }
+    }
+    return total;
 }
 
 fn andNotContainers(_: Allocator, self: *Container, other: *const Container) void {
@@ -1372,6 +1409,14 @@ pub const RoaringBitmap = struct {
         if (self == other or other.keys.items.len == 0) return;
         self.invalidateRankCache();
 
+        // Small updates can seek directly to their chunks. Ordered segment
+        // results can append without walking the accumulated directory.
+        if (other.keys.items.len <= 8 or self.keys.items.len == 0 or
+            other.keys.items[0] >= self.keys.items[self.keys.items.len - 1])
+        {
+            return self.unionSmallOrOrdered(other);
+        }
+
         var extra: usize = 0;
         var left: usize = 0;
         for (other.keys.items, other.containers.items) |key, *container| {
@@ -1422,6 +1467,28 @@ pub const RoaringBitmap = struct {
             self.containers.items[write] = merged;
         }
         std.debug.assert(write == remaining);
+    }
+
+    fn unionSmallOrOrdered(self: *RoaringBitmap, other: *const RoaringBitmap) !void {
+        for (other.keys.items, other.containers.items) |key, *container| {
+            if (container.isEmpty()) continue;
+            const len = self.keys.items.len;
+            if (len != 0 and self.keys.items[len - 1] == key) {
+                try orContainers(self.alloc, &self.containers.items[len - 1], container);
+                continue;
+            }
+            const position = if (len == 0 or self.keys.items[len - 1] < key) len else self.lowerChunk(key);
+            if (position < len and self.keys.items[position] == key) {
+                try orContainers(self.alloc, &self.containers.items[position], container);
+                continue;
+            }
+            var owned = try cloneContainer(self.alloc, container);
+            errdefer owned.deinit(self.alloc);
+            try self.keys.ensureUnusedCapacity(self.alloc, 1);
+            try self.containers.ensureUnusedCapacity(self.alloc, 1);
+            self.keys.insertAssumeCapacity(position, key);
+            self.containers.insertAssumeCapacity(position, owned);
+        }
     }
 
     pub fn andNotWith(self: *RoaringBitmap, other: *const RoaringBitmap) void {
@@ -3220,12 +3287,16 @@ test "optional numeric range union merges interleaved chunk directories" {
 test "optional numeric range union keeps its directory valid after allocation failure" {
     const alloc = std.testing.allocator;
     const left_values = [_]u32{ 65537, 3 * 65536 + 1, 5 * 65536 + 1 };
-    const right_values = [_]u32{ 1, 2 * 65536 + 1, 4 * 65536 + 1, 5 * 65536 + 2 };
+    const right_values = [_]u32{
+        1,              2 * 65536 + 1, 4 * 65536 + 1, 5 * 65536 + 2,
+        6 * 65536 + 1,  7 * 65536 + 1, 8 * 65536 + 1, 9 * 65536 + 1,
+        10 * 65536 + 1,
+    };
     var right = RoaringBitmap.init(alloc);
     defer right.deinit();
     for (right_values) |value| try right.add(value);
     var saw_failure = false;
-    for (0..8) |offset| {
+    for (0..12) |offset| {
         var failing: std.testing.FailingAllocator = .init(alloc, .{});
         var left = RoaringBitmap.init(failing.allocator());
         defer left.deinit();
@@ -3248,4 +3319,35 @@ test "optional numeric range union keeps its directory valid after allocation fa
         for (left_values ++ right_values) |value| try std.testing.expect(left.contains(value));
     }
     try std.testing.expect(saw_failure);
+}
+
+test "optional numeric range unions sparse values in order and promotes without a temporary array" {
+    const alloc = std.testing.allocator;
+    var failing: std.testing.FailingAllocator = .init(alloc, .{});
+    var left = RoaringBitmap.init(failing.allocator());
+    defer left.deinit();
+    var right = RoaringBitmap.init(alloc);
+    defer right.deinit();
+    for (0..2048) |index| {
+        try left.add(@intCast(2 * index));
+        try right.add(@intCast(2 * index + 1));
+    }
+    try left.orWith(&right);
+    try std.testing.expect(left.containers.items[0] == .array);
+    try std.testing.expectEqual(@as(usize, array_max), left.cardinality());
+    try right.add(4096);
+
+    const before = failing.alloc_index;
+    failing.fail_index = before;
+    try std.testing.expectError(error.OutOfMemory, left.orWith(&right));
+    try std.testing.expectEqual(@as(usize, array_max), left.cardinality());
+    try std.testing.expect(!left.contains(4096));
+
+    failing.fail_index = std.math.maxInt(usize);
+    try left.orWith(&right);
+    try std.testing.expectEqual(before + 1, failing.alloc_index);
+    try std.testing.expect(left.containers.items[0] == .bitmap);
+    var values = left.iterator();
+    for (0..4097) |value| try std.testing.expectEqual(@as(?u32, @intCast(value)), values.next());
+    try std.testing.expect(values.next() == null);
 }
