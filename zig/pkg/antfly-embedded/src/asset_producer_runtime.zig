@@ -4081,7 +4081,24 @@ pub const Runtime = struct {
         return false;
     }
 
-    fn readerMediaGeometry(alloc: Allocator, request: anytype, complete: *bool) !remote_capabilities.DiscoveryMediaGeometry {
+    const ReaderMimeShape = struct {
+        batch: u8 = 0,
+        first: u8 = 0,
+
+        fn add(self: *ReaderMimeShape, mime: []const u8, index: usize) void {
+            const essence = std.mem.trim(u8, mime[0 .. std.mem.indexOfScalar(u8, mime, ';') orelse mime.len], " \t");
+            const names = [_][]const u8{ "image/png", "image/jpeg", "image/gif", "image/bmp", "image/webp" };
+            var mask: u8 = 0;
+            for (names, 0..) |name, bit| {
+                if (std.ascii.eqlIgnoreCase(essence, name)) mask = @as(u8, 1) << @intCast(bit);
+            }
+            if (std.ascii.eqlIgnoreCase(essence, "image/jpg")) mask = 2;
+            self.batch |= mask;
+            if (index == 0) self.first = mask;
+        }
+    };
+
+    fn readerMediaGeometry(alloc: Allocator, request: anytype, complete: *bool, mime_shape: *ReaderMimeShape) !remote_capabilities.DiscoveryMediaGeometry {
         var geometry: remote_capabilities.DiscoveryMediaGeometry = .{};
         for (request.images, 0..) |image, index| {
             const item: remote_capabilities.DiscoveryMediaCost = if (@TypeOf(request) == readers.Request) blk: {
@@ -4092,10 +4109,12 @@ pub const Runtime = struct {
                 if (parsed.decoded_size == 0) return error.InvalidDataURI;
                 var decoded = try inference_work.decodeInlineDataUriAlloc(alloc, image);
                 defer decoded.deinit(alloc);
+                mime_shape.add(decoded.mime_type, index);
                 const pixels = try inference_work.encodedImagePixels(decoded.mime_type, decoded.data);
                 complete.* = complete.* and readerGeometryVerifiable(decoded.data);
                 break :blk .{ .encoded = image.len, .framed = image.len, .pixels = pixels };
             } else blk: {
+                mime_shape.add(image.mime_type, index);
                 complete.* = complete.* and readerGeometryVerifiable(image.bytes);
                 break :blk .{
                     .encoded = try inference_work.AttachmentTransport.data_uri.wireSize(image.bytes.len, image.mime_type.len),
@@ -4131,7 +4150,8 @@ pub const Runtime = struct {
         const model = cfg.model orelse "";
         const wait = self.execution.waitContext();
         var complete = request.images.len != 0;
-        const geometry = try readerMediaGeometry(alloc, request, &complete);
+        var mime_shape: ReaderMimeShape = .{};
+        const geometry = try readerMediaGeometry(alloc, request, &complete, &mime_shape);
         measured.* = geometry;
         const shaped = headers.*;
         var json_only = @TypeOf(request) == readers.Request;
@@ -4148,8 +4168,14 @@ pub const Runtime = struct {
             headers.* = shaped;
             if (complete) headers.* = try placement.withMediaGeometry(headers.*, if (rounded) rounded_geometry else geometry);
             headers.* = try placement.withReaderWire(headers.*, json_only, batch_wire, first_wire, rounded);
+            headers.* = try placement.withReaderMime(headers.*, mime_shape.batch, mime_shape.first);
             if (rounded) headers.* = try placement.withRoundedMediaMarker(headers.*);
             const lease = cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait) catch |err| switch (err) {
+                error.InferenceDiscoveryRequiresJsonTransport => {
+                    if (json_only) return err;
+                    json_only = true;
+                    continue;
+                },
                 error.InferenceDiscoveryRequiresExactGeometry, error.InferenceDiscoveryTooManyItems, error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryRejected => {
                     if (rounded) {
                         rounded = false;

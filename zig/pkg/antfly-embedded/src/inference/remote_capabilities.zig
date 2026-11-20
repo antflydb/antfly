@@ -122,6 +122,7 @@ pub const DiscoveryHeaders = struct {
     value: [64]u8 = undefined,
     media_value: [125]u8 = undefined,
     reader_wire_value: [176]u8 = undefined,
+    reader_mime_value: [7]u8 = undefined,
 
     pub fn withShape(self: *DiscoveryHeaders, base: []const [2][]const u8, shape: DiscoveryShape) ![]const [2][]const u8 {
         if (base.len >= self.entries.len) return error.TooManyInferenceHeaders;
@@ -144,6 +145,13 @@ pub const DiscoveryHeaders = struct {
             if (index % 4 != 3) cost.* = roundDiscoveryUpperBound(cost.*);
         };
         self.entries[shaped.len] = .{ "X-Antfly-Inference-Discovery-Reader-Transport", try std.fmt.bufPrint(&self.reader_wire_value, "{s}:{d}:{d}:{d}:{d}:{d}:{d}:{d}:{d}", .{ mode, costs[0], costs[1], costs[2], costs[3], costs[4], costs[5], costs[6], costs[7] }) };
+        return self.entries[0 .. shaped.len + 1];
+    }
+
+    pub fn withReaderMime(self: *DiscoveryHeaders, shaped: []const [2][]const u8, batch: u8, first: u8) ![]const [2][]const u8 {
+        if (batch == 0) return shaped;
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        self.entries[shaped.len] = .{ "X-Antfly-Inference-Discovery-Reader-MIME", try std.fmt.bufPrint(&self.reader_mime_value, "{d}:{d}", .{ batch, first }) };
         return self.entries[0 .. shaped.len + 1];
     }
 
@@ -635,7 +643,7 @@ pub const Cache = struct {
                     err,
                 );
                 if (owner_context_error == null and completion.err != null and
-                    (err == error.RemoteCapabilityDiscoveryTransient or err == error.RemoteCapabilitySelectorAbsent))
+                    (err == error.RemoteCapabilityDiscoveryTransient or err == error.RemoteCapabilitySelectorAbsent or err == error.InferenceDiscoveryRequiresExactGeometry or err == error.InferenceDiscoveryRequiresJsonTransport))
                 {
                     // A failed cold flight has no lease to defer. Remember its
                     // cooldown in the same bounded cache as positive entries.
@@ -1549,6 +1557,7 @@ fn discoveryResponseError(response: httpx.Response) anyerror {
         if (response.headers.get("X-Antfly-Inference-Discovery-Error")) |reason| {
             if (std.mem.eql(u8, reason, "items")) return error.InferenceDiscoveryTooManyItems;
             if (std.mem.eql(u8, reason, "geometry")) return error.InferenceDiscoveryRequiresExactGeometry;
+            if (std.mem.eql(u8, reason, "json")) return error.InferenceDiscoveryRequiresJsonTransport;
         }
     }
     return discoveryStatusError(response.status.code, capabilityStaleResponse(response));
