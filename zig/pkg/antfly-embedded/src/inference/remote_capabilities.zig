@@ -643,7 +643,7 @@ pub const Cache = struct {
                     err,
                 );
                 if (owner_context_error == null and completion.err != null and
-                    (err == error.RemoteCapabilityDiscoveryTransient or err == error.RemoteCapabilitySelectorAbsent or err == error.InferenceDiscoveryRequiresExactGeometry or err == error.InferenceDiscoveryRequiresJsonTransport))
+                    (err == error.RemoteCapabilityDiscoveryTransient or err == error.RemoteCapabilitySelectorAbsent or err == error.InferenceDiscoveryRequiresExactGeometry or err == error.InferenceDiscoveryRequiresJsonTransport or err == error.InferenceDiscoveryShapeRejected))
                 {
                     // A failed cold flight has no lease to defer. Remember its
                     // cooldown in the same bounded cache as positive entries.
@@ -1556,6 +1556,7 @@ fn discoveryResponseError(response: httpx.Response) anyerror {
     if (response.status.code == 413) {
         if (response.headers.get("X-Antfly-Inference-Discovery-Error")) |reason| {
             if (std.mem.eql(u8, reason, "items")) return error.InferenceDiscoveryTooManyItems;
+            if (std.mem.eql(u8, reason, "shape")) return error.InferenceDiscoveryShapeRejected;
             if (std.mem.eql(u8, reason, "geometry")) return error.InferenceDiscoveryRequiresExactGeometry;
             if (std.mem.eql(u8, reason, "json")) return error.InferenceDiscoveryRequiresJsonTransport;
         }

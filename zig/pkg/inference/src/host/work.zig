@@ -983,6 +983,15 @@ pub fn parseInlineDataUri(uri: []const u8) !?InlineDataUri {
     };
 }
 
+pub fn inlineImageDiscoveryPrefix(uri: []const u8, buffer: []u8) !?struct { mime_type: []const u8, bytes: []const u8 } {
+    const parsed = (data_uri.parse(uri) catch return error.InvalidDataURI) orelse return null;
+    if (!parsed.has_explicit_media_type or parsed.payload.len == 0) return error.InvalidDataURI;
+    return .{
+        .mime_type = parsed.media_type,
+        .bytes = parsed.decodePrefix(buffer) catch return error.InvalidDataURI,
+    };
+}
+
 pub const DecodedInlineDataUri = struct {
     mime_type: []u8,
     data: []u8,

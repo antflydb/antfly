@@ -2918,11 +2918,13 @@ fn collectOnnxDependenciesForPath(
     maybe_path: ?[]const u8,
     primary: bool,
     logical_path: ?[]const u8,
+    control: InferenceExecutionControl,
 ) !void {
+    try control.check();
     const path = maybe_path orelse return;
     if (!primary and !std.mem.endsWith(u8, path, ".onnx")) return;
-    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSetWithBase(allocator, path, if (logical_path) |logical| std.fs.path.dirname(logical) else null) catch |err| {
-        if (err == error.OutOfMemory) return err;
+    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSetWithControl(allocator, path, if (logical_path) |logical| std.fs.path.dirname(logical) else null, null, control) catch |err| {
+        if (err == error.OutOfMemory or err == error.Timeout or err == error.Cancelled or err == error.Canceled) return err;
         dependencies.valid = false;
         return;
     };
@@ -2936,6 +2938,10 @@ fn collectCompatibilityOnnxDependencies(
     allocator: std.mem.Allocator,
     man: *const manifest_mod.ModelManifest,
 ) !OnnxDependencies {
+    return collectCompatibilityOnnxDependenciesWithControl(allocator, man, .{});
+}
+
+fn collectCompatibilityOnnxDependenciesWithControl(allocator: std.mem.Allocator, man: *const manifest_mod.ModelManifest, control: InferenceExecutionControl) !OnnxDependencies {
     var dependencies = OnnxDependencies{};
     errdefer dependencies.deinit(allocator);
     const paths = [_]?[]const u8{
@@ -2946,7 +2952,7 @@ fn collectCompatibilityOnnxDependencies(
         man.visual_projection_path,
         man.audio_projection_path,
     };
-    for (paths, 0..) |path, index| try collectOnnxDependenciesForPath(allocator, &dependencies, path, index == 0, if (index == 0) man.onnx_logical_path else null);
+    for (paths, 0..) |path, index| try collectOnnxDependenciesForPath(allocator, &dependencies, path, index == 0, if (index == 0) man.onnx_logical_path else null, control);
     return dependencies;
 }
 
@@ -2979,17 +2985,21 @@ fn addShardedArtifactStatsToSignature(
     io: std.Io,
     signature: *std.crypto.hash.sha2.Sha256,
     index_path: ?[]const u8,
+    control: InferenceExecutionControl,
 ) !void {
+    try control.check();
     const path = index_path orelse return;
-    const bytes = try c_file.readFile(allocator, path);
+    const bytes = try c_file.readFileWithControl(allocator, io, path, control);
     defer allocator.free(bytes);
     var index = try safetensors_mod.ShardedIndex.load(allocator, bytes);
     defer index.deinit();
+    try control.check();
     const model_dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(allocator);
     var it = index.weight_map.iterator();
     while (it.next()) |entry| {
+        try control.check();
         const shard = entry.value_ptr.*;
         if (seen.contains(shard)) continue;
         try seen.put(allocator, shard, {});
@@ -3037,6 +3047,19 @@ fn computeCompatibilitySignatureWithDependencies(
     external_paths: []const []const u8,
     external_paths_valid: bool,
 ) !CompatibilitySignature {
+    return computeCompatibilitySignatureWithControl(allocator, io, model_path, man, external_paths, external_paths_valid, .{});
+}
+
+fn computeCompatibilitySignatureWithControl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    external_paths: []const []const u8,
+    external_paths_valid: bool,
+    control: InferenceExecutionControl,
+) !CompatibilitySignature {
+    try control.check();
     var signature = std.crypto.hash.sha2.Sha256.init(.{});
     addCompatibilityManifestFacts(&signature, man);
 
@@ -3044,6 +3067,7 @@ fn computeCompatibilitySignatureWithDependencies(
     // hashing avoids stale policy decisions when deployment tools preserve
     // size and timestamps during an in-place replacement.
     for (manifest_mod.listing_compatibility_sidecars) |sidecar_name| {
+        try control.check();
         try addModelSidecarToSignature(
             allocator,
             io,
@@ -3065,8 +3089,9 @@ fn computeCompatibilitySignatureWithDependencies(
         io,
         &signature,
         man.safetensors_index_path,
+        control,
     ) catch |err| {
-        if (err == error.OutOfMemory) return err;
+        if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
         signature.update("invalid-sharded-index");
     };
     try addOnnxArtifactToSignature(allocator, io, &signature, man.onnx_path);
@@ -3083,6 +3108,7 @@ fn computeCompatibilitySignatureWithDependencies(
     try addArtifactIdentityToSignature(allocator, io, &signature, man.processor_config_path, true);
     if (!external_paths_valid) signature.update("invalid-onnx-artifact-set");
     for (external_paths) |external_path| {
+        try control.check();
         try addArtifactIdentityToSignature(
             allocator,
             io,
@@ -4887,6 +4913,11 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !CompatibilitySummary {
+        return self.compatibilitySummaryForDirWithControl(allocator, model_path, .{});
+    }
+
+    fn compatibilitySummaryForDirWithControl(self: *Node, allocator: std.mem.Allocator, model_path: []const u8, control: InferenceExecutionControl) !CompatibilitySummary {
+        try control.check();
         var required_backend_scratch: [1]backends_mod.BackendType = undefined;
         const compatibility_backends = try compatibilityBackendsForSessionManager(
             &self.session_manager,
@@ -4894,7 +4925,7 @@ pub const Node = struct {
         );
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*threaded| threaded.deinit();
-        const io = self.inferenceIo(allocator, null, &owned_io);
+        const io = self.inferenceIo(allocator, control.io, &owned_io);
 
         // A deployment can replace several sidecars and artifacts without an
         // atomic directory snapshot. Derive and validate the manifest twice so
@@ -4903,6 +4934,7 @@ pub const Node = struct {
         const max_snapshot_attempts = 3;
         var attempt: usize = 0;
         while (attempt < max_snapshot_attempts) : (attempt += 1) {
+            try control.check();
             var man = try manifest_mod.loadListingFromDir(allocator, model_path);
             defer man.deinit();
 
@@ -4911,13 +4943,14 @@ pub const Node = struct {
             if (cached) |entry| entry.retain();
             self.compatibility_cache_lock.unlock();
             if (cached) |entry| {
-                const cached_signature = computeCompatibilitySignatureWithDependencies(
+                const cached_signature = computeCompatibilitySignatureWithControl(
                     allocator,
                     io,
                     model_path,
                     &man,
                     entry.external_paths,
                     entry.external_paths_valid,
+                    control,
                 ) catch |err| {
                     entry.release();
                     return err;
@@ -4933,23 +4966,25 @@ pub const Node = struct {
                 if (cache_hit) return cached_summary;
             }
 
-            var dependencies = try collectCompatibilityOnnxDependencies(allocator, &man);
+            var dependencies = try collectCompatibilityOnnxDependenciesWithControl(allocator, &man, control);
             defer dependencies.deinit(allocator);
-            const raw_artifact_signature = try computeCompatibilitySignatureWithDependencies(
+            const raw_artifact_signature = try computeCompatibilitySignatureWithControl(
                 allocator,
                 io,
                 model_path,
                 &man,
                 dependencies.paths.items,
                 dependencies.valid,
+                control,
             );
             const artifact_signature = compatibilitySignatureForBackends(raw_artifact_signature, compatibility_backends);
 
-            const summary = try model_manager_mod.compatibilitySummaryForBackends(
+            const summary = try model_manager_mod.compatibilitySummaryForBackendsWithControl(
                 allocator,
                 model_path,
                 &man,
                 compatibility_backends,
+                control,
             );
 
             var verification_manifest = try manifest_mod.loadListingFromDir(
@@ -4957,18 +4992,20 @@ pub const Node = struct {
                 model_path,
             );
             defer verification_manifest.deinit();
-            var verification_dependencies = try collectCompatibilityOnnxDependencies(
+            var verification_dependencies = try collectCompatibilityOnnxDependenciesWithControl(
                 allocator,
                 &verification_manifest,
+                control,
             );
             defer verification_dependencies.deinit(allocator);
-            const raw_verification_signature = try computeCompatibilitySignatureWithDependencies(
+            const raw_verification_signature = try computeCompatibilitySignatureWithControl(
                 allocator,
                 io,
                 model_path,
                 &verification_manifest,
                 verification_dependencies.paths.items,
                 verification_dependencies.valid,
+                control,
             );
             const verification_signature = compatibilitySignatureForBackends(raw_verification_signature, compatibility_backends);
             if (!std.mem.eql(
@@ -26798,10 +26835,13 @@ pub const Node = struct {
             const model_kind = @tagName(manifest.model_type);
             const qwen3vl_reader = isGenerativeReadModel(&manifest);
             const reader_candidate = manifestMatchesModelListingTask("readers", model_kind, &manifest);
-            const compatibility_summary = self.compatibilitySummaryForDir(a, entry.path) catch CompatibilitySummary{
-                .level = .unknown,
-                .code = .artifact_unreadable,
-                .message = "model compatibility could not be determined",
+            const compatibility_summary = self.compatibilitySummaryForDirWithControl(a, entry.path, control) catch |err| switch (err) {
+                error.Timeout, error.Cancelled, error.Canceled => return err,
+                else => CompatibilitySummary{
+                    .level = .unknown,
+                    .code = .artifact_unreadable,
+                    .message = "model compatibility could not be determined",
+                },
             };
             try discovered_listings.append(a, .{
                 .entry_index = entry_index,
@@ -27066,10 +27106,13 @@ pub const Node = struct {
                 if (model_count > 0) try body.append(a, ',');
                 try jsonEncodeString(&body, a, listing.identifier);
                 try body.append(a, ':');
-                const loaded_compatibility = self.compatibilitySummaryForDir(a, listing.canonical_model_dir) catch CompatibilitySummary{
-                    .level = .unknown,
-                    .code = .artifact_unreadable,
-                    .message = "model compatibility could not be determined",
+                const loaded_compatibility = self.compatibilitySummaryForDirWithControl(a, listing.canonical_model_dir, control) catch |err| switch (err) {
+                    error.Timeout, error.Cancelled, error.Canceled => return err,
+                    else => CompatibilitySummary{
+                        .level = .unknown,
+                        .code = .artifact_unreadable,
+                        .message = "model compatibility could not be determined",
+                    },
                 };
                 try appendModelInfo(
                     &body,

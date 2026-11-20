@@ -767,6 +767,11 @@ pub fn inspectGraphCompatibility(allocator: std.mem.Allocator, onnx_path: []cons
 }
 
 pub fn inspectGraphCompatibilityWithContext(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8, logical_path: ?[]const u8) !void {
+    return inspectGraphCompatibilityWithControl(allocator, onnx_path, external_base_dir, logical_path, .{});
+}
+
+pub fn inspectGraphCompatibilityWithControl(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8, logical_path: ?[]const u8, control: InferenceExecutionControl) !void {
+    try control.check();
     var mapped = try c_file.MmapRegion.init(allocator, onnx_path);
     defer mapped.deinit();
     if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
@@ -790,8 +795,22 @@ pub fn inspectGraphCompatibilityWithContext(allocator: std.mem.Allocator, onnx_p
     }
     const dim_overrides: ?*const onnx_graph.DimOverrides = if (use_clipclap_dim_overrides) &clipclap_dim_overrides else null;
 
+    try control.check();
+    const Check = struct {
+        fn call(raw: *const anyopaque) error{ Timeout, Canceled, Cancelled }!void {
+            const active: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+            active.check() catch |err| switch (err) {
+                error.Timeout => return error.Timeout,
+                error.Canceled => return error.Canceled,
+                else => return error.Cancelled,
+            };
+        }
+    };
+    if (control.deadline_ns != null or control.check_fn != null or control.cancellation != null)
+        model.conversion_checkpoint = .{ .context = &control, .check = Check.call };
     var converted = try model.convertToGraphWithDims(allocator, dim_overrides);
     defer converted.deinit(allocator);
+    try control.check();
     try validateImportedGraph(&converted.graph, "convert");
 }
 

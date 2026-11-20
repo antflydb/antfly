@@ -209,6 +209,16 @@ test "reader split windows share lower bound checks for mixed media" {
     try std.testing.expectError(error.InferenceDiscoveryTooManyItems, Runtime.validateReaderPlacementGeometry(lease, inline_lower_bound, 2, false));
 }
 
+test "reader split windows share bounded inline placement decoding" {
+    const png_uri = test_png_data_uri ++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" ++ "invalid-tail!";
+    var complete = true;
+    var mime: Runtime.ReaderMimeShape = .{};
+    const geom = try Runtime.readerMediaGeometry(readers.Request{ .images = &.{png_uri} }, &complete, &mime);
+    try std.testing.expect(complete);
+    try std.testing.expectEqual(@as(u64, 6), geom.batch.pixels);
+    try std.testing.expectEqual(@as(usize, png_uri.len), geom.batch.encoded);
+    try std.testing.expectEqual(@as(u8, 1), mime.batch);
+}
 test "reader split windows share the proxy JPEG metadata scan boundary" {
     const frame = "\xff\xc0\x00\x08\x08\x00\x0d\x00\x0b\x01";
     try std.testing.expect(Runtime.readerGeometryVerifiable("\xff\xd8" ++ frame));
@@ -4098,20 +4108,37 @@ pub const Runtime = struct {
         }
     };
 
-    fn readerMediaGeometry(alloc: Allocator, request: anytype, complete: *bool, mime_shape: *ReaderMimeShape) !remote_capabilities.DiscoveryMediaGeometry {
+    fn readerInlinePixels(uri: []const u8, complete: *bool) u64 {
+        var buffer: [65538]u8 = undefined;
+        const prefix = (inference_work.inlineImageDiscoveryPrefix(uri, &buffer) catch null) orelse {
+            complete.* = false;
+            return 0;
+        };
+        if (!readerGeometryVerifiable(prefix.bytes)) {
+            complete.* = false;
+            return 0;
+        }
+        const pixels = inference_work.encodedImagePixels(prefix.mime_type, prefix.bytes) catch {
+            complete.* = false;
+            return 0;
+        };
+        return pixels;
+    }
+
+    fn readerMediaGeometry(request: anytype, complete: *bool, mime_shape: *ReaderMimeShape) !remote_capabilities.DiscoveryMediaGeometry {
         var geometry: remote_capabilities.DiscoveryMediaGeometry = .{};
         for (request.images, 0..) |image, index| {
             const item: remote_capabilities.DiscoveryMediaCost = if (@TypeOf(request) == readers.Request) blk: {
-                const parsed = (try inference_work.parseInlineDataUri(image)) orelse {
+                var small: [96]u8 = undefined;
+                const prefix = (try inference_work.inlineImageDiscoveryPrefix(image, &small)) orelse {
                     complete.* = false;
                     continue;
                 };
-                if (parsed.decoded_size == 0) return error.InvalidDataURI;
-                var decoded = try inference_work.decodeInlineDataUriAlloc(alloc, image);
-                defer decoded.deinit(alloc);
-                mime_shape.add(decoded.mime_type, index);
-                const pixels = try inference_work.encodedImagePixels(decoded.mime_type, decoded.data);
-                complete.* = complete.* and readerGeometryVerifiable(decoded.data);
+                mime_shape.add(prefix.mime_type, index);
+                const pixels = if (readerGeometryVerifiable(prefix.bytes))
+                    inference_work.encodedImagePixels(prefix.mime_type, prefix.bytes) catch readerInlinePixels(image, complete)
+                else
+                    readerInlinePixels(image, complete);
                 break :blk .{ .encoded = image.len, .framed = image.len, .pixels = pixels };
             } else blk: {
                 mime_shape.add(image.mime_type, index);
@@ -4151,7 +4178,7 @@ pub const Runtime = struct {
         const wait = self.execution.waitContext();
         var complete = request.images.len != 0;
         var mime_shape: ReaderMimeShape = .{};
-        const geometry = try readerMediaGeometry(alloc, request, &complete, &mime_shape);
+        const geometry = try readerMediaGeometry(request, &complete, &mime_shape);
         measured.* = geometry;
         const shaped = headers.*;
         var json_only = @TypeOf(request) == readers.Request;
