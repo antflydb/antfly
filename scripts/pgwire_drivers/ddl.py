@@ -186,6 +186,25 @@ def exercise_ddl(conn):
         ).fetchone() == ("p", "p")
         conn.execute(f"DELETE FROM {child} WHERE id = 'c'")
 
+    partial_parent = prefix + "_partial_parent"
+    admit(
+        f"CREATE TABLE {partial_parent} (id TEXT PRIMARY KEY, a TEXT NOT NULL, b TEXT NOT NULL, UNIQUE(a,b))"
+    )
+    visible(partial_parent)
+    conn.execute(f"INSERT INTO {partial_parent} (id,a,b) VALUES ('p','a','b')")
+    # The first publication installs parent witnesses. The second reuses them.
+    for suffix in ("install", "reuse"):
+        child = prefix + "_partial_" + suffix
+        admit(
+            f"CREATE TABLE {child} (id TEXT PRIMARY KEY, a TEXT, b TEXT, "
+            f"FOREIGN KEY (a,b) REFERENCES {partial_parent}(a,b) MATCH PARTIAL)"
+        )
+        visible(child)
+        conn.execute(f"INSERT INTO {child} (id,a) VALUES ('c','a')")
+        assert conn.execute(f"SELECT a FROM {child} WHERE id = 'c'").fetchone() == (
+            "a",
+        )
+
     # A rejected declaration must not reserve the name or lock the parent.
     recovery = prefix + "_recovery"
     try:

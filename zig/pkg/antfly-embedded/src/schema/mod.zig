@@ -26,6 +26,7 @@ pub fn versionedSchemaKeyAlloc(alloc: std.mem.Allocator, version: u32) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{d}", .{ versioned_schema_key_prefix, version });
 }
 
+pub const columnLineage = impl.columnLineage;
 pub const ParsedTableSchema = impl.TableSchema;
 pub const DocumentSchema = impl.DocumentSchema;
 pub const DocumentProperty = impl.DocumentProperty;

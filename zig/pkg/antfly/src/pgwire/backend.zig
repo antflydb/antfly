@@ -35,6 +35,7 @@ pub const Identity = struct {
 };
 
 pub const Request = struct {
+    capture_cursor_authority: bool = false,
     completion: ?*@import("completion.zig").Completion = null,
     completion_allocator: ?std.mem.Allocator = null,
     statement: []const u8,
@@ -105,7 +106,25 @@ pub const Diagnostic = struct {
 
 pub const MutationOutcome = enum { committed, committed_pending, committed_repair_required, committed_graph_metric_materialization_rejected };
 
+pub const CatalogStamp = struct {
+    catalog_revision: u64,
+    relation_epoch: @import("antfly_local_sources").system_catalog_relation_reconciliation.Epoch,
+};
+
+pub const DescriptionStamp = struct {
+    /// Null when the binder consulted no catalog objects.
+    catalog: ?CatalogStamp = null,
+    authority: u64,
+    reusable: bool = true,
+};
+
+pub const CursorAuthority = struct {
+    ptr: *anyopaque,
+    validate: *const fn (*anyopaque, std.mem.Allocator, Identity, Request, bool) anyerror!void,
+};
 pub const Description = struct {
+    is_select: bool = false,
+    stamp: ?DescriptionStamp = null,
     columns: []const Column = &.{},
     parameter_types: []const Type = &.{},
     parameter_descriptors: []const Parameter = &.{},
@@ -114,6 +133,8 @@ pub const Description = struct {
 };
 
 pub const Result = struct {
+    /// Captured from the executed binding into the caller's cursor arena.
+    cursor_authority: ?CursorAuthority = null,
     columns: []const Column = &.{},
     rows: []const []const std.json.Value = &.{},
     sql_nulls: ?[]const []const bool = null,
@@ -206,6 +227,10 @@ pub const Backend = struct {
         /// Called serially between protocol operations, after backend work joins.
         refresh: ?*const fn (*anyopaque, std.mem.Allocator, Identity, []const u8) anyerror!void = null,
         describe: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Description,
+        /// Validate the exact catalog and principal used to describe a statement.
+        description_current: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, Description) anyerror!bool = null,
+        /// Compare resolved targets across compatible schema versions of a bound portal.
+        same_binding_targets: ?*const fn ([]const u8, []const u8) bool = null,
         execute: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Result,
         /// Authenticated catalog snapshot for typed dotted-name SET/SHOW/RESET.
         load_settings: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!@import("antfly_local_sources").sql_setting_catalog.RawSnapshot = null,

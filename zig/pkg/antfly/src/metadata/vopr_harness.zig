@@ -6903,6 +6903,7 @@ pub const MetadataAdminVoprSource = struct {
         const group_id = target.cluster.metadata_group_id;
         const result = switch (input) {
             .setting_snapshot => |scope| try store.sqlSettingSnapshotJson(alloc, group_id, scope),
+            .policy_definition_read => |request| try store.policyDefinitionRead(alloc, group_id, request),
             .policy_snapshot => |request| try store.sqlPolicySnapshotJson(alloc, group_id, request.table_id, request.principal, request.database, request.roles),
             .setting_mutate => return error.Forbidden,
             // VOPR's public catalog façade does not own the private
