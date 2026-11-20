@@ -12598,6 +12598,26 @@ pub const DataServer = struct {
         targets: []const DagInventory.DagActivationTarget,
     };
 
+    /// Discover unfinished jobs on this authority. The returned slice is
+    /// owned by the caller and ordered by attempt ID.
+    pub fn pendingDagActivationJobsOnRoute(
+        self: *DataServer,
+        allocator: std.mem.Allocator,
+        table_name: []const u8,
+        route: DagActivationRoute,
+        after: ?DagAuthority.Digest,
+        cancellation: antfly.db.types.CancellationToken,
+    ) ![]DagAuthority.Digest {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const attempts = try self.readDagActivationControl(arena.allocator(), table_name, cancellation, []DagAuthority.Digest, route, .{
+            .mode = @as(enum { dag_activation_pending_jobs }, .dag_activation_pending_jobs),
+            .dag_pending = .{ .namespace = route.namespace, .after = after },
+        });
+        if (attempts.len > DagAuthority.ActivationJobUpdate.pending_page_size) return error.InvalidDagAuthority;
+        return allocator.dupe(DagAuthority.Digest, attempts);
+    }
+
     /// Recover a known attempt using only its authority route and identity.
     pub fn resumeDagActivationJob(
         self: *DataServer,

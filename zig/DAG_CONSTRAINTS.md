@@ -96,8 +96,9 @@ The hosted job driver advances through acquisition, per-domain scanning,
 publication, and cleanup. The authority stores job progress through an
 ordered compare-and-set operation. Cycle rejection is recorded before the
 cleanup step can release fences. The initial job update also stores the immutable plan, so a worker can
-recover a known attempt from its authority route and identifier. Automatic
-job discovery and scheduling still need wiring.
+recover a known attempt from its authority route and identifier. The authority indexes unfinished attempts in the same ordered writer as
+job progress. Hosted workers can discover them by advancing a bounded
+attempt-ID cursor. Automatic scheduling still needs wiring.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence

@@ -29,7 +29,8 @@ pub fn isLookupControl(json: []const u8) bool {
     return std.mem.startsWith(u8, json, "{\"mode\":\"dag_activation_checkpoint\"") or
         std.mem.startsWith(u8, json, "{\"mode\":\"dag_activation_source_page\"") or
         std.mem.startsWith(u8, json, "{\"mode\":\"dag_activation_job_status\"") or
-        std.mem.startsWith(u8, json, "{\"mode\":\"dag_activation_job_plan\"");
+        std.mem.startsWith(u8, json, "{\"mode\":\"dag_activation_job_plan\"") or
+        std.mem.startsWith(u8, json, "{\"mode\":\"dag_activation_pending_jobs\"");
 }
 
 pub const ScanRequest = struct {

@@ -178,6 +178,34 @@ pub const ActivationJobUpdate = struct {
     plan_json: ?[]const u8 = null,
 
     pub const max_plan_bytes = 2 * 1024 * 1024;
+    pub const pending_page_size = 64;
+    const pending_prefix = "\x00\x00__metadata__:dag-activation-pending:";
+
+    pub fn pendingPage(txn: anytype, after: ?Digest, buffer: *[pending_page_size]Digest) ![]const Digest {
+        const Handle = switch (@typeInfo(@TypeOf(txn))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(txn),
+        };
+        var cursor = if (comptime @hasDecl(Handle, "openPhysicalCursorAdapter"))
+            try txn.openPhysicalCursorAdapter()
+        else
+            try txn.openCursor();
+        defer cursor.close();
+        const key = pending_prefix.* ++ (after orelse @as(Digest, @splat(0)));
+        var row = try cursor.seekAtOrAfter(if (after == null) pending_prefix else &key);
+        if (after != null and row != null and std.mem.eql(u8, row.?.key, &key)) row = try cursor.next();
+        var len: usize = 0;
+        while (row) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, pending_prefix)) break;
+            if (entry.key.len != key.len) return error.InvalidDagAuthority;
+            buffer[len] = entry.key[pending_prefix.len..][0..@sizeOf(Digest)].*;
+            len += 1;
+            if (len == buffer.len) break;
+            row = try cursor.next();
+        }
+        return buffer[0..len];
+    }
+
     const plan_prefix = "\x00\x00__metadata__:dag-activation-plan:";
     const prefix = "\x00\x00__metadata__:dag-activation-job:";
 
@@ -256,6 +284,12 @@ pub const ActivationJobUpdate = struct {
         const raw = try std.json.Stringify.valueAlloc(alloc, self.next, .{ .emit_strings_as_arrays = true });
         defer alloc.free(raw);
         try txn.put(&jobKey(fence.activation), raw);
+        const pending_key = pending_prefix.* ++ fence.activation;
+        switch (self.next.phase) {
+            .complete, .rejected_cycle => try txn.delete(&pending_key),
+            .acquire => try txn.put(&pending_key, "1"),
+            else => {},
+        }
     }
 };
 
@@ -2086,6 +2120,9 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try create_job.stage(alloc, &txn, fence);
     try create_job.stage(alloc, &txn, fence);
     try std.testing.expectEqualStrings("{}", (try ActivationJobUpdate.readPlan(&txn, fence.activation)).?);
+    var pending: [ActivationJobUpdate.pending_page_size]Digest = undefined;
+    try std.testing.expectEqualSlices(Digest, &.{fence.activation}, try ActivationJobUpdate.pendingPage(&txn, null, &pending));
+    try std.testing.expectEqual(@as(usize, 0), (try ActivationJobUpdate.pendingPage(&txn, fence.activation, &pending)).len);
     try std.testing.expectError(error.GraphConstraintRevisionChanged, (ActivationJobUpdate{
         .next = initial_job,
         .plan_json = "[]",
@@ -2098,6 +2135,14 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     skipped.phase = .release;
     try std.testing.expectError(error.InvalidDagMutation, (ActivationJobUpdate{ .expected = scanning_job, .next = skipped }).stage(alloc, &txn, fence));
     try std.testing.expectEqualDeep(@as(?JobProgress, scanning_job), try ActivationJobUpdate.read(alloc, &txn, fence.activation));
+    var aborting_job = scanning_job;
+    aborting_job.phase = .abandon_cycle;
+    try (ActivationJobUpdate{ .expected = scanning_job, .next = aborting_job }).stage(alloc, &txn, fence);
+    var rejected_job = aborting_job;
+    rejected_job.phase = .rejected_cycle;
+    try (ActivationJobUpdate{ .expected = aborting_job, .next = rejected_job }).stage(alloc, &txn, fence);
+    try std.testing.expectEqual(@as(usize, 0), (try ActivationJobUpdate.pendingPage(&txn, null, &pending)).len);
+    try std.testing.expectEqualDeep(@as(?JobProgress, rejected_job), try ActivationJobUpdate.read(alloc, &txn, fence.activation));
     try Contributions.finishActivation(&txn, ordered_id, 1, versions, second_end);
     try Contributions.finishActivation(&txn, ordered_id, 1, versions, second_end);
     const release: SourceFenceCommand = .{ .namespace = @splat(0), .action = .release, .fence = fence };

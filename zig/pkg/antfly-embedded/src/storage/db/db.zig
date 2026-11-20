@@ -26929,10 +26929,11 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, dag_activation_checkpoint, dag_activation_source_page, dag_activation_job_status, dag_activation_job_plan, merge_copy_receipt },
+            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, dag_activation_checkpoint, dag_activation_source_page, dag_activation_job_status, dag_activation_job_plan, dag_activation_pending_jobs, merge_copy_receipt },
             scope: ?@import("online_source_contract.zig").Scope = null,
             dag_source_page: ?@import("dag_activation_contract.zig").ScanRequest = null,
             dag_job: ?struct { namespace: [24]u8, attempt: [32]u8 } = null,
+            dag_pending: ?struct { namespace: [24]u8, after: ?[32]u8 = null } = null,
             dag_scan: ?struct {
                 namespace: [24]u8,
                 domain: [32]u8,
@@ -26944,6 +26945,7 @@ pub const DB = struct {
         if ((request.value.mode == .dag_activation_checkpoint) != (request.value.dag_scan != null)) return error.InvalidBatchRequest;
         if ((request.value.mode == .dag_activation_source_page) != (request.value.dag_source_page != null)) return error.InvalidBatchRequest;
         if ((request.value.mode == .dag_activation_job_status or request.value.mode == .dag_activation_job_plan) != (request.value.dag_job != null)) return error.InvalidBatchRequest;
+        if ((request.value.mode == .dag_activation_pending_jobs) != (request.value.dag_pending != null)) return error.InvalidBatchRequest;
         var output: std.Io.Writer.Allocating = .init(alloc);
         errdefer output.deinit();
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
@@ -26979,6 +26981,17 @@ pub const DB = struct {
                 defer read.abort();
                 const range = self.core.byteRange();
                 const page = try @import("dag_graph_effects.zig").scanAccepted(scratch.allocator(), &read, scan_request, range.start, range.end);
+                try @import("relational_integrity_json.zig").write(page, &stream);
+            },
+            .dag_activation_pending_jobs => {
+                const pending_request = request.value.dag_pending.?;
+                if (!std.mem.eql(u8, &pending_request.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace)))
+                    return error.GraphConstraintRevisionChanged;
+                const update = @import("../../graph/dag_authority.zig").ActivationJobUpdate;
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                var buffer: [update.pending_page_size][32]u8 = undefined;
+                const page = try update.pendingPage(&read, pending_request.after, &buffer);
                 try @import("relational_integrity_json.zig").write(page, &stream);
             },
             .dag_activation_job_status, .dag_activation_job_plan => {
