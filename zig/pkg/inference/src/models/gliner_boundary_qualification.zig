@@ -804,9 +804,10 @@ fn metalBatchEntries() [2 + family_profiles.len]Entry {
     return entries;
 }
 // Bounded shared-program cohort: authenticated base capture, all ten task
-// cases on CPU/CUDA; CPU F32/BF16 and CUDA F32. Both CUDA BF16 schedules
-// remain excluded: a later fresh vendor compilation changed a latent record.
-// The deterministic vendor profile passes three independent compilations.
+// cases on CPU/CUDA; CPU F32/BF16 and CUDA F32. Provider-default and
+// nondeterministic vendor CUDA BF16 remain excluded: a fresh vendor
+// compilation changed a latent record. The deterministic vendor profile
+// passes three independent compilations.
 // Geometry comes from the exact prepared requests, not the native envelope.
 const pjrt_base_entries = entries: {
     const backends = [_]Backend{ .pjrt_cpu_f32, .pjrt_cpu_bf16, .pjrt_cuda_f32, .pjrt_cuda_bf16_deterministic };

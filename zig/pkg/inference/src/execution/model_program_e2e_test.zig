@@ -634,9 +634,15 @@ test "model program real boundary extraction executes compiled task graphs" {
     const executor = @import("../extractors/gliner_boundary_executor.zig");
     const wire = @import("../extractors/extraction_v2.zig");
     for ([_]factory.PjrtSessionOptions.Precision{ .f32, .bf16 }) |precision| {
-        const compiled = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(precision, null));
+        var selected_options = try @import("testing/pjrt_qualification.zig").options(precision, null);
+        // The published CUDA BF16 profile uses deterministic vendor GEMM.
+        // Provider-default remains available as an explicit failing probe.
+        if (precision == .bf16 and selected_options.memory_policy.? == .cuda)
+            selected_options = try @import("testing/pjrt_qualification.zig").optionsWithDefaultGemm(precision, null, .vendor_deterministic);
+        const compiled = try factory.createPjrtSessionWithOptions(a, model, selected_options);
         defer compiled.close();
         for ([_][]const u8{ "natural", "latent", "anchorless" }) |mode| {
+            std.debug.print("boundary precision={s} gemm={s} mode={s} windowed=false\n", .{ @tagName(precision), @tagName(selected_options.gemm), mode });
             const request_bytes = try std.fmt.allocPrint(a,
                 \\{{"schema_version":2,"model":"fixture","schema":{{"entities":["person","company"],"entity_attributes":{{"status":{{"labels":["active","inactive"],"applies_to":["person"]}}}},"classifications":[{{"name":"sentiment","labels":["negative","positive"]}}],"structures":{{"employment":{{"mode":"{s}","fields":{{"name":{{"type":"str","cardinality":"required_one"}},"company":{{"type":"str","cardinality":"optional_one"}}}}}}}},"relations":[{{"type":"works_for","source":"person","target":"company"}}]}},"inputs":[{{"content":"Ada works at Antfly in Seattle."}},{{"content":"Bob works at Google in London."}}]}}
             , .{mode});
@@ -663,6 +669,7 @@ test "model program real boundary extraction executes compiled task graphs" {
                 defer right.deinit();
                 try expectTaskJsonParity(left.value, right.value, if (precision == .bf16) 2e-2 else 2e-3);
             }
+            std.debug.print("boundary precision={s} gemm={s} mode={s} windowed=true\n", .{ @tagName(precision), @tagName(selected_options.gemm), mode });
             const window_bytes = try std.fmt.allocPrint(a, "{s},\"options\":{{\"long_document\":{{\"mode\":\"window\",\"window_words\":3,\"overlap_words\":1}}}}}}", .{request_bytes[0 .. request_bytes.len - 1]});
             defer a.free(window_bytes);
             var window_request = try wire.parseJson(a, window_bytes, .{});
@@ -770,7 +777,8 @@ test "model program qualified extraction binds actual PJRT profile and bounded g
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
     const model = platform.env.getenv("ANTFLY_PJRT_BOUNDARY_MODEL") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    const compiled = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(.f32, null));
+    const selected_options = try @import("testing/pjrt_qualification.zig").options(.f32, null);
+    const compiled = try factory.createPjrtSessionWithOptions(a, model, selected_options);
     defer compiled.close();
     var cb = try factory.getComputeBackend(compiled, a);
     defer cb.deinit();
@@ -793,9 +801,14 @@ test "model program qualified extraction binds actual PJRT profile and bounded g
     const actual = try executor.executeQualified(&cb, a, &cfg, tok.tokenizer(), &request, opts);
     defer a.free(actual);
     try std.testing.expectEqualStrings(expected, actual);
-    try std.testing.expectEqual(.pjrt_cpu_f32, try @import("../extractors/gliner_boundary_qualification.zig").backendForSession(compiled));
     const policy = @import("../models/gliner_boundary_qualification.zig");
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, policy.supportsFeatures(opts.identity.?, .pjrt_cpu_f32, policy.Features.initOne(.long_document)));
+    const actual_backend = try @import("../extractors/gliner_boundary_qualification.zig").backendForSession(compiled);
+    const expected_backend: policy.Backend = switch (selected_options.memory_policy.?) {
+        .cpu => .pjrt_cpu_f32,
+        .cuda => .pjrt_cuda_f32,
+    };
+    try std.testing.expectEqual(expected_backend, actual_backend);
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, policy.supportsFeatures(opts.identity.?, actual_backend, policy.Features.initOne(.long_document)));
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, policy.supportsFeatures(opts.identity.?, .pjrt_cuda_bf16_vendor, policy.Features.initOne(.entities)));
 }
 

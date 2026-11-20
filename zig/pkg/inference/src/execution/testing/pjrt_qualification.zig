@@ -25,7 +25,13 @@ fn setting(generic: [:0]const u8, legacy: [:0]const u8) ?[]const u8 {
 }
 
 pub fn options(precision: Options.Precision, task: @FieldType(Options, "task_override")) !Options {
-    const gemm = if (setting("ANTFLY_PJRT_QUALIFICATION_GEMM", "ANTFLY_PJRT_DECODER_GEMM")) |value| std.meta.stringToEnum(@FieldType(Options, "gemm"), value) orelse return error.InvalidPjrtGemm else .provider_default;
+    return optionsWithDefaultGemm(precision, task, .provider_default);
+}
+
+/// Fixtures select their published arithmetic profile; explicit environment
+/// overrides remain authoritative, including deliberately unqualified probes.
+pub fn optionsWithDefaultGemm(precision: Options.Precision, task: @FieldType(Options, "task_override"), default_gemm: @FieldType(Options, "gemm")) !Options {
+    const gemm = if (setting("ANTFLY_PJRT_QUALIFICATION_GEMM", "ANTFLY_PJRT_DECODER_GEMM")) |value| std.meta.stringToEnum(@FieldType(Options, "gemm"), value) orelse return error.InvalidPjrtGemm else default_gemm;
     const physical = setting("ANTFLY_PJRT_QUALIFICATION_DEVICE_BYTES", "ANTFLY_PJRT_DECODER_DEVICE_BYTES") orelse return .{ .task_override = task, .memory_policy = .cpu, .precision = precision, .gemm = gemm };
     const capacity = setting("ANTFLY_PJRT_QUALIFICATION_CAPACITY_BYTES", "ANTFLY_PJRT_DECODER_CAPACITY_BYTES") orelse return error.MissingPjrtCapacity;
     const unified = setting("ANTFLY_PJRT_QUALIFICATION_UNIFIED_MEMORY", "ANTFLY_PJRT_DECODER_UNIFIED_MEMORY");
