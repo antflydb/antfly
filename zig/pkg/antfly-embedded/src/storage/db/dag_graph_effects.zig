@@ -18,6 +18,7 @@
 //! before using this adapter.
 const std = @import("std");
 const authority = @import("../../graph/dag_authority.zig");
+const validation = @import("../../graph/dag_validation.zig");
 const edges = @import("graph_edge_types.zig");
 const keys = @import("../internal_keys.zig");
 const A = std.mem.Allocator;
@@ -177,34 +178,44 @@ pub fn artifactGeneration(value: ?[]const u8) !?u64 {
     return generation;
 }
 
-/// Stage all co-located contributions of a physical writer in their final
-/// state. Already staged producer decisions are recognized by their manifest.
-pub fn stageLocalArtifactChanges(alloc: A, txn: anytype, namespace: [24]u8, changes: []const ArtifactChange) !void {
-    const Binding = @import("artifact_publication.zig").LocalDagBinding;
-    const validation = @import("../../graph/dag_validation.zig");
-    const Entry = struct {
-        domain: authority.Digest,
-        replacement: Replacement,
+pub const BoundReplacement = struct {
+    domain: authority.Digest,
+    replacement: Replacement,
 
-        fn before(_: void, left: @This(), right: @This()) bool {
-            return switch (std.mem.order(u8, &left.domain, &right.domain)) {
-                .lt => true,
-                .gt => false,
-                .eq => lessThan({}, left.replacement, right.replacement),
-            };
-        }
-    };
-    var entries: std.ArrayList(Entry) = .empty;
+    fn before(_: void, left: @This(), right: @This()) bool {
+        return switch (std.mem.order(u8, &left.domain, &right.domain)) {
+            .lt => true,
+            .gt => false,
+            .eq => lessThan({}, left.replacement, right.replacement),
+        };
+    }
+};
+
+/// Normalize a writer's exact before/after images into ordered domain
+/// replacements. The scratch arena owns the result and decoded bindings.
+pub fn collectBoundArtifactChanges(alloc: A, txn: anytype, namespace: [24]u8, changes: []const ArtifactChange, budget: *validation.Budget) ![]BoundReplacement {
+    const Binding = @import("artifact_publication.zig").LocalDagBinding;
+    const Generations = std.AutoHashMapUnmanaged(u64, ?Binding);
+    var catalog_bindings: std.StringHashMapUnmanaged(Generations) = .empty;
+    var entries: std.ArrayList(BoundReplacement) = .empty;
     for (changes) |change| {
         if (change.before == change.after) continue;
         const parsed = (try keys.parseGraphEdgeArtifactKeyAlloc(alloc, change.key)) orelse return error.InvalidDagAuthority;
         inline for (.{ false, true }) |present| {
             if (if (present) change.after else change.before) |generation| {
-                if (try Binding.readForProducer(alloc, txn, namespace, parsed.index_name, generation)) |binding| {
-                    defer binding.deinit();
-                    for (binding.value.edge_types) |edge_type| {
+                const index = try catalog_bindings.getOrPut(alloc, parsed.index_name);
+                if (!index.found_existing) index.value_ptr.* = .empty;
+                const cached = try index.value_ptr.getOrPut(alloc, generation);
+                if (!cached.found_existing) {
+                    try budget.consume(.requests, 1);
+                    // The writer scratch arena owns the parsed configuration.
+                    const binding = try Binding.readForProducer(alloc, txn, namespace, parsed.index_name, generation);
+                    cached.value_ptr.* = if (binding) |value| value.value else null;
+                }
+                if (cached.value_ptr.*) |binding| {
+                    for (binding.edge_types) |edge_type| {
                         if (!std.mem.eql(u8, edge_type, parsed.edge_type)) continue;
-                        const id = try authority.domain(binding.value.table_identity, generation, parsed.index_name, edge_type);
+                        const id = try authority.domain(binding.table_identity, generation, parsed.index_name, edge_type);
                         const replacement = try relationshipReplacement(alloc, .{
                             .index_name = parsed.index_name,
                             .edge_type = parsed.edge_type,
@@ -213,29 +224,36 @@ pub fn stageLocalArtifactChanges(alloc: A, txn: anytype, namespace: [24]u8, chan
                             .owner = parsed.doc_key,
                             .edge_id = parsed.edge_id,
                         }, present);
-                        if (!try authority.Contributions.matchesReplacement(alloc, txn, id, replacement))
-                            try entries.append(alloc, .{ .domain = id, .replacement = replacement });
+                        try entries.append(alloc, .{ .domain = id, .replacement = replacement });
                         break;
                     }
                 }
             }
         }
     }
-    std.mem.sort(Entry, entries.items, {}, Entry.before);
-    const replacements = try alloc.alloc(Replacement, entries.items.len);
-    for (entries.items, replacements) |entry, *item| item.* = entry.replacement;
-    const Clock = struct {
-        fn now(_: *anyopaque) u64 {
-            return 0;
-        }
-    };
-    var clock_context: u8 = 0;
-    var budget: validation.Budget = .{ .clock = .{ .context = &clock_context, .now = Clock.now } };
+    std.mem.sort(BoundReplacement, entries.items, {}, BoundReplacement.before);
+    return entries.toOwnedSlice(alloc);
+}
+
+/// Stage all co-located contributions of a physical writer in their final
+/// state. Already staged producer decisions are recognized by their manifest.
+pub fn stageLocalArtifactChanges(alloc: A, txn: anytype, namespace: [24]u8, changes: []const ArtifactChange, budget: *validation.Budget) !void {
+    const entries = try collectBoundArtifactChanges(alloc, txn, namespace, changes, budget);
+    var len: usize = 0;
+    for (entries) |entry| {
+        try budget.consume(.requests, 1);
+        if (try authority.Contributions.matchesReplacement(alloc, txn, entry.domain, entry.replacement)) continue;
+        entries[len] = entry;
+        len += 1;
+    }
+    if (len == 0) return;
+    const replacements = try alloc.alloc(Replacement, len);
+    for (entries[0..len], replacements) |entry, *item| item.* = entry.replacement;
     var start: usize = 0;
-    while (start < entries.items.len) {
-        const domain = entries.items[start].domain;
+    while (start < len) {
+        const domain = entries[start].domain;
         var end = start + 1;
-        while (end < entries.items.len and std.mem.eql(u8, &domain, &entries.items[end].domain)) : (end += 1) {}
+        while (end < len and std.mem.eql(u8, &domain, &entries[end].domain)) : (end += 1) {}
         const state = try authority.Storage.requireActive(txn, domain);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly/dag-physical-writer/v1");
@@ -254,7 +272,7 @@ pub fn stageLocalArtifactChanges(alloc: A, txn: anytype, namespace: [24]u8, chan
             .replacements = replacements[start..end],
         };
         var witness: validation.Witness = .{};
-        _ = try vote.stagePublication(alloc, txn, &budget, &witness);
+        _ = try vote.stagePublication(alloc, txn, budget, &witness);
         start = end;
     }
 }

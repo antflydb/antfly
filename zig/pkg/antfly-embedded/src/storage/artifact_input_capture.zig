@@ -221,10 +221,19 @@ pub const Capture = struct {
             defer arena.deinit();
             const scratch = arena.allocator();
             const owner = (try authority.load(txn)) orelse return error.GraphConstraintNotReady;
+            const validation = @import("../graph/dag_validation.zig");
+            const OrderedClock = struct {
+                fn now(_: *anyopaque) u64 {
+                    return 0;
+                }
+            };
+            var budget: validation.Budget = .{ .clock = .{ .context = self, .now = OrderedClock.now } };
+            try budget.consume(.requests, self.dag_graph_preimages.count());
             const changes = try scratch.alloc(dag_effects.ArtifactChange, self.dag_graph_preimages.count());
             var graph = self.dag_graph_preimages.iterator();
             for (changes) |*change| {
                 const item = graph.next().?;
+                try budget.consume(.bytes, item.key_ptr.*.len);
                 const raw: ?[]const u8 = txn.get(item.key_ptr.*) catch |err| blk: {
                     if (err != error.NotFound) return err;
                     break :blk null;
@@ -238,7 +247,7 @@ pub const Capture = struct {
                 else => @TypeOf(txn),
             };
             if (comptime @hasDecl(Handle, "openCursor"))
-                try dag_effects.stageLocalArtifactChanges(scratch, txn, owner.namespace, changes)
+                try dag_effects.stageLocalArtifactChanges(scratch, txn, owner.namespace, changes, &budget)
             else
                 return error.GraphConstraintNotReady;
         }

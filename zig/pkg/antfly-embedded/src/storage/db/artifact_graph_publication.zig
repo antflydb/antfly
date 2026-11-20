@@ -254,6 +254,30 @@ test "ordered artifact inventory graph publication validates guards generations 
         const reverse = try keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "owner", "g", "links", "entity", "target");
         defer alloc.free(reverse);
         {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const effects = @import("dag_graph_effects.zig");
+            const validation = @import("../../graph/dag_validation.zig");
+            const Clock = struct {
+                fn now(_: *anyopaque) u64 {
+                    return 0;
+                }
+            };
+            var budget: validation.Budget = .{
+                .limits = .{ .requests = 1 },
+                .clock = .{ .context = &read, .now = Clock.now },
+            };
+            const normalized = try effects.collectBoundArtifactChanges(arena.allocator(), &read, command.namespace, &.{
+                .{ .key = edge_key, .before = command.producer_generation, .after = null },
+                .{ .key = reverse, .before = null, .after = command.producer_generation },
+            }, &budget);
+            try std.testing.expectEqual(@as(usize, 1), budget.stats.requests);
+            try std.testing.expectEqual(@as(usize, 2), normalized.len);
+            for (normalized) |item| try std.testing.expectEqual(request.domain, item.domain);
+        }
+        {
             var writer = try store.beginWriteTxn();
             defer writer.abort();
             try writer.put(reverse, edge);
