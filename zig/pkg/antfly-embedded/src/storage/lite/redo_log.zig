@@ -200,9 +200,15 @@ pub const Writer = struct {
         // `error.NativeRedoLogCorrupt` on reopen rather than the clean,
         // retryable torn-tail recovery this design promises for exactly
         // this case.
-        if (payload.len != 0) {
-            try self.file.writePositionalAll(self.io, payload, offset + header_len);
-        }
+        //
+        // An all-zero header-sized end marker goes right after the record,
+        // in the same write as the payload. A failed earlier append may
+        // have left payload bytes past this record's end (recovery clears
+        // only a torn header), and without the marker replay would read
+        // them as the next header whenever this record is shorter.
+        const end_marker: [header_len]u8 = @splat(0);
+        const marker_len: usize = if (record_len + header_len <= self.remaining()) header_len else 0;
+        try writePositionalPairAll(self.file, self.io, payload, end_marker[0..marker_len], offset + header_len);
         try self.file.writePositionalAll(self.io, &header_buf, offset);
 
         self.tail += record_len;
@@ -281,6 +287,21 @@ pub const Writer = struct {
         self.last_sequence = m.last_sequence;
     }
 };
+
+/// Writes `first` then `second` contiguously at `offset`, in one vectored
+/// write when the kernel takes it all.
+fn writePositionalPairAll(file: File, io: Io, first: []const u8, second: []const u8, offset: u64) !void {
+    const total = first.len + second.len;
+    var written: usize = 0;
+    while (written < total) {
+        if (written < first.len) {
+            written += try file.writePositional(io, &.{ first[written..], second }, offset + written);
+        } else {
+            const at = written - first.len;
+            written += try file.writePositional(io, &.{second[at..]}, offset + written);
+        }
+    }
+}
 
 /// One decoded, checksum-and-sequence-validated record, handed to a
 /// `Reader.replay` callback. `payload` aliases the caller-supplied scratch
@@ -684,6 +705,25 @@ test "replay resumes continuity from a checkpoint baseline" {
     const superseded = try replay(testing.allocator, region.file, io, 0, capacity, 12, null, null);
     try testing.expectEqual(@as(u64, 0), superseded.valid_count);
     try testing.expectEqual(StopReason.end_of_region, superseded.stop_reason);
+}
+
+test "an append ends the log even over a failed longer append's payload" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(11, "x");
+    // A failed longer append: its payload landed, its header did not.
+    const abandoned: [256]u8 = @splat(0xC3);
+    try region.file.writePositionalAll(io, &abandoned, writer.tail + header_len);
+    try writer.append(12, "y");
+    try writer.sync();
+
+    const outcome = try replay(testing.allocator, region.file, io, 0, capacity, 10, null, null);
+    try testing.expectEqual(@as(u64, 2), outcome.valid_count);
+    try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
 }
 
 test "bounded replay stops before records past the durable ceiling" {

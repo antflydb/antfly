@@ -3079,7 +3079,7 @@ pub const DocStore = struct {
     }
 
     pub fn lastReplaySequenceFromTxn(_: *DocStore, txn: *Txn, fallback_last: u64) !u64 {
-        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+        const raw = replay_journal_format.getNextSequence(txn) catch |err| switch (err) {
             error.NotFound => return fallback_last,
             else => return err,
         };
@@ -3233,7 +3233,7 @@ pub const DocStore = struct {
     fn loadReplayNextSequenceFromStore(self: *DocStore, fallback_next: u64) u64 {
         var txn = self.beginProbeTxn() catch return fallback_next;
         defer txn.abort();
-        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch return fallback_next;
+        const raw = replay_journal_format.getNextSequence(&txn) catch return fallback_next;
         if (raw.len != 8) return fallback_next;
         return std.mem.readInt(u64, raw[0..8], .little);
     }
@@ -3272,7 +3272,7 @@ pub const DocStore = struct {
         // the cache unknown so the next observation retries recovery.
         var txn = self.beginProbeTxn() catch return fallback_next;
         defer txn.abort();
-        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+        const raw = replay_journal_format.getNextSequence(&txn) catch |err| switch (err) {
             error.NotFound => return fallback_next,
             else => return fallback_next,
         };
@@ -7410,6 +7410,22 @@ test "docstore upgrades a base-revision replay journal when it opens" {
         .payload = "replay:2",
     });
     try std.testing.expectEqual(@as(u64, 2), store.lastReplaySequence(0));
+}
+
+// A read-only open never upgrades a base-revision journal; its sequence
+// readers must still find `next_sequence` under the legacy key rather than
+// report an empty journal.
+test "docstore reads a base-revision journal's watermark before it is upgraded" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try writeLegacyReplayJournal(&store);
+    try std.testing.expectEqual(@as(u64, 1), store.lastReplaySequence(0));
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(u64, 1), try store.lastReplaySequenceFromTxn(&txn, 0));
 }
 
 test "docstore refuses an unknown replay journal format when it opens" {

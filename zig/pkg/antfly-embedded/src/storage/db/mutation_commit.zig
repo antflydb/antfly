@@ -5349,8 +5349,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             };
             var probe = Probe{ .through = sequence };
-            _ = try cursor.forEachNext(1, &probe, Probe.consume);
-            return !probe.pending;
+            while (true) {
+                const scan = try cursor.forEachNext(1, &probe, Probe.consume);
+                if (scan.matched_entries != 0) return !probe.pending;
+                // A batch capped by scanned work examined only a prefix; keep
+                // scanning until a match, the end, or past `sequence`.
+                if (!scan.scan_budget_exhausted or scan.last_sequence >= sequence) return true;
+            }
         }
 
         pub fn notifyQueryVisibilityEvent(ctx: *AsyncContext, event: QueryVisibilityEvent) void {
