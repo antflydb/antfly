@@ -2956,7 +2956,7 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
             try control.check();
             var decoded: [32]u8 = undefined;
             if (published) |source| {
-                try source.verifyFile(artifact.path);
+                try source.verifyFileWithControl(artifact.path, control);
                 if (artifact.sha256) |digest| {
                     // verifyFile authenticated this digest against the actual
                     // file and retained its complete construction stamp.

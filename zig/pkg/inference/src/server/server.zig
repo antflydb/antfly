@@ -26677,17 +26677,23 @@ pub const Node = struct {
                 const path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| return requestModelResolutionError(ctx, err);
                 const path = path_selection.path;
                 defer ctx.allocator.free(path);
-                var manifest = self.loadBoundManifest(ctx.allocator, path, false, self.bindModelSelection(path_selection, null)) catch |err| return modelLoadFailureResponse(ctx, err);
+                const control = path_selection.bind(catalog_control);
+                var manifest = self.loadBoundManifest(ctx.allocator, path, false, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 defer manifest.deinit();
                 var dense_output = manifest.denseEmbeddingOutput();
-                const revision = if (try self.model_manager.acquireLoadedModelWithControl(path, self.bindModelSelection(path_selection, null))) |cached| loaded: {
+                const revision = if (self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return requestModelResolutionError(ctx, err)) |cached| loaded: {
                     var handle = cached;
                     defer handle.release();
                     // Geometry and revision must describe the same serving generation.
                     dense_output = handle.get().manifest.denseEmbeddingOutput();
-                    break :loaded handle.get().resolution_revision orelse if (std.mem.eql(u8, operation, "embed")) return error.InvalidEmbeddingIdentity else try self.model_manager.modelIdentityForManifest(path, manifest);
-                } else try self.model_manager.modelIdentityForManifest(path, manifest);
-                const hex = std.fmt.bytesToHex(revision, .lower);
+                    if (handle.get().resolution_revision) |loaded_revision| break :loaded loaded_revision;
+                    if (std.mem.eql(u8, operation, "embed")) return error.InvalidEmbeddingIdentity;
+                    break :loaded null;
+                } else null;
+                const hex = std.fmt.bytesToHex(revision orelse
+                    self.model_manager.modelIdentityForManifestWithControl(path, manifest, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err), .lower);
+                control.check() catch |err| return inferenceFailureResponse(ctx, err);
+
                 const catalog_allocator = catalog.arena.allocator();
                 try info.object.put(catalog_allocator, "model_revision", .{ .string = &hex });
                 if (std.mem.eql(u8, operation, "generate")) {
@@ -38136,6 +38142,31 @@ test "catalog model resolution preserves timeout and cancellation responses" {
         defer response.deinit();
         try std.testing.expectEqual(entry[1], response.status.code);
     }
+}
+
+test "catalog model resolution preserves timeout during managed checksums" {
+    const receipts = @import("../registry/managed_receipt.zig");
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const filename = "payload.bin";
+    try tmp.dir.writeFile(io, .{ .sub_path = filename, .data = "payload" });
+    const path = try tmp.dir.realPathFileAlloc(io, filename, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const Cancel = struct {
+        fn check(raw: ?*anyopaque) !void {
+            const remaining: *usize = @ptrCast(@alignCast(raw.?));
+            if (remaining.* == 0) return error.Timeout;
+            remaining.* -= 1;
+        }
+    };
+    var checkpoints: usize = 3;
+    try std.testing.expectError(error.Timeout, receipts.verifyValidatedArtifactSha256AndStampWithControl(
+        io,
+        &.{ .path = filename, .canonical_path = path, .size = 7, .sha256 = null },
+        "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+        (InferenceExecutionControl{}).withCheckpoint(&checkpoints, Cancel.check),
+    ));
 }
 
 test "decide maps model resolution errors to client responses" {
