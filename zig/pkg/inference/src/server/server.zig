@@ -2077,6 +2077,12 @@ fn runEmbeddingRuntimeRecoveryLoop(adapter: anytype) !void {
 
 // Check the acquired generation on every recovery attempt, before broker or
 // pipeline dispatch. Observing the alias before/after execution cannot fence ABA.
+fn pinnableEmbeddingRevision(managed_publication: ?[32]u8, revision: ?[32]u8) ?[32]u8 {
+    // Local dependency signatures fence reloads in this process. Only managed
+    // publications prove a content identity that can survive replica replacement.
+    return if (managed_publication != null) revision else null;
+}
+
 fn requireLoadedEmbeddingRevision(expected: ?[32]u8, actual: ?[32]u8) !void {
     try embedding_revision.require(expected, actual);
 }
@@ -5350,7 +5356,7 @@ pub const Node = struct {
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
-                try requireLoadedEmbeddingRevision(attempt.expected_revision, model.resolution_revision);
+                try requireLoadedEmbeddingRevision(attempt.expected_revision, pinnableEmbeddingRevision(model.managed_publication, model.resolution_revision));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 const input_tokens = try maxTokenizerTextTokens(
                     attempt.allocator,
@@ -5509,7 +5515,7 @@ pub const Node = struct {
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
-                try requireLoadedEmbeddingRevision(attempt.expected_revision, model.resolution_revision);
+                try requireLoadedEmbeddingRevision(attempt.expected_revision, pinnableEmbeddingRevision(model.managed_publication, model.resolution_revision));
                 if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 const input_tokens = try maxTokenizerTextTokens(
                     attempt.allocator,
@@ -8500,7 +8506,7 @@ pub const Node = struct {
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
-                try requireLoadedEmbeddingRevision(attempt.expected_revision, model.resolution_revision);
+                try requireLoadedEmbeddingRevision(attempt.expected_revision, pinnableEmbeddingRevision(model.managed_publication, model.resolution_revision));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 try model.verifyEmbeddingIdentityWithControl(attempt.control);
                 if (attempt.parsed.groups.items.len != 0) {
@@ -14605,7 +14611,7 @@ pub const Node = struct {
 
                 fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                     const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
-                    try requireLoadedEmbeddingRevision(attempt.model_revision, model.resolution_revision);
+                    try requireLoadedEmbeddingRevision(attempt.model_revision, pinnableEmbeddingRevision(model.managed_publication, model.resolution_revision));
                     if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                     var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
                         .allocator = attempt.allocator,
@@ -14759,7 +14765,7 @@ pub const Node = struct {
 
             fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
-                try requireLoadedEmbeddingRevision(attempt.request.model_revision, model.resolution_revision);
+                try requireLoadedEmbeddingRevision(attempt.request.model_revision, pinnableEmbeddingRevision(model.managed_publication, model.resolution_revision));
                 attempt.model_identity = model.embedding_identity;
                 try model.verifyEmbeddingIdentityWithControl(attempt.execution_control);
                 if (attempt.request.model_identity) |expected| {
@@ -26035,7 +26041,7 @@ pub const Node = struct {
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
         const loaded = handle.get();
-        try requireLoadedEmbeddingRevision(request.model_revision, loaded.resolution_revision);
+        try requireLoadedEmbeddingRevision(request.model_revision, pinnableEmbeddingRevision(loaded.managed_publication, loaded.resolution_revision));
         var frame_cache = grouped.FrameCache{ .allocator = grouped.workspaceBackingAllocator(loaded.session.backend()), .session = loaded.session };
         defer frame_cache.deinit();
         if (request.model_identity) |expected| {
@@ -26495,6 +26501,7 @@ pub const Node = struct {
         }
 
         if (expected_revision) |required| {
+            if (manifest.managed_publication == null) return embeddingRevisionFailureResponse(ctx);
             const manifest_revision = self.model_manager.modelIdentityForManifestWithControl(resolved_path, manifest, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             requireLoadedEmbeddingRevision(required, manifest_revision) catch return embeddingRevisionFailureResponse(ctx);
@@ -26563,7 +26570,8 @@ pub const Node = struct {
         expected_revision: ?[32]u8,
         execution_control: InferenceExecutionControl,
     ) !httpx.Response {
-        requireLoadedEmbeddingRevision(expected_revision, handle.get().resolution_revision) catch return embeddingRevisionFailureResponse(ctx);
+        const model = handle.get();
+        requireLoadedEmbeddingRevision(expected_revision, pinnableEmbeddingRevision(model.managed_publication, model.resolution_revision)) catch return embeddingRevisionFailureResponse(ctx);
         const entry = handle.activationSnapshot(runtimeManifestTaskMask) orelse return activationInstanceEvicted(ctx);
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
@@ -26617,12 +26625,14 @@ pub const Node = struct {
                 var manifest = self.loadBoundManifest(ctx.allocator, path, false, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 defer manifest.deinit();
                 var dense_output = manifest.denseEmbeddingOutput();
+                var managed_publication = manifest.managed_publication;
                 const cached_model = self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 const revision = if (cached_model) |cached| loaded: {
                     var handle = cached;
-                    defer handle.release();
+                    defer handle.releaseObservation();
                     // Geometry and revision must describe the same serving generation.
                     dense_output = handle.get().manifest.denseEmbeddingOutput();
+                    managed_publication = handle.get().managed_publication;
                     if (handle.get().resolution_revision) |loaded_revision| break :loaded loaded_revision;
                     if (std.mem.eql(u8, operation, "embed")) return error.InvalidEmbeddingIdentity;
                     break :loaded self.model_manager.modelIdentityForManifestWithControl(path, manifest, control) catch |err| return modelLoadFailureResponse(ctx, err);
@@ -26634,7 +26644,7 @@ pub const Node = struct {
                     catalog_publication.require(ctx.allocator, ctx.io, self.config.models_dir, catalog_generation) catch |err| return modelLoadFailureResponse(ctx, err);
                     return ctx.json(catalog.value);
                 }
-                try info.object.put(catalog_allocator, "model_revision_pinning", .{ .bool = true });
+                try info.object.put(catalog_allocator, "model_revision_pinning", .{ .bool = pinnableEmbeddingRevision(managed_publication, revision) != null });
                 // Registry-wide listing deliberately skips full geometry parsing.
                 // Scoped discovery already resolved metadata without loading weights.
                 if (dense_output) |shape| {
@@ -50506,15 +50516,28 @@ test "scoped model discovery resolves dense geometry without loading weights" {
         // Identity inspection may fingerprint this file, but loading it fails.
         .data = "metadata-only fixture",
     });
+    const managed = @import("../registry/managed_receipt.zig");
+    const config = @embedFile("../architectures/embedding_gemma2_config.json");
+    const weights = "second metadata-only fixture";
+    var config_digest: [32]u8 = undefined;
+    var weights_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(config, &config_digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(weights, &weights_digest, .{});
+    const config_hex = std.fmt.bytesToHex(config_digest, .lower);
+    const weights_hex = std.fmt.bytesToHex(weights_digest, .lower);
+    const receipt = try std.json.Stringify.valueAlloc(a, managed.DownloadReceipt{
+        .version = 2,
+        .source = .{ .owner = "acme", .name = "other", .variant = "safetensors", .selected_format = "safetensors" },
+        .artifacts = &.{
+            .{ .path = "config.json", .size = config.len, .sha256 = &config_hex },
+            .{ .path = "model.safetensors", .size = weights.len, .sha256 = &weights_hex },
+        },
+    }, .{});
+    defer a.free(receipt);
     try tmp.dir.createDirPath(io, "embedders/acme/other");
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "embedders/acme/other/config.json",
-        .data = @embedFile("../architectures/embedding_gemma2_config.json"),
-    });
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "embedders/acme/other/model.safetensors",
-        .data = "second metadata-only fixture",
-    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/config.json", .data = config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/model.safetensors", .data = weights });
+    try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/" ++ managed.complete_filename, .data = receipt });
     const models_path = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(models_path);
     var node = try Node.init(a, .{ .models_dir = models_path });
@@ -50537,11 +50560,13 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(i64, 768), shape.object.get("native_dimensions").?.integer);
     try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);
     try std.testing.expectEqual(@as(usize, 64), model.object.get("model_revision").?.string.len);
-    try std.testing.expect(model.object.get("model_revision_pinning").?.bool);
+    try std.testing.expect(!model.object.get("model_revision_pinning").?.bool);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
     const wrong = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     try std.testing.expect(!std.mem.eql(u8, model.object.get("model_revision").?.string, wrong));
-    var activation = try httpx.Request.init(a, .POST, "/ai/v1/models/instances?model_revision=" ++ wrong);
+    const activation_path = try std.fmt.allocPrint(a, "/ai/v1/models/instances?model_revision={s}", .{model.object.get("model_revision").?.string});
+    defer a.free(activation_path);
+    var activation = try httpx.Request.init(a, .POST, activation_path);
     defer activation.deinit();
     activation.body = "{\"model\":\"acme/demo\",\"task\":\"embedder\"}";
     var activation_ctx = httpx.Context.init(a, io, &activation);
@@ -50550,6 +50575,19 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     defer refused.deinit();
     try std.testing.expectEqual(@as(u16, 409), refused.status.code);
     try std.testing.expect(refused.headers.get(embedding_revision.response_header) == null);
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+
+    var managed_request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=acme%2Fother&task=embed");
+    defer managed_request.deinit();
+    var managed_context = httpx.Context.init(a, io, &managed_request);
+    defer managed_context.deinit();
+    var managed_response = try node.listModels(&managed_context);
+    defer managed_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), managed_response.status.code);
+    var managed_catalog = try std.json.parseFromSlice(std.json.Value, a, managed_response.body.?, .{});
+    defer managed_catalog.deinit();
+    const published = managed_catalog.value.object.get("embedders").?.object.get("acme/other").?;
+    try std.testing.expect(published.object.get("model_revision_pinning").?.bool);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
 
     for ([_][]const u8{ "/ai/v1/models/instances", "/ai/v1/models/instances?model_revision=" ++ wrong }) |path| {

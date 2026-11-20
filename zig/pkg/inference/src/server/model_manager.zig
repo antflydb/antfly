@@ -5001,6 +5001,10 @@ pub const ModelHandle = struct {
         self.releaseWithUsage(true);
     }
 
+    pub fn releaseObservation(self: *ModelHandle) void {
+        self.releaseWithUsage(false);
+    }
+
     // Observation pins share exactly the same final-retired-owner cleanup,
     // but are not inference usage and must not renew idle cache residency.
     fn releaseWithUsage(self: *ModelHandle, used: bool) void {
@@ -5048,7 +5052,7 @@ pub const ModelObservationHandle = struct {
     }
 
     pub fn release(self: *ModelObservationHandle) void {
-        self.handle.releaseWithUsage(false);
+        self.handle.releaseObservation();
     }
 };
 
@@ -5058,7 +5062,7 @@ pub const LoadedModelSnapshot = struct {
     handles: []ModelHandle,
 
     pub fn deinit(self: *LoadedModelSnapshot) void {
-        for (self.handles) |*handle| handle.releaseWithUsage(false);
+        for (self.handles) |*handle| handle.releaseObservation();
         self.allocator.free(self.handles);
         self.handles = &.{};
     }
