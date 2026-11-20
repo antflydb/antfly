@@ -186,6 +186,7 @@ pub fn admitResolvingAlloc(
     const stored = try ctx.canonicalFromPublicAlloc(a, sources_value, refresh_value, resolver(&lookup), lowering);
     var config = try ctx.parseStoredJson(a, stored);
     defer config.deinit();
+    try rejectEmbeddingSearches(a, config.sources);
     const owner_identity = try identityAlloc(a, owner.table_id);
     const declared = try declarationsAlloc(a, tables, collect);
     // The candidate replaces any previous declaration of the same name.
@@ -196,6 +197,23 @@ pub fn admitResolvingAlloc(
     }
     try ctx.rejectCrossTableCycle(a, others.items, owner_identity, enrichment_name, stored);
     return alloc.dupe(u8, stored);
+}
+
+/// Distributed snapshot sources run their search request on the data
+/// server, which has no query embedder: a request needing a query embedding
+/// (`semantic_search`) would only fail at rebuild time. Refuse it here.
+fn rejectEmbeddingSearches(a: Allocator, sources: []const ctx.Source) !void {
+    for (sources) |source| {
+        if (source.kind != .search or source.search.request.len == 0) continue;
+        const request = std.json.parseFromSliceLeaky(std.json.Value, a, source.search.request, .{}) catch return error.InvalidContextSourcesConfig;
+        if (request != .object) continue;
+        const semantic = request.object.get("semantic_search") orelse continue;
+        switch (semantic) {
+            .null => {},
+            .string => |text| if (text.len != 0) return error.UnsupportedContextPredicate,
+            else => return error.UnsupportedContextPredicate,
+        }
+    }
 }
 
 /// Server primitives the host is built on.
@@ -710,4 +728,34 @@ test "context host caches catalog declarations until the catalog changes" {
     try std.testing.expect(test_collect_calls > parsed_once);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"dependent_table_id\":\"srv:9\"") != null);
     try std.testing.expect(try host.anyContextSources(alloc, 1 + 2 * std.time.ns_per_s, std.time.ns_per_s));
+}
+
+test "distributed admission refuses snapshot searches that need a query embedding" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const collect = CollectEnrichments{ .collect_fn = testCollect };
+    var tables = [_]TableInfo{
+        .{ .table_id = 7, .name = "orgs", .indexes_json = "{}" },
+        .{ .table_id = 9, .name = "docs", .indexes_json = "{}" },
+    };
+    const Case = struct { raw: []const u8, admitted: bool };
+    for ([_]Case{
+        .{ .raw = 
+        \\{"h":{"search":{"table":"orgs","request":{"semantic_search":"x","indexes":["emb"]}},"fields":["t"],"tracking":"snapshot"}}
+        , .admitted = false },
+        .{ .raw = 
+        \\{"h":{"search":{"table":"orgs","request":{"semantic_search":{"$source":"/topic"},"indexes":["emb"]}},"fields":["t"],"tracking":"snapshot"}}
+        , .admitted = false },
+        .{ .raw = 
+        \\{"h":{"search":{"table":"orgs","request":{"full_text_search":{"query":"acme"}}},"fields":["t"],"tracking":"snapshot"}}
+        , .admitted = true },
+    }) |case| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, case.raw, .{});
+        if (case.admitted) {
+            const stored = try admitAlloc(alloc, &tables, collect, "docs", "brief", value, null, null);
+            alloc.free(stored);
+        } else try std.testing.expectError(error.UnsupportedContextPredicate, admitAlloc(alloc, &tables, collect, "docs", "brief", value, null, null));
+    }
 }

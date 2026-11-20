@@ -6800,24 +6800,9 @@ pub const DataServer = struct {
         return antfly.public_api.indexes.collectArtifactEnrichmentsFromTableIndexesJson(a, indexes_json);
     }
 
-    fn contextParseQuery(ptr: *anyopaque, a: std.mem.Allocator, table_name: []const u8, body: []const u8) anyerror!antfly.db.types.SearchRequest {
-        const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const contract = @import("antfly_local_sources").api_query_contract;
-        // Snapshot sources may use semantic search: resolve index aliases and
-        // query embeddings exactly as the public query path does.
-        if (self.http_server) |*server| {
-            var resolver = server.semanticStatusResolver(.internal, "");
-            // Arena-owned: the parsed request lives as long as `a`.
-            if (contract.parseQueryRequest(a, resolver.iface(), table_name, body)) |owned| {
-                return owned.req;
-            } else |err| switch (err) {
-                // A table the resolver's catalog view does not name: fall
-                // back to resolver-free parsing (non-semantic queries).
-                error.TableNotFound => {},
-                else => return err,
-            }
-        }
-        const owned = try contract.parseQueryRequest(a, null, table_name, body);
+    fn contextParseQuery(_: *anyopaque, a: std.mem.Allocator, table_name: []const u8, body: []const u8) anyerror!antfly.db.types.SearchRequest {
+        // Arena-owned: the parsed request lives as long as `a`.
+        const owned = try @import("antfly_local_sources").api_query_contract.parseQueryRequest(a, null, table_name, body);
         return owned.req;
     }
 
