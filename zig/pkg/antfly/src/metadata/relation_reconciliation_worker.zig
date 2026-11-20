@@ -555,7 +555,7 @@ test "relation reconciliation worker publication pool expires idle snapshots ren
     try std.testing.expectError(error.OutOfMemory, pool.step(io, &host, work, 7, now));
     const begins = host.begins;
     host.begin_error = null;
-    try std.testing.expect((try pool.step(io, &host, work, 7, now + 1)) == null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pool.step(io, &host, work, 7, now + 1));
     try std.testing.expectEqual(begins, host.begins);
     host.step_error = error.InvalidCatalogRecord;
     try std.testing.expectError(error.InvalidCatalogRecord, pool.step(io, &host, work, 7, now + std.time.ns_per_s));

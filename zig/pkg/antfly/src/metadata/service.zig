@@ -13826,7 +13826,7 @@ test "metadata service reallocation barrier requires a current protocol from the
 test "metadata table topology protocol fences namespace writers and restored declarations" {
     const version = metadata_topology_protocol.resolver_namespaces_version;
     const table: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "source", .indexes_json = "{\"knowledge\":{\"resolvers\":[]}}" };
-    try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = "{\"topology\":{\"create\":{\"table\":{\"indexes_json\":\"{\\\"resolvers\\\":[]}\"}}}}" })));
+    try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = "{\"mutation\":{\"kind\":\"table\"},\"topology\":{\"create\":{\"table\":{\"indexes_json\":\"{\\\"resolvers\\\":[]}\"}}}}" })));
     try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = table })));
     try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = table, .replacement = table } })));
     try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } })));
@@ -13849,7 +13849,9 @@ test "metadata table topology protocol fences namespace writers and restored dec
         const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .indexes_json = indexes }, .{});
         defer std.testing.allocator.free(encoded);
         try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_restore_staging = encoded })));
-        try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = encoded })));
+        const catalog = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = .{ .indexes_json = indexes } } } }, .{});
+        defer std.testing.allocator.free(catalog);
+        try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = catalog })));
     }
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var predecessor = MetadataStatus{
