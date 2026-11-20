@@ -49091,6 +49091,17 @@ pub const DB = struct {
 
         fn scanLargeOrderedScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !bool {
             if (comptime builtin.os.tag == .freestanding) return false;
+            var delivery_started = false;
+            return self.scanLargeOrderedScopeWithSpill(options, &delivery_started) catch |err| {
+                if (delivery_started) return err;
+                return switch (err) {
+                    error.SqlProgramLimitExceeded, error.NoSpaceLeft, error.DiskQuota, error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem, error.FileNotFound, error.InputOutput, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => false,
+                    else => err,
+                };
+            };
+        }
+
+        fn scanLargeOrderedScopeWithSpill(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions, delivery_started: *bool) !bool {
             const constraints = options.constraints orelse return false;
             if (!constraints.positive_filter) return false;
             const set = if (constraints.primary_include_compact) constraints.primary_include else doc_set.ResolvedDocSet{ .ordinals = constraints.filter_doc_nums };
@@ -49158,6 +49169,14 @@ pub const DB = struct {
             var last: std.ArrayListUnmanaged(u8) = .empty;
             defer last.deinit(self.alloc);
             var have_last = false;
+            var delivery = std.heap.ArenaAllocator.init(self.alloc);
+            defer delivery.deinit();
+            var keys: [256][]const u8 = undefined;
+            var ordinals: [256]?doc_set.DocOrdinal = undefined;
+            var len: usize = 0;
+            var batch_size = @min(@max(options.scan_batch_size orelse keys.len, 1), keys.len);
+            const duration = ttlDurationNs(self.db);
+            const now = currentTimeNs();
             while (try ordered.nextLeased()) |row| {
                 defer row.release();
                 try Check.run(self);
@@ -49166,10 +49185,35 @@ pub const DB = struct {
                 last.clearRetainingCapacity();
                 try last.appendSlice(self.alloc, id);
                 have_last = true;
-                const ordinal = std.math.cast(doc_set.DocOrdinal, row.row.ordinal);
-                if (try self.visitIdWithOrdinal(id, ordinal, true) == .stop) return true;
+                keys[len] = try delivery.allocator().dupe(u8, id);
+                ordinals[len] = std.math.cast(doc_set.DocOrdinal, row.row.ordinal);
+                len += 1;
+                if (len == batch_size) {
+                    delivery_started.* = true;
+                    if (try self.deliverOrderedBatch(delivery.allocator(), keys[0..len], ordinals[0..len], duration, now) == .stop) return true;
+                    len = 0;
+                    _ = delivery.reset(.retain_capacity);
+                    batch_size = @min(keys.len, batch_size * 2);
+                }
+            }
+            if (len != 0) {
+                delivery_started.* = true;
+                _ = try self.deliverOrderedBatch(delivery.allocator(), keys[0..len], ordinals[0..len], duration, now);
             }
             return true;
+        }
+
+        fn deliverOrderedBatch(self: *@This(), alloc: Allocator, keys: []const []const u8, ordinals: []const ?doc_set.DocOrdinal, duration: u64, now: u64) !docstore_mod.DocStore.ScanAction {
+            const timestamps = if (duration == 0) null else try loadDocumentTimestampsManyWithIdentityShape(self.db, alloc, keys, true);
+            defer if (timestamps) |values| alloc.free(values);
+            for (keys, ordinals, 0..) |id, ordinal, i| {
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                if (timestamps) |values| if (values[i]) |ts| {
+                    if (ttl_mod.isExpired(ts, duration, now)) continue;
+                };
+                if (try self.visitPreparedId(id, ordinal, true, true) == .stop) return .stop;
+            }
+            return .@"continue";
         }
 
         fn orderedScopeContains(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions, id: []const u8) bool {
@@ -49381,6 +49425,10 @@ pub const DB = struct {
         }
 
         fn visitIdWithOrdinal(self: *@This(), id: []const u8, known_ordinal: ?doc_set.DocOrdinal, unique: bool) !docstore_mod.DocStore.ScanAction {
+            return self.visitPreparedId(id, known_ordinal, unique, false);
+        }
+
+        fn visitPreparedId(self: *@This(), id: []const u8, known_ordinal: ?doc_set.DocOrdinal, unique: bool, expiry_checked: bool) !docstore_mod.DocStore.ScanAction {
             const ordinal = identity: {
                 var txn = try self.db.core.store.beginProbeTxn();
                 defer txn.abort();
@@ -49391,7 +49439,7 @@ pub const DB = struct {
                 if (!(if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive())) break :identity null;
                 break :identity ordinal;
             };
-            return self.visitor(self.visitor_ctx, id, ordinal, unique, false);
+            return self.visitor(self.visitor_ctx, id, ordinal, unique, expiry_checked);
         }
     };
 
