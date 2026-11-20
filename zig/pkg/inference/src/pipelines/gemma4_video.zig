@@ -51,7 +51,7 @@ pub fn promptAllowance(a: std.mem.Allocator, bytes: []const u8, control: Control
     const media_control = media.source.Control{ .context = adapter.context, .check_fn = adapter.check_fn };
     if (bytes.len > video.packet_sampling.gemma4_max_input_bytes) return error.VideoInputTooLarge;
     if (media.transport_stream.isTransportStream(bytes)) {
-        return clockAllowance(try media.transport_stream.probeSampleClock(a, bytes, .{ .max_bytes = video.packet_sampling.gemma4_max_input_bytes }, media_control));
+        return clockAllowance(try media.transport_stream.probeSampleClock(a, bytes, .{ .max_bytes = video.packet_sampling.gemma4_max_input_bytes, .max_packets = video.mp4_coded.limits.max_samples }, media_control));
     }
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = inspection_bytes } };
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-prompt-clock", .control = media_control, .admission_pool = &pool, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
@@ -364,19 +364,13 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
     // VideoToolbox surfaces are a separate budget from decoder heap memory.
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes - inspection_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
     var inspection = embedding_video.InspectionScope{ .allocator = a, .limit = inspection_bytes };
+    defer inspection.deinit();
     const configuration = embedding_video.Configuration{ .sampling = sampling, .pool = &pool, .inspection_scope = &inspection };
     const adapter = control.imageWorkControl();
-    const source_control: media.source.Control = .{ .context = adapter.context, .check_fn = adapter.check_fn };
-    const transport = if (media.transport_stream.isTransportStream(bytes)) video.transport_avc.indexClip(a, "generation-video", bytes, .{
-        .transport = .{ .max_bytes = video.packet_sampling.gemma4_max_input_bytes },
-        .stream = .{ .max_bytes = video.packet_sampling.gemma4_max_input_bytes, .control = source_control, .admission_pool = &pool, .source_limits = .{ .max_total_bytes = 512 * 1024 * 1024 } },
-    }) catch |err| return inputError(err) else null;
-    defer if (transport) |owner| owner.deinit();
-    defer inspection.deinit();
-    const reader = if (transport) |owner| &owner.reader else null;
-    const timestamps = embedding_video.inspectedPresentationUs(a, bytes, reader, control, configuration) catch |err| return inputError(err);
+    const source_control = media.source.Control{ .context = adapter.context, .check_fn = adapter.check_fn };
+    const timestamps = embedding_video.inspectedPresentationUs(a, bytes, null, control, configuration) catch |err| return inputError(err);
     defer a.free(timestamps);
-    const inspected = inspection.find(bytes, reader, configuration).?;
+    const inspected = inspection.find(bytes, null, configuration).?;
     if (!inspected.webm and inspected.reader.track.codec == .hevc) {
         if (@import("builtin").os.tag != .macos) return error.HevcDecoderUnavailable;
         const required = try video.apple_hevc.surfaceBytesControlled(inspected.reader.track, source_control);
@@ -388,7 +382,7 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
     const extra = (try frames.pixelWorkingBytes()) -| prepaid_model_pixels;
     try permit.ensureCapacity(admission, .host, try std.math.add(usize, permit.reservation.host_bytes, extra));
     var observer: Observer = .{ .a = a, .cb = cb, .frames = &frames };
-    const replay_bytes = embedding_video.observeConfiguredSourceBytes(a, bytes, reader, control, .{
+    const replay_bytes = embedding_video.observeConfiguredSourceBytes(a, bytes, null, control, .{
         .observer = .{ .context = &observer, .accept = Observer.accept },
         .sampling = sampling,
         .pool = &pool,

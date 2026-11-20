@@ -868,12 +868,15 @@ pub const Runner = struct {
         defer self.audio_provider = null;
         const count = self.request.limits.max_index_packets;
         const identity = @import("media_index_cache.zig").Cache.videoKey(source, if (transport) .transport else if (webm) .webm else .mp4, count, self.request.max_working_bytes);
-        var build: ?@import("media_speaker_flights.zig").Registry.Lease = if (transport and self.request.index_cache_admission != null and identity != null and self.request.index_cache != null)
-            try self.request.index_cache.?.acquireBuild(identity.?, self.control)
-        else
-            null;
+        var hit = if (identity != null and self.request.index_cache != null) self.request.index_cache.?.get(identity.?) else null;
+        var build: ?@import("media_speaker_flights.zig").Registry.Lease = null;
         defer if (build) |lease| lease.deinit();
-        if (identity) |key| if (self.request.index_cache) |cache| if (cache.get(key)) |entry| {
+        if (hit == null and transport and identity != null and self.request.index_cache != null and self.request.index_cache_admission != null) {
+            build = try self.request.index_cache.?.acquireBuild(identity.?, self.control);
+            hit = self.request.index_cache.?.get(identity.?);
+        }
+        if (hit) |entry| {
+            const cache = self.request.index_cache.?;
             defer cache.release(entry);
             if (build) |lease| lease.deinit();
             build = null;
@@ -899,7 +902,7 @@ pub const Runner = struct {
                 else => unreachable,
             }
             return;
-        };
+        }
         var limits = video.mp4_coded.limits;
         limits.max_samples = count;
         limits.max_index_bytes = self.request.max_working_bytes;
@@ -2940,4 +2943,71 @@ test "model aware media MP4 edits select exact packets through cold and cached o
         try window.bind(policy, &pool);
         try std.testing.expectEqualSlices(usize, &.{1 - window.packet_base}, window.selection.?.selected);
     }
+}
+
+test "model aware media admits sparse HEVC and MJPEG windows by selected dependency runs" {
+    const a = std.testing.allocator;
+    inline for (.{ "codecs/hevc-hvc1.mp4", "mjpeg.mov" }) |name| {
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 8 * 1024 * 1024 } };
+        defer std.debug.assert(pool.snapshot().host_bytes == 0);
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = @embedFile("../testdata/video/" ++ name) } };
+        var original = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
+        defer original.deinit();
+        var reader = original;
+        reader.track.timescale = 1;
+        reader.track.edit = .{};
+        reader.track.hevc_sync_validated = true;
+        var packets: [40]media.mp4.Packet = undefined;
+        for (&packets, 0..) |*packet, i| {
+            packet.* = original.packets[0];
+            packet.sync = true;
+            packet.pts = @intCast(i);
+            packet.duration = 1;
+        }
+        reader.packets = &packets;
+        var owner = try @import("media_chunking_video.zig").Owner.init(a, &reader, &pool, .{ .max_dependency_packets = 2, .max_coded_window_bytes = 2 * @as(usize, packets[0].size) });
+        defer owner.deinit();
+        const policy = video.sampling.TimestampPolicy{ .max_frames = 2, .end_ns = 40 * std.time.ns_per_s };
+        var window = try owner.prepare(policy);
+        defer window.deinit();
+        try window.bind(policy, &pool);
+        try std.testing.expectEqual(@as(usize, 2), window.coded.reader.packets.len);
+        try std.testing.expectEqual(@as(usize, 39), window.selection.?.projection_keys[1].picture);
+    }
+}
+
+test "model aware media preserves a resumed AVC hold as a repeated output slot" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 8 * 1024 * 1024 } };
+    var source = media.source.Source{ .allocator = a, .identity = "held", .storage = .{ .borrowed = @embedFile("../testdata/video/closed.mp4") } };
+    var original = try media.mp4.Reader.init(a, &source, .{});
+    defer original.deinit();
+    var reader = original;
+    reader.track.timescale = 1;
+    reader.track.edit = .{};
+    var packets = [_]media.mp4.Packet{ original.packets[0], original.packets[0] };
+    packets[0].pts = 0;
+    packets[0].duration = 4;
+    packets[1].pts = 1;
+    packets[1].duration = 1;
+    reader.packets = &packets;
+    var owner = try @import("media_chunking_video.zig").Owner.init(a, &reader, &pool, .{ .max_dependency_packets = 2 });
+    defer owner.deinit();
+    const policy = video.sampling.TimestampPolicy{ .end_ns = 3 * std.time.ns_per_s, .step_ns = std.time.ns_per_s, .hold = true };
+    var window = try owner.prepare(policy);
+    defer window.deinit();
+    try window.bind(policy, &pool);
+    const ids = window.selection.?.selected;
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 0 }, ids);
+    const Frames = struct {
+        fn accept(raw: *anyopaque, slot: usize, _: *const video.h264.Frame) !void {
+            const seen: *[3]bool = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!seen[slot]);
+            seen[slot] = true;
+        }
+    };
+    var seen: [3]bool = @splat(false);
+    const stats = try video.h264.decodeSelected(a, &window.coded.reader, ids, .{ .max_dependency_packets = 2 }, &seen, Frames.accept);
+    try std.testing.expectEqual(@as(usize, 2), stats.decoded_packets);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &seen);
 }

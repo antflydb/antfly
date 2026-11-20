@@ -45,7 +45,7 @@ pub const Span = struct {
         self.members.appendAssumeCapacity(first);
         var coded_bytes: usize = reader.packets[first].size;
         var next = first + 1;
-        while (next < reader.packets.len and next - dependency_start < options.max_dependency_packets) : (next += 1) {
+        while (next < reader.packets.len and (headers or next - dependency_start < options.max_dependency_packets)) : (next += 1) {
             try reader.input.control.check();
             if (reader.packets[next].size > options.max_packet_bytes) return error.ResourceLimitExceeded;
             var owned: ?[]u8 = null;
@@ -65,22 +65,28 @@ pub const Span = struct {
             const previous = if (self.storage.items.len == 0) initial.len else self.storage.items.len;
             const length = try std.math.add(usize, previous, lease.bytes.len);
             if (length > options.max_packet_bytes) return error.ResourceLimitExceeded;
-            // Charge coalesced bytes, simultaneous growth and escaped/RBSP copies.
-            // Source leases and the core workspace have separate reservations.
+            // Reserve the actual capacities, including moving growth and RBSP
+            // scratch. Geometric growth keeps fragmented pictures linear in size.
             const member_count = self.members.items.len + @intFromBool(part.residual);
-            try self.reservation.resize(.{ .host_bytes = try std.math.add(usize, try std.math.mul(usize, length, 3), try std.math.mul(usize, member_count, @sizeOf(usize))) });
-            // Precise capacity growth avoids uncharged allocator over-allocation.
-            try self.storage.ensureTotalCapacityPrecise(allocator, length);
+            const capacity = grownCapacity(self.storage.capacity, length, options.max_packet_bytes);
+            const members = grownCapacity(self.members.capacity, member_count, reader.packets.len);
+            const member_bytes = try std.math.mul(usize, members, 2 * @sizeOf(usize));
+            try self.reservation.resize(.{ .host_bytes = try std.math.add(usize, try std.math.mul(usize, capacity, 3), member_bytes) });
+            try self.storage.ensureTotalCapacityPrecise(allocator, capacity);
             if (self.storage.items.len == 0) self.storage.appendSliceAssumeCapacity(initial);
             self.storage.appendSliceAssumeCapacity(lease.bytes);
             if (part.residual) {
-                try self.members.ensureTotalCapacityPrecise(allocator, member_count);
+                try self.members.ensureTotalCapacityPrecise(allocator, members);
                 self.members.appendAssumeCapacity(next);
             }
             self.last = next;
         }
         if (self.storage.items.len != 0) self.bytes = self.storage.items;
         return self;
+    }
+    fn grownCapacity(current: usize, needed: usize, limit: usize) usize {
+        if (needed <= current) return current;
+        return @max(needed, @min(limit, current +| current / 2 +| 8));
     }
     pub fn deinit(self: *Span) void {
         self.storage.deinit(self.allocator);
@@ -107,4 +113,21 @@ fn kinds(bytes: []const u8, length: u3) !Kinds {
         cursor += size;
     }
     return result;
+}
+
+test "AVC partition header indexing is independent of replay packet limits" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/decode-bframes.mp4");
+    var source = media.source.Source{ .allocator = a, .identity = "partitions", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var view = reader;
+    view.packets = reader.packets[0..4];
+    view.track.nal_length_bytes = 1;
+    var data = [4][2]u8{ .{ 1, 2 }, .{ 1, 3 }, .{ 1, 4 }, .{ 1, 1 } };
+    const headers = [_][]u8{ &data[0], &data[1], &data[2], &data[3] };
+    var span = try Span.initHeaders(a, &view, 0, headers[0], .{ .max_dependency_packets = 1 }, &headers);
+    defer span.deinit();
+    try std.testing.expectEqual(@as(usize, 2), span.last);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, span.members.items);
 }

@@ -438,3 +438,17 @@ test "video dependency immutable seek cache reuses verified anchors without reta
     src.identity = "different-source";
     try std.testing.expectError(error.InvalidVideoReaderSelection, video.decode_plan.create(a, &reader, &.{19}, .{ .seek_cache = &cache }));
 }
+
+test "video metadata-only IDR qualification charges NAL headers without pinning payloads" {
+    var src = source();
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    const before = src.total_bytes;
+    var plan = try video.decode_plan.create(a, &reader, &.{19}, .{ .headers_only = true, .max_probe_bytes = 128 });
+    defer plan.deinit();
+    const restart = plan.runs[0].first;
+    try std.testing.expect(restart > 0 and reader.packets[restart].size > 128);
+    try std.testing.expect(plan.probe_bytes > 0 and plan.probe_bytes <= 128);
+    try std.testing.expectEqual(src.total_bytes - before, plan.probe_bytes);
+    try std.testing.expect(plan.anchorBytes(restart) == null);
+}

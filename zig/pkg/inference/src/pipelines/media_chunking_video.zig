@@ -152,7 +152,7 @@ pub const Owner = struct {
             logical = try video.h264_pictures.planning(a, reader, planning, registry);
         const count = if (logical) |index| index.pictures.len else reader.packets.len;
         var metadata_bytes = try video.sampling.Timeline.storageBytes(count);
-        if (reader.track.codec == .avc or reader.track.codec == .hevc) metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, reader.packets.len, @sizeOf(usize)));
+        if ((reader.track.codec == .avc and registry == null) or reader.track.codec == .hevc) metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, reader.packets.len, @sizeOf(usize)));
         if (logical != null) {
             const base = try std.math.ceilPowerOfTwo(usize, @max(@as(usize, 1), count));
             metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, try std.math.add(usize, count, try std.math.mul(usize, base, 2)), @sizeOf(usize)));
@@ -179,14 +179,20 @@ pub const Owner = struct {
         const hevc_predecessors = try a.alloc(usize, if (reader.track.codec == .hevc) reader.packets.len else 0);
         errdefer a.free(hevc_predecessors);
         if (hevc_predecessors.len != 0) try video.hevc_restart.fillPredecessors(reader, hevc_predecessors);
-        var seek_cache: ?video.decode_plan.SeekCache = if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null;
+        var seek_cache: ?video.decode_plan.SeekCache = if (registry) |session| registrySeekCache(a, reader, session) else if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null;
         errdefer if (seek_cache) |*cache| cache.deinit();
-        if (registry) |owner| {
-            for (owner.progressive_idrs.items) |packet| seek_cache.?.nearest[packet] = packet;
-        }
         var dependencies: ?Dependencies = if (logical) |index| try Dependencies.init(a, index) else null;
         errdefer if (dependencies) |*index| index.deinit();
         return .{ .hevc_predecessors = hevc_predecessors, .metadata_reservation = metadata_reservation, .dependencies = dependencies, .timeline = timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .logical = logical, .registry = registry, .origin = timeline.first, .pool = pool, .limits = limits };
+    }
+    fn registrySeekCache(a: std.mem.Allocator, reader: *const media.mp4.Reader, registry: *const video.h264_dynamic.Session) video.decode_plan.SeekCache {
+        var cache = video.decode_plan.SeekCache.forPage(a, reader, registry.progressive_idrs.items);
+        for (registry.entries.items) |entry| {
+            const cfg = entry.config;
+            if (!cfg.frame_only or cfg.separate_planes or cfg.profile == 88) return cache;
+        }
+        cache.complete = true;
+        return cache;
     }
     pub fn fromSnapshot(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits, snapshot: *const Snapshot) !Owner {
         try reader.input.control.check();
@@ -196,7 +202,7 @@ pub const Owner = struct {
         options.decode.max_dependency_packets = limits.max_dependency_packets;
         const registry = if (snapshot.registry) |*shared| try shared.bind(a, reader, options.decode) else null;
         errdefer if (registry) |session| session.deinit();
-        const seek_cache = if (reader.track.codec == .avc) video.decode_plan.SeekCache.forPage(a, reader, if (registry) |session| session.progressive_idrs.items else &.{}) else null;
+        const seek_cache = if (registry) |session| registrySeekCache(a, reader, session) else if (reader.track.codec == .avc) video.decode_plan.SeekCache.forPage(a, reader, &.{}) else null;
         return .{ .hevc_predecessors = snapshot.hevc_predecessors, .borrowed_planning = true, .duration_ns = snapshot.duration_ns, .metadata_reservation = .{}, .dependencies = snapshot.dependencies, .timeline = snapshot.timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .logical = logical, .registry = registry, .origin = snapshot.origin, .pool = pool, .limits = limits };
     }
     pub fn deinit(self: *Owner) void {
@@ -222,23 +228,29 @@ pub const Owner = struct {
         defer a.free(selected);
         var selected_packets: [32]usize = undefined;
         const packets = selected_packets[0..selected.len];
-        var first: usize = std.math.maxInt(usize);
-        var stop: usize = 0;
+        var storage: [32]video.decode_plan.Run = undefined;
+        var count: usize = 0;
         for (selected, packets) |id, *packet| {
             packet.* = if (self.logical) |index| index.pictures[id].first_packet else id;
-            const dependency = if (self.reader.track.codec == .hevc)
+            if (self.reader.track.codec == .avc) continue;
+            const start = if (self.reader.track.codec == .hevc)
                 try video.hevc_restart.startFor(self.reader.packets, self.hevc_predecessors, packet.*)
             else
                 packet.*;
-            first = @min(first, dependency);
-            const last = if (self.logical) |index| index.pictures[id].last_packet orelse return error.IncompleteVideoPicture else id;
-            stop = @max(stop, last + 1);
+            storage[count] = .{ .first = start, .last = packet.* };
+            count += 1;
         }
-        var storage: [32]video.decode_plan.Run = undefined;
-        var count: usize = 1;
-        storage[0] = .{ .first = first, .last = stop - 1 };
         if (self.reader.track.codec == .avc) {
-            var plan = try video.decode_plan.create(a, self.reader, packets, .{ .seek_cache = if (self.seek_cache) |*cache| cache else null, .portable_config = true, .max_decode_packets = self.limits.max_dependency_packets, .max_run_packets = self.limits.max_dependency_packets });
+            // Overlapping display intervals can select A, B, A. Preserve those
+            // output slots while planning each coded dependency only once.
+            var unique: [32]usize = undefined;
+            var n: usize = 0;
+            for (packets) |packet| {
+                if (std.mem.indexOfScalar(usize, unique[0..n], packet) != null) continue;
+                unique[n] = packet;
+                n += 1;
+            }
+            var plan = try video.decode_plan.create(a, self.reader, unique[0..n], .{ .seek_cache = if (self.seek_cache) |*cache| cache else null, .portable_config = true, .headers_only = true, .max_decode_packets = self.limits.max_dependency_packets, .max_run_packets = self.limits.max_dependency_packets });
             defer plan.deinit();
             count = 0;
             for (plan.runs) |run| {
@@ -258,15 +270,27 @@ pub const Owner = struct {
                         if (begin == previous_first and end == previous_stop) break;
                     }
                 }
-                while (count != 0 and begin <= storage[count - 1].last + 1) {
-                    count -= 1;
-                    begin = @min(begin, storage[count].first);
-                    end = @max(end, storage[count].last + 1);
-                }
                 storage[count] = .{ .first = begin, .last = end - 1 };
                 count += 1;
             }
         }
+        // Presentation order can differ from decode order, including HEVC
+        // leading pictures whose restart precedes the previous target's IRAP.
+        std.mem.sort(video.decode_plan.Run, storage[0..count], {}, struct {
+            fn less(_: void, left: video.decode_plan.Run, right: video.decode_plan.Run) bool {
+                return left.first < right.first;
+            }
+        }.less);
+        var merged: usize = 0;
+        for (storage[0..count]) |run| {
+            if (merged != 0 and run.first <= storage[merged - 1].last + 1) {
+                storage[merged - 1].last = @max(storage[merged - 1].last, run.last);
+            } else {
+                storage[merged] = run;
+                merged += 1;
+            }
+        }
+        count = merged;
         const runs = storage[0..count];
         var total_packets: usize = 0;
         var coded_bytes: u64 = 0;

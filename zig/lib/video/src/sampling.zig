@@ -147,14 +147,28 @@ pub const Timeline = struct {
     }
 
     /// Preserve original logical picture IDs for decoding preroll while indexing
-    /// only presentation timestamps inside the container's edit.
+    /// pictures that start inside the edit or remain displayed across its start.
     pub fn initEdited(a: std.mem.Allocator, pictures: []const TimedPicture, control: media.source.Control, edit: media.timeline.Edit) !Timeline {
         const stop: ?i128 = if (edit.source_duration) |d| @as(i128, edit.source_start) + d else null;
+        // Only the latest undated picture before an edit can still be held.
+        var preceding: ?i64 = null;
+        if (stop != null) for (pictures, 0..) |pic, i| {
+            if (i % 256 == 0) try control.check();
+            if (pic.pts < edit.source_start) preceding = @max(preceding orelse pic.pts, pic.pts);
+        };
+        const Visible = struct {
+            fn overlaps(pic: TimedPicture, begin: i64, end: i128, prior: ?i64) bool {
+                if (pic.pts >= end) return false;
+                if (pic.pts >= begin) return true;
+                if (pic.duration) |duration| return @as(i128, pic.pts) + duration > begin;
+                return pic.pts == prior;
+            }
+        };
         const count = if (stop) |bound| blk: {
             var n: usize = 0;
             for (pictures, 0..) |pic, i| {
                 if (i % 256 == 0) try control.check();
-                if (pic.pts >= edit.source_start and pic.pts < bound) n += 1;
+                if (Visible.overlaps(pic, edit.source_start, bound, preceding)) n += 1;
             }
             break :blk n;
         } else pictures.len;
@@ -165,7 +179,7 @@ pub const Timeline = struct {
         var i: usize = 0;
         for (pictures, 0..) |picture, id| {
             if (id % 256 == 0) try control.check();
-            if (stop) |bound| if (picture.pts < edit.source_start or picture.pts >= bound) continue;
+            if (stop) |bound| if (!Visible.overlaps(picture, edit.source_start, bound, preceding)) continue;
             bounds.include(picture.pts, picture.duration);
             entries[i] = .{ .id = id, .pts = picture.pts, .stop = @min(stop orelse std.math.maxInt(i128), if (picture.duration) |d| @as(i128, picture.pts) + d else std.math.maxInt(i128)) };
             i += 1;
@@ -519,7 +533,7 @@ test "source timestamp sampling preserves edit origin and visible logical IDs" {
     try std.testing.expectEqual(@as(i128, 25), timeline.last);
     const ids = try timeline.select(a, 10, .{ .step_ns = std.time.ns_per_s, .hold = true }, .{}, true);
     defer a.free(ids);
-    try std.testing.expectEqualSlices(usize, &.{ 2, 1 }, ids);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, ids);
 }
 
 test "source timestamp sampling never revives a superseded undated picture" {

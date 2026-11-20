@@ -55,18 +55,27 @@ pub const Mapping = struct {
 pub const View = struct {
     map: Mapping,
     wire: *media.source.Source,
+    // Reader copies can issue simultaneous normalized reads. The physical
+    // provider and its request-wide byte/read counters have one owner.
+    mutex: std.Io.Mutex = .init,
     pub fn source(self: *View, identity: []const u8, limits: media.source.Limits) media.source.Source {
         return .{ .allocator = self.wire.allocator, .identity = identity, .control = self.wire.control, .admission_pool = self.wire.admission_pool, .limits = limits, .storage = .{ .range = .{ .context = self, .length = self.map.len, .read_at = read } } };
     }
     fn read(raw: *anyopaque, start: u64, out: []u8, control: media.source.Control) !usize {
         const self: *View = @ptrCast(@alignCast(raw));
         if (out.len == 0) return 0;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         if (start >= self.map.len or out.len > self.map.len - start) return error.UnexpectedEndOfSource;
         var pos = start;
         var id = containing(Nal, self.map.nals, "logical", pos);
         const end = start + out.len;
-        const final = self.map.nals[containing(Nal, self.map.nals, "logical", end - 1)];
-        const final_es = final.elementary + ((end - final.logical) -| 4);
+        const final_id = containing(Nal, self.map.nals, "logical", end - 1);
+        const final = self.map.nals[final_id];
+        // A read ending inside a synthetic prefix requires no wire bytes
+        // from that NAL, including any preceding Annex B padding.
+        const final_es = if (end > final.logical + 4) final.elementary + (end - final.logical - 4) else if (final_id > 0) self.map.nals[final_id - 1].elementary + self.map.nals[final_id - 1].size else 0;
         const final_wire: u64 = if (final_es == 0) 0 else blk: {
             const last = self.map.runs[containing(Run, self.map.runs, "elementary", final_es - 1)];
             break :blk last.offset(final_es - 1 - last.elementary) + 1;
@@ -102,24 +111,26 @@ pub const View = struct {
                     const capacity = @min(256 * 1024, self.wire.limits.max_read_bytes, self.wire.limits.max_retained_bytes -| self.wire.retained_bytes, remaining);
                     // Coalesce nearby extents while there is room to pay for
                     // transport overhead in addition to all remaining payload.
-                    const slack = remaining -| (end - pos);
+                    const whole_span_fits = final_wire - wire <= remaining;
+                    const synthetic = 4 * (final_id - id) -| (final.logical + 4 -| end);
+                    const slack = remaining -| (end - pos - synthetic);
                     var last_id = run_id;
                     // Under a tight byte budget do not prefetch Annex B start
                     // codes or padding between this NAL and the next one.
-                    const fetch_end = if (final_wire - wire <= remaining) final_es else es + (stop - pos);
+                    const fetch_end = if (whole_span_fits) final_es else es + (stop - pos);
                     var last_es = @min(fetch_end, run.elementary + run.len);
                     var wire_end = run.offset(last_es - 1 - run.elementary) + 1;
                     while (last_es < fetch_end and wire_end - wire < capacity) {
                         const next = self.map.runs[last_id + 1];
-                        if (next.wire - wire_end > 188) break;
+                        if (next.wire - wire_end > 188 and !(whole_span_fits and final_wire - wire <= capacity and self.wire.limits.max_reads -| self.wire.reads == 1)) break;
                         const next_es = @min(fetch_end, next.elementary + next.len);
                         const next_end = next.offset(next_es - 1 - next.elementary) + 1;
-                        if (next_end - wire - (next_es - es) > slack) break;
+                        if (!whole_span_fits and next_end - wire - (next_es - es) > slack) break;
                         last_id += 1;
                         last_es = next_es;
                         wire_end = next_end;
                     }
-                    if (wire_end - wire - (last_es - es) > slack)
+                    if (!whole_span_fits and wire_end - wire - (last_es - es) > slack)
                         wire_end = wire + @min(run.len - relative, 184 - relative % 184, stop - pos);
                     const count: usize = @intCast(@min(wire_end - wire, capacity));
                     if (count == 0) return error.ResourceLimitExceeded;
@@ -149,8 +160,14 @@ pub const Index = struct {
     headers: std.ArrayList([]u8) = .empty,
     current_header: std.ArrayList(u8) = .empty,
 
+    capture_headers: bool = true,
+
     pub fn build(self: *Index, a: std.mem.Allocator, wire: *media.source.Source, options: avc.Options) !void {
-        self.* = .{ .memory = .{ .backing = a, .limit = options.index.max_index_bytes, .reservation = if (wire.admission_pool) |pool| try pool.acquire(.{}) else .{} } };
+        return self.buildForReader(a, wire, options, true);
+    }
+
+    pub fn buildForReader(self: *Index, a: std.mem.Allocator, wire: *media.source.Source, options: avc.Options, capture_headers: bool) !void {
+        self.* = .{ .capture_headers = capture_headers, .memory = .{ .backing = a, .limit = options.index.max_index_bytes, .reservation = if (wire.admission_pool) |pool| try pool.acquire(.{}) else .{} } };
         errdefer self.deinit();
         var units = try avc.Stream.initIndex(a, wire.identity, options, .{ .context = self, .track = recordTrack, .nal = recordNal, .packet = recordPacket });
         defer if (!units.ended) units.deinit();
@@ -176,12 +193,14 @@ pub const Index = struct {
     fn recordNal(raw: *anyopaque, elementary: usize, nal: []const u8) !void {
         const self: *Index = @ptrCast(@alignCast(raw));
         const len = nal.len;
-        const retained = try @import("h264_prefix.zig").retainedSize(nal[0], len);
         const a = self.memory.allocator();
-        var prefix: [4]u8 = undefined;
-        std.mem.writeInt(u32, &prefix, @intCast(retained), .big);
-        try self.current_header.appendSlice(a, &prefix);
-        try self.current_header.appendSlice(a, nal[0..retained]);
+        if (self.capture_headers) {
+            const retained = try @import("h264_prefix.zig").retainedSize(nal[0], len);
+            var prefix: [4]u8 = undefined;
+            std.mem.writeInt(u32, &prefix, @intCast(retained), .big);
+            try self.current_header.appendSlice(a, &prefix);
+            try self.current_header.appendSlice(a, nal[0..retained]);
+        }
         try self.nals.append(self.memory.allocator(), .{ .logical = self.length, .elementary = elementary, .size = @intCast(len) });
         self.length = try std.math.add(u64, self.length, 4 + len);
     }
@@ -199,6 +218,7 @@ pub const Index = struct {
         if (self.packet_end != self.length) return error.InvalidVideoIndex;
         const a = self.memory.allocator();
         try self.packets.append(a, packet);
+        if (!self.capture_headers) return;
         try self.headers.ensureUnusedCapacity(a, 1);
         self.headers.appendAssumeCapacity(try self.current_header.toOwnedSlice(a));
     }
@@ -298,4 +318,23 @@ test "seekable transport skips multiplexed padding under exact payload budget" {
     var both = try mapped.read(0, 10);
     defer both.deinit();
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 9, 0, 0, 0, 1, 10 }, both.bytes);
+    packed_wire.limits.max_total_bytes = 100;
+    const before = packed_wire.total_bytes;
+    var prefix = try mapped.read(4, 4);
+    defer prefix.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 9, 0, 0, 0 }, prefix.bytes);
+    try std.testing.expectEqual(@as(u64, 1), packed_wire.total_bytes - before);
+}
+
+test "seekable transport coalesces prefixes and TS headers under one exact read" {
+    var bytes: [192]u8 = @splat(0);
+    bytes[183] = 9;
+    bytes[191] = 10;
+    var wire = media.source.Source{ .allocator = std.testing.allocator, .storage = .{ .borrowed = &bytes }, .identity = "stride", .limits = .{ .max_total_bytes = 9, .max_reads = 1 } };
+    var view = View{ .wire = &wire, .map = .{ .len = 10, .nals = &.{ .{ .logical = 0, .elementary = 183, .size = 1 }, .{ .logical = 5, .elementary = 187, .size = 1 } }, .runs = &.{.{ .elementary = 0, .wire = 0, .len = 188 }} } };
+    var source = view.source("mapped", .{});
+    var payload = try source.read(0, 10);
+    defer payload.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 9, 0, 0, 0, 1, 10 }, payload.bytes);
+    try std.testing.expectEqual(@as(usize, 1), wire.reads);
 }

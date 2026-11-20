@@ -97,9 +97,13 @@ pub const Continuation = struct {
         return if (self.core) |core| self.epoch_start.? + core.cursor() else 0;
     }
     pub fn decodeSelected(self: *@This(), indexes: []const usize, context: *anyopaque, callback: h264.SelectionCallback) !h264.Statistics {
+        return self.decodeSelectedReader(self.session.reader, indexes, context, callback);
+    }
+    pub fn decodeSelectedReader(self: *@This(), reader: *media.mp4.Reader, indexes: []const usize, context: *anyopaque, callback: h264.SelectionCallback) !h264.Statistics {
         const registry = self.session;
-        if (indexes.len == 0 or indexes.len > registry.options.max_dependency_packets) return error.ResourceLimitExceeded;
-        for (indexes) |index| if (index >= registry.reader.packets.len or index < self.cursor()) return error.InvalidPacketIndex;
+        if (reader.packets.ptr != registry.reader.packets.ptr or reader.packets.len != registry.reader.packets.len) return error.InvalidPacketIndex;
+        if (indexes.len == 0 or indexes.len > registry.options.max_selection_slots) return error.ResourceLimitExceeded;
+        for (indexes) |index| if (index >= reader.packets.len or index < self.cursor()) return error.InvalidPacketIndex;
         errdefer self.deinit();
         const selected = try registry.backing.alloc(usize, indexes.len);
         defer registry.backing.free(selected);
@@ -113,11 +117,10 @@ pub const Continuation = struct {
             const epoch = try registry.epochAt(indexes[slots[begin]]);
             while (end < slots.len and indexes[slots[end]] < epoch.end) : (end += 1)
                 selected[end] = indexes[slots[end]] - epoch.start;
-            const count = end - begin;
-            if (count > registry.options.max_dependency_packets -| stats.decoded_packets) return error.ResourceLimitExceeded;
+            if (stats.decoded_packets >= registry.options.max_dependency_packets) return error.ResourceLimitExceeded;
             const entry = registry.entries.items[epoch.entry];
-            var view = registry.reader.*;
-            view.packets = registry.reader.packets[epoch.start..epoch.end];
+            var view = reader.*;
+            view.packets = reader.packets[epoch.start..epoch.end];
             view.track.avcc = entry.avcc;
             view.track.width = @intCast(entry.config.width);
             view.track.height = @intCast(entry.config.height);
@@ -638,7 +641,7 @@ pub const Session = struct {
         return borrowed.decodeSelected(indexes, context, callback);
     }
     pub fn decodeSelected(self: *Session, indexes: []const usize, context: *anyopaque, callback: h264.SelectionCallback) !h264.Statistics {
-        if (indexes.len == 0 or indexes.len > self.options.max_dependency_packets) return error.ResourceLimitExceeded;
+        if (indexes.len == 0 or indexes.len > self.options.max_selection_slots) return error.ResourceLimitExceeded;
         for (indexes) |index| if (index >= self.reader.packets.len) return error.InvalidPacketIndex;
         const allocator = self.budget.allocator();
         const selected = allocator.alloc(usize, indexes.len) catch |err| return if (err == error.OutOfMemory and self.budget.denied) error.ResourceLimitExceeded else err;
@@ -921,6 +924,7 @@ test "dynamic AVC continuation shares its packet budget across geometry epochs" 
     try std.testing.expectEqual(@as(usize, 1), seen);
     try std.testing.expect(continuation.core == null);
     registry.options.max_dependency_packets = 3;
-    const stats = try continuation.decodeSelected(&.{ 1, 2 }, &seen, Sink.accept);
+    const stats = try continuation.decodeSelected(&.{ 1, 2, 1, 2 }, &seen, Sink.accept);
     try std.testing.expectEqual(@as(usize, 3), stats.decoded_packets);
+    try std.testing.expectEqual(@as(usize, 5), seen);
 }

@@ -25,6 +25,8 @@ pub const Options = struct {
     seek_cache: ?*SeekCache = null,
     /// Software AVC profiles; the decoder still validates full picture syntax.
     portable_config: bool = false,
+    /// Metadata-only consumers do not need to pin complete IDR payloads.
+    headers_only: bool = false,
     /// Split adjacent IDR runs before exceeding a decoder's dependency bound.
     max_run_packets: usize = std.math.maxInt(usize),
     max_selections: usize = 64,
@@ -87,6 +89,7 @@ pub const SeekCache = struct {
     // A paged request borrows sorted verified IDRs and memoizes just its
     // recently searched intervals. Dense storage remains useful for cold scans.
     verified: []const usize = &.{},
+    complete: bool = false,
     recent: [32]struct { first: usize, last: usize, anchor: usize } = undefined,
     recent_count: usize = 0,
     next_slot: usize = 0,
@@ -98,6 +101,10 @@ pub const SeekCache = struct {
         if (self.nearest.len != 0) {
             const value = self.nearest[index];
             return if (value == std.math.maxInt(usize)) null else value;
+        }
+        if (self.complete) {
+            const after = std.sort.upperBound(usize, self.verified, index, usizeOrder);
+            return if (after == 0) 0 else self.verified[after - 1];
         }
         for (self.recent[0..self.recent_count]) |range| if (index >= range.first and index <= range.last) return range.anchor;
         return if (std.sort.binarySearch(usize, self.verified, index, usizeOrder) != null) index else null;
@@ -134,6 +141,48 @@ const Builder = struct {
     probe_candidates: usize = 0,
     probe_bytes: usize = 0,
     search_steps: usize = 0,
+    fn probe(self: *Builder, index: usize) !bool {
+        const packet = self.reader.packets[index];
+        const width = self.reader.track.nal_length_bytes;
+        if (!self.options.headers_only) {
+            if (packet.size > self.options.max_probe_bytes -| self.probe_bytes) return error.ResourceLimitExceeded;
+            var payload = try self.reader.readPacket(index);
+            defer payload.deinit();
+            self.probe_bytes += packet.size;
+            const idr = if (self.options.portable_config) try avc.isPortableIdr(payload.bytes, width) else try avc.isIdr(payload.bytes, width);
+            if (idr) {
+                try self.anchors.append(self.allocator, .{ .index = index, .payload = payload });
+                payload = .{ .source = null, .bytes = &.{} };
+            }
+            return idr;
+        }
+        if (packet.size == 0 or (width != 1 and width != 2 and width != 4)) return error.MalformedVideoPacket;
+        var cursor: usize = 0;
+        var nals: usize = 0;
+        var idr_start = false;
+        while (cursor < packet.size) {
+            const header_size = @as(usize, width) + 1;
+            if (packet.size - cursor < header_size) return error.MalformedVideoPacket;
+            const n = @min(header_size + 1, packet.size - cursor);
+            if (n > self.options.max_probe_bytes -| self.probe_bytes or nals == 4096) return error.ResourceLimitExceeded;
+            var prefix = try self.reader.input.read(try std.math.add(u64, packet.offset, cursor), n);
+            defer prefix.deinit();
+            self.probe_bytes += n;
+            nals += 1;
+            var size: usize = 0;
+            for (prefix.bytes[0..width]) |b| size = (size << 8) | b;
+            if (size == 0 or size > packet.size - cursor - width) return error.MalformedVideoPacket;
+            const kind = try avc.checkedNalType(prefix.bytes[width], self.options.portable_config);
+            if (kind >= 1 and kind <= 4) return false;
+            if (kind == 5) {
+                if (size == 1) return error.MalformedVideoPacket;
+                // first_mb_in_slice == 0 is the one-bit Exp-Golomb code 1.
+                idr_start = idr_start or prefix.bytes[header_size] & 0x80 != 0;
+            }
+            cursor += width + size;
+        }
+        return idr_start;
+    }
     fn start(self: *Builder, selected: usize) !usize {
         if (self.options.mode == .from_start) return 0;
         var index = selected;
@@ -157,17 +206,12 @@ const Builder = struct {
                 };
                 if (!rejected) {
                     const size = self.reader.packets[index].size;
-                    if (size > self.options.max_packet_bytes or self.probe_candidates >= self.options.max_probe_candidates or size > self.options.max_probe_bytes -| self.probe_bytes) return error.ResourceLimitExceeded;
+                    if (size > self.options.max_packet_bytes or self.probe_candidates >= self.options.max_probe_candidates) return error.ResourceLimitExceeded;
                     self.probe_candidates += 1;
-                    var lease = try self.reader.readPacket(index);
-                    errdefer lease.deinit();
-                    self.probe_bytes += size;
-                    if (try (if (self.options.portable_config) avc.isPortableIdr(lease.bytes, self.reader.track.nal_length_bytes) else avc.isIdr(lease.bytes, self.reader.track.nal_length_bytes))) {
-                        try self.anchors.append(self.allocator, .{ .index = index, .payload = lease });
+                    if (try self.probe(index)) {
                         if (self.options.seek_cache) |cache| cache.remember(index, selected, index);
                         return index;
                     }
-                    lease.deinit();
                     try self.rejected.append(self.allocator, index);
                 }
             }

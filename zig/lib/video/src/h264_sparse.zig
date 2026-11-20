@@ -39,7 +39,7 @@ pub fn decodeSelected(a: std.mem.Allocator, reader: *media.mp4.Reader, selected:
         unique[count] = index;
         count += 1;
     }
-    var plan = try planning.create(a, reader, unique[0..count], .{ .portable_config = true, .max_run_packets = options.decode.max_dependency_packets, .max_decode_packets = options.max_total_packets, .max_selections = options.max_selections });
+    var plan = try planning.create(a, reader, unique[0..count], .{ .portable_config = true, .headers_only = true, .max_packet_bytes = options.decode.max_packet_bytes, .max_run_packets = options.decode.max_dependency_packets, .max_decode_packets = options.max_total_packets, .max_selections = options.max_selections });
     defer plan.deinit();
     const indexes = try a.alloc(usize, selected.len);
     defer a.free(indexes);

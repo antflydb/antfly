@@ -33,6 +33,8 @@ pub const Options = struct {
     max_packet_bytes: usize = 16 * 1024 * 1024,
     max_decode_bytes: usize = 128 * 1024 * 1024,
     max_dependency_packets: usize = 256,
+    /// Presentation slots include repeats. Compressed packet work is bounded independently.
+    max_selection_slots: usize = 65_536,
     /// Lazy reconstruction slots for field pairs separated by other pictures.
     max_pending_pictures: usize = 16,
     /// Per reconstructed picture, including both standalone PAFF field packets.
@@ -1167,7 +1169,7 @@ pub const SelectionCallback = *const fn (*anyopaque, usize, *const Frame) anyerr
 pub fn decodeSelected(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: *anyopaque, callback: SelectionCallback) !Statistics {
     try reader.input.control.check();
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
-    if (indexes.len == 0 or indexes.len > options.max_dependency_packets) return error.ResourceLimitExceeded;
+    if (indexes.len == 0 or indexes.len > options.max_selection_slots) return error.ResourceLimitExceeded;
     for (indexes) |index| if (index >= reader.packets.len) {
         return error.InvalidPacketIndex;
     };
@@ -1184,7 +1186,7 @@ pub fn decodeSelected(allocator: std.mem.Allocator, reader: *media.mp4.Reader, i
     return .{ .decoded_packets = frame.decoded_packets, .payload_bytes = frame.payload_bytes, .decode_high_water = frame.decode_high_water };
 }
 pub fn decodeWithConfigurations(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: ?*anyopaque, callback: ?SelectionCallback, configurations: @import("h264_dynamic.zig").Context) !Frame {
-    if (indexes.len == 0 or indexes.len > options.max_dependency_packets) return error.ResourceLimitExceeded;
+    if (indexes.len == 0 or indexes.len > options.max_selection_slots) return error.ResourceLimitExceeded;
     for (indexes) |index| if (index >= reader.packets.len) return error.InvalidPacketIndex;
     var budget = @import("decode_budget.zig").Budget{ .backing = allocator, .limit = options.max_decode_bytes };
     return decodeBudget(&budget, reader, indexes, options, callback_context, callback, configurations) catch |err| return if (err == error.OutOfMemory and budget.denied) error.ResourceLimitExceeded else err;
@@ -1367,7 +1369,7 @@ pub const Incremental = struct {
     pub fn decodeSelectedWithConfigurations(self: *Incremental, reader: *media.mp4.Reader, indexes: []const usize, callback_context: *anyopaque, callback: SelectionCallback, configurations: ?@import("h264_dynamic.zig").Context) !Statistics {
         if (!self.valid) return error.UnsupportedIncrementalConfiguration;
         if (indexes.len == 0) return error.InvalidPacketIndex;
-        if (indexes.len > self.options.max_dependency_packets) return error.ResourceLimitExceeded;
+        if (indexes.len > self.options.max_selection_slots) return error.ResourceLimitExceeded;
         // Independent colour planes publish only after all three prediction
         // lanes complete. Preserve their combined span/slot envelope.
         if (self.cfg.?.separate_planes) {
@@ -1451,16 +1453,19 @@ pub const Incremental = struct {
         // A warm DPB is useful only while it is cheaper than an independently
         // verified restart. Never discard an unfinished field/partition pair.
         if (!self.hasPending() and (first > self.cursor() +| 32 or last - self.cursor() >= self.options.max_dependency_packets)) {
-            var restart = first;
+            const known = if (configurations) |epoch| epoch.progressiveRestart(first) else null;
+            var restart = known orelse first;
             var probes: usize = 0;
             while (restart > self.cursor() and probes < self.options.max_dependency_packets) : (restart -= 1) {
                 probes += 1;
-                if (!reader.packets[restart].sync and configurations == null) continue;
-                var lease = try reader.readPacket(restart);
-                defer lease.deinit();
-                if (lease.bytes.len > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
-                const probe_cfg = if (configurations) |epoch_context| try epoch_context.session.configAt(epoch_context.base + restart) else self.cfg.?;
-                if (!try isDependencyReset(self.budget.allocator(), probe_cfg, lease.bytes, reader.track.nal_length_bytes, reader.input)) continue;
+                if (known == null) {
+                    if (!reader.packets[restart].sync and configurations == null) continue;
+                    var lease = try reader.readPacket(restart);
+                    defer lease.deinit();
+                    if (lease.bytes.len > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
+                    const probe_cfg = if (configurations) |epoch_context| try epoch_context.session.configAt(epoch_context.base + restart) else self.cfg.?;
+                    if (!try isDependencyReset(self.budget.allocator(), probe_cfg, lease.bytes, reader.track.nal_length_bytes, reader.input)) continue;
+                }
                 // Apply a hysteresis of 32 packets to avoid resetting for tiny
                 // savings. Dependency-limit recovery takes priority over it.
                 if (restart - self.cursor() > 32 or last - self.cursor() >= self.options.max_dependency_packets) {

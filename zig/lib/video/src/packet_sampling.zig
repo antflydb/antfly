@@ -80,6 +80,15 @@ pub fn gemma4WebmPictures(index: @import("webm_pictures.zig").Index, control: me
     }
     const declared: ?i64 = if (index.duration_seconds) |seconds| @intFromFloat(seconds * std.time.ns_per_s) else null;
     const duration = std.math.cast(i64, bounds.end(declared) - bounds.first) orelse return error.TimestampOverflow;
+    if (duration == 0 and bounds.first == bounds.latest) {
+        // All visible outputs share one instant. Target zero is decidable
+        // without inventing a duration or frame rate.
+        var plan = Gemma4Plan{};
+        plan.packet_ids[0] = 0;
+        plan.timestamps_us[0] = 0;
+        plan.len = 1;
+        return plan;
+    }
     if (duration <= 0) return error.EmptyVideoWindow;
     return planPictures(std.time.ns_per_s, .{ .source_start = bounds.first, .source_duration = duration }, index.pictures, null, null, control);
 }
@@ -115,10 +124,17 @@ fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, sample
     const seconds = @divFloor(duration + scale - 1, scale);
     const count: usize = @intCast(@min(seconds, gemma4_max_frames));
     var best: [gemma4_max_frames]?usize = @splat(null);
+    var held: ?usize = null;
+    var held_pts: i64 = std.math.minInt(i64);
     for (pictures, 0..) |pic, id| {
         if (id % 256 == 0) try control.check();
         if (visible) |mask| if (!mask.isSet(id)) continue;
-        const pts = (try pictureTime(pic, samples)).pts;
+        const time = try pictureTime(pic, samples);
+        const pts = time.pts;
+        if (pts < origin and @as(i128, pts) + (time.duration orelse 0) > origin and (held == null or pts > held_pts or (pts == held_pts and packetId(pic, id) < packetId(pictures[held.?], held.?)))) {
+            held = id;
+            held_pts = pts;
+        }
         const tick = @as(i128, pts) - origin;
         if (tick < 0 or tick >= duration) continue;
         const second = @divFloor(tick, scale);
@@ -148,7 +164,12 @@ fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, sample
         plan.timestamps_us[plan.len] = try presentationUs((try pictureTime(pic, samples)).pts, origin, scale);
         plan.len += 1;
     };
-    if (plan.len == 0) return error.EmptyVideo;
+    if (plan.len == 0) {
+        const id = held orelse return error.EmptyVideo;
+        plan.packet_ids[0] = packetId(pictures[id], id);
+        plan.timestamps_us[0] = 0;
+        plan.len = 1;
+    }
     return plan;
 }
 
@@ -264,4 +285,15 @@ pub fn selectConfigured(a: std.mem.Allocator, reader: *const media.mp4.Reader, s
     const sampled = try sampling_mod.embeddingGemma2(a, .{ .total_frames = order.len, .fps = @as(f64, @floatFromInt(order.len)) / seconds, .duration_seconds = seconds }, .{});
     for (sampled) |*index| index.* = order[index.*];
     return sampled;
+}
+
+test "Gemma4 selects a solitary undated WebM output and a picture spanning the entire edit" {
+    var visible = [_]@import("webm_pictures.zig").Picture{.{ .pts = 123, .duration = null, .width = 16, .height = 16 }};
+    var single = try gemma4WebmPictures(.{ .allocator = std.testing.allocator, .pictures = &visible }, .{});
+    try std.testing.expectEqualSlices(usize, &.{0}, single.ids());
+    try std.testing.expectEqualSlices(i64, &.{0}, single.timestamps());
+    visible[0].duration = 100;
+    var held = try planPictures(10, .{ .source_start = 130, .source_duration = 20 }, &visible, null, null, .{});
+    try std.testing.expectEqualSlices(usize, &.{0}, held.ids());
+    try std.testing.expectEqualSlices(i64, &.{0}, held.timestamps());
 }

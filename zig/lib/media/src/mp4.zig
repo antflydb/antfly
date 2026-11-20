@@ -307,7 +307,7 @@ pub fn probeSampleClock(bytes: []const u8, limits: Limits, control: source.Contr
         const offset = if (t.ctts.len == 0) 0 else try composition.next();
         const pts = try edit.present(try std.math.add(i64, dts, offset));
         dts = try std.math.add(i64, dts, duration);
-        result.include(pts);
+        result.includeInterval(pts, @intCast(duration));
     }
     try durations.finish();
     try composition.finish();
@@ -1006,7 +1006,7 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
                     const pts = try std.math.add(i64, dts, composition);
                     if (composition < 0) track.decode_preroll_ticks = @max(track.decode_preroll_ticks, std.math.cast(u32, -composition) orelse return error.TimestampOverflow);
                     const presented = try track.edit.present(pts);
-                    if (clock) |out| out.include(presented) else packets.appendAssumeCapacity(.{ .offset = offset, .size = size, .dts = dts, .media_dts = dts, .media_pts = pts, .pts = presented, .duration = duration, .sync = sample_flags & 0x10000 == 0 });
+                    if (clock) |out| out.includeInterval(presented, duration) else packets.appendAssumeCapacity(.{ .offset = offset, .size = size, .dts = dts, .media_dts = dts, .media_pts = pts, .pts = presented, .duration = duration, .sync = sample_flags & 0x10000 == 0 });
                     dts = try std.math.add(i64, dts, duration);
                     previous_end = dts;
                     offset = end;

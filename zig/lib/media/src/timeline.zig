@@ -39,6 +39,11 @@ pub const SampleClock = struct {
     first: i64 = std.math.maxInt(i64),
     last: i64 = std.math.minInt(i64),
 
+    pub fn includeInterval(self: *SampleClock, pts: i64, duration: u64) void {
+        if (self.edit.source_duration != null and pts < self.edit.source_start and @as(i128, pts) + duration > self.edit.source_start) {
+            self.include(self.edit.source_start);
+        } else self.include(pts);
+    }
     pub fn include(self: *SampleClock, pts: i64) void {
         if (self.edit.source_duration) |duration| {
             const relative = @as(i128, pts) - self.edit.source_start;
