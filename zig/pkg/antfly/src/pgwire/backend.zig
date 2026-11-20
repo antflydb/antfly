@@ -105,10 +105,15 @@ pub const Diagnostic = struct {
 
 pub const MutationOutcome = enum { committed, committed_pending, committed_repair_required, committed_graph_metric_materialization_rejected };
 
-pub const DescriptionStamp = struct {
+pub const CatalogStamp = struct {
     catalog_revision: u64,
     relation_epoch: @import("antfly_local_sources").system_catalog_relation_reconciliation.Epoch,
-    authority: [32]u8,
+};
+
+pub const DescriptionStamp = struct {
+    /// Null when the binder consulted no catalog objects.
+    catalog: ?CatalogStamp = null,
+    authority: u64,
 };
 
 pub const Description = struct {

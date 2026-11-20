@@ -283,6 +283,10 @@ fn pendingReceipt(alloc: std.mem.Allocator, target: domain.Target, source_id: u6
 }
 
 pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.CatalogDdl) !catalog.DdlOutcome {
+    return executeBound(server, identity, context, database, namespace, alloc, ddl, null);
+}
+
+pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.CatalogDdl, expected: ?@import("sql_ddl_binding.zig").Guard) !catalog.DdlOutcome {
     try context.ensureActive();
     if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
     if (ddl.truncate_tables.len == 0 or ddl.truncate_tables.len > 128) return error.InvalidSqlSyntax;
@@ -303,6 +307,9 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     }
     const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets } }), .{});
     if (resolved.tables.len != targets.len) return error.InvalidSqlBackendResponse;
+    if (expected) |guard| for (resolved.tables, 0..) |table, i| {
+        if (try guard.id(targets.len, i) != (if (table) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
+    };
     const logical_state = try std.json.parseFromSliceLeaky(domain.State, a, try server.source.systemCatalog(a, context, .snapshot), .{});
     var logical_index = try domain.StateIndex.init(a, logical_state);
     defer logical_index.deinit(a);

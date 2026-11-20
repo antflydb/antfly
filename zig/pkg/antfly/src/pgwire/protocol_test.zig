@@ -229,7 +229,7 @@ const Mock = struct {
         try req.check();
         self.probes += 1;
         if (self.probe_change_at == self.probes) self.catalog_revision += 1;
-        return desc.stamp.?.catalog_revision == self.catalog_revision;
+        return desc.stamp.?.catalog.?.catalog_revision == self.catalog_revision;
     }
 
     fn describe(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Description {
@@ -237,7 +237,7 @@ const Mock = struct {
         self.describes += 1;
         try request.check();
         if (self.probe_change_at != null) return .{
-            .stamp = .{ .catalog_revision = self.catalog_revision, .relation_epoch = .{ .incarnation = @splat(if (self.replace_incarnation) @intCast(self.catalog_revision) else 1), .revision = self.catalog_revision }, .authority = @splat(0) },
+            .stamp = .{ .catalog = .{ .catalog_revision = self.catalog_revision, .relation_epoch = .{ .incarnation = @splat(if (self.replace_incarnation) @intCast(self.catalog_revision) else 1), .revision = self.catalog_revision } }, .authority = 1 },
             .binding_guard = if (self.replace_incarnation or self.catalog_revision == 1) "original table" else "replacement table",
             .columns = &.{},
         };

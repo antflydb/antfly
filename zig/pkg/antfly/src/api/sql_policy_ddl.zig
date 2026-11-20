@@ -56,6 +56,10 @@ fn commandScope(command: @FieldType(ast.PolicyDdl, "command")) policies.CommandS
 }
 
 pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.PolicyDdl) !catalog.DdlOutcome {
+    return executeBound(server, identity, context, database, namespace, alloc, ddl, null);
+}
+
+pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.PolicyDdl, expected_id: ?u64) !catalog.DdlOutcome {
     try context.ensureActive();
     const target: domain.Target = .{ .database = ddl.table.database orelse database, .namespace = ddl.table.namespace orelse namespace, .table = ddl.table.table };
     try target.validate();
@@ -67,7 +71,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     // Publication is a separate topology-fenced operation; never turn a
     // definition mutation into a serving-generation switch implicitly.
     if (ddl.action == .enable or ddl.action == .disable) {
-        try server.beginRowPolicyPublication(alloc, context, target, ddl.action == .enable);
+        try server.beginRowPolicyPublication(alloc, context, target, ddl.action == .enable, expected_id);
         return .{ .mutation_outcome = .committed_pending };
     }
 
@@ -79,6 +83,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const resolved_bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true, .expected_revision = state.revision } });
     const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, resolved_bytes, .{ .allocate = .alloc_always });
     if (resolved.revision != state.revision or resolved.tables.len != 1) return error.CatalogGenerationChanged;
+    if (expected_id) |id| if (id != (if (resolved.tables[0]) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
     const physical = resolved.tables[0] orelse return error.TableNotFound;
     const definition = physical.query_definition orelse return error.InvalidSqlBackendResponse;
     if (definition.table_id != physical.table_id) return error.InvalidSqlBackendResponse;

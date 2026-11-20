@@ -126,7 +126,9 @@ const std = @import("std");
 /// Version 93 separates immutable restore inputs from mutable checkpoints.
 /// Version 94 retains distributed restore admission ownership on ranges.
 pub const pinned_restore_job_version: u16 = 94;
-pub const current_version: u16 = pinned_restore_job_version;
+/// Catalog apply checks the physical identity captured by pgwire Bind.
+pub const bound_ddl_version: u16 = 95;
+pub const current_version: u16 = bound_ddl_version;
 
 pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
     const empty: [32]u8 = @splat(0);

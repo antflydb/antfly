@@ -172,6 +172,7 @@ pub const Adapter = struct {
     database: []const u8 = "default",
     namespace: []const u8 = "public",
     /// Borrowed from the pinned connection request, never retained by a plan.
+    ddl_guard: ?@import("sql_ddl_binding.zig").Guard = null,
     ddl_search_path: ?*const @import("../pgwire/search_path.zig").Path = null,
     decision_provider: ?@import("antfly_local_sources").functions_decisions.DecisionProvider = null,
     /// Pgwire retains the original durable owner scope independently of its
@@ -706,7 +707,7 @@ pub const Adapter = struct {
 
     fn ddl(ptr: *anyopaque, allocators: catalog.DdlAllocators, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
-        return @import("sql_catalog.zig").executeWithAllocators(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, input, self.ddl_search_path);
+        return @import("sql_catalog.zig").executeBound(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, input, self.ddl_search_path, self.ddl_guard);
     }
 
     fn checkpoint(ptr: *anyopaque) !void {
@@ -747,6 +748,9 @@ pub const Adapter = struct {
         if (!try http_server.resourcePermissionCurrentlyAllowed(self.identity.*, .graph, definition.name.table, .read)) return error.Forbidden;
         const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .read = .{ .kind = .graph, .name = definition.name.table } });
         const state = try std.json.parseFromSliceLeaky(system_catalog.State, alloc, bytes, .{ .allocate = .alloc_always });
+        // Resolve the label tables at the same logical cut as the mapping.
+        if (self.revision) |revision| if (revision != state.revision) return error.CatalogGenerationChanged;
+        self.revision = state.revision;
         const record = state.find(.graph, 0, definition.name.table) orelse return error.CatalogNotFound;
         const cypher = @import("cypher");
         var graph = try system_catalog.graphForExecution(alloc, record);
@@ -807,6 +811,7 @@ pub const Adapter = struct {
         if (!self.server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
         const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = targets, .include_query_definitions = true, .expected_revision = self.revision } });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
+        if (self.revision) |revision| if (revision != snapshot.revision) return error.CatalogGenerationChanged;
         if (snapshot.tables.len != targets.len) return error.InvalidSqlBackendResponse;
         const bindings = try alloc.alloc(catalog.Table, targets.len);
         for (targets, snapshot.tables, bindings) |target, resolved, *binding| binding.* = try self.bindResolved(alloc, target, resolved, snapshot.revision, action);

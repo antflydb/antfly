@@ -325,14 +325,16 @@ pub const Mutation = struct {
     location_json: []const u8 = "null",
     source_json: []const u8 = "null",
     expected_graph_revision: ?u64 = null,
+    /// Bound destructive SQL DDL. Zero attests absence for IF EXISTS.
+    expected_resource_id: ?u64 = null,
     /// Populated only by native table admission, never accepted from public JSON.
     table_id: u64 = 0,
     storage_name: []const u8 = "",
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "expected_graph_revision")) {
-                if (self.expected_graph_revision) |revision| {
+            if (comptime std.mem.eql(u8, name, "expected_graph_revision") or std.mem.eql(u8, name, "expected_resource_id")) {
+                if (@field(self, name)) |revision| {
                     try jw.objectField(name);
                     try jw.write(revision);
                 }
@@ -874,6 +876,10 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
         if (try reader.physicalByName(request.name)) |table| if (try reader.byId(.table, table.id) == null) {
             found = .{ .kind = .table, .id = table.id, .parent_id = default_namespace_id, .name = table.name, .storage_name = table.name };
         };
+    }
+    if (request.expected_resource_id) |expected| {
+        if (request.action == .create) return error.InvalidCatalogMutation;
+        if ((if (found) |resource| resource.id else 0) != expected) return error.CatalogGenerationChanged;
     }
     var upserts = std.ArrayListUnmanaged(Resource).empty;
     defer upserts.deinit(alloc);

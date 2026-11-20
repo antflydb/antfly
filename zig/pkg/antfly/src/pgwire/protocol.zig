@@ -491,8 +491,8 @@ pub const Session = struct {
         if (try self.descriptionCurrent(alloc, portal.statement, bound)) return;
         const current = try self.rebindCached(alloc, portal.statement, bound);
         if (bound.binding_guard) |before| {
-            if (bound.stamp) |previous| {
-                const stamp = current.stamp orelse return error.CatalogGenerationChanged;
+            if (if (bound.stamp) |s| s.catalog else null) |previous| {
+                const stamp = (current.stamp orelse return error.CatalogGenerationChanged).catalog orelse return error.CatalogGenerationChanged;
                 if (!std.mem.eql(u8, &previous.relation_epoch.incarnation, &stamp.relation_epoch.incarnation))
                     return error.CatalogGenerationChanged;
             }

@@ -3648,6 +3648,16 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command: metadata_storage.TransitionCommand) std.mem.Allocator.Error!u16 {
     var required = (try transitionBaseDecoderVersion(a, command));
     switch (command) {
+        .apply_system_catalog => |bytes| {
+            const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind, expected_resource_id: ?u64 = null } };
+            var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return metadata_topology_protocol.current_version,
+            };
+            defer parsed.deinit();
+            if (parsed.value.mutation.expected_resource_id != null) required = @max(required, metadata_topology_protocol.bound_ddl_version);
+            if (parsed.value.mutation.kind == .graph) required = @max(required, metadata_topology_protocol.graph_definition_version);
+        },
         .register_store, .upsert_store, .upsert_store_heartbeat => |record| {
             if (record.artifact_sources_protocol_version >= 4) {
                 required = @max(required, metadata_topology_protocol.index_alias_lifecycle_version);
@@ -3733,15 +3743,6 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
         else => {},
     }
     if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
-    if (command == .apply_system_catalog) {
-        const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind } };
-        var parsed = std.json.parseFromSlice(Header, a, command.apply_system_catalog, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return metadata_topology_protocol.current_version,
-        };
-        defer parsed.deinit();
-        if (parsed.value.mutation.kind == .graph) return metadata_topology_protocol.graph_definition_version;
-    }
     if (command == .apply_resolver_authority or command == .advance_resolver_namespace) return metadata_topology_protocol.resolver_records_version;
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
         return metadata_topology_protocol.relation_mutation_version;

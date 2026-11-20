@@ -6540,7 +6540,7 @@ pub const ApiHttpServer = struct {
     /// SQL has already checked table-admin authorization. Metadata resolves
     /// schema and owner descriptors again under a leader read-index and
     /// rechecks them at Raft apply; this API supplies only a logical target.
-    pub fn beginRowPolicyPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, target: @import("antfly_local_sources").system_catalog_domain.Target, enable: bool) !void {
+    pub fn beginRowPolicyPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, target: @import("antfly_local_sources").system_catalog_domain.Target, enable: bool, expected_id: ?u64) !void {
         try context.ensureActive();
         try target.validate();
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -6550,6 +6550,7 @@ pub const ApiHttpServer = struct {
         const resolved_bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target} } });
         const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, resolved_bytes, .{ .allocate = .alloc_always });
         if (resolved.tables.len != 1) return error.InvalidSqlBackendResponse;
+        if (expected_id) |id| if (id != (if (resolved.tables[0]) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
         const physical = resolved.tables[0] orelse return error.TableNotFound;
         var internal_context = context;
         internal_context.setting_admin = true;

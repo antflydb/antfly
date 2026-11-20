@@ -121,11 +121,19 @@ proxy's login into an unbounded, cached grant or retry a canceled mutation.
   without replaying a statement or mutation. A statement can be closed
   independently of its portals. Opaque backend continuation tokens are rejected.
 - New bindings use the current ordered search path. A bound portal retains its
-  namespace, path and physical relation identities through Execute. Unchanged
-  catalog and authority generations reuse the last validated description.
-  Rebinding checks the parameter types, result types and field names. A replaced
-  table rejects an already bound portal with `40001`. Compatible DDL, including
-  an added unselected column or index, transparently refreshes the catalog guard. Changed result types fail with `0A000` and PostgreSQL's
+  namespace, path and physical relation identities through Execute. Graph scans
+  also pin the graph definition revision and label tables. Destructive DDL
+  checks its bound targets again during mutation admission. A bound
+  `DROP TABLE IF EXISTS` cannot remove a table created after Bind observed
+  its absence. Clustered catalog mutations carrying a bound resource ID
+  require metadata topology protocol 95.
+- Warm Describe reuses the validated shape while its catalog and authorization
+  generations match. Descriptions that consulted no catalog objects, such as
+  `SELECT 1`, need only the credential check. Rebinding checks parameter
+  types, result types and field names. Table replacement or graph remapping
+  rejects an already bound portal with `40001`. Compatible changes, including
+  an added unselected column, refresh the guard. Changed result types fail
+  with `0A000` and PostgreSQL's
   `cached plan must not change result type` message before reading or mutation
   admission. Rebinding also refreshes the settings epoch; execution validates
   that fresh epoch to fence concurrent setting catalog changes.

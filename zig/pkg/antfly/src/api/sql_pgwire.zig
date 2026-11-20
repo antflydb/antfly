@@ -154,11 +154,13 @@ pub const Adapter = struct {
     fn descriptionCurrent(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request, description: wire.Description) !bool {
         const self: *Adapter = @ptrCast(@alignCast(raw));
         const credential: *Credential = @ptrCast(@alignCast(identity.context));
-        var authenticated: ?http.AuthenticatedIdentity = try credential.identity(self.server.alloc);
-        defer authenticated.?.deinit(self.server.alloc);
-        var authority: Authority = .{ .credential = credential, .identity = &authenticated, .request = request };
-        const stamp = try descriptionStamp(self.server, alloc, try authority.context(), authenticated.?) orelse return false;
-        return std.meta.eql(description.stamp.?, stamp);
+        try validateRequest(request);
+        if (self.server.cfg.user_manager != credential.manager) return error.Unauthorized;
+        const stamp = description.stamp orelse return false;
+        if (stamp.authority != try credential.descriptionRevision()) return false;
+        const previous = stamp.catalog orelse return true;
+        const current = try catalogStamp(self.server, alloc, credential, request) orelse return false;
+        return std.meta.eql(previous, current);
     }
 
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
@@ -269,6 +271,7 @@ pub const Adapter = struct {
         if (!std.mem.eql(u8, current.principal, next.principal) or !std.mem.eql(u8, current.username, next.username)) return error.Unauthorized;
         std.mem.swap(?http.AuthenticatedIdentity, &current.trusted_identity, &next.trusted_identity);
         std.mem.swap(?[]u8, &current.trusted_issuer, &next.trusted_issuer);
+        current.trusted_revision += 1;
         current.verifier_mac = next.verifier_mac;
         current.trusted_expires = next.trusted_expires;
     }
@@ -766,6 +769,7 @@ const Credential = struct {
     trusted_identity: ?http.AuthenticatedIdentity = null,
     trusted_issuer: ?[]u8 = null,
     trusted_expires: i64 = 0,
+    trusted_revision: u64 = 1,
     session_cleanup_complete: bool = true,
 
     fn sessionPrincipal(self: *const Credential) []const u8 {
@@ -840,6 +844,14 @@ const Credential = struct {
         }
         const current = self.manager.?.destinationGrantMac(self.principal, credential_domain) catch return error.Unauthorized;
         if (!std.crypto.timing_safe.eql([Mac.mac_length]u8, current, self.verifier_mac)) return error.Unauthorized;
+    }
+
+    fn descriptionRevision(self: *Credential) !u64 {
+        if (self.trusted_identity != null) {
+            try self.validate();
+            return self.trusted_revision;
+        }
+        return self.manager.?.authorization_revision.load(.acquire);
     }
 
     fn release(raw: *anyopaque, alloc: std.mem.Allocator) void {
@@ -953,6 +965,9 @@ const Job = struct {
         var admission = try server.acquireSqlExecution(write);
         defer admission.release();
         preparation.release();
+        // Sample before loading grants so a concurrent revocation can only
+        // cause a cache miss, never attest a descriptor built under old grants.
+        const authority_revision = if (self.kind == .describe) try self.credential.descriptionRevision() else 0;
         var identity: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
         defer identity.?.deinit(server.alloc);
         var authority = Authority{ .credential = self.credential, .identity = &identity, .request = self.request };
@@ -996,27 +1011,35 @@ const Job = struct {
                 .unknown => null,
                 inline else => |tag| @field(ast.ColumnType, @tagName(tag)),
             };
-            // Sample before binding: a concurrent change makes the next probe
-            // miss. Query execution still verifies its exact admission guards.
-            const stamp = try descriptionStamp(server, self.alloc, context, identity.?);
+            var probe: DescriptionProbe = .{ .server = server, .credential = self.credential, .request = self.request };
+            guarded.probe = &probe;
             var describe_backend = guarded.backend();
             describe_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
             if (compiled.uses_current_setting) describe_backend.setting_capture = native_adapter.settingCapture();
             var description = try describe_sql.describe(self.request.scratch_allocator orelse self.alloc, describe_backend, compiled, hints);
             defer description.deinit();
+            const ddl_catalog = @import("sql_catalog.zig");
+            const guard = if (ddl_catalog.bindsExisting(compiled.statement)) blk: {
+                try probe.sample(self.alloc);
+                const bound = try ddl_catalog.describeGuard(server, identity, context, native_adapter.database, native_adapter.namespace, self.alloc, compiled.statement, native_adapter.ddl_search_path);
+                break :blk bound.bytes;
+            } else try statementBindingGuard(self.alloc, native_adapter.revision, description.binding);
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
             for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
             for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             self.description = .{
-                .stamp = stamp,
+                .stamp = if (compiled.uses_current_setting or (probe.sampled and probe.catalog == null)) null else .{ .catalog = probe.catalog, .authority = authority_revision },
                 .columns = columns,
                 .parameter_types = parameter_types,
                 .parameter_descriptors = try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors),
-                .binding_guard = try statementBindingGuard(self.alloc, native_adapter.revision, description.binding),
+                .binding_guard = guard,
                 .setting_epoch = if (description.settings) |view| view.epoch else null,
             };
             return;
+        }
+        if (@import("sql_catalog.zig").bindsExisting(compiled.statement)) {
+            if (self.request.binding_guard) |bytes| native_adapter.ddl_guard = try @import("sql_ddl_binding.zig").Guard.decode(bytes);
         }
         const parameters = if (self.request.parameter_cells != null) self.request.parameters else try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
         var execution_backend = guarded.backend();
@@ -1247,6 +1270,18 @@ fn releaseResult(raw: *anyopaque) void {
     result.deinit();
 }
 
+fn requestContext(credential: *const Credential, request: *const wire.Request) operation.RequestContext {
+    const deadline = std.math.cast(u64, request.deadline.raw.nanoseconds);
+    return .{
+        .deadline_ns = deadline,
+        .deadline_io = if (deadline != null) io_abi.Borrow.init(&request.io) else null,
+        .fanout_io = io_abi.Borrow.init(&request.io),
+        .cancellation = operation.CancellationToken.fromAtomic(request.cancel_requested),
+        .principal = .{ .kind = .user, .subject = credential.username },
+        .destination_authorization_principal = credential.principal,
+    };
+}
+
 const Authority = struct {
     credential: *Credential,
     identity: *?http.AuthenticatedIdentity,
@@ -1263,22 +1298,11 @@ const Authority = struct {
         // which carry native absolute deadlines rather than an Io clock borrow.
         // Unrepresentable positive deadlines are effectively unbounded; check()
         // above still rejects expired requests and explicit cancellation.
-        const deadline = std.math.cast(u64, self.request.deadline.raw.nanoseconds);
-        const native_context: operation.RequestContext = .{
-            .sql_completion = if (self.request.completion != null) .{ .ptr = self, .prepare_transaction = prepareTransaction, .prepare_metadata = prepareMetadata, .reject_metadata = rejectMetadata } else null,
-            .deadline_ns = deadline,
-            .deadline_io = if (deadline != null) io_abi.Borrow.init(&self.request.io) else null,
-            .fanout_io = io_abi.Borrow.init(&self.request.io),
-            .cancellation = operation.CancellationToken.fromAtomic(self.request.cancel_requested),
-            .principal = .{ .kind = .user, .subject = self.identity.*.?.username },
-            .destination_authorization_principal = self.credential.principal,
-            // The authenticated, credential-fenced identity is borrowed for
-            // this statement only; owner write proofs are minted before the
-            // durable transaction plan is sealed.
-            .row_policy_credential = self.identity,
-            .table_write_authorization = .{ .ptr = self, .allows = allowsWrite },
-        };
-        return native_context.platformDeadline();
+        var native_context = requestContext(self.credential, &self.request);
+        native_context.sql_completion = if (self.request.completion != null) .{ .ptr = self, .prepare_transaction = prepareTransaction, .prepare_metadata = prepareMetadata, .reject_metadata = rejectMetadata } else null;
+        native_context.row_policy_credential = self.identity;
+        native_context.table_write_authorization = .{ .ptr = self, .allows = allowsWrite };
+        return native_context.platformDeadline() catch |err| return requestError(self.request, err);
     }
 
     fn prepareTransaction(raw: *anyopaque, id: [16]u8) !void {
@@ -1305,6 +1329,7 @@ const GuardedCatalog = struct {
     authority: *Authority,
     revision: *const ?u64,
     expected_guard: ?[]const u8,
+    probe: ?*DescriptionProbe = null,
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
@@ -1314,9 +1339,13 @@ const GuardedCatalog = struct {
     fn resolveGraph(raw: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
+        if (self.probe) |probe| try probe.sample(alloc);
         const resolve_graph = self.native.vtable.resolve_graph orelse return error.UnsupportedSqlExecution;
         const table = try resolve_graph(self.native.ptr, alloc, definition);
         if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
+        if (self.expected_guard) |guard| for (table.graph.?.dependencies) |dependency| {
+            try verifyBindingGuard(guard, self.revision.*.?, dependency);
+        };
         try self.checkTableRead(table);
         return table;
     }
@@ -1373,6 +1402,7 @@ const GuardedCatalog = struct {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
         try self.authority.credential.validate();
+        if (self.probe) |probe| try probe.sample(alloc);
         const table = try resolveOnPath(self.native, alloc, name, action, if (self.authority.request.search_path) |*path| path else null);
         if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
         return table;
@@ -1608,29 +1638,44 @@ const GuardedCatalog = struct {
     }
 };
 
-fn descriptionStamp(server: *http.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, identity: http.AuthenticatedIdentity) !?wire.DescriptionStamp {
+const DescriptionProbe = struct {
+    server: *http.ApiHttpServer,
+    credential: *Credential,
+    request: wire.Request,
+    sampled: bool = false,
+    catalog: ?wire.CatalogStamp = null,
+
+    fn sample(self: *@This(), alloc: std.mem.Allocator) !void {
+        if (self.sampled) return;
+        self.sampled = true;
+        self.catalog = try catalogStamp(self.server, alloc, self.credential, self.request);
+    }
+};
+
+fn requestError(request: wire.Request, err: anyerror) anyerror {
+    request.check() catch |canceled| return canceled;
+    return if (err == error.DeadlineExceeded) error.QueryCanceled else err;
+}
+
+fn catalogStamp(server: *http.ApiHttpServer, alloc: std.mem.Allocator, credential: *Credential, request: wire.Request) !?wire.CatalogStamp {
     const domain = @import("antfly_local_sources").system_catalog_domain;
-    // Optional optimization: older metadata peers can reject the added field,
-    // and stores without relation tracking cannot attest the physical cut.
-    const bytes = server.source.systemCatalog(alloc, context, .{ .resolve_many = .{ .include_source_epoch = true } }) catch {
-        try context.ensureActive();
-        return null;
+    const context = requestContext(credential, &request).platformDeadline() catch |err| return requestError(request, err);
+    const bytes = server.source.systemCatalog(alloc, context, .{ .resolve_many = .{ .include_source_epoch = true } }) catch |err| {
+        // Preserve executor shutdown, translate client cancellation and timeout
+        // to the recoverable pgwire statement error, and allow older peers.
+        return switch (requestError(request, err)) {
+            error.QueryCanceled => error.QueryCanceled,
+            error.Canceled => error.Canceled,
+            else => null,
+        };
     };
     defer alloc.free(bytes);
+    try request.check();
     var reply = try std.json.parseFromSlice(domain.ResolvedMany, alloc, bytes, .{ .ignore_unknown_fields = true });
     defer reply.deinit();
     const epoch = reply.value.source_epoch orelse return null;
     if (epoch.revision == 0 or std.mem.allEqual(u8, &epoch.incarnation, 0)) return null;
-    var buffer: [512]u8 = undefined;
-    var hash: std.Io.Writer.Hashing(std.crypto.hash.Blake3) = .init(&buffer);
-    std.json.Stringify.value(.{
-        identity.username,    identity.user_instance_id, identity.credential_principal, identity.is_internal_service,
-        identity.permissions, identity.roles,            identity.row_filter,           identity.metadata_json,
-    }, .{}, &hash.writer) catch unreachable;
-    hash.writer.flush() catch unreachable;
-    var digest: [32]u8 = undefined;
-    hash.hasher.final(&digest);
-    return .{ .catalog_revision = reply.value.revision, .relation_epoch = epoch, .authority = digest };
+    return .{ .catalog_revision = reply.value.revision, .relation_epoch = epoch };
 }
 
 fn statementBindingGuard(alloc: std.mem.Allocator, revision: ?u64, binding: describe_sql.BoundStatement) !?[]const u8 {
@@ -1642,12 +1687,22 @@ fn statementBindingGuard(alloc: std.mem.Allocator, revision: ?u64, binding: desc
 }
 
 fn collectBindingTable(table: catalog.Table, scans: *[64]catalog.StatementScan, count: *usize) !void {
+    // Lowered joins, CTEs and set operations bind their output through a
+    // virtual table. Only their underlying physical scans have catalog IDs.
+    if (table.id == 0) return;
     for (scans[0..count.*]) |scan| {
-        if (scan.table.id == table.id and scan.table.schema_version == table.schema_version and std.mem.eql(u8, scan.table.physical_name, table.physical_name)) return;
+        if (graphRevision(scan.table) == graphRevision(table) and scan.table.id == table.id and scan.table.schema_version == table.schema_version and std.mem.eql(u8, scan.table.physical_name, table.physical_name)) return;
     }
     if (count.* == scans.len) return error.SqlProgramLimitExceeded;
     scans[count.*] = .{ .table = table, .request = .{ .fields = &.{}, .limit = 1 } };
     count.* += 1;
+    if (table.graph) |binding| for (binding.dependencies) |dependency| {
+        try collectBindingTable(dependency, scans, count);
+    };
+}
+
+fn graphRevision(table: catalog.Table) u64 {
+    return if (table.graph) |binding| binding.graph.revision else 0;
 }
 
 fn collectBindingTables(binding: describe_sql.BoundStatement, scans: *[64]catalog.StatementScan, count: *usize, depth: usize) anyerror!void {
@@ -1673,7 +1728,7 @@ fn bindingGuard(alloc: std.mem.Allocator, revision: u64, table: catalog.Table) !
 fn bindingGuards(alloc: std.mem.Allocator, revision: u64, scans: []const catalog.StatementScan) ![]const u8 {
     if (scans.len == 0 or scans.len > 64) return error.SqlProgramLimitExceeded;
     var length: usize = 10;
-    for (scans) |scan| length = try std.math.add(usize, length, 16 + scan.table.physical_name.len);
+    for (scans) |scan| length = try std.math.add(usize, length, 24 + scan.table.physical_name.len);
     const bytes = try alloc.alloc(u8, length);
     std.mem.writeInt(u64, bytes[0..8], revision, .little);
     std.mem.writeInt(u16, bytes[8..10], @intCast(scans.len), .little);
@@ -1683,8 +1738,9 @@ fn bindingGuards(alloc: std.mem.Allocator, revision: u64, scans: []const catalog
         std.mem.writeInt(u32, entry[0..4], @intCast(scan.table.physical_name.len), .little);
         std.mem.writeInt(u64, entry[4..12], scan.table.id, .little);
         std.mem.writeInt(u32, entry[12..16], scan.table.schema_version, .little);
-        @memcpy(entry[16..][0..scan.table.physical_name.len], scan.table.physical_name);
-        offset += 16 + scan.table.physical_name.len;
+        std.mem.writeInt(u64, entry[16..24], graphRevision(scan.table), .little);
+        @memcpy(entry[24..][0..scan.table.physical_name.len], scan.table.physical_name);
+        offset += 24 + scan.table.physical_name.len;
     }
     return bytes;
 }
@@ -1692,7 +1748,7 @@ fn bindingGuards(alloc: std.mem.Allocator, revision: u64, scans: []const catalog
 const GuardTargets = struct {
     rest: []const u8,
     count: u16,
-    const Target = struct { id: u64, version: u32, name: []const u8 };
+    const Target = struct { id: u64, version: u32, graph_revision: u64, name: []const u8 };
 
     fn init(guard: []const u8) !GuardTargets {
         if (guard.len < 10) return error.CatalogGenerationChanged;
@@ -1706,22 +1762,23 @@ const GuardTargets = struct {
             return null;
         }
         const entry = self.rest;
-        if (entry.len < 16) return error.CatalogGenerationChanged;
+        if (entry.len < 24) return error.CatalogGenerationChanged;
         const len = std.mem.readInt(u32, entry[0..4], .little);
-        if (len > entry.len - 16) return error.CatalogGenerationChanged;
-        self.rest = entry[16 + len ..];
+        if (len > entry.len - 24) return error.CatalogGenerationChanged;
+        self.rest = entry[24 + len ..];
         self.count -= 1;
-        return .{ .id = std.mem.readInt(u64, entry[4..12], .little), .version = std.mem.readInt(u32, entry[12..16], .little), .name = entry[16..][0..len] };
+        return .{ .id = std.mem.readInt(u64, entry[4..12], .little), .version = std.mem.readInt(u32, entry[12..16], .little), .graph_revision = std.mem.readInt(u64, entry[16..24], .little), .name = entry[24..][0..len] };
     }
 };
 
 fn sameBindingTargets(before: []const u8, after: []const u8) bool {
+    if (@import("sql_ddl_binding.zig").Guard.isDdl(before)) return std.mem.eql(u8, before, after);
     var left = GuardTargets.init(before) catch return false;
     var right = GuardTargets.init(after) catch return false;
     if (left.count != right.count) return false;
     while (left.next() catch return false) |x| {
         const y = (right.next() catch return false) orelse return false;
-        if (x.id != y.id or !std.mem.eql(u8, x.name, y.name)) return false;
+        if (x.id != y.id or x.graph_revision != y.graph_revision or !std.mem.eql(u8, x.name, y.name)) return false;
     }
     return right.rest.len == 0;
 }
@@ -1731,8 +1788,8 @@ fn verifyBindingGuard(guard: []const u8, revision: u64, table: catalog.Table) !v
     if (std.mem.readInt(u64, guard[0..8], .little) != revision) return error.CatalogGenerationChanged;
     var found = false;
     while (try targets.next()) |target| {
-        if (std.mem.eql(u8, target.name, table.physical_name)) {
-            if (target.id != table.id or target.version != table.schema_version) return error.CatalogGenerationChanged;
+        if (target.id == table.id and (target.graph_revision != 0) == (table.graph != null) and std.mem.eql(u8, target.name, table.physical_name)) {
+            if (target.graph_revision != graphRevision(table) or target.version != table.schema_version) return error.CatalogGenerationChanged;
             found = true;
         }
     }
@@ -1798,6 +1855,31 @@ test "SQL pgwire binding manifest includes recursive mutation sources and dedupl
     const updated = (try statementBindingGuard(std.testing.allocator, 9, binding)).?;
     defer std.testing.allocator.free(updated);
     try std.testing.expectEqualSlices(u8, inserted, updated);
+}
+
+test "SQL pgwire warm catalog probe returns recoverable cancellation and preserves shutdown" {
+    const Probe = struct {
+        cancel: std.atomic.Value(bool) = .init(false),
+        client_cancel: bool = true,
+        failure: anyerror = error.Canceled,
+
+        fn call(raw: *anyopaque, _: std.mem.Allocator, _: operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cancel.store(self.client_cancel, .release);
+            return self.failure;
+        }
+    };
+    var probe: Probe = .{};
+    var server = http.ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &probe, .vtable = &.{ .status = undefined, .system_catalog = Probe.call } }, null, null);
+    defer server.deinit();
+    var credential: Credential = .{ .manager = null, .username = @constCast("alice"), .principal = @constCast("basic:alice"), .verifier_mac = undefined };
+    const request: wire.Request = .{ .statement = "", .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } }, .cancel_requested = &probe.cancel };
+    try std.testing.expectError(error.QueryCanceled, catalogStamp(&server, std.testing.allocator, &credential, request));
+    probe.cancel.store(false, .release);
+    probe.client_cancel = false;
+    try std.testing.expectError(error.Canceled, catalogStamp(&server, std.testing.allocator, &credential, request));
+    probe.failure = error.DeadlineExceeded;
+    try std.testing.expectError(error.QueryCanceled, catalogStamp(&server, std.testing.allocator, &credential, request));
 }
 
 test "SQL pgwire credential snapshot observes policy revocation and password rotation" {
@@ -1969,8 +2051,22 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     };
     try std.testing.checkAllAllocationFailures(alloc, SplitSweep.run, .{ cursor, &native_cursor, false });
     try std.testing.checkAllAllocationFailures(alloc, SplitSweep.run, .{ cursor, &native_cursor, true });
+    var server = http.ApiHttpServer.init(alloc, .{ .user_manager = &manager }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    var adapter = Adapter{ .server = &server };
+    const wire_identity: wire.Identity = .{ .context = credential, .release = Credential.release };
+    const cached: wire.Description = .{ .columns = &.{}, .stamp = .{ .authority = try credential.descriptionRevision() } };
+    // An empty catalog backend and a zero-allocation budget exercise the
+    // warm path for a binding which never resolved a table.
+    var no_alloc = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expect(try Adapter.descriptionCurrent(&adapter, no_alloc.allocator(), wire_identity, authority.request, cached));
+    try std.testing.expect(!no_alloc.has_induced_failure);
+    server.cfg.user_manager = null;
+    try std.testing.expectError(error.Unauthorized, Adapter.descriptionCurrent(&adapter, alloc, wire_identity, authority.request, cached));
+    server.cfg.user_manager = &manager;
     const closes_before_revoke = native_cursor.closes;
     try manager.removePermissionFromUser("alice", "docs", .table);
+    try std.testing.expect(!try Adapter.descriptionCurrent(&adapter, alloc, wire_identity, authority.request, cached));
     {
         var current = try credential.identity(alloc);
         defer current.deinit(alloc);
@@ -2208,9 +2304,11 @@ test "SQL pgwire native trusted-only renewal preserves owners without native boo
         try std.testing.expectEqual(@as(usize, 1), snapshot.row_filter.len);
         try std.testing.expect(!no_decode.has_induced_failure);
     }
+    const original_revision = try credential.descriptionRevision();
     credential.trusted_expires = 0;
     try std.testing.expectError(error.Unauthorized, credential.validate());
     try Adapter.refresh(&adapter, a, authenticated, token);
+    try std.testing.expect(original_revision != try credential.descriptionRevision());
     try credential.validate();
     try std.testing.expectEqualStrings("trusted:cloudaf:key-1", credential.sessionPrincipal());
     const other = try testTrustedToken(a, "renewal-key", "{\"iss\":\"cloudaf\",\"sub\":\"key-2\",\"admin\":true,\"exp\":4102444800}");

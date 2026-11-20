@@ -521,7 +521,15 @@ pub const UserManager = struct {
     // not a distributed revocation oracle: already admitted statements have
     // a bounded lease, while subsequent admissions pin the new graph.
     role_revision: u64 = 1,
+    // Local to this manager. Publish under the same lock as every credential
+    // or policy write, including a multi-step write that fails partway through.
+    authorization_revision: std.atomic.Value(u64) = .init(1),
     lifecycle_hook: ?AuthLifecycleHook = null,
+
+    fn finishAuthorizationWrite(self: *UserManager, io: std.Io) void {
+        _ = self.authorization_revision.fetchAdd(1, .release);
+        self.mutation_mutex.unlock(io);
+    }
 
     pub fn setLifecycleHook(self: *UserManager, hook: ?AuthLifecycleHook) void {
         self.lifecycle_hook = hook;
@@ -653,7 +661,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.createUserWithMetadataUnlocked(username, password, initial_policies, metadata_json);
     }
 
@@ -788,7 +796,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         const existing = self.users.getPtr(username) orelse return error.UserNotFound;
         const metadata_json = self.user_metadata.get(username) orelse "{}";
         const new_hash = try hashPassword(self.alloc, io, new_password);
@@ -810,7 +818,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         const instance_id = self.user_instances.get(username) orelse return error.UserNotFound;
         if (self.personal_grant_revoker) |revoker| {
             if (!revoker.revoke_fn(revoker.ptr, instance_id)) return error.PersonalGrantRevocationFailed;
@@ -869,7 +877,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.addPermissionToSubjectUnlocked(subject, permission);
     }
 
@@ -887,7 +895,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.addPermissionToSubjectUnlocked(username, permission);
     }
@@ -901,7 +909,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         const removed = if (std.mem.eql(u8, resource_name, "*"))
             try self.enforcer.removeFilteredPolicy(0, &.{ username, resource_type.slice() })
@@ -1006,7 +1014,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.addRoleToSubjectUnlocked(subject, role);
     }
 
@@ -1020,7 +1028,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.addRoleToSubjectUnlocked(username, role);
     }
@@ -1029,7 +1037,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.removeRoleFromSubjectUnlocked(subject, role);
     }
 
@@ -1043,7 +1051,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.removeRoleFromSubjectUnlocked(username, role);
     }
@@ -1226,7 +1234,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.setSubjectRowFilterUnlocked(subject, table, filter_json);
     }
 
@@ -1242,7 +1250,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.setSubjectRowFilterUnlocked(username, table, filter_json);
     }
@@ -1251,7 +1259,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.removeSubjectRowFilterUnlocked(subject, table);
     }
 
@@ -1265,7 +1273,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.removeSubjectRowFilterUnlocked(username, table);
     }
@@ -1349,7 +1357,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
 
         for (permissions) |perm| {
@@ -1553,7 +1561,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.deleteApiKeyUnlocked(username, key_id);
     }
 

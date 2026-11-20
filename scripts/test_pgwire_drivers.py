@@ -82,12 +82,13 @@ def exercise_cached_setting_plans(server, password):
     print("SQL and driver cached settings survive catalog changes: PASS", flush=True)
 
 
-def exercise_bound_write(server, password):
+def exercise_bound_portals(server, password):
     """Commit DDL after the client receives BindComplete and before Execute."""
     import socket
     import struct
 
     import psycopg
+    import requests
 
     def message(tag, data=b""):
         return tag + struct.pack("!I", 4 + len(data)) + data
@@ -114,19 +115,20 @@ def exercise_bound_write(server, password):
         insert = "INSERT INTO portal_target (id, n) VALUES ('a', 0)"
         migrator.execute(create)
         migrator.execute(insert)
-        sql = b"UPDATE portal_target SET n = 9 WHERE id = 'a'"
-        wire.sendall(message(b"P", b"stmt\0" + sql + b"\0\0\0") + message(b"H"))
-        assert receive(reader) == (b"1", b"")
 
-        for migration in ("alter", "replace", "reuse"):
-            wire.sendall(message(b"B", b"portal\0stmt\0" + bytes(6)) + message(b"H"))
-            assert receive(reader) == (b"2", b"")
-            if migration == "alter":
-                migrator.execute("ALTER TABLE portal_target ADD COLUMN note TEXT")
-            if migration == "replace":
-                migrator.execute("DROP TABLE portal_target")
-                migrator.execute(create)
-                migrator.execute(insert)
+        def parse(name, sql):
+            body = name.encode() + b"\0" + sql.encode() + bytes(3)
+            wire.sendall(message(b"P", body) + message(b"H"))
+            frame = receive(reader)
+            assert frame == (b"1", b""), (sql, frame)
+
+        def bind(name):
+            body = b"portal\0" + name.encode() + bytes(7)
+            wire.sendall(message(b"B", body) + message(b"H"))
+            frame = receive(reader)
+            assert frame == (b"2", b""), (name, frame)
+
+        def execute(expected_error=None):
             wire.sendall(message(b"E", b"portal\0" + bytes(4)) + message(b"S"))
             errors = []
             while True:
@@ -135,18 +137,89 @@ def exercise_bound_write(server, password):
                     errors.append(data.split(b"\0"))
                 if tag == b"Z":
                     break
-            if migration == "replace":
-                assert len(errors) == 1 and b"C40001" in errors[0], errors
+            if expected_error:
+                assert len(errors) == 1 and expected_error in errors[0], errors
             else:
                 assert not errors, errors
+
+        for name, query in (
+            ("constant", "SELECT 1"),
+            ("derived", "WITH c AS (SELECT 1 AS n) SELECT n FROM c"),
+        ):
+            parse(name, query)
+            bind(name)
+            execute()
+
+        parse("update", "UPDATE portal_target SET n = 9 WHERE id = 'a'")
+        for migration in ("alter", "replace", "reuse"):
+            bind("update")
+            if migration == "alter":
+                migrator.execute("ALTER TABLE portal_target ADD COLUMN note TEXT")
+            if migration == "replace":
+                migrator.execute("DROP TABLE portal_target")
+                migrator.execute(create)
+                migrator.execute(insert)
+            execute(b"C40001" if migration == "replace" else None)
             assert migrator.execute("SELECT n FROM portal_target").fetchone() == (
                 0 if migration == "replace" else 9,
             )
 
-    print(
-        "Bound UPDATE rejects a replaced table and a fresh Bind succeeds: PASS",
-        flush=True,
-    )
+        parse("drop", "DROP TABLE portal_target")
+        bind("drop")
+        migrator.execute("DROP TABLE portal_target")
+        migrator.execute(create)
+        migrator.execute(insert)
+        execute(b"C40001")
+        assert migrator.execute("SELECT n FROM portal_target").fetchone() == (0,)
+
+        parse("conditional", "DROP TABLE IF EXISTS portal_absent")
+        bind("conditional")
+        migrator.execute("CREATE TABLE portal_absent (n BIGINT)")
+        execute(b"C40001")
+        assert migrator.execute("SELECT COUNT(*) FROM portal_absent").fetchone() == (0,)
+
+        parse("truncate", "TRUNCATE TABLE portal_target, portal_absent")
+        bind("truncate")
+        migrator.execute("DROP TABLE portal_absent")
+        migrator.execute("CREATE TABLE portal_absent (n BIGINT)")
+        execute(b"C40001")
+        assert migrator.execute("SELECT n FROM portal_target").fetchone() == (0,)
+
+        # A fresh Bind acquires the new identity and unrelated DDL is compatible.
+        bind("drop")
+        migrator.execute("CREATE TABLE graph_other (id TEXT, n BIGINT)")
+        execute()
+        migrator.execute(create)
+
+        graph_url = server.api_url + "/graphs/portal_graph"
+
+        def definition(table):
+            return {"labels": [{"name": "D", "table": table}], "relationships": []}
+
+        with requests.Session() as http:
+            http.auth = ("admin", password)
+            created = http.post(graph_url, json=definition("portal_target"), timeout=10)
+            created.raise_for_status()
+            parse(
+                "graph",
+                "SELECT q.n FROM GRAPH_TABLE(portal_graph MATCH(n IS D) "
+                "COLUMNS(n.n AS n)) q",
+            )
+            bind("graph")
+            changed = http.put(
+                graph_url,
+                json={
+                    "expected_revision": "1",
+                    "definition": definition("graph_other"),
+                },
+                timeout=10,
+            )
+            changed.raise_for_status()
+            execute(b"C40001")
+            bind("graph")
+            execute()
+
+    print("Bound DML, DDL and graph identity across catalog changes: PASS", flush=True)
 
 
 def exercise_cached_search_path(server, password):
@@ -275,7 +348,7 @@ def main():
     try:
         server.restart()
         print("cold-start and restart DDL without retries: PASS", flush=True)
-        exercise_bound_write(server, AUTH_BOOTSTRAP_PASSWORD)
+        exercise_bound_portals(server, AUTH_BOOTSTRAP_PASSWORD)
         exercise_cached_search_path(server, AUTH_BOOTSTRAP_PASSWORD)
         exercise_cached_setting_plans(server, AUTH_BOOTSTRAP_PASSWORD)
         run_clients(
