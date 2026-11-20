@@ -49,6 +49,17 @@ pub const DiscoveryShape = struct {
     pub fn formatHeader(self: DiscoveryShape, buf: *[64]u8) ![]const u8 {
         if (self.items == 0) return error.InvalidInferenceDiscoveryShape;
         const mask: u8 = @bitCast(self.modalities);
+        // Version 1 can carry unknown media without accidentally claiming a
+        // text-only invocation. Use version 4 when exact text or a candidate
+        // limit must also survive the wire.
+        if (self.media and mask & ~@as(u8, 1) == 0 and (mask != 0 or self.candidates != null)) {
+            var stream: std.Io.Writer = .fixed(buf);
+            try stream.print("4:{d}:{d}:", .{ self.items, mask });
+            if (self.output_tokens) |tokens| try stream.print("{d}", .{tokens}) else try stream.writeByte('-');
+            try stream.writeByte(':');
+            if (self.candidates) |count| try stream.print("{d}", .{count}) else try stream.writeByte('-');
+            return stream.buffered();
+        }
         if (self.candidates) |count| {
             if (self.output_tokens) |tokens| return std.fmt.bufPrint(buf, "3:{d}:{d}:{d}:{d}", .{ self.items, mask, tokens, count });
             return std.fmt.bufPrint(buf, "3:{d}:{d}:-:{d}", .{ self.items, mask, count });
@@ -78,6 +89,16 @@ pub const DiscoveryHeaders = struct {
     }
 };
 
+/// Read only the data URI header. Full validation belongs to invocation
+/// admission, which already has to check sizes and encoding.
+pub fn inlineDiscoveryMime(uri: []const u8) ?[]const u8 {
+    if (!std.ascii.startsWithIgnoreCase(uri, "data:")) return null;
+    const body = uri["data:".len..];
+    const header = body[0..@min(body.len, 256)];
+    const end = std.mem.indexOfAny(u8, header, ";,") orelse return null;
+    return if (end == 0) null else body[0..end];
+}
+
 pub fn generationModalities(messages: anytype) work.Modalities {
     var mask: u8 = 0;
     for (messages) |message| {
@@ -90,7 +111,7 @@ pub fn generationModalities(messages: anytype) work.Modalities {
             const modalities: work.Modalities = switch (part) {
                 .text => .{ .text = true },
                 .image_url => .{ .image = true },
-                .media => |media| work.modalityForMimeType(media.mime_type) orelse .{},
+                .media => |media| work.modalityForMimeType(if (media.mime_type.len != 0) media.mime_type else inlineDiscoveryMime(media.url orelse media.data) orelse "") orelse .{},
             };
             mask |= @bitCast(modalities);
         }

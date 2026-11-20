@@ -26540,6 +26540,19 @@ pub const Node = struct {
         };
     }
 
+    fn validateChunkOutputManifest(self: *Node, kind: lib_chunker.outputs.Kind, manifest: *const manifest_mod.ModelManifest) !?@import("../models/media_classifier_profile.zig").Profile {
+        if (kind == .transcribe) {
+            const contract = try resolvedInferenceExecutorContract(self, "transcribe", manifest);
+            try validateInferenceExecutorInvocation(contract, .{ .has_audio = true, .item_count = 1, .media_parts_per_item = 1 });
+            return null;
+        }
+        std.debug.assert(kind == .classify);
+        const profile = manifest.media_classifier orelse return error.UnsupportedMediaClassifier;
+        try profile.validate();
+        if (manifest.model_type != .classifier or !manifest.hasCapability("classification") or !manifest.hasTask("classify") or manifest.id2label == null) return error.UnsupportedMediaClassifier;
+        return profile;
+    }
+
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader("X-Antfly-Generation-Placement-Version", "1");
         if (ctx.header("X-Antfly-Inference-Chunk-Requirements")) |requirements| {
@@ -26574,19 +26587,32 @@ pub const Node = struct {
                         if (!std.mem.eql(u8, expected, &identity)) return ctx.status(404).json(.{ .@"error" = "ChunkModelIdentityMismatch" });
                     }
                 } else {
-                    const category = if (std.mem.eql(u8, task, "embed")) "embedders" else if (std.mem.eql(u8, task, "transcribe")) "transcribers" else if (std.mem.eql(u8, task, "classify")) "classifiers" else return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                    const kind: lib_chunker.outputs.Kind = if (std.mem.eql(u8, task, "embed")) .embedding else if (std.mem.eql(u8, task, "transcribe")) .transcribe else if (std.mem.eql(u8, task, "classify")) .classify else return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                    const category = switch (kind) {
+                        .embedding => "embedders",
+                        .transcribe => "transcribers",
+                        .classify => "classifiers",
+                        .diarize => unreachable,
+                    };
                     const selected = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| return requestModelResolutionError(ctx, err);
                     defer ctx.allocator.free(selected.path);
-                    if (pin) |expected| {
-                        const control = selected.bind(self.bindExecutionControl(ctx.io, .{}));
-                        const identity = if (std.mem.eql(u8, task, "embed"))
-                            self.model_manager.chunkPlanningIdentityForDiscovery(selected.path, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err)
-                        else manifest_identity: {
-                            var manifest = self.loadBoundManifest(ctx.allocator, selected.path, false, control) catch |err| return requestModelResolutionError(ctx, err);
-                            defer manifest.deinit();
-                            break :manifest_identity std.fmt.bytesToHex(self.model_manager.modelIdentityForManifest(selected.path, manifest) catch |err| return requestModelResolutionError(ctx, err), .lower);
+                    const control = selected.bind(self.bindExecutionControl(ctx.io, .{}));
+                    if (kind == .embedding) {
+                        if (pin) |expected| {
+                            const identity = self.model_manager.chunkPlanningIdentityForDiscovery(selected.path, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err);
+                            if (!std.mem.eql(u8, expected, &identity)) return ctx.status(404).json(.{ .@"error" = "ChunkModelIdentityMismatch" });
+                        }
+                    } else {
+                        var manifest = self.loadBoundManifest(ctx.allocator, selected.path, false, control) catch |err| return requestModelResolutionError(ctx, err);
+                        defer manifest.deinit();
+                        _ = self.validateChunkOutputManifest(kind, &manifest) catch |err| {
+                            if (err == error.OutOfMemory or isModelPublicationError(err)) return requestModelResolutionError(ctx, err);
+                            return ctx.status(404).json(.{ .@"error" = "ChunkOutputModelUnsupported" });
                         };
-                        if (!std.mem.eql(u8, expected, &identity)) return ctx.status(404).json(.{ .@"error" = "ChunkModelIdentityMismatch" });
+                        if (pin) |expected| {
+                            const identity = std.fmt.bytesToHex(self.model_manager.modelIdentityForManifest(selected.path, manifest) catch |err| return requestModelResolutionError(ctx, err), .lower);
+                            if (!std.mem.eql(u8, expected, &identity)) return ctx.status(404).json(.{ .@"error" = "ChunkModelIdentityMismatch" });
+                        }
                     }
                 }
             }
@@ -49823,13 +49849,7 @@ const MediaOutputExecution = struct {
         } else {
             var manifest = try self.node.loadBoundManifest(a, path, false, selected_control);
             defer manifest.deinit();
-            if (target.kind == .transcribe) {
-                const contract = try resolvedInferenceExecutorContract(self.node, "transcribe", &manifest);
-                try validateInferenceExecutorInvocation(contract, .{ .has_audio = true, .item_count = 1, .media_parts_per_item = 1 });
-            } else {
-                const profile = manifest.media_classifier orelse return error.UnsupportedMediaClassifier;
-                try profile.validate();
-                if (manifest.model_type != .classifier or !manifest.hasCapability("classification") or !manifest.hasTask("classify") or manifest.id2label == null) return error.UnsupportedMediaClassifier;
+            if (try self.node.validateChunkOutputManifest(target.kind, &manifest)) |profile| {
                 classifier_profile = profile;
                 max_audio_ns = profile.max_audio_ns;
                 uses_audio = profile.input == .waveform;

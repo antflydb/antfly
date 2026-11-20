@@ -1584,7 +1584,7 @@ pub const Runtime = struct {
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
                 if (parsed.output_schema != null) break :blk try self.constrainedProducerCapabilities(alloc, &parsed.generator, parsed.output, null, parsed.batch, .generate);
-                break :blk try self.generatorCapabilities(alloc, parsed.generator);
+                break :blk try self.generatorCapabilities(alloc, parsed.generator, requests);
             },
             .extractor => blk: {
                 if (try generated_extractor.isGenerated(alloc, requests[0].config_json)) {
@@ -1931,7 +1931,7 @@ pub const Runtime = struct {
             parsed.tool_output == .content;
     }
 
-    fn generatorCapabilities(self: *Runtime, alloc: Allocator, cfg: generating_runtime.GeneratorConfig) !?inference_work.InferenceCapabilities {
+    fn generatorCapabilities(self: *Runtime, alloc: Allocator, cfg: generating_runtime.GeneratorConfig, requests: []const asset_producer.Request) !?inference_work.InferenceCapabilities {
         if (cfg.provider != .antfly) return null;
         if (cfg.url.len == 0) {
             const local = self.antfly_provider orelse return null;
@@ -1954,17 +1954,27 @@ pub const Runtime = struct {
             header_count += 1;
         }
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
-        return self.capabilityCache().getOrDiscoverWithContext(
-            self.http,
-            cfg.url,
-            cfg.model,
-            .generate_batch,
-            header_storage[0..header_count],
-            self.execution.waitContext(),
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => null,
-        };
+        var shape = try homogeneousDiscoveryShape(alloc, requests);
+        shape.output_tokens = discoveryOutputTokens(cfg.max_tokens);
+        var placement: remote_capabilities.DiscoveryHeaders = .{};
+        while (true) {
+            const headers = try placement.withShape(header_storage[0..header_count], shape);
+            return self.capabilityCache().getOrDiscoverWithContext(
+                self.http,
+                cfg.url,
+                cfg.model,
+                .generate_batch,
+                headers,
+                self.execution.waitContext(),
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.InferenceDiscoveryTooManyItems => if (shape.items > 1) {
+                    shape.items /= 2;
+                    continue;
+                } else null,
+                else => null,
+            };
+        }
     }
 
     fn extractorBatchMode(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !inference_work.BatchMode {
@@ -1985,10 +1995,9 @@ pub const Runtime = struct {
         if (cfg.provider != .antfly or cfg.resolvedUrl() == null)
             return self.extractorCapabilities(alloc, cfg.*);
         var shape = try homogeneousDiscoveryShape(alloc, requests);
-        var caps = (try self.bindExtractorWindow(alloc, cfg, &shape)) orelse return null;
-        caps.batch.max_items = @min(caps.batch.max_items, shape.items);
-        caps.batch.preferred_items = @min(caps.batch.preferred_items, caps.batch.max_items);
-        return caps;
+        // Report the backend contract. The sampled window is an invocation
+        // shape, and can be a singleton prototype used to size later batches.
+        return self.bindExtractorWindow(alloc, cfg, &shape);
     }
 
     fn bindExtractorWindow(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, shape: *remote_capabilities.DiscoveryShape) !?inference_work.InferenceCapabilities {
@@ -3560,7 +3569,7 @@ pub const Runtime = struct {
         if (request.media.len > 0 and cfg.provider == .antfly and cfg.url.len > 0 and
             self.canGenerateBatchWithConfig(parsed_cfg, &.{request}))
         {
-            if (try self.generatorCapabilities(alloc, cfg) != null) {
+            if (try self.generatorCapabilities(alloc, cfg, &.{request}) != null) {
                 const outputs = try self.tryGenerateBatch(alloc, &.{request});
                 defer alloc.free(outputs);
                 return outputs[0];
@@ -4999,7 +5008,12 @@ fn extendDiscoveryShape(alloc: Allocator, first: remote_capabilities.DiscoverySh
 
 fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {
     var shape: remote_capabilities.DiscoveryShape = .{ .items = @max(1, requests.len), .output_tokens = 0 };
-    const Part = struct { type: ?[]const u8 = null, mime_type: ?[]const u8 = null };
+    const Part = struct {
+        type: ?[]const u8 = null,
+        mime_type: ?[]const u8 = null,
+        url: ?[]const u8 = null,
+        data: ?[]const u8 = null,
+    };
     for (requests) |request| {
         for (request.media) |media| {
             shape.media = true;
@@ -5011,7 +5025,7 @@ fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Req
             if (parts_json.len == 0 or parts_json[0] != '[') {
                 const extraction = request.producer_type == .extractor and raw.len != 0;
                 shape.modalities.text = shape.modalities.text or
-                    (if (extraction) std.mem.startsWith(u8, parts_json, "\"") else request.source_text.len != 0);
+                    (if (extraction) true else request.source_text.len != 0);
                 continue;
             }
             var parts = try std.json.parseFromSlice([]const Part, alloc, parts_json, .{ .ignore_unknown_fields = true });
@@ -5027,7 +5041,8 @@ fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Req
                     shape.modalities.image = true;
                 } else if (std.mem.eql(u8, kind, "media")) {
                     shape.media = true;
-                    if (part.mime_type) |mime_type| {
+                    const mime = part.mime_type orelse remote_capabilities.inlineDiscoveryMime(part.url orelse part.data orelse "");
+                    if (mime) |mime_type| {
                         if (inference_work.modalityForMimeType(mime_type)) |modalities|
                             mergeInferenceModalities(&shape.modalities, modalities);
                     }
@@ -5036,10 +5051,37 @@ fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Req
             if (request.producer_type == .generator and !has_content)
                 shape.modalities.text = shape.modalities.text or request.source_text.len != 0;
         } else {
+            // OCR metadata prototypes describe an image before any bytes are rendered.
+            if (request.producer_type == .extractor and request.media.len == 0 and request.source_text.len == 0) {
+                if (inference_work.modalityForMimeType(request.content_type)) |modalities| {
+                    mergeInferenceModalities(&shape.modalities, modalities);
+                    shape.media = shape.media or @as(u8, @bitCast(modalities)) & ~@as(u8, 1) != 0;
+                }
+            }
             shape.modalities.text = shape.modalities.text or ((request.producer_type == .extractor or request.media.len == 0) and request.source_text.len != 0);
         }
     }
     return shape;
+}
+
+test "asset producer runtime discovers inferred media and OCR prototypes" {
+    const alloc = std.testing.allocator;
+    var request: asset_producer.Request = .{
+        .producer_type = .extractor,
+        .config_json = "{}",
+        .source_text = "",
+        .source_parts_json = "[{\"type\":\"text\",\"text\":\"extract\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,AA==\"}]",
+    };
+    const shape = try producerDiscoveryShape(alloc, &.{request});
+    try std.testing.expect(shape.media and shape.modalities.text and shape.modalities.image);
+    request.source_parts_json = null;
+    request.content_type = "image/png";
+    const prototype = try producerDiscoveryShape(alloc, &.{request});
+    try std.testing.expect(prototype.media and prototype.modalities.image and !prototype.modalities.text);
+
+    var header: [64]u8 = undefined;
+    const unknown = remote_capabilities.DiscoveryShape{ .items = 1, .media = true, .modalities = .{ .text = true }, .output_tokens = 0 };
+    try std.testing.expectEqualStrings("4:1:1:0:-", try unknown.formatHeader(&header));
 }
 
 test "asset producer runtime discovers structured media without fallback text" {
