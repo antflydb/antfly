@@ -1308,9 +1308,10 @@ pub const RoaringBitmap = struct {
 
         // Read keys
         try bm.keys.ensureTotalCapacity(alloc, n);
-        for (0..n) |_| {
+        for (0..n) |index| {
             const k = std.mem.readInt(u16, data[pos..][0..2], .little);
             pos += 2;
+            if (index != 0 and k <= bm.keys.items[index - 1]) return error.InvalidRoaringBitmap;
             bm.keys.appendAssumeCapacity(k);
         }
 
@@ -1339,19 +1340,25 @@ pub const RoaringBitmap = struct {
                 // Bitmap container
                 if (data.len - pos < bitmap_words * @sizeOf(u64)) return error.InvalidRoaringBitmap;
                 const words = try alloc.alloc(u64, bitmap_words);
-                for (0..bitmap_words) |w| {
-                    words[w] = std.mem.readInt(u64, data[pos..][0..8], .little);
+                errdefer alloc.free(words);
+                var decoded_count: usize = 0;
+                for (words) |*word| {
+                    word.* = std.mem.readInt(u64, data[pos..][0..8], .little);
+                    decoded_count += @popCount(word.*);
                     pos += 8;
                 }
+                if (decoded_count != card) return error.InvalidRoaringBitmap;
                 bm.containers.appendAssumeCapacity(.{ .bitmap = words });
             } else {
                 // Array container
                 if (data.len - pos < card * @sizeOf(u16)) return error.InvalidRoaringBitmap;
                 var arr = std.ArrayListUnmanaged(u16).empty;
+                errdefer arr.deinit(alloc);
                 try arr.ensureTotalCapacity(alloc, card);
-                for (0..card) |_| {
+                for (0..card) |index| {
                     const v = std.mem.readInt(u16, data[pos..][0..2], .little);
                     pos += 2;
+                    if (index != 0 and v <= arr.items[index - 1]) return error.InvalidRoaringBitmap;
                     arr.appendAssumeCapacity(v);
                 }
                 bm.containers.appendAssumeCapacity(.{ .array = arr });
@@ -1417,30 +1424,44 @@ pub const RoaringBitmap = struct {
             return self.unionSmallOrOrdered(other);
         }
 
-        var extra: usize = 0;
-        var left: usize = 0;
-        for (other.keys.items, other.containers.items) |key, *container| {
-            while (left < self.keys.items.len and self.keys.items[left] < key) left += 1;
-            if ((left == self.keys.items.len or self.keys.items[left] != key) and !container.isEmpty()) extra += 1;
+        const original_len = self.keys.items.len;
+        const first = self.lowerChunk(other.keys.items[0]);
+        const last_key = other.keys.items[other.keys.items.len - 1];
+        const last = self.lowerChunk(last_key);
+        const end = last + @intFromBool(last < original_len and self.keys.items[last] == last_key);
+        const seek_cost = std.math.log2_int(usize, original_len) + 1;
+        if (other.keys.items.len <= (end - first) / seek_cost and self.containsUnionChunks(other)) {
+            return self.unionSmallOrOrdered(other);
         }
 
-        var remaining = self.keys.items.len;
-        const total = remaining + extra;
+        var extra: usize = 0;
+        var left = first;
+        for (other.keys.items, other.containers.items) |key, *container| {
+            while (left < end and self.keys.items[left] < key) left += 1;
+            if ((left == end or self.keys.items[left] != key) and !container.isEmpty()) extra += 1;
+        }
+
+        var remaining = end;
+        const total = original_len + extra;
         try self.keys.ensureTotalCapacity(self.alloc, total);
         try self.containers.ensureTotalCapacity(self.alloc, total);
         self.keys.items.len = total;
         self.containers.items.len = total;
+        if (extra != 0) {
+            std.mem.copyBackwards(u16, self.keys.items[end + extra ..], self.keys.items[end..original_len]);
+            std.mem.copyBackwards(Container, self.containers.items[end + extra ..], self.containers.items[end..original_len]);
+        }
 
         // Merge backward so the reserved tail can hold results without a
         // second directory. On failure, retain the completed union suffix
         // and the original left prefix as a valid partial union.
-        var write = total;
+        var write = end + extra;
         errdefer {
-            const end = remaining + total - write;
-            std.mem.copyForwards(u16, self.keys.items[remaining..end], self.keys.items[write..total]);
-            std.mem.copyForwards(Container, self.containers.items[remaining..end], self.containers.items[write..total]);
-            self.keys.shrinkRetainingCapacity(end);
-            self.containers.shrinkRetainingCapacity(end);
+            const partial_len = remaining + total - write;
+            std.mem.copyForwards(u16, self.keys.items[remaining..partial_len], self.keys.items[write..total]);
+            std.mem.copyForwards(Container, self.containers.items[remaining..partial_len], self.containers.items[write..total]);
+            self.keys.shrinkRetainingCapacity(partial_len);
+            self.containers.shrinkRetainingCapacity(partial_len);
         }
         var right = other.keys.items.len;
         while (right != 0) {
@@ -1467,6 +1488,13 @@ pub const RoaringBitmap = struct {
             self.containers.items[write] = merged;
         }
         std.debug.assert(write == remaining);
+    }
+
+    fn containsUnionChunks(self: *const RoaringBitmap, other: *const RoaringBitmap) bool {
+        for (other.keys.items, other.containers.items) |key, *container| {
+            if (self.findChunk(key) == null and !container.isEmpty()) return false;
+        }
+        return true;
     }
 
     fn unionSmallOrOrdered(self: *RoaringBitmap, other: *const RoaringBitmap) !void {
@@ -3286,7 +3314,7 @@ test "optional numeric range union merges interleaved chunk directories" {
 
 test "optional numeric range union keeps its directory valid after allocation failure" {
     const alloc = std.testing.allocator;
-    const left_values = [_]u32{ 65537, 3 * 65536 + 1, 5 * 65536 + 1 };
+    const left_values = [_]u32{ 65537, 3 * 65536 + 1, 5 * 65536 + 1, 30 * 65536 + 1 };
     const right_values = [_]u32{
         1,              2 * 65536 + 1, 4 * 65536 + 1, 5 * 65536 + 2,
         6 * 65536 + 1,  7 * 65536 + 1, 8 * 65536 + 1, 9 * 65536 + 1,
@@ -3350,4 +3378,39 @@ test "optional numeric range unions sparse values in order and promotes without 
     var values = left.iterator();
     for (0..4097) |value| try std.testing.expectEqual(@as(?u32, @intCast(value)), values.next());
     try std.testing.expect(values.next() == null);
+}
+
+test "optional numeric range bitmap decoder rejects noncanonical containers" {
+    const alloc = std.testing.allocator;
+    // Duplicate and unsorted chunk keys, then duplicate and unsorted values.
+    const invalid = [_][]const u8{
+        &.{ 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0 },
+        &.{ 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0 },
+        &.{ 1, 0, 0, 0, 1, 0, 1, 0, 1, 0 },
+        &.{ 1, 0, 0, 0, 1, 0, 2, 0, 1, 0 },
+    };
+    for (invalid) |bytes| try std.testing.expectError(error.InvalidRoaringBitmap, RoaringBitmap.fromBytes(alloc, bytes));
+
+    var bitmap = RoaringBitmap.init(alloc);
+    defer bitmap.deinit();
+    try bitmap.addRange(0, 9000);
+    const bytes = try bitmap.toBytes(alloc);
+    defer alloc.free(bytes);
+    bytes[6] = 0;
+    try std.testing.expectError(error.InvalidRoaringBitmap, RoaringBitmap.fromBytes(alloc, bytes));
+}
+
+test "optional numeric range union handles a skewed overlapping directory" {
+    const alloc = std.testing.allocator;
+    var left = RoaringBitmap.init(alloc);
+    defer left.deinit();
+    var right = RoaringBitmap.init(alloc);
+    defer right.deinit();
+    for (0..1024) |chunk| try left.add(@as(u32, @intCast(chunk)) << 16);
+    for (0..9) |sample| try right.add((@as(u32, @intCast(20 + sample * 100)) << 16) + 1);
+    try left.orWith(&right);
+    try std.testing.expectEqual(@as(usize, 1033), left.cardinality());
+    var additions = right.iterator();
+    while (additions.next()) |value| try std.testing.expect(left.contains(value));
+    try std.testing.expect(left.contains(1023 << 16));
 }
