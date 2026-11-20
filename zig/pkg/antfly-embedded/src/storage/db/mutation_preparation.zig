@@ -1643,7 +1643,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 const expected_kind: enrichment_artifact_codec.Kind = if (request.kind == .dense_embedding) .dense_embedding else .sparse_embedding;
                 if (metadata.header.kind != expected_kind or metadata.sourceHash() != enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) or
-                    (request.kind == .dense_embedding and metadata.dense_dimensions != request.expected_dims)) return null;
+                    (request.kind == .dense_embedding and (metadata.dense_dimensions != request.expected_dims or
+                        (request.model_revision != null and !std.meta.eql(metadata.model_revision, request.model_revision))))) return null;
             }
             const result = try sources.toOwnedSlice(alloc);
             keep = true;
@@ -1750,6 +1751,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else => return err,
             };
             defer memo.alloc.free(raw);
+            if (request.model_revision != null and
+                !std.meta.eql(enrichment_artifact_codec.denseEmbeddingModelRevision(raw) catch return false, request.model_revision))
+                return false;
             const source_hash = enrichment_artifact_codec.sourceHash(raw) catch return false;
             const expected_hash = if (request.kind == .dense_embedding) dense: {
                 const revision = if (S.ownerField(self, "enrichment_runtime").*) |runtime|

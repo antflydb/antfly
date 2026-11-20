@@ -784,26 +784,30 @@ pub const MetadataHttpClient = struct {
     /// apply the subsequent registration. Absent/upgrade-required routes are
     /// a safe legacy registration verdict; all other failures remain errors.
     pub fn storeRootReadiness(self: *MetadataHttpClient, base_uri: []const u8) !bool {
-        return self.storeRootCapabilityReadiness(base_uri, routes.Routes.internal_store_root_readiness, topology_protocol.store_root_uuid_decoder_version);
+        return self.storeRootCapabilityReadiness(base_uri, routes.Routes.internal_store_root_readiness, topology_protocol.store_root_uuid_decoder_version, null);
     }
 
     /// Separate authenticated v18 admission. Old leaders do not expose this
     /// route, so callers omit the public key rather than appending a command
     /// their followers cannot decode.
     pub fn storeRootSigningReadiness(self: *MetadataHttpClient, base_uri: []const u8) !bool {
-        return self.storeRootCapabilityReadiness(base_uri, routes.Routes.internal_store_root_signing_readiness, topology_protocol.store_root_signing_decoder_version);
+        return self.storeRootCapabilityReadiness(base_uri, routes.Routes.internal_store_root_signing_readiness, topology_protocol.store_root_signing_decoder_version, null);
     }
 
-    fn storeRootCapabilityReadiness(self: *MetadataHttpClient, base_uri: []const u8, route: []const u8, required_version: u16) !bool {
+    pub fn pinnedEmbeddingReadiness(self: *MetadataHttpClient, base_uri: []const u8, budget: ?RequestBudget) !bool {
+        return self.storeRootCapabilityReadiness(base_uri, routes.Routes.internal_pinned_embedding_readiness, topology_protocol.pinned_embedding_revision_version, budget);
+    }
+
+    fn storeRootCapabilityReadiness(self: *MetadataHttpClient, base_uri: []const u8, route: []const u8, required_version: u16, budget: ?RequestBudget) !bool {
         const uri = try join(self.alloc, base_uri, route);
         defer self.alloc.free(uri);
-        var response = try self.executeWithRetry(.{
+        var response = try self.executeWithRetryBudget(.{
             .method = .POST,
             .uri = uri,
             .body = "",
             .content_type = "application/json",
             .timeout_ms = default_request_timeout_ms,
-        });
+        }, budget);
         defer response.deinit(self.alloc);
         if (response.status == 404 or response.status == 405 or response.status == 426) return false;
         if (response.status != 200) return error.StoreRootReadinessUnavailable;

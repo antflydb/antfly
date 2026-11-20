@@ -2646,6 +2646,7 @@ pub const EmbeddingArtifactOrigin = union(enum) {
     /// (dense artifacts carry `text_input`; sparse ones treat it as
     /// `generated`).
     generated_text: ?u64,
+    pinned: struct { source_hash: ?u64, text_input: bool, revision: [32]u8 },
 };
 
 pub const StoreWritePositions = std.StringHashMapUnmanaged(usize);

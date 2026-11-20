@@ -200,6 +200,13 @@ test "store-root readiness returns only an exact durable v17 activation" {
     signing_fake.store.activation.?.member_count += 1;
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, signing_call(&signing_fake, .{}));
     try std.testing.expect(!signing_fake.validated);
+    var pin_proof = proof;
+    pin_proof.required_version = protocol.pinned_embedding_revision_version;
+    var pin_fake: Fake = .{ .store = .{ .activation = activation }, .proof = pin_proof };
+    const pin_call = comptime storeRootCapabilityReadinessCall(Fake, protocol.pinned_embedding_revision_version);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, pin_call(&pin_fake, .{}));
+    pin_fake.store.activation.?.version = protocol.pinned_embedding_revision_version;
+    try std.testing.expectEqual(protocol.pinned_embedding_revision_version, (try pin_call(&pin_fake, .{})).activated_version);
 }
 
 pub const AdminSource = struct {
@@ -214,6 +221,7 @@ pub const AdminSource = struct {
         linearizable_head: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
         ensure_store_root_readiness: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.StoreRootReadiness = null,
         ensure_store_root_signing_readiness: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.StoreRootReadiness = null,
+        ensure_pinned_embedding_readiness: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.StoreRootReadiness = null,
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.AdminSnapshot = null,
         provisioning_snapshot: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, node_id: u64) anyerror!@import("restore_staging.zig").ProvisioningSnapshot = null,
         restore_staging_authority: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, input: @import("restore_staging.zig").AuthorityRequest) anyerror!@import("restore_staging.zig").AuthorityResponse = null,
@@ -650,6 +658,7 @@ pub const AdminSource = struct {
                 .linearizable_head = metadataServiceLinearizableHead,
                 .ensure_store_root_readiness = comptime storeRootReadinessCall(service.MetadataService),
                 .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataService, @import("topology_protocol.zig").store_root_signing_decoder_version),
+                .ensure_pinned_embedding_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataService, @import("topology_protocol.zig").pinned_embedding_revision_version),
                 .linearizable_snapshot = metadataServiceLinearizableSnapshot,
                 .runtime_topology = metadataServiceRuntimeTopology,
                 .status = metadataServiceStatus,
@@ -723,6 +732,7 @@ pub const AdminSource = struct {
                 .linearizable_head = metadataHttpServiceLinearizableHead,
                 .ensure_store_root_readiness = comptime storeRootReadinessCall(service.MetadataHttpService),
                 .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataHttpService, @import("topology_protocol.zig").store_root_signing_decoder_version),
+                .ensure_pinned_embedding_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataHttpService, @import("topology_protocol.zig").pinned_embedding_revision_version),
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
                 .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,
@@ -2064,6 +2074,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
         try server.post(routes.Routes.internal_store_root_readiness, httpx.Handler.bind(self, metadataStoreRootReadiness));
         try server.post(routes.Routes.internal_store_root_signing_readiness, httpx.Handler.bind(self, metadataStoreRootSigningReadiness));
+        try server.post(routes.Routes.internal_pinned_embedding_readiness, httpx.Handler.bind(self, metadataPinnedEmbeddingReadiness));
         try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
         try server.post(routes.Routes.internal_provisioning_snapshot, httpx.Handler.bind(self, metadataProvisioningSnapshot));
         try server.post(routes.Routes.internal_restore_staging_authority, httpx.Handler.bind(self, metadataRestoreStagingAuthority));
@@ -2542,6 +2553,16 @@ pub const MetadataHttpServer = struct {
             return ctx.status(403).text("authenticated service required");
         const request = requestContext(ctx);
         const result = self.source.ensureStoreRootSigningReadiness(request) catch |err| return metadataMutationError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedJson(ctx, result);
+    }
+
+    fn metadataPinnedEmbeddingReadiness(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null)
+            return ctx.status(403).text("authenticated service required");
+        const ready = self.source.vtable.ensure_pinned_embedding_readiness orelse return ctx.status(404).text("capability unavailable");
+        const request = requestContext(ctx);
+        const result = ready(self.source.ptr, request) catch |err| return metadataMutationError(ctx, err);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
     }

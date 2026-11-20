@@ -52540,6 +52540,7 @@ fn testEmbeddingArtifactOrigins(alloc: Allocator) !void {
             try std.testing.expectEqual(switch (origin) {
                 .authored => @as(?u64, null),
                 .generated, .generated_text => |hash| hash,
+                .pinned => |pin| pin.source_hash,
             }, try enrichment_artifact_codec.sourceHash(write.value));
         }
     }
@@ -94756,12 +94757,21 @@ test "leann synchronous document provenance pins revisions and tolerates inferen
     try computeDenseRequestImpl(a, &db, body, request, &writes, &no_deletes, &sink, &chunks, false, &memo, null, Fake.append);
     const expected = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, "alpha", @as([32]u8, @splat(1)));
     try std.testing.expectEqual(expected, (try enrichment_artifact_codec.sourceHash(writes.items[0].value)).?);
+    try std.testing.expectEqual(@as(?[32]u8, null), try enrichment_artifact_codec.denseEmbeddingModelRevision(writes.items[0].value));
     const original = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, writes.items[0].value);
     defer a.free(original);
     freePrimaryVectorRebuildWrites(a, &writes);
     try computeDenseRequestImpl(a, &db, body, request, &writes, &no_deletes, &sink, &chunks, false, &memo, null, Fake.append);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     freePrimaryVectorRebuildWrites(a, &writes);
+    var pinned = request;
+    pinned.model_revision = @splat(1);
+    try computeDenseRequestImpl(a, &db, body, pinned, &writes, &no_deletes, &sink, &chunks, false, &memo, null, Fake.append);
+    try std.testing.expectEqual(pinned.model_revision, try enrichment_artifact_codec.denseEmbeddingModelRevision(writes.items[0].value));
+    freePrimaryVectorRebuildWrites(a, &writes);
+    pinned.model_revision = @splat(7);
+    try std.testing.expectError(error.EnrichmentSourceChanged, computeDenseRequestImpl(a, &db, body, pinned, &writes, &no_deletes, &sink, &chunks, false, &memo, null, Fake.append));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
     const key = try internal_keys.documentKeyAlloc(a, request.doc_key);
     defer a.free(key);
     try db.core.store.put(key, body);

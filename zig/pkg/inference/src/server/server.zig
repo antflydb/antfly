@@ -26448,6 +26448,15 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
         defer parsed.deinit();
         const request = parsed.value;
+        const expected_revision: ?[32]u8 = if (ctx.query("model_revision")) |encoded| blk: {
+            var revision: [32]u8 = undefined;
+            if (request.task != .embedder or encoded.len != 64)
+                return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL_REVISION" });
+            _ = std.fmt.hexToBytes(&revision, encoded) catch
+                return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL_REVISION" });
+            break :blk revision;
+        } else null;
+
         if (request.task == .chunker and canonicalFixedChunkModel(request.model) != null) {
             return ctx.status(400).json(.{
                 .@"error" = "MODEL_INSTANCE_UNAVAILABLE",
@@ -26456,7 +26465,7 @@ pub const Node = struct {
         }
 
         var execution_control = httpInferenceExecutionControl(self, ctx);
-        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
+        execution_control.check() catch return embeddingRevisionFailureResponse(ctx);
         const model_path = if (request.task == .reader)
             self.resolveReadRequestModelSelection(ctx.allocator, ctx.io, request.model)
         else
@@ -26471,6 +26480,12 @@ pub const Node = struct {
         defer manifest.deinit();
         if (!manifestMatchesModelListingTask(runtimeListingTask(request.task), @tagName(manifest.model_type), &manifest)) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model does not support the requested task" });
+        }
+
+        if (expected_revision) |required| {
+            const manifest_revision = self.model_manager.modelIdentityForManifest(resolved_path, manifest) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            requireLoadedEmbeddingRevision(required, manifest_revision) catch return embeddingRevisionFailureResponse(ctx);
         }
 
         var runtime_id: model_manager_mod.RuntimeId = 0;
@@ -26517,14 +26532,16 @@ pub const Node = struct {
         } else {
             var handle = self.model_manager.acquireFromDirWithControl(resolved_path, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
+            defer handle.release();
+            requireLoadedEmbeddingRevision(expected_revision, handle.get().resolution_revision) catch return embeddingRevisionFailureResponse(ctx);
             runtime_id = handle.get().runtime_id;
-            handle.release();
         }
 
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         const models = try self.runtimeModelsAlloc(arena.allocator(), ctx.io, runtime_id, request.task);
         if (models.len == 0) return ctx.status(409).json(.{ .@"error" = "INSTANCE_EVICTED", .message = "instance was evicted after loading; retry", .retryable = true });
+        try acknowledgeEmbeddingRevision(ctx, expected_revision);
         return ctx.json(models[0]);
     }
 
@@ -50459,6 +50476,18 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);
     try std.testing.expectEqual(@as(usize, 64), model.object.get("model_revision").?.string.len);
     try std.testing.expect(model.object.get("model_revision_pinning").?.bool);
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+    const wrong = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    try std.testing.expect(!std.mem.eql(u8, model.object.get("model_revision").?.string, wrong));
+    var activation = try httpx.Request.init(a, .POST, "/ai/v1/models/instances?model_revision=" ++ wrong);
+    defer activation.deinit();
+    activation.body = "{\"model\":\"acme/demo\",\"task\":\"embedder\"}";
+    var activation_ctx = httpx.Context.init(a, io, &activation);
+    defer activation_ctx.deinit();
+    var refused = try node.loadModelInstance(&activation_ctx);
+    defer refused.deinit();
+    try std.testing.expectEqual(@as(u16, 409), refused.status.code);
+    try std.testing.expect(refused.headers.get(embedding_revision.response_header) == null);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
 }
 

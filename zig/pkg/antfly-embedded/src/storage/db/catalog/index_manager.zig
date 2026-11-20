@@ -27630,9 +27630,6 @@ pub const IndexManager = struct {
     ) !void {
         if (try store.lastReplaySequenceFromTxn(source_txn, 0) != snapshot_sequence)
             return error.DenseBackfillSnapshotSequenceMismatch;
-        // A pinned model's members come only from accepted embedding
-        // artifacts. Raw vector fields cannot backfill this generation.
-        if (entry.model_revision != null) return;
         var schema_views = SchemaViewSet{ .manager = self };
         defer schema_views.deinit();
         var runtime_store = try initRuntimeStore(self.alloc, store);
@@ -27684,10 +27681,22 @@ pub const IndexManager = struct {
                 if (!self.keyInRange(raw_key)) continue;
                 try items.ensureUnusedCapacity(self.alloc, 1);
                 try pending_mappings.ensureUnusedCapacity(self.alloc, 1);
-                const vector_values = (try self.extractDenseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name, entry.dims, &schema_views)) orelse continue;
+                const vector_values = if (entry.model_revision) |revision| blk: {
+                    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(self.alloc, raw_key, denseVectorArtifactNameAt(entry, 0));
+                    defer self.alloc.free(artifact_key);
+                    const accepted = source_txn.get(artifact_key) catch |err| switch (err) {
+                        error.NotFound => continue,
+                        else => return err,
+                    };
+                    if (!std.meta.eql(try enrichment_artifact_codec.denseEmbeddingModelRevision(accepted), @as(?[32]u8, revision)))
+                        return error.ArtifactRepairRequired;
+                    if (try enrichment_artifact_codec.decodeDenseEmbeddingDims(accepted) != entry.dims)
+                        return error.ArtifactRepairRequired;
+                    break :blk try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(self.alloc, accepted);
+                } else (try self.extractDenseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name, entry.dims, &schema_views)) orelse continue;
                 errdefer self.alloc.free(vector_values);
 
-                if (entry.embedding_names.len == 0) {
+                if (entry.model_revision == null and entry.embedding_names.len == 0) {
                     try self.writeDenseEmbeddingArtifactTxn(
                         &mapping_batch,
                         raw_key,
@@ -39516,6 +39525,40 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
     var ready = try index_generation_manifest.load(alloc, active_path);
     defer ready.deinit(alloc);
     try std.testing.expectEqual(snapshot_sequence, ready.ready_applied_sequence);
+}
+
+test "ordered artifact inventory native backfill reconstructs pinned vectors from accepted bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    const accepted_doc = try internal_keys.documentKeyAlloc(alloc, "with-artifact");
+    defer alloc.free(accepted_doc);
+    const raw_only_doc = try internal_keys.documentKeyAlloc(alloc, "without-artifact");
+    defer alloc.free(raw_only_doc);
+    try store.put(accepted_doc, "{\"body\":\"text\"}");
+    try store.put(raw_only_doc, "{\"body\":[9,9]}");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "with-artifact", "semantic");
+    defer alloc.free(artifact_key);
+    const artifact = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAtRevisionAlloc(alloc, 1, true, @splat(0xaa), &.{ 1, 2 });
+    defer alloc.free(artifact);
+    try store.put(artifact_key, artifact);
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.add(&store, .{ .name = "semantic", .kind = .dense_vector, .config_json =
+        \\{"field":"body","dims":2,"embedding_name":"semantic","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"},"semantic_producer":"{\"provider\":\"antfly\",\"model\":\"embed\",\"model_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"}
+    });
+    const entry = manager.denseIndex("semantic") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
+    try std.testing.expect((try manager.lookupDenseVectorId(&store, "semantic", "with-artifact")) != null);
+    try std.testing.expect((try manager.lookupDenseVectorId(&store, "semantic", "without-artifact")) == null);
 }
 
 test "fresh native dense backfill extends a shared vector generation without a source rescan" {

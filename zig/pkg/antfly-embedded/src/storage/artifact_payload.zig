@@ -151,6 +151,7 @@ pub const Metadata = struct {
     header: codec.Header,
     dense_dimensions: ?u32,
     reference: ?Reference,
+    model_revision: ?[32]u8 = null,
 
     pub fn decode(value: []const u8) !Metadata {
         if (isReference(value)) {
@@ -171,6 +172,7 @@ pub const Metadata = struct {
             else
                 try codec.decodeDenseEmbeddingDims(value),
             .reference = null,
+            .model_revision = if (header.kind == .dense_embedding and header.version != codec.codec_version) try codec.denseEmbeddingModelRevision(value) else null,
         };
     }
 
