@@ -45988,9 +45988,9 @@ pub const DB = struct {
             allowed: ?*const std.StringHashMapUnmanaged(void) = null,
             ids: std.ArrayListUnmanaged([]const u8) = .empty,
             local_work: values.Work = .{},
-            fn consume(raw: ?*anyopaque, candidate: db_query_search.MatchAllCandidate) anyerror!void {
+            fn consume(raw: ?*anyopaque, candidate: *db_query_search.MatchAllCandidate) anyerror!void {
                 const value_scan: *@This() = @ptrCast(@alignCast(raw.?));
-                var owned = candidate;
+                var owned = candidate.take();
                 defer owned.deinit(value_scan.a);
                 if (value_scan.allowed) |allowed| if (!allowed.contains(owned.id)) return;
                 if (value_scan.req.cancellation) |token| try token.check();
@@ -48875,9 +48875,13 @@ pub const DB = struct {
         options: db_query_search.MatchAllCandidateCollectOptions,
     ) anyerror!db_query_search.MatchAllCandidates {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        var identity_scan = PrimaryMatchAllIdentityScan{ .db = self, .req = req };
+        const exact_scope = options.exact_primary_keys != null or options.exact_primary_ordinals != null;
         return try db_query_search.collectMatchAllCandidatesWithOptions(alloc, req, .{
             .ctx = self,
             .primary_key_range = self.core.byteRange(),
+            .scan_ids_ctx = if (exact_scope) &identity_scan else null,
+            .scan_ids = if (exact_scope) PrimaryMatchAllIdentityScan.scan else null,
             .scan_store_range = scanStoreRangeCallback,
             .scan_store_range_with_context = scanStoreRangeWithContextCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
@@ -48932,6 +48936,10 @@ pub const DB = struct {
             self.alloc = alloc;
             self.visitor = visitor;
             self.visitor_ctx = visitor_ctx;
+            if (options.exact_primary_keys != null or options.exact_primary_ordinals != null) {
+                try self.scanExactScope(options);
+                return;
+            }
             // Explicit historical reads still need identities deleted since
             // that generation. Current reads use the compact live population.
             const historical = if (self.req.identity_read_generation) |generation| generation < try self.db.currentIdentityReadGeneration() else false;
@@ -49005,6 +49013,32 @@ pub const DB = struct {
             defer txn.abort();
             try self.db.core.store.scanReadTxnWithContext(&txn, lower, upper, .{ .reverse = options.primary_key_reverse }, self, visit);
             if (!self.stopped) _ = try self.drainExceptionalBefore(null);
+        }
+
+        fn scanExactScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
+            const owner_range = self.db.core.byteRange();
+            for (options.exceptionalPrimaryKeys()) |id| {
+                if (!owner_range.contains(id)) continue;
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                if (try self.visitId(id) == .stop) return;
+            }
+            const ordinals = options.exact_primary_ordinals orelse return;
+            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+            defer scratch.deinit();
+            var offset: usize = 0;
+            while (offset < ordinals.len) {
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                _ = scratch.reset(.retain_capacity);
+                var values: [256]?[]const u8 = undefined;
+                const ordinal_batch = ordinals[offset..][0..@min(values.len, ordinals.len - offset)];
+                try resolvePrimaryOrdinalKeysCallback(self.db, scratch.allocator(), ordinal_batch, self.req.identity_read_generation, values[0..ordinal_batch.len]);
+                for (values[0..ordinal_batch.len]) |value| {
+                    const id = value orelse continue;
+                    if (!owner_range.contains(id)) continue;
+                    if (try self.visitId(id) == .stop) return;
+                }
+                offset += ordinal_batch.len;
+            }
         }
 
         fn mappingKeyAlloc(alloc: Allocator, id: []const u8, kind: u8) ![]u8 {
@@ -157454,6 +157488,8 @@ test "optional numeric range keeps mixed primary matches for native field sortin
         };
         var argument: u8 = 0;
         for ([_]u32{ 2, 0 }) |limit| {
+            var count_executor = executor;
+            if (limit == 0) count_executor.collect_candidates_stream = db.matchAllExecutor().collect_candidates_stream;
             var rejected = try db_query_search.searchMatchAll(a, .{
                 .index_name = "ft",
                 .limit = limit,
@@ -157461,7 +157497,7 @@ test "optional numeric range keeps mixed primary matches for native field sortin
                 .resolved_doc_filter = &scope,
                 .native_key_predicate = .{ .ptr = &argument, .allows = Predicate.deny },
                 .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
-            }, executor);
+            }, count_executor);
             defer rejected.deinit();
             try std.testing.expectEqual(@as(usize, 0), rejected.hits.len);
             try std.testing.expectEqual(@as(u32, 0), rejected.total_hits);
@@ -157496,6 +157532,41 @@ test "optional numeric range keeps mixed primary matches for native field sortin
         defer mixed_page.deinit();
         try std.testing.expectEqual(@as(usize, 2), mixed_page.hits.len);
         try std.testing.expectEqualStrings("legacy", mixed_page.hits[1].id);
+        {
+            const c = struct {
+                extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+                extern fn unsetenv(name: [*:0]const u8) c_int;
+            };
+            const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+            const old_budget = if (@import("antfly_platform").env.getenv(budget_env)) |value| try a.dupeSentinel(u8, value, 0) else null;
+            defer if (old_budget) |value| a.free(value);
+            try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "2", 1));
+            defer if (old_budget) |value| {
+                _ = c.setenv(budget_env, value, 1);
+            } else {
+                _ = c.unsetenv(budget_env);
+            };
+            var oversized_scope = doc_set.ResolvedDocFilter{
+                .include = try doc_set.fromOrdinalsAlloc(a, &.{ mapped_ordinal, std.math.maxInt(u32) }),
+            };
+            defer oversized_scope.deinit(a);
+            oversized_scope.legacy_include = try doc_set.cloneDocKeysAlloc(a, &.{"legacy"});
+            var bounded_executor = db.matchAllExecutor();
+            bounded_executor.live_filter_doc_set = null;
+            bounded_executor.nonvisible_doc_set = null;
+            var top = try db_query_search.searchMatchAll(a, .{
+                .index_name = "ft",
+                .limit = 1,
+                .include_stored = false,
+                .resolved_doc_filter = &oversized_scope,
+                .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+            }, bounded_executor);
+            defer top.deinit();
+            try std.testing.expectEqual(@as(u32, 2), top.total_hits);
+            try std.testing.expectEqual(@as(usize, 1), top.hits.len);
+            try std.testing.expectEqualStrings("mapped", top.hits[0].id);
+        }
+
         {
             var write = try db.core.store.beginWriteTxn();
             errdefer write.abort();
