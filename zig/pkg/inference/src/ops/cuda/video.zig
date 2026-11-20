@@ -922,7 +922,7 @@ test "gemma4 real video exports decoded RGB parity fixture" {
         }
     };
     var capture = CaptureFrames{ .compute = &compute, .cb = &cb, .preprocess = &preprocess, .output = output };
-    const stats = try decodeMp4(a, &compute.ctx, bytes, .{ .context = &capture, .consume = CaptureFrames.consume });
+    const stats = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &capture, .consume = CaptureFrames.consume }, .gemma4);
     try std.testing.expect(capture.count > 0);
     try std.testing.expectEqual(stats.selected_frames, capture.count);
 }
