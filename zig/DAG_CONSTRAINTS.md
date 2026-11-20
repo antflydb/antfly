@@ -4,10 +4,10 @@ Issue: https://github.com/antflydb/antfly/issues/1637
 
 ## Status
 
-This branch implements **validation and authority protocol primitives only**. It
-is not an implementation of the complete public DAG feature. `topology: "dag"`
-remains rejected by the runtime parser. Do not add it to the public enum until
-the integration described below is implemented and qualified.
+This branch implements the validation kernel, durable authority, hosted
+activation workflow, and co-located physical write enforcement. Public
+`topology: "dag"` admission requires the distributed integration and
+qualification described below.
 
 Implemented sources:
 
@@ -36,8 +36,9 @@ an ordered set of authority domains atomically with its participant vote.
 It persists a versioned candidate packet and resolves the recorded domains in
 the same batch as the participant decision, including authority-only participants
 and resolution after authority owner changes. Ordinary transactions keep their
-original record format and skip authority lookups. The hosted coordinator can
-carry an explicitly routed authority participant supplied by the caller. Its
+original record format. Source prepares check the local binding marker before
+recording a vote. The hosted coordinator can carry an explicitly routed
+authority participant supplied by the caller. Its
 private HTTP and ordered Raft prepare envelopes have distinct version tags and
 carry binary contribution identifiers. Prepared graph artifact replay can derive
 canonical per-record replacements for a selected index and edge type after the
@@ -107,14 +108,19 @@ refreshes catalog revisions while requiring the pinned topology.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence
-command currently requires a root without asynchronous standby mirroring. The
-activation coordinator still needs to execute the protocol across roots,
-enumerate the pinned graph, and certify end of input. Regular index admission
-and direct graph-index open still reject DAG.
-An existing distributed reservation remains under the original coordinator,
-and the publication coordinator still needs to enlist the authority under
-the source and contender guards. Document-derived and explicit writers still
-need to supply their final contributions.
+command currently requires a root without asynchronous standby mirroring.
+Regular index admission and direct graph-index open still reject DAG. A
+certified catalog generation keeps its declared DAG edge types across refreshes.
+
+The co-located physical writer collects graph artifact preimages and afterimages
+and stages their final replacements atomically with the artifact mutations. It
+reuses decoded catalog bindings within a write and charges preparation and
+validation to one work budget. Source participants with local DAG bindings
+reject transaction prepares until they can prove their final contribution before
+voting. The distributed coordinator still needs to bind the exact source
+replacements to that vote and enlist the authority under the same transaction
+decision. Generated publication across roots also needs that enlistment under
+its source and contender guards.
 
 ## Constraint domain and authority
 
