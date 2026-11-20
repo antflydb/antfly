@@ -12578,6 +12578,61 @@ pub const DataServer = struct {
         }, cancellation);
     }
 
+    /// Run one activation step. The scheduling owner must durably
+    /// commit the returned phase before invoking this again.
+    pub fn advanceDagActivationJob(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        manifest: DagEffects.ScanManifest,
+        route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+        catalog: DagInventory.Command,
+        targets: []const DagInventory.DagActivationTarget,
+        progress: DagEffects.JobProgress,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !DagEffects.JobProgress {
+        const Port = struct {
+            server: *DataServer,
+            allocator: std.mem.Allocator,
+            table: []const u8,
+            manifest: DagEffects.ScanManifest,
+            route: DagActivationRoute,
+            sources: []const DagActivationRoute,
+            catalog: DagInventory.Command,
+            targets: []const DagInventory.DagActivationTarget,
+            cancellation: antfly.db.types.CancellationToken,
+
+            pub fn acquire(p: @This()) !void {
+                try p.server.acquireDagActivationOnRoutes(p.allocator, p.table, p.manifest, p.route, p.sources, p.cancellation);
+            }
+
+            pub fn scan(p: @This(), domain: DagAuthority.Digest, epoch: u64) !bool {
+                return p.server.advanceDagActivationOnRoutes(p.allocator, p.table, p.manifest, p.route, p.sources, domain, epoch, p.cancellation);
+            }
+
+            pub fn publish(p: @This(), epoch: u64) !void {
+                try p.server.publishDagActivationOnRoute(p.allocator, p.table, p.manifest, p.route, p.catalog, p.targets, epoch, p.cancellation);
+            }
+
+            pub fn release(p: @This()) !void {
+                try p.server.releaseDagActivationOnRoutes(p.allocator, p.table, p.manifest, p.route, p.sources, p.cancellation);
+            }
+        };
+        try cancellation.check();
+        return progress.advance(manifest, catalog.binding.digest, catalog.binding.epoch, Port{
+            .server = self,
+            .allocator = alloc,
+            .table = table_name,
+            .manifest = manifest,
+            .route = route,
+            .sources = source_routes,
+            .catalog = catalog,
+            .targets = targets,
+            .cancellation = cancellation,
+        });
+    }
+
     fn localRaftBatchGroupRoutedWithCancellation(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -42995,6 +43050,17 @@ fn consumerTests() type {
                 .roots = &.{.{ .namespace = @splat(3), .index_name = "g", .edge_type = "R", .generation = 1 }},
             }}, @splat(3), @splat(4));
             var server: DataServer = undefined;
+            try std.testing.expectError(error.GraphConstraintRevisionChanged, server.advanceDagActivationJob(
+                std.testing.allocator,
+                "docs",
+                manifest,
+                .{ .namespace = @splat(9), .fence = undefined },
+                &.{},
+                .{ .namespace = @splat(3), .binding = .{ .epoch = 0, .digest = @splat(0), .semantic_digest = @splat(0) }, .catalogs = .{} },
+                &.{},
+                .{ .fence = manifest.fence, .catalog_digest = @splat(0), .catalog_epoch = 0, .owner_epoch = 1 },
+                .none,
+            ));
             try std.testing.expectError(error.GraphConstraintRevisionChanged, server.acquireDagActivationOnRoutes(
                 std.testing.allocator,
                 "docs",

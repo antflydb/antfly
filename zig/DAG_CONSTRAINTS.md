@@ -92,6 +92,9 @@ on roots an abandoned attempt never reached, fencing delayed acquisitions.
 The hosted publication step derives terminal proofs for exactly the manifest
 domains from the destination catalog generation. Ordered apply verifies each
 proof and installs the activation certificate with the catalog binding.
+The hosted job driver advances through acquisition, per-domain scanning,
+publication, and cleanup. A cycle produces a rejection phase that the
+scheduler must persist before releasing fences.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence

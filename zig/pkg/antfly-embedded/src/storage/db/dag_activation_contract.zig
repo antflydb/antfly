@@ -126,6 +126,110 @@ pub const ScanManifest = struct {
     }
 };
 
+/// Persist the returned progress before advancing again. A failed or ambiguous
+/// step can be retried using the previous progress and the same pinned plan.
+pub const JobProgress = struct {
+    fence: authority.SourceFence,
+    catalog_digest: authority.Digest,
+    catalog_epoch: u64,
+    owner_epoch: u64,
+    phase: enum { acquire, scan, publish, release, complete, abandon_cycle, rejected_cycle } = .acquire,
+    next_domain: usize = 0,
+
+    pub fn advance(
+        self: JobProgress,
+        manifest: ScanManifest,
+        catalog_digest: authority.Digest,
+        catalog_epoch: u64,
+        port: anytype,
+    ) !JobProgress {
+        if (!std.meta.eql(self.fence, manifest.fence) or
+            !std.mem.eql(u8, &self.catalog_digest, &catalog_digest) or
+            self.catalog_epoch != catalog_epoch) return error.GraphConstraintRevisionChanged;
+        if (self.owner_epoch == 0) return error.InvalidDagMutation;
+        if (switch (self.phase) {
+            .acquire => self.next_domain != 0,
+            .scan, .abandon_cycle, .rejected_cycle => self.next_domain >= manifest.domains.len,
+            .publish, .release, .complete => self.next_domain != manifest.domains.len,
+        }) return error.InvalidDagMutation;
+
+        var next = self;
+        switch (self.phase) {
+            .acquire => {
+                try port.acquire();
+                next.phase = .scan;
+            },
+            .scan => {
+                const done = port.scan(manifest.domains[self.next_domain].id, self.owner_epoch) catch |err| {
+                    if (err != error.GraphCycle) return err;
+                    next.phase = .abandon_cycle;
+                    return next;
+                };
+                if (done) {
+                    next.next_domain += 1;
+                    if (next.next_domain == manifest.domains.len) next.phase = .publish;
+                }
+            },
+            .publish => {
+                try port.publish(self.owner_epoch);
+                next.phase = .release;
+            },
+            .release => {
+                try port.release();
+                next.phase = .complete;
+            },
+            .abandon_cycle => {
+                try port.release();
+                next.phase = .rejected_cycle;
+            },
+            .complete, .rejected_cycle => {},
+        }
+        return next;
+    }
+};
+
+test "DAG activation persists cycle rejection before releasing its fenced roots" {
+    const manifest = try ScanManifest.init(&.{.{
+        .id = @splat(1),
+        .roots = &.{.{ .namespace = @splat(2), .index_name = "g", .edge_type = "R", .generation = 1 }},
+    }}, @splat(2), @splat(3));
+    const digest: authority.Digest = @splat(4);
+    const Port = struct {
+        releases: usize = 0,
+        cyclic: bool = true,
+
+        pub fn acquire(_: *@This()) !void {}
+
+        pub fn scan(p: *@This(), _: authority.Digest, _: u64) !bool {
+            if (p.cyclic) return error.GraphCycle;
+            return true;
+        }
+
+        pub fn publish(_: *@This(), _: u64) !void {}
+
+        pub fn release(p: *@This()) !void {
+            p.releases += 1;
+        }
+    };
+    var port: Port = .{};
+    const initial: JobProgress = .{ .fence = manifest.fence, .catalog_digest = digest, .catalog_epoch = 9, .owner_epoch = 1 };
+    const scanning = try initial.advance(manifest, digest, 9, &port);
+    try std.testing.expectEqual(.scan, scanning.phase);
+    const abandoned = try scanning.advance(manifest, digest, 9, &port);
+    try std.testing.expectEqual(.abandon_cycle, abandoned.phase);
+    try std.testing.expectEqual(@as(usize, 0), port.releases);
+    try std.testing.expectEqual(.rejected_cycle, (try abandoned.advance(manifest, digest, 9, &port)).phase);
+    try std.testing.expectEqual(@as(usize, 1), port.releases);
+
+    port.cyclic = false;
+    const publishing = try scanning.advance(manifest, digest, 9, &port);
+    try std.testing.expectEqual(.publish, publishing.phase);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, publishing.advance(manifest, @splat(9), 9, &port));
+    const releasing = try publishing.advance(manifest, digest, 9, &port);
+    try std.testing.expectEqual(.release, releasing.phase);
+    try std.testing.expectEqual(.complete, (try releasing.advance(manifest, digest, 9, &port)).phase);
+}
+
 fn hashNumber(hash: *std.crypto.hash.sha2.Sha256, number: u64) void {
     var bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &bytes, number, .big);
