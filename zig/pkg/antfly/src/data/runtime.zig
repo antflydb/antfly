@@ -12398,6 +12398,34 @@ pub const DataServer = struct {
         source_routes: []const DagActivationRoute,
         cancellation: antfly.db.types.CancellationToken,
     ) !void {
+        return self.setDagActivationFencesOnRoutes(alloc, table_name, manifest, authority_route, source_routes, .acquire, cancellation);
+    }
+
+    /// Release source cuts after the caller records publication or abandonment.
+    /// Sources are released first so a new attempt cannot claim the authority
+    /// while cleanup still has outstanding source cuts.
+    pub fn releaseDagActivationOnRoutes(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        manifest: DagEffects.ScanManifest,
+        authority_route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        return self.setDagActivationFencesOnRoutes(alloc, table_name, manifest, authority_route, source_routes, .release, cancellation);
+    }
+
+    fn setDagActivationFencesOnRoutes(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        manifest: DagEffects.ScanManifest,
+        authority_route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+        action: enum { acquire, release },
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
         if (!std.mem.eql(u8, &manifest.authority_namespace, &authority_route.namespace))
             return error.GraphConstraintRevisionChanged;
         try cancellation.check();
@@ -12430,10 +12458,11 @@ pub const DataServer = struct {
                 source.selected = true;
             }
         }
-        for (ordered.items) |route| {
+        for (0..ordered.items.len) |index| {
+            const route = ordered.items[if (action == .acquire) index else ordered.items.len - 1 - index];
             try cancellation.check();
             try localRaftBatchGroupRoutedWithCancellation(self, alloc, route.fence, table_name, .{
-                .dag_source_fence = .{ .namespace = route.namespace, .action = .acquire, .fence = manifest.fence },
+                .dag_source_fence = .{ .namespace = route.namespace, .action = if (action == .acquire) .acquire else .release, .fence = manifest.fence },
             }, cancellation);
         }
     }
@@ -42940,6 +42969,14 @@ fn consumerTests() type {
             }}, @splat(3), @splat(4));
             var server: DataServer = undefined;
             try std.testing.expectError(error.GraphConstraintRevisionChanged, server.acquireDagActivationOnRoutes(
+                std.testing.allocator,
+                "docs",
+                manifest,
+                .{ .namespace = @splat(9), .fence = undefined },
+                &.{},
+                .none,
+            ));
+            try std.testing.expectError(error.GraphConstraintRevisionChanged, server.releaseDagActivationOnRoutes(
                 std.testing.allocator,
                 "docs",
                 manifest,

@@ -86,6 +86,9 @@ route with a bound sized for a physical cursor. Distributed activation still
 needs a durable scheduler. The hosted acquisition step validates the pinned
 routing footprint before proposing the authority fence and each distinct source
 fence. A retry of the same attempt can reuse fences already acquired.
+After recording a terminal decision, the hosted cleanup step releases source
+fences first and the authority fence last. Cleanup records a terminal marker
+on roots an abandoned attempt never reached, fencing delayed acquisitions.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence

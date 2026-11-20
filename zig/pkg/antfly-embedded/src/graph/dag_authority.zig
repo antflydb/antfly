@@ -191,7 +191,14 @@ pub const SourceFenceCommand = struct {
             if (!std.mem.eql(u8, snapshot, &self.fence.snapshot)) return error.GraphConstraintAttemptConflict;
             return;
         } else |err| if (err != error.NotFound) return err;
-        try self.fence.release(txn);
+        if (try SourceFence.read(txn)) |current| {
+            if (std.mem.eql(u8, &current.activation, &self.fence.activation)) {
+                if (!std.meta.eql(current, self.fence)) return error.GraphConstraintAttemptConflict;
+                try txn.delete(SourceFence.key);
+            }
+        }
+        // Cleanup may reach a root this attempt never acquired. Fence delayed
+        // acquisitions without disturbing a different activation's cut.
         try txn.put(&key, &self.fence.snapshot);
     }
 
@@ -1930,6 +1937,13 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     const subsequent: SourceFence = .{ .activation = @splat(10), .snapshot = @splat(11) };
     try subsequent.acquire(&txn);
     try release.stageRelease(&txn);
+    const abandoned: SourceFenceCommand = .{
+        .namespace = @splat(0),
+        .action = .release,
+        .fence = .{ .activation = @splat(12), .snapshot = @splat(13) },
+    };
+    try abandoned.stageRelease(&txn);
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, abandoned.requireIncomplete(&txn));
     try std.testing.expectEqualDeep(subsequent, (try SourceFence.read(&txn)).?);
     try subsequent.release(&txn);
 
