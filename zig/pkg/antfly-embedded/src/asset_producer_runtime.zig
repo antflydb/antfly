@@ -3453,12 +3453,12 @@ pub const Runtime = struct {
             alloc.free(results);
         };
         var image_offset: usize = 0;
-        const local_reader = isLocalReaderProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl());
+        const routed_reader = self.routedReaderConfig(cfg_parsed.value);
+        const local_reader = isLocalReaderProvider(routed_reader.provider, routed_reader.resolvedUrl());
         var reader_chunk_max_images = if (local_reader)
             @min(localReaderBatchMaxImages(), capabilities.batch.max_items)
         else
-            capabilities.batch.max_items;
-        var reader_batch = capabilities.batch;
+            total_images;
         var remaining_response_bytes = self.responseLimitForTask(.reader, total_images);
         while (image_offset < total_images) {
             if (remaining_response_bytes == 0) return error.ResponseTooLarge;
@@ -3467,12 +3467,12 @@ pub const Runtime = struct {
             // attribution. URL-only inputs retain the conservative legacy
             // source boundary until their transport also carries per-item
             // identity.
-            const image_end = if (uses_encoded_media)
+            const image_end = if (uses_encoded_media and local_reader)
                 try encodedReaderBatchEnd(
                     flat_encoded.items,
                     image_offset,
-                    reader_batch,
-                    if (local_reader) .borrowed_binary else .data_uri,
+                    capabilities.batch,
+                    .borrowed_binary,
                 )
             else if (local_reader)
                 readerBatchEnd(flat_source_fingerprints.items, image_offset, reader_chunk_max_images)
@@ -3503,7 +3503,6 @@ pub const Runtime = struct {
                 const attempted = image_end - image_offset;
                 if (local_reader) return err;
                 reader_chunk_max_images = smallerReaderWindow(err, attempted) orelse return err;
-                reader_batch.max_items = reader_chunk_max_images;
                 continue;
             };
             const charged = chunk_batch.responseBytes();
@@ -4102,7 +4101,7 @@ pub const Runtime = struct {
 
     fn validateReaderPlacementGeometry(lease: remote_capabilities.CapabilityLease, geometry: remote_capabilities.DiscoveryMediaGeometry, items: usize) !remote_capabilities.CapabilityLease {
         if (lease.capabilities) |caps| {
-            if (items > 1 and !geometry.fits(caps)) return error.InferenceDiscoveryTooManyItems;
+            if (items > 1 and (!caps.batch.acceptsItems(items) or !geometry.fits(caps))) return error.InferenceDiscoveryTooManyItems;
         }
         return lease;
     }

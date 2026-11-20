@@ -13761,6 +13761,10 @@ pub const Node = struct {
     }
 
     fn requestModelResolutionError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        switch (err) {
+            error.Timeout, error.Canceled, error.Cancelled => return inferenceFailureResponse(ctx, err),
+            else => {},
+        }
         if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
         return switch (requestModelResolutionErrorKind(err)) {
             .invalid => ctx.status(400).json(.{
@@ -38113,6 +38117,25 @@ test "ambiguous model resolution returns an actionable conflict response" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, ambiguous_model_error_message) != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "owner/name:variant") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_RESOLUTION_FAILED") == null);
+}
+
+test "catalog model resolution preserves timeout and cancellation responses" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .GET, "/ai/v1/models");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    const cases = [_]struct { anyerror, u16 }{
+        .{ error.Timeout, 504 },
+        .{ error.Canceled, 408 },
+        .{ error.Cancelled, 408 },
+    };
+    for (cases) |entry| {
+        var response = try Node.requestModelResolutionError(&ctx, entry[0]);
+        defer response.deinit();
+        try std.testing.expectEqual(entry[1], response.status.code);
+    }
 }
 
 test "decide maps model resolution errors to client responses" {
