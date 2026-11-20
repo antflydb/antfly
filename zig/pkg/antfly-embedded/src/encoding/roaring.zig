@@ -1294,9 +1294,22 @@ pub const RoaringBitmap = struct {
         return buf;
     }
 
-    /// Deserialize from bytes.
+    /// Deserialize the canonical wire format.
     pub fn fromBytes(alloc: Allocator, data: []const u8) !RoaringBitmap {
-        if (data.len < 2) return RoaringBitmap.init(alloc);
+        return decodeBytes(alloc, data, null);
+    }
+
+    /// Older deletion records could store a low-cardinality container as
+    /// bitmap words. Only persisted deletion readers accept that layout.
+    pub fn fromPersistedDeletionBytes(alloc: Allocator, data: []const u8) !RoaringBitmap {
+        return fromBytes(alloc, data) catch |err| switch (err) {
+            error.InvalidRoaringBitmap => decodeLegacyDeletionBytes(alloc, data),
+            else => err,
+        };
+    }
+
+    fn decodeBytes(alloc: Allocator, data: []const u8, legacy_dense: ?[]const bool) !RoaringBitmap {
+        if (data.len < 2) return error.InvalidRoaringBitmap;
 
         const n = std.mem.readInt(u16, data[0..2], .little);
         var pos: usize = 2;
@@ -1336,7 +1349,7 @@ pub const RoaringBitmap = struct {
             const card = @as(usize, cards[i]) + 1;
             cumulative[i] = running;
             running += card;
-            if (card > array_max) {
+            if (card > array_max or (legacy_dense != null and legacy_dense.?[i])) {
                 // Bitmap container
                 if (data.len - pos < bitmap_words * @sizeOf(u64)) return error.InvalidRoaringBitmap;
                 const words = try alloc.alloc(u64, bitmap_words);
@@ -1364,9 +1377,90 @@ pub const RoaringBitmap = struct {
                 bm.containers.appendAssumeCapacity(.{ .array = arr });
             }
         }
+        if (pos != data.len) return error.InvalidRoaringBitmap;
         bm.cumulative_cards = cumulative;
 
         return bm;
+    }
+
+    fn decodeLegacyDeletionBytes(alloc: Allocator, data: []const u8) !RoaringBitmap {
+        if (data.len < 2) return error.InvalidRoaringBitmap;
+        const count: usize = std.mem.readInt(u16, data[0..2], .little);
+        const header_len = 2 + count * 4;
+        if (count == 0 or data.len < header_len) return error.InvalidRoaringBitmap;
+        const cards = data[2 + count * 2 .. header_len];
+
+        const dense_bytes = bitmap_words * @sizeOf(u64);
+        var minimum: usize = 0;
+        for (0..count) |index| {
+            const card = @as(usize, std.mem.readInt(u16, cards[index * 2 ..][0..2], .little)) + 1;
+            minimum += if (card <= array_max) card * @sizeOf(u16) else dense_bytes;
+        }
+        if (data.len - header_len < minimum or data.len - header_len > count * dense_bytes) return error.InvalidRoaringBitmap;
+
+        const Frame = struct { offset: usize, minimum: usize, next: u8 = 0 };
+        const frames = try alloc.alloc(Frame, count + 1);
+        defer alloc.free(frames);
+        const layout = try alloc.alloc(bool, count);
+        defer alloc.free(layout);
+        frames[0] = .{ .offset = header_len, .minimum = minimum };
+        var depth: usize = 0;
+        var found = false;
+        // Persisters wrote no representation bit. Explore the two valid
+        // widths only when their contents and suffix lengths agree. Bound
+        // work on damaged input and reject records with multiple layouts.
+        var steps = count * 16 + 1024;
+        while (steps != 0) : (steps -= 1) {
+            if (depth == count) {
+                if (found) return error.InvalidRoaringBitmap;
+                for (layout, frames[0..count]) |*dense, frame| dense.* = frame.next == 2;
+                found = true;
+                depth -= 1;
+                continue;
+            }
+            const frame = &frames[depth];
+            const card = @as(usize, std.mem.readInt(u16, cards[depth * 2 ..][0..2], .little)) + 1;
+            if (frame.next == (if (card <= array_max) @as(u8, 2) else 1)) {
+                if (depth == 0) {
+                    if (!found) return error.InvalidRoaringBitmap;
+                    return decodeBytes(alloc, data, layout);
+                }
+                depth -= 1;
+                continue;
+            }
+            const dense = card > array_max or frame.next == 1;
+            frame.next += 1;
+            const canonical_size = if (card <= array_max) card * @sizeOf(u16) else dense_bytes;
+            const size = if (dense) dense_bytes else canonical_size;
+            const remaining = data.len - frame.offset;
+            const suffix_minimum = frame.minimum - canonical_size;
+            const suffix_maximum = (count - depth - 1) * dense_bytes;
+            if (size > remaining or remaining - size < suffix_minimum or remaining - size > suffix_maximum) continue;
+            if (!matchesLegacyContainer(data[frame.offset..][0..size], card, dense)) continue;
+            depth += 1;
+            frames[depth] = .{ .offset = frame.offset + size, .minimum = suffix_minimum };
+        }
+        return error.InvalidRoaringBitmap;
+    }
+
+    fn matchesLegacyContainer(bytes: []const u8, card: usize, dense: bool) bool {
+        if (dense) {
+            var count: usize = 0;
+            var offset: usize = 0;
+            while (offset < bytes.len) : (offset += @sizeOf(u64)) {
+                count += @popCount(std.mem.readInt(u64, bytes[offset..][0..8], .little));
+                if (count > card) return false;
+            }
+            return count == card;
+        }
+        var previous = std.mem.readInt(u16, bytes[0..2], .little);
+        var offset: usize = 2;
+        while (offset < bytes.len) : (offset += @sizeOf(u16)) {
+            const current = std.mem.readInt(u16, bytes[offset..][0..2], .little);
+            if (current <= previous) return false;
+            previous = current;
+        }
+        return true;
     }
 
     // ========================================================================
@@ -3413,4 +3507,50 @@ test "optional numeric range union handles a skewed overlapping directory" {
     var additions = right.iterator();
     while (additions.next()) |value| try std.testing.expect(left.contains(value));
     try std.testing.expect(left.contains(1023 << 16));
+}
+
+test "optional numeric range persisted deletion decoder recovers older mixed container layouts" {
+    const alloc = std.testing.allocator;
+    const dense_bytes = bitmap_words * @sizeOf(u64);
+    const header = [_]u8{ 3, 0, 0, 0, 1, 0, 2, 0, 0, 0, 2, 0, 1, 0 };
+    var legacy: [header.len + 2 + dense_bytes + 4]u8 = @splat(0);
+    @memcpy(legacy[0..header.len], &header);
+    std.mem.writeInt(u16, legacy[header.len..][0..2], 10, .little);
+    const dense_offset = header.len + 2;
+    for ([_]u16{ 0, 102, 9999 }) |value| legacy[dense_offset + value / 8] |= @as(u8, 1) << @as(u3, @truncate(value));
+    std.mem.writeInt(u16, legacy[dense_offset + dense_bytes ..][0..2], 14, .little);
+    std.mem.writeInt(u16, legacy[dense_offset + dense_bytes + 2 ..][0..2], 20, .little);
+
+    try std.testing.expectError(error.InvalidRoaringBitmap, RoaringBitmap.fromBytes(alloc, &legacy));
+    var recovered = try RoaringBitmap.fromPersistedDeletionBytes(alloc, &legacy);
+    defer recovered.deinit();
+    var deleted = recovered.iterator();
+    for ([_]u32{ 10, 65536, 65536 + 102, 65536 + 9999, 2 * 65536 + 14, 2 * 65536 + 20 }) |expected| {
+        try std.testing.expectEqual(@as(?u32, expected), deleted.next());
+    }
+    try std.testing.expect(deleted.next() == null);
+    const canonical = try recovered.toBytes(alloc);
+    defer alloc.free(canonical);
+    var roundtrip = try RoaringBitmap.fromBytes(alloc, canonical);
+    defer roundtrip.deinit();
+    try std.testing.expect(roundtrip.eql(&recovered));
+}
+
+test "optional numeric range bitmap decoding distinguishes empty truncated and ambiguous data" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidRoaringBitmap, RoaringBitmap.fromBytes(alloc, &.{}));
+    try std.testing.expectError(error.InvalidRoaringBitmap, RoaringBitmap.fromBytes(alloc, &.{0}));
+    try std.testing.expectError(error.InvalidRoaringBitmap, RoaringBitmap.fromBytes(alloc, &.{ 0, 0, 0 }));
+    try std.testing.expectError(error.InvalidRoaringBitmap, RoaringBitmap.fromPersistedDeletionBytes(alloc, &.{0}));
+    var empty = try RoaringBitmap.fromBytes(alloc, &.{ 0, 0 });
+    defer empty.deinit();
+    try std.testing.expect(empty.isEmpty());
+
+    const header = [_]u8{ 2, 0, 0, 0, 1, 0, 0, 0, 0, 0 };
+    var ambiguous: [header.len + bitmap_words * @sizeOf(u64) + 2]u8 = @splat(0);
+    @memcpy(ambiguous[0..header.len], &header);
+    // Either chunk can be dense, with one set bit inside both possible
+    // dense spans and a valid one-value array at either end.
+    ambiguous[header.len + 100] = 1;
+    try std.testing.expectError(error.InvalidRoaringBitmap, RoaringBitmap.fromPersistedDeletionBytes(alloc, &ambiguous));
 }

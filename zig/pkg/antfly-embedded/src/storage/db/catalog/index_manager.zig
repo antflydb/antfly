@@ -35423,7 +35423,7 @@ fn buildSplitSegment(
         owned.deinit();
     };
     if (deletion_bitmap_bytes) |bytes| {
-        deleted = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
+        deleted = try roaring.RoaringBitmap.fromPersistedDeletionBytes(alloc, bytes);
     }
 
     var doc_keys = std.ArrayListUnmanaged([]u8).empty;

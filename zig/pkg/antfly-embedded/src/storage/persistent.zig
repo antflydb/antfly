@@ -1612,7 +1612,7 @@ pub const PersistentIndex = struct {
                     else => return err,
                 };
                 if (deletion_bytes) |bytes| {
-                    var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
+                    var bitmap = try roaring.RoaringBitmap.fromPersistedDeletionBytes(alloc, bytes);
                     if (!bitmap.isEmpty()) {
                         writer.setDeletionBitmap(seg_id, bitmap);
                     } else {
@@ -2645,7 +2645,7 @@ pub const PersistentIndex = struct {
             if (existing_dest.contains(entry.seg_id)) continue;
 
             if (deletion_bytes) |bytes| {
-                var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
+                var bitmap = try roaring.RoaringBitmap.fromPersistedDeletionBytes(alloc, bytes);
                 if (!bitmap.isEmpty()) {
                     replacement_deleted[replacements_initialized] = bitmap;
                 } else {
@@ -4931,11 +4931,45 @@ test "persistent index open keeps recovered segment ownership on later catalog e
         var txn = try pi.beginWriteMainTxn();
         errdefer txn.abort();
         const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
-        try txn.put(.deletions, &seg_key, "\x01\x00");
+        try txn.put(.deletions, &seg_key, "\x01");
         try txn.commit();
     }
 
     try std.testing.expectError(error.InvalidRoaringBitmap, PersistentIndex.open(alloc, .{ .path = path }));
+}
+
+test "persistent index reopens legacy low-cardinality dense deletion records" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    {
+        var pi = try PersistentIndex.open(alloc, .{ .path = path });
+        defer pi.close();
+        const segment = try buildMultiDocSegment(alloc, &.{
+            .{ .doc_id = "doc:a", .term = "alpha" },
+            .{ .doc_id = "doc:b", .term = "beta" },
+        });
+        defer alloc.free(segment);
+        try pi.indexSegment(segment);
+        var legacy: [6 + 8192]u8 = @splat(0);
+        legacy[0] = 1;
+        legacy[6] = 2;
+
+        var txn = try pi.beginWriteMainTxn();
+        errdefer txn.abort();
+        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
+        try txn.put(.deletions, &seg_key, &legacy);
+        try txn.commit();
+    }
+
+    var pi = try PersistentIndex.open(alloc, .{ .path = path });
+    defer pi.close();
+    const deleted = pi.snapshot().segments[0].shared.deleted.?;
+    try std.testing.expectEqual(@as(usize, 1), deleted.cardinality());
+    try std.testing.expect(!deleted.contains(0));
+    try std.testing.expect(deleted.contains(1));
 }
 
 test "persistent index classifies active segments for split" {
