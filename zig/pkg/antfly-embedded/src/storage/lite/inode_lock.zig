@@ -385,6 +385,10 @@ pub const Entry = struct {
     /// Highest durable redo sequence this process published to the shared
     /// lock region. A larger published sequence came from another process.
     self_published_durable_sequence: std.atomic.Value(u64) = .init(0),
+    /// Where this process's latest commit left the redo log's tail, so a
+    /// stale same-process writer resumes there instead of rescanning the
+    /// whole retained log. Guarded by `mutex`; see `RedoAppendCursor`.
+    redo_append_cursor: ?RedoAppendCursor = null,
     /// Defense in depth, not a lock: the `NativeFile` instance (as
     /// `@intFromPtr`, 0 for none yet) that most recently began a
     /// transaction against this inode *while marked `lease_managed`* --
@@ -447,6 +451,34 @@ pub fn redoOverlayAppliedThrough(entry: *Entry, io: Io) u64 {
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
     return if (entry.redo_overlay) |*overlay| overlay.appliedThrough() else 0;
+}
+
+/// A redo writer position: `tail` follows the record at `last_sequence` in
+/// the log run whose first record carries `salt`, in the log region at
+/// `log_offset` of `capacity` bytes. Valid while the log still starts with
+/// that run; a reader checks the salt at the log's start before using it.
+pub const RedoAppendCursor = struct {
+    log_offset: u64,
+    capacity: u64,
+    tail: u64,
+    last_sequence: u64,
+    salt: u64,
+};
+
+pub fn publishRedoAppendCursor(entry: *Entry, io: Io, cursor: RedoAppendCursor) void {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    if (entry.redo_append_cursor) |current| {
+        // Within one run, never move the cursor back.
+        if (current.salt == cursor.salt and current.log_offset == cursor.log_offset and current.last_sequence > cursor.last_sequence) return;
+    }
+    entry.redo_append_cursor = cursor;
+}
+
+pub fn redoAppendCursor(entry: *Entry, io: Io) ?RedoAppendCursor {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    return entry.redo_append_cursor;
 }
 
 pub fn committedSequence(entry: *Entry) u64 {

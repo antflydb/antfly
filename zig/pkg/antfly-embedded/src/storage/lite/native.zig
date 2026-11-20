@@ -10205,6 +10205,14 @@ pub const NativeFile = struct {
         self.namespace_directory_delta_depth = 0;
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.namespace_directory_cache = .empty;
+        // A peer may have recorded a shrink's owed release (an index catalog
+        // record) and its smaller reservation: the cached answer no longer
+        // describes this catalog.
+        const before = self.activeCheckpoint();
+        const after = header.checkpoints[header.active_checkpoint];
+        if (before.index_catalog_root_page != after.index_catalog_root_page or
+            self.header.redo_log_capacity != header.redo_log_capacity or self.header.redo_log_offset != header.redo_log_offset)
+            self.redo_reservation_release_pending = null;
         self.header = header;
         self.rebindRedoWriterToHeader();
     }
@@ -10543,6 +10551,19 @@ pub const NativeFile = struct {
     /// its owner's newest header. Never truncates: unlike `open`'s own
     /// recovery, this is not resolving a crash, so a rejected candidate's
     /// tail is left alone for whichever instance still needs it.
+    /// The shared append cursor, when it describes this log: the same
+    /// region, a position past `floor`, and a log that still starts with the
+    /// cursor's run (its first record carries the cursor's salt; a restart
+    /// picks a new one). Null sends the caller to a full scan.
+    fn redoResumeCursor(self: *NativeFile, io: std.Io, entry: *inode_lock.Entry, floor: u64) !?inode_lock.RedoAppendCursor {
+        const cursor = inode_lock.redoAppendCursor(entry, io) orelse return null;
+        if (cursor.log_offset != self.header.redo_log_offset or cursor.capacity != self.header.redo_log_capacity) return null;
+        if (cursor.tail == 0 or cursor.tail > cursor.capacity or cursor.last_sequence < floor) return null;
+        const salt = (try redo_log.firstRecordSalt(self.file, io, cursor.log_offset, cursor.capacity)) orelse return null;
+        if (salt != cursor.salt) return null;
+        return cursor;
+    }
+
     fn refreshIfWriterBaseStale(self: *NativeFile) !void {
         const entry = self.inode_lock_ref.load(.acquire) orelse return;
         // The inode registry only sees this process's commits. Another
@@ -10630,7 +10651,19 @@ pub const NativeFile = struct {
                 // boundary are already in its tree -- start after the
                 // later of the two, exactly `refreshCrossProcessRedoOverlay`'s
                 // own fix.
-                const outcome = try redo_log.replayBounded(self.allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, @max(redo.durable_sequence, redo.checkpoint_sequence), null, header.checkpoints[header.active_checkpoint].commit_sequence, Noop.onRecord, null);
+                const floor = @max(redo.durable_sequence, redo.checkpoint_sequence);
+                // Another handle in this process committed since: resume
+                // where it left the tail when the log still starts with the
+                // same run, instead of rereading and checksumming every
+                // retained record. The shared overlay already holds them.
+                const resume_at = try self.redoResumeCursor(io, entry, floor);
+                if (builtin.is_test and resume_at == null) test_stale_writer_full_scans += 1;
+                const start_offset: u64 = if (resume_at) |cursor| cursor.tail else 0;
+                var outcome = try redo_log.replayBounded(self.allocator, self.file, io, self.header.redo_log_offset + start_offset, self.header.redo_log_capacity - start_offset, if (resume_at) |cursor| @max(floor, cursor.last_sequence) else floor, null, header.checkpoints[header.active_checkpoint].commit_sequence, Noop.onRecord, null);
+                outcome.valid_bytes += start_offset;
+                if (resume_at) |cursor| if (outcome.last_sequence == null) {
+                    outcome.last_sequence = cursor.last_sequence;
+                };
                 // perf/lwa-xproc-redocorrupt2: this scan has no upper
                 // bound of its own either -- a stop at or past the
                 // *other* process' own published durable ceiling
@@ -10644,6 +10677,9 @@ pub const NativeFile = struct {
                 const ceiling = if (self.regionForInode() catch null) |r| publishedDurableCeiling(r, r.readLogState()) else null;
                 if (outcome.stop_reason == .corrupt_record and (ceiling == null or outcome.valid_bytes < ceiling.?)) return error.NativeRedoLogCorrupt;
                 redo.writer.tail = outcome.valid_bytes;
+                // Another handle may have restarted the log since: learn the
+                // salt of the run this tail belongs to.
+                redo.writer.salt = if (resume_at) |cursor| cursor.salt else null;
                 // A slot-only commit (a ledger reclaim, a capacity shrink's
                 // bookkeeping) consumes a sequence the log never records.
                 redo.writer.last_sequence = @max(outcome.last_sequence orelse 0, latest);
@@ -21461,7 +21497,17 @@ pub const NativeFile = struct {
     /// of the on-disk stale-base check. A no-op if this handle never
     /// registered with the registry (e.g. a bare test construction).
     fn publishCommittedSequenceToInode(self: *NativeFile) void {
-        if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.publishCommittedSequence(entry, self.activeCheckpoint().commit_sequence);
+        if (self.inode_lock_ref.load(.acquire)) |entry| {
+            inode_lock.publishCommittedSequence(entry, self.activeCheckpoint().commit_sequence);
+            if (self.redo) |*redo| if (redo.writer.salt) |salt| if (redo.writer.last_sequence) |last| if (redo.writer.tail != 0)
+                inode_lock.publishRedoAppendCursor(entry, self.runtimeIo(), .{
+                    .log_offset = redo.writer.base_offset,
+                    .capacity = redo.writer.capacity,
+                    .tail = redo.writer.tail,
+                    .last_sequence = last,
+                    .salt = salt,
+                });
+        }
     }
 
     /// The log-full fold in `commitTransactionWithDurability` and
@@ -22435,6 +22481,7 @@ pub const NativeFile = struct {
             // so only the position fields need to carry over.
             if (prepared.redo) |prepared_redo| {
                 self.redo.?.writer.tail = prepared_redo.writer.tail;
+                self.redo.?.writer.salt = prepared_redo.writer.salt;
                 self.redo.?.writer.last_sequence = prepared_redo.writer.last_sequence;
             }
         } else {
@@ -36615,6 +36662,7 @@ test "lite redo log cold open tolerates a corrupt-looking record at or past the 
         .payload_len = 3,
         .commit_sequence = last_sequence + 1,
         .crc32 = 0xdeadbeef,
+        .salt = writer.redo.?.writer.salt.?,
     };
     var header_buf: [redo_log.header_len]u8 = undefined;
     bad.encode(&header_buf);
@@ -36631,6 +36679,56 @@ test "lite redo log cold open tolerates a corrupt-looking record at or past the 
     const value = (try reopened.getDocumentAlloc(a, "alpha")) orelse return error.TestUnexpectedResult;
     defer a.free(value);
     try std.testing.expectEqualStrings("one", value);
+}
+
+/// Full-log rescans by a stale same-process writer's refresh.
+var test_stale_writer_full_scans: u32 = 0;
+
+// A stale handle resumes at the tail another handle in this process left,
+// rather than rereading the whole retained log, and still appends where the
+// log really ends.
+test "lite redo log a stale same-process writer resumes at the shared tail" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-stale-writer-cursor.aflite");
+    defer a.free(path);
+    var first = try NativeFile.createWithRedoLog(a, io, path, .{}, 256 * 1024);
+    defer first.close();
+    try first.beginTransaction();
+    try first.putDocument("seed", "zero");
+    try first.commitTransaction();
+    var second = try NativeFile.openWithIo(a, io, path, .{ .externally_locked = true });
+    defer second.close();
+
+    var key_buf: [16]u8 = undefined;
+    for (0..2) |round| {
+        for (0..8) |i| {
+            try first.beginTransaction();
+            try first.putDocument(try std.fmt.bufPrint(&key_buf, "first-{d}-{d}", .{ round, i }), "value");
+            try first.commitTransaction();
+        }
+        test_stale_writer_full_scans = 0;
+        try second.beginTransaction();
+        try second.putDocument(try std.fmt.bufPrint(&key_buf, "second-{d}", .{round}), "value");
+        try second.commitTransaction();
+        try std.testing.expectEqual(@as(u32, 0), test_stale_writer_full_scans);
+        // A restart between rounds: the cursor the next round resumes from
+        // belongs to the new run.
+        if (round == 0) {
+            try first.beginTransaction();
+            try first.putDocument("before-fold", "value");
+            try first.commitTransaction();
+            try first.checkpointRedoLog();
+        }
+    }
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reopened.close();
+    try expectRedoDocument(&reopened, "seed", "zero");
+    try expectRedoDocument(&reopened, "first-1-7", "value");
+    try expectRedoDocument(&reopened, "second-0", "value");
+    try expectRedoDocument(&reopened, "second-1", "value");
 }
 
 /// Counts (and can fail) `coldRecoverySync`; tests run one at a time.
@@ -36741,6 +36839,7 @@ test "lite redo log cold open stays strict about corruption when the region carr
             .payload_len = 3,
             .commit_sequence = last_sequence + 1,
             .crc32 = 0xdeadbeef,
+            .salt = writer.redo.?.writer.salt.?,
         };
         var header_buf: [redo_log.header_len]u8 = undefined;
         bad.encode(&header_buf);
@@ -39422,6 +39521,51 @@ test "lite redo log resumes a reservation release an interrupted shrink left owe
     try std.testing.expect((try writer.loadLedger(writer.activeCheckpoint())).count(offset_page + old_pages - 1) != 0);
     try expectRedoDocument(&writer, "alpha", "one");
     try expectRedoDocument(&writer, "beta", "two");
+}
+
+// A handle that cached "no release owed" must look again once it adopts a
+// peer's checkpoint that recorded one.
+test "lite redo log a retained handle sees a peer's owed reservation release" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-shrink-peer-cache.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithRedoLog(a, io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+    try writer.checkpointRedoLog();
+
+    var retained = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer retained.close();
+    try std.testing.expect(!try retained.redoReservationReleasePending());
+
+    // The peer's interrupted shrink: the durable intent, then the smaller
+    // header; its release never runs.
+    const page_size: u64 = writer.header.page_size;
+    const old_pages = writer.header.redo_log_capacity / page_size;
+    const target_pages = old_pages / 2;
+    {
+        writer.redo.?.checkpointing = true;
+        defer writer.redo.?.checkpointing = false;
+        var intent: [16]u8 = undefined;
+        std.mem.writeInt(u64, intent[0..8], old_pages, .little);
+        std.mem.writeInt(u64, intent[8..16], target_pages, .little);
+        try writer.putIndexCatalogRecord(NativeFile.redo_reservation_key, &intent);
+        writer.resyncRedoSequenceAfterSlotCommit();
+    }
+    var next_header = writer.header;
+    next_header.redo_log_capacity = target_pages * page_size;
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, next_header);
+    try writer.file.writePositionalAll(io, &encoded, 0);
+    try writer.file.sync(io);
+
+    try retained.adoptOnDiskCheckpoint(io);
+    try std.testing.expect(try retained.redoReservationReleasePending());
 }
 
 // A fold a reader pin defers keeps the superseded log ahead of the records

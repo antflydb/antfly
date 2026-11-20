@@ -29962,6 +29962,7 @@ pub const IndexManager = struct {
             misses.deinit(miss_alloc);
         }
         const locator_complete = try sparse_mod.SparseIndex.projectionHasCompleteLocatorMap(&sparse_txn);
+        var alignment_available = locator_complete;
         var alignment_samples: usize = 0;
         var alignment_hits: usize = 0;
         var ordinal_iter = if (set.* == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
@@ -30004,9 +30005,9 @@ pub const IndexManager = struct {
             try primary_txn.getManySortedOwnedScoped(key_arena.allocator(), keys[0..key_count], values[0..key_count]);
             if (direct) {
                 var proven: [ordinals.len]bool = @splat(false);
-                if (locator_complete and (alignment_samples < 64 or alignment_hits *| 4 >= alignment_samples)) {
-                    try sparse_mod.SparseIndex.proveProjectionDocNums(
-                        key_arena.allocator(),
+                if (alignment_available and (alignment_samples < 64 or alignment_hits *| 4 >= alignment_samples)) {
+                    alignment_available = try sparse_mod.SparseIndex.tryProveProjectionDocNums(
+                        alloc,
                         &sparse_txn,
                         unique_ordinals[0..key_count],
                         values[0..key_count],
@@ -35901,7 +35902,7 @@ fn buildSplitSegment(
         owned.deinit();
     };
     if (deletion_bitmap_bytes) |bytes| {
-        deleted = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
+        deleted = try roaring.RoaringBitmap.fromPersistedDeletionBytes(alloc, bytes, reader.doc_count);
     }
 
     var doc_keys = std.ArrayListUnmanaged([]u8).empty;
