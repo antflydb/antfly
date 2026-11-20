@@ -51330,34 +51330,77 @@ fn scalarSearchAsset(self: *DB, key: []const u8) bool {
 // A PDF page is stored as a generated vector under its logical unit key.
 // Read only the primary-owned artifact header, including for external payloads.
 fn virtualPdfPageUnit(self: *DB, alloc: Allocator, txn: *docstore_mod.DocStore.Txn, key: []const u8) !?[]u8 {
-    if (!internal_keys.isDocumentUnitArtifactRecordKey(key)) return null;
-    var ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, key)) orelse return null;
-    defer ref.deinit(alloc);
-    const unit = ref.unit_id orelse return null;
-    if (!std.mem.startsWith(u8, unit, "page:")) return null;
-    const number = std.fmt.parseUnsigned(u32, unit[5..], 10) catch return null;
-    if (number == 0) return null;
-    var snapshot = try self.core.index_manager.acquireWritePlanSnapshot();
-    defer snapshot.release();
-    const outputs = snapshot.plan().pdf_page_outputs.get(ref.name) orelse return null;
-    for (outputs.items) |output| {
-        const vector = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, key, output);
-        defer alloc.free(vector);
-        const meta = txn.getArtifactMetadata(vector) catch |err| switch (err) {
-            error.NotFound => continue,
-            else => return err,
-        };
-        const source = meta.sourceHash() orelse continue;
-        const fingerprint = try std.fmt.allocPrint(alloc, "{s}:{x:0>16}", .{ output, source });
-        defer alloc.free(fingerprint);
-        return try std.json.Stringify.valueAlloc(alloc, .{
-            .unit_id = unit,
-            .unit_type = "page",
-            .provenance = .{ .page_number = number },
-            ._artifact_unit_fingerprint = fingerprint,
-        }, .{});
+    var values: [1]?[]const u8 = .{null};
+    try hydrateVirtualPdfPageUnits(self, alloc, txn, &.{key}, &values);
+    return if (values[0]) |page| @constCast(page) else null;
+}
+
+// Resolve one output per still-missing page per round. Read only physical headers,
+// keeping the configured output precedence and a single catalog cut for the batch.
+fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.DocStore.Txn, keys: []const []const u8, values: []?[]const u8) !void {
+    const Candidate = struct { index: usize, unit: []const u8, number: u32, outputs: []const []const u8 };
+    const Probe = struct {
+        candidate: Candidate,
+        key: []const u8,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            return std.mem.lessThan(u8, a.key, b.key);
+        }
+    };
+    var snapshot: ?index_manager_mod.IndexManager.WritePlanSnapshotView = null;
+    defer if (snapshot) |*pinned| pinned.release();
+    var batch = std.heap.ArenaAllocator.init(output);
+    defer batch.deinit();
+    var wave = std.heap.ArenaAllocator.init(output);
+    defer wave.deinit();
+    var offset: usize = 0;
+    while (offset < keys.len) {
+        const end = @min(offset + 128, keys.len);
+        _ = batch.reset(.retain_capacity);
+        var candidates: [128]Candidate = undefined;
+        var count: usize = 0;
+        for (offset..end) |i| {
+            if (values[i] != null or !internal_keys.isDocumentUnitArtifactRecordKey(keys[i])) continue;
+            const ref = (try artifact_ids.decodeArtifactRefAlloc(batch.allocator(), keys[i])) orelse continue;
+            const unit = ref.unit_id orelse continue;
+            if (!std.mem.startsWith(u8, unit, "page:")) continue;
+            const number = std.fmt.parseUnsigned(u32, unit[5..], 10) catch continue;
+            if (number == 0) continue;
+            if (snapshot == null) snapshot = try self.core.index_manager.acquireWritePlanSnapshot();
+            const names = snapshot.?.plan().pdf_page_outputs.get(ref.name) orelse continue;
+            if (names.items.len == 0) continue;
+            candidates[count] = .{ .index = i, .unit = unit, .number = number, .outputs = names.items };
+            count += 1;
+        }
+        while (count != 0) {
+            _ = wave.reset(.retain_capacity);
+            var probes: [128]Probe = undefined;
+            var physical: [128][]const u8 = undefined;
+            var headers: [128]?[]const u8 = undefined;
+            for (candidates[0..count], probes[0..count]) |item, *probe| probe.* = .{ .candidate = item, .key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(wave.allocator(), keys[item.index], item.outputs[0]) };
+            if (!std.sort.isSorted(Probe, probes[0..count], {}, Probe.less)) std.mem.sort(Probe, probes[0..count], {}, Probe.less);
+            for (probes[0..count], physical[0..count]) |probe, *key| key.* = probe.key;
+            try txn.getManySortedPhysical(physical[0..count], headers[0..count]);
+            const received = count;
+            count = 0;
+            for (probes[0..received], headers[0..received]) |probe, header| {
+                var item = probe.candidate;
+                if (header) |bytes| {
+                    const meta = try @import("../artifact_payload.zig").Metadata.decode(bytes);
+                    if (meta.sourceHash()) |source| {
+                        const fingerprint = try std.fmt.allocPrint(wave.allocator(), "{s}:{x:0>16}", .{ item.outputs[0], source });
+                        values[item.index] = try std.json.Stringify.valueAlloc(output, .{ .unit_id = item.unit, .unit_type = "page", .provenance = .{ .page_number = item.number }, ._artifact_unit_fingerprint = fingerprint }, .{});
+                        continue;
+                    }
+                }
+                item.outputs = item.outputs[1..];
+                if (item.outputs.len != 0) {
+                    candidates[count] = item;
+                    count += 1;
+                }
+            }
+        }
+        offset = end;
     }
-    return null;
 }
 
 fn materializeSearchStoredValue(self: *DB, alloc: Allocator, key: []const u8, raw: []const u8) ![]u8 {
@@ -51655,10 +51698,11 @@ fn loadStoredSearchDocumentsMany(
     defer privacy_arena.deinit();
     const privacy = @import("privacy_read.zig");
     const policy = try privacy.capture(self, privacy_arena.allocator());
+    var virtual_pages = std.heap.ArenaAllocator.init(alloc);
+    defer virtual_pages.deinit();
+    try hydrateVirtualPdfPageUnits(self, virtual_pages.allocator(), &txn, read_keys, read_values);
     for (pending.items, 0..) |item, i| {
-        const page = if (read_values[i] == null) try virtualPdfPageUnit(self, alloc, &txn, item.store_key) else null;
-        defer if (page) |bytes| alloc.free(bytes);
-        const value = read_values[i] orelse page orelse continue;
+        const value = read_values[i] orelse continue;
         if (policy != null and policy.?.prepared.policy.mode != .monitor) {
             var row_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
             var row_arena = std.heap.ArenaAllocator.init(row_backing.allocator());

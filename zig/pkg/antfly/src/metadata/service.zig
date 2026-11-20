@@ -3790,6 +3790,12 @@ test "index alias decoder floor composes with table features and preserves CAS h
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .apply_system_catalog = envelope }, floor });
 }
 
+test "relation mutation admission gates bound transaction sessions independently of ordinary sessions" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(metadata_topology_protocol.transaction_sessions_version, try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_transaction_sessions = &.{1} }));
+    try std.testing.expectEqual(metadata_topology_protocol.bound_session_version, try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_transaction_sessions = &.{2} }));
+}
+
 fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.TransitionCommand) std.mem.Allocator.Error!u16 {
     if (command == .compare_and_set_job_state) return if (std.mem.startsWith(u8, command.compare_and_set_job_state.key, "privacy/")) metadata_topology_protocol.privacy_version else metadata_topology_protocol.job_state_version;
     const namespace_indexes = switch (command) {
@@ -3817,7 +3823,15 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
         },
         else => {},
     }
-    if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
+    if (command == .apply_transaction_sessions) {
+        const frame = command.apply_transaction_sessions;
+        if (frame.len == 0) return metadata_topology_protocol.current_version;
+        return switch (frame[0]) {
+            1 => metadata_topology_protocol.transaction_sessions_version,
+            2 => metadata_topology_protocol.bound_session_version,
+            else => metadata_topology_protocol.current_version,
+        };
+    }
     if (command == .apply_resolver_authority or command == .advance_resolver_namespace) return metadata_topology_protocol.resolver_records_version;
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
         return if (command.compare_and_replace_table.relation_guard.?.qualified_table) metadata_topology_protocol.bound_ddl_version else metadata_topology_protocol.relation_mutation_version;

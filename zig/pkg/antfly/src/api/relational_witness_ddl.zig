@@ -116,6 +116,8 @@ pub fn prepare(alloc: Allocator, tables: []const records.TableRecord, child_name
     var child_json = try preserveOwned(owned, before, proposed);
     var parents = std.ArrayList(Parent).empty;
     const fks = try child.relationalForeignKeyDefinitions(owned);
+    if (fks.len == 0) return .{ .arena = arena, .schema_json = child_json, .parents = &.{} };
+    const validation = try @import("antfly_local_sources").schema_relational_foreign_key_target.ChildTargets.init(owned, child, fks);
     const Target = struct { table: ?*const records.TableRecord = null, requirements: std.ArrayList(support.ColumnGroup) = .empty };
     var targets: std.StringArrayHashMapUnmanaged(Target) = .empty;
     for (fks) |fk| {
@@ -147,7 +149,7 @@ pub fn prepare(alloc: Allocator, tables: []const records.TableRecord, child_name
             }
             break :blk parent.schema_json;
         };
-        try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(alloc, child_json, name, parent_json);
+        try validation.validateParent(alloc, name, parent_json);
     }
     const owned_result_parents = try parents.toOwnedSlice(owned);
     return .{ .arena = arena, .schema_json = child_json, .parents = owned_result_parents };

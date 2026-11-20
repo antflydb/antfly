@@ -25,7 +25,8 @@ const lease_mod = @import("antfly_local_sources").storage_db_lease;
 const sql_connection_record = @import("sql_connection_record.zig");
 const platform_time = @import("antfly_platform").time;
 
-const session_prefix = "\x00\x00__api_txn_sessions__:";
+const session_record = @import("../metadata/transaction_session_record.zig");
+const session_prefix = session_record.session_prefix;
 const session_lease_prefix = "\x00\x00__api_txn_session_leases__:";
 const session_expiry_prefix = "\x00\x00__api_txn_session_expiry__:";
 const session_recovery_prefix = "\x00\x00__api_txn_session_recovery__:";
@@ -5853,7 +5854,13 @@ fn leaseRecordOwnerNodeId(owner_id: []const u8) ?u64 {
 fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try out.appendSlice(alloc, "{\"owner_node_id\":");
+    const bound = if (session.staged != null and session.staged.?.bound_catalog_incarnation != null) true else blk: {
+        var saves = session.savepoints.valueIterator();
+        while (saves.next()) |save| if (save.snapshot.bound_catalog_incarnation != null) break :blk true;
+        break :blk false;
+    };
+    try out.appendSlice(alloc, if (bound) session_record.bound_session_header else "{");
+    try out.appendSlice(alloc, "\"owner_node_id\":");
     try out.print(alloc, "{d}", .{session.owner_node_id});
     try out.appendSlice(alloc, ",\"principal\":");
     if (session.principal) |principal| {
@@ -5997,6 +6004,9 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         .object => |obj| obj,
         else => return error.InvalidTransactionSessionRecord,
     };
+    if (obj.get("session_format")) |version| {
+        if (version != .number_string or !std.mem.eql(u8, version.number_string, "2")) return error.InvalidTransactionSessionRecord;
+    }
     var session: Session = .{
         .txn_id = txn_id,
         .owner_node_id = if (obj.get("owner_node_id")) |value|
@@ -7939,6 +7949,28 @@ test "transaction commit response includes participant group diagnostics" {
     const participant = conflict.participant.?;
     try std.testing.expectEqual(@as(?u64, 7001), participant.group_id);
     try std.testing.expectEqualStrings("prepare", participant.phase.?);
+}
+
+test "SQL pgwire bound staged and savepoint-only sessions require the bound-session decoder" {
+    const a = std.testing.allocator;
+    for (0..3) |mode| {
+        var session: Session = .{ .txn_id = @splat(1), .owner_node_id = 1, .begin_timestamp = 1, .last_touched_timestamp = 1, .sync_level = .write };
+        defer session.deinit(a);
+        const bound: OwnedTransactionCommitRequest = .{ .bound_catalog_incarnation = @splat(17) };
+        if (mode == 1) session.staged = bound;
+        if (mode == 2) try session.savepoints.put(a, 1, .{ .id = 1, .snapshot = bound });
+        const bytes = try encodeSessionRecord(a, session);
+        defer a.free(bytes);
+        var recovered = try decodeSessionRecord(a, session.txn_id, bytes);
+        defer recovered.deinit(a);
+        if (mode == 1) try std.testing.expectEqual(bound.bound_catalog_incarnation, recovered.staged.?.bound_catalog_incarnation);
+        if (mode == 2) try std.testing.expectEqual(bound.bound_catalog_incarnation, recovered.savepoints.get(1).?.snapshot.bound_catalog_incarnation);
+        const frame = try session_record.encode(a, .{ .changes = &.{.{ .key = session_record.session_prefix ++ "id", .expected = null, .value = bytes }} });
+        defer a.free(frame);
+        try std.testing.expectEqual(@as(u8, if (mode == 0) 1 else 2), frame[0]);
+        frame[0] = if (mode == 0) 2 else 1;
+        try std.testing.expectError(error.InvalidTransactionSessionRecord, session_record.decode(a, frame));
+    }
 }
 
 test "distributed txn session preserves numeric tokens across staging savepoints and durable recovery" {

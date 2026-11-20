@@ -35,6 +35,7 @@ pub const Identity = struct {
 };
 
 pub const Request = struct {
+    capture_cursor_authority: bool = false,
     completion: ?*@import("completion.zig").Completion = null,
     completion_allocator: ?std.mem.Allocator = null,
     statement: []const u8,
@@ -117,6 +118,10 @@ pub const DescriptionStamp = struct {
     reusable: bool = true,
 };
 
+pub const CursorAuthority = struct {
+    ptr: *const anyopaque,
+    validate: *const fn (*const anyopaque, std.mem.Allocator, Identity, Request, bool) anyerror!void,
+};
 pub const Description = struct {
     stamp: ?DescriptionStamp = null,
     columns: []const Column = &.{},
@@ -127,6 +132,8 @@ pub const Description = struct {
 };
 
 pub const Result = struct {
+    /// Captured from the executed binding into the caller's cursor arena.
+    cursor_authority: ?CursorAuthority = null,
     columns: []const Column = &.{},
     rows: []const []const std.json.Value = &.{},
     sql_nulls: ?[]const []const bool = null,

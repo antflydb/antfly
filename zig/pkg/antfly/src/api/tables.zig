@@ -3784,10 +3784,14 @@ fn queryNeedsPrimaryTextIndex(req: db_mod.types.SearchRequest) bool {
 }
 
 pub fn schemaVersion(schema_json: []const u8) !u32 {
+    return schemaVersionAlloc(std.heap.page_allocator, schema_json);
+}
+
+pub fn schemaVersionAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !u32 {
     if (schema_json.len == 0) return 0;
     // Skip schema bodies and index definitions when only the version is needed.
     const Header = struct { version: std.json.Value = .{ .integer = 0 } };
-    var parsed = std.json.parseFromSlice(Header, std.heap.page_allocator, schema_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+    var parsed = std.json.parseFromSlice(Header, alloc, schema_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.UnexpectedToken => return error.InvalidSchemaUpdateRequest,
         else => return err,
     };

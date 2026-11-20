@@ -35,8 +35,9 @@ buffered rows retain a small authorization capsule. Every fetch rechecks current
 credentials, scoped table identities, read grants and row filters. Held rows
 survive later transaction boundaries, not disconnect or node restart. Rollback
 to a savepoint closes cursors created after that savepoint without rewinding
-earlier cursor positions. Blocking plans without a native pull stream remain
-unsupported for SQL DECLARE.
+earlier cursor positions. Blocking SELECT plans materialize once under the same
+cursor quotas. Both paths pin the serving SQL row-policy generation and check
+role membership and effective row filters before releasing buffered rows.
 
 `SET [SESSION|LOCAL] statement_timeout`, `SHOW statement_timeout`, and
 `RESET statement_timeout` work with both simple and extended queries. Values

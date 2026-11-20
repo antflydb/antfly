@@ -2190,7 +2190,8 @@ pub const MetadataHttpServer = struct {
         // tokenless legacy internal calls; this operation must not use that
         // exception. A supplied token is verified by the host middleware even
         // during migration.
-        if (parsed.value == .policy_publication_status and
+        const cursor_read = parsed.value == .resolve_many and parsed.value.resolve_many.cursor_bindings.len != 0;
+        if ((parsed.value == .policy_publication_status or cursor_read) and
             ctx.header(@import("../api/internal_service_auth.zig").header_name) == null)
             return ctx.status(403).text("policy publication status requires an authenticated service");
         if (admin_grant or parsed.value.requiresSettingAuthorityReadGrant()) {
@@ -2212,7 +2213,7 @@ pub const MetadataHttpServer = struct {
         ) catch return ctx.status(400).text("invalid forwarding context")) orelse return ctx.status(400).text("missing forwarding context");
         var context = systemCatalogRequestContext(ctx, forwarding.remaining_ms);
         context.setting_admin = admin_grant;
-        context.row_policy_install_authority = parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin;
+        context.row_policy_install_authority = cursor_read or parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin;
         context.fk_generation_publication_authority = fk_publication_read or parsed.value == .sql_completion_reference_mutate or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
         const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
         const identity_reader = if (!parsed.value.isMutation())

@@ -695,6 +695,27 @@ pub fn findIdentity(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
     return id;
 }
 
+/// Project just the graph identity header. Large graph definitions are skipped
+/// in place when checking a retained cursor across unrelated catalog changes.
+pub fn graphRevisionMatches(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, binding: domain.CursorBinding) !bool {
+    const name_key = try nameKeyAlloc(alloc, group_id, .graph, 0, binding.physical);
+    defer alloc.free(name_key);
+    const id = txn.get(name_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (id.len != 8) return error.InvalidCatalogRecord;
+    if (std.mem.readInt(u64, id[0..8], .little) != binding.id) return false;
+    const key = try recordKeyAlloc(alloc, group_id, .graph, binding.id);
+    defer alloc.free(key);
+    const Header = struct { kind: domain.Kind, parent_id: u64 = 0, name: []const u8, id: u64, graph_revision: u64 = 1 };
+    var header = try std.json.parseFromSlice(Header, alloc, try txn.get(key), .{ .ignore_unknown_fields = true });
+    defer header.deinit();
+    const row = header.value;
+    if (row.kind != .graph or row.parent_id != 0 or row.id != binding.id or !std.mem.eql(u8, row.name, binding.physical)) return error.InvalidCatalogRecord;
+    return row.graph_revision == binding.version;
+}
+
 pub fn find(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) !?std.json.Parsed(domain.Resource) {
     const key = try nameKeyAlloc(alloc, group_id, kind, parent, name);
     defer alloc.free(key);

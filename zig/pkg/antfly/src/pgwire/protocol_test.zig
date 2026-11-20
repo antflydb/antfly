@@ -78,6 +78,7 @@ const Mock = struct {
     revoke_after_commit: bool = false,
     unknown_commit: bool = false,
     cursor_revoked: bool = false,
+    buffered_filter_changed: bool = false,
     stream_fail_at: ?usize = null,
     failed_transactions: usize = 0,
     canceled: std.atomic.Value(bool) = .init(false),
@@ -233,6 +234,11 @@ const Mock = struct {
         return desc.stamp.?.catalog.?.catalog_revision == self.catalog_revision;
     }
 
+    fn validateBuffered(raw: *const anyopaque, _: std.mem.Allocator, _: backend.Identity, req: backend.Request, _: bool) !void {
+        const self: *const Mock = @ptrCast(@alignCast(raw));
+        try req.check();
+        if (self.cursor_revoked or self.buffered_filter_changed) return error.Forbidden;
+    }
     fn describe(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Description {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.describes += 1;
@@ -258,6 +264,11 @@ const Mock = struct {
         return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.settingEpoch() };
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
+        var result = try executeStatement(raw, alloc, request);
+        if (request.capture_cursor_authority) result.cursor_authority = .{ .ptr = raw, .validate = validateBuffered };
+        return result;
+    }
+    fn executeStatement(raw: *anyopaque, alloc: std.mem.Allocator, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
         if (self.result_override) |result| return result;
         self.observed_setting = if (request.setting_overlay.len == 0) null else request.setting_overlay[0].value.integer;
@@ -278,7 +289,9 @@ const Mock = struct {
                 request.diagnostics.?.transaction_status = .idle;
                 return error.SqlTransactionOutcomeUnknown;
             }
-            if (self.revoke_after_commit) self.cursor_revoked = true;
+            if (self.revoke_after_commit) {
+                if (self.stream_rows == 0) self.buffered_filter_changed = true else self.cursor_revoked = true;
+            }
             return .{ .command_tag = "COMMIT", .transaction_status = .idle };
         }
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "rollback")) return .{ .command_tag = "ROLLBACK", .transaction_status = .idle };

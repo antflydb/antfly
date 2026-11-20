@@ -12949,14 +12949,19 @@ pub const RaftApplyStore = struct {
         if (table_id == 0) return error.InvalidRowPolicyPublication;
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        const stamp = (try system_catalog_storage.loadPolicyPublicationStamp(alloc, &txn, group_id, table_id)) orelse {
+        const stamp = try self.policyStampTxn(alloc, &txn, group_id, table_id);
+        return std.json.Stringify.valueAlloc(alloc, stamp, .{});
+    }
+
+    fn policyStampTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !?sql_policies.PublicationStamp {
+        const stamp = (try system_catalog_storage.loadPolicyPublicationStamp(alloc, txn, group_id, table_id)) orelse {
             // Absence is data, not an unsupported capability or a stale fence.
             // A publication without its transactionally written stamp is corrupt.
-            if (try system_catalog_storage.loadPolicyPublication(alloc, &txn, group_id, table_id)) |publication| {
+            if (try system_catalog_storage.loadPolicyPublication(alloc, txn, group_id, table_id)) |publication| {
                 publication.deinit();
                 return error.RowPolicyCatalogChanged;
             }
-            return alloc.dupe(u8, "null");
+            return null;
         };
         if (stamp.topology_generation != 0 and
             !std.mem.eql(u8, &stamp.schema_record_digest, &(@as([32]u8, @splat(0)))))
@@ -12966,13 +12971,13 @@ pub const RaftApplyStore = struct {
             // per-request proof read O(1) in shard count. Begin validates the
             // physical owner cut; later ACKs and promotion validate its
             // transactionally maintained topology and schema fences.
-            try self.validatePolicyOwnerStampTxn(&txn, group_id, stamp);
+            try self.validatePolicyOwnerStampTxn(txn, group_id, stamp);
         } else {
-            var publication = (try system_catalog_storage.loadPolicyPublication(alloc, &txn, group_id, table_id)) orelse return error.RowPolicyCatalogChanged;
+            var publication = (try system_catalog_storage.loadPolicyPublication(alloc, txn, group_id, table_id)) orelse return error.RowPolicyCatalogChanged;
             defer publication.deinit();
-            try self.validatePolicyOwnerCutTxn(&txn, group_id, publication.value);
+            try self.validatePolicyOwnerCutTxn(txn, group_id, publication.value);
         }
-        return std.json.Stringify.valueAlloc(alloc, stamp, .{});
+        return stamp;
     }
 
     pub fn sqlPolicyPublicationWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_table_id: u64) ![]u8 {
@@ -14909,6 +14914,8 @@ pub const RaftApplyStore = struct {
     pub fn resolveSystemCatalogIdentitiesWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany, context: @import("antfly_local_sources").api_operation.RequestContext) !system_catalog.ResolvedMany {
         try context.ensureActive();
         if (request.targets.len > 256 or request.storage_names.len > 256 - request.targets.len or request.relations.len > 256 - request.targets.len - request.storage_names.len) return error.CatalogCommandTooLarge;
+        if (request.cursor_catalog_cut != null and request.cursor_bindings.len == 0) return error.InvalidCatalogMutation;
+        if (request.cursor_bindings.len != 0 and (request.cursor_bindings.len > 256 or request.targets.len != 0 or request.storage_names.len != 0 or request.relations.len != 0 or !request.include_source_epoch or request.include_query_definitions or request.name_allocation)) return error.InvalidCatalogMutation;
         if (request.expected_relation_epoch != null and request.relations.len == 0) return error.InvalidCatalogMutation;
         for (request.relations) |target| try target.validate();
         var txn = try self.beginQueryCatalogReadTxn(group_id);
@@ -14933,6 +14940,34 @@ pub const RaftApplyStore = struct {
             }
         else
             null;
+        if (request.cursor_bindings.len != 0) {
+            // The catalog and physical source revisions jointly fence names and
+            // schemas. Policy promotion and owner fencing are checked on every read.
+            const same_catalog = if (request.cursor_catalog_cut) |cut| cut.revision == meta.revision and source_epoch != null and cut.epoch.eql(source_epoch.?) else false;
+            var hash = std.crypto.hash.Blake3.init(.{});
+            var protected = false;
+            for (request.cursor_bindings) |binding| {
+                try context.ensureActive();
+                if (!same_catalog) {
+                    if (binding.target) |target| {
+                        const row = (try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, alloc, &txn, group_id, target)) orelse return error.CatalogGenerationChanged;
+                        defer row.deinit(alloc);
+                        if (row.table_id != binding.id or !std.mem.eql(u8, row.name, binding.physical)) return error.CatalogGenerationChanged;
+                        var buf: [160]u8 = undefined;
+                        const projection = try borrowTableProjection(try txn.get(try tableKeyForGroup(&buf, group_id, row.table_id)), .schema);
+                        if (try @import("../../api/tables.zig").schemaVersionAlloc(alloc, projection.query_definition.?.schema_json) != binding.version) return error.CatalogGenerationChanged;
+                    } else {
+                        if (!try system_catalog_storage.graphRevisionMatches(alloc, &txn, group_id, binding)) return error.CatalogGenerationChanged;
+                    }
+                }
+                try system_catalog.CursorPolicies.observe(&hash, &protected, binding, if (binding.target != null) try self.policyStampTxn(alloc, &txn, group_id, binding.id) else null);
+            }
+            return .{ .tables = &.{}, .revision = meta.revision, .source_epoch = source_epoch, .cursor_policies = .{ .protected = protected, .digest = digest: {
+                var digest: [32]u8 = undefined;
+                hash.final(&digest);
+                break :digest digest;
+            } } };
+        }
         const tables = try alloc.alloc(?system_catalog.ResolvedTable, request.targets.len);
         var initialized: usize = 0;
         errdefer {
@@ -43434,6 +43469,16 @@ test "system catalog graph authority probes use bounded indexed identities acros
         try system_catalog_storage.applyDelta(alloc, &txn, 21, .{ .next_id = 8, .upserts = @constCast(&[_]system_catalog.Resource{graph}), .removes = &.{} }, .{}, @splat(0));
         try txn.commit();
     }
+    const binding: system_catalog.CursorBinding = .{ .id = 7, .physical = "g", .version = graph.graph_revision };
+    const cursor: system_catalog.ResolveMany = .{ .cursor_bindings = &.{binding}, .include_source_epoch = true };
+    {
+        const reply = try store.resolveSystemCatalogIdentities(alloc, 21, cursor);
+        defer reply.deinit(alloc);
+        try std.testing.expect(!reply.cursor_policies.?.protected);
+        var stale = binding;
+        stale.version += 1;
+        try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(alloc, 21, .{ .cursor_bindings = &.{stale}, .include_source_epoch = true }));
+    }
     const first = try store.graphAuthority(alloc, 21, .{ .name = "g", .graph_id = 7 });
     try std.testing.expect(first.present);
     var buffer: [4096]u8 = undefined;
@@ -43448,6 +43493,7 @@ test "system catalog graph authority probes use bounded indexed identities acros
         try system_catalog_storage.applyDelta(alloc, &txn, 21, .{ .next_id = 8, .removes = @constCast(&[_]system_catalog.Resource{graph}), .upserts = &.{} }, .{ .revision = 1, .next_id = 8 }, @splat(0));
         try txn.commit();
     }
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(alloc, 21, cursor));
     bounded.reset();
     try std.testing.expect(!(try store.graphAuthority(bounded.allocator(), 21, .{ .name = "g", .graph_id = 7 })).present);
     // A replacement may reuse an old revision. It cannot reuse cached presence.

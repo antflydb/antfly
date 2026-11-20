@@ -85,6 +85,7 @@ const SqlCursor = struct {
     arena: std.heap.ArenaAllocator,
     statement: []const u8,
     description: backend.Description,
+    authority: ?backend.CursorAuthority = null,
     stream: ?backend.ReadStream,
     session_id: []const u8,
     fetched: u64 = 0,
@@ -1306,12 +1307,17 @@ pub const Session = struct {
             }
             spool = Spool.init(self.cursor_budget.?);
         }
+        var buffered_authority: ?backend.CursorAuthority = null;
         if (stream == null) {
             // Blocking sorts/aggregates decline pull execution. Materialize
             // once under the statement row cap, then copy into the shared
             // cursor byte/row budget before exposing a cursor name.
+            req.capture_cursor_authority = true;
             var result = try self.source.vtable.execute(self.source.context, arena.allocator(), identity, req);
             defer result.deinit();
+            const authority = result.cursor_authority orelse return error.UnsupportedSqlExecution;
+            try authority.validate(authority.ptr, arena.allocator(), identity, req, true);
+            buffered_authority = authority;
             const same_session = if (self.session_id) |id|
                 if (result.session_id) |observed| std.mem.eql(u8, id, observed) else false
             else
@@ -1329,7 +1335,7 @@ pub const Session = struct {
         const database = if (self.database) |value| try arena.allocator().dupe(u8, value) else null;
         const namespace = try arena.allocator().dupe(u8, self.request_namespace orelse self.effectiveNamespace());
         self.cursor_epoch = std.math.add(u64, self.cursor_epoch, 1) catch return error.ProgramLimitExceeded;
-        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .search_path = self.effectiveSearchPath(), .creation_epoch = self.cursor_epoch });
+        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .authority = buffered_authority, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .search_path = self.effectiveSearchPath(), .creation_epoch = self.cursor_epoch });
         key_moved = true;
         arena_moved = true;
         stream_moved = true;
@@ -1505,9 +1511,8 @@ pub const Session = struct {
         if (cursor.stream) |stream| return stream.validate.?(stream.context, alloc, req);
         if (!cursor.exhausted) return error.InvalidCursorName;
         const identity = self.identity orelse return error.AuthenticationFailed;
-        const current = try self.source.vtable.describe(self.source.context, alloc, identity, req);
-        if (!columnsEqual(cursor.description.columns, current.columns) or
-            !std.mem.eql(u8, cursor.description.binding_guard orelse "", current.binding_guard orelse "")) return error.CatalogGenerationChanged;
+        const authority = cursor.authority orelse return error.InvalidCursorName;
+        try authority.validate(authority.ptr, alloc, identity, req, false);
     }
 
     fn finishSqlCursors(self: *Session, committed: bool) void {
@@ -1928,6 +1933,7 @@ test "pgwire typed parameter failures retain actionable PostgreSQL SQLSTATEs" {
     try std.testing.expectEqualStrings("22003", sqlstate(error.SqlNumericOutOfRange));
     try std.testing.expectEqualStrings("22021", sqlstate(error.SqlInvalidTextEncoding));
     try std.testing.expectEqualStrings("42P08", sqlstate(error.ConflictingSqlParameterTypes));
+    try std.testing.expectEqualStrings("40001", sqlstate(error.RowPolicyCatalogChanged));
 }
 
 fn sqlstate(err: anyerror) []const u8 {
@@ -1959,7 +1965,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => "22023",
         error.UnsupportedReadVisibility => "0A000",
         error.ReadRequirementNotReady => "53300",
-        error.CatalogGenerationChanged, error.ReadSnapshotTooOld => "40001",
+        error.CatalogGenerationChanged, error.RowPolicyCatalogChanged, error.ReadSnapshotTooOld => "40001",
         error.InFailedSqlTransaction => "25P02",
         error.CursorMustBeInTransaction, error.NoActiveSqlTransaction => "25P01",
         error.CursorNotScrollable => "55000",

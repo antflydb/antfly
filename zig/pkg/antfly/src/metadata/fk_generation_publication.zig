@@ -625,6 +625,9 @@ pub const InitialCreatePlan = struct {
         const fks = try parsed.relationalForeignKeyDefinitions(alloc);
         defer if (fks.len > 0) alloc.free(fks);
         if (fks.len == 0 or fks.len > max_constraints) return error.InvalidGenerationPublication;
+        var validation_arena = std.heap.ArenaAllocator.init(alloc);
+        defer validation_arena.deinit();
+        const validation = try @import("antfly_local_sources").schema_relational_foreign_key_target.ChildTargets.init(validation_arena.allocator(), parsed, fks);
         // Consume each constraint exactly once, including self references.
         var unassigned: std.StringHashMapUnmanaged([]const u8) = .empty;
         defer unassigned.deinit(alloc);
@@ -655,7 +658,7 @@ pub const InitialCreatePlan = struct {
         var support_changes: usize = 0;
         if (transitions > max_constraints) return error.InvalidGenerationPublication;
         if (self.self_transitions.len != 0)
-            try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(alloc, self.child.schema_json, self.child.name, self.child.schema_json);
+            try validation.validateParent(alloc, self.child.name, self.child.schema_json);
         for (self.self_transitions, 0..) |transition, ti| {
             try transition.validate(self.child);
             if (transition.expected_generation != null or transition.next_generation == null or
@@ -710,9 +713,9 @@ pub const InitialCreatePlan = struct {
             if (self.support_pending) {
                 const after = parent.support_after orelse parent.table;
                 if (after.table_id != parent.table.table_id or !std.mem.eql(u8, after.name, parent.table.name)) return error.InvalidGenerationPublication;
-                try validateInitialPartialParent(alloc, self.child.schema_json, fks, after);
+                if (groups.items.len != 0) try validation.validateParent(alloc, after.name, after.schema_json);
             } else {
-                try validateInitialPartialParent(alloc, self.child.schema_json, fks, parent.table);
+                if (groups.items.len != 0) try validation.validateParent(alloc, parent.table.name, parent.table.schema_json);
             }
             owners = std.math.add(usize, owners, parent.ranges.len) catch return error.InvalidGenerationPublication;
             transitions = std.math.add(usize, transitions, parent.transitions.len) catch return error.InvalidGenerationPublication;
@@ -822,15 +825,6 @@ pub const InitialCreatePlan = struct {
             return error.InvalidGenerationPublication;
     }
 };
-
-fn validateInitialPartialParent(alloc: std.mem.Allocator, child_json: []const u8, fks: anytype, parent: records.TableRecord) !void {
-    for (fks) |fk| {
-        if (fk.match == .partial and std.mem.eql(u8, fk.parent_table, parent.name)) {
-            try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(alloc, child_json, parent.name, parent.schema_json);
-            return;
-        }
-    }
-}
 
 /// Derived from the committed immutable plan, never a supervisor-supplied
 /// index name. A parent owner must prove each selected witness is ready before
@@ -1871,7 +1865,10 @@ test "initial MATCH PARTIAL publication pins parent witness support" {
     defer child.deinit(alloc);
     const fks = try child.relationalForeignKeyDefinitions(alloc);
     defer alloc.free(fks);
-    try std.testing.expectError(error.ForeignKeyPartialSupportIndexRequired, validateInitialPartialParent(alloc, child_json, fks, .{ .table_id = 201, .name = "parent", .schema_json = parent_json }));
+    var validation_arena = std.heap.ArenaAllocator.init(alloc);
+    defer validation_arena.deinit();
+    const validation = try @import("antfly_local_sources").schema_relational_foreign_key_target.ChildTargets.init(validation_arena.allocator(), child, fks);
+    try std.testing.expectError(error.ForeignKeyPartialSupportIndexRequired, validation.validateParent(alloc, "parent", parent_json));
     const supported = (try @import("antfly_local_sources").schema_relational_witness_indexes.ensureCoverage(alloc, parent_json, &.{ "a", "b" })).?;
     defer alloc.free(supported);
     const no_full_text: records.TableRecord = .{
@@ -1886,14 +1883,14 @@ test "initial MATCH PARTIAL publication pins parent witness support" {
     const recomputed = try @import("../api/tables.zig").applySchemaUpdateRecordWithIncarnation(alloc, &no_full_text, supported, 1);
     defer table_manager.freeTable(alloc, recomputed);
     try std.testing.expect(table_manager.tableDefinitionsEqual(no_full_text_after, recomputed));
-    try validateInitialPartialParent(alloc, child_json, fks, .{ .table_id = 201, .name = "parent", .schema_json = supported });
+    try validation.validateParent(alloc, "parent", supported);
     var names_arena = std.heap.ArenaAllocator.init(alloc);
     defer names_arena.deinit();
     const names = try initialPartialSupportNames(names_arena.allocator(), child_json, .{ .table_id = 201, .name = "parent", .schema_json = supported });
     try std.testing.expectEqual(@as(usize, 2), names.len);
     try std.testing.expectEqualStrings(&@import("antfly_local_sources").schema_relational_witness_indexes.supportName("a"), names[0]);
     try std.testing.expectEqualStrings(&@import("antfly_local_sources").schema_relational_witness_indexes.supportName("b"), names[1]);
-    try std.testing.expectError(error.ForeignKeyTargetNotUnique, validateInitialPartialParent(alloc, child_json, fks, .{ .table_id = 201, .name = "parent", .schema_json = child_json }));
+    try std.testing.expectError(error.ForeignKeyTargetNotUnique, validation.validateParent(alloc, "parent", child_json));
 }
 
 test "FK generation publication derives history-bound replacement and reparenting" {

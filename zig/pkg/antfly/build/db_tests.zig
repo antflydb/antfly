@@ -890,7 +890,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "externalizeSearchResultArtifactIds",
             "native asset members hydrate source authority and revision identity",
-            "direct PDF member preserves stored page metadata",
+            "direct PDF member",
             "native unit ancestry uses its configured producer name",
             "native member logical filters use parent values and shared verification budgets",
             "missing modality producers and transcription failures remain incomplete",
@@ -943,7 +943,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_lib_db_result_shape_tests = addFilteredTestRunArtifact(b, lib_db_result_shape_tests);
     lib_db_query_step.dependOn(&run_lib_db_result_shape_tests.step);
-    const alias_provenance_run = addFilteredTestRunArtifactWithRuntimeFilters(b, lib_db_result_shape_tests, &.{"externalizeSearchResultArtifactIds"});
+    const alias_provenance_run = addFilteredTestRunArtifactWithRuntimeFilters(b, lib_db_result_shape_tests, &.{ "externalizeSearchResultArtifactIds", "direct PDF member" });
     b.step("antfly-index-alias-provenance-test", "Verify repeated member identity conversion and allocation cleanup")
         .dependOn(&alias_provenance_run.step);
 

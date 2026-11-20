@@ -433,7 +433,7 @@ const OwnedRead = struct {
     admission: http.RequestAdmission.Lease,
     stream: *Pull.Stream,
     columns: []const wire.Column,
-    policies: []const Policy,
+    retained: RetainedRead,
     detached: bool = false,
     const Policy = struct {
         resource: []const u8,
@@ -488,6 +488,7 @@ const OwnedRead = struct {
         errdefer if (self.session_id) |id| server.alloc.free(id);
         // Native catalog resolution extends this identity with aliases using
         // server.alloc; every allocation in the mutable identity must share it.
+        const admitted_revision = credential.readRevision();
         self.identity = try credential.identity(server.alloc);
         errdefer self.identity.?.deinit(server.alloc);
         // Statement, parameter and binding-guard data are portal-owned. Keep a
@@ -535,6 +536,8 @@ const OwnedRead = struct {
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
+        var opening: CursorAdmission = .{ .out = arena, .adapter = adapter, .native = &self.native_adapter, .credential = credential, .admitted = admitted_revision };
+        opening.install(&stream_backend);
         const opened = try Pull.Stream.openOwned(try @import("sql_memory_owner.zig").create(adapter.server.alloc, alloc, adapter.server.shared_resource_manager orelse &adapter.server.local_resource_manager), stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
         if (opened == null) {
             if (self.decision_runtime) |*active| active.deinit();
@@ -558,6 +561,7 @@ const OwnedRead = struct {
             self.native_adapter.graph_parameter_cells = frame.values;
         };
         errdefer self.stream.close();
+        self.retained = opening.captured orelse return error.InvalidSqlBackendResponse;
         if (self.session_id) |id_hex| if (self.range_guards.tables.len != 0) {
             const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
             _ = (try server.txn_sessions.stage(server.alloc, id, &self.range_guards)) orelse return error.SqlTransactionNotActive;
@@ -566,17 +570,6 @@ const OwnedRead = struct {
             lease.release();
             transaction_lease = null;
         }
-        const binding = self.stream.context.binding;
-        var policies: std.ArrayList(Policy) = .empty;
-        const scan_count = if (binding.relation) |relation| relation.scans.len else @intFromBool(binding.table != null);
-        for (0..scan_count) |i| {
-            const table = if (binding.relation) |relation| relation.scans[i].table else binding.table.?;
-            try policies.append(arena, try Policy.capture(arena, self.identity, table));
-            if (table.graph) |graph| for (graph.dependencies) |dependency| {
-                try policies.append(arena, try Policy.capture(arena, self.identity, dependency));
-            };
-        }
-        self.policies = policies.items;
         const columns = try arena.alloc(wire.Column, self.stream.context.binding.columns.len);
         for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
         self.columns = columns;
@@ -601,43 +594,7 @@ const OwnedRead = struct {
         if (!std.mem.eql(u8, original.database.?, request.database orelse "default") or !std.mem.eql(u8, original.namespace.?, request.namespace orelse "public") or
             !std.meta.eql(original.search_path, request.search_path) or
             !std.mem.eql(u8, original.binding_guard orelse "", request.binding_guard orelse "")) return error.CatalogGenerationChanged;
-        // Detached rows retain immutable source identity, not permission to
-        // follow a renamed/replaced logical resource into a different table.
-        // Resolve definitions only: never reacquire or rerun the row snapshot.
-        var current: ?http.AuthenticatedIdentity = try self.authority.credential.identity(self.adapter.server.alloc);
-        defer current.?.deinit(self.adapter.server.alloc);
-        try validatePolicies(self.adapter.server.alloc, &current.?, self.identity.?, self.policies);
-        var authority: Authority = .{ .credential = self.authority.credential, .identity = &current, .request = request };
-        var adapter: execution.Adapter = .{ .server = self.adapter.server, .identity = &current, .context = try authority.context(), .database = original.database.?, .namespace = original.namespace.? };
-        const domain = @import("antfly_local_sources").system_catalog_domain;
-        var targets: std.ArrayList(domain.Target) = .empty;
-        var expected: std.ArrayList(Policy) = .empty;
-        var has_graph = false;
-        for (self.policies) |policy| {
-            if (policy.graph_revision) |version| {
-                has_graph = true;
-                const bytes = try adapter.server.source.systemCatalog(alloc, adapter.context, .{ .read = .{ .kind = .graph, .name = policy.resource } });
-                const cut = try std.json.parseFromSliceLeaky(domain.State, alloc, bytes, .{});
-                const graph = cut.find(.graph, 0, policy.resource) orelse return error.CatalogGenerationChanged;
-                if (graph.id != policy.id or graph.graph_revision != version) return error.CatalogGenerationChanged;
-                if (adapter.revision) |revision| if (cut.revision != revision) return error.CatalogGenerationChanged;
-                adapter.revision = cut.revision;
-            } else if (policy.name) |name| {
-                try targets.append(alloc, .{ .database = name.database.?, .namespace = name.namespace.?, .table = name.table });
-                try expected.append(alloc, policy);
-            }
-        }
-        // Verify even a graph with no label tables against the source epoch.
-        if (has_graph and targets.items.len == 0) _ = try adapter.resolveMany(alloc, &.{}, .read);
-        var offset: usize = 0;
-        while (offset < targets.items.len) {
-            const end = @min(offset + 256, targets.items.len);
-            const bindings = try adapter.resolveMany(alloc, targets.items[offset..end], .read);
-            for (bindings, expected.items[offset..end]) |table, policy| {
-                if (table.id != policy.id or table.schema_version != policy.schema_version or !std.mem.eql(u8, table.physical_name, policy.resource)) return error.CatalogGenerationChanged;
-            }
-            offset = end;
-        }
+        try self.retained.check(alloc, self.authority.credential, request, false);
     }
 
     fn next(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
@@ -661,9 +618,7 @@ const OwnedRead = struct {
             defer state.deinit(self.adapter.server.alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionNotActive;
         }
-        var fresh = try self.authority.credential.identity(alloc);
-        defer fresh.deinit(alloc);
-        try validatePolicies(alloc, &fresh, self.identity.?, self.policies);
+        try self.retained.check(alloc, self.authority.credential, request, false);
         var page = try self.stream.nextBatch(limit);
         errdefer page.deinit();
         const owner = try alloc.create(PageOwner);
@@ -682,6 +637,10 @@ const OwnedRead = struct {
         // permissions or filters. Buffered operator rows need this check too:
         // they need not cause another native cursor.next call.
         for (admitted.catalog_aliases) |alias| try http.projectCatalogIdentity(alloc, fresh, alias.logical, alias.physical);
+        try validateProjectedPolicies(alloc, fresh, policies);
+    }
+
+    fn validateProjectedPolicies(alloc: std.mem.Allocator, fresh: *http.AuthenticatedIdentity, policies: []const Policy) !void {
         if (policies.len == 0) return;
         var local: [8]http.GraphPermissionCheck = undefined;
         const checks = if (policies.len <= local.len) local[0..policies.len] else try alloc.alloc(http.GraphPermissionCheck, policies.len);
@@ -753,7 +712,182 @@ const OwnedRead = struct {
     }
 };
 
+const ReadRevision = struct { grants: u64, token: u64, roles: ?u64 };
+
+// Capture the exact executable binding before either kind of reader can touch
+// rows. Preserve existing after-write receipt validation on the same binding.
+const CursorAdmission = struct {
+    out: std.mem.Allocator,
+    adapter: *Adapter,
+    native: *execution.Adapter,
+    credential: *Credential,
+    admitted: ReadRevision,
+    previous: @FieldType(catalog.Backend, "execution_binding_validator") = null,
+    captured: ?RetainedRead = null,
+
+    fn install(self: *@This(), backend: *catalog.Backend) void {
+        self.previous = backend.execution_binding_validator;
+        backend.execution_binding_validator = .{ .ptr = self, .validate = capture };
+    }
+
+    fn capture(raw: *anyopaque, scratch: std.mem.Allocator, binding: describe_sql.BoundStatement) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.previous) |validator| try validator.validate(validator.ptr, scratch, binding);
+        self.captured = try RetainedRead.capture(self.out, self.adapter, self.credential, self.native.identity.* orelse return error.Unauthorized, binding, self.native.context, self.native.revision, self.admitted);
+    }
+};
+
+const RetainedRead = struct {
+    const Domain = @import("antfly_local_sources").system_catalog_domain;
+    adapter: *Adapter,
+    policies: []const OwnedRead.Policy,
+    bindings: []const Domain.CursorBinding,
+    admitted: ReadRevision,
+    cut: Cut,
+    const Cut = struct { policies: Domain.CursorPolicies, stamp: ?wire.CatalogStamp, revision: ?u64 };
+
+    fn capture(out: std.mem.Allocator, adapter: *Adapter, credential: *Credential, identity: http.AuthenticatedIdentity, binding: describe_sql.BoundStatement, context: operation.RequestContext, revision: ?u64, admitted: ReadRevision) !RetainedRead {
+        var temp = std.heap.ArenaAllocator.init(adapter.server.alloc);
+        defer temp.deinit();
+        var tables: std.ArrayHashMapUnmanaged(BindingEntry, catalog.Table, BindingEntryContext, true) = .empty;
+        try collectBindingTables(temp.allocator(), binding, &tables, 0);
+        const policies = try out.alloc(OwnedRead.Policy, tables.count());
+        const bindings = try out.alloc(Domain.CursorBinding, tables.count());
+        for (tables.values(), policies, bindings) |table, *policy, *target| {
+            policy.* = try OwnedRead.Policy.capture(out, identity, table);
+            const name = policy.name;
+            if (name == null and policy.graph_revision == null) return error.InvalidSqlBackendResponse;
+            target.* = .{ .target = if (name) |n| .{ .database = n.database.?, .namespace = n.namespace.?, .table = n.table } else null, .physical = policy.resource, .id = policy.id, .version = policy.graph_revision orelse policy.schema_version };
+        }
+        var result: RetainedRead = .{ .adapter = adapter, .policies = policies, .bindings = bindings, .admitted = admitted, .cut = undefined };
+        result.cut = try result.readCut(temp.allocator(), context, revision, null);
+        if (!std.meta.eql(admitted, credential.readRevision())) return error.Forbidden;
+        return result;
+    }
+
+    fn readCut(self: *const RetainedRead, allocator: std.mem.Allocator, context: operation.RequestContext, expected: ?u64, known: ?wire.CatalogStamp) !Cut {
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var revision = expected;
+        var stamp: ?wire.CatalogStamp = null;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        var protected = false;
+        var offset: usize = 0;
+        var internal = context;
+        internal.row_policy_install_authority = true;
+        while (offset < self.bindings.len) {
+            _ = scratch.reset(.retain_capacity);
+            const end = @min(offset + 256, self.bindings.len);
+            const request: Domain.ResolveMany = .{ .cursor_bindings = self.bindings[offset..end], .cursor_catalog_cut = if (known) |cut| .{ .revision = cut.catalog_revision, .epoch = cut.relation_epoch } else null, .expected_revision = revision, .include_source_epoch = true };
+            const reply = try self.bindingBatch(a, internal, request);
+            const policies = reply.cursor_policies orelse return error.InvalidSqlBackendResponse;
+            try context.checkCatalogIncarnation(reply.source_epoch);
+            if (revision) |r| if (r != reply.revision) return error.CatalogGenerationChanged;
+            const observed: ?wire.CatalogStamp = if (reply.source_epoch) |epoch| .{ .catalog_revision = reply.revision, .relation_epoch = epoch } else null;
+            if (offset != 0 and !std.meta.eql(stamp, observed)) return error.CatalogGenerationChanged;
+            stamp = observed;
+            revision = reply.revision;
+            hash.update(&policies.digest);
+            protected = protected or policies.protected;
+            offset = end;
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return .{ .policies = .{ .digest = digest, .protected = protected }, .stamp = stamp, .revision = revision };
+    }
+
+    fn bindingBatch(self: *const RetainedRead, a: std.mem.Allocator, context: operation.RequestContext, request: Domain.ResolveMany) !Domain.ResolvedMany {
+        const source = self.adapter.server.source;
+        if (source.systemCatalog(a, context, .{ .resolve_many = request })) |bytes| {
+            const reply = try std.json.parseFromSliceLeaky(Domain.ResolvedMany, a, bytes, .{ .ignore_unknown_fields = true });
+            if (reply.cursor_policies != null) return reply;
+        } else |err| switch (err) {
+            error.UnknownField, error.UnsupportedOperation => {},
+            else => return err,
+        }
+        // Older owners expose the same proofs individually. Fence both ends
+        // of their batch and require an explicit publication status per table.
+        var targets: std.ArrayList(Domain.Target) = .empty;
+        for (request.cursor_bindings) |binding| if (binding.target) |target| try targets.append(a, target);
+        const legacy: Domain.ResolveMany = .{ .targets = targets.items, .expected_revision = request.expected_revision, .include_source_epoch = true, .include_query_definitions = true };
+        const bytes = source.systemCatalog(a, context, .{ .resolve_many = legacy }) catch |err| switch (err) {
+            error.UnknownField, error.UnsupportedOperation => blk: {
+                if (context.bound_catalog_incarnation != null) return error.CatalogGenerationChanged;
+                var old = legacy;
+                old.include_source_epoch = false;
+                break :blk try source.systemCatalog(a, context, .{ .resolve_many = old });
+            },
+            else => return err,
+        };
+        var reply = try std.json.parseFromSliceLeaky(Domain.ResolvedMany, a, bytes, .{ .ignore_unknown_fields = true });
+        try context.checkCatalogIncarnation(reply.source_epoch);
+        if (reply.tables.len != targets.items.len) return error.InvalidSqlBackendResponse;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        var protected = false;
+        var index: usize = 0;
+        for (request.cursor_bindings) |binding| {
+            const stamp = if (binding.target != null) table: {
+                const row = reply.tables[index] orelse return error.CatalogGenerationChanged;
+                index += 1;
+                const definition = row.query_definition orelse return error.InvalidSqlBackendResponse;
+                if (row.table_id != binding.id or definition.table_id != binding.id or !std.mem.eql(u8, row.name, binding.physical) or
+                    try @import("tables.zig").schemaVersionAlloc(a, definition.schema_json) != binding.version) return error.CatalogGenerationChanged;
+                const raw = try source.systemCatalog(a, context, .{ .policy_publication_status = binding.id });
+                break :table try std.json.parseFromSliceLeaky(?@import("antfly_local_sources").system_catalog_policies.PublicationStamp, a, raw, .{ .ignore_unknown_fields = true });
+            } else graph: {
+                const raw = try source.systemCatalog(a, context, .{ .read = .{ .kind = .graph, .name = binding.physical } });
+                const state = try std.json.parseFromSliceLeaky(Domain.State, a, raw, .{ .ignore_unknown_fields = true });
+                const row = state.find(.graph, 0, binding.physical) orelse return error.CatalogGenerationChanged;
+                if (state.revision != reply.revision or row.id != binding.id or row.graph_revision != binding.version) return error.CatalogGenerationChanged;
+                break :graph null;
+            };
+            try Domain.CursorPolicies.observe(&hash, &protected, binding, stamp);
+        }
+        const last = try source.systemCatalog(a, context, .{ .resolve_many = .{ .include_source_epoch = reply.source_epoch != null, .expected_revision = reply.revision } });
+        const end = try std.json.parseFromSliceLeaky(Domain.ResolvedMany, a, last, .{ .ignore_unknown_fields = true });
+        if (end.revision != reply.revision or !std.meta.eql(end.source_epoch, reply.source_epoch)) return error.CatalogGenerationChanged;
+        reply.cursor_policies = .{ .digest = undefined, .protected = protected };
+        hash.final(&reply.cursor_policies.?.digest);
+        return reply;
+    }
+
+    fn check(self: *const RetainedRead, a: std.mem.Allocator, credential: *Credential, request: wire.Request, materialized: bool) !void {
+        try request.check();
+        try credential.validate();
+        if (self.adapter.server.cfg.user_manager != credential.manager) return error.Unauthorized;
+        // Every role mutation publishes the manager's authorization revision.
+        // Only enter the role graph or reconstruct filters when that stamp moves.
+        if (credential.grantRevision() != self.admitted.grants or credential.trusted_revision != self.admitted.token) {
+            if (self.cut.policies.protected and (credential.trusted_revision != self.admitted.token or
+                (if (credential.manager) |manager| manager.rowPolicyRoleRevision() else null) != self.admitted.roles)) return error.Forbidden;
+            if (materialized) return error.Forbidden;
+            var fresh = try credential.identity(a);
+            defer fresh.deinit(a);
+            for (self.bindings) |binding| if (binding.target) |target| {
+                const logical = try target.resourceNameAlloc(a);
+                defer a.free(logical);
+                try http.projectCatalogIdentity(a, &fresh, logical, binding.physical);
+            };
+            try OwnedRead.validateProjectedPolicies(a, &fresh, self.policies);
+        }
+        var context = try requestContext(credential, &request).platformDeadline();
+        if (self.cut.stamp) |stamp| context.bound_catalog_incarnation = stamp.relation_epoch.incarnation;
+        const cut = try self.readCut(a, context, if (materialized) self.cut.revision else null, self.cut.stamp);
+        if (!std.meta.eql(cut.policies, self.cut.policies)) return error.RowPolicyCatalogChanged;
+        if (materialized and !std.meta.eql(self.cut.stamp, cut.stamp)) return error.CatalogGenerationChanged;
+    }
+
+    fn validateBuffered(raw: *const anyopaque, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request, materialized: bool) !void {
+        const self: *const RetainedRead = @ptrCast(@alignCast(raw));
+        var job: StreamJob = .{ .adapter = self.adapter, .alloc = a, .credential = @ptrCast(@alignCast(identity.context)), .request = request, .buffered = self, .materialized = materialized };
+        try job.dispatch();
+    }
+};
+
 const StreamJob = struct {
+    buffered: ?*const RetainedRead = null,
+    materialized: bool = false,
     adapter: *Adapter,
     alloc: std.mem.Allocator,
     credential: *Credential,
@@ -807,6 +941,11 @@ const StreamJob = struct {
             const response = try call(server.source.ptr, self.alloc, try authority.context(), .{ .read = .{ .kind = .namespace, .database = database, .name = namespace } });
             self.alloc.free(response);
             return;
+        }
+        if (self.buffered) |buffered| {
+            var admission = try self.adapter.server.acquireSqlExecution(false);
+            defer admission.release();
+            return buffered.check(self.alloc, self.credential, self.request, self.materialized);
         }
         if (self.validate_only) return self.owner.?.validateCursor(self.alloc, self.request);
         if (self.owner) |owner| self.page = try owner.pull(self.alloc, self.request, self.limit) else self.opened = try OwnedRead.open(self.adapter, self.alloc, self.credential, self.request);
@@ -901,6 +1040,14 @@ const Credential = struct {
         }
         const current = self.manager.?.destinationGrantMac(self.principal, credential_domain) catch return error.Unauthorized;
         if (!std.crypto.timing_safe.eql([Mac.mac_length]u8, current, self.verifier_mac)) return error.Unauthorized;
+    }
+
+    fn grantRevision(self: *const Credential) u64 {
+        return if (self.manager) |m| m.authorization_revision.load(.acquire) else 0;
+    }
+
+    fn readRevision(self: *Credential) ReadRevision {
+        return .{ .grants = self.grantRevision(), .roles = if (self.manager) |m| m.rowPolicyRoleRevision() else null, .token = self.trusted_revision };
     }
 
     fn descriptionRevision(self: *Credential) !u64 {
@@ -1019,6 +1166,7 @@ const Job = struct {
         };
         defer lease.release(self.adapter.server.sqlPlanCacheIo());
         const compiled = lease.compiled();
+        if (self.request.capture_cursor_authority and compiled.statement != .select) return error.UnsupportedSqlExecution;
         const write = self.kind == .execute and switch (compiled.statement) {
             .select, .explain => false,
             .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
@@ -1029,6 +1177,7 @@ const Job = struct {
         preparation.release();
         // Sample before loading grants so a concurrent revocation can only
         // cause a cache miss, never attest a descriptor built under old grants.
+        const cursor_revision = if (self.request.capture_cursor_authority) self.credential.readRevision() else null;
         const authority_revision = if (self.kind == .describe) try self.credential.descriptionRevision() else 0;
         var identity: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
         defer identity.?.deinit(server.alloc);
@@ -1115,6 +1264,11 @@ const Job = struct {
         }
         const parameters = if (self.request.parameter_cells != null) self.request.parameters else try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
         var execution_backend = guarded.backend();
+        var opening: CursorAdmission = undefined;
+        if (cursor_revision) |revision| {
+            opening = .{ .out = self.alloc, .adapter = self.adapter, .native = &native_adapter, .credential = self.credential, .admitted = revision };
+            opening.install(&execution_backend);
+        }
         execution_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
         var result = native_adapter.execute(self.request.scratch_allocator orelse self.alloc, compiled, parameters, .{ .result_rows = self.request.limit, .native_result = true, .parameter_cells = self.request.parameter_cells, .parameter_owner = self.request.parameter_owner }, execution_backend) catch |err| {
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
@@ -1148,7 +1302,14 @@ const Job = struct {
         for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
         const native_owner = if (result.output.native_rows != null) try result.state.arena.allocator().create(NativeResultCells) else null;
         if (native_owner) |owner| owner.* = .{ .result = result };
+        const cursor_authority: ?wire.CursorAuthority = if (cursor_revision != null) authority_result: {
+            const capture = opening.captured orelse return error.InvalidSqlBackendResponse;
+            const pinned = try self.alloc.create(RetainedRead);
+            pinned.* = capture;
+            break :authority_result .{ .ptr = pinned, .validate = RetainedRead.validateBuffered };
+        } else null;
         self.result = .{
+            .cursor_authority = cursor_authority,
             .columns = columns,
             .cells = if (native_owner) |owner| .{ .context = owner, .count = result.output.rowCount(), .width = columns.len, .read = NativeResultCells.read } else null,
             .rows = result.output.rows,
@@ -1811,9 +1972,11 @@ const BindingEntryContext = struct {
 };
 const BindingEntries = std.ArrayHashMapUnmanaged(BindingEntry, void, BindingEntryContext, true);
 
-fn collectBindingTable(alloc: std.mem.Allocator, table: catalog.Table, entries: *BindingEntries) !void {
+fn collectBindingTable(alloc: std.mem.Allocator, table: catalog.Table, entries: anytype) !void {
     if (table.id == 0) return;
-    if ((try entries.getOrPut(alloc, BindingEntry.of(table))).found_existing) return;
+    const entry = try entries.getOrPut(alloc, BindingEntry.of(table));
+    if (entry.found_existing) return;
+    if (@TypeOf(entry.value_ptr.*) == catalog.Table) entry.value_ptr.* = table;
     if (entries.count() > max_binding_entries) return error.SqlProgramLimitExceeded;
     if (table.graph) |binding| for (binding.dependencies) |dependency| {
         try collectBindingTable(alloc, dependency, entries);
@@ -1824,7 +1987,7 @@ fn graphRevision(table: catalog.Table) u64 {
     return if (table.graph) |binding| binding.graph.revision else 0;
 }
 
-fn collectBindingTables(alloc: std.mem.Allocator, binding: describe_sql.BoundStatement, entries: *BindingEntries, depth: usize) anyerror!void {
+fn collectBindingTables(alloc: std.mem.Allocator, binding: describe_sql.BoundStatement, entries: anytype, depth: usize) anyerror!void {
     if (depth >= 64) return error.SqlProgramLimitExceeded;
     if (binding.table) |table| try collectBindingTable(alloc, table, entries);
     if (binding.relation) |relation| for (relation.scans) |scan| {
@@ -2236,6 +2399,19 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     server.cfg.user_manager = null;
     try std.testing.expectError(error.Unauthorized, Adapter.descriptionCurrent(&adapter, alloc, wire_identity, authority.request, cached));
     server.cfg.user_manager = &manager;
+    // SQL roles can change while the same ordinary table grant remains valid.
+    try manager.addRoleToUser("alice", "reader");
+    var retained: RetainedRead = .{ .adapter = &adapter, .admitted = credential.readRevision(), .bindings = &.{}, .policies = &.{}, .cut = .{ .policies = .{ .digest = @splat(0), .protected = true }, .stamp = null, .revision = null } };
+    try manager.removeRoleFromUser("alice", "reader");
+    try std.testing.expect(try http.tablePermissionCurrentlyAllowed(admitted, "docs", .read));
+    try std.testing.expectError(error.Forbidden, retained.check(alloc, credential, authority.request, false));
+    retained.admitted = credential.readRevision();
+    retained.cut.policies.protected = false;
+    retained.policies = &retained_policies;
+    retained.bindings = &.{.{ .id = 17, .physical = "private-table-17", .version = 1, .target = .{ .database = "default", .namespace = "public", .table = "docs" } }};
+    try manager.setRowFilter("alice", "docs", "{\"term\":\"allowed\"}");
+    try std.testing.expectError(error.Forbidden, retained.check(alloc, credential, authority.request, false));
+    try manager.removeRowFilter("alice", "docs");
     const closes_before_revoke = native_cursor.closes;
     try manager.removePermissionFromUser("alice", "docs", .table);
     try std.testing.expect(!try Adapter.descriptionCurrent(&adapter, alloc, wire_identity, authority.request, cached));
@@ -2489,6 +2665,65 @@ test "SQL pgwire native trusted-only renewal preserves owners without native boo
     try std.testing.expectEqualStrings("trusted:cloudaf:key-1", credential.sessionPrincipal());
     server.cfg.trusted_principal_issuer = "rotated";
     try std.testing.expectError(error.Unauthorized, credential.validate());
+}
+
+test "SQL pgwire retained reads track the serving policy even without a catalog revision change on older owners" {
+    const Domain = RetainedRead.Domain;
+    const Stamp = @import("antfly_local_sources").system_catalog_policies.PublicationStamp;
+    const Fake = struct {
+        generation: u64 = 1,
+        revision: u64 = 10,
+        schema_version: u64 = 1,
+        compact: bool = false,
+        calls: usize = 0,
+        fn call(raw: *anyopaque, a: std.mem.Allocator, ctx: operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(ctx.row_policy_install_authority);
+            const stamp: Stamp = .{ .table_id = 7, .schema_version = 1, .catalog_epoch = self.generation, .generation = self.generation, .phase = .active };
+            return switch (input) {
+                .policy_publication_status => std.json.Stringify.valueAlloc(a, stamp, .{}),
+                .resolve_many => |request| blk: {
+                    if (request.expected_revision) |revision| if (revision != self.revision) return error.CatalogGenerationChanged;
+                    var reply: Domain.ResolvedMany = .{ .revision = self.revision, .tables = &.{}, .source_epoch = .{ .incarnation = @splat(1), .revision = 2 } };
+                    if (request.cursor_bindings.len != 0) {
+                        if (!self.compact) return error.UnknownField;
+                        var hash = std.crypto.hash.Blake3.init(.{});
+                        var protected = false;
+                        try Domain.CursorPolicies.observe(&hash, &protected, request.cursor_bindings[0], stamp);
+                        reply.cursor_policies = .{ .digest = undefined, .protected = protected };
+                        hash.final(&reply.cursor_policies.?.digest);
+                    } else if (request.targets.len != 0) {
+                        const rows = try a.alloc(?Domain.ResolvedTable, 1);
+                        rows[0] = .{ .table_id = 7, .name = "physical", .query_definition = .{ .table_id = 7, .schema_json = try std.json.Stringify.valueAlloc(a, .{ .version = self.schema_version }, .{}), .read_schema_json = "", .indexes_json = "{}" } };
+                        reply.tables = rows;
+                    }
+                    break :blk std.json.Stringify.valueAlloc(a, reply, .{});
+                },
+                else => error.UnexpectedCatalogCall,
+            };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake: Fake = .{};
+    var api = http.ApiHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.call } }, null, null);
+    defer api.deinit();
+    var adapter: Adapter = .{ .server = &api };
+    const bindings = [_]Domain.CursorBinding{.{ .id = 7, .physical = "physical", .version = 1, .target = .{ .database = "default", .namespace = "public", .table = "docs" } }};
+    var retained: RetainedRead = .{ .adapter = &adapter, .admitted = undefined, .policies = &.{}, .bindings = &bindings, .cut = undefined };
+    const original = try retained.readCut(a, .{}, 10, null);
+    try std.testing.expect(original.policies.protected);
+    fake.compact = true;
+    fake.calls = 0;
+    try std.testing.expectEqualDeep(original, try retained.readCut(a, .{}, 10, original.stamp));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    fake.generation += 1;
+    const changed = try retained.readCut(a, .{}, 10, original.stamp);
+    try std.testing.expect(!std.meta.eql(original.policies, changed.policies));
+    fake.compact = false;
+    try std.testing.expectEqualDeep(changed, try retained.readCut(a, .{}, 10, original.stamp));
+    fake.schema_version += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, retained.readCut(a, .{}, 10, original.stamp));
 }
 
 test "SQL pgwire native trusted credential and identity allocation failures release owned snapshots" {

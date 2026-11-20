@@ -740,6 +740,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk std.json.Stringify.valueAlloc(alloc, table, .{});
         },
         .resolve_many => |request| blk: {
+            if (request.cursor_bindings.len != 0 and !context.row_policy_install_authority) return error.Forbidden;
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             const result = try store.resolveSystemCatalogIdentitiesWithContext(alloc, svc.metadata_group_id, request, context);

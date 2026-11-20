@@ -3284,9 +3284,10 @@ const LocalStandaloneMetadata = struct {
                 return std.json.Stringify.valueAlloc(alloc, identity, .{});
             },
             .resolve_many => |request| {
+                if (request.cursor_bindings.len != 0 and !context.row_policy_install_authority) return error.Forbidden;
                 if (request.name_allocation and !self.standaloneRelationPublicationSupported())
                     return self.resolveAllocationNamesLocked(alloc, context, request);
-                if (request.relations.len != 0 or request.expected_relation_epoch != null or request.include_source_epoch) {
+                if (request.relations.len != 0 or request.expected_relation_epoch != null or request.include_source_epoch or request.cursor_bindings.len != 0) {
                     const store = self.lifecycle_store orelse return error.CatalogPublicationProofPending;
                     const resolved = try store.resolveSystemCatalogIdentitiesWithContext(alloc, group_ids.main_metadata_group_id, request, context);
                     defer resolved.deinit(alloc);

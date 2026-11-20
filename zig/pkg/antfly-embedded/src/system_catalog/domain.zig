@@ -1249,7 +1249,35 @@ pub const RelationMutationGuard = struct {
     }
 };
 
+/// Identity observed by the SQL binder. A null target denotes a named graph.
+pub const CursorBinding = struct {
+    target: ?Target = null,
+    physical: []const u8,
+    id: u64,
+    version: u64,
+};
+
+pub const CursorPolicies = struct {
+    digest: [32]u8,
+    protected: bool,
+
+    pub fn observe(hash: *std.crypto.hash.Blake3, protected: *bool, binding: CursorBinding, stamp: ?@import("policies.zig").PublicationStamp) !void {
+        var encoded: [16]u8 = @splat(0);
+        if (stamp) |value| {
+            if (value.table_id != binding.id or value.schema_version != binding.version) return error.RowPolicyCatalogChanged;
+            if (try value.servingAuthority()) |serving| {
+                std.mem.writeInt(u64, encoded[0..8], serving.generation, .little);
+                std.mem.writeInt(u64, encoded[8..16], serving.catalog_epoch, .little);
+                protected.* = true;
+            }
+        }
+        hash.update(&encoded);
+    }
+};
+pub const CursorCatalogCut = struct { revision: u64, epoch: @import("relation_reconciliation.zig").Epoch };
 pub const ResolveMany = struct {
+    cursor_catalog_cut: ?CursorCatalogCut = null,
+    cursor_bindings: []const CursorBinding = &.{},
     targets: []const Target = &.{},
     /// Internal reverse lookup for dependency authorization and schema output.
     /// Captured with forward bindings in the same immutable catalog read.
@@ -1266,7 +1294,9 @@ pub const ResolveMany = struct {
     expected_relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        if (self.include_source_epoch) {
+        if (self.cursor_bindings.len != 0) {
+            try jw.write(.{ .cursor_bindings = self.cursor_bindings, .cursor_catalog_cut = self.cursor_catalog_cut, .include_source_epoch = true, .expected_revision = self.expected_revision });
+        } else if (self.include_source_epoch) {
             try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .include_source_epoch = true, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
         } else if (self.relations.len != 0 or self.expected_relation_epoch != null) {
             try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
@@ -1278,6 +1308,7 @@ pub const ResolveMany = struct {
 };
 
 pub const ResolvedMany = struct {
+    cursor_policies: ?CursorPolicies = null,
     revision: u64,
     tables: []const ?ResolvedTable,
     logical_names: []const ?[]const u8 = &.{},
@@ -1291,7 +1322,9 @@ pub const ResolvedMany = struct {
     relation_names_only: bool = false,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        if (self.source_epoch != null) {
+        if (self.cursor_policies != null) {
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .source_epoch = self.source_epoch, .cursor_policies = self.cursor_policies });
+        } else if (self.source_epoch != null) {
             try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .source_epoch = self.source_epoch, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only });
         } else if (self.relation_epoch != null or self.relations.len != 0) {
             try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only });

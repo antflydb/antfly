@@ -1086,12 +1086,11 @@ fn hydrateArtifactRevisions(alloc: Allocator, result: *types.SearchResult, paylo
             defer state_key.deinit(alloc);
             try internal_keys.appendDocumentPrefix(&state_key, alloc, ref.document_id);
             try state_key.append(alloc, internal_keys.asset_state_kind);
-            // An embedding hit reports its source chunk (see reconcileArtifactRef),
-            // and its payload above is that chunk's: fingerprint the chunk
-            // producer's state too, so both revisions describe the reported member.
+            // Dense hits report the source chunk or document unit. Fingerprint
+            // the producer that owns that member's payload.
             const producer = if (ref.kind == .chunk and ref.source != null and ref.source.?.kind == .asset)
                 ref.source.?.name
-            else if (ref.kind == .embedding and ref.source != null and ref.source.?.kind == .chunk)
+            else if (ref.kind == .embedding and ref.source != null and (ref.source.?.kind == .chunk or (ref.source.?.kind == .asset and ref.source.?.unit_id != null)))
                 ref.source.?.name
             else
                 ref.name;
@@ -4141,6 +4140,38 @@ test "direct PDF member preserves stored page metadata with independent ancestor
         try std.testing.expectEqualStrings(if (projected) projected_page else Loader.page, result.hits[0].stored_data.?);
         try std.testing.expectEqualStrings(Loader.page, result.hits[0].ancestor_unit_data.?);
     }
+}
+
+test "direct PDF member and page embedding share the page producer derivation" {
+    const a = std.testing.allocator;
+    const page = try internal_keys.documentUnitArtifactKeyAlloc(a, "doc", "pages", "page:000001");
+    defer a.free(page);
+    const embedding = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, page, "visual");
+    defer a.free(embedding);
+    var state: std.ArrayList(u8) = .empty;
+    defer state.deinit(a);
+    try internal_keys.appendDocumentPrefix(&state, a, "doc");
+    try state.append(a, internal_keys.asset_state_kind);
+    try internal_keys.appendEncodedComponent(&state, a, "pages");
+    const Loader = struct {
+        key: []const u8,
+        reads: usize = 0,
+        fn load(raw: ?*anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqualStrings(self.key, key);
+            self.reads += 1;
+            return try alloc.dupe(u8, "page producer state");
+        }
+    };
+    var loader: Loader = .{ .key = state.items };
+    const hits = try a.alloc(types.SearchHit, 2);
+    for (hits, [_][]const u8{ page, embedding }) |*hit, key| hit.* = .{ .id = try a.dupe(u8, page), .artifact_ref = try artifact_ids.decodeArtifactRefAlloc(a, key), .stored_data = try a.dupe(u8, "{}") };
+    var result: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = @intCast(hits.len) };
+    defer result.deinit();
+    try hydrateArtifactRevisions(a, &result, &.{ null, null }, .{ .ctx = &loader, .load_stored = Loader.load, .load_parent_stored = TestChunkParentShaper.loadParentStored, .resolve_parent_id = TestChunkParentShaper.resolveParentId });
+    try std.testing.expectEqual(@as(usize, 1), loader.reads);
+    try std.testing.expectEqualStrings(hits[0].artifact_ref.?.revision.?, hits[1].artifact_ref.?.revision.?);
+    try std.testing.expectEqualStrings(hits[0].artifact_ref.?.derivation_revision.?, hits[1].artifact_ref.?.derivation_revision.?);
 }
 
 test "a dense chunk member reports its chunk with the chunk's revisions" {
