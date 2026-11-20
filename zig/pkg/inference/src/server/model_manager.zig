@@ -191,6 +191,7 @@ test "Qwen3 embedding production backends include native CPU and CUDA" {
 /// when no compatible route exists, and incompatible only when every candidate
 /// is known to be unusable.
 pub const compatibilitySummaryForBackends = backend_compatibility.compatibilitySummaryForBackends;
+pub const compatibilitySummaryForBackendsWithControl = backend_compatibility.compatibilitySummaryForBackendsWithControl;
 
 const selectBetterCompatibility = backend_compatibility.selectBetterCompatibility;
 
@@ -5660,9 +5661,13 @@ pub const ModelManager = struct {
         const identity = if (man.embedding_style == .embedding_gemma2)
             try self.chunkPlanningGemmaIdentity(model_dir, man, io, control)
         else
-            std.fmt.bytesToHex(try modelIdentity(self.allocator, io, model_dir, man), .lower);
+            std.fmt.bytesToHex(try modelIdentityWithArtifacts(self.allocator, io, model_dir, man, null, control), .lower);
         _ = try self.publicationForRequest(model_dir, control);
         return identity;
+    }
+
+    pub fn modelIdentityForManifestWithControl(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest, io: std.Io, control: InferenceExecutionControl) ![32]u8 {
+        return modelIdentityWithArtifacts(self.allocator, io, model_dir, manifest, null, control);
     }
 
     pub fn modelIdentityForManifest(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
@@ -14259,7 +14264,7 @@ test "model selection embedded SentencePiece accounts and verifies independent o
         var shared = try PublishedArtifacts.init(a, counted_io, root, null);
         defer shared.deinit();
         Probe.opens = 0;
-        _ = try modelIdentityWithArtifacts(a, counted_io, root, man, &shared);
+        _ = try modelIdentityWithArtifacts(a, counted_io, root, man, &shared, .{});
         _ = try tokenizerLoadAdmissionPlanWithArtifacts(a, root, &man, .sentencepiece, &shared);
         const tokenizer = try loadSentencePieceTokenizerWithArtifacts(a, &man, &shared);
         defer {

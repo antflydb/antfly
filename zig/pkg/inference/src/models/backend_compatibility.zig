@@ -467,6 +467,11 @@ pub fn compatibilitySummaryForBackend(
     man: *const manifest_mod.ModelManifest,
     backend: backends.BackendType,
 ) !?CompatibilitySummary {
+    return compatibilitySummaryForBackendWithControl(allocator, model_dir, man, backend, .{});
+}
+
+fn compatibilitySummaryForBackendWithControl(allocator: std.mem.Allocator, model_dir: []const u8, man: *const manifest_mod.ModelManifest, backend: backends.BackendType, control: InferenceExecutionControl) !?CompatibilitySummary {
+    try control.check();
     const candidate = artifactCandidateForBackend(man.*, backend) orelse return null;
 
     // Split GGUF Qwen3-VL promotions are Metal-only. The official integrated
@@ -511,13 +516,14 @@ pub fn compatibilitySummaryForBackend(
         .requires_image = manifestRequiresInput(man, "image"),
         .requires_audio = manifestRequiresInput(man, "audio"),
     };
+    try control.check();
     if (candidate == .gguf) {
         var maybe_report = host_weights.inspectGgufModelForListing(
             allocator,
             model_dir,
             candidate_manifest,
         ) catch |err| {
-            if (err == error.OutOfMemory) return err;
+            if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
             return .{
                 .level = .incompatible,
                 .code = .artifact_unreadable,
@@ -553,13 +559,15 @@ pub fn compatibilitySummaryForBackend(
             }
         }
     }
+    try control.check();
     if (candidate == .safetensors) {
-        safetensors_mod.validateArtifactSet(
+        safetensors_mod.validateArtifactSetWithControl(
             allocator,
             man.safetensors_path,
             man.safetensors_index_path,
+            control,
         ) catch |err| {
-            if (err == error.OutOfMemory) return err;
+            if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
             return .{
                 .level = .incompatible,
                 .code = .artifact_unreadable,
@@ -568,9 +576,10 @@ pub fn compatibilitySummaryForBackend(
         };
     }
     if (candidate != .onnx) session_factory.validateJinaRetrievalAdapter(allocator, man.*, backend) catch |err| {
-        if (err == error.OutOfMemory) return err;
+        if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
         return .{ .level = .incompatible, .code = .artifact_unreadable, .message = "the selected Jina retrieval adapter is incomplete, invalid, or unreadable" };
     };
+    try control.check();
     if (try validateNativeCompanionsForBackend(
         allocator,
         man,
@@ -608,8 +617,8 @@ pub fn compatibilitySummaryForBackend(
         }
         if (duplicate) continue;
 
-        var artifacts = backends.imported_onnx_session.inspectArtifactSetWithBase(allocator, path, base) catch |err| {
-            if (err == error.OutOfMemory) return err;
+        var artifacts = backends.imported_onnx_session.inspectArtifactSetWithControl(allocator, path, base, null, control) catch |err| {
+            if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
             return .{
                 .level = .incompatible,
                 .code = .invalid_graph,
@@ -618,8 +627,8 @@ pub fn compatibilitySummaryForBackend(
         };
         artifacts.deinit();
 
-        backends.imported_onnx_session.inspectGraphCompatibilityWithContext(allocator, path, base, logical_path) catch |err| {
-            if (err == error.OutOfMemory) return err;
+        backends.imported_onnx_session.inspectGraphCompatibilityWithControl(allocator, path, base, logical_path, control) catch |err| {
+            if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
             return .{
                 .level = .incompatible,
                 .code = .invalid_graph,
@@ -627,6 +636,7 @@ pub fn compatibilitySummaryForBackend(
             };
         };
     }
+    try control.check();
     return summaryFromAssessment(assessment);
 }
 
@@ -644,13 +654,18 @@ pub fn compatibilitySummaryForBackends(
     man: *const manifest_mod.ModelManifest,
     preferred_backends: []const backends.BackendType,
 ) !CompatibilitySummary {
+    return compatibilitySummaryForBackendsWithControl(allocator, model_dir, man, preferred_backends, .{});
+}
+
+pub fn compatibilitySummaryForBackendsWithControl(allocator: std.mem.Allocator, model_dir: []const u8, man: *const manifest_mod.ModelManifest, preferred_backends: []const backends.BackendType, control: InferenceExecutionControl) !CompatibilitySummary {
     var best: ?CompatibilitySummary = null;
     for (preferred_backends) |backend| {
-        const summary = try compatibilitySummaryForBackend(
+        const summary = try compatibilitySummaryForBackendWithControl(
             allocator,
             model_dir,
             man,
             backend,
+            control,
         ) orelse continue;
         best = selectBetterCompatibility(best, summary);
         if (best.?.level == .compatible) return best.?;

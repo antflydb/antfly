@@ -165,6 +165,11 @@ pub fn inspectGraphCompatibility(allocator: std.mem.Allocator, onnx_path: []cons
 }
 
 pub fn inspectGraphCompatibilityWithContext(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8, logical_path: ?[]const u8) !void {
+    return inspectGraphCompatibilityWithControl(allocator, onnx_path, external_base_dir, logical_path, .{});
+}
+
+pub fn inspectGraphCompatibilityWithControl(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8, logical_path: ?[]const u8, control: InferenceExecutionControl) !void {
+    try control.check();
     var mapped = try c_file.MmapRegion.init(allocator, onnx_path);
     defer mapped.deinit();
     if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
@@ -188,8 +193,22 @@ pub fn inspectGraphCompatibilityWithContext(allocator: std.mem.Allocator, onnx_p
     }
     const dim_overrides: ?*const onnx_graph.DimOverrides = if (use_clipclap_dim_overrides) &clipclap_dim_overrides else null;
 
+    try control.check();
+    const Check = struct {
+        fn call(raw: *const anyopaque) error{ Timeout, Canceled, Cancelled }!void {
+            const active: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+            active.check() catch |err| switch (err) {
+                error.Timeout => return error.Timeout,
+                error.Canceled => return error.Canceled,
+                else => return error.Cancelled,
+            };
+        }
+    };
+    if (control.deadline_ns != null or control.check_fn != null or control.cancellation != null)
+        model.conversion_checkpoint = .{ .context = &control, .check = Check.call };
     var converted = try model.convertToGraphWithDims(allocator, dim_overrides);
     defer converted.deinit(allocator);
+    try control.check();
     try validateImportedGraph(&converted.graph, "convert");
 }
 
@@ -250,6 +269,11 @@ pub fn inspectArtifactSetWithBase(allocator: std.mem.Allocator, onnx_path: []con
 }
 
 pub fn inspectArtifactSetWithReader(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8, reader: ?onnx_graph.tensor.ExternalDataReader) !OnnxArtifactSet {
+    return inspectArtifactSetWithControl(allocator, onnx_path, external_base_dir, reader, .{});
+}
+
+pub fn inspectArtifactSetWithControl(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8, reader: ?onnx_graph.tensor.ExternalDataReader, control: InferenceExecutionControl) !OnnxArtifactSet {
+    try control.check();
     const opened = if (reader) |source| try source.open(onnx_path) else null;
     defer if (opened) |file| file.deinit();
     var mapped = if (opened) |file|
@@ -263,6 +287,7 @@ pub fn inspectArtifactSetWithReader(allocator: std.mem.Allocator, onnx_path: []c
     const model_dir = external_base_dir orelse std.fs.path.dirname(onnx_path) orelse ".";
     var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, mapped.data, model_dir);
     defer model.deinit();
+    try control.check();
 
     var paths = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -273,6 +298,7 @@ pub fn inspectArtifactSetWithReader(allocator: std.mem.Allocator, onnx_path: []c
 
     var initializer_it = model.initializer_map.iterator();
     while (initializer_it.next()) |entry| {
+        try control.check();
         const tensor = try model.initializerAt(entry.value_ptr.*);
         if (!tensor.isExternal()) continue;
         const external = tensor.externalDataInfo();

@@ -2934,11 +2934,13 @@ fn collectOnnxDependenciesForPath(
     maybe_path: ?[]const u8,
     primary: bool,
     logical_path: ?[]const u8,
+    control: InferenceExecutionControl,
 ) !void {
+    try control.check();
     const path = maybe_path orelse return;
     if (!primary and !std.mem.endsWith(u8, path, ".onnx")) return;
-    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSetWithBase(allocator, path, if (logical_path) |logical| std.fs.path.dirname(logical) else null) catch |err| {
-        if (err == error.OutOfMemory) return err;
+    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSetWithControl(allocator, path, if (logical_path) |logical| std.fs.path.dirname(logical) else null, null, control) catch |err| {
+        if (err == error.OutOfMemory or err == error.Timeout or err == error.Cancelled or err == error.Canceled) return err;
         dependencies.valid = false;
         return;
     };
@@ -2952,6 +2954,10 @@ fn collectCompatibilityOnnxDependencies(
     allocator: std.mem.Allocator,
     man: *const manifest_mod.ModelManifest,
 ) !OnnxDependencies {
+    return collectCompatibilityOnnxDependenciesWithControl(allocator, man, .{});
+}
+
+fn collectCompatibilityOnnxDependenciesWithControl(allocator: std.mem.Allocator, man: *const manifest_mod.ModelManifest, control: InferenceExecutionControl) !OnnxDependencies {
     var dependencies = OnnxDependencies{};
     errdefer dependencies.deinit(allocator);
     const paths = [_]?[]const u8{
@@ -2962,7 +2968,7 @@ fn collectCompatibilityOnnxDependencies(
         man.visual_projection_path,
         man.audio_projection_path,
     };
-    for (paths, 0..) |path, index| try collectOnnxDependenciesForPath(allocator, &dependencies, path, index == 0, if (index == 0) man.onnx_logical_path else null);
+    for (paths, 0..) |path, index| try collectOnnxDependenciesForPath(allocator, &dependencies, path, index == 0, if (index == 0) man.onnx_logical_path else null, control);
     return dependencies;
 }
 
@@ -2995,17 +3001,21 @@ fn addShardedArtifactStatsToSignature(
     io: std.Io,
     signature: *std.crypto.hash.sha2.Sha256,
     index_path: ?[]const u8,
+    control: InferenceExecutionControl,
 ) !void {
+    try control.check();
     const path = index_path orelse return;
-    const bytes = try c_file.readFile(allocator, path);
+    const bytes = try c_file.readFileWithControl(allocator, io, path, control);
     defer allocator.free(bytes);
     var index = try safetensors_mod.ShardedIndex.load(allocator, bytes);
     defer index.deinit();
+    try control.check();
     const model_dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(allocator);
     var it = index.weight_map.iterator();
     while (it.next()) |entry| {
+        try control.check();
         const shard = entry.value_ptr.*;
         if (seen.contains(shard)) continue;
         try seen.put(allocator, shard, {});
@@ -3053,6 +3063,19 @@ fn computeCompatibilitySignatureWithDependencies(
     external_paths: []const []const u8,
     external_paths_valid: bool,
 ) !CompatibilitySignature {
+    return computeCompatibilitySignatureWithControl(allocator, io, model_path, man, external_paths, external_paths_valid, .{});
+}
+
+fn computeCompatibilitySignatureWithControl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    external_paths: []const []const u8,
+    external_paths_valid: bool,
+    control: InferenceExecutionControl,
+) !CompatibilitySignature {
+    try control.check();
     var signature = std.crypto.hash.sha2.Sha256.init(.{});
     addCompatibilityManifestFacts(&signature, man);
 
@@ -3060,6 +3083,7 @@ fn computeCompatibilitySignatureWithDependencies(
     // hashing avoids stale policy decisions when deployment tools preserve
     // size and timestamps during an in-place replacement.
     for (manifest_mod.listing_compatibility_sidecars) |sidecar_name| {
+        try control.check();
         try addModelSidecarToSignature(
             allocator,
             io,
@@ -3081,8 +3105,9 @@ fn computeCompatibilitySignatureWithDependencies(
         io,
         &signature,
         man.safetensors_index_path,
+        control,
     ) catch |err| {
-        if (err == error.OutOfMemory) return err;
+        if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
         signature.update("invalid-sharded-index");
     };
     try addOnnxArtifactToSignature(allocator, io, &signature, man.onnx_path);
@@ -3099,6 +3124,7 @@ fn computeCompatibilitySignatureWithDependencies(
     try addArtifactIdentityToSignature(allocator, io, &signature, man.processor_config_path, true);
     if (!external_paths_valid) signature.update("invalid-onnx-artifact-set");
     for (external_paths) |external_path| {
+        try control.check();
         try addArtifactIdentityToSignature(
             allocator,
             io,
@@ -4949,6 +4975,11 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !CompatibilitySummary {
+        return self.compatibilitySummaryForDirWithControl(allocator, model_path, .{});
+    }
+
+    fn compatibilitySummaryForDirWithControl(self: *Node, allocator: std.mem.Allocator, model_path: []const u8, control: InferenceExecutionControl) !CompatibilitySummary {
+        try control.check();
         var required_backend_scratch: [1]backends_mod.BackendType = undefined;
         const compatibility_backends = try compatibilityBackendsForSessionManager(
             &self.session_manager,
@@ -4956,7 +4987,7 @@ pub const Node = struct {
         );
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*threaded| threaded.deinit();
-        const io = self.inferenceIo(allocator, null, &owned_io);
+        const io = self.inferenceIo(allocator, control.io, &owned_io);
 
         // A deployment can replace several sidecars and artifacts without an
         // atomic directory snapshot. Derive and validate the manifest twice so
@@ -4965,6 +4996,7 @@ pub const Node = struct {
         const max_snapshot_attempts = 3;
         var attempt: usize = 0;
         while (attempt < max_snapshot_attempts) : (attempt += 1) {
+            try control.check();
             var man = try manifest_mod.loadListingFromDir(allocator, model_path);
             defer man.deinit();
 
@@ -4973,13 +5005,14 @@ pub const Node = struct {
             if (cached) |entry| entry.retain();
             self.compatibility_cache_lock.unlock();
             if (cached) |entry| {
-                const cached_signature = computeCompatibilitySignatureWithDependencies(
+                const cached_signature = computeCompatibilitySignatureWithControl(
                     allocator,
                     io,
                     model_path,
                     &man,
                     entry.external_paths,
                     entry.external_paths_valid,
+                    control,
                 ) catch |err| {
                     entry.release();
                     return err;
@@ -4995,23 +5028,25 @@ pub const Node = struct {
                 if (cache_hit) return cached_summary;
             }
 
-            var dependencies = try collectCompatibilityOnnxDependencies(allocator, &man);
+            var dependencies = try collectCompatibilityOnnxDependenciesWithControl(allocator, &man, control);
             defer dependencies.deinit(allocator);
-            const raw_artifact_signature = try computeCompatibilitySignatureWithDependencies(
+            const raw_artifact_signature = try computeCompatibilitySignatureWithControl(
                 allocator,
                 io,
                 model_path,
                 &man,
                 dependencies.paths.items,
                 dependencies.valid,
+                control,
             );
             const artifact_signature = compatibilitySignatureForBackends(raw_artifact_signature, compatibility_backends);
 
-            const summary = try model_manager_mod.compatibilitySummaryForBackends(
+            const summary = try model_manager_mod.compatibilitySummaryForBackendsWithControl(
                 allocator,
                 model_path,
                 &man,
                 compatibility_backends,
+                control,
             );
 
             var verification_manifest = try manifest_mod.loadListingFromDir(
@@ -5019,18 +5054,20 @@ pub const Node = struct {
                 model_path,
             );
             defer verification_manifest.deinit();
-            var verification_dependencies = try collectCompatibilityOnnxDependencies(
+            var verification_dependencies = try collectCompatibilityOnnxDependenciesWithControl(
                 allocator,
                 &verification_manifest,
+                control,
             );
             defer verification_dependencies.deinit(allocator);
-            const raw_verification_signature = try computeCompatibilitySignatureWithDependencies(
+            const raw_verification_signature = try computeCompatibilitySignatureWithControl(
                 allocator,
                 io,
                 model_path,
                 &verification_manifest,
                 verification_dependencies.paths.items,
                 verification_dependencies.valid,
+                control,
             );
             const verification_signature = compatibilitySignatureForBackends(raw_verification_signature, compatibility_backends);
             if (!std.mem.eql(
@@ -14320,6 +14357,10 @@ pub const Node = struct {
     }
 
     fn requestModelResolutionError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        switch (err) {
+            error.Timeout, error.Canceled, error.Cancelled => return inferenceFailureResponse(ctx, err),
+            else => {},
+        }
         if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
         return switch (requestModelResolutionErrorKind(err)) {
             .invalid => ctx.status(400).json(.{
@@ -27409,6 +27450,10 @@ pub const Node = struct {
     }
 
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        ctx.application_deadline_ns = @import("inference_deadline.zig").establish(ctx.application_deadline_ns, ctx.request.headers.iterator(), platform.time.monotonicNs()) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_INFERENCE_TIMEOUT", .retryable = false });
+        const catalog_control = httpInferenceExecutionControl(self, ctx);
+        catalog_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         try ctx.setHeader("X-Antfly-Generation-Placement-Version", "1");
         const catalog_generation = catalog_publication.read(ctx.allocator, ctx.io, self.config.models_dir) catch |err| return requestModelResolutionError(ctx, err);
         if (ctx.header("X-Antfly-Inference-Chunk-Requirements")) |requirements| {
@@ -27439,7 +27484,7 @@ pub const Node = struct {
                     };
                     defer ctx.allocator.free(path);
                     if (pin) |expected| {
-                        const identity = self.chunkSpeakerRevision(path, ctx.io, self.bindExecutionControl(ctx.io, .{})) catch |err| return requestModelResolutionError(ctx, err);
+                        const identity = self.chunkSpeakerRevision(path, ctx.io, catalog_control) catch |err| return requestModelResolutionError(ctx, err);
                         if (!std.mem.eql(u8, expected, &identity)) return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkModelIdentityMismatch");
                     }
                 } else {
@@ -27456,7 +27501,7 @@ pub const Node = struct {
                         return requestModelResolutionError(ctx, err);
                     };
                     defer ctx.allocator.free(selected.path);
-                    const control = selected.bind(self.bindExecutionControl(ctx.io, .{}));
+                    const control = selected.bind(catalog_control);
                     if (kind == .embedding) {
                         if (pin) |expected| {
                             const identity = self.model_manager.chunkPlanningIdentityForDiscovery(selected.path, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err);
@@ -27470,7 +27515,7 @@ pub const Node = struct {
                             return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkOutputModelUnsupported");
                         };
                         if (pin) |expected| {
-                            const identity = std.fmt.bytesToHex(self.model_manager.modelIdentityForManifest(selected.path, manifest) catch |err| return requestModelResolutionError(ctx, err), .lower);
+                            const identity = std.fmt.bytesToHex(self.model_manager.modelIdentityForManifestWithControl(selected.path, manifest, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err), .lower);
                             if (!std.mem.eql(u8, expected, &identity)) return self.chunkCatalogResponse(ctx, catalog_generation, "ChunkModelIdentityMismatch");
                         }
                     }
@@ -27494,9 +27539,15 @@ pub const Node = struct {
         }
         const model = try ctx.queryDecoded("model");
         const task = ctx.query("task");
-        const scoped_embedding = if (task != null and std.mem.eql(u8, task.?, "embed")) model else null;
+        const scope: ?CatalogListingScope = if (model) |name| scope: {
+            const operation = task orelse break :scope null;
+            if (std.mem.eql(u8, operation, "embed")) break :scope .{ .name = name, .category = "embedders" };
+            if (std.mem.eql(u8, operation, "generate")) break :scope .{ .name = name, .category = "generators" };
+            break :scope null;
+        } else null;
         const publication = if (catalog_generation.kind == .legacy) null else std.fmt.bytesToHex(catalog_generation.digest, .lower);
-        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, scoped_embedding, if (publication) |*hex| hex else null) catch |err| {
+        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, scope, if (publication) |*hex| hex else null, catalog_control) catch |err| {
+            if (err == error.Timeout or err == error.Canceled or err == error.Cancelled) return inferenceFailureResponse(ctx, err);
             if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
             return err;
         };
@@ -27511,17 +27562,23 @@ pub const Node = struct {
                 const path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| return requestModelResolutionError(ctx, err);
                 const path = path_selection.path;
                 defer ctx.allocator.free(path);
-                var manifest = self.loadBoundManifest(ctx.allocator, path, false, self.bindModelSelection(path_selection, null)) catch |err| return modelLoadFailureResponse(ctx, err);
+                const control = path_selection.bind(catalog_control);
+                var manifest = self.loadBoundManifest(ctx.allocator, path, false, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 defer manifest.deinit();
                 var dense_output = manifest.denseEmbeddingOutput();
-                const revision = if (try self.model_manager.acquireLoadedModelWithControl(path, self.bindModelSelection(path_selection, null))) |cached| loaded: {
+                const revision = if (self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return requestModelResolutionError(ctx, err)) |cached| loaded: {
                     var handle = cached;
                     defer handle.release();
                     // Geometry and revision must describe the same serving generation.
                     dense_output = handle.get().manifest.denseEmbeddingOutput();
-                    break :loaded handle.get().resolution_revision orelse if (std.mem.eql(u8, operation, "embed")) return error.InvalidEmbeddingIdentity else try self.model_manager.modelIdentityForManifest(path, manifest);
-                } else try self.model_manager.modelIdentityForManifest(path, manifest);
-                const hex = std.fmt.bytesToHex(revision, .lower);
+                    if (handle.get().resolution_revision) |loaded_revision| break :loaded loaded_revision;
+                    if (std.mem.eql(u8, operation, "embed")) return error.InvalidEmbeddingIdentity;
+                    break :loaded null;
+                } else null;
+                const hex = std.fmt.bytesToHex(revision orelse
+                    self.model_manager.modelIdentityForManifestWithControl(path, manifest, ctx.io, control) catch |err| return requestModelResolutionError(ctx, err), .lower);
+                control.check() catch |err| return inferenceFailureResponse(ctx, err);
+
                 const catalog_allocator = catalog.arena.allocator();
                 try info.object.put(catalog_allocator, "model_revision", .{ .string = &hex });
                 if (std.mem.eql(u8, operation, "generate")) {
@@ -27556,10 +27613,13 @@ pub const Node = struct {
     /// (e.g. the antfly server's /connections endpoint) can list the embedded
     /// node's models without going through HTTP. Caller owns the result.
     pub fn listModelsJsonAlloc(self: *Node, a: std.mem.Allocator, io: std.Io) ![]u8 {
-        return self.listModelsJsonAllocScoped(a, io, null, null);
+        return self.listModelsJsonAllocScoped(a, io, null, null, .{});
     }
 
-    fn listModelsJsonAllocScoped(self: *Node, a: std.mem.Allocator, io: std.Io, scoped_embedding: ?[]const u8, publication: ?[]const u8) ![]u8 {
+    const CatalogListingScope = struct { name: []const u8, category: []const u8 };
+
+    fn listModelsJsonAllocScoped(self: *Node, a: std.mem.Allocator, io: std.Io, listing_scope: ?CatalogListingScope, publication: ?[]const u8, control: InferenceExecutionControl) ![]u8 {
+        try control.check();
         var buf = std.ArrayListUnmanaged(u8).empty;
         defer buf.deinit(a);
         var body = std.ArrayListUnmanaged(u8).empty;
@@ -27571,26 +27631,34 @@ pub const Node = struct {
         var openai_data_count: usize = 0;
         const list_created = completionCreatedTimestamp();
 
-        var inventory = if (self.selector_cache) |cache|
-            try cache.snapshot(a, io, self.config.models_dir)
+        const borrowed = if (self.selector_cache) |cache|
+            try cache.borrowInventory(io, self.config.models_dir, control)
         else
-            try selection_mod.Inventory.loadStable(a, io, self.config.models_dir);
-        defer inventory.deinit();
+            null;
+        defer if (borrowed) |lease| lease.release();
+        var owned = if (borrowed == null)
+            try selection_mod.Inventory.loadStableWithControl(a, io, self.config.models_dir, control)
+        else
+            null;
+        defer if (owned) |*inventory| inventory.deinit();
+        const inventory = if (borrowed) |lease| lease.inventory() else &owned.?;
+        try control.check();
         const discovered = inventory.discovered;
-        const selected_path = if (scoped_embedding) |name| inventory.lookup(name, "embedders") catch null else null;
+        const selected_path = if (listing_scope) |name| inventory.lookup(name.name, name.category) catch null else null;
 
         var discovered_listings = std.ArrayListUnmanaged(DiscoveredModelListing).empty;
         defer {
             for (discovered_listings.items) |*listing| listing.deinit();
             discovered_listings.deinit(a);
         }
-        try discovered_listings.ensureTotalCapacity(a, if (scoped_embedding == null) discovered.len else 1);
+        try discovered_listings.ensureTotalCapacity(a, if (listing_scope == null) discovered.len else 1);
         // Candidates whose manifest cannot be read stay visible with their
         // error, so one malformed directory never hides a model silently.
         var rejected_listings = std.ArrayListUnmanaged(RejectedModelListing).empty;
         defer rejected_listings.deinit(a);
         for (discovered, 0..) |entry, entry_index| {
-            if (scoped_embedding != null and (selected_path == null or !std.mem.eql(u8, selected_path.?, entry.path))) continue;
+            try control.check();
+            if (listing_scope != null and (selected_path == null or !std.mem.eql(u8, selected_path.?, entry.path))) continue;
             // A directory spelling is not proof of a format or immutable pin.
             // Unmanaged installations may advertise only literal legacy names.
             if (inventory.names[entry_index].len == 0) continue;
@@ -27609,10 +27677,13 @@ pub const Node = struct {
             const model_kind = @tagName(manifest.model_type);
             const qwen3vl_reader = isGenerativeReadModel(&manifest);
             const reader_candidate = manifestMatchesModelListingTask("readers", model_kind, &manifest);
-            const compatibility_summary = self.compatibilitySummaryForDir(a, entry.path) catch CompatibilitySummary{
-                .level = .unknown,
-                .code = .artifact_unreadable,
-                .message = "model compatibility could not be determined",
+            const compatibility_summary = self.compatibilitySummaryForDirWithControl(a, entry.path, control) catch |err| switch (err) {
+                error.Timeout, error.Cancelled, error.Canceled => return err,
+                else => CompatibilitySummary{
+                    .level = .unknown,
+                    .code = .artifact_unreadable,
+                    .message = "model compatibility could not be determined",
+                },
             };
             try discovered_listings.append(a, .{
                 .entry_index = entry_index,
@@ -27653,8 +27724,9 @@ pub const Node = struct {
             canonical_discovered_dirs.deinit(a);
         }
 
-        const scan_loaded = scoped_embedding == null or selected_path == null;
+        const scan_loaded = listing_scope == null or selected_path == null;
         for (if (scan_loaded) discovered else &.{}) |entry| {
+            try control.check();
             const canonical_path = realPathExistingAlloc(a, io, entry.path) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -27700,7 +27772,7 @@ pub const Node = struct {
                     a.free(canonical_model_dir);
                     continue;
                 };
-                if (scoped_embedding) |name| if (!std.mem.eql(u8, name, identifier)) {
+                if (listing_scope) |name| if (!std.mem.eql(u8, name.name, identifier)) {
                     a.free(identifier);
                     a.free(canonical_model_dir);
                     continue;
@@ -27730,12 +27802,13 @@ pub const Node = struct {
         }
 
         for (task_names, 0..) |task, task_idx| {
+            try control.check();
             if (task_idx > 0) try body.append(a, ',');
             try body.append(a, '"');
             try body.appendSlice(a, task);
             try body.appendSlice(a, "\":{");
 
-            if (scoped_embedding != null and !std.mem.eql(u8, task, "embedders")) {
+            if (listing_scope != null and !std.mem.eql(u8, task, listing_scope.?.category)) {
                 try body.append(a, '}');
                 continue;
             }
@@ -27777,6 +27850,7 @@ pub const Node = struct {
 
             // Add discovered models matching this task
             for (discovered_listings.items) |*listing| {
+                try control.check();
                 // The public chunk executor currently implements only the
                 // built-in fixed multimodal chunker above. A manifest task is
                 // not proof that a model-backed chunk execution path exists.
@@ -27844,6 +27918,7 @@ pub const Node = struct {
             // Unreadable candidates appear under the task their path implies,
             // marked incompatible with the reason the manifest was rejected.
             for (rejected_listings.items) |rejected| {
+                try control.check();
                 const entry = discovered[rejected.entry_index];
                 if (!std.mem.eql(u8, rejectedListingTask(entry), task)) continue;
                 const listed = try listed_model_names.getOrPut(a, entry.path);
@@ -27862,6 +27937,7 @@ pub const Node = struct {
             // snapshot keeps them alive, and each listing has already been
             // canonicalized to a safe request identifier outside the lock.
             for (loaded_listings.items) |listing| {
+                try control.check();
                 if (std.mem.eql(u8, task, "chunkers")) continue;
                 const model = listing.model;
                 const model_task = @tagName(model.manifest.model_type);
@@ -27872,10 +27948,13 @@ pub const Node = struct {
                 if (model_count > 0) try body.append(a, ',');
                 try jsonEncodeString(&body, a, listing.identifier);
                 try body.append(a, ':');
-                const loaded_compatibility = self.compatibilitySummaryForDir(a, listing.canonical_model_dir) catch CompatibilitySummary{
-                    .level = .unknown,
-                    .code = .artifact_unreadable,
-                    .message = "model compatibility could not be determined",
+                const loaded_compatibility = self.compatibilitySummaryForDirWithControl(a, listing.canonical_model_dir, control) catch |err| switch (err) {
+                    error.Timeout, error.Cancelled, error.Canceled => return err,
+                    else => CompatibilitySummary{
+                        .level = .unknown,
+                        .code = .artifact_unreadable,
+                        .message = "model compatibility could not be determined",
+                    },
                 };
                 try appendModelInfo(
                     &body,
@@ -27938,7 +28017,7 @@ pub const Node = struct {
         // Keep ML schemas in their own group while allowing task-aware pool
         // discovery to find predictors through the same bounded catalog.
         try buf.appendSlice(a, ",\"predictors\":{");
-        if (scoped_embedding == null) {
+        if (listing_scope == null) {
             _ = tabular_mod.discovery.discover(io, a, &self.tabular_registry, self.config.ml_dir) catch {};
             const predictors = try self.tabular_registry.list(a);
             defer a.free(predictors);
@@ -27971,7 +28050,7 @@ pub const Node = struct {
         // Composite discovery reads only bounded declarative metadata. It
         // never loads model weights or exposes private provider bindings.
         const ca = catalog.arena.allocator();
-        if (scoped_embedding == null) {
+        if (listing_scope == null) {
             const native_info = try self.documentCatalogInfo(ca, null, "read");
             try catalog.value.object.getPtr("readers").?.object.put(ca, "antfly/native-document", native_info);
             for (discovered) |entry| {
@@ -27998,11 +28077,13 @@ pub const Node = struct {
         // Descriptors retain installation identity until ownership is finalized.
         // A same-named installation in another scope cannot supply its contract.
         for (task_names) |task| {
+            try control.check();
             const models = catalog.value.object.getPtr(task).?;
             for (discovered, inventory.names) |entry, names| {
+                try control.check();
                 const descriptor = models.object.get(entry.path) orelse continue;
                 for (names) |selector| {
-                    if (scoped_embedding) |name| if (!std.mem.eql(u8, name, selector)) continue;
+                    if (listing_scope) |name| if (!std.mem.eql(u8, name.name, selector)) continue;
                     const owner = (inventory.lookup(selector, task) catch continue) orelse continue;
                     if (std.mem.eql(u8, owner, entry.path)) try models.object.put(ca, selector, descriptor);
                 }
@@ -28018,7 +28099,7 @@ pub const Node = struct {
             }
         }
         filterOpenAiCatalogSelectors(&catalog.value);
-        try inventory.requireCurrentGeneration(io);
+        try inventory.requireCurrentGenerationWithControl(io, control);
         return std.json.Stringify.valueAlloc(a, catalog.value, .{});
     }
 
@@ -39002,6 +39083,86 @@ test "ambiguous model resolution returns an actionable conflict response" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, ambiguous_model_error_message) != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "owner/name:variant") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_RESOLUTION_FAILED") == null);
+}
+
+test "catalog model resolution preserves timeout and cancellation responses" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .GET, "/ai/v1/models");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    const cases = [_]struct { anyerror, u16 }{
+        .{ error.Timeout, 504 },
+        .{ error.Canceled, 408 },
+        .{ error.Cancelled, 408 },
+    };
+    for (cases) |entry| {
+        var response = try Node.requestModelResolutionError(&ctx, entry[0]);
+        defer response.deinit();
+        try std.testing.expectEqual(entry[1], response.status.code);
+    }
+}
+
+test "catalog model resolution preserves timeout during managed checksums" {
+    const receipts = @import("../registry/managed_receipt.zig");
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const filename = "payload.bin";
+    try tmp.dir.writeFile(io, .{ .sub_path = filename, .data = "payload" });
+    const path = try tmp.dir.realPathFileAlloc(io, filename, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const Cancel = struct {
+        fn check(raw: ?*anyopaque) !void {
+            const remaining: *usize = @ptrCast(@alignCast(raw.?));
+            if (remaining.* == 0) return error.Timeout;
+            remaining.* -= 1;
+        }
+    };
+    var checkpoints: usize = 3;
+    try std.testing.expectError(error.Timeout, receipts.verifyValidatedArtifactSha256AndStampWithControl(
+        io,
+        &.{ .path = filename, .canonical_path = path, .size = 7, .sha256 = null },
+        "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+        (InferenceExecutionControl{}).withCheckpoint(&checkpoints, Cancel.check),
+    ));
+}
+
+test "catalog model resolution preserves timeout and scopes generation listing" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tensor_header = "{\"probe\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    const header_size = comptime std.mem.alignForward(usize, tensor_header.len, 8);
+    var weights: [8 + header_size + 4]u8 = @splat(0);
+    std.mem.writeInt(u64, weights[0..8], header_size, .little);
+    @memset(weights[8..][0..header_size], ' ');
+    @memcpy(weights[8..][0..tensor_header.len], tensor_header);
+    inline for (.{ "selected", "other" }) |name| {
+        try tmp.dir.createDirPath(io, "generators/" ++ name);
+        try tmp.dir.writeFile(io, .{ .sub_path = "generators/" ++ name ++ "/config.json", .data = "{\"model_type\":\"llama\"}" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "generators/" ++ name ++ "/model.safetensors", .data = &weights });
+    }
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true });
+    defer node.deinit();
+    try node.attachIo(io);
+    var request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=selected&task=generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.listModels(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer parsed.deinit();
+    const generators = parsed.value.object.get("generators").?.object;
+    try std.testing.expectEqual(@as(usize, 1), generators.count());
+    const selected = generators.get("selected") orelse return error.MissingGenerator;
+    try std.testing.expectEqual(@as(usize, 64), selected.object.get("model_revision").?.string.len);
 }
 
 test "decide maps model resolution errors to client responses" {

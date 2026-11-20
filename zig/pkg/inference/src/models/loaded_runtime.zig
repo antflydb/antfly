@@ -106,8 +106,13 @@ pub fn componentDependencySignature(
     io: std.Io,
     dependencies: []const []const u8,
 ) !ComponentPlanKey {
+    return componentDependencySignatureWithControl(io, dependencies, .{});
+}
+
+fn componentDependencySignatureWithControl(io: std.Io, dependencies: []const []const u8, control: InferenceExecutionControl) !ComponentPlanKey {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     for (dependencies) |path| {
+        try control.check();
         updateComponentPlanKeySlice(&hash, path);
         const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
             hash.update("missing");
@@ -1842,6 +1847,11 @@ test "loaded runtime cleanup head publication unwinds every allocation failure" 
 }
 
 pub fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    return resolutionModelRevisionWithControl(a, io, manifest, .{});
+}
+
+pub fn resolutionModelRevisionWithControl(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest, control: InferenceExecutionControl) ![32]u8 {
+    try control.check();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1852,12 +1862,13 @@ pub fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manif
         }
     }
     if (manifest.safetensors_index_path) |path| {
-        const raw = try @import("../util/c_file.zig").readFile(alloc, path);
+        const raw = try @import("../util/c_file.zig").readFileWithControl(alloc, io, path, control);
         const index = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
         if (index == .object) if (index.object.get("weight_map")) |weights| {
             if (weights != .object) return error.InvalidModelLayout;
             var seen: std.StringHashMapUnmanaged(void) = .empty;
             for (weights.object.values()) |file| {
+                try control.check();
                 if (file != .string) return error.InvalidModelLayout;
                 const slot = try seen.getOrPut(alloc, file.string);
                 if (!slot.found_existing) try paths.append(alloc, try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path).?, file.string }));
@@ -1867,18 +1878,19 @@ pub fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manif
     var external: std.ArrayList([]const u8) = .empty;
     var inspected_primary = false;
     for (paths.items) |path| {
+        try control.check();
         const primary = (manifest.onnx_path != null and std.mem.eql(u8, path, manifest.onnx_path.?)) or
             (manifest.onnx_logical_path != null and std.mem.eql(u8, path, manifest.onnx_logical_path.?));
         if (primary and inspected_primary) continue;
         if (!primary and !std.mem.endsWith(u8, path, ".onnx")) continue;
         const base = if (primary and manifest.onnx_logical_path != null) std.fs.path.dirname(manifest.onnx_logical_path.?) else null;
-        var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithBase(alloc, if (primary) manifest.onnx_path.? else path, base);
+        var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithControl(alloc, if (primary) manifest.onnx_path.? else path, base, null, control);
         defer artifacts.deinit();
         if (primary) inspected_primary = true;
         for (artifacts.external_paths) |tensor_path| try external.append(alloc, try alloc.dupe(u8, tensor_path));
     }
     try paths.appendSlice(alloc, external.items);
-    return componentDependencySignature(io, paths.items);
+    return componentDependencySignatureWithControl(io, paths.items, control);
 }
 
 const eg2_identity = @import("embedding_gemma2_identity.zig");
@@ -2006,7 +2018,7 @@ test "loaded runtime owned asset construction unwinds model and shared state at 
 }
 
 pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
-    return modelIdentityWithArtifacts(a, io, model_dir, manifest, null);
+    return modelIdentityWithArtifacts(a, io, model_dir, manifest, null, .{});
 }
 
 /// The resource domain supplies admission; all model preparation and backend
@@ -2107,7 +2119,7 @@ pub fn preparePrimary(allocator: std.mem.Allocator, model_dir: []const u8, sourc
     defer if (artifacts_owned) tokenizer_artifacts.deinit();
     tokenizer_artifacts.verification_cache = preparation.host.session_loading.verification_cache;
     const resolution_file_revision = try resolutionModelRevision(allocator, sm.io orelse std.Options.debug_io, man);
-    const resolution_revision = try modelIdentityWithArtifacts(allocator, io, model_dir, man, &tokenizer_artifacts);
+    const resolution_revision = try modelIdentityWithArtifacts(allocator, io, model_dir, man, &tokenizer_artifacts, control orelse .{});
     const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
         try eg2_identity.signature(allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
     else
@@ -2397,7 +2409,7 @@ pub fn loadPlanningAssets(allocator: std.mem.Allocator, model_dir: []const u8, i
     defer proof.deinit();
     var bound = try session_loader.BoundModelSource.init(&proof, model_dir, @import("model_source.zig").ModelSource.kindForPath(model_dir), &man, null);
     defer bound.deinit();
-    const revision = try modelIdentityWithArtifacts(allocator, preparation.identity_io orelse return error.MissingIoRuntime, model_dir, man, artifacts);
+    const revision = try modelIdentityWithArtifacts(allocator, preparation.identity_io orelse return error.MissingIoRuntime, model_dir, man, artifacts, control);
     const planning = try chunkPlanningSnapshotWithControl(allocator, io, man, revision, control);
     const kind = try tokenizer_loader.tokenizerKindWithArtifacts(man, artifacts, tokenizer_loader.tokenizerGemmaCompat(man, model_dir));
     const plan = try @import("load_plan.zig").tokenizerLoadAdmissionPlanWithArtifacts(allocator, model_dir, &man, kind, artifacts);
@@ -2545,7 +2557,8 @@ test "actual optional text head stays numeric and quota funded after asset slot 
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
 }
 
-pub fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest, published: ?*PublishedArtifacts) ![32]u8 {
+pub fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest, published: ?*PublishedArtifacts, control: InferenceExecutionControl) ![32]u8 {
+    try control.check();
     var owned: ?managed_receipt.ValidatedReceipt = null;
     defer if (owned) |*validated| validated.deinit();
     const receipt: ?*managed_receipt.ValidatedReceipt = if (published) |source|
@@ -2567,15 +2580,16 @@ pub fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: [
         }.less);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         for (artifacts) |artifact| {
+            try control.check();
             var decoded: [32]u8 = undefined;
             if (published) |source| {
-                try source.verifyFile(artifact.path);
+                try source.verifyFileWithControl(artifact.path, control);
                 if (artifact.sha256) |digest| {
                     // verifyFile authenticated this digest against the actual
                     // file and retained its complete construction stamp.
                     _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
-                } else decoded = try ArtifactDigestCache.digest(io, artifact);
-            } else decoded = try ArtifactDigestCache.digest(io, artifact);
+                } else decoded = try ArtifactDigestCache.digestWithControl(io, artifact, control);
+            } else decoded = try ArtifactDigestCache.digestWithControl(io, artifact, control);
             if (artifact.sha256) |digest| {
                 if (digest.len != 64) return error.InvalidManagedDownload;
                 var expected: [32]u8 = undefined;
@@ -2590,7 +2604,7 @@ pub fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: [
         hash.final(&result);
         return imagePreprocessingRevision(manifest, result);
     }
-    return imagePreprocessingRevision(manifest, try resolutionModelRevision(a, io, manifest));
+    return imagePreprocessingRevision(manifest, try resolutionModelRevisionWithControl(a, io, manifest, control));
 }
 
 pub const ManagedWhisperPrompt = struct {
