@@ -2409,7 +2409,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     retained.cut.policies.protected = false;
     retained.policies = &retained_policies;
     retained.bindings = &.{.{ .id = 17, .physical = "private-table-17", .version = 1, .target = .{ .database = "default", .namespace = "public", .table = "docs" } }};
-    try manager.setRowFilter("alice", "docs", "{\"term\":\"allowed\"}");
+    try manager.setRowFilter("alice", "docs", "{\"term\":{\"tenant_id\":\"allowed\"}}");
     try std.testing.expectError(error.Forbidden, retained.check(alloc, credential, authority.request, false));
     try manager.removeRowFilter("alice", "docs");
     const closes_before_revoke = native_cursor.closes;
