@@ -49504,12 +49504,11 @@ pub const DB = struct {
             // read scopes bound each page's pinned blocks and values.
             read: ?docstore_mod.DocStore.Txn = null,
             reverse: std.StringHashMapUnmanaged(Entry) = .empty,
-            missing: std.ArrayListUnmanaged(doc_set.DocOrdinal) = .empty,
             bitmap: ?@import("../../encoding/roaring.zig").Iterator = null,
             offset: usize = 0,
             initialized: bool = false,
             exhausted: bool = false,
-            incomplete: ?bool = null,
+            incomplete: bool = false,
             explicit_keys: ?std.StringHashMapUnmanaged(void) = null,
 
             fn deinit(self: *SourceRecovery) void {
@@ -49583,21 +49582,32 @@ pub const DB = struct {
                 }
                 var resolved: [page.len]?[]const u8 = undefined;
                 try scope.getManySorted(reverse_keys[0..len], resolved[0..len]);
+                var missing: [page.len]doc_set.DocOrdinal = undefined;
+                var missing_count: usize = 0;
                 for (page[0..len], resolved[0..len]) |ordinal, key| {
                     try db_query_search.checkSearchRequestDeadline(self.req);
                     if (key) |id| {
                         if (recovery.reverse.contains(id)) continue;
                         const retained = cache_alloc.dupe(u8, id) catch return original_error;
                         recovery.reverse.put(cache_alloc, retained, .{ .ordinal = ordinal }) catch return original_error;
-                    } else {
-                        recovery.missing.append(cache_alloc, ordinal) catch return original_error;
+                    } else if (!recovery.incomplete) {
+                        missing[missing_count] = ordinal;
+                        missing_count += 1;
                     }
+                }
+                if (missing_count != 0) {
+                    var states: [page.len]bool = undefined;
+                    self.readSourceVisibility(&recovery.read, missing[0..missing_count], states[0..missing_count]) catch |err| {
+                        if (!recoverableSourceIdentityError(err)) return err;
+                        // A failed proof cannot establish a nonmember.
+                        recovery.incomplete = true;
+                    };
+                    if (!recovery.incomplete) recovery.incomplete = std.mem.indexOfScalar(bool, states[0..missing_count], true) != null;
                 }
                 try self.recoverKnownSourceKeys(&recovery.read, recovery, &pending, ordinals, visible);
             }
             if (pending.count() == 0) return;
-            if (recovery.incomplete == null) recovery.incomplete = try self.hasLiveMissingSourceIdentity(&recovery.read, recovery.missing.items);
-            if (!recovery.incomplete.? and recovery.explicit_keys == null) {
+            if (!recovery.incomplete and recovery.explicit_keys == null) {
                 var explicit: std.StringHashMapUnmanaged(void) = .empty;
                 for ([_]*const doc_set.ResolvedDocSet{ set, &constraints.legacy_filter }) |key_set| {
                     if (key_set.* != .doc_keys) continue;
@@ -49613,10 +49623,10 @@ pub const DB = struct {
             while (unresolved.next()) |entry| {
                 const slot = entry.value_ptr.*;
                 const failure = failures[slot].?;
-                if (!recovery.incomplete.?) {
+                if (!recovery.incomplete) {
                     if (!recovery.explicit_keys.?.contains(entry.key_ptr.*)) continue;
                     if (failure == error.NotFound) {
-                        visible[slot] = recovery.reverse.get(entry.key_ptr.*) == null;
+                        visible[slot] = true;
                         continue;
                     }
                 }
@@ -49651,8 +49661,8 @@ pub const DB = struct {
                     if (is_visible) {
                         ordinals[entry.value_ptr.*] = cached.ordinal;
                         visible[entry.value_ptr.*] = true;
-                        pending.removeByPtr(entry.key_ptr);
                     }
+                    pending.removeByPtr(entry.key_ptr);
                     continue;
                 }
                 candidates[count] = .{ .ordinal = cached.ordinal, .key = entry.key_ptr.*, .slot = entry.value_ptr.* };
@@ -49666,24 +49676,12 @@ pub const DB = struct {
             try self.readSourceVisibility(read, numbers[0..count], states[0..count]);
             for (candidates[0..count], states[0..count]) |candidate, is_visible| {
                 recovery.reverse.getPtr(candidate.key).?.visible = is_visible;
-                if (!is_visible) continue;
-                ordinals[candidate.slot] = candidate.ordinal;
-                visible[candidate.slot] = true;
+                if (is_visible) {
+                    ordinals[candidate.slot] = candidate.ordinal;
+                    visible[candidate.slot] = true;
+                }
                 _ = pending.remove(candidate.key);
             }
-        }
-
-        fn hasLiveMissingSourceIdentity(self: *@This(), read: *?docstore_mod.DocStore.Txn, missing: []doc_set.DocOrdinal) !bool {
-            var offset: usize = 0;
-            while (offset < missing.len) {
-                const page = missing[offset..@min(offset + 256, missing.len)];
-                std.mem.sort(doc_set.DocOrdinal, page, {}, std.sort.asc(doc_set.DocOrdinal));
-                var states: [256]bool = undefined;
-                try self.readSourceVisibility(read, page, states[0..page.len]);
-                if (std.mem.indexOfScalar(bool, states[0..page.len], true) != null) return true;
-                offset += page.len;
-            }
-            return false;
         }
 
         fn sourceRecoveryRead(self: *@This(), read: *?docstore_mod.DocStore.Txn) !*docstore_mod.DocStore.Txn {
@@ -158358,6 +158356,18 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
         try std.testing.expect(visible[0]);
         try std.testing.expectEqual(@as(?doc_set.DocOrdinal, endpoints[1]), resolved[0]);
         try std.testing.expectEqual(loaded_ordinals, recovery.offset);
+
+        // A legacy key backed by a future ordinal has a conclusive
+        // negative result even if its forward mapping cannot be decoded.
+        var historical_scan: DB.PrimaryMatchAllIdentityScan = .{ .db = &db, .req = .{ .identity_read_generation = 0 }, .alloc = a };
+        var historical: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
+        defer historical.deinit();
+        for (0..2) |_| {
+            try historical_scan.recoverScopedSourceBatch(options, &historical, a, &.{writes[1].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+            try std.testing.expect(!visible[0]);
+            try std.testing.expect(historical.reverse.get(writes[1].key).?.visible == false);
+            historical_scan.db = undefined;
+        }
 
         // Stop inside the first bitmap page, then resume across later pages.
         var bitmap_scope = @import("../../encoding/roaring.zig").RoaringBitmap.init(a);

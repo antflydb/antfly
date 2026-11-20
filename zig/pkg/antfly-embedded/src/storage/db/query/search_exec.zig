@@ -10347,7 +10347,7 @@ const IndexedPredicateEvaluator = struct {
         fn publishCoverage(self: *FrontierProbeInput, alloc: Allocator, keys: std.AutoHashMapUnmanaged(u32, []const u8), control: QueryExecutionControl) !void {
             errdefer {
                 self.deinit(alloc);
-                self.* = .{ .attempted = true };
+                self.* = .{ .attempted = true, .range_projection_disabled = self.range_projection_disabled };
             }
             var ordinals = keys.keyIterator();
             while (ordinals.next()) |ordinal| {
@@ -10555,7 +10555,11 @@ const IndexedPredicateEvaluator = struct {
                 // Rebuild only the current scope when a merge cannot fit the
                 // graph work budget alongside its input batches.
                 memo.deinit(self.alloc);
-                memo.* = .{ .attempted = true, .covered = roaring.RoaringBitmap.init(self.alloc) };
+                memo.* = .{
+                    .attempted = true,
+                    .range_projection_disabled = memo.range_projection_disabled,
+                    .covered = roaring.RoaringBitmap.init(self.alloc),
+                };
                 missing.clearRetainingCapacity();
                 try self.collectMissingProbeOrdinals(memo, scope, frontier, &missing);
                 try self.extendProbeScope(memo, missing, null);
@@ -11341,13 +11345,7 @@ const IndexedPredicateEvaluator = struct {
             evidence.covered.deinit();
             return evidence.matches;
         }
-        // Keep physical work charged to the request. When one full pass
-        // fits but a partial pass and replay may not, go straight to stored rows.
-        const use_single_pass = if (self.budget) |budget|
-            scope_count <= budget.remaining_anchors and scope_count +| (scope_count - covered_count) > budget.remaining_anchors
-        else
-            false;
-        if (covered_count == 0 or use_single_pass) {
+        if (covered_count == 0) {
             evidence.covered.deinit();
             evidence.matches.deinit();
             return self.executeStoredRange(stored, scope);
@@ -11360,6 +11358,27 @@ const IndexedPredicateEvaluator = struct {
         };
         missing.andNotWith(&evidence.covered);
         evidence.covered.deinit();
+        // If the budget cannot pay for a replay, reserve the result before
+        // reading residual rows. Rejected rows only clear preexisting bits.
+        if (self.budget) |budget| {
+            if (scope_count +| (scope_count - covered_count) > budget.remaining_anchors) {
+                evidence.matches.orWith(&missing) catch {
+                    missing.deinit();
+                    evidence.matches.deinit();
+                    self.discardRangeFrontier();
+                    return self.executeStoredRange(stored, scope);
+                };
+                self.evaluateStoredRange(stored, &missing, &evidence.matches, true) catch |err| {
+                    missing.deinit();
+                    evidence.matches.deinit();
+                    if (err != error.OutOfMemory) return err;
+                    self.discardRangeFrontier();
+                    return self.executeStoredRange(stored, scope);
+                };
+                missing.deinit();
+                return evidence.matches;
+            }
+        }
         const residual = self.executeStoredRange(stored, &missing) catch |err| {
             missing.deinit();
             evidence.matches.deinit();
@@ -11389,14 +11408,19 @@ const IndexedPredicateEvaluator = struct {
     }
 
     fn executeStoredRange(self: IndexedPredicateEvaluator, range: std.json.Value, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        var matches = roaring.RoaringBitmap.init(self.alloc);
+        errdefer matches.deinit();
+        try self.evaluateStoredRange(range, scope, &matches, false);
+        return matches;
+    }
+
+    fn evaluateStoredRange(self: IndexedPredicateEvaluator, range: std.json.Value, scope: *const roaring.RoaringBitmap, matches: *roaring.RoaringBitmap, comptime prefilled: bool) !void {
         const load = self.executor.load_many_stored_values orelse return error.UnsupportedQueryRequest;
         var wrapper: std.json.ObjectMap = .empty;
         defer wrapper.deinit(self.scratch);
         try wrapper.put(self.scratch, "range", range);
         var predicate = try graph_exec.PreparedPatternFilter.initValue(self.alloc, .{ .object = wrapper });
         defer predicate.deinit();
-        var matches = roaring.RoaringBitmap.init(self.alloc);
-        errdefer matches.deinit();
         var row = std.heap.ArenaAllocator.init(self.alloc);
         defer row.deinit();
 
@@ -11409,7 +11433,10 @@ const IndexedPredicateEvaluator = struct {
             while (count < ordinals.len) {
                 const ordinal = docs.next() orelse break;
                 if (self.missing_rows) |missing| {
-                    if (missing.contains(ordinal)) continue;
+                    if (missing.contains(ordinal)) {
+                        if (prefilled) matches.removeRetainingStorage(ordinal);
+                        continue;
+                    }
                 }
                 ordinals[count] = ordinal;
                 if (self.frontier) |frontier| frontier_keys[count] = frontier.get(ordinal) orelse return error.InvalidData;
@@ -11433,12 +11460,15 @@ const IndexedPredicateEvaluator = struct {
                 const value = raw orelse {
                     const missing = self.missing_rows orelse return error.StorageReadTemporarilyUnavailable;
                     try missing.add(ordinal);
+                    if (prefilled) matches.removeRetainingStorage(ordinal);
                     continue;
                 };
-                if (try predicate.matchesStored(scratch, key, value)) try matches.add(ordinal);
+                const matched = try predicate.matchesStored(scratch, key, value);
+                if (prefilled) {
+                    if (!matched) matches.removeRetainingStorage(ordinal);
+                } else if (matched) try matches.add(ordinal);
             }
         }
-        return matches;
     }
 
     fn resolveOrdinals(self: IndexedPredicateEvaluator, docs: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
@@ -12387,7 +12417,7 @@ test "optional numeric range frontier memo coalesces small extensions" {
 test "optional numeric range frontier publication discards mappings after allocation failure" {
     var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
     const alloc = failing.allocator();
-    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .range_projection_disabled = true, .covered = roaring.RoaringBitmap.init(alloc) };
     defer memo.deinit(alloc);
     var map: std.AutoHashMapUnmanaged(u32, u32) = .empty;
     try map.put(alloc, 1, 1);
@@ -12399,6 +12429,7 @@ test "optional numeric range frontier publication discards mappings after alloca
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.OutOfMemory, memo.publishCoverage(alloc, keys, .{}));
     try std.testing.expect(memo.covered == null);
+    try std.testing.expect(memo.range_projection_disabled);
     try std.testing.expectEqual(@as(usize, 0), memo.batches.items.len);
 }
 
@@ -12544,6 +12575,7 @@ test "optional numeric range returns full stored results after residual or union
     const Loader = struct {
         calls: usize = 0,
         fail_first: bool = true,
+        expected_count: usize = 2,
 
         fn load(raw: ?*anyopaque, scratch: Allocator, keys: []const []const u8) ![]?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -12553,7 +12585,7 @@ test "optional numeric range returns full stored results after residual or union
                 try std.testing.expectEqualStrings("stored", keys[0]);
                 return error.OutOfMemory;
             }
-            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expectEqual(self.expected_count, keys.len);
             const values = try scratch.alloc(?[]u8, keys.len);
             for (keys, values) |key, *value| {
                 value.* = try scratch.dupe(u8, if (std.mem.eql(u8, key, "stored")) "{\"rank\":8}" else "{\"rank\":1}");
@@ -12611,7 +12643,7 @@ test "optional numeric range returns full stored results after residual or union
     try std.testing.expect(memo.range_projection_disabled and memo.covered == null);
     try std.testing.expect(joined.eql(&retried));
 
-    loader = .{ .fail_first = false };
+    loader = .{ .fail_first = false, .expected_count = 1 };
     var budget = WorkBudget.init(10, 10);
     budget.remaining_anchors = scope.cardinality();
     var budgeted = evaluator;
@@ -12622,8 +12654,15 @@ test "optional numeric range returns full stored results after residual or union
     var exact_budget = try budgeted.finishMixedRange(parsed.value, &scope, partial);
     defer exact_budget.deinit();
     try std.testing.expectEqual(@as(usize, 1), loader.calls);
+    try std.testing.expectEqual(@as(usize, 1), budget.remaining_anchors);
+    try std.testing.expectEqual(@as(usize, 2), exact_budget.cardinality());
+    var one_row = roaring.RoaringBitmap.init(alloc);
+    defer one_row.deinit();
+    try one_row.add(2);
+    var next_clause = try budgeted.executeStoredRange(parsed.value, &one_row);
+    defer next_clause.deinit();
     try std.testing.expectEqual(@as(usize, 0), budget.remaining_anchors);
-    try std.testing.expect(exact_budget.eql(&retried));
+    try std.testing.expect(next_clause.eql(&retried));
 }
 
 const ResidualIdentityContext = struct {
