@@ -273,7 +273,14 @@ const Header = extern struct {
     /// reasoning: no implicit compiler-inserted padding anywhere in this
     /// struct. Widened from 4 to 12 bytes by v5's `writer_holder` growing
     /// 64 -> 128 bits (see `format_version`'s own v5 comment).
-    _log_reserved: [12]u8 = @splat(0),
+    _log_reserved: [4]u8 = @splat(0),
+    /// Byte offset, relative to the log's base, where the records after
+    /// `log_checkpoint_sequence`'s fold begin: a fold a reader pin deferred
+    /// keeps the superseded log before it, and a cold reader skips that
+    /// prefix instead of reading and checksumming it. Zero when the fold
+    /// reset the log, or when unknown (scan from the start). Guarded by the
+    /// same seqlock; older binaries leave it zero.
+    log_fold_start_offset: std.atomic.Value(u64),
 };
 
 comptime {
@@ -1282,6 +1289,7 @@ pub const Region = struct {
                 .log_durable_sequence = .init(0),
                 .log_durable_offset = .init(0),
                 .log_generation = .init(0),
+                .log_fold_start_offset = .init(0),
             };
             fresh.header_checksum = headerChecksum(&fresh);
             try setup_file.writePositionalAll(io, std.mem.asBytes(&fresh), 0);
@@ -2389,6 +2397,8 @@ pub const Region = struct {
         checkpoint_sequence: u64,
         durable_sequence: u64,
         durable_offset: u64,
+        /// See `Header.log_fold_start_offset`.
+        fold_start_offset: u64 = 0,
     };
 
     /// Publishes the writer's current log state as one consistent triple,
@@ -2437,6 +2447,7 @@ pub const Region = struct {
         hdr.log_checkpoint_sequence.store(state.checkpoint_sequence, .seq_cst);
         hdr.log_durable_sequence.store(state.durable_sequence, .seq_cst);
         hdr.log_durable_offset.store(state.durable_offset, .seq_cst);
+        hdr.log_fold_start_offset.store(state.fold_start_offset, .seq_cst);
         hdr.log_generation.store(publishing +% 1, .seq_cst);
     }
 
@@ -2449,6 +2460,7 @@ pub const Region = struct {
         hdr.log_checkpoint_sequence.store(0, .monotonic);
         hdr.log_durable_sequence.store(0, .monotonic);
         hdr.log_durable_offset.store(0, .monotonic);
+        hdr.log_fold_start_offset.store(0, .monotonic);
         // A reinitialized region's generation is zero: never published.
         hdr.log_generation.store(0, .release);
     }
@@ -2496,6 +2508,7 @@ pub const Region = struct {
             .checkpoint_sequence = hdr.log_checkpoint_sequence.load(.seq_cst),
             .durable_sequence = hdr.log_durable_sequence.load(.seq_cst),
             .durable_offset = hdr.log_durable_offset.load(.seq_cst),
+            .fold_start_offset = hdr.log_fold_start_offset.load(.seq_cst),
         };
     }
 
@@ -2523,6 +2536,7 @@ pub const Region = struct {
                 .checkpoint_sequence = hdr.log_checkpoint_sequence.load(.seq_cst),
                 .durable_sequence = hdr.log_durable_sequence.load(.seq_cst),
                 .durable_offset = hdr.log_durable_offset.load(.seq_cst),
+                .fold_start_offset = hdr.log_fold_start_offset.load(.seq_cst),
             };
             const after = hdr.log_generation.load(.seq_cst);
             if (before == after) return state;

@@ -60,6 +60,23 @@ class StagedFormattingTests(unittest.TestCase):
     def format(self, path, data):
         return data.replace(b"value=1", b"value = 1")
 
+    def test_waits_out_a_briefly_held_index_lock(self):
+        import threading
+
+        self.base()
+        self.write("example.py", b"value=1\n" + b"# context\n" * 12 + b"other = 0\n")
+        self.git("add", "--", "example.py")
+        lock = self.root / ".git" / "index.lock"
+        lock.write_bytes(b"")
+        release = threading.Timer(0.3, lock.unlink)
+        release.start()
+        try:
+            format_staged.format_staged(self.root, self.format)
+        finally:
+            release.join()
+        staged = self.git("show", ":example.py")
+        self.assertTrue(staged.startswith(b"value = 1\n"))
+
     def test_partial_staging_preserves_unstaged_hunk(self):
         original = self.base()
         staged = original.replace(b"value = 0", b"value=1")
