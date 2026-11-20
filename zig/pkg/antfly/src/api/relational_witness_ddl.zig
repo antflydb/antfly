@@ -116,9 +116,13 @@ pub fn prepare(alloc: Allocator, tables: []const records.TableRecord, child_name
     var child_json = try preserveOwned(owned, before, proposed);
     var parents = std.ArrayList(Parent).empty;
     const fks = try child.relationalForeignKeyDefinitions(owned);
-    const Target = struct { table: ?*const records.TableRecord = null, supported_schema: ?[]const u8 = null };
+    const Target = struct { table: ?*const records.TableRecord = null, requirements: std.ArrayList(support.ColumnGroup) = .empty };
     var targets: std.StringArrayHashMapUnmanaged(Target) = .empty;
-    for (fks) |fk| try targets.put(owned, fk.parent_table, .{});
+    for (fks) |fk| {
+        const entry = try targets.getOrPut(owned, fk.parent_table);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        if (fk.match == .partial) try entry.value_ptr.requirements.append(owned, fk.parent_columns);
+    }
     var remaining = targets.count() - @intFromBool(targets.contains(child_name));
     for (tables) |*table| {
         if (remaining == 0) break;
@@ -128,23 +132,15 @@ pub fn prepare(alloc: Allocator, tables: []const records.TableRecord, child_name
             remaining -= 1;
         }
     }
-    for (fks) |fk| {
-        if (fk.match != .partial) continue;
-        if (std.mem.eql(u8, child_name, fk.parent_table)) {
-            if (try support.ensureCoverage(owned, child_json, fk.parent_columns)) |updated| child_json = updated;
-            continue;
-        }
-        const target = targets.getPtr(fk.parent_table).?;
-        const parent = target.table orelse return error.ForeignKeyParentTableNotFound;
-        if (parent.relational_retirement_json.len != 0 or parent.restore_backup_id.len != 0) return error.TableTransitionActive;
-        if (try support.ensureCoverage(owned, target.supported_schema orelse parent.schema_json, fk.parent_columns)) |updated|
-            target.supported_schema = updated;
+    if (targets.get(child_name)) |target| {
+        if (try support.ensureCoverageMany(owned, child_json, target.requirements.items)) |updated| child_json = updated;
     }
     // Target validation checks all the child's constraints naming this parent.
     for (targets.keys(), targets.values()) |name, target| {
         const parent_json = if (std.mem.eql(u8, child_name, name)) child_json else blk: {
             const parent = target.table orelse return error.ForeignKeyParentTableNotFound;
-            if (target.supported_schema) |updated| {
+            if (target.requirements.items.len != 0 and (parent.relational_retirement_json.len != 0 or parent.restore_backup_id.len != 0)) return error.TableTransitionActive;
+            if (try support.ensureCoverageMany(owned, parent.schema_json, target.requirements.items)) |updated| {
                 const after = try tables_api.applySchemaUpdateRecord(owned, parent, updated);
                 try parents.append(owned, .{ .before = parent.*, .after = after });
                 break :blk after.schema_json;

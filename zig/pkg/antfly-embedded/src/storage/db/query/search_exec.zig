@@ -15683,11 +15683,8 @@ fn searchDenseInternal(
             }
             profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
 
-            var stored_data = if (entry.has_pdf_page_members and raw_member_mode and postprocess_req.include_stored)
-                try pdfPageHitProjection(alloc, source_artifact_ref)
-            else
-                null;
-            var stored_data_owned = stored_data != null;
+            var stored_data: ?[]u8 = null;
+            var stored_data_owned = false;
             errdefer if (stored_data_owned) {
                 if (stored_data) |data| alloc.free(data);
             };
@@ -15710,17 +15707,9 @@ fn searchDenseInternal(
                 stored_data_owned = stored_data != null;
                 profile.load_projected_document_ns += projected_source_profile.total_ns - load_profile_total_before;
             }
-            // Page-image embeddings may have no standalone unit row. Ancestor
-            // projection is independent of the top-level stored-field mask.
-            const unit_data = if (entry.has_pdf_page_members and raw_member_mode and postprocess_req.hierarchy_include_unit)
-                try pdfPageHitProjection(alloc, source_artifact_ref)
-            else
-                null;
-            errdefer if (unit_data) |data| alloc.free(data);
             try hit_vector_ids.append(alloc, hit.vector_id);
             try hits.append(alloc, .{
                 .id = doc_key,
-                .ancestor_unit_data = unit_data,
                 .doc_ordinal = null,
                 .score = vector_mod.similarityFromDistance(hit.distance, entry.metric),
                 .distance = hit.distance,
@@ -17199,22 +17188,6 @@ fn lookupDenseHitDocOrdinal(
     if (!denseHitPageNeedsDocOrdinals(req)) return null;
     const lookup = executor.lookup_doc_ordinal orelse return null;
     return try lookup(executor.ctx, alloc, doc_key, req.identity_read_generation);
-}
-
-// The producer persists the page vector under a unit key plus the embedding
-// suffix. Its page number is intrinsic to that identity, so historical vectors
-// can expose the same projection without storing or backfilling a second row.
-fn pdfPageHitProjection(alloc: Allocator, artifact: ?types.ArtifactRef) !?[]u8 {
-    const ref = artifact orelse return null;
-    const unit = switch (ref.kind) {
-        .asset => ref.unit_id,
-        .embedding => if (ref.source) |source| (if (source.kind == .asset) source.unit_id else null) else null,
-        .chunk => null,
-    } orelse return null;
-    if (!std.mem.startsWith(u8, unit, "page:")) return null;
-    const page = std.fmt.parseInt(u32, unit["page:".len..], 10) catch return null;
-    if (page == 0) return null;
-    return try std.json.Stringify.valueAlloc(alloc, .{ .unit_id = unit, .unit_type = "page", .provenance = .{ .page_number = page } }, .{});
 }
 
 fn loadMissingProjectedDenseHitDocuments(

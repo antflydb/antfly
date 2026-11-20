@@ -269,6 +269,8 @@ pub const Parent = struct {
 
 pub const Plan = struct {
     id: Id,
+    expected_incarnation: ?[32]u8 = null,
+
     child_before: records.TableRecord,
     child_after: records.TableRecord,
     /// Exact durable owner catalog at the source-fence cut. This is only a
@@ -278,6 +280,21 @@ pub const Plan = struct {
     child_ranges: []const records.RangeRecord,
     child_fences: []const topology.Fence,
     parents: []const Parent,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "expected_incarnation") and self.expected_incarnation == null;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (!self.nativeJsonSkipField(name)) {
+                try jw.objectField(name);
+                try jw.write(@field(self, name));
+            }
+        }
+        try jw.endObject();
+    }
 
     pub fn validate(self: Plan, alloc: std.mem.Allocator) !void {
         if (std.mem.allEqual(u8, &self.id, 0) or self.child_before.table_id == 0 or
@@ -550,6 +567,7 @@ fn supportUpdateMatches(alloc: std.mem.Allocator, before: records.TableRecord, a
 /// generation. It deliberately does not invent an old schema/source receipt.
 pub const InitialCreatePlan = struct {
     id: Id,
+    expected_incarnation: ?[32]u8 = null,
     retirement_scope: InitialRetirementScope,
     catalog_id: u64,
     expected_catalog_revision: u64,
@@ -573,6 +591,7 @@ pub const InitialCreatePlan = struct {
     namespace_id: u64,
 
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        if (std.mem.eql(u8, field, "expected_incarnation")) return self.expected_incarnation == null;
         return std.mem.eql(u8, field, "support_schema_format") and self.support_schema_format == .legacy;
     }
 
@@ -609,7 +628,19 @@ pub const InitialCreatePlan = struct {
         // Consume each constraint exactly once, including self references.
         var unassigned: std.StringHashMapUnmanaged([]const u8) = .empty;
         defer unassigned.deinit(alloc);
+        const support = @import("antfly_local_sources").schema_relational_witness_indexes;
+        var requirements: std.StringHashMapUnmanaged(std.ArrayList(support.ColumnGroup)) = .empty;
+        defer {
+            var groups = requirements.valueIterator();
+            while (groups.next()) |list| list.deinit(alloc);
+            requirements.deinit(alloc);
+        }
         for (fks) |fk| {
+            if (fk.match == .partial) {
+                const group = try requirements.getOrPut(alloc, fk.parent_table);
+                if (!group.found_existing) group.value_ptr.* = .empty;
+                try group.value_ptr.append(alloc, fk.parent_columns);
+            }
             const slot = try unassigned.getOrPut(alloc, fk.name);
             if (slot.found_existing) return error.InvalidGenerationPublication;
             slot.value_ptr.* = fk.parent_table;
@@ -647,18 +678,9 @@ pub const InitialCreatePlan = struct {
             // placement, index, or policy changes through the lock bypass.
             const support_before = parent.support_before orelse parent.table;
             if (parent.support_before != null and parent.support_after == null) return error.InvalidGenerationPublication;
-            var support_json = support_before.schema_json;
-            var changed = false;
-            for (fks) |fk| {
-                if (fk.match != .partial or !std.mem.eql(u8, fk.parent_table, parent.table.name)) continue;
-                if (try @import("antfly_local_sources").schema_relational_witness_indexes.ensureCoverage(alloc, support_json, fk.parent_columns)) |updated| {
-                    if (changed) alloc.free(support_json);
-                    support_json = updated;
-                    changed = true;
-                }
-            }
-            defer if (changed) alloc.free(support_json);
-            if (changed) {
+            const groups = requirements.get(parent.table.name) orelse std.ArrayList(support.ColumnGroup).empty;
+            if (try support.ensureCoverageMany(alloc, support_before.schema_json, groups.items)) |support_json| {
+                defer alloc.free(support_json);
                 support_changes += 1;
                 const before = parent.support_before orelse return error.InvalidGenerationPublication;
                 const after = parent.support_after orelse return error.InvalidGenerationPublication;
@@ -976,7 +998,7 @@ pub const InitialPublication = struct {
                 if (self.phase != .preparing_support or !self.plan.support_pending) return error.GenerationPublicationChanged;
                 const sealed = command.plan.?;
                 try sealed.validate(alloc);
-                if (sealed.catalog_id != self.plan.catalog_id or sealed.namespace_id != self.plan.namespace_id or
+                if (!std.meta.eql(sealed.expected_incarnation, self.plan.expected_incarnation) or sealed.catalog_id != self.plan.catalog_id or sealed.namespace_id != self.plan.namespace_id or
                     sealed.expected_catalog_revision != self.plan.expected_catalog_revision or
                     sealed.retirement_scope != self.plan.retirement_scope or
                     sealed.support_schema_format != self.plan.support_schema_format or

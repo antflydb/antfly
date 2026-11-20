@@ -889,6 +889,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "externalizeSearchResultArtifactIds",
             "native asset members hydrate source authority and revision identity",
+            "direct PDF member preserves stored page metadata",
             "native unit ancestry uses its configured producer name",
             "native member logical filters use parent values and shared verification budgets",
             "missing modality producers and transcription failures remain incomplete",

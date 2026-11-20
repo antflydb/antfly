@@ -132,7 +132,9 @@ pub const bound_ddl_version: u16 = 95;
 pub const bound_catalog_incarnation_version: u16 = 96;
 /// Version 97 versions FK witness-schema reconstruction and fences policy publication begin.
 pub const guarded_publication_version: u16 = 97;
-pub const current_version: u16 = guarded_publication_version;
+/// Generation plans can bind a catalog incarnation and policy creates can enforce capacity at apply.
+pub const guarded_generation_admission_version: u16 = 98;
+pub const current_version: u16 = guarded_generation_admission_version;
 
 pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
     const empty: [32]u8 = @splat(0);

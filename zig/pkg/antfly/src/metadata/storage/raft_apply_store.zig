@@ -3761,6 +3761,21 @@ test "system catalog relation namespace transaction FK generation publication be
         .child_fences = &.{child_fence},
         .parents = &.{.{ .table = parent, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .transitions = &.{derived[0].transition} }},
     };
+    {
+        var stale_plan = plan;
+        stale_plan.expected_incarnation = "22222222222222222222222222222222".*;
+        const stale = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.Command{
+            .plan_id = id,
+            .child_table_id = child.table_id,
+            .expected_revision = 0,
+            .action = .begin,
+            .plan = stale_plan,
+        }, .{});
+        defer alloc.free(stale);
+        try std.testing.expectError(error.CatalogGenerationChanged, store.requireMetadataIncarnation(group_id, stale_plan.expected_incarnation));
+        try store.applyStandaloneCommand(group_id, .{ .apply_fk_generation_publication = stale });
+        try std.testing.expectError(error.GenerationPublicationNotFound, store.fkGenerationPublicationStatusJson(alloc, group_id, child.table_id));
+    }
     var altered_index_plan = plan;
     altered_index_plan.child_after.indexes_json = "{\"unexpected\":{}}";
     try std.testing.expectError(error.InvalidGenerationPublication, altered_index_plan.validate(alloc));
@@ -4436,6 +4451,22 @@ test "system catalog relation namespace transaction FK generation publication in
         .namespace_id = system_catalog.default_namespace_id,
         .parents = &.{.{ .table = parent, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .transitions = &.{derived[0].transition} }},
     };
+    {
+        var stale_plan = plan;
+        stale_plan.expected_incarnation = "22222222222222222222222222222222".*;
+        const stale = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{
+            .plan_id = id,
+            .child_table_id = candidate.child.table_id,
+            .expected_revision = 0,
+            .action = .begin,
+            .plan = stale_plan,
+        }, .{});
+        defer alloc.free(stale);
+        try std.testing.expectError(error.CatalogGenerationChanged, store.requireMetadataIncarnation(group_id, stale_plan.expected_incarnation));
+        try std.testing.expectError(error.GenerationPublicationChanged, store.preflightFkInitialCreateCommand(group_id, stale));
+        try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = stale });
+        try std.testing.expectError(error.GenerationPublicationNotFound, store.fkInitialCreateStatusJson(alloc, group_id, candidate.child.table_id));
+    }
     const hidden_proof: fk_generation_publication.InitialPlacementProof = .{
         .plan_id = plan.id,
         .plan_digest = try plan.digest(alloc),
@@ -8278,6 +8309,18 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
             defer decoded.deinit(alloc);
             try std.testing.expectEqualDeep(command, decoded);
             {
+                var stale = draft;
+                stale.expected_incarnation = "22222222222222222222222222222222".*;
+                const bytes = try std.json.Stringify.valueAlloc(alloc, stale, .{});
+                defer alloc.free(bytes);
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                try applyRestoreTransitionForTest(&store, &txn, group, .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = bytes } });
+                var buf: [256]u8 = undefined;
+                try std.testing.expectError(error.NotFound, txn.get(try restoreJobKeyForGroup(&buf, group, user_key)));
+                try std.testing.expectError(error.NotFound, txn.get(try restore_staging.jobKey(&buf, group, id)));
+            }
+            {
                 var cancelled_txn = try store.store.beginWriteTxn();
                 defer cancelled_txn.abort();
                 var key_buf: [256]u8 = undefined;
@@ -11709,7 +11752,7 @@ pub const RaftApplyStore = struct {
             if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
             var hash: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
-            try system_catalog_storage.applyPolicyCommand(self.alloc, &txn, group_id, command, hash);
+            try system_catalog_storage.applyPolicyCommand(self.alloc, &txn, group_id, command, hash, .reject);
             const observed = try system_catalog_storage.readMeta(self.alloc, &txn, group_id);
             if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &hash)) return error.CatalogGenerationChanged;
         }
@@ -11944,6 +11987,23 @@ pub const RaftApplyStore = struct {
         _ = self.projection_listeners.orderedRemove(projection_index.?);
         _ = self.committed_key_listeners.orderedRemove(committed_key_index.?);
         return true;
+    }
+
+    fn metadataIncarnationMatchesTxn(txn: anytype, group: u64, expected: ?[32]u8) !bool {
+        const incarnation = expected orelse return true;
+        var buf: [160]u8 = undefined;
+        const raw = txn.get(try metadataIncarnationKeyForGroup(&buf, group)) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(raw)).incarnation, &incarnation);
+    }
+
+    pub fn requireMetadataIncarnation(self: *RaftApplyStore, group: u64, expected: ?[32]u8) !void {
+        if (expected == null) return;
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        if (!try metadataIncarnationMatchesTxn(&txn, group, expected)) return error.CatalogGenerationChanged;
     }
 
     pub fn getMetadataIncarnation(
@@ -13103,6 +13163,12 @@ pub const RaftApplyStore = struct {
         return std.mem.eql(u8, &epoch.incarnation, &incarnation);
     }
 
+    pub fn policyCreateHasCapacity(self: *RaftApplyStore, group: u64) !bool {
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        return system_catalog_storage.policyCreateHasCapacity(&txn, group);
+    }
+
     fn applySqlPoliciesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
         var parsed = try std.json.parseFromSlice(sql_policies.Command, self.alloc, bytes, .{});
@@ -13112,7 +13178,9 @@ pub const RaftApplyStore = struct {
         const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
-        try system_catalog_storage.applyPolicyCommand(self.alloc, txn, group_id, parsed.value, hash);
+        // Repeat capacity admission in the apply transaction. A create that
+        // loses a race leaves the catalog revision and receipt unchanged.
+        try system_catalog_storage.applyPolicyCommand(self.alloc, txn, group_id, parsed.value, hash, .skip);
         const observed = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
         if (observed.revision != previous.revision) self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id });
     }
@@ -14185,8 +14253,9 @@ pub const RaftApplyStore = struct {
         const source_tracked = try relation_reconciliation.readSourceRevision(txn, group_id) != 0;
         var previous_source_digest: ?[32]u8 = null;
         if (command.action == .begin) {
-            if (prior != null) return error.GenerationPublicationChanged;
             const plan = command.plan.?;
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, plan.expected_incarnation)) return error.GenerationPublicationChanged;
+            if (prior != null) return error.GenerationPublicationChanged;
             const digest = try plan.digest(a);
             const meta = try system_catalog_storage.readMeta(a, txn, group_id);
             if (plan.catalog_id != meta.next_id or plan.expected_catalog_revision != meta.revision or
@@ -14288,6 +14357,7 @@ pub const RaftApplyStore = struct {
             // apply retains immutable plan/receipt slices from the previous
             // value. Keep them in the transaction arena through serialization.
             const previous = try std.json.parseFromSliceLeaky(fk_generation_publication.InitialPublication, a, prior orelse return error.GenerationPublicationNotFound, .{});
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, previous.plan.expected_incarnation)) return error.StaleInitialFkCreateCommand;
             if (source_tracked) previous_source_digest = try relationInitialSourceDigest(previous, command.child_table_id);
             if (command.action == .seal_support) {
                 const sealed = command.plan orelse return error.InvalidGenerationPublication;
@@ -14629,6 +14699,7 @@ pub const RaftApplyStore = struct {
         var previous: ?std.json.Parsed(fk_generation_publication.Publication) = null;
         defer if (previous) |*value| value.deinit();
         if (command.action == .begin) {
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, command.plan.?.expected_incarnation)) return;
             var completion_buf: [200]u8 = undefined;
             const retired = txn.get(try fk_generation_publication.completionKey(&completion_buf, group_id, .{ .child_table_id = table_id, .publication_id = command.plan_id })) catch |err| switch (err) {
                 error.NotFound => null,
@@ -14661,6 +14732,7 @@ pub const RaftApplyStore = struct {
             publication = .{ .plan = plan, .plan_digest = plan_digest, .child_identity = try plan.childIdentity(alloc), .revision = 1, .phase = .fencing_child };
         } else {
             previous = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, existing orelse return error.GenerationPublicationNotFound, .{ .allocate = .alloc_always });
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, previous.?.value.plan.expected_incarnation)) return;
             if (source_tracked) previous_source_digest = try relationFkSourceDigest(previous.?.value, table_id);
             publication = try previous.?.value.apply(alloc, command);
             if (command.action == .publish_child) {
@@ -22515,6 +22587,7 @@ pub const RaftApplyStore = struct {
             if (job_bytes.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging;
             var job = try std.json.parseFromSlice(restore_staging.Job, alloc, job_bytes, .{});
             defer job.deinit();
+            if (!try metadataIncarnationMatchesTxn(&txn, group_id, job.value.plan.expected_incarnation)) continue;
             try overlayRestoreStagingProgressTxn(&txn, alloc, group_id, id, &job.value);
             // Drafts reserve identities and live source definitions, but may
             // not create target owners until immutable source cuts are bound.
@@ -22623,6 +22696,7 @@ pub const RaftApplyStore = struct {
         const bytes = (try stagingGet(&txn, try restore_staging.jobKey(&key_buf, group_id, id))) orelse return null;
         var job = try std.json.parseFromSlice(restore_staging.Job, alloc, bytes, .{ .allocate = .alloc_always });
         errdefer job.deinit();
+        if (!try metadataIncarnationMatchesTxn(&txn, group_id, job.value.plan.expected_incarnation)) return error.CatalogGenerationChanged;
         try overlayRestoreStagingProgressTxn(&txn, alloc, group_id, id, &job.value);
         if (job.value.plan.preparing_sources) {
             const arena = job.arena.allocator();
@@ -22981,6 +23055,7 @@ pub const RaftApplyStore = struct {
             if (current != null) return; // Immutable identity; callers verify plan digest after apply.
             if (try stagingGet(txn, progress_key) != null) return; // Canceled before admission.
             const plan = command.plan.?;
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, plan.expected_incarnation)) return;
             _ = restoreCatalogDeltaTxn(catalog_arena.allocator(), txn, group_id, plan) catch |err| {
                 if (err == error.InvalidRestoreStaging) return;
                 return err;
@@ -23054,6 +23129,7 @@ pub const RaftApplyStore = struct {
             const existing = current orelse return;
             var job = try std.json.parseFromSlice(restore_staging.Job, self.alloc, existing, .{});
             defer job.deinit();
+            if (!try metadataIncarnationMatchesTxn(txn, group_id, job.value.plan.expected_incarnation)) return;
             if (source_tracked) previous_source_digest = try relationRestoreSourceDigest(job.value.plan);
             const progress_bytes = (try stagingGet(txn, progress_key)) orelse return error.InvalidRestoreStaging;
             var progress = try std.json.parseFromSlice(restore_staging.Progress, self.alloc, progress_bytes, .{});
@@ -23096,6 +23172,7 @@ pub const RaftApplyStore = struct {
                 .freeze_rewrite => {
                     if (next.state != .preparing_sources or !job.value.plan.preparing_sources or next.completed_owners != total) return;
                     const frozen = command.plan.?;
+                    if (!std.meta.eql(frozen.expected_incarnation, job.value.plan.expected_incarnation)) return;
                     const previous_digest = try job.value.plan.rewriteIntentDigest(self.alloc);
                     const frozen_digest = try frozen.rewriteIntentDigest(self.alloc);
                     if (!std.mem.eql(u8, &previous_digest, &frozen_digest)) return;
@@ -39770,6 +39847,48 @@ test "system catalog inert SQL policy definitions survive standalone replay, sna
         var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
         defer store.deinit();
         try store.updateStandaloneCatalog(group, 0, .{ .tables = &.{table}, .auxiliary_json = "{}", .import_catalog = .{ .revision = 1, .next_id = 8, .resources = &.{binding} } });
+        {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const capped_root = try std.fmt.allocPrint(a, "{s}-capacity", .{root});
+            var capped_store = try RaftApplyStore.init(alloc, .{ .root_dir = capped_root });
+            defer capped_store.deinit();
+            const existing = try a.alloc(sql_policies.Record, 1024);
+            for (existing, 0..) |*row, index| {
+                row.* = record;
+                row.id += index;
+                row.name = try std.fmt.allocPrint(a, "policy_{d}", .{index});
+            }
+            const next_id = record.id + existing.len;
+            try capped_store.updateStandaloneCatalog(group, 0, .{ .tables = &.{table}, .auxiliary_json = "{}", .import_catalog = .{ .revision = 1, .next_id = next_id, .resources = &.{binding}, .policies = existing } });
+            var create = command;
+            create.version = sql_policies.capacity_checked_version;
+            create.change.put.id = next_id;
+            try std.testing.expect(!try capped_store.policyCreateHasCapacity(group));
+            try capped_store.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, create, .{}) });
+            try std.testing.expectEqual(@as(u64, 1), (try capped_store.systemCatalogMeta(a, group)).revision);
+            var update = command;
+            update.change.put = existing[0];
+            update.change.put.generation += 1;
+            try capped_store.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, update, .{}) });
+            const drop: sql_policies.Command = .{ .expected_revision = 2, .change = .{ .drop = .{ .id = record.id, .generation = 2, .table_id = record.table_id } } };
+            try capped_store.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, drop, .{}) });
+            try std.testing.expect(try capped_store.policyCreateHasCapacity(group));
+            create.expected_revision = 3;
+            try capped_store.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, create, .{}) });
+            try std.testing.expectEqual(@as(u64, 4), (try capped_store.systemCatalogMeta(a, group)).revision);
+            try std.testing.expect(!try capped_store.policyCreateHasCapacity(group));
+            create.version = 1;
+            create.expected_revision = 4;
+            create.change.put.id += 1;
+            create.change.put.name = "historical_last_policy";
+            try capped_store.applyStandaloneCommand(group, .{ .apply_sql_policies = try std.json.Stringify.valueAlloc(a, create, .{}) });
+            var legacy = try capped_store.systemCatalogSnapshot(a, group);
+            defer legacy.deinit();
+            try std.testing.expectEqual(@as(usize, 1025), legacy.value.policies.len);
+            try std.testing.expect(!try capped_store.policyCreateHasCapacity(group));
+        }
         try store.applyStandaloneCommand(group, .{ .apply_sql_policies = bytes });
         try store.applyStandaloneCommand(group, .{ .apply_sql_policies = bytes });
         const stale: sql_policies.Command = .{ .expected_revision = 1, .change = .{ .drop = .{ .id = 8, .generation = 1, .table_id = 7 } } };

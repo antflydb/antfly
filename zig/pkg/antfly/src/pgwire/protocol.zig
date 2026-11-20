@@ -1967,7 +1967,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.SqlSubstringError => "22011",
         error.InvalidSqlCharacterCode => "54000",
         error.SqlNotNullViolation => "23502",
-        error.SqlProgramLimitExceeded, error.SqlResultTooLarge, error.SqlLimitExceeded, error.SettingLimitExceeded => "54000",
+        error.SqlProgramLimitExceeded, error.SqlResultTooLarge, error.SqlLimitExceeded, error.SettingLimitExceeded, error.RowPolicyLimitExceeded => "54000",
         error.UnknownSetting => "42704",
         error.SettingCatalogChanged => "55000",
         error.UnknownColumn => "42703",

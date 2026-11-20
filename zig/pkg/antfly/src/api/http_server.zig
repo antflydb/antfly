@@ -18728,6 +18728,7 @@ pub const ApiHttpServer = struct {
         if (self.cfg.auth_enabled and identity == null) return contextualJsonErrorResponse(self.alloc, 403, "schema rewrite requires table administrator authorization");
         var snapshot = (try self.source.adminSnapshot()) orelse return contextualRetryableJsonErrorResponse(self.alloc, 503, "schema rewrite metadata is unavailable");
         defer self.source.freeAdminSnapshot(&snapshot);
+        try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
         const current = tables_api.findTableByName(&snapshot, before.name) orelse return contextualJsonErrorResponse(self.alloc, 404, "not found");
         if (!metadata_table_manager.tableDefinitionsEqual(before, current.*)) return contextualJsonErrorResponse(self.alloc, 409, "schema changed; refresh before rewriting");
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -18760,7 +18761,7 @@ pub const ApiHttpServer = struct {
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(encoded_request, &digest, .{});
         const backup_id = try alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
-        var start: restore_jobs.StartRequest = .{ .scope = .cluster, .source_kind = .schema_rewrite, .backup_id = backup_id, .location = try std.fmt.allocPrint(alloc, "metadata://schema-rewrite/{s}", .{std.fmt.bytesToHex(plan_id, .lower)}), .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = namespace, .idempotency_key = key, .destination_authorization_principal = storedDestinationPrincipal(identity) };
+        var start: restore_jobs.StartRequest = .{ .scope = .cluster, .source_kind = .schema_rewrite, .expected_incarnation = context.expectedMetadataIncarnation(), .backup_id = backup_id, .location = try std.fmt.allocPrint(alloc, "metadata://schema-rewrite/{s}", .{std.fmt.bytesToHex(plan_id, .lower)}), .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = namespace, .idempotency_key = key, .destination_authorization_principal = storedDestinationPrincipal(identity) };
         if (try self.restore_job_store.existingRewriteAdmission(self.alloc, start)) |existing| {
             defer self.alloc.free(existing);
             if (context.sql_completion_submission) |observed| observed.* = true;
@@ -18799,10 +18800,13 @@ pub const ApiHttpServer = struct {
             }
         };
         var observer: Observer = .{ .server = self, .context = context };
-        const plan = try admission.buildWithPolicies(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, .{ .default_columns = default_columns });
+        const plan = try admission.buildBound(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, .{ .default_columns = default_columns }, context.expectedMetadataIncarnation());
         start.rewrite_plan_json = try std.json.Stringify.valueAlloc(alloc, plan, .{});
         try ensureTableOperationActive(context);
-        const accepted = self.restore_job_store.startRecoverableObserved(self.alloc, start, true, context.sql_completion_submission) catch |err| return restoreJobStartErrorResponse(self.alloc, err);
+        const accepted = self.restore_job_store.startRecoverableObserved(self.alloc, start, true, context.sql_completion_submission) catch |err| {
+            if (err == error.CatalogGenerationChanged) return err;
+            return restoreJobStartErrorResponse(self.alloc, err);
+        };
         const encoded = switch (accepted) {
             .accepted => |value| value,
             .unknown => |value| {

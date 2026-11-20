@@ -182,6 +182,7 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
     }.less);
     const result: publication.Plan = .{
         .id = id,
+        .expected_incarnation = context.expectedMetadataIncarnation(),
         .child_before = try ownedTableForPlan(alloc, current),
         .child_after = after,
         .child_catalog_before_b64 = catalog_b64,

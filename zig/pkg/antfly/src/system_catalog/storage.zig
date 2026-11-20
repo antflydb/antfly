@@ -280,8 +280,12 @@ fn policyCount(txn: *docstore.DocStore.Txn, group: u64) !u32 {
     return std.mem.readInt(u32, raw[0..4], .little);
 }
 
+pub fn policyCreateHasCapacity(txn: *docstore.DocStore.Txn, group: u64) !bool {
+    return try policyCount(txn, group) < policies.max_definitions;
+}
+
 fn putPolicyCount(txn: *docstore.DocStore.Txn, group: u64, count: usize) !void {
-    if (count > 1024) return error.RowPolicyLimitExceeded;
+    if (count > policies.max_stored_definitions) return error.RowPolicyLimitExceeded;
     var buf: [128]u8 = undefined;
     const key = try policyCountKey(&buf, group);
     if (count == 0) {
@@ -323,7 +327,7 @@ pub fn loadPolicies(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
         }
         alloc.free(kvs);
     }
-    if (kvs.len > 1024) return error.RowPolicyLimitExceeded;
+    if (kvs.len > policies.max_stored_definitions) return error.RowPolicyLimitExceeded;
     const records = try alloc.alloc(policies.Record, kvs.len);
     for (kvs, records, 0..) |kv, *record, i| {
         record.* = try std.json.parseFromSliceLeaky(policies.Record, alloc, kv.value, .{ .allocate = .alloc_always });
@@ -339,8 +343,8 @@ pub fn loadPolicies(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
 /// Only trusted admin admission may propose this internal transition. The
 /// deterministic apply path checks revision and table identity again; it does
 /// not activate policy enforcement merely by storing a definition.
-pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.Command, command_hash: [32]u8) !void {
-    if (command.version != 1) return error.InvalidRowPolicyRecord;
+pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.Command, command_hash: [32]u8, on_full: enum { reject, skip }) !void {
+    if (command.version != 1 and command.version != policies.capacity_checked_version) return error.InvalidRowPolicyRecord;
     const meta = try readMeta(alloc, txn, group_id);
     if (meta.revision != command.expected_revision) return;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -366,7 +370,14 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
             } else {
                 if (owner != null) return error.InvalidRowPolicyRecord;
                 if (record.id != meta.next_id or record.generation != 1) return error.RowPolicyCatalogChanged;
-                try putPolicyCount(txn, group_id, @as(usize, try policyCount(txn, group_id)) + 1);
+                const count = try policyCount(txn, group_id);
+                if (count >= policies.max_definitions) {
+                    if (on_full == .reject) return error.RowPolicyLimitExceeded;
+                    // A predecessor could commit exactly one extra definition.
+                    // Preserve its applied revision and command receipt on replay.
+                    if (command.version >= policies.capacity_checked_version or count >= policies.max_stored_definitions) return;
+                }
+                try putPolicyCount(txn, group_id, count + 1);
                 next_id = try std.math.add(u64, next_id, 1);
             }
             try writePolicyName(a, txn, group_id, record);

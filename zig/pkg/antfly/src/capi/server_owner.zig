@@ -2293,6 +2293,10 @@ pub fn metadataApplyStoreProjection(
                     };
                     break :blk metadataProjectionJson(alloc, out_json, result);
                 },
+                .policy_create_has_capacity => {
+                    const available = handle.store.policyCreateHasCapacity(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, available);
+                },
                 .require_policy_index_mutation_allowed => |input| {
                     handle.store.requirePolicyIndexMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, true);

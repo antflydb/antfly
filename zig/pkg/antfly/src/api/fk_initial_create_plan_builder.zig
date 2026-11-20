@@ -160,6 +160,7 @@ pub fn buildWithScratch(
         .candidate = candidate,
     } });
     const prepared = try std.json.parseFromSliceLeaky(publication.InitialCreatePrepare, alloc, prepare_bytes, .{ .allocate = .alloc_always });
+    try context.checkMetadataIncarnation(prepared.metadata_incarnation);
     var child = prepared.child;
     child.schema_json = try bindReservedSelf(alloc, child.schema_json, target.table, child.name);
     const routing_derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
@@ -221,6 +222,7 @@ pub fn buildWithScratch(
     }.less);
     const plan: publication.InitialCreatePlan = .{
         .id = id,
+        .expected_incarnation = context.expectedMetadataIncarnation(),
         .retirement_scope = retirementScopeForDeployment(server.cfg.deployment_mode),
         .catalog_id = prepared.catalog_id,
         .expected_catalog_revision = prepared.expected_catalog_revision,

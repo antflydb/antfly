@@ -362,13 +362,15 @@ pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, con
     if (!context.fk_generation_publication_authority) return error.Forbidden;
     try command.validateShape();
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.fk_generation_publication_version);
+    const guarded = command.plan != null and command.plan.?.expected_incarnation != null;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (guarded) protocol.guarded_generation_admission_version else protocol.fk_generation_publication_version);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;
     defer if (gate_held) svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    if (command.plan) |plan| try store.requireMetadataIncarnation(svc.metadata_group_id, plan.expected_incarnation);
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(bytes);
     if (bytes.len > fk_publication.max_bytes) return error.CatalogCommandTooLarge;
@@ -391,7 +393,8 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     try command.validateShape();
     try context.ensureActive();
     const versioned_support = if (command.plan) |plan| plan.support_schema_format != .legacy or fk_publication.hasStampedSupport(plan.parents) else false;
-    const version = if (versioned_support) protocol.guarded_publication_version else protocol.fk_initial_create_version;
+    const guarded = command.plan != null and command.plan.?.expected_incarnation != null;
+    const version = if (guarded) protocol.guarded_generation_admission_version else if (versioned_support) protocol.guarded_publication_version else protocol.fk_initial_create_version;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, version);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
@@ -399,6 +402,7 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     defer if (gate_held) svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    if (command.plan) |plan| try store.requireMetadataIncarnation(svc.metadata_group_id, plan.expected_incarnation);
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(bytes);
     if (bytes.len > fk_publication.max_bytes) return error.CatalogCommandTooLarge;
@@ -421,6 +425,11 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     return observed;
 }
 
+pub fn requirePolicyCapacity(store: anytype, group: u64, command: @import("antfly_local_sources").system_catalog_policies.Command) !void {
+    if (command.createsDefinition() and !try store.policyCreateHasCapacity(group))
+        return error.RowPolicyLimitExceeded;
+}
+
 pub fn validateBoundPolicy(alloc: std.mem.Allocator, store: anytype, group: u64, command: @import("antfly_local_sources").system_catalog_policies.Command) !void {
     if (command.expected_incarnation) |incarnation| {
         const guard: operation.RequestContext = .{ .bound_catalog_incarnation = incarnation };
@@ -441,7 +450,19 @@ pub fn validateBoundPolicy(alloc: std.mem.Allocator, store: anytype, group: u64,
 pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("antfly_local_sources").system_catalog_policies.Command) ![]u8 {
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (command.expected_incarnation != null or command.expected_schema_version != null) protocol.bound_catalog_incarnation_version else protocol.sql_row_policy_publication_version);
+    if (command.version != 1) return error.InvalidRowPolicyRecord;
+    const minimum = if (command.expected_incarnation != null or command.expected_schema_version != null) protocol.bound_catalog_incarnation_version else protocol.sql_row_policy_publication_version;
+    var proposed = command;
+    const readiness = if (command.createsDefinition()) ready: {
+        const proof = svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.guarded_generation_admission_version) catch |err| switch (err) {
+            // Legacy replicas also compare expected_revision before any writes.
+            // The locked capacity preflight remains valid for that exact revision.
+            error.TableTopologyProtocolUpgradeRequired => break :ready try svc.ensureTableTopologyProtocolReadyWithContext(context, minimum),
+            else => return err,
+        };
+        proposed.version = @import("antfly_local_sources").system_catalog_policies.capacity_checked_version;
+        break :ready proof;
+    } else try svc.ensureTableTopologyProtocolReadyWithContext(context, minimum);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
@@ -450,7 +471,8 @@ pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: o
     try validateBoundPolicy(alloc, store, svc.metadata_group_id, command);
     const current = try store.systemCatalogMeta(alloc, svc.metadata_group_id);
     if (current.revision != command.expected_revision) return error.RowPolicyCatalogChanged;
-    const bytes = try serializePolicyDefinitionCommand(alloc, command);
+    try requirePolicyCapacity(store, svc.metadata_group_id, command);
+    const bytes = try serializePolicyDefinitionCommand(alloc, proposed);
     defer alloc.free(bytes);
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_sql_policies = bytes });

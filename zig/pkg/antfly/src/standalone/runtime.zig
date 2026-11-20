@@ -1563,6 +1563,8 @@ const LocalStandaloneMetadata = struct {
         if (!self.coordinated_lifecycle_allowed) return error.CoordinatedStandaloneHAMetadataRequired;
         try self.requireRestoreJobTermLocked(term);
         try self.requireStandbyRestoreJobFormatLocked(alloc, value);
+        const guard = try Staging.PlanGuard.read(alloc, plan_json);
+        try self.lifecycle_store.?.requireMetadataIncarnation(group_ids.main_metadata_group_id, guard.expected_incarnation);
         try self.applyJobCommandLocked(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } });
         return (try self.lifecycle_store.?.getRestoreJobRecord(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
     }
@@ -2952,6 +2954,7 @@ const LocalStandaloneMetadata = struct {
                     else => unreachable,
                 };
                 try command.validateShape();
+                if (command.plan) |plan| try store.requireMetadataIncarnation(group_ids.main_metadata_group_id, plan.expected_incarnation);
                 const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
                 defer alloc.free(bytes);
                 if (bytes.len > publication.max_bytes) return error.CatalogCommandTooLarge;
@@ -3082,11 +3085,15 @@ const LocalStandaloneMetadata = struct {
                 if (!context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.RowPolicyUnsupported;
                 if (!self.localPolicyPublicationSupported()) return error.RowPolicyUnsupported;
+                if (command.version != 1) return error.InvalidRowPolicyRecord;
+                try @import("../system_catalog/operations.zig").requirePolicyCapacity(store, group_ids.main_metadata_group_id, command);
+                var proposed = command;
+                if (command.createsDefinition()) proposed.version = @import("antfly_local_sources").system_catalog_policies.capacity_checked_version;
                 try @import("../system_catalog/operations.zig").validateBoundPolicy(alloc, store, group_ids.main_metadata_group_id, command);
                 var encoded: std.Io.Writer.Allocating = .init(alloc);
                 defer encoded.deinit();
                 var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
-                try @import("antfly_local_sources").storage_db_relational_integrity_json.write(command, &stream);
+                try @import("antfly_local_sources").storage_db_relational_integrity_json.write(proposed, &stream);
                 const bytes = encoded.written();
                 if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
                 try context.ensureActive();

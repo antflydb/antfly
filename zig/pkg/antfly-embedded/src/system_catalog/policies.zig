@@ -181,6 +181,12 @@ pub const Record = struct {
 
 /// Internal-only Raft payload. Public policy DDL is deliberately unavailable
 /// until all data owners can enforce the new generation.
+pub const max_definitions = 1024;
+// Older leaders checked the existing catalog size, allowing one final create
+// at the limit. These rows must remain readable and removable after upgrade.
+pub const max_stored_definitions = max_definitions + 1;
+pub const capacity_checked_version: u16 = 2;
+
 pub const Command = struct {
     version: u16 = 1,
     expected_revision: u64,
@@ -188,6 +194,10 @@ pub const Command = struct {
     expected_schema_version: ?u32 = null,
 
     change: union(enum) { put: Record, drop: struct { id: u64, generation: u64, table_id: u64 } },
+
+    pub fn createsDefinition(self: Command) bool {
+        return self.change == .put and self.change.put.generation == 1;
+    }
 
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
         if (comptime std.mem.eql(u8, field, "expected_incarnation") or std.mem.eql(u8, field, "expected_schema_version")) return @field(self, field) == null;

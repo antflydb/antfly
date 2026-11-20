@@ -408,7 +408,7 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
     var digest: [32]u8 = undefined;
     const cohort_manifest = try std.json.Stringify.valueAlloc(a, .{ .targets = planned, .external_fk_parents = external_parents }, .{});
     std.crypto.hash.Blake3.hash(cohort_manifest, &digest, .{});
-    const plan: stages.Plan = .{ .id = id, .cohort_digest = digest, .targets = planned, .external_fk_parents = external_parents };
+    const plan: stages.Plan = .{ .id = id, .expected_incarnation = context.expectedMetadataIncarnation(), .cohort_digest = digest, .targets = planned, .external_fk_parents = external_parents };
     try plan.validate(a);
     const primary_target = for (planned) |target| {
         if (target.source_table_id == resolved.tables[0].?.table_id) break target.table;
@@ -429,7 +429,7 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
         return err;
     };
     var submitted = false;
-    const accepted = server.restore_job_store.startRecoverableObserved(a, .{ .scope = .cluster, .source_kind = .empty_generation, .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = generation_plan }, true, &submitted) catch |err| {
+    const accepted = server.restore_job_store.startRecoverableObserved(a, .{ .scope = .cluster, .source_kind = .empty_generation, .expected_incarnation = context.expectedMetadataIncarnation(), .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = generation_plan }, true, &submitted) catch |err| {
         if (!submitted) try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, completion_owner);
         try @import("sql_completion.zig").rejectMetadataWithContext(context, completion_owner, err);
         return err;

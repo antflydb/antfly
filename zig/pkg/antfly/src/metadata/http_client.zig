@@ -1293,7 +1293,10 @@ pub const MetadataHttpClient = struct {
                 error.StoreRootEnrollmentChanged
             else
                 error.CatalogGenerationChanged,
-            413 => error.CatalogCommandTooLarge,
+            413 => if (input == .policy_definition_mutate and std.mem.eql(u8, response.body, "RowPolicyLimitExceeded"))
+                error.RowPolicyLimitExceeded
+            else
+                error.CatalogCommandTooLarge,
             426 => error.TableTopologyProtocolUpgradeRequired,
             503 => error.NotLeader,
             else => error.MetadataMutationOutcomeUnknown,

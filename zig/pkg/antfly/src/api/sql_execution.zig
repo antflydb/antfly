@@ -181,6 +181,7 @@ pub const Adapter = struct {
     inherit_session_database: bool = false,
     inherit_session_namespace: bool = false,
     revision: ?u64 = null,
+    missing_target_epoch: ?@import("antfly_local_sources").system_catalog_relation_reconciliation.Epoch = null,
     target: ?system_catalog.Target = null,
     outcome_transaction_id: ?[32]u8 = null,
     session_id: ?[]const u8 = null,
@@ -813,9 +814,20 @@ pub const Adapter = struct {
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
         try self.context.checkCatalogIncarnation(snapshot.source_epoch);
         if (self.revision) |revision| if (revision != snapshot.revision) return error.CatalogGenerationChanged;
+        if (self.missing_target_epoch) |epoch| if (snapshot.source_epoch == null or !epoch.eql(snapshot.source_epoch.?)) return error.CatalogGenerationChanged;
         if (snapshot.tables.len != targets.len) return error.InvalidSqlBackendResponse;
+        // An absent higher-priority search-path candidate is part of this read cut.
+        self.revision = snapshot.revision;
         const bindings = try alloc.alloc(catalog.Table, targets.len);
-        for (targets, snapshot.tables, bindings) |target, resolved, *binding| binding.* = try self.bindResolved(alloc, target, resolved, snapshot.revision, action);
+        for (targets, snapshot.tables, bindings) |target, resolved, *binding| {
+            const table = resolved orelse {
+                // Legacy default.public physical tables can change without
+                // changing the logical namespace revision.
+                self.missing_target_epoch = snapshot.source_epoch;
+                return error.TableNotFound;
+            };
+            binding.* = try self.bindResolved(alloc, target, table, snapshot.revision, action);
+        }
         return bindings;
     }
 
@@ -842,9 +854,8 @@ pub const Adapter = struct {
         return projected;
     }
 
-    fn bindResolved(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, resolved: ?system_catalog.ResolvedTable, revision: u64, action: catalog.Action) !catalog.Table {
+    fn bindResolved(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, table: system_catalog.ResolvedTable, revision: u64, action: catalog.Action) !catalog.Table {
         const logical = try target.resourceNameAlloc(alloc);
-        const table = resolved orelse return error.TableNotFound;
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
@@ -864,7 +875,6 @@ pub const Adapter = struct {
             }),
         };
         binding.scope = .{ .database = try alloc.dupe(u8, target.database), .namespace = try alloc.dupe(u8, target.namespace), .name = try alloc.dupe(u8, target.table), .revision = revision };
-        self.revision = revision;
         self.target = target;
         try self.recordPreparedBinding(alloc, binding);
         if (self.identity.*) |*identity| try http_server.projectCatalogIdentity(self.server.alloc, identity, logical, table.name);
@@ -2847,6 +2857,32 @@ test "SQL point bound is half-open and excludes all byte-key descendants" {
         const descendant = [_]u8{ 'a', 0xff, @intCast(next) };
         try std.testing.expect(std.mem.order(u8, &descendant, upper) != .lt);
     }
+}
+
+test "SQL pgwire search path retains the catalog revision of a missing candidate" {
+    const Lookup = struct {
+        calls: usize = 0,
+        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const revision = call.resolve_many.expected_revision;
+            if (self.calls == 1) {
+                try std.testing.expect(revision == null);
+                return alloc.dupe(u8, "{\"revision\":7,\"tables\":[null]}");
+            }
+            try std.testing.expectEqual(@as(?u64, 7), revision);
+            return alloc.dupe(u8, "{\"revision\":8,\"tables\":[null]}");
+        }
+    };
+    var lookup: Lookup = .{};
+    var server: http_server.ApiHttpServer = undefined;
+    server.source = .{ .ptr = &lookup, .vtable = &.{ .status = undefined, .system_catalog = Lookup.resolve, .supports_query_definitions = true } };
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.TableNotFound, adapter.resolveMany(arena.allocator(), &.{.{ .database = "default", .namespace = "first", .table = "events" }}, .read));
+    try std.testing.expectError(error.CatalogGenerationChanged, adapter.resolveMany(arena.allocator(), &.{.{ .database = "default", .namespace = "second", .table = "events" }}, .read));
 }
 
 test "SQL require-index equality uses exact native bounds only inside a guarded statement" {

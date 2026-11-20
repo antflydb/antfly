@@ -638,7 +638,7 @@ pub const MutableState = struct {
     }
 
     pub fn clonePolicies(alloc: std.mem.Allocator, records: []const @import("policies.zig").Record) !OwnedPolicies {
-        if (records.len > 1024) return error.RowPolicyLimitExceeded;
+        if (records.len > @import("policies.zig").max_stored_definitions) return error.RowPolicyLimitExceeded;
         const bytes = try std.json.Stringify.valueAlloc(alloc, records, .{});
         defer alloc.free(bytes);
         var owned = try std.json.parseFromSlice([]const @import("policies.zig").Record, alloc, bytes, .{ .allocate = .alloc_always });

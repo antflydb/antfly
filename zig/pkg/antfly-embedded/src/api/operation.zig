@@ -137,9 +137,13 @@ pub const RequestContext = struct {
         if (epoch == null or !std.mem.eql(u8, &expected, &epoch.?.incarnation)) return error.CatalogGenerationChanged;
     }
 
+    pub fn expectedMetadataIncarnation(self: RequestContext) ?[32]u8 {
+        return std.fmt.bytesToHex(self.bound_catalog_incarnation orelse return null, .lower);
+    }
+
     pub fn checkMetadataIncarnation(self: RequestContext, actual: ?[32]u8) !void {
-        const expected = self.bound_catalog_incarnation orelse return;
-        if (actual == null or !std.mem.eql(u8, &std.fmt.bytesToHex(expected, .lower), &actual.?)) return error.CatalogGenerationChanged;
+        const expected = self.expectedMetadataIncarnation() orelse return;
+        if (actual == null or !std.mem.eql(u8, &expected, &actual.?)) return error.CatalogGenerationChanged;
     }
 
     pub fn markSQLSubmission(self: RequestContext) void {
