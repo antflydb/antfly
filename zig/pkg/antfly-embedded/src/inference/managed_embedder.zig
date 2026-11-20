@@ -1587,7 +1587,32 @@ pub const ManagedEmbedder = struct {
         cancellation: ?CancellationToken,
         request_id: []const u8,
         retry_not_before_ns: ?*u64,
+    ) !PreparedQueryEmbedding {
+        return self.prepareQueryEmbeddingWithPlacement(alloc, index_name, deadline_ns, cancellation, request_id, retry_not_before_ns, .generic);
+    }
+
+    pub fn prepareQueryEmbeddingForInvocation(
+        self: *const ManagedEmbedder,
+        alloc: std.mem.Allocator,
+        index_name: []const u8,
+        deadline_ns: u64,
+        cancellation: ?CancellationToken,
+        request_id: []const u8,
+        retry_not_before_ns: ?*u64,
         uses_template: bool,
+    ) !PreparedQueryEmbedding {
+        return self.prepareQueryEmbeddingWithPlacement(alloc, index_name, deadline_ns, cancellation, request_id, retry_not_before_ns, if (uses_template) .after_render else .text);
+    }
+
+    fn prepareQueryEmbeddingWithPlacement(
+        self: *const ManagedEmbedder,
+        alloc: std.mem.Allocator,
+        index_name: []const u8,
+        deadline_ns: u64,
+        cancellation: ?CancellationToken,
+        request_id: []const u8,
+        retry_not_before_ns: ?*u64,
+        placement: enum { generic, text, after_render },
     ) !PreparedQueryEmbedding {
         const configured = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         var entry = configured.requestOverlay(alloc);
@@ -1599,9 +1624,9 @@ pub const ManagedEmbedder = struct {
         entry.remote_query_workload = isAntflyProvider(entry.provider) and entry.antfly_provider == null;
         // A template may produce media. Its invocation chooses placement after
         // rendering, and its result is not published in the text query cache.
-        if (!uses_template) {
-            if (try prepareRemoteQueryEmbedding(alloc, &entry, .{ .items = 1, .output_tokens = 0 })) |lease|
-                entry.planned_embedding_lease = lease;
+        if (placement != .after_render) {
+            const shape: ?remote_capabilities.DiscoveryShape = if (placement == .text) .{ .items = 1, .output_tokens = 0 } else null;
+            if (try prepareRemoteQueryEmbedding(alloc, &entry, shape)) |lease| entry.planned_embedding_lease = lease;
         }
         return .{ .entry = entry };
     }
@@ -6419,7 +6444,7 @@ const RemoteEmbeddingPlacement = struct {
     fn headers(self: *RemoteEmbeddingPlacement, base: []const [2][]const u8, items: usize, media: bool) ![]const [2][]const u8 {
         std.debug.assert(base.len < self.storage.len);
         @memcpy(self.storage[0..base.len], base);
-        const shape = remote_capabilities.DiscoveryShape{ .items = items, .media = media, .output_tokens = 0 };
+        const shape = remote_capabilities.DiscoveryShape{ .items = @max(items, 1), .media = media, .output_tokens = 0 };
         self.storage[base.len] = .{
             remote_capabilities.discovery_shape_header,
             try shape.formatHeader(&self.shape_value),

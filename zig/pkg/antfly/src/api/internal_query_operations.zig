@@ -225,7 +225,7 @@ pub fn computeManagedQueryVector(
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         if (deadline <= platform_time.monotonicNs()) return error.Timeout;
-        var prepared = runtime.prepareQueryEmbedding(alloc, index_name, deadline, options.cancellation, options.request_id, options.retry_not_before_ns, embedding_template != null) catch |err| {
+        var prepared = runtime.prepareQueryEmbeddingForInvocation(alloc, index_name, deadline, options.cancellation, options.request_id, options.retry_not_before_ns, embedding_template != null) catch |err| {
             if (err == error.InferenceCapabilitiesStale and attempt == 0) continue;
             return err;
         };
