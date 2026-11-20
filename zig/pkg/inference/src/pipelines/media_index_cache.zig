@@ -90,6 +90,7 @@ pub const Cache = struct {
     pub const Planning = union(enum) { mp4: *const video_owner.Owner, webm: WebmSnapshot };
     pub const Entry = struct {
         allocation: admitted.AdmittedAllocator,
+        admission: Admission,
         header_lease: @import("../runtime/tier/memory.zig").AdmissionLease,
         arena: std.heap.ArenaAllocator,
         key: [32]u8,
@@ -275,6 +276,12 @@ pub const Cache = struct {
         }
         self.insert(entry);
     }
+    fn admitClone(owner: *const admitted.AdmittedAllocator, bytes: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+        if (bytes > (max_bytes - @sizeOf(Entry)) -| owner.reserved_bytes) return error.ResourceLimitExceeded;
+        const entry: *const Entry = @alignCast(@fieldParentPtr("allocation", owner));
+        return entry.admission.acquire(entry.admission.context, bytes);
+    }
+
     fn prepareEntry(self: *Cache, a: std.mem.Allocator, identity: [32]u8, data: Input, admission: Admission, planning: ?Planning) ?*Entry {
         const estimate = switch (data) {
             .speaker_analysis => |value| @sizeOf(@import("inference_chunker").diarization.Registry) + value.spanCount() * @sizeOf(@import("inference_chunker").diarization.Span),
@@ -284,13 +291,17 @@ pub const Cache = struct {
             .mp4 => |r| std.math.mul(usize, r.packets.len, @sizeOf(media.mp4.Packet)) catch return null,
             .webm => |r| (std.math.mul(usize, r.packets.len, @sizeOf(media.webm.Packet)) catch return null) +| (std.math.mul(usize, r.cues.len, @sizeOf(media.webm.Cue)) catch return null) +| (if (r.source_timeline) |timeline| timeline.samples.len *| @sizeOf(media.webm.SourceTimeline.Sample) else 0),
         };
-        if (estimate > max_bytes) return null;
+        const planning_bytes = if (planning) |plan| switch (plan) {
+            .mp4 => |owner| video_owner.Snapshot.storageBytes(owner),
+            .webm => |snapshot| std.mem.sliceAsBytes(snapshot.index.pictures).len +| std.mem.sliceAsBytes(snapshot.index.restarts).len +| std.mem.sliceAsBytes(snapshot.timeline.entries).len +| std.mem.sliceAsBytes(snapshot.timeline.maxima).len,
+        } else 0;
+        if (estimate +| planning_bytes > max_bytes - @sizeOf(Entry)) return null;
         var header_lease = admission.acquire(admission.context, @sizeOf(Entry)) catch return null;
         const entry = a.create(Entry) catch {
             header_lease.release();
             return null;
         };
-        entry.* = .{ .header_lease = header_lease, .allocation = .{ .backing = a, .admission_context = admission.context, .admit = admission.acquire }, .arena = undefined, .key = identity, .data = undefined, .refs = 0 };
+        entry.* = .{ .header_lease = header_lease, .admission = admission, .allocation = .{ .backing = a, .admit_owned = admitClone }, .arena = undefined, .key = identity, .data = undefined, .refs = 0 };
         entry.arena = .init(entry.allocation.allocator());
         self.copy(entry, data) catch {
             entry.destroy();

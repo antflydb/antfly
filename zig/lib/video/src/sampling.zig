@@ -175,6 +175,18 @@ pub const Timeline = struct {
                 return x.pts < y.pts or (x.pts == y.pts and x.id > y.id);
             }
         }.less);
+        // Missing durations end at the next distinct presentation time.
+        var group_end = entries.len;
+        var next_pts: i128 = stop orelse std.math.maxInt(i128);
+        while (group_end != 0) {
+            try control.check();
+            const pts = entries[group_end - 1].pts;
+            while (group_end != 0 and entries[group_end - 1].pts == pts) {
+                group_end -= 1;
+                if (pictures[entries[group_end].id].duration == null) entries[group_end].stop = next_pts;
+            }
+            next_pts = pts;
+        }
         try control.check();
         const base = try std.math.ceilPowerOfTwo(usize, entries.len);
         const maxima = try a.alloc(i128, try std.math.mul(usize, base, 2));
@@ -281,13 +293,24 @@ fn cappedAtOrigin(a: std.mem.Allocator, pictures: []const TimedPicture, timescal
         const ordinal: u128 = if (policy.overflow == .uniform and count > 1 and candidates > count) @as(u128, i) * (candidates - 1) / (count - 1) else i;
         const target: i128 = policy.start_ns + @as(i128, @intCast(ordinal * policy.step_ns));
         var chosen: ?usize = null;
-        if (policy.hold) for (pictures, 0..) |picture, id| {
-            if (id % 256 == 0) try control.check();
-            const time = (@as(i128, picture.pts) - first) * 1_000_000_000;
-            const stop: ?i128 = if (picture.duration) |duration| time + @as(i128, duration) * 1_000_000_000 else null;
-            if (time > target * timescale or (stop != null and stop.? <= target * timescale)) continue;
-            if (chosen == null or picture.pts > pictures[chosen.?].pts) chosen = id;
-        };
+        if (policy.hold) {
+            var latest: ?i64 = null;
+            var unknown: ?usize = null;
+            for (pictures, 0..) |picture, id| {
+                if (id % 256 == 0) try control.check();
+                const time = (@as(i128, picture.pts) - first) * std.time.ns_per_s;
+                if (time > target * timescale) continue;
+                latest = @max(latest orelse picture.pts, picture.pts);
+                if (picture.duration) |duration| {
+                    if (time + @as(i128, duration) * std.time.ns_per_s <= target * timescale) continue;
+                    if (chosen == null or picture.pts > pictures[chosen.?].pts) chosen = id;
+                } else if (unknown == null or picture.pts > pictures[unknown.?].pts) unknown = id;
+            }
+            if (unknown) |id| {
+                const pts = pictures[id].pts;
+                if (pts == latest.? and (chosen == null or pts > pictures[chosen.?].pts or (pts == pictures[chosen.?].pts and id < chosen.?))) chosen = id;
+            }
+        }
         if (chosen != null) {
             const id = chosen.?;
             if (output.items.len == 0 or output.items[output.items.len - 1] != id) try output.append(a, id);
@@ -497,4 +520,18 @@ test "source timestamp sampling preserves edit origin and visible logical IDs" {
     const ids = try timeline.select(a, 10, .{ .step_ns = std.time.ns_per_s, .hold = true }, .{}, true);
     defer a.free(ids);
     try std.testing.expectEqualSlices(usize, &.{ 2, 1 }, ids);
+}
+
+test "source timestamp sampling never revives a superseded undated picture" {
+    const a = std.testing.allocator;
+    const pictures = [_]TimedPicture{ .{ .pts = 6, .duration = 2 }, .{ .pts = 0, .duration = null }, .{ .pts = 2, .duration = 1 } };
+    const policy = TimestampPolicy{ .end_ns = 4 * std.time.ns_per_s, .hold = true };
+    var timeline = try Timeline.init(a, &pictures, .{});
+    defer timeline.deinit();
+    const indexed = try timeline.select(a, 2, policy, .{}, false);
+    defer a.free(indexed);
+    const linear = try cappedSourceTimestamps(a, &pictures, 2, policy, .{});
+    defer a.free(linear);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 0 }, indexed);
+    try std.testing.expectEqualSlices(usize, indexed, linear);
 }

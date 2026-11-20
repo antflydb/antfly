@@ -233,7 +233,10 @@ pub fn selectConfigured(a: std.mem.Allocator, reader: *const media.mp4.Reader, s
         return a.dupe(usize, plan.ids());
     }
     if (try needsLogicalIndex(a, reader.track)) {
-        var logical = try h264_pictures.indexMode(a, &mutable, .{}, sampling == .source_timestamps, registry);
+        var logical = if (sampling == .source_timestamps)
+            try h264_pictures.indexMode(a, &mutable, h264_pictures.Options.forTrack(reader.packets.len), true, registry)
+        else
+            try h264_pictures.planning(a, &mutable, h264_pictures.Options.forTrack(reader.packets.len), registry);
         defer logical.deinit();
         return selectLogical(a, reader, logical, sampling, reader.input.control);
     }

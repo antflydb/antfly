@@ -256,13 +256,29 @@ pub fn inspectEmbedding(allocator: std.mem.Allocator, bytes: []const u8, control
     var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(true));
     defer reader.deinit();
     try validateTrack(reader.track);
-    const normalized = try @import("antfly_video").hevc_config.normalizeReader(allocator, &reader);
+    const normalized = try normalizeDecoderTrack(allocator, &reader);
     defer if (normalized) |config| allocator.free(config);
     const end_us = try validateTimeline(reader.track, reader.packets);
     const sampler = try embeddingSamplerForReader(&reader, end_us);
     const frame = Frame{ .device = 0, .pitch = 0, .width = reader.track.width, .height = reader.track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = try quarterTurns(reader.track.display_matrix), .sar = try displayAspect(allocator, reader.track) };
     const display = try frame.displaySize();
     return .{ .width = reader.track.width, .height = reader.track.height, .frames = sampler.length, .codec = reader.track.codec, .display_width = display[0], .display_height = display[1] };
+}
+
+fn normalizeDecoderTrack(allocator: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
+    return @import("antfly_video").hevc_config.normalizeReader(allocator, reader) catch |err| return switch (err) {
+        error.UnsupportedVideoProfile => error.UnsupportedVideoFormat,
+        else => err,
+    };
+}
+
+test "gemma4 video NVDEC declines unsupported active HEVC parameters for portable fallback" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../../testdata/video/codecs/hevc-422.mp4");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "hevc-sps" };
+    var reader = try media.mp4.Reader.init(a, &source, decodeLimits(.gemma4));
+    defer reader.deinit();
+    try std.testing.expectError(error.UnsupportedVideoFormat, normalizeDecoderTrack(a, &reader));
 }
 
 fn validateTrack(track: anytype) !void {
@@ -529,7 +545,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
             ctx.video_decoder_cache = null;
         }
     }
-    const normalized = try @import("antfly_video").hevc_config.normalizeReader(allocator, &reader);
+    const normalized = try normalizeDecoderTrack(allocator, &reader);
     defer if (normalized) |config| allocator.free(config);
     const track = reader.track;
     const color = try containerColor(track.color_info);

@@ -46,11 +46,48 @@ pub const Window = struct {
 /// metadata outlive this window. Range providers remain demand-read; no coded
 /// bytes are materialized, and packet offsets keep their original meaning.
 pub fn borrow(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !Window {
-    if (reader.input.identity.len > options.max_identity_bytes or reader.packets.len == 0 or reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
-    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.mul(usize, reader.packets.len, @sizeOf(media.mp4.Packet)) }) else media.admission.Token{};
+    if (reader.packets.len == 0) return error.ResourceLimitExceeded;
+    return borrowRuns(a, reader, &.{.{ .first = 0, .last = reader.packets.len - 1 }}, options);
+}
+
+pub const Run = @import("decode_plan.zig").Run;
+/// Translate between compact replay ordinals and the immutable track's ordinals.
+pub fn sourcePacket(runs: []const Run, local: usize) !usize {
+    var offset = local;
+    for (runs) |run| {
+        const len = run.last - run.first + 1;
+        if (offset < len) return run.first + offset;
+        offset -= len;
+    }
+    return error.InvalidPacketIndex;
+}
+pub fn localPacket(runs: []const Run, original: usize) !usize {
+    var offset: usize = 0;
+    for (runs) |run| {
+        if (original < run.first) break;
+        if (original <= run.last) return offset + (original - run.first);
+        offset += run.last - run.first + 1;
+    }
+    return error.InvalidPacketIndex;
+}
+pub fn borrowRuns(a: std.mem.Allocator, reader: *media.mp4.Reader, runs: []const Run, options: Options) !Window {
+    if (reader.input.identity.len > options.max_identity_bytes) return error.ResourceLimitExceeded;
+    var count: usize = 0;
+    for (runs, 0..) |run, i| {
+        if (run.first > run.last or run.last >= reader.packets.len or (i != 0 and run.first <= runs[i - 1].last)) return error.InvalidPacketIndex;
+        count += run.last - run.first + 1;
+    }
+    if (count == 0 or count > options.max_packets) return error.ResourceLimitExceeded;
+    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.mul(usize, count, @sizeOf(media.mp4.Packet)) }) else media.admission.Token{};
     errdefer reservation.deinit();
-    const packets = try a.dupe(media.mp4.Packet, reader.packets);
+    const packets = try a.alloc(media.mp4.Packet, count);
     errdefer a.free(packets);
+    var pos: usize = 0;
+    for (runs) |run| {
+        const slice = reader.packets[run.first .. run.last + 1];
+        @memcpy(packets[pos..][0..slice.len], slice);
+        pos += slice.len;
+    }
     var identity_reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = reader.input.identity.len }) else media.admission.Token{};
     errdefer identity_reservation.deinit();
     const identity = try a.dupe(u8, reader.input.identity);
@@ -63,11 +100,12 @@ pub fn borrow(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options)
     return .{ .snapshot = null, .reader = view, .epoch = 0, .identity = identity, .identity_reservation = identity_reservation };
 }
 const ParameterOverlay = struct {
+    const Entry = struct { index: usize, start: u64, packet: media.mp4.Packet, prefix: []const u8 };
     allocator: std.mem.Allocator,
     input: media.source.Source,
     original: *media.source.Source,
-    first: media.mp4.Packet,
-    prefix: []u8,
+    entries: []Entry,
+    bytes: []u8,
     reservation: media.admission.Token,
     fn read(raw: *anyopaque, offset: u64, destination: []u8, control: media.source.Control) !usize {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -80,23 +118,31 @@ const ParameterOverlay = struct {
             @memcpy(destination[0..count], lease.bytes);
             return count;
         }
-        const relative = offset - boundary;
-        if (relative < self.prefix.len) {
-            const count: usize = @intCast(@min(destination.len, self.prefix.len - relative));
-            @memcpy(destination[0..count], self.prefix[@intCast(relative)..][0..count]);
+        var lo: usize = 0;
+        var hi = self.entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.entries[mid].start <= offset) lo = mid + 1 else hi = mid;
+        }
+        const entry = self.entries[lo - 1];
+        const relative = offset - entry.start;
+        if (relative < entry.prefix.len) {
+            const count: usize = @intCast(@min(destination.len, entry.prefix.len - relative));
+            @memcpy(destination[0..count], entry.prefix[@intCast(relative)..][0..count]);
             return count;
         }
-        const payload_offset = relative - self.prefix.len;
-        if (payload_offset > self.first.size) return error.UnexpectedEndOfSource;
-        const count: usize = @intCast(@min(destination.len, self.first.size - payload_offset));
-        var lease = try self.original.read(try std.math.add(u64, self.first.offset, payload_offset), count);
+        const payload_offset = relative - entry.prefix.len;
+        if (payload_offset >= entry.packet.size) return error.UnexpectedEndOfSource;
+        const count: usize = @intCast(@min(destination.len, entry.packet.size - payload_offset));
+        var lease = try self.original.read(entry.packet.offset + payload_offset, count);
         defer lease.deinit();
         @memcpy(destination[0..count], lease.bytes);
         return count;
     }
     fn deinit(self: *@This()) void {
         std.debug.assert(self.input.retained_bytes == 0);
-        self.allocator.free(self.prefix);
+        self.allocator.free(self.bytes);
+        self.allocator.free(self.entries);
         self.reservation.deinit();
         self.allocator.destroy(self);
     }
@@ -106,23 +152,55 @@ const ParameterOverlay = struct {
 pub fn borrowWithParameters(a: std.mem.Allocator, reader: *media.mp4.Reader, parameters: []const u8, options: Options) !Window {
     var window = try borrow(a, reader, options);
     errdefer window.deinit();
-    if (parameters.len == 0) return window;
-    if (!reader.track.inband_parameter_sets or reader.track.codec != .avc) return error.UnsupportedDynamicVideoConfig;
-    const first = reader.packets[0];
-    const size = try std.math.add(usize, parameters.len, first.size);
-    if (size > options.stream.max_bytes or size > reader.input.limits.max_read_bytes) return error.ResourceLimitExceeded;
-    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = parameters.len + @sizeOf(ParameterOverlay) }) else media.admission.Token{};
-    errdefer reservation.deinit();
-    const prefix = try a.dupe(u8, parameters);
-    errdefer a.free(prefix);
-    const overlay = try a.create(ParameterOverlay);
-    errdefer a.destroy(overlay);
-    overlay.* = .{ .allocator = a, .original = reader.input, .first = first, .prefix = prefix, .reservation = reservation, .input = .{ .allocator = a, .identity = reader.input.identity, .limits = reader.input.limits, .control = options.stream.control, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .context = overlay, .read_at = ParameterOverlay.read, .length = try std.math.add(u64, reader.input.length(), size) } } } };
-    window.reader.packets[0].size = std.math.cast(u32, size) orelse return error.ResourceLimitExceeded;
-    window.overlay = overlay;
-    window.reader.input = &overlay.input;
-    window.reader.packets[0].offset = reader.input.length();
+    try attachPrefixes(&window, &.{.{ .index = 0, .bytes = parameters }}, options);
     return window;
+}
+
+pub const PacketPrefix = struct { index: usize, bytes: []const u8 };
+pub fn attachPrefixes(window: *Window, prefixes: []const PacketPrefix, options: Options) !void {
+    const reader = &window.reader;
+    const a = reader.allocator;
+    var count: usize = 0;
+    var size: usize = 0;
+    for (prefixes) |p| {
+        if (p.bytes.len == 0) continue;
+        if (p.index >= reader.packets.len) return error.InvalidPacketIndex;
+        count += 1;
+        size = try std.math.add(usize, size, p.bytes.len);
+    }
+    if (count == 0) return;
+    if (window.overlay != null or !reader.track.requiresAvcRegistry()) return error.UnsupportedDynamicVideoConfig;
+    const charge = try std.math.add(usize, try std.math.add(usize, size, @sizeOf(ParameterOverlay)), try std.math.mul(usize, count, @sizeOf(ParameterOverlay.Entry)));
+    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = charge }) else media.admission.Token{};
+    errdefer reservation.deinit();
+    const entries = try a.alloc(ParameterOverlay.Entry, count);
+    errdefer a.free(entries);
+    const bytes = try a.alloc(u8, size);
+    errdefer a.free(bytes);
+    var offset = reader.input.length();
+    var at: usize = 0;
+    var i: usize = 0;
+    for (prefixes) |p| {
+        if (p.bytes.len == 0) continue;
+        if (i != 0 and entries[i - 1].index >= p.index) return error.InvalidPacketIndex;
+        const packet = reader.packets[p.index];
+        const total = try std.math.add(usize, p.bytes.len, packet.size);
+        if (total > options.stream.max_bytes or total > reader.input.limits.max_read_bytes or total > std.math.maxInt(u32)) return error.ResourceLimitExceeded;
+        const dest = bytes[at..][0..p.bytes.len];
+        @memcpy(dest, p.bytes);
+        entries[i] = .{ .index = p.index, .start = offset, .packet = packet, .prefix = dest };
+        at += p.bytes.len;
+        i += 1;
+        offset = try std.math.add(u64, offset, total);
+    }
+    const overlay = try a.create(ParameterOverlay);
+    overlay.* = .{ .allocator = a, .original = reader.input, .bytes = bytes, .entries = entries, .reservation = reservation, .input = .{ .allocator = a, .identity = reader.input.identity, .limits = reader.input.limits, .control = options.stream.control, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .context = overlay, .read_at = ParameterOverlay.read, .length = offset } } } };
+    for (entries) |entry| {
+        reader.packets[entry.index].offset = entry.start;
+        reader.packets[entry.index].size = @intCast(entry.prefix.len + entry.packet.size);
+    }
+    window.overlay = overlay;
+    reader.input = &overlay.input;
 }
 /// Clone only packet/span metadata and retain immutable payload storage. This is
 /// used by an epoch-owned decoder whose references outlive a delivered window.
@@ -159,14 +237,20 @@ pub fn clone(a: std.mem.Allocator, original: *const Window, options: Options) !W
     constructing = false;
     if (original.overlay) |overlay| {
         // Use a separate scope to avoid also running construction errdefers.
-        return clonePrefix(&result, overlay.first, overlay.prefix, options);
+        return clonePrefixes(&result, overlay, options);
     }
     return result;
 }
-fn clonePrefix(window: *Window, first: media.mp4.Packet, prefix: []const u8, options: Options) !Window {
+fn clonePrefixes(window: *Window, overlay: *const ParameterOverlay, options: Options) !Window {
     errdefer window.deinit();
-    window.reader.packets[0] = first;
-    try prefixParameters(window, prefix, options);
+    const a = window.reader.allocator;
+    const prefixes = try a.alloc(PacketPrefix, overlay.entries.len);
+    defer a.free(prefixes);
+    for (overlay.entries, prefixes) |entry, *prefix| {
+        window.reader.packets[entry.index] = entry.packet;
+        prefix.* = .{ .index = entry.index, .bytes = entry.prefix };
+    }
+    try attachPrefixes(window, prefixes, options);
     return window.*;
 }
 

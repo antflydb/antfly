@@ -69,6 +69,13 @@ const Row = struct {
     slices: usize = 0,
 };
 pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: options_mod.Options, registry: ?*dynamic.Session) !options_mod.Index {
+    var temporary = media.admission.TrackedAllocator{ .backing = a, .limit = options.decode.max_parameter_bytes, .reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{}) else .{} };
+    defer temporary.reservation.deinit();
+    defer std.debug.assert(temporary.live == 0);
+    return planHeaders(a, temporary.allocator(), reader, options, registry) catch |err| return if (err == error.OutOfMemory) temporary.denied orelse err else err;
+}
+
+fn planHeaders(a: std.mem.Allocator, scratch: std.mem.Allocator, reader: *media.mp4.Reader, options: options_mod.Options, registry: ?*dynamic.Session) !options_mod.Index {
     try reader.input.control.check();
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
     if (reader.packets.len == 0) return error.EmptyVideo;
@@ -81,13 +88,6 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
     const bound = try std.math.mul(usize, capacity, @sizeOf(Row) + @sizeOf(h264.Picture) + 256);
     var reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = bound }) else media.admission.Token{};
     errdefer reservation.deinit();
-    // Header/coalescing temporaries have a separate fixed admitted ceiling;
-    // sparse reads must not hide uncharged ownership behind source leases.
-    var temporary_reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = options.decode.max_parameter_bytes }) else media.admission.Token{};
-    defer temporary_reservation.deinit();
-    var temporary = @import("decode_budget.zig").Budget{ .backing = a, .limit = options.decode.max_parameter_bytes };
-    defer std.debug.assert(temporary.live == 0);
-    const scratch = temporary.allocator();
     const rows = try a.alloc(Row, capacity);
     defer a.free(rows);
     var lookup: std.AutoHashMap(u64, usize) = .init(a);
@@ -107,7 +107,7 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
             }
         }
         if (reader.packets[packet_index].size > options.decode.max_packet_bytes) return error.ResourceLimitExceeded;
-        const cached = if (registry) |owner| (if (owner.header_packets.items.len == reader.packets.len) owner.header_packets.items else null) else null;
+        const cached = if (registry) |owner| owner.planningHeaders() else null;
         const bytes_before = reader.input.total_bytes;
         const bytes = if (cached) |packets| packets[packet_index] else try @import("h264_prefix.zig").packet(scratch, reader, packet_index, options.decode.max_packet_bytes);
         defer if (cached == null) scratch.free(bytes);

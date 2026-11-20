@@ -106,14 +106,14 @@ pub const Continuation = struct {
         const slots = try registry.backing.alloc(usize, indexes.len);
         defer registry.backing.free(slots);
         var stats = h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = registry.budget.live };
-        for (registry.epochs.items) |epoch| {
-            var count: usize = 0;
-            for (indexes, 0..) |index, slot| if (index >= epoch.start and index < epoch.end) {
-                selected[count] = index - epoch.start;
-                slots[count] = slot;
-                count += 1;
-            };
-            if (count == 0) continue;
+        orderSlots(slots, indexes);
+        var end: usize = 0;
+        while (end < slots.len) {
+            const begin = end;
+            const epoch = try registry.epochAt(indexes[slots[begin]]);
+            while (end < slots.len and indexes[slots[end]] < epoch.end) : (end += 1)
+                selected[end] = indexes[slots[end]] - epoch.start;
+            const count = end - begin;
             if (count > registry.options.max_dependency_packets -| stats.decoded_packets) return error.ResourceLimitExceeded;
             const entry = registry.entries.items[epoch.entry];
             var view = registry.reader.*;
@@ -142,12 +142,12 @@ pub const Continuation = struct {
                     try capture.callback(capture.context, capture.slots[slot], frame);
                 }
             };
-            var capture = Capture{ .slots = slots[0..count], .context = context, .callback = callback };
+            var capture = Capture{ .slots = slots[begin..end], .context = context, .callback = callback };
             const core = self.core.?;
             const limit = core.options.max_dependency_packets;
             defer core.options.max_dependency_packets = limit;
             core.options.max_dependency_packets = limit -| stats.decoded_packets;
-            const result = try core.decodeSelectedWithConfigurations(&view, selected[0..count], &capture, Capture.publish, .{ .session = registry, .base = epoch.start, .independent_start = epoch.independent, .max_refs = epoch.max_refs });
+            const result = try core.decodeSelectedWithConfigurations(&view, selected[begin..end], &capture, Capture.publish, .{ .session = registry, .base = epoch.start, .independent_start = epoch.independent, .max_refs = epoch.max_refs });
             stats.decoded_packets += result.decoded_packets;
             stats.payload_bytes += result.payload_bytes;
             stats.decode_high_water = @max(stats.decode_high_water, result.decode_high_water + registry.budget.live);
@@ -166,6 +166,18 @@ pub const Snapshot = struct {
     sequence_versions: [32]Versions,
     picture_versions: [256]Versions,
 
+    pub fn storageBytes(session: *const Session) usize {
+        var bytes = std.mem.sliceAsBytes(session.entries.items).len +| std.mem.sliceAsBytes(session.epochs.items).len +| std.mem.sliceAsBytes(session.packet_configs).len +| std.mem.sliceAsBytes(session.progressive_idrs.items).len;
+        for (session.entries.items) |entry| {
+            bytes +|= entry.avcc.len;
+            if (entry.config.groups.explicit) |map| bytes +|= map.len;
+        }
+        inline for (.{ session.sequence_versions[0..], session.picture_versions[0..] }) |table| for (table) |versions| {
+            bytes +|= std.mem.sliceAsBytes(versions.list.items).len;
+            for (versions.list.items) |version| bytes +|= version.bytes.len;
+        };
+        return bytes;
+    }
     fn copyVersions(a: std.mem.Allocator, source: anytype) !@TypeOf(source) {
         var result: @TypeOf(source) = @splat(.{});
         for (&result, source) |*dest, versions| {
@@ -216,6 +228,15 @@ pub const Snapshot = struct {
     }
 };
 
+fn orderSlots(slots: []usize, indexes: []const usize) void {
+    for (slots, 0..) |*slot, i| slot.* = i;
+    std.mem.sort(usize, slots, indexes, struct {
+        fn less(ids: []const usize, left: usize, right: usize) bool {
+            return ids[left] < ids[right];
+        }
+    }.less);
+}
+
 pub const Session = struct {
     borrowed: bool = false,
     backing: std.mem.Allocator,
@@ -231,7 +252,9 @@ pub const Session = struct {
     epochs: std.ArrayList(Epoch) = .empty,
     progressive_idrs: std.ArrayList(usize) = .empty,
     packet_configs: []usize = &.{},
+    memory: ?media.admission.TrackedAllocator = null,
     header_budget: Budget,
+    supplied_headers: ?[]const []u8 = null,
     header_packets: std.ArrayList([]u8) = .empty,
     cache_headers: bool = false,
     probe_packets: usize = 0,
@@ -241,26 +264,44 @@ pub const Session = struct {
     sequence_versions: [32]Versions = @splat(.{}),
     picture_versions: [256]Versions = @splat(.{}),
     pub fn init(allocator: std.mem.Allocator, reader: *media.mp4.Reader, options: h264.Options) !*Session {
-        return initCached(allocator, reader, options, false);
+        return initCached(allocator, reader, options, false, null);
     }
     pub fn initPlanning(allocator: std.mem.Allocator, reader: *media.mp4.Reader, options: h264.Options) !*Session {
-        return initCached(allocator, reader, options, true);
+        return initCached(allocator, reader, options, true, null);
     }
-    fn initCached(allocator: std.mem.Allocator, reader: *media.mp4.Reader, options: h264.Options, cache_headers: bool) !*Session {
+    pub fn initWithHeaders(allocator: std.mem.Allocator, reader: *media.mp4.Reader, options: h264.Options, headers: []const []u8) !*Session {
+        if (headers.len != reader.packets.len) return error.InvalidVideoIndex;
+        return initCached(allocator, reader, options, false, headers);
+    }
+    pub fn planningHeaders(self: *const Session) ?[]const []u8 {
+        return self.supplied_headers orelse if (self.header_packets.items.len == self.reader.packets.len) self.header_packets.items else null;
+    }
+    fn initCached(allocator: std.mem.Allocator, reader: *media.mp4.Reader, options: h264.Options, cache_headers: bool, headers: ?[]const []u8) !*Session {
         if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
         if (reader.packets.len > options.max_parameter_packets) return error.ResourceLimitExceeded;
         const self = try allocator.create(Session);
-        self.* = .{ .backing = allocator, .budget = .{ .backing = allocator, .limit = options.max_parameter_bytes }, .header_budget = .{ .backing = allocator, .limit = options.max_parameter_bytes }, .reader = reader, .length_bytes = reader.track.nal_length_bytes, .options = options, .cache_headers = cache_headers };
+        self.* = .{ .backing = allocator, .budget = .{ .backing = allocator, .limit = options.max_parameter_bytes }, .header_budget = .{ .backing = allocator, .limit = options.max_parameter_bytes }, .reader = reader, .length_bytes = reader.track.nal_length_bytes, .options = options, .cache_headers = cache_headers, .supplied_headers = headers };
         errdefer self.deinit();
-        self.reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(usize, try std.math.mul(usize, options.max_parameter_bytes, 2), @sizeOf(Session)) }) else media.admission.Token{};
-        self.scan() catch |err| return if (err == error.OutOfMemory and (self.budget.denied or self.header_budget.denied)) error.ResourceLimitExceeded else err;
+        self.reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(Session) }) else media.admission.Token{};
+        if (reader.input.admission_pool) |pool| {
+            self.memory = .{ .backing = allocator, .limit = std.math.maxInt(usize), .reservation = try pool.acquire(.{}) };
+            self.budget.backing = self.memory.?.allocator();
+            self.header_budget.backing = self.memory.?.allocator();
+        }
+        self.scan() catch |err| return self.scanError(err);
         return self;
+    }
+    fn scanError(self: *const Session, err: anyerror) anyerror {
+        if (err != error.OutOfMemory) return err;
+        if (self.memory) |memory| if (memory.denied) |reason| return reason;
+        return if (self.budget.denied or self.header_budget.denied) error.ResourceLimitExceeded else err;
     }
     pub fn deinit(self: *Session) void {
         var reservation = self.reservation;
         defer reservation.deinit();
         defer self.backing.destroy(self);
         if (self.borrowed) return;
+        defer if (self.memory) |*memory| memory.reservation.deinit();
         const allocator = self.budget.allocator();
         for (self.entries.items) |value| {
             value.config.groups.deinit(allocator);
@@ -280,6 +321,7 @@ pub const Session = struct {
         self.header_packets.deinit(a);
         self.header_packets = .empty;
         self.cache_headers = false;
+        self.supplied_headers = null;
     }
     fn install(self: *Session, nal: []const u8, at: ?usize) !void {
         if (nal.len > std.math.maxInt(u16)) return error.ResourceLimitExceeded;
@@ -360,24 +402,26 @@ pub const Session = struct {
             if (packet.size > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
             const bytes_before = self.reader.input.total_bytes;
             const header_allocator = self.header_budget.allocator();
-            const prefix = @import("h264_prefix.zig").packet(header_allocator, self.reader, i, self.options.max_packet_bytes) catch |err| retry: {
+            const prefix = if (self.supplied_headers) |headers| headers[i] else @import("h264_prefix.zig").packet(header_allocator, self.reader, i, self.options.max_packet_bytes) catch |err| retry: {
                 // Cache pressure must never narrow the parameter/profile limit
                 // or make a long clip fail. Discard the optional cache, then
                 // continue sparse reads with one bounded packet in flight.
-                if (err != error.OutOfMemory or !self.header_budget.denied or self.header_packets.items.len == 0) return err;
+                if (err != error.OutOfMemory or (!self.header_budget.denied and (self.memory == null or self.memory.?.denied == null)) or self.header_packets.items.len == 0) return err;
                 self.releasePlanningHeaders();
                 self.header_budget.denied = false;
+                if (self.memory) |*memory| memory.denied = null;
                 break :retry try @import("h264_prefix.zig").packet(header_allocator, self.reader, i, self.options.max_packet_bytes);
             };
-            var retained = false;
+            var retained = self.supplied_headers != null;
             defer if (!retained) header_allocator.free(prefix);
             if (self.cache_headers) {
                 if (self.header_packets.append(header_allocator, prefix)) |_| {
                     retained = true;
                 } else |err| {
-                    if (err != error.OutOfMemory or !self.header_budget.denied) return err;
+                    if (err != error.OutOfMemory or (!self.header_budget.denied and (self.memory == null or self.memory.?.denied == null))) return err;
                     self.releasePlanningHeaders();
                     self.header_budget.denied = false;
+                    if (self.memory) |*memory| memory.denied = null;
                 }
             }
             const lease = .{ .bytes = prefix };
@@ -445,11 +489,14 @@ pub const Session = struct {
         self.reader = reader;
         const begin = self.packet_configs.len;
         errdefer self.valid = false;
-        self.scanFrom(begin) catch |err| return if (err == error.OutOfMemory and self.budget.denied) error.ResourceLimitExceeded else err;
+        self.scanFrom(begin) catch |err| return self.scanError(err);
     }
     /// Parameter NALs effective immediately before a retained packet. Initial
     /// avcC entries are already present in the reader and need no duplication.
     pub fn bootstrapBefore(self: *Session, a: std.mem.Allocator, index: usize) ![]u8 {
+        return self.bootstrap(a, index, false);
+    }
+    pub fn bootstrap(self: *Session, a: std.mem.Allocator, index: usize, include_original: bool) ![]u8 {
         if (!self.valid or index > self.packet_configs.len) return error.InvalidPacketIndex;
         var sequence: [32]?Parameter = @splat(null);
         var picture: [256]?Parameter = @splat(null);
@@ -457,19 +504,19 @@ pub const Session = struct {
         for (&picture, &self.picture_versions) |*slot, *versions| slot.* = versions.before(index);
         var size: usize = 0;
         const length = self.length_bytes;
-        for (sequence) |item| if (item) |parameter| if (!parameter.original) {
+        for (sequence) |item| if (item) |parameter| if (include_original or !parameter.original) {
             if (parameter.bytes.len > (@as(u64, 1) << (@as(u6, length) * 8)) - 1) return error.ResourceLimitExceeded;
             size = try std.math.add(usize, size, length + parameter.bytes.len);
         };
-        for (picture) |item| if (item) |parameter| if (!parameter.original) {
+        for (picture) |item| if (item) |parameter| if (include_original or !parameter.original) {
             if (parameter.bytes.len > (@as(u64, 1) << (@as(u6, length) * 8)) - 1) return error.ResourceLimitExceeded;
             size = try std.math.add(usize, size, length + parameter.bytes.len);
         };
         if (size > self.options.max_parameter_bytes) return error.ResourceLimitExceeded;
         const bytes = try a.alloc(u8, size);
         var cursor: usize = 0;
-        for (sequence) |item| if (item) |parameter| if (!parameter.original) writeParameter(bytes, &cursor, length, parameter.bytes);
-        for (picture) |item| if (item) |parameter| if (!parameter.original) writeParameter(bytes, &cursor, length, parameter.bytes);
+        for (sequence) |item| if (item) |parameter| if (include_original or !parameter.original) writeParameter(bytes, &cursor, length, parameter.bytes);
+        for (picture) |item| if (item) |parameter| if (include_original or !parameter.original) writeParameter(bytes, &cursor, length, parameter.bytes);
         return bytes;
     }
     /// Allocate the new selector table before changing any retained state.
@@ -556,8 +603,14 @@ pub const Session = struct {
     }
     fn epochAt(self: *const Session, index: usize) !Epoch {
         if (index >= self.reader.packets.len) return error.InvalidPacketIndex;
-        for (self.epochs.items) |epoch| if (index >= epoch.start and index < epoch.end) return epoch;
-        return error.MissingVideoParameterSet;
+        var lo: usize = 0;
+        var hi = self.epochs.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (index >= self.epochs.items[mid].end) lo = mid + 1 else hi = mid;
+        }
+        if (lo == self.epochs.items.len or index < self.epochs.items[lo].start) return error.MissingVideoParameterSet;
+        return self.epochs.items[lo];
     }
     /// Last complete progressive IDR in this epoch at or before the target.
     pub fn progressiveRestart(self: *const Session, epoch_start: usize, target: usize) ?usize {
@@ -596,19 +649,14 @@ pub const Session = struct {
         if (self.budget.peak >= options.max_decode_bytes) return error.ResourceLimitExceeded;
         options.max_decode_bytes -= self.budget.peak;
         var stats = h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = self.budget.peak };
-        for (slots, 0..) |*slot, i| slot.* = i;
-        std.mem.sort(usize, slots, indexes, struct {
-            fn less(ids: []const usize, left: usize, right: usize) bool {
-                return ids[left] < ids[right];
-            }
-        }.less);
+        orderSlots(slots, indexes);
         var first: usize = 0;
-        for (self.epochs.items) |epoch| {
+        while (first < slots.len) {
+            const epoch = try self.epochAt(indexes[slots[first]]);
             const begin = first;
             while (first < slots.len and indexes[slots[first]] < epoch.end) : (first += 1) {
                 selected[first] = indexes[slots[first]] - epoch.start;
             }
-            if (begin == first) continue;
             var view = self.reader.*;
             view.packets = self.reader.packets[epoch.start..epoch.end];
             const value = self.entries.items[epoch.entry];

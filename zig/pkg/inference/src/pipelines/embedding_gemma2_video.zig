@@ -311,7 +311,7 @@ pub const DecoderContinuation = struct {
         if (self.reader.track.codec != .avc or self.reader.track.inband_parameter_sets or !try compatibleApple(self.allocator, self.reader.track.avcc)) return false;
         var absolute: [32]usize = undefined;
         if (selected.len > absolute.len) return error.ResourceLimitExceeded;
-        for (selected, absolute[0..selected.len]) |index, *target| target.* = try std.math.add(usize, index, packet_base);
+        for (selected, absolute[0..selected.len]) |index, *target| target.* = if (capture.reader_selection.?.packet_runs.len != 0) try video.live_windows.sourcePacket(capture.reader_selection.?.packet_runs, index) else try std.math.add(usize, index, packet_base);
         if (self.apple) |apple| for (absolute[0..selected.len]) |index| {
             if (index < apple.next_packet) return false;
         };
@@ -328,14 +328,15 @@ pub const DecoderContinuation = struct {
         const Forward = struct {
             target: *Capture,
             base: usize,
+            runs: []const video.decode_plan.Run,
             fn accept(raw: *anyopaque, frame: *const video.apple.Frame) !void {
                 const forwarder: *@This() = @ptrCast(@alignCast(raw));
                 var local = frame.*;
-                local.decode_index = try std.math.sub(usize, frame.decode_index, forwarder.base);
+                local.decode_index = if (forwarder.runs.len == 0) try std.math.sub(usize, frame.decode_index, forwarder.base) else try video.live_windows.localPacket(forwarder.runs, frame.decode_index);
                 try Capture.publishApple(forwarder.target, &local);
             }
         };
-        var forward = Forward{ .target = capture, .base = packet_base };
+        var forward = Forward{ .target = capture, .base = packet_base, .runs = capture.reader_selection.?.packet_runs };
         const warm = self.apple.?.next_packet != 0;
         const packets = self.apple.?.decodeToControlled(absolute[0..selected.len], .{ .context = &forward, .accept = Forward.accept }, capture.control) catch |err| {
             self.deinit();
@@ -419,6 +420,7 @@ pub const ReaderSelection = struct {
     } = null,
     continuation: ?*DecoderContinuation = null,
     packet_base: usize = 0,
+    packet_runs: []const video.decode_plan.Run = &.{},
     allocator: std.mem.Allocator,
     selected: []const usize,
     gemma4_plan: ?video.packet_sampling.Gemma4Plan = null,
@@ -453,28 +455,31 @@ pub const ReaderSelection = struct {
         const plan = if (sampling == .gemma4) try video.packet_sampling.gemma4Pictures(reader, logical.pictures, control) else null;
         const selected = if (plan) |value| try a.dupe(usize, value.ids()) else try selectLogical(a, reader, logical.*, sampling, control);
         errdefer a.free(selected);
-        return finishImmutable(a, reader, sampling, plan, selected, &reservation, control, source_binding, packet_base);
+        return finishImmutable(a, reader, sampling, plan, selected, &reservation, control, source_binding, packet_base, &.{});
     }
 
     pub fn fromPacketIds(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, ids: []const usize, pool: ?*media.admission.Pool, control: media.source.Control, source_binding: [32]u8, packet_base: usize) !ReaderSelection {
+        return fromMappedPacketIds(a, reader, sampling, ids, pool, control, source_binding, packet_base, &.{});
+    }
+    pub fn fromMappedPacketIds(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, ids: []const usize, pool: ?*media.admission.Pool, control: media.source.Control, source_binding: [32]u8, packet_base: usize, runs: []const video.decode_plan.Run) !ReaderSelection {
         if (ids.len == 0 or ids.len > 32) return error.InvalidVideoReaderSelection;
         var reservation = if (pool) |shared| try shared.acquire(.{ .host_bytes = ids.len * (@sizeOf(usize) + @sizeOf(CacheKey)) }) else media.admission.Token{};
         errdefer reservation.deinit();
         const selected = try a.dupe(usize, ids);
         errdefer a.free(selected);
-        return finishImmutable(a, reader, sampling, null, selected, &reservation, control, source_binding, packet_base);
+        return finishImmutable(a, reader, sampling, null, selected, &reservation, control, source_binding, packet_base, runs);
     }
 
-    fn finishImmutable(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, plan: ?video.packet_sampling.Gemma4Plan, selected: []usize, reservation: *media.admission.Token, control: media.source.Control, source_binding: [32]u8, packet_base: usize) !ReaderSelection {
+    fn finishImmutable(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, plan: ?video.packet_sampling.Gemma4Plan, selected: []usize, reservation: *media.admission.Token, control: media.source.Control, source_binding: [32]u8, packet_base: usize, runs: []const video.decode_plan.Run) !ReaderSelection {
         if (selected.len == 0 or selected.len > 32) return error.InvalidVideoReaderSelection;
         const keys = try a.alloc(CacheKey, selected.len);
         errdefer a.free(keys);
         for (selected, keys) |id, *key| {
             if (id >= reader.packets.len) return error.InvalidVideoReaderSelection;
-            key.* = .{ .clip = source_binding, .picture = try std.math.add(usize, packet_base, id) };
+            key.* = .{ .clip = source_binding, .picture = if (runs.len == 0) try std.math.add(usize, packet_base, id) else try video.live_windows.sourcePacket(runs, id) };
         }
         try reservation.resize(.{ .host_bytes = selected.len * (@sizeOf(usize) + @sizeOf(CacheKey)) });
-        return .{ .allocator = a, .gemma4_plan = plan, .selected = selected, .projection_keys = keys, .binding = try readerMetadataBinding(reader, sampling, control), .immutable = true, .reservation = reservation.* };
+        return .{ .allocator = a, .gemma4_plan = plan, .selected = selected, .projection_keys = keys, .binding = try readerMetadataBinding(reader, sampling, control), .immutable = true, .packet_runs = runs, .packet_base = packet_base, .reservation = reservation.* };
     }
     pub fn deinit(self: *ReaderSelection) void {
         self.allocator.free(self.selected);
@@ -2466,7 +2471,12 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, requested: [
         }
         if (try decodeAppleH264(a, reader, selected, capture)) return;
         if (continuation) |owner| {
-            if (try owner.decodeControlled(selected, capture.reader_selection.?.packet_base, capture, Capture.publishDecoded, capture.control)) {
+            const selection = capture.reader_selection.?;
+            var mapped: [32]usize = undefined;
+            if (selection.packet_runs.len != 0) for (selected, mapped[0..selected.len]) |id, *dest| {
+                dest.* = try video.live_windows.sourcePacket(selection.packet_runs, id);
+            };
+            if (try owner.decodeControlled(if (selection.packet_runs.len != 0) mapped[0..selected.len] else selected, if (selection.packet_runs.len != 0) 0 else selection.packet_base, capture, Capture.publishDecoded, capture.control)) {
                 capture.decoder.record(.portable);
                 return;
             }
@@ -3809,6 +3819,9 @@ test "embeddinggemma2 video bound selection reuses logical metadata without deco
     try std.testing.expect(planned.pixels > 0);
     try std.testing.expectEqual(reads, source.reads);
     try std.testing.expectEqual(before.host_bytes + selected.len * (@sizeOf(usize) + @sizeOf(CacheKey)), pool.snapshot().host_bytes);
+    const rebuilt = try inspectReaderPlan(a, &reader, .{}, sampling, &pool, false);
+    try std.testing.expectEqualSlices(u64, planned.picture_indexes[0..planned.pictures], rebuilt.picture_indexes[0..rebuilt.pictures]);
+    pool.limits.host_bytes = pool.snapshot().host_bytes;
     try std.testing.expectError(error.SharedAdmissionExceeded, inspectReaderPlan(a, &reader, .{}, sampling, &pool, false));
 }
 

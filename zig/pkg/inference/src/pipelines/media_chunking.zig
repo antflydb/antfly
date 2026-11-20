@@ -888,7 +888,7 @@ pub const Runner = struct {
                     const input = if (transport) bind: {
                         const plan = entry.mp4_plan orelse return error.InvalidVideoIndex;
                         view = .{ .map = plan.transport orelse return error.InvalidVideoIndex, .wire = source };
-                        normalized = view.source(&self.summary.identity.source, .{ .max_total_bytes = 512 * 1024 * 1024 });
+                        normalized = view.source(&self.summary.identity.source, .{ .max_total_bytes = std.math.maxInt(u64), .max_reads = std.math.maxInt(usize) });
                         break :bind &normalized;
                     } else source;
                     var reader = data.reader(self.allocator, input);
@@ -912,10 +912,11 @@ pub const Runner = struct {
             });
             defer index.deinit();
             var view = video.transport_seek.View{ .map = index.mapping(), .wire = source };
-            var normalized = view.source(&self.summary.identity.source, .{ .max_total_bytes = 512 * 1024 * 1024 });
+            var normalized = view.source(&self.summary.identity.source, .{ .max_total_bytes = std.math.maxInt(u64), .max_reads = std.math.maxInt(usize) });
             var reader = media.mp4.Reader{ .allocator = self.allocator, .input = &normalized, .metadata = .{ .source = null, .bytes = &.{} }, .packets = index.packets.items, .track = index.track.?, .limits = limits };
-            var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
+            var owner = try @import("media_chunking_video.zig").Owner.initPlanned(self.allocator, &reader, &self.pool, self.request.limits, index.headers.items);
             defer owner.deinit();
+            index.releaseHeaders();
             owner.transport = view.map;
             if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission|
                 cache.rememberPlanned(std.heap.smp_allocator, key, .{ .mp4 = reader }, admission, .{ .mp4 = &owner });
@@ -1645,6 +1646,59 @@ test "model aware media multi-PPS AVC chunk window binds the active parameter re
     var delivered: usize = 0;
     _ = try video.h264.decodeSelected(a, &window.coded.reader, window.selection.?.selected, .{}, &delivered, Count.frame);
     try std.testing.expectEqual(window.selection.?.selected.len, delivered);
+}
+
+test "model aware media sparse AVC runs retain source IDs and charge only selected IDRs" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 8 * 1024 * 1024 } };
+    var source = media.source.Source{ .allocator = a, .identity = "sparse-multi-pps", .storage = .{ .borrowed = @embedFile("../testdata/video/h264-two-pps.mp4") }, .admission_pool = &pool };
+    var input = try media.mp4.Reader.init(a, &source, .{});
+    defer input.deinit();
+    var reader = input;
+    reader.track.timescale = 1;
+    reader.track.edit = .{};
+    var packets: [40]media.mp4.Packet = undefined;
+    for (&packets, 0..) |*packet, i| {
+        packet.* = input.packets[0];
+        packet.pts = @intCast(i);
+        packet.duration = 1;
+    }
+    reader.packets = &packets;
+    var owner = try @import("media_chunking_video.zig").Owner.init(a, &reader, &pool, .{ .max_dependency_packets = 1 });
+    defer owner.deinit();
+    const single = video.sampling.TimestampPolicy{ .max_frames = 1, .end_ns = std.time.ns_per_s };
+    var first = try owner.prepare(single);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.coded.reader.packets.len);
+    owner.limits.max_dependency_packets = 2;
+    owner.limits.max_coded_window_bytes = 2 * @as(usize, input.packets[0].size);
+    const sparse = video.sampling.TimestampPolicy{ .max_frames = 2, .end_ns = 40 * std.time.ns_per_s };
+    var window = try owner.prepare(sparse);
+    defer window.deinit();
+    try window.bind(sparse, &pool);
+    try std.testing.expectEqual(@as(usize, 2), window.coded.reader.packets.len);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, window.selection.?.selected);
+    try std.testing.expectEqual(@as(usize, 39), window.selection.?.projection_keys[1].picture);
+}
+
+test "model aware media reference AVC plans a long multi-PPS track from headers" {
+    const a = std.testing.allocator;
+    var input = media.source.Source{ .allocator = a, .identity = "reference-multi-pps", .storage = .{ .borrowed = @embedFile("../testdata/video/h264-two-pps.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &input, .{});
+    defer reader.deinit();
+    var long = reader;
+    const packets = try a.alloc(media.mp4.Packet, 8193);
+    defer a.free(packets);
+    for (packets, 0..) |*packet, i| {
+        packet.* = reader.packets[0];
+        packet.pts = @intCast(i);
+        packet.duration = 1;
+    }
+    long.packets = packets;
+    long.track.timescale = 1000;
+    const selected = try video.packet_sampling.selectWithSampling(a, &long, .reference);
+    defer a.free(selected);
+    try std.testing.expect(selected.len > 1 and selected.len <= 32);
 }
 
 test "model aware media edited AVC windows retain decode preroll and select only displayed packets" {

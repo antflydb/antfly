@@ -49048,7 +49048,10 @@ const ChunkEmbeddingAdapter = struct {
             .video => |movie| blk: {
                 const plan = if (movie.ahead) |ahead| ahead.plan else try @import("../pipelines/embedding_gemma2_video.zig").inspectConfiguredPlan(adapter.a, movie.bytes, movie.reader, adapter.control, .{ .sampling = if (movie.source_timestamps) .{ .source_timestamps = movie.policy } else .{ .timestamps = movie.policy }, .selection = movie.selection, .webm = movie.webm }, if (adapter.model) |model| model.session.backend() == .metal else false);
                 var indexes = plan.picture_indexes;
-                for (indexes[0..plan.pictures]) |*index| index.* = try std.math.add(u64, index.*, movie.packet_base);
+                for (indexes[0..plan.pictures]) |*index| {
+                    const runs = if (movie.selection) |selection| selection.packet_runs else &.{};
+                    index.* = if (runs.len != 0) try @import("antfly_video").live_windows.sourcePacket(runs, @intCast(index.*)) else try std.math.add(u64, index.*, movie.packet_base);
+                }
                 break :blk .{ .video_plan = plan, .input_tokens = plan.sequence_tokens, .picture_count = @intCast(plan.pictures), .selected_pictures = try adapter.a.dupe(u64, indexes[0..plan.pictures]), .picture_basis = if (movie.webm != null) .logical else if (movie.reader != null or movie.bytes.len < 4 or !std.mem.eql(u8, movie.bytes[0..4], "\x1a\x45\xdf\xa3")) .packet_assembly else .logical };
             },
             .text => unreachable,

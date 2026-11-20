@@ -67,6 +67,10 @@ pub const View = struct {
         const end = start + out.len;
         const final = self.map.nals[containing(Nal, self.map.nals, "logical", end - 1)];
         const final_es = final.elementary + ((end - final.logical) -| 4);
+        const final_wire: u64 = if (final_es == 0) 0 else blk: {
+            const last = self.map.runs[containing(Run, self.map.runs, "elementary", final_es - 1)];
+            break :blk last.offset(final_es - 1 - last.elementary) + 1;
+        };
         // A single wire read can serve many contiguous TS packets and NALs.
         var lease: ?media.source.Lease = null;
         defer if (lease) |*held| held.deinit();
@@ -94,9 +98,30 @@ pub const View = struct {
                     if (lease) |*held| held.deinit();
                     lease = null;
                     try control.check();
-                    const last = self.map.runs[containing(Run, self.map.runs, "elementary", final_es - 1)];
-                    const wire_end = last.offset(final_es - 1 - last.elementary) + 1;
-                    const count: usize = @intCast(@min(wire_end - wire, 256 * 1024, self.wire.limits.max_read_bytes, self.wire.limits.max_retained_bytes -| self.wire.retained_bytes));
+                    const remaining = self.wire.limits.max_total_bytes -| self.wire.total_bytes;
+                    const capacity = @min(256 * 1024, self.wire.limits.max_read_bytes, self.wire.limits.max_retained_bytes -| self.wire.retained_bytes, remaining);
+                    // Coalesce nearby extents while there is room to pay for
+                    // transport overhead in addition to all remaining payload.
+                    const slack = remaining -| (end - pos);
+                    var last_id = run_id;
+                    // Under a tight byte budget do not prefetch Annex B start
+                    // codes or padding between this NAL and the next one.
+                    const fetch_end = if (final_wire - wire <= remaining) final_es else es + (stop - pos);
+                    var last_es = @min(fetch_end, run.elementary + run.len);
+                    var wire_end = run.offset(last_es - 1 - run.elementary) + 1;
+                    while (last_es < fetch_end and wire_end - wire < capacity) {
+                        const next = self.map.runs[last_id + 1];
+                        if (next.wire - wire_end > 188) break;
+                        const next_es = @min(fetch_end, next.elementary + next.len);
+                        const next_end = next.offset(next_es - 1 - next.elementary) + 1;
+                        if (next_end - wire - (next_es - es) > slack) break;
+                        last_id += 1;
+                        last_es = next_es;
+                        wire_end = next_end;
+                    }
+                    if (wire_end - wire - (last_es - es) > slack)
+                        wire_end = wire + @min(run.len - relative, 184 - relative % 184, stop - pos);
+                    const count: usize = @intCast(@min(wire_end - wire, capacity));
                     if (count == 0) return error.ResourceLimitExceeded;
                     lease = try self.wire.read(wire, count);
                     wire_start = wire;
@@ -121,11 +146,13 @@ pub const Index = struct {
     track: ?media.mp4.Track = null,
     length: u64 = 0,
     packet_end: u64 = 0,
+    headers: std.ArrayList([]u8) = .empty,
+    current_header: std.ArrayList(u8) = .empty,
 
     pub fn build(self: *Index, a: std.mem.Allocator, wire: *media.source.Source, options: avc.Options) !void {
         self.* = .{ .memory = .{ .backing = a, .limit = options.index.max_index_bytes, .reservation = if (wire.admission_pool) |pool| try pool.acquire(.{}) else .{} } };
         errdefer self.deinit();
-        var units = try avc.Stream.init(a, wire.identity, .{ .video = options, .retain_initial_description = true, .locations = .{ .context = self, .record = recordNal } }, self, accept);
+        var units = try avc.Stream.initIndex(a, wire.identity, options, .{ .context = self, .track = recordTrack, .nal = recordNal, .packet = recordPacket });
         defer if (!units.ended) units.deinit();
         var consumer = units.consumer();
         consumer.extent = recordRun;
@@ -146,32 +173,49 @@ pub const Index = struct {
         } else if (elementary != 0) return error.InvalidVideoIndex;
         try self.runs.append(self.memory.allocator(), .{ .wire = wire, .elementary = elementary, .len = len });
     }
-    fn recordNal(raw: *anyopaque, elementary: usize, len: usize) !void {
+    fn recordNal(raw: *anyopaque, elementary: usize, nal: []const u8) !void {
         const self: *Index = @ptrCast(@alignCast(raw));
+        const len = nal.len;
+        const retained = try @import("h264_prefix.zig").retainedSize(nal[0], len);
+        const a = self.memory.allocator();
+        var prefix: [4]u8 = undefined;
+        std.mem.writeInt(u32, &prefix, @intCast(retained), .big);
+        try self.current_header.appendSlice(a, &prefix);
+        try self.current_header.appendSlice(a, nal[0..retained]);
         try self.nals.append(self.memory.allocator(), .{ .logical = self.length, .elementary = elementary, .size = @intCast(len) });
         self.length = try std.math.add(u64, self.length, 4 + len);
     }
-    fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+    fn recordTrack(raw: *anyopaque, track: media.mp4.Track) !void {
         const self: *Index = @ptrCast(@alignCast(raw));
-        const reader = delivery.segment.?.reader;
-        if (self.track == null) {
-            var track = reader.track;
-            track.avcc = try self.memory.allocator().dupe(u8, track.avcc);
-            self.track = track;
-        }
-        for (reader.packets) |original| {
-            var packet = original;
-            packet.offset = self.packet_end;
-            self.packet_end += packet.size;
-            try self.packets.append(self.memory.allocator(), packet);
-        }
+        var owned = track;
+        owned.avcc = try self.memory.allocator().dupe(u8, track.avcc);
+        self.track = owned;
+    }
+    fn recordPacket(raw: *anyopaque, original: media.mp4.Packet) !void {
+        const self: *Index = @ptrCast(@alignCast(raw));
+        var packet = original;
+        packet.offset = self.packet_end;
+        self.packet_end += packet.size;
         if (self.packet_end != self.length) return error.InvalidVideoIndex;
+        const a = self.memory.allocator();
+        try self.packets.append(a, packet);
+        try self.headers.ensureUnusedCapacity(a, 1);
+        self.headers.appendAssumeCapacity(try self.current_header.toOwnedSlice(a));
+    }
+    pub fn releaseHeaders(self: *Index) void {
+        const a = self.memory.allocator();
+        for (self.headers.items) |bytes| a.free(bytes);
+        self.headers.deinit(a);
+        self.headers = .empty;
+        self.current_header.deinit(a);
+        self.current_header = .empty;
     }
     pub fn mapping(self: *const Index) Mapping {
         return .{ .runs = self.runs.items, .nals = self.nals.items, .len = self.length };
     }
     pub fn deinit(self: *Index) void {
         const a = self.memory.allocator();
+        self.releaseHeaders();
         if (self.track) |track| a.free(track.avcc);
         self.runs.deinit(a);
         self.nals.deinit(a);
@@ -196,6 +240,24 @@ test "seekable transport matches normalized packet payloads and every partial NA
         try std.testing.expectEqual(expected.reader.packets.len, index.packets.items.len);
         var view = View{ .map = index.mapping(), .wire = &wire };
         var virtual = view.source(name, .{});
+        // Registry and picture planning consume the headers captured during
+        // demux even if there is no provider budget left for a second scan.
+        {
+            virtual.limits.max_reads = 0;
+            defer virtual.limits.max_reads = (media.source.Limits{}).max_reads;
+            var reader = expected.reader;
+            reader.input = &virtual;
+            reader.packets = index.packets.items;
+            const pictures = @import("h264_pictures.zig");
+            const options = pictures.Options.forTrack(reader.packets.len);
+            const registry = try @import("h264_dynamic.zig").Session.initWithHeaders(a, &reader, options.decode, index.headers.items);
+            defer registry.deinit();
+            var logical = try pictures.planning(a, &reader, options, registry);
+            defer logical.deinit();
+            try std.testing.expect(logical.pictures.len > 0);
+            try std.testing.expectEqual(@as(usize, 0), virtual.reads);
+            index.releaseHeaders();
+        }
         // A physical provider can lend much smaller reads than a coded packet.
         wire.limits.max_read_bytes = 377;
         for (index.packets.items, 0..) |packet, id| {
@@ -213,4 +275,27 @@ test "seekable transport matches normalized packet payloads and every partial NA
             }
         }
     }
+}
+
+test "seekable transport skips multiplexed padding under exact payload budget" {
+    const a = std.testing.allocator;
+    var bytes: [4096]u8 = @splat(0);
+    bytes[0] = 9;
+    bytes[80] = 10;
+    bytes[4000] = 11;
+    var wire = media.source.Source{ .allocator = a, .storage = .{ .borrowed = &bytes }, .identity = "padded", .limits = .{ .max_total_bytes = 3 } };
+    var view = View{ .wire = &wire, .map = .{ .len = 7, .nals = &.{.{ .logical = 0, .elementary = 0, .size = 3 }}, .runs = &.{ .{ .elementary = 0, .wire = 0, .len = 1 }, .{ .elementary = 1, .wire = 80, .len = 1 }, .{ .elementary = 2, .wire = 4000, .len = 1 } } } };
+    var source = view.source("mapped", .{});
+    var payload = try source.read(0, 7);
+    defer payload.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 3, 9, 10, 11 }, payload.bytes);
+    try std.testing.expectEqual(@as(u64, 3), wire.total_bytes);
+
+    // Two NALs in one physical run have a synthetic length between them.
+    var packed_wire = media.source.Source{ .allocator = a, .storage = .{ .borrowed = &bytes }, .identity = "annex", .limits = .{ .max_total_bytes = 2 } };
+    var packed_view = View{ .wire = &packed_wire, .map = .{ .len = 10, .nals = &.{ .{ .logical = 0, .elementary = 0, .size = 1 }, .{ .logical = 5, .elementary = 80, .size = 1 } }, .runs = &.{.{ .elementary = 0, .wire = 0, .len = 81 }} } };
+    var mapped = packed_view.source("annex-mapped", .{});
+    var both = try mapped.read(0, 10);
+    defer both.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 9, 0, 0, 0, 1, 10 }, both.bytes);
 }
