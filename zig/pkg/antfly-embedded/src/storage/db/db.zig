@@ -94768,7 +94768,14 @@ test "leann synchronous document provenance pins revisions and tolerates inferen
     pinned.model_revision = @splat(1);
     try computeDenseRequestImpl(a, &db, body, pinned, &writes, &no_deletes, &sink, &chunks, false, &memo, null, Fake.append);
     try std.testing.expectEqual(pinned.model_revision, try enrichment_artifact_codec.denseEmbeddingModelRevision(writes.items[0].value));
+    try db.core.store.put(writes.items[0].key, writes.items[0].value);
     freePrimaryVectorRebuildWrites(a, &writes);
+    var restoration = GeneratedEmbeddingMemo.init(a);
+    defer restoration.deinit();
+    restoration.reuse_stored_artifacts = true;
+    try computeDenseRequestImpl(a, &db, body, pinned, &writes, &no_deletes, &sink, &chunks, false, &restoration, null, Fake.append);
+    try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
     pinned.model_revision = @splat(7);
     try std.testing.expectError(error.EnrichmentSourceChanged, computeDenseRequestImpl(a, &db, body, pinned, &writes, &no_deletes, &sink, &chunks, false, &memo, null, Fake.append));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
