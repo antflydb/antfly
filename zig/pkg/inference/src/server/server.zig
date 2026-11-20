@@ -2119,6 +2119,13 @@ fn pinnedEmbeddingPreflightFailure(ctx: *httpx.Context, revision: ?[32]u8, err: 
     };
 }
 
+fn isPinnedCatalogArtifactFailure(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidManagedDownload, error.ChecksumMismatch, error.ModelArtifactNotPublished => true,
+        else => false,
+    };
+}
+
 fn embeddingArtifactFailureResponse(ctx: *httpx.Context) !httpx.Response {
     try ctx.setHeader("X-Antfly-Embedding-Artifact-Unavailable", "true");
     return transientCapacityFailureResponse(ctx, "EMBEDDING_ARTIFACT_UNAVAILABLE", "this replica could not verify an embedding artifact", "embedding_artifact_unavailable");
@@ -3605,11 +3612,11 @@ const ScopedCatalogPublication = struct {
     lease: PublicationLease,
     artifacts: PublishedArtifacts,
 
-    fn open(a: std.mem.Allocator, io: std.Io, path: []const u8, control: InferenceExecutionControl) !?ScopedCatalogPublication {
+    fn open(a: std.mem.Allocator, io: std.Io, path: []const u8, publication: ?[32]u8, control: InferenceExecutionControl) !?ScopedCatalogPublication {
         try control.check();
         // Direct ONNX paths are not parsed by the directory/GGUF listing path.
         if (std.mem.endsWith(u8, path, ".onnx")) return null;
-        const publication = (try @import("../registry/managed_receipt.zig").publicationGeneration(a, io, path)) orelse return null;
+        if (publication == null) return null;
         const owned_path = try a.dupe(u8, path);
         errdefer a.free(owned_path);
         var lease = try PublicationLease.shared(a, io, owned_path);
@@ -26988,11 +26995,18 @@ pub const Node = struct {
             if (std.mem.eql(u8, operation, "generate")) break :scope .{ .name = name, .category = "generators" };
             break :scope null;
         } else null;
+        const include_revisions = std.mem.eql(u8, ctx.query("model_revision_candidates") orelse "", "1");
+        const requested_revision = ctx.query("model_revision");
+        const replica_probe = if (listing_scope) |scope|
+            std.mem.eql(u8, scope.category, "embedders") and (include_revisions or requested_revision != null)
+        else
+            false;
         const publication = if (catalog_generation.kind == .legacy) null else std.fmt.bytesToHex(catalog_generation.digest, .lower);
         var scoped_publication: ?ScopedCatalogPublication = null;
         defer if (scoped_publication) |*captured| captured.deinit();
-        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, listing_scope, if (publication) |*hex| hex else null, &scoped_publication, catalog_control) catch |err| {
+        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, listing_scope, if (publication) |*hex| hex else null, &scoped_publication, replica_probe, catalog_control) catch |err| {
             if (err == error.Timeout or err == error.Canceled or err == error.Cancelled) return inferenceFailureResponse(ctx, err);
+            if (replica_probe and isPinnedCatalogArtifactFailure(err)) return embeddingArtifactFailureResponse(ctx);
             if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
             return err;
         };
@@ -27005,12 +27019,9 @@ pub const Node = struct {
             defer catalog.deinit();
             if (catalog.value == .object) if (catalog.value.object.getPtr(category)) |models| if (models.* == .object) if (models.object.getPtr(name)) |info| if (info.* == .object) {
                 const embedding = std.mem.eql(u8, operation, "embed");
-                const include_revisions = if (ctx.query("model_revision_candidates")) |flag| std.mem.eql(u8, flag, "1") else false;
-                const requested_revision = ctx.query("model_revision");
-                const replica_probe = embedding and (include_revisions or requested_revision != null);
                 const prepared = if (scoped_publication) |*scope| scope else null;
                 const path_selection = self.resolveRequestModelSelectionWithOptions(ctx.allocator, ctx.io, name, category, .{ .scoped = prepared }) catch |err| {
-                    if (replica_probe and (err == error.InvalidManagedDownload or err == error.ChecksumMismatch)) return embeddingArtifactFailureResponse(ctx);
+                    if (replica_probe and isPinnedCatalogArtifactFailure(err)) return embeddingArtifactFailureResponse(ctx);
                     return requestModelResolutionError(ctx, err);
                 };
                 const path = path_selection.path;
@@ -27027,13 +27038,16 @@ pub const Node = struct {
                     manifest_mod.loadFromPublishedArtifacts(ctx.allocator, path, artifacts, false)
                 else
                     self.loadBoundManifest(ctx.allocator, path, false, control)) catch |err| {
-                    if (replica_probe and (err == error.InvalidManagedDownload or err == error.ChecksumMismatch or err == error.ModelArtifactNotPublished)) return embeddingArtifactFailureResponse(ctx);
+                    if (replica_probe and isPinnedCatalogArtifactFailure(err)) return embeddingArtifactFailureResponse(ctx);
                     return modelLoadFailureResponse(ctx, err);
                 };
                 defer manifest.deinit();
                 var dense_output = manifest.denseEmbeddingOutput();
                 var durable_revision: ?[32]u8 = null;
-                var cached_model = self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return modelLoadFailureResponse(ctx, err);
+                var cached_model = if (scoped_artifacts) |artifacts|
+                    self.model_manager.acquireLoadedModelFromInstallation(path, artifacts.installation.?)
+                else
+                    self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 defer if (cached_model) |*handle| handle.releaseObservation();
                 const declared = if (embedding and manifest.managed_publication != null and (cached_model == null or include_revisions or requested_revision != null))
                     (if (scoped_artifacts) |artifacts|
@@ -27129,12 +27143,12 @@ pub const Node = struct {
     /// (e.g. the antfly server's /connections endpoint) can list the embedded
     /// node's models without going through HTTP. Caller owns the result.
     pub fn listModelsJsonAlloc(self: *Node, a: std.mem.Allocator, io: std.Io) ![]u8 {
-        return self.listModelsJsonAllocScoped(a, io, null, null, null, .{});
+        return self.listModelsJsonAllocScoped(a, io, null, null, null, false, .{});
     }
 
     const CatalogListingScope = struct { name: []const u8, category: []const u8 };
 
-    fn listModelsJsonAllocScoped(self: *Node, a: std.mem.Allocator, io: std.Io, listing_scope: ?CatalogListingScope, publication: ?[]const u8, scoped_publication: ?*?ScopedCatalogPublication, control: InferenceExecutionControl) ![]u8 {
+    fn listModelsJsonAllocScoped(self: *Node, a: std.mem.Allocator, io: std.Io, listing_scope: ?CatalogListingScope, publication: ?[]const u8, scoped_publication: ?*?ScopedCatalogPublication, replica_probe: bool, control: InferenceExecutionControl) ![]u8 {
         try control.check();
         var buf = std.ArrayListUnmanaged(u8).empty;
         defer buf.deinit(a);
@@ -27163,7 +27177,13 @@ pub const Node = struct {
         const inventory = if (borrowed) |lease| lease.inventory() else &owned.?;
         try control.check();
         const discovered = inventory.discovered;
-        const scoped_owner = if (listing_scope) |selected| inventory.lookupIndex(selected.name, selected.category) else null;
+        const scoped_owner = if (listing_scope) |selected| owner: {
+            const lookup = inventory.lookupIndex(selected.name, selected.category);
+            if (lookup) |current| {
+                if (replica_probe and current == null) break :owner try inventory.lookupDamagedIndex(selected.name, selected.category);
+            } else |err| break :owner err;
+            break :owner lookup;
+        } else null;
         const scoped_index = scoped_owner catch null;
         const selected_start = scoped_index orelse 0;
         const selected_end = if (listing_scope == null) discovered.len else if (scoped_index != null) selected_start + 1 else 0;
@@ -27183,19 +27203,28 @@ pub const Node = struct {
             const entry = discovered[entry_index];
             // A directory spelling is not proof of a format or immutable pin.
             // Unmanaged installations may advertise only literal legacy names.
-            if (inventory.names[entry_index].len == 0) continue;
+            if (inventory.names[entry_index].len == 0 and !(replica_probe and entry.installation_selection.damaged)) continue;
             const candidate_result: manifest_mod.ListingCandidate = candidate: {
                 if (scoped_publication != null and listing_scope != null and std.mem.eql(u8, listing_scope.?.category, "embedders")) {
                     const scope = scoped_publication.?;
-                    scope.* = ScopedCatalogPublication.open(a, io, entry.path, control) catch |err| {
+                    scope.* = ScopedCatalogPublication.open(a, io, entry.path, inventory.publications[entry_index], control) catch |err| {
+                        if (replica_probe) {
+                            if (isPinnedCatalogArtifactFailure(err)) return err;
+                            if (inventory.publications[entry_index] != null and (err == error.FileNotFound or err == error.NotDir))
+                                return error.ModelArtifactsChanging;
+                        }
                         if (manifest_mod.isListingCandidateRejection(err)) break :candidate .{ .rejected = err };
                         return err;
                     };
                     if (scope.*) |*captured| {
                         const manifest = manifest_mod.loadFromPublishedArtifacts(a, entry.path, &captured.artifacts, true) catch |err| {
+                            if (replica_probe and isPinnedCatalogArtifactFailure(err)) return err;
                             if (manifest_mod.isListingCandidateRejection(err)) break :candidate .{ .rejected = err };
                             return err;
                         };
+                        // Let execution resolve a repaired selector immediately,
+                        // even when in-place repair leaves the receipt unchanged.
+                        if (entry.installation_selection.damaged) if (borrowed) |lease| lease.invalidateIfCurrent();
                         break :candidate .{ .manifest = manifest };
                     }
                 }
@@ -27619,6 +27648,7 @@ pub const Node = struct {
             const native_info = try self.documentCatalogInfo(ca, null, "read");
             try catalog.value.object.getPtr("readers").?.object.put(ca, "antfly/native-document", native_info);
             for (discovered) |entry| {
+                if (entry.installation_selection.damaged) continue;
                 // Resolve each advertised operation independently; never let one
                 // same-named registration overwrite another task's definition.
                 for ([_]document_contract.Operation{ .read, .extract }) |operation| {
@@ -51241,13 +51271,28 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     defer node.deinit();
     try node.attachIo(io);
 
+    const ReceiptReads = struct {
+        var count: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (std.mem.endsWith(u8, path, "embedders/acme/other/" ++ @import("../registry/managed_receipt.zig").complete_filename)) count += 1;
+            return original(raw, dir, path, options);
+        }
+    };
+    var counted_io_table = io.vtable.*;
+    ReceiptReads.count = 0;
+    ReceiptReads.original = counted_io_table.dirOpenFile;
+    counted_io_table.dirOpenFile = ReceiptReads.open;
+    const counted_io = std.Io{ .userdata = io.userdata, .vtable = &counted_io_table };
     var request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=acme%2Fdemo&task=embed");
     defer request.deinit();
-    var ctx = httpx.Context.init(a, io, &request);
+    var ctx = httpx.Context.init(a, counted_io, &request);
     defer ctx.deinit();
     var response = try node.listModels(&ctx);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(usize, 1), ReceiptReads.count);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
     defer parsed.deinit();
     const embedders = parsed.value.object.get("embedders").?.object;
@@ -51281,11 +51326,13 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/model.safetensors", .data = &corrupt });
     var managed_request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=acme%2Fother&task=embed");
     defer managed_request.deinit();
-    var managed_context = httpx.Context.init(a, io, &managed_request);
+    ReceiptReads.count = 0;
+    var managed_context = httpx.Context.init(a, counted_io, &managed_request);
     defer managed_context.deinit();
     var managed_response = try node.listModels(&managed_context);
     defer managed_response.deinit();
     try std.testing.expectEqual(@as(u16, 200), managed_response.status.code);
+    try std.testing.expectEqual(@as(usize, 1), ReceiptReads.count);
     var managed_catalog = try std.json.parseFromSlice(std.json.Value, a, managed_response.body.?, .{});
     defer managed_catalog.deinit();
     const published = managed_catalog.value.object.get("embedders").?.object.get("acme/other").?;
@@ -51295,21 +51342,8 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     var managed_activation = try httpx.Request.init(a, .POST, managed_activation_path);
     defer managed_activation.deinit();
     managed_activation.body = "{\"model\":\"acme/other\",\"task\":\"embedder\"}";
-    const ReceiptReads = struct {
-        var count: usize = 0;
-        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
-
-        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
-            if (std.mem.endsWith(u8, path, @import("../registry/managed_receipt.zig").complete_filename)) count += 1;
-            return original(raw, dir, path, options);
-        }
-    };
-    var activation_io_table = io.vtable.*;
     ReceiptReads.count = 0;
-    ReceiptReads.original = activation_io_table.dirOpenFile;
-    activation_io_table.dirOpenFile = ReceiptReads.open;
-    const activation_io = std.Io{ .userdata = io.userdata, .vtable = &activation_io_table };
-    var managed_activation_context = httpx.Context.init(a, activation_io, &managed_activation);
+    var managed_activation_context = httpx.Context.init(a, counted_io, &managed_activation);
     defer managed_activation_context.deinit();
     var managed_refused = try node.loadModelInstance(&managed_activation_context);
     defer managed_refused.deinit();
@@ -51351,6 +51385,35 @@ test "scoped model discovery resolves dense geometry without loading weights" {
         defer broken.deinit();
         try std.testing.expectEqual(@as(u16, 503), broken.status.code);
         try std.testing.expectEqualStrings("true", broken.headers.get("X-Antfly-Embedding-Artifact-Unavailable").?);
+    }
+
+    var probe_request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=acme%2Fother&task=embed&model_revision_candidates=1");
+    defer probe_request.deinit();
+    for ([_]bool{ false, true }) |rebuild| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/model.safetensors", .data = weights[0..1] });
+        if (rebuild) node.selector_cache.?.invalidate(io);
+        var probe_ctx = httpx.Context.init(a, io, &probe_request);
+        defer probe_ctx.deinit();
+        var damaged = try node.listModels(&probe_ctx);
+        defer damaged.deinit();
+        try std.testing.expectEqual(@as(u16, 503), damaged.status.code);
+        try std.testing.expectEqualStrings("true", damaged.headers.get("X-Antfly-Embedding-Artifact-Unavailable").?);
+
+        // Repairing an existing file does not change the directory or receipt
+        // generation. A scoped probe must recover from either inventory state.
+        try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/model.safetensors", .data = weights });
+        var repaired_probe_ctx = httpx.Context.init(a, io, &probe_request);
+        defer repaired_probe_ctx.deinit();
+        var healthy = try node.listModels(&repaired_probe_ctx);
+        defer healthy.deinit();
+        try std.testing.expectEqual(@as(u16, 200), healthy.status.code);
+        var healthy_catalog = try std.json.parseFromSlice(std.json.Value, a, healthy.body.?, .{});
+        defer healthy_catalog.deinit();
+        const info = healthy_catalog.value.object.get("embedders").?.object.get("acme/other") orelse return error.ExpectedRepairedModel;
+        try std.testing.expect(info.object.get("model_revision_pinning").?.bool);
+        const inventory = try node.selector_cache.?.borrowForSelector(io, models_path, "acme/other", "embedders", .{});
+        defer inventory.release();
+        try std.testing.expect((try inventory.inventory().lookupIndex("acme/other", "embedders")) != null);
     }
 
     // Publish a new receipt at the same selector. A populated digest and

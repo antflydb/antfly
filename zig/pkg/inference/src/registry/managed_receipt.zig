@@ -43,6 +43,13 @@ pub const DownloadReceipt = struct {
     artifacts: []const ArtifactReceipt,
 };
 
+/// Used only to report a selected installation's artifact failure. The
+/// declaration never authorizes execution or participates in healthy ownership.
+pub const DamagedReceipt = struct {
+    parsed: std.json.Parsed(DownloadReceipt),
+    publication: [32]u8,
+};
+
 pub const ValidatedArtifact = struct {
     path: []const u8,
     canonical_path: []u8,
@@ -321,6 +328,7 @@ fn loadValidatedSource(
     dest_dir: []const u8,
     source: ReceiptSource,
     control: ExecutionControl,
+    damaged: ?*?DamagedReceipt,
 ) !?ValidatedReceipt {
     try control.check();
     const cwd = std.Io.Dir.cwd();
@@ -376,7 +384,14 @@ fn loadValidatedSource(
         error.OutOfMemory => return err,
         else => return error.InvalidManagedDownload,
     };
-    errdefer parsed.deinit();
+    var artifact_damaged = false;
+    errdefer {
+        if (artifact_damaged and damaged != null) {
+            var publication: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(receipt_json, &publication, .{});
+            damaged.?.* = .{ .parsed = parsed, .publication = publication };
+        } else parsed.deinit();
+    }
     try control.check();
     if ((parsed.value.version != 1 and parsed.value.version != 2) or
         parsed.value.artifacts.len == 0 or
@@ -386,7 +401,10 @@ fn loadValidatedSource(
     }
 
     const canonical_root = realPathAlloc(allocator, io, dest_dir) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return error.InvalidManagedDownload,
+        error.FileNotFound, error.NotDir => {
+            artifact_damaged = true;
+            return error.InvalidManagedDownload;
+        },
         else => return err,
     };
     defer allocator.free(canonical_root);
@@ -418,13 +436,24 @@ fn loadValidatedSource(
             canonical_root,
             artifact.path,
         ) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => return error.InvalidManagedDownload,
-            error.InvalidModelArtifactPath => return error.InvalidManagedDownload,
+            error.FileNotFound, error.NotDir, error.InvalidModelArtifactPath => {
+                artifact_damaged = true;
+                return error.InvalidManagedDownload;
+            },
             else => return err,
         };
         errdefer allocator.free(canonical_path);
-        const stat = try cwd.statFile(io, canonical_path, .{ .follow_symlinks = false });
-        if (stat.kind != .file or stat.size != artifact.size) return error.InvalidManagedDownload;
+        const stat = cwd.statFile(io, canonical_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                artifact_damaged = true;
+                return error.InvalidManagedDownload;
+            },
+            else => return err,
+        };
+        if (stat.kind != .file or stat.size != artifact.size) {
+            artifact_damaged = true;
+            return error.InvalidManagedDownload;
+        }
         const canonical = canonical_groups.getOrPutAssumeCapacity(canonical_path);
         if (canonical.found_existing) {
             const prior = &artifacts[canonical.value_ptr.*];
@@ -493,7 +522,17 @@ pub fn loadValidatedWithControl(
     dest_dir: []const u8,
     control: ExecutionControl,
 ) !?ValidatedReceipt {
-    return loadValidatedSource(allocator, io, dest_dir, .completion, control);
+    return loadValidatedSource(allocator, io, dest_dir, .completion, control, null);
+}
+
+pub fn loadValidatedForInventory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    control: ExecutionControl,
+    damaged: *?DamagedReceipt,
+) !?ValidatedReceipt {
+    return loadValidatedSource(allocator, io, dest_dir, .completion, control, damaged);
 }
 
 /// Load the validated artifact plan of a private staging transaction. This is
@@ -504,7 +543,7 @@ pub fn loadValidatedPlan(
     io: std.Io,
     dest_dir: []const u8,
 ) !ValidatedReceipt {
-    return (try loadValidatedSource(allocator, io, dest_dir, .plan, .{})) orelse
+    return (try loadValidatedSource(allocator, io, dest_dir, .plan, .{}, null)) orelse
         error.IncompleteManagedDownload;
 }
 

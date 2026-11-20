@@ -71,6 +71,7 @@ pub const Inventory = struct {
     discovered: []const registry.ModelEntry,
     names: []const []const []const u8,
     publications: []const ?[32]u8 = &.{},
+    damaged_installations: []const usize = &.{},
     owners: [tasks.len]std.StringHashMapUnmanaged(Owner) = @splat(.empty),
     watches: []const Watch = &.{},
     generation: catalog_publication.Generation = .{},
@@ -129,7 +130,7 @@ pub const Inventory = struct {
                 }
             }
         }
-        const found = try source.discoverInstallationsWithControl(io, control);
+        const found = try source.discoverInstallationsWithControl(io, a, control);
         for (found) |entry| {
             try watchInstallation(&paths, a, io, entry.path);
         }
@@ -137,18 +138,23 @@ pub const Inventory = struct {
         const entries = try a.alloc(registry.ModelEntry, found.len);
         const names = try a.alloc([]const []const u8, found.len);
         const publications = try a.alloc(?[32]u8, found.len);
-        for (found, entries, names, publications) |entry, *out, *selectors, *publication| {
+        var damaged_installations: std.ArrayList(usize) = .empty;
+        for (found, entries, names, publications, 0..) |entry, *out, *selectors, *publication, index| {
             try control.check();
-            var candidate = std.heap.ArenaAllocator.init(allocator);
-            defer candidate.deinit();
-            const proof = try registry.managedModelSelectionWithControl(candidate.allocator(), io, entry.path, control);
+            const proof = entry.installation_selection;
             const managed = proof.names;
             publication.* = if (proof.rejected) null else proof.publication;
-            selectors.* = try a.alloc([]const u8, if (managed.len > 0) managed.len else if (std.mem.indexOfAny(u8, entry.name, ":@") == null) @as(usize, 1) else 0);
-            if (managed.len > 0) {
-                for (managed, @constCast(selectors.*)) |name, *owned| owned.* = try a.dupe(u8, name);
-            } else if (selectors.len > 0) @constCast(selectors.*)[0] = try a.dupe(u8, entry.name);
+            selectors.* = if (proof.damaged) &.{} else if (managed.len != 0)
+                managed
+            else if (std.mem.indexOfAny(u8, entry.name, ":@") == null) names: {
+                const literal = try a.alloc([]const u8, 1);
+                literal[0] = try a.dupe(u8, entry.name);
+                break :names literal;
+            } else &.{};
             out.* = entry;
+            if (proof.damaged) {
+                try damaged_installations.append(a, index);
+            } else out.installation_selection = .{};
             out.path = try a.dupe(u8, entry.path);
             // Qualified, immutable keys keep distinct capability descriptors.
             const canonical = if (managed.len == 4) managed[2] else if (managed.len > 0) managed[managed.len - 1] else entry.name;
@@ -157,6 +163,7 @@ pub const Inventory = struct {
         result.discovered = entries;
         result.names = names;
         result.publications = publications;
+        result.damaged_installations = try damaged_installations.toOwnedSlice(a);
         try result.buildOwners(control);
         const watches = try a.alloc(Watch, paths.count());
         var iterator = paths.iterator();
@@ -224,6 +231,26 @@ pub const Inventory = struct {
         return null;
     }
 
+    /// A valid owner always takes precedence over a damaged declaration.
+    /// Scoped replica probes can revalidate a damaged installation directly.
+    pub fn lookupDamagedIndex(self: *const Inventory, selector: []const u8, task: []const u8) !?usize {
+        var result: ?usize = null;
+        for (self.damaged_installations) |index| {
+            const entry = self.discovered[index];
+            const candidate = entry.installation_selection;
+            if (!registry.modelInTaskScope(self.models_dir, entry.path, task)) continue;
+            const matched = if (candidate.names.len == 0)
+                std.mem.indexOfAny(u8, selector, ":@") == null and std.mem.eql(u8, entry.name, selector)
+            else for (candidate.names) |name| {
+                if (std.mem.eql(u8, name, selector)) break true;
+            } else false;
+            if (!matched) continue;
+            if (result != null) return error.InvalidManagedDownload;
+            result = index;
+        }
+        return result;
+    }
+
     pub fn lookup(self: *const Inventory, selector: []const u8, task: ?[]const u8) !?[]const u8 {
         if (task) |scope| {
             const index = (try self.lookupIndex(selector, scope)) orelse return null;
@@ -269,6 +296,11 @@ pub const Inventory = struct {
             out.* = entry;
             out.name = try a.dupe(u8, entry.name);
             out.path = try a.dupe(u8, entry.path);
+            if (entry.installation_selection.damaged) {
+                const damaged_names = try a.alloc([]const u8, entry.installation_selection.names.len);
+                for (entry.installation_selection.names, damaged_names) |name, *value| value.* = try a.dupe(u8, name);
+                out.installation_selection.names = damaged_names;
+            }
             const strings = try a.alloc([]const u8, selectors.len);
             for (selectors, strings) |name, *value| value.* = try a.dupe(u8, name);
             owned.* = strings;
@@ -276,6 +308,7 @@ pub const Inventory = struct {
         copy.discovered = entries;
         copy.names = names;
         copy.publications = try a.dupe(?[32]u8, self.publications);
+        copy.damaged_installations = try a.dupe(usize, self.damaged_installations);
         // Full catalogs retain legacy watch evidence until serialization ends.
         const watches = try a.alloc(Watch, self.watches.len);
         for (self.watches, watches) |watch, *owned| owned.* = .{ .path = try a.dupe(u8, watch.path), .stamp = watch.stamp };
@@ -307,6 +340,12 @@ pub const Cache = struct {
         pub fn inventory(self: Lease) *const Inventory {
             return &self.slot.inventory;
         }
+        pub fn invalidateIfCurrent(self: Lease) void {
+            self.cache.mutex.lockUncancelable(self.io);
+            defer self.cache.mutex.unlock(self.io);
+            if (self.cache.current == self.slot and self.cache.epoch == self.slot.epoch) self.cache.epoch +%= 1;
+        }
+
         pub fn release(self: Lease) void {
             self.cache.mutex.lockUncancelable(self.io);
             self.slot.refs -= 1;

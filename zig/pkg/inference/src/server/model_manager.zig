@@ -8327,6 +8327,17 @@ pub const ModelManager = struct {
         return handle;
     }
 
+    /// Observe a runtime only if it was built from the already validated
+    /// installation. The caller holds the publication lease.
+    pub fn acquireLoadedModelFromInstallation(self: *ModelManager, model_dir: []const u8, installation: managed_receipt.Installation) ?ModelHandle {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        const model = self.loaded.get(model_dir) orelse self.loaded_aliases.get(model_dir) orelse return null;
+        if (!std.meta.eql(model.managed_installation, @as(?managed_receipt.Installation, installation))) return null;
+        model.active_handles += 1;
+        return .{ .manager = self, .model = model };
+    }
+
     /// Pin the same cached publication selected by ordinary request loading,
     /// including required-backend and A4B policy keys. Never load cold assets
     /// or join a load flight while reading request-admission metadata.
