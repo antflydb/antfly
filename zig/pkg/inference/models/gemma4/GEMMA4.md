@@ -20,6 +20,11 @@ unmodified Transformers (cosine >= 0.9999, relative L2 <= 0.02, identical
 argmax), and all 585 reference decisions through EOS or the output budget
 matched. These gates apply to the explicit profile, not bare process defaults.
 
+NVDEC and portable decoding share MP4 frame selection. Both take the first
+presented picture at or after each one-second target, uniformly cap targets
+at 32, and emit a repeated selection once. MP4 edit bounds apply before
+sampling, and prompt timestamps are relative to the content start.
+
 On CUDA devices with compute capability 8.0 or newer, 16×16 video patches
 with zero mean and unit standard deviation use the same bicubic RGB8 resize
 for NVDEC and portable decoding. Set `ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC=0`

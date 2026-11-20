@@ -57,7 +57,7 @@ pub const Encoded = struct {
 
 /// Sample logical presentation frames, then map them to decode packet indexes.
 /// The FPS policy matches HF; timestamp selection remains a separate video API.
-pub const Sampling = union(enum) { reference, timestamps: video.sampling.TimestampPolicy, source_timestamps: video.sampling.TimestampPolicy };
+pub const Sampling = video.packet_sampling.Sampling;
 /// Decoder controls apply equally to CPU and Metal model execution.
 pub const WebmInput = struct {
     reader: *const media.webm.Reader,
@@ -410,7 +410,7 @@ pub const ReaderSelection = struct {
         var reservation = if (pool) |shared| try shared.acquire(.{ .host_bytes = bound }) else media.admission.Token{};
         errdefer reservation.deinit();
         const binding = try readerBinding(reader, sampling, control);
-        const selected = try selectLogical(a, logical.*, sampling, control);
+        const selected = try selectLogical(a, reader, logical.*, sampling, control);
         errdefer a.free(selected);
         if (selected.len == 0 or selected.len > 32) return error.InvalidVideoReaderSelection;
         for (selected) |id| if (id >= reader.packets.len) return error.InvalidVideoReaderSelection;
@@ -427,7 +427,7 @@ pub const ReaderSelection = struct {
         const bound = try std.math.add(usize, try std.math.mul(usize, logical.pictures.len, @sizeOf(video.sampling.TimedPicture)), 128 * @sizeOf(usize) + 32 * @sizeOf(CacheKey));
         var reservation = if (pool) |shared| try shared.acquire(.{ .host_bytes = bound }) else media.admission.Token{};
         errdefer reservation.deinit();
-        const selected = try selectLogical(a, logical.*, sampling, control);
+        const selected = try selectLogical(a, reader, logical.*, sampling, control);
         errdefer a.free(selected);
         if (selected.len == 0 or selected.len > 32) return error.InvalidVideoReaderSelection;
         const keys = try a.alloc(CacheKey, selected.len);
@@ -570,7 +570,7 @@ fn readerMetadataBinding(reader: *const media.mp4.Reader, sampling: Sampling, co
     hashValue(&hash, reader.input.identity);
     hashValue(&hash, @as(u8, @backingInt(std.meta.activeTag(sampling))));
     switch (sampling) {
-        .reference => {},
+        .reference, .gemma4 => {},
         .timestamps, .source_timestamps => |p| hashValue(&hash, p),
     }
     for (reader.packets) |packet| {
@@ -630,7 +630,7 @@ fn readerBinding(reader: *const media.mp4.Reader, sampling: Sampling, control: m
     hashValue(&hash, reader.track);
     hashValue(&hash, @as(u8, @backingInt(std.meta.activeTag(sampling))));
     switch (sampling) {
-        .reference => {},
+        .reference, .gemma4 => {},
         .timestamps, .source_timestamps => |policy_value| hashValue(&hash, policy_value),
     }
     hashValue(&hash, @as(u64, reader.packets.len));
@@ -652,94 +652,15 @@ fn readerBinding(reader: *const media.mp4.Reader, sampling: Sampling, control: m
     }
     return hash.finalResult();
 }
-fn selectLogical(a: std.mem.Allocator, logical: video.h264_pictures.Index, sampling: Sampling, control: media.source.Control) ![]usize {
-    if (sampling == .source_timestamps) if (logical.pending_pts) |pts| {
-        const end = sampling.source_timestamps.end_ns orelse return error.InvalidLiveWatermark;
-        if (@as(i128, pts) * std.time.ns_per_s < @as(i128, end) * logical.timescale) return error.InvalidLiveWatermark;
-    };
-    if (sampling == .reference) {
-        const owned = try logical.select();
-        defer logical.allocator.free(owned);
-        return a.dupe(usize, owned);
-    }
-    const metadata = try a.alloc(video.sampling.TimedPicture, logical.pictures.len);
-    defer a.free(metadata);
-    for (logical.pictures, metadata) |picture, *item| {
-        try control.check();
-        item.* = .{ .pts = picture.pts, .duration = picture.duration };
-    }
-    const selected = try timestampSelect(a, metadata, logical.timescale, sampling, control);
-    for (selected) |*id| id.* = logical.pictures[id.*].first_packet;
-    return selected;
-}
+const selectLogical = video.packet_sampling.selectLogical;
 fn selectReader(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control, selection: ?*const ReaderSelection) ![]usize {
     return if (selection) |bound| bound.select(a, reader, sampling, control) else selectWithSampling(a, reader, sampling);
 }
-fn timestampSelect(a: std.mem.Allocator, metadata: []const video.sampling.TimedPicture, scale: u32, sampling: Sampling, control: media.source.Control) ![]usize {
-    return switch (sampling) {
-        .timestamps => |interval| video.sampling.cappedTimestamps(a, metadata, scale, interval, control),
-        .source_timestamps => |interval| video.sampling.cappedSourceTimestamps(a, metadata, scale, interval, control),
-        .reference => error.InvalidSamplingPolicy,
-    };
-}
+const timestampSelect = video.packet_sampling.timestampSelect;
+pub const selectWithSampling = video.packet_sampling.selectWithSampling;
 pub fn select(a: std.mem.Allocator, reader: *const media.mp4.Reader) ![]usize {
     return selectWithSampling(a, reader, .reference);
 }
-pub fn selectWithSampling(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling) ![]usize {
-    if (reader.track.codec == .avc) {
-        const cfg = try video.h264.configParse(a, reader.track.avcc);
-        defer cfg.groups.deinit(a);
-        if (reader.track.inband_parameter_sets or !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes or cfg.groups.count > 1 or cfg.redundant) {
-            // Index completed assemblies rather than transport members.
-            var mutable = reader.*;
-            var logical = if (sampling == .source_timestamps)
-                try video.h264_pictures.streaming(a, &mutable, .{})
-            else
-                try video.h264_pictures.index(a, &mutable, .{});
-            defer logical.deinit();
-            if (sampling == .source_timestamps) {
-                // A live window may carry an unfinished future field pair as
-                // decoder context, but never sample inside its pending barrier.
-                if (logical.pending_pts) |pts| {
-                    const end = sampling.source_timestamps.end_ns orelse return error.InvalidLiveWatermark;
-                    if (@as(i128, pts) * std.time.ns_per_s < @as(i128, end) * logical.timescale) return error.InvalidLiveWatermark;
-                }
-            }
-            if (sampling == .reference) return logical.select();
-            const metadata = try a.alloc(video.sampling.TimedPicture, logical.pictures.len);
-            defer a.free(metadata);
-            for (logical.pictures, metadata) |picture, *item| item.* = .{ .pts = picture.pts, .duration = picture.duration };
-            const selected = try timestampSelect(a, metadata, logical.timescale, sampling, reader.input.control);
-            for (selected) |*id| id.* = logical.pictures[id.*].first_packet;
-            return selected;
-        }
-    }
-    if (sampling != .reference) {
-        const metadata = try a.alloc(video.sampling.TimedPicture, reader.packets.len);
-        defer a.free(metadata);
-        for (reader.packets, metadata) |packet, *item| item.* = .{ .pts = packet.pts, .duration = packet.duration };
-        return timestampSelect(a, metadata, reader.track.timescale, sampling, reader.input.control);
-    }
-    if (reader.packets.len == 0 or reader.track.timescale == 0) return error.EmptyVideo;
-    const order = try a.alloc(usize, reader.packets.len);
-    defer a.free(order);
-    for (order, 0..) |*index, i| index.* = i;
-    const Less = struct {
-        fn less(packets: []const media.mp4.Packet, l: usize, r: usize) bool {
-            return packets[l].pts < packets[r].pts or (packets[l].pts == packets[r].pts and l < r);
-        }
-    };
-    std.mem.sort(usize, order, @as([]const media.mp4.Packet, reader.packets), Less.less);
-    const first = reader.packets[order[0]].pts;
-    const last = reader.packets[order[order.len - 1]];
-    const ticks = @as(i128, last.pts) + last.duration - first;
-    if (ticks <= 0) return error.InvalidSamplingMetadata;
-    const seconds = @as(f64, @floatFromInt(ticks)) / @as(f64, @floatFromInt(reader.track.timescale));
-    const sampled = try video.sampling.embeddingGemma2(a, .{ .total_frames = order.len, .fps = @as(f64, @floatFromInt(order.len)) / seconds, .duration_seconds = seconds }, .{});
-    for (sampled) |*index| index.* = order[index.*];
-    return sampled;
-}
-
 pub const validatedPreparation: video.validated_frames.PreparationPolicy = .{ .identity = 0x4547325650520001, .options = validatedOptions };
 fn validatedOptions(track: media.mp4.Track, frame: *const video.h264.Frame) !video.preparation.Options {
     var capture = Capture{ .a = undefined, .cb = undefined, .track = track, .control = .{}, .output = &.{}, .frame_tokens = &.{}, .selected = &.{} };
@@ -1331,13 +1252,14 @@ pub fn selectedConfiguredPresentationUs(a: std.mem.Allocator, bytes: []const u8,
         }
         for (selected, output) |id, *value| value.* = @divFloor(entry.webm_index.?.pictures[id].pts - first, 1000);
     } else {
-        for (entry.reader.packets) |packet| {
+        if (configuration.sampling == .gemma4) {
+            first = try video.packet_sampling.gemma4Origin(&entry.reader);
+        } else for (entry.reader.packets) |packet| {
             try control.check();
             first = @min(first, packet.pts);
         }
         for (selected, output) |id, *value| {
-            const ticks = @as(i128, entry.reader.packets[id].pts) - first;
-            value.* = std.math.cast(i64, @divFloor(ticks * std.time.us_per_s, entry.reader.track.timescale)) orelse return error.TimestampOverflow;
+            value.* = try video.packet_sampling.presentationUs(entry.reader.packets[id].pts, first, entry.reader.track.timescale);
         }
     }
     return output;
@@ -1364,17 +1286,19 @@ pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: 
     const selected = try selectWithSampling(a, &input.reader, sampling);
     defer a.free(selected);
     var first: i64 = std.math.maxInt(i64);
-    for (input.reader.packets) |packet| first = @min(first, packet.pts);
+    if (sampling == .gemma4) first = try video.packet_sampling.gemma4Origin(&input.reader) else {
+        for (input.reader.packets) |packet| first = @min(first, packet.pts);
+    }
     const output = try a.alloc(i64, selected.len);
     for (selected, output) |id, *value| {
-        const ticks: i128 = input.reader.packets[id].pts - first;
-        value.* = @intCast(@divFloor(ticks * std.time.us_per_s, input.reader.track.timescale));
+        value.* = try video.packet_sampling.presentationUs(input.reader.packets[id].pts, first, input.reader.track.timescale);
     }
     return output;
 }
 fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control, timeline: ?*const video.sampling.Timeline) ![]usize {
     if (sampling == .reference) return index.select();
     if (timeline) |cached| return switch (sampling) {
+        .gemma4 => cached.select(a, 1_000_000_000, .{}, control, true),
         .timestamps => |p| cached.select(a, 1_000_000_000, p, control, true),
         .source_timestamps => |p| cached.select(a, 1_000_000_000, p, control, false),
         .reference => unreachable,

@@ -42,6 +42,7 @@ pub const windows = @import("windows.zig");
 pub const apple_jobs = @import("apple_jobs.zig");
 pub const tone = @import("tone.zig");
 pub const display = @import("display.zig");
+pub const packet_sampling = @import("packet_sampling.zig");
 pub const sampling = @import("sampling.zig");
 test {
     _ = mp4_coded;

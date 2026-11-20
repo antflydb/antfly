@@ -26,7 +26,7 @@ const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Session = @import("../backends/session.zig").Session;
 const memory = @import("../runtime/tier/memory.zig");
 
-const sampling: embedding_video.Sampling = .{ .timestamps = .{} };
+const sampling: embedding_video.Sampling = .gemma4;
 
 /// Decoder and indexing memory, shared through one pool per request.
 const portable_pool_bytes: u64 = 512 * 1024 * 1024;
@@ -156,7 +156,9 @@ pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Alloca
         if (projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes, admission.explicit_scratch_limit == 0)) |projected| {
             return projected;
         } else |err| {
-            if (err != error.NvdecUnavailable and inputError(err) != error.InvalidVideoInput) return err;
+            // The NVDEC duration limit is a decoder constraint. The
+            // portable route can still select 32 targets across a longer clip.
+            if (err != error.NvdecUnavailable and err != error.VideoDurationExceeded and inputError(err) != error.InvalidVideoInput) return err;
             std.log.info("gemma4 video falling back to portable decoding: {s}", .{@errorName(err)});
         }
         var permit = try admission.acquire(true, .{});

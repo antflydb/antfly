@@ -308,10 +308,9 @@ pub const Module = struct {
         var wp = weights.ptr;
         var w = target_width;
         var h = target_height;
-        var patch: u32 = 16;
         var bits = precision_bits;
         var format_id: u32 = @backingInt(format);
-        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&hp), @ptrCast(&sp), @ptrCast(&fp), @ptrCast(&wp), @ptrCast(&w), @ptrCast(&h), @ptrCast(&patch), @ptrCast(&bits), @ptrCast(&format_id) };
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&hp), @ptrCast(&sp), @ptrCast(&fp), @ptrCast(&wp), @ptrCast(&w), @ptrCast(&h), @ptrCast(&bits), @ptrCast(&format_id) };
         try self.launch1d(ctx, self.pillow_vertical_patches, &args, @intCast(count));
     }
 

@@ -189,9 +189,9 @@ accepts video. Without a declaration, video requests to that target are rejected
 Local Gemma 4 generators with a projector accept one video per request, alongside
 text but not image or audio parts anywhere in that request. Earlier turns can contain
 text. `context_management` rejects video, because it only plans text. Generators
-sample one frame per second: CUDA takes
-H.264, HEVC, and AV1 MP4 up to 60 seconds, and CPU and Metal take the
-[portable codecs](../../zig/lib/video/VIDEO.md) up to 32 uniformly spaced frames.
+target one frame per second and uniformly cap the selection at 32 across the clip.
+CUDA takes H.264, HEVC, and AV1 MP4 up to 60 seconds. CPU and Metal take the
+[portable codecs](../../zig/lib/video/VIDEO.md).
 When CUDA rejects a clip, portable decoding reserves host scratch only for the
 fallback. Portable decoding charges the invocation's host, combined, and scratch
 budgets in both serving and the native CLI, and serving also holds shared session

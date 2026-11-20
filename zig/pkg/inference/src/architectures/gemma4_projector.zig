@@ -272,6 +272,7 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
     cfg.max_image_tokens = 70;
     var preprocessor = try video.Preprocessor.init(allocator, &compute.ctx);
     defer preprocessor.deinit();
+    const max_frames = @import("antfly_video").packet_sampling.gemma4_max_frames;
     const State = struct {
         cb: *const ComputeBackend,
         allocator: std.mem.Allocator,
@@ -280,8 +281,8 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
         preprocess: *video.Preprocessor,
         resample: image.Resample,
         output: ?CT = null,
-        tokens: [video.max_frames]usize = undefined,
-        timestamps: [video.max_frames]i64 = undefined,
+        tokens: [max_frames]usize = undefined,
+        timestamps: [max_frames]i64 = undefined,
         count: usize = 0,
         rows: usize = 0,
         fn check(user_data: *anyopaque) !void {
@@ -294,10 +295,12 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
             const g = targetGeometry(self.cfg, display[0], display[1]);
             const gpu_compute: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
             const projected = if (self.resample == .torchvision_bicubic) bicubic: {
-                const raster = frame.rasterSize();
-                const rgb = try self.preprocess.rgb8Gemma4(gpu_compute, frame);
-                defer self.cb.free(rgb);
-                const patches = try gpu_compute.preprocessResidentRgb(rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height), if (self.cfg.direct_unified) .channel_planar_unit else .channel_planar_centered);
+                const patches = resized: {
+                    const raster = frame.rasterSize();
+                    const rgb = try self.preprocess.rgb8Gemma4(gpu_compute, frame);
+                    defer self.cb.free(rgb);
+                    break :resized try gpu_compute.preprocessResidentRgb(rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height), if (self.cfg.direct_unified) .channel_planar_unit else .channel_planar_centered);
+                };
                 defer self.cb.free(patches);
                 break :bicubic try encodeResidentProjectionInput(self.cb, self.allocator, self.weights, self.cfg, patches, g);
             } else bilinear: {
@@ -306,7 +309,7 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
                 break :bilinear try encodeResidentPatches(self.cb, self.allocator, self.weights, self.cfg, patches, g);
             };
             defer self.cb.free(projected.embeddings);
-            if (self.output == null) self.output = (try self.cb.allocUninitF32Shape(&.{ @intCast(video.max_frames * 70), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
+            if (self.output == null) self.output = (try self.cb.allocUninitF32Shape(&.{ @intCast(max_frames * 70), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
             if (!try self.cb.copyRows2D(self.allocator, self.output.?, self.rows, projected.embeddings, 0, projected.tokens, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
             self.tokens[self.count] = projected.tokens;
             self.timestamps[self.count] = frame.timestamp_us;
@@ -316,7 +319,7 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
     };
     var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor, .resample = videoResample(cb, cfg) };
     defer if (state.output) |out| cb.free(out);
-    const stats = try video.decodeMp4(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check });
+    const stats = try video.decodeMp4Sampled(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check }, .gemma4);
     const embeddings = try ownVideoRows(cb, allocator, state.output.?, state.rows, cfg.text_hidden);
     errdefer cb.free(embeddings);
     const counts = try allocator.dupe(usize, state.tokens[0..state.count]);
@@ -7691,6 +7694,107 @@ test "gemma4 video CUDA projects resident frames and matches native patch projec
         defer a.free(actual);
         try std.testing.expectEqual(expected.embeddings.len, actual.len);
         for (expected.embeddings, actual) |want, value| try std.testing.expectApproxEqAbs(want, value, 0.0002);
+    }
+}
+
+test "gemma4 video CUDA bicubic projection matches native embeddings for both projector formats" {
+    if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const cuda = @import("../ops/cuda/cuda_compute.zig");
+    const video = @import("../ops/cuda/video.zig");
+    const native = @import("../ops/native_compute.zig");
+    const compat = @import("../io/compat.zig");
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.initWithKernelJitForProfile(a, .{}, .gemma4);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var native_weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer native_weights.deinitOwned();
+    var reference = native.NativeCompute.init(a, &native_weights, null);
+    defer reference.deinit();
+    const ref_cb = reference.computeBackend();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bicubic.gguf", .{tmp.sub_path});
+    defer a.free(path);
+    const clip = @embedFile("../testdata/video/closed.mp4");
+    var preprocessor = try video.Preprocessor.init(a, &compute.ctx);
+    defer preprocessor.deinit();
+    const Oracle = struct {
+        gpu: *cuda.CudaCompute,
+        pre: *video.Preprocessor,
+        weights: *ProjectorWeights,
+        cfg: Config,
+        embeddings: []const f32,
+        timestamps: []const i64,
+        counts: []const usize,
+        frame_index: usize = 0,
+        offset: usize = 0,
+
+        // Layer norm largely cancels an affine input error. Also assert the
+        // range at the actual patch_norm.1 boundary before comparing embeddings.
+        fn checkUnifiedInput(raw: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !CT {
+            const gpu: *cuda.CudaCompute = @ptrCast(@alignCast(raw));
+            const backend = gpu.computeBackend();
+            if (dim == 16 * 16 * 3) {
+                const values = try backend.toFloat32(input, std.testing.allocator);
+                defer std.testing.allocator.free(values);
+                for (values) |value| try std.testing.expect(value >= 0 and value <= 1);
+            }
+            return backend.layerNorm(input, gamma, beta, dim, eps);
+        }
+
+        fn consume(raw: *anyopaque, frame: video.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const allocator = self.weights.allocator;
+            const raster = frame.rasterSize();
+            const display = try frame.displaySize();
+            const rgb = try self.pre.rgb8Gemma4(self.gpu, frame);
+            defer self.gpu.computeBackend().free(rgb);
+            const bytes = try allocator.alloc(u8, @as(usize, raster[0]) * raster[1] * 3);
+            defer allocator.free(bytes);
+            const tensor: *cuda.CudaTensor = @ptrCast(@alignCast(rgb));
+            try tensor.buffer.copyToHost(&self.gpu.ctx, bytes);
+            try self.gpu.ctx.synchronize();
+            const g = targetGeometry(self.cfg, display[0], display[1]);
+            const prepared = try prepareImageViewAtGeometry(allocator, self.weights, self.cfg, .{ .data = bytes, .width = raster[0], .height = raster[1], .format = .rgb8 }, g, .torchvision_bicubic);
+            defer prepared.deinit();
+            const expected = try encodePreparedImageBatch(self.weights.cb, allocator, self.weights, self.cfg, &.{prepared});
+            defer allocator.free(expected.embeddings);
+            try std.testing.expect(self.frame_index < self.timestamps.len);
+            try std.testing.expectEqual(frame.timestamp_us, self.timestamps[self.frame_index]);
+            try std.testing.expectEqual(expected.tokens, self.counts[self.frame_index]);
+            const end = self.offset + expected.embeddings.len;
+            try std.testing.expect(end <= self.embeddings.len);
+            for (expected.embeddings, self.embeddings[self.offset..end]) |e, v| try std.testing.expectApproxEqAbs(e, v, 0.0002);
+            self.offset = end;
+            self.frame_index += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |unified| {
+        try writeVideoTestProjector(a, path, unified, 16);
+        const absolute = try compat.cwd().realPathFileAlloc(compat.io(), path, a);
+        defer a.free(absolute);
+        const projector = try ProjectorStore.open(a, absolute);
+        defer projector.close();
+        var cfg = try parseConfig(&projector.gguf.parsed);
+        cfg.max_image_tokens = 70;
+        if (videoResample(&cb, cfg) != .torchvision_bicubic) return error.SkipZigTest;
+        var vtable = cb.vtable.*;
+        if (unified) vtable.layerNorm = Oracle.checkUnifiedInput;
+        const guarded = ComputeBackend{ .ptr = cb.ptr, .vtable = &vtable };
+        var projected = try encodeProjectedVideoResident(&guarded, a, projector, clip, false);
+        defer projected.deinit();
+        const portable_times = try @import("../pipelines/embedding_gemma2_video.zig").selectedPresentationUs(a, clip, .{}, .gemma4, null);
+        defer a.free(portable_times);
+        try std.testing.expectEqualSlices(i64, portable_times, projected.timestamps_us);
+        const actual = try cb.toFloat32(projected.images.embeddings, a);
+        defer a.free(actual);
+        var weights = ProjectorWeights.init(&ref_cb, a, projector.gguf, projector);
+        defer weights.deinit();
+        var oracle = Oracle{ .gpu = &compute, .pre = &preprocessor, .weights = &weights, .cfg = cfg, .embeddings = actual, .timestamps = projected.timestamps_us, .counts = projected.images.tokens_per_image };
+        _ = try video.decodeMp4Sampled(a, &compute.ctx, clip, .{ .context = &oracle, .consume = Oracle.consume }, .gemma4);
+        try std.testing.expectEqual(actual.len, oracle.offset);
+        try std.testing.expectEqual(projected.timestamps_us.len, oracle.frame_index);
     }
 }
 

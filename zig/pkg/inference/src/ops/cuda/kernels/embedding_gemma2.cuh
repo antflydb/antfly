@@ -50,7 +50,8 @@ extern "C" __global__ void termite_embedding_gemma2_pillow_vertical_patches_f32(
     float* out, const unsigned char* horizontal,
     const unsigned long long* starts, const unsigned long long* offsets,
     const int* weights, unsigned int target_width, unsigned int target_height,
-    unsigned int patch_size, unsigned int precision_bits, unsigned int format) {
+    unsigned int precision_bits, unsigned int format) {
+    constexpr unsigned int patch_size = 16;
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t count = (size_t)target_width * target_height * 3;
     if (i >= count) return;

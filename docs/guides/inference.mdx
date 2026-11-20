@@ -154,8 +154,9 @@ require FFmpeg, a CUDA compiler, or NVRTC at runtime.
 Clips must be progressive 8-bit 4:2:0 SDR, at most 256 MiB and 60 seconds, with
 coded dimensions no larger than 4096 on either axis and no more than 18,000
 samples. The GPU's own decoder minimum and maximum dimensions also apply.
-Frames are selected in presentation order at one frame per second, with up to
-70 visual tokens per selected frame. MP4 edit-list end times are respected.
+Frames are selected in presentation order at one frame per second. Clips with
+more than 32 sampling targets use 32 uniformly spaced targets across the clip.
+Each selected frame contributes up to 70 visual tokens. MP4 edit-list end times are respected.
 Decoded surfaces, resized patches, projected features, and the prompt embedding
 handoff stay on the GPU. Compressed packets, timestamps, and model weights still
 use host memory; weights upload once per request.

@@ -51,6 +51,7 @@ fn releaseDecoder(raw: *anyopaque) callconv(.c) void {
     ctx.video_cache_budget.release();
 }
 
+const packet_sampling = @import("antfly_video").packet_sampling;
 pub const max_frames = 60;
 pub const max_duration_us = 60_000_000;
 pub const Frame = struct {
@@ -113,7 +114,7 @@ pub const Sampler = struct {
     }
 };
 
-pub const Sampling = enum { presentation_seconds, embedding_gemma2 };
+pub const Sampling = enum { presentation_seconds, embedding_gemma2, gemma4 };
 
 fn mp4Limits(extended: bool) media.mp4.Limits {
     return .{ .max_samples = 18_000, .max_dimension = 4096, .codecs = if (extended) std.EnumSet(media.mp4.Codec).initMany(&.{ .avc, .hevc, .av1 }) else std.EnumSet(media.mp4.Codec).initOne(.avc) };
@@ -331,15 +332,70 @@ pub const EmbeddingSampler = struct {
     }
 };
 
+/// NVDEC returns the packet tag supplied to the parser, including across
+/// B-frame reordering. Matching packet identity preserves tied or sub-us PTS.
+const SelectedPackets = struct {
+    ids: []const usize,
+    reader: *const media.mp4.Reader,
+    origin: i64,
+    next: usize = 0,
+    timestamp_us: i64 = 0,
+
+    fn select(self: *SelectedPackets, tag: i64) !bool {
+        if (self.next == self.ids.len or tag != self.ids[self.next]) return false;
+        self.timestamp_us = try packet_sampling.presentationUs(self.reader.packets[self.ids[self.next]].pts, self.origin, self.reader.track.timescale);
+        self.next += 1;
+        return true;
+    }
+};
+
+test "Gemma4 packet selection spans a 45-second edit and identifies tied PTS by packet" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../../testdata/video/closed.mp4") }, .identity = "selection" };
+    var original = try media.mp4.Reader.init(a, &source, .{});
+    defer original.deinit();
+    var reader = original;
+    reader.track.timescale = 1000;
+    reader.track.edit = .{ .source_start = 123, .source_duration = 45000 };
+    var packets: [48]media.mp4.Packet = @splat(reader.packets[0]);
+    // Reverse decode order so ordinal selection cannot pass this oracle.
+    for (&packets, 0..) |*packet, i| {
+        packet.pts = 123 + (@as(i64, @intCast(45 -| i))) * 1000;
+        packet.duration = 1000;
+    }
+    packets[47].pts = 122;
+    reader.packets = &packets;
+    const ids = try packet_sampling.selectWithSampling(a, &reader, .gemma4);
+    defer a.free(ids);
+    try std.testing.expectEqual(@as(usize, 32), ids.len);
+    var plan = SelectedPackets{ .ids = ids, .reader = &reader, .origin = try packet_sampling.gemma4Origin(&reader) };
+    try std.testing.expect(!try plan.select(47));
+    try std.testing.expect(!try plan.select(46)); // same PTS as selected packet 45
+    for (ids, 0..) |id, index| {
+        const second = index * 44 / 31;
+        try std.testing.expectEqual(45 - second, id);
+        try std.testing.expect(try plan.select(@intCast(id)));
+        try std.testing.expectEqual(@as(i64, @intCast(second * std.time.us_per_s)), plan.timestamp_us);
+    }
+    try std.testing.expect(!try plan.select(0)); // edit end is exclusive
+}
+
 const DecodeState = struct {
     ctx: *context.CudaContext,
     consumer: Consumer,
     sampler: Sampler = .{},
     embedding_sampler: ?EmbeddingSampler = null,
+    selected_packets: ?SelectedPackets = null,
     stats: Stats = .{},
     failure: ?anyerror = null,
     rotation: u32 = 0,
     sar: PixelAspect = .{},
+    fn wantsFrame(self: *DecodeState, tag: i64) !bool {
+        if (self.selected_packets) |*plan| return plan.select(tag);
+        if (self.embedding_sampler) |*sampler| return sampler.select(tag);
+        return self.sampler.select(tag);
+    }
+
     fn checkStatus(self: *DecodeState, status: c_int) !void {
         if (self.failure) |err| return err;
         if (self.ctx.video_cache_budget.failure) |err| return err;
@@ -354,14 +410,14 @@ const DecodeState = struct {
         };
         if (device == 0) {
             self.stats.decoded_frames += 1;
-            return if ((if (self.embedding_sampler) |*sampler| sampler.select(pts) else self.sampler.select(pts)) catch |err| {
+            return if (self.wantsFrame(pts) catch |err| {
                 self.failure = err;
                 return -1;
             }) 1 else 0;
         }
         const repetitions = if (self.embedding_sampler) |sampler| sampler.repetitions else 1;
         for (0..if (self.consumer.coalesce_repetitions) @as(usize, 1) else repetitions) |_| {
-            self.consumer.consume(self.consumer.context, .{ .device = device, .pitch = pitch, .width = width, .height = height, .timestamp_us = pts, .matrix = matrix, .full_range = full_range, .rotation = self.rotation, .sar = self.sar, .high_depth = @intFromBool(bit_depth == 10), .tone = if (transfer == 16) 1 else if (transfer == 18) 2 else 0, .repetitions = if (self.consumer.coalesce_repetitions) repetitions else 1 }) catch |err| {
+            self.consumer.consume(self.consumer.context, .{ .device = device, .pitch = pitch, .width = width, .height = height, .timestamp_us = if (self.selected_packets) |plan| plan.timestamp_us else pts, .matrix = matrix, .full_range = full_range, .rotation = self.rotation, .sar = self.sar, .high_depth = @intFromBool(bit_depth == 10), .tone = if (transfer == 16) 1 else if (transfer == 18) 2 else 0, .repetitions = if (self.consumer.coalesce_repetitions) repetitions else 1 }) catch |err| {
                 self.failure = err;
                 break;
             };
@@ -415,6 +471,9 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     _ = try (Frame{ .device = 0, .pitch = 0, .width = track.width, .height = track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = state.rotation, .sar = state.sar }).displaySize();
     if (reader.packets.len == 0) return error.EmptyVideo;
     state.sampler.end_us = try validateTimeline(track, reader.packets);
+    const selected = if (sampling == .gemma4) try packet_sampling.selectWithSampling(allocator, &reader, .gemma4) else null;
+    defer if (selected) |ids| allocator.free(ids);
+    if (selected) |ids| state.selected_packets = .{ .ids = ids, .reader = &reader, .origin = try packet_sampling.gemma4Origin(&reader) };
     if (sampling == .embedding_gemma2) {
         state.embedding_sampler = try embeddingSamplerForReader(&reader, state.sampler.end_us);
     }
@@ -454,7 +513,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
         defer lease.deinit();
         annex.clearRetainingCapacity();
         if (track.codec == .av1) try annex.appendSlice(allocator, lease.bytes) else try annexPacket(allocator, &annex, lease.bytes, track.nal_length_bytes);
-        const pts = try timestampUs(packet.pts, track.timescale);
+        const pts = if (selected != null) @as(i64, @intCast(index)) else try timestampUs(packet.pts, track.timescale);
         const result = antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), pts, 0);
         if (state.failure) |err| return err;
         try state.checkStatus(result);
@@ -463,6 +522,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     const result = antfly_nvdec_packet(decoder.?, null, 0, 0, 1);
     if (state.failure) |err| return err;
     try state.checkStatus(result);
+    if (state.selected_packets) |plan| if (plan.next != plan.ids.len) return error.VideoDecodeFailed;
     if (state.stats.selected_frames == 0) return error.EmptyVideo;
     if (state.embedding_sampler) |sampler| if (sampler.next != sampler.length) return error.VideoDecodeFailed;
     succeeded = true;

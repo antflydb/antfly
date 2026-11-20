@@ -4113,7 +4113,7 @@ fn validateGroupContent(group: Group, options: Options, allow_manual_markers: bo
         if (part == .sampled_video) {
             switch (part.sampled_video.sampling) {
                 .timestamps, .source_timestamps => |policy| try policy.validate(),
-                .reference => {},
+                .reference, .gemma4 => {},
             }
             if (part.sampled_video.webm) |input| {
                 if (part.sampled_video.reader != null or part.sampled_video.selection != null or part.sampled_video.bytes.len != 0 or input.index.reader != input.reader or input.index.pictures.len == 0) return error.InvalidEmbeddingGroup;
