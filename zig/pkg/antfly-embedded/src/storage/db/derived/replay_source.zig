@@ -232,6 +232,30 @@ pub const Source = struct {
         );
     }
 
+    /// Whether no record for `hint` lies in (`from_sequence`, `through`].
+    /// A batch capped by scanned work examines only a prefix, so the scan
+    /// continues until a match, the end of the journal, or past `through`:
+    /// a caller advancing a watermark on this answer never skips pending
+    /// work.
+    pub fn noMatchingRecordThrough(self: Source, alloc: Allocator, from_sequence: u64, hint: TargetHint, through: u64) !bool {
+        var cursor = try self.openMatchingCursor(alloc, from_sequence, hint);
+        defer cursor.deinit(alloc);
+        const Probe = struct {
+            through: u64,
+            pending: bool = false,
+            fn consume(ptr: *anyopaque, at: u64, _: []const u8) !void {
+                const probe: *@This() = @ptrCast(@alignCast(ptr));
+                probe.pending = at <= probe.through;
+            }
+        };
+        var probe = Probe{ .through = through };
+        while (true) {
+            const scan = try cursor.forEachNext(1, &probe, Probe.consume);
+            if (scan.matched_entries != 0) return !probe.pending;
+            if (!scan.scan_budget_exhausted or scan.last_sequence >= through) return true;
+        }
+    }
+
     pub fn openMatchingCursor(
         self: Source,
         alloc: Allocator,
@@ -1558,6 +1582,45 @@ test "replay source primary fallback reports an empty batch capped by scanned wo
     try std.testing.expectEqual(@as(usize, 1), second.calls);
     try std.testing.expectEqual(sequence, second.last_sequence);
     try std.testing.expect(!second_stats.scan_budget_exhausted);
+}
+
+// The watermark probe must see a record past the first capped scan window.
+test "replay source noMatchingRecordThrough looks past a capped empty window" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    var sequence: u64 = 1;
+    while (sequence <= primary_store_fallback_scan_budget_min) : (sequence += 1) {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"doc:ft"},
+            .target_hints = &.{.full_text},
+        });
+        defer alloc.free(payload);
+        const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+        try batch.put(key[0..], payload);
+    }
+    const enrichment_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = sequence,
+        .changed_doc_keys = &.{"doc:enrich"},
+        .target_hints = &.{.enrichment},
+    });
+    defer alloc.free(enrichment_payload);
+    const enrichment_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+    try batch.put(enrichment_key[0..], enrichment_payload);
+    try batch.commit();
+
+    const source = Source.fromPrimaryStore(&store, null, null);
+    try std.testing.expect(!try source.noMatchingRecordThrough(alloc, 0, .enrichment, sequence));
+    try std.testing.expect(try source.noMatchingRecordThrough(alloc, 0, .enrichment, sequence - 1));
 }
 
 test "replay source primary cursor resumes after stop chunk progress" {

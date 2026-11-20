@@ -7882,6 +7882,17 @@ pub const NativeFile = struct {
         return replayIntoSharedOverlayFrom(file, io, overlay, 0, floor, ceiling);
     }
 
+    /// Decodes one redo record's logical mutations and page images into the
+    /// shared overlay. Caller holds the overlay lock.
+    fn applyRedoRecordToOverlay(overlay: *redo_overlay.SharedRedoOverlay, sequence: u64, payload: []const u8) !void {
+        if (payload.len < CompactCheckpoint.encoded_size + 4) return error.InvalidNativeRedoRecord;
+        const logical_len = std.mem.readInt(u32, payload[CompactCheckpoint.encoded_size..][0..4], .little);
+        const logical_start = CompactCheckpoint.encoded_size + 4;
+        if (logical_start + logical_len > payload.len) return error.InvalidNativeRedoRecord;
+        try overlay.decodeLogicalMutationsPayload(std.heap.page_allocator, payload[logical_start..][0..logical_len], sequence);
+        try overlay.decodeRedoGroupPayload(std.heap.page_allocator, payload[logical_start + logical_len ..], sequence);
+    }
+
     /// `replayIntoSharedOverlay` from log offset `start_offset` (a record
     /// boundary), stopping before any record past `ceiling`. The outcome's
     /// `valid_bytes` is relative to the log start, not `start_offset`.
@@ -7891,12 +7902,7 @@ pub const NativeFile = struct {
             io: std.Io,
             fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
                 const ac: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
-                if (record.payload.len < CompactCheckpoint.encoded_size + 4) return error.InvalidNativeRedoRecord;
-                const logical_len = std.mem.readInt(u32, record.payload[CompactCheckpoint.encoded_size..][0..4], .little);
-                const logical_start = CompactCheckpoint.encoded_size + 4;
-                if (logical_start + logical_len > record.payload.len) return error.InvalidNativeRedoRecord;
-                try ac.overlay.decodeLogicalMutationsPayload(std.heap.page_allocator, record.payload[logical_start..][0..logical_len], record.commit_sequence);
-                try ac.overlay.decodeRedoGroupPayload(std.heap.page_allocator, record.payload[logical_start + logical_len ..], record.commit_sequence);
+                try applyRedoRecordToOverlay(ac.overlay, record.commit_sequence, record.payload);
             }
         };
         var apply: Apply = .{ .overlay = overlay, .io = io };
@@ -8068,39 +8074,10 @@ pub const NativeFile = struct {
             r.releaseReaderSlot(s);
         };
         if (builtin.is_test) if (test_hook) |hook| hook(test_ctx);
-        // A fold that published between the catch-up above and this pin may
-        // already have zero-filled the log from `folded_through`, and the
-        // pin only defers folds after it. Catch up again under the pin until
-        // the published boundary stops moving.
-        if (scan_region) |r| while (true) {
-            const checked = r.readLogStateChecked();
-            const published = checked orelse r.readLogStateRaw();
-            replay_ceiling = publishedReplayCeiling(r, checked);
-            published_offset = published.durable_offset;
-            durable_ceiling_offset = publishedDurableCeiling(r, published);
-            if (published.checkpoint_sequence <= folded_through) break;
-            try self.adoptOnDiskCheckpoint(io);
-            checkpoint = self.activeCheckpoint();
-            const adopted = checkpoint.redo_folded_through;
-            // The region can name a checkpoint the data file never reached
-            // (a torn publication's raw fields, or a region that outlived a
-            // crash the file was rolled back across): stop once the disk has
-            // nothing newer to adopt.
-            if (adopted <= folded_through) break;
-            folded_through = adopted;
-            if (scan_slot) |slot| r.pinReader(slot, @max(folded_through, 1));
-        };
-        // Everything published as durable is already folded into the
-        // adopted checkpoint, whose fold may be erasing the old log right
-        // now (it published before checking pins). Do not read it; writer
-        // authority settles the append position before any append.
-        // This process's own commits are already visible here through the
-        // shared overlay, durable or not; the bound applies to other
-        // processes' records only.
-        if (replay_ceiling) |ceiling| if (self.inode_lock_ref.load(.acquire)) |own_entry| {
-            replay_ceiling = @max(ceiling, inode_lock.committedSequence(own_entry), inode_lock.redoOverlayAppliedThrough(own_entry, io));
-        };
-        const skip_scan = if (replay_ceiling) |ceiling| ceiling <= folded_through else false;
+        // Every scan below must reach the coherent watermark it observed,
+        // however it stops: a zeroed header or short read inside that prefix
+        // is lost acknowledged work, never a shorter view to serve. A newer
+        // fold can explain a short scan; recheck and retry then.
         const MetaCtx = struct {
             compact: ?CompactCheckpoint = null,
             fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
@@ -8110,25 +8087,79 @@ pub const NativeFile = struct {
             }
         };
         var meta_ctx: MetaCtx = .{};
-        const meta_outcome: redo_log.ReplayOutcome = if (skip_scan)
-            .{ .valid_count = 0, .valid_bytes = published_offset, .last_sequence = replay_ceiling, .stop_reason = .durable_ceiling }
-        else
-            try redo_log.replayBounded(allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, folded_through, replay_ceiling, MetaCtx.onRecord, &meta_ctx);
-        // A torn tail or a clean (never-written-past-the-checkpoint) end
-        // are both benign (§9.5) -- the valid prefix, possibly empty, is
-        // everything this recovery trusts. A corrupt record is not,
-        // *unless* it stopped at or past `durable_ceiling_offset` (see
-        // that variable's own comment above): this open must fail rather
-        // than silently serve a truncated view of acknowledged work, but
-        // "acknowledged" is bounded by what the writer has actually
-        // published as durable -- a stop beyond that line is this scan
-        // racing a write (an in-flight append or a concurrent fold's
-        // zero-fill of an already-superseded prefix) that was never
-        // promised to be readable yet, not lost data.
-        if (meta_outcome.stop_reason == .corrupt_record and
-            (durable_ceiling_offset == null or meta_outcome.valid_bytes < durable_ceiling_offset.?))
-        {
-            return error.NativeRedoLogCorrupt;
+        var meta_outcome: redo_log.ReplayOutcome = undefined;
+        var skip_scan = false;
+        var promised_durable: ?u64 = null;
+        var observed_checkpoint: u64 = 0;
+        var cold_attempts: u32 = 0;
+        cold_scan: while (true) {
+            // A fold that published between the catch-up above and this pin may
+            // already have zero-filled the log from `folded_through`, and the
+            // pin only defers folds after it. Catch up again under the pin until
+            // the published boundary stops moving.
+            if (scan_region) |r| while (true) {
+                const checked = r.readLogStateChecked();
+                const published = checked orelse r.readLogStateRaw();
+                promised_durable = if (checked) |state| state.durable_sequence else null;
+                observed_checkpoint = published.checkpoint_sequence;
+                replay_ceiling = publishedReplayCeiling(r, checked);
+                published_offset = published.durable_offset;
+                durable_ceiling_offset = publishedDurableCeiling(r, published);
+                if (published.checkpoint_sequence <= folded_through) break;
+                try self.adoptOnDiskCheckpoint(io);
+                checkpoint = self.activeCheckpoint();
+                const adopted = checkpoint.redo_folded_through;
+                // The region can name a checkpoint the data file never reached
+                // (a torn publication's raw fields, or a region that outlived a
+                // crash the file was rolled back across): stop once the disk has
+                // nothing newer to adopt.
+                if (adopted <= folded_through) break;
+                folded_through = adopted;
+                if (scan_slot) |slot| r.pinReader(slot, @max(folded_through, 1));
+            };
+            // Everything published as durable is already folded into the
+            // adopted checkpoint, whose fold may be erasing the old log right
+            // now (it published before checking pins). Do not read it; writer
+            // authority settles the append position before any append.
+            // This process's own commits are already visible here through the
+            // shared overlay, durable or not; the bound applies to other
+            // processes' records only.
+            if (replay_ceiling) |ceiling| if (self.inode_lock_ref.load(.acquire)) |own_entry| {
+                replay_ceiling = @max(ceiling, inode_lock.committedSequence(own_entry), inode_lock.redoOverlayAppliedThrough(own_entry, io));
+            };
+            skip_scan = if (replay_ceiling) |ceiling| ceiling <= folded_through else false;
+            meta_ctx = .{};
+            meta_outcome = if (skip_scan)
+                .{ .valid_count = 0, .valid_bytes = published_offset, .last_sequence = replay_ceiling, .stop_reason = .durable_ceiling }
+            else
+                try redo_log.replayBounded(allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, folded_through, replay_ceiling, MetaCtx.onRecord, &meta_ctx);
+            // A torn tail or a clean (never-written-past-the-checkpoint) end
+            // are both benign (§9.5) -- the valid prefix, possibly empty, is
+            // everything this recovery trusts. A corrupt record is not,
+            // *unless* it stopped at or past `durable_ceiling_offset` (see
+            // that variable's own comment above): this open must fail rather
+            // than silently serve a truncated view of acknowledged work, but
+            // "acknowledged" is bounded by what the writer has actually
+            // published as durable -- a stop beyond that line is this scan
+            // racing a write (an in-flight append or a concurrent fold's
+            // zero-fill of an already-superseded prefix) that was never
+            // promised to be readable yet, not lost data.
+            if (meta_outcome.stop_reason == .corrupt_record and
+                (durable_ceiling_offset == null or meta_outcome.valid_bytes < durable_ceiling_offset.?))
+            {
+                return error.NativeRedoLogCorrupt;
+            }
+            if (promised_durable) |want| {
+                const covered = @max(checkpoint.commit_sequence, folded_through);
+                if (@max(meta_outcome.last_sequence orelse 0, covered) < want) {
+                    cold_attempts += 1;
+                    if (cold_attempts < 3) if (scan_region) |r| if (r.readLogStateChecked()) |again| {
+                        if (again.checkpoint_sequence > observed_checkpoint) continue :cold_scan;
+                    };
+                    return error.NativeRedoLogCorrupt;
+                }
+            }
+            break :cold_scan;
         }
         self.manifest_commits_enabled = false;
 
@@ -9226,112 +9257,132 @@ pub const NativeFile = struct {
 
         // A torn publication says nothing about the writer's progress: keep
         // this view, and leave the append position to writer authority.
-        const published = region.readLogStateChecked() orelse {
+        var published = region.readLogStateChecked() orelse {
             redo.tail_source = .unknown;
             region.pinReader(slot, @max(redo.durable_sequence, 1));
             return;
         };
 
-        // §9.3b "re-open semantics": the real on-disk checkpoint has
-        // moved since this instance last synced with it. Re-read it
-        // (roots, page_count, manifest -- real fields, not the logical
-        // watermark bumped below) before anything else, the same
-        // in-process staleness fix `refreshIfWriterBaseStale` already
-        // applies, triggered here by the region's published watermark
-        // instead of `inode_lock.committedSequence`.
-        if (published.checkpoint_sequence > redo.checkpoint_sequence) {
-            var header_bytes: [header_size]u8 = undefined;
-            try readHeaderExactAt(self.file, io, &header_bytes);
-            var header = try decodeHeader(&header_bytes);
-            const file_size = (try self.file.stat(io)).size;
-            header.checkpoints = loadCheckpointSlots(self.file, io, header.page_size, file_size);
-            const recovered = try recoverActiveCheckpoint(self.file, io, header, file_size, false);
-            header.active_checkpoint = recovered.index;
-            try self.adoptIndexPublicationHeader(header);
-            // perf/lwa-fold-boundary: `commit_sequence` is the writer's
-            // *tip*, not its fold boundary -- the same distinction
-            // `recoverRedoLog` makes on a cold open. `redo_folded_through`
-            // just came back from the on-disk slot this re-read loaded,
-            // so it is this process's own correct, authoritative fold
-            // boundary going forward, exactly as if this were a fresh
-            // open.
-            redo.checkpoint_sequence = self.header.checkpoints[self.header.active_checkpoint].redo_folded_through;
-        }
+        // A scan that comes up short of the watermark is retried only when a
+        // newer fold can explain it; otherwise the log lost acknowledged
+        // commits and this view must not advance past them.
+        var attempts: u32 = 0;
+        catch_up: while (true) {
+            // §9.3b "re-open semantics": the real on-disk checkpoint has
+            // moved since this instance last synced with it. Re-read it
+            // (roots, page_count, manifest -- real fields, not the logical
+            // watermark bumped below) before anything else, the same
+            // in-process staleness fix `refreshIfWriterBaseStale` already
+            // applies, triggered here by the region's published watermark
+            // instead of `inode_lock.committedSequence`.
+            if (published.checkpoint_sequence > redo.checkpoint_sequence) {
+                var header_bytes: [header_size]u8 = undefined;
+                try readHeaderExactAt(self.file, io, &header_bytes);
+                var header = try decodeHeader(&header_bytes);
+                const file_size = (try self.file.stat(io)).size;
+                header.checkpoints = loadCheckpointSlots(self.file, io, header.page_size, file_size);
+                const recovered = try recoverActiveCheckpoint(self.file, io, header, file_size, false);
+                header.active_checkpoint = recovered.index;
+                try self.adoptIndexPublicationHeader(header);
+                // perf/lwa-fold-boundary: `commit_sequence` is the writer's
+                // *tip*, not its fold boundary -- the same distinction
+                // `recoverRedoLog` makes on a cold open. `redo_folded_through`
+                // just came back from the on-disk slot this re-read loaded,
+                // so it is this process's own correct, authoritative fold
+                // boundary going forward, exactly as if this were a fresh
+                // open.
+                redo.checkpoint_sequence = self.header.checkpoints[self.header.active_checkpoint].redo_folded_through;
+            }
 
-        // Everything the writer has made durable is already folded into the
-        // checkpoint just adopted. Its fold may be erasing the old log right
-        // now (it published before checking pins, and may not have seen
-        // ours), so do not read it: adopt the published position instead.
-        if (published.durable_sequence <= redo.checkpoint_sequence and
-            published.durable_sequence > @min(redo.durable_sequence, redo.shared.appliedThrough()))
-        {
-            redo.shared.noteApplied(published.durable_sequence);
-            if (published.durable_sequence > redo.durable_sequence) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
-            redo.durable_sequence = @max(redo.durable_sequence, published.durable_sequence);
-            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, published.durable_offset, redo.durable_sequence);
-            redo.tail_source = .unknown;
-            redo.tail_fold_boundary = null;
-        } else if (published.durable_sequence > @min(redo.durable_sequence, redo.shared.appliedThrough())) {
-            const ReplayCtx = struct {
-                file: *NativeFile,
-                io: std.Io,
-                start_after_sequence: u64,
-                durable_ceiling_offset: u64,
-                max_sequence: ?u64,
-                start_offset: u64,
-                outcome: redo_log.ReplayOutcome = undefined,
-                fn run(rc: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
-                    rc.outcome = try replayIntoSharedOverlayFrom(rc.file, rc.io, overlay, rc.start_offset, rc.start_after_sequence, rc.max_sequence);
-                    // perf/lwa-xproc-redocorrupt2: `replay` has no upper
-                    // bound of its own -- a stop at or past this read's own
-                    // `published.durable_offset` ceiling (captured before
-                    // this scan started) is this scan racing a write still
-                    // landing past what the writer had actually published
-                    // as durable (an in-flight append, or a concurrent
-                    // fold's own torn zero-fill of an already-superseded
-                    // prefix), not lost data. See `recoverRedoLog`'s own
-                    // `durable_ceiling_offset` for the full reasoning and
-                    // the live repro that exposed it.
-                    if (rc.outcome.stop_reason == .corrupt_record and rc.outcome.valid_bytes < rc.durable_ceiling_offset) return error.NativeRedoLogCorrupt;
+            // Everything the writer has made durable is already folded into the
+            // checkpoint just adopted. Its fold may be erasing the old log right
+            // now (it published before checking pins, and may not have seen
+            // ours), so do not read it: adopt the published position instead.
+            if (published.durable_sequence <= redo.checkpoint_sequence and
+                published.durable_sequence > @min(redo.durable_sequence, redo.shared.appliedThrough()))
+            {
+                redo.shared.noteApplied(published.durable_sequence);
+                if (published.durable_sequence > redo.durable_sequence) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
+                redo.durable_sequence = @max(redo.durable_sequence, published.durable_sequence);
+                redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, published.durable_offset, redo.durable_sequence);
+                redo.tail_source = .unknown;
+                redo.tail_fold_boundary = null;
+            } else if (published.durable_sequence > @min(redo.durable_sequence, redo.shared.appliedThrough())) {
+                const ReplayCtx = struct {
+                    file: *NativeFile,
+                    io: std.Io,
+                    start_after_sequence: u64,
+                    durable_ceiling_offset: u64,
+                    max_sequence: ?u64,
+                    start_offset: u64,
+                    outcome: redo_log.ReplayOutcome = undefined,
+                    fn run(rc: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
+                        rc.outcome = try replayIntoSharedOverlayFrom(rc.file, rc.io, overlay, rc.start_offset, rc.start_after_sequence, rc.max_sequence);
+                        // perf/lwa-xproc-redocorrupt2: `replay` has no upper
+                        // bound of its own -- a stop at or past this read's own
+                        // `published.durable_offset` ceiling (captured before
+                        // this scan started) is this scan racing a write still
+                        // landing past what the writer had actually published
+                        // as durable (an in-flight append, or a concurrent
+                        // fold's own torn zero-fill of an already-superseded
+                        // prefix), not lost data. See `recoverRedoLog`'s own
+                        // `durable_ceiling_offset` for the full reasoning and
+                        // the live repro that exposed it.
+                        if (rc.outcome.stop_reason == .corrupt_record and rc.outcome.valid_bytes < rc.durable_ceiling_offset) return error.NativeRedoLogCorrupt;
+                    }
+                };
+                // Records at or below the adopted checkpoint's fold boundary are
+                // already in its tree. Replaying from an older durable sequence
+                // instead walks into the sequence a deferred fold consumed
+                // without appending a record, which reads as a gap
+                // (`NativeRedoLogCorrupt`).
+                // Resume after the last record this instance verified when the
+                // log has not been reset since (same fold boundary): rescanning
+                // from the start reads and checksums every earlier record again
+                // on each catch-up.
+                const incremental = redo.tail_source != .unknown and
+                    redo.tail_fold_boundary == redo.checkpoint_sequence and
+                    redo.writer.tail <= self.header.redo_log_capacity;
+                const resume_sequence = redo.writer.last_sequence orelse redo.checkpoint_sequence;
+                var rctx: ReplayCtx = .{
+                    .file = self,
+                    .io = io,
+                    .start_after_sequence = if (incremental) @max(resume_sequence, redo.checkpoint_sequence) else redo.checkpoint_sequence,
+                    .durable_ceiling_offset = publishedDurableCeiling(region, published) orelse std.math.maxInt(u64),
+                    .max_sequence = published.durable_sequence,
+                    .start_offset = if (incremental) redo.writer.tail else 0,
+                };
+                try inode_lock.withRedoOverlayLock(entry, io, &rctx, ReplayCtx.run);
+
+                const outcome = rctx.outcome;
+                // However the scan stopped, the log and the adopted checkpoint
+                // (its fold boundary and its own unlogged commits) must reach
+                // the watermark before this view serves it or marks it applied.
+                const covered = @max(redo.checkpoint_sequence, self.activeCheckpoint().commit_sequence);
+                if (@max(outcome.last_sequence orelse 0, covered) < published.durable_sequence) {
+                    attempts += 1;
+                    const again = region.readLogStateChecked() orelse return error.NativeRedoLogCorrupt;
+                    if (attempts < 3 and again.checkpoint_sequence > published.checkpoint_sequence) {
+                        published = again;
+                        continue :catch_up;
+                    }
+                    return error.NativeRedoLogCorrupt;
                 }
-            };
-            // Records at or below the adopted checkpoint's fold boundary are
-            // already in its tree. Replaying from an older durable sequence
-            // instead walks into the sequence a deferred fold consumed
-            // without appending a record, which reads as a gap
-            // (`NativeRedoLogCorrupt`).
-            // Resume after the last record this instance verified when the
-            // log has not been reset since (same fold boundary): rescanning
-            // from the start reads and checksums every earlier record again
-            // on each catch-up.
-            const incremental = redo.tail_source != .unknown and
-                redo.tail_fold_boundary == redo.checkpoint_sequence and
-                redo.writer.tail <= self.header.redo_log_capacity;
-            const resume_sequence = redo.writer.last_sequence orelse redo.checkpoint_sequence;
-            var rctx: ReplayCtx = .{
-                .file = self,
-                .io = io,
-                .start_after_sequence = if (incremental) @max(resume_sequence, redo.checkpoint_sequence) else redo.checkpoint_sequence,
-                .durable_ceiling_offset = publishedDurableCeiling(region, published) orelse std.math.maxInt(u64),
-                .max_sequence = published.durable_sequence,
-                .start_offset = if (incremental) redo.writer.tail else 0,
-            };
-            try inode_lock.withRedoOverlayLock(entry, io, &rctx, ReplayCtx.run);
-
-            const outcome = rctx.outcome;
-            // Another instance on this inode in the same process records its
-            // commits in the shared overlay directly, so replay finds nothing
-            // for them; they still advance what this instance reads.
-            const seen = @max(outcome.last_sequence orelse 0, @min(published.durable_sequence, redo.shared.appliedThrough()));
-            if (outcome.valid_count != 0 or seen > redo.durable_sequence) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
-            redo.shared.noteApplied(@max(published.durable_sequence, outcome.last_sequence orelse 0));
-            redo.durable_sequence = @max(redo.durable_sequence, seen);
-            const last_sequence = outcome.last_sequence orelse if (incremental) redo.writer.last_sequence else null;
-            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, last_sequence);
-            redo.tail_fold_boundary = redo.checkpoint_sequence;
-            // Bounded by the watermark: a dead writer may have left a
-            // surviving suffix past it.
-            redo.tail_source = .published;
+                // Another instance on this inode in the same process records its
+                // commits in the shared overlay directly, so replay finds nothing
+                // for them; they still advance what this instance reads.
+                const seen = @max(outcome.last_sequence orelse 0, @min(published.durable_sequence, redo.shared.appliedThrough()));
+                if (outcome.valid_count != 0 or seen > redo.durable_sequence) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
+                redo.shared.noteApplied(@max(published.durable_sequence, outcome.last_sequence orelse 0));
+                redo.durable_sequence = @max(redo.durable_sequence, seen);
+                const last_sequence = outcome.last_sequence orelse if (incremental) redo.writer.last_sequence else null;
+                redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, last_sequence);
+                redo.tail_fold_boundary = redo.checkpoint_sequence;
+                // Bounded by the watermark: a dead writer may have left a
+                // surviving suffix past it.
+                redo.tail_source = .published;
+            }
+            break :catch_up;
         }
 
         // Provisional bump, exactly as an ordinary redo commit already
@@ -9769,8 +9820,28 @@ pub const NativeFile = struct {
         if (start_offset > capacity) return error.NativeRedoLogCorrupt;
 
         // Validate first, installing nothing: the recovered suffix becomes
-        // this writer's own tail only once it is durable.
-        var scan = try redo_log.replayBounded(self.allocator, self.file, io, self.header.redo_log_offset + start_offset, capacity - start_offset, floor, null, null, null);
+        // this writer's own tail only once it is durable. The one scan keeps
+        // copies of the records the shared overlay does not hold yet, so
+        // the install after the barrier never rereads the log.
+        const Stage = struct {
+            allocator: Allocator,
+            applied: u64,
+            records: std.ArrayListUnmanaged(struct { sequence: u64, payload: []u8 }) = .empty,
+            fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
+                const stage: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+                if (record.commit_sequence <= stage.applied) return;
+                try stage.records.ensureUnusedCapacity(stage.allocator, 1);
+                const copy = try stage.allocator.dupe(u8, record.payload);
+                stage.records.appendAssumeCapacity(.{ .sequence = record.commit_sequence, .payload = copy });
+            }
+            fn deinit(stage: *@This()) void {
+                for (stage.records.items) |record| stage.allocator.free(record.payload);
+                stage.records.deinit(stage.allocator);
+            }
+        };
+        var stage: Stage = .{ .allocator = self.allocator, .applied = redo.shared.appliedThrough() };
+        defer stage.deinit();
+        var scan = try redo_log.replayBounded(self.allocator, self.file, io, self.header.redo_log_offset + start_offset, capacity - start_offset, floor, null, Stage.onRecord, &stage);
         scan.valid_bytes += start_offset;
         const published = region.readLogStateChecked();
         if (scan.stop_reason == .corrupt_record) {
@@ -9791,22 +9862,20 @@ pub const NativeFile = struct {
             try self.file.sync(io);
         }
 
-        if (scan.valid_count != 0) {
-            const Apply = struct {
-                file: *NativeFile,
-                io: std.Io,
-                start_offset: u64,
-                floor: u64,
-                ceiling: u64,
-                outcome: redo_log.ReplayOutcome = undefined,
+        if (stage.records.items.len != 0) {
+            const Install = struct {
+                stage: *Stage,
                 fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
-                    ctx.outcome = try replayIntoSharedOverlayFrom(ctx.file, ctx.io, overlay, ctx.start_offset, ctx.floor, ctx.ceiling);
+                    const applied = overlay.appliedThrough();
+                    for (ctx.stage.records.items) |record| {
+                        if (record.sequence <= applied) continue;
+                        try applyRedoRecordToOverlay(overlay, record.sequence, record.payload);
+                    }
+                    _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
                 }
             };
-            var apply: Apply = .{ .file = self, .io = io, .start_offset = start_offset, .floor = floor, .ceiling = scan.last_sequence.? };
-            try inode_lock.withRedoOverlayLock(entry, io, &apply, Apply.run);
-            // Nothing else writes the log under writer authority.
-            if (apply.outcome.last_sequence != scan.last_sequence or apply.outcome.valid_bytes != scan.valid_bytes) return error.NativeRedoLogCorrupt;
+            var install: Install = .{ .stage = &stage };
+            try inode_lock.withRedoOverlayLock(entry, io, &install, Install.run);
         }
         const last = @max(scan.last_sequence orelse 0, floor, redo.writer.last_sequence orelse 0);
         redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, capacity, scan.valid_bytes, if (last == 0) null else last);
@@ -38269,4 +38338,30 @@ test "lite redo log dead-writer recovery refuses a log shorter than the publishe
     const after = region.readLogStateChecked().?;
     try std.testing.expectEqual(published.durable_sequence, after.durable_sequence);
     try std.testing.expectEqual(published.durable_offset, after.durable_offset);
+}
+
+// However replay stops (zeros, a short read), a reader must not serve a
+// prefix shorter than the durable sequence the writer published: those
+// commits were acknowledged.
+test "lite redo log a cold reader refuses a log shorter than the published durable sequence" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-short-cold.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer writer.close();
+        try writer.beginTransaction();
+        try writer.putDocument("alpha", "one");
+        try writer.commitTransaction();
+        const second_record_offset = writer.header.redo_log_offset + writer.redo.?.writer.tail;
+        try writer.beginTransaction();
+        try writer.putDocument("beta", "two");
+        try writer.commitTransaction();
+        const zeros: [redo_log.header_len]u8 = @splat(0);
+        try writer.file.writePositionalAll(io, &zeros, second_record_offset);
+    }
+    try std.testing.expectError(error.NativeRedoLogCorrupt, NativeFile.openWithIo(a, io, path, .{ .read_only = true }));
 }

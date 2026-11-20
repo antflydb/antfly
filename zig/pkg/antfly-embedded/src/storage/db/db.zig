@@ -56471,19 +56471,7 @@ fn markPrecomputedEnrichmentAppliedForSyncContext(ctx: *const BatchExecutionCont
 }
 
 fn noPendingEnrichmentReplayThroughContext(ctx: *const BatchExecutionContext, applied_sequence: u64, sequence: u64) !bool {
-    var cursor = try ctx.replay_source.openMatchingCursor(ctx.alloc, applied_sequence, .enrichment);
-    defer cursor.deinit(ctx.alloc);
-    const Probe = struct {
-        through: u64,
-        pending: bool = false,
-        fn consume(ptr: *anyopaque, at: u64, _: []const u8) !void {
-            const probe: *@This() = @ptrCast(@alignCast(ptr));
-            probe.pending = at <= probe.through;
-        }
-    };
-    var probe = Probe{ .through = sequence };
-    _ = try cursor.forEachNext(1, &probe, Probe.consume);
-    return !probe.pending;
+    return try ctx.replay_source.noMatchingRecordThrough(ctx.alloc, applied_sequence, .enrichment, sequence);
 }
 
 fn runMaintenanceUntilContext(ctx: *const BatchExecutionContext, sequence: u64, sync_targets: ManagedSyncTargets) !void {
