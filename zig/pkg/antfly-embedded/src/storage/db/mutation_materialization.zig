@@ -3611,7 +3611,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // streaming replay session before the upsert restores the member.
                     // Reserve the delete lane for actual source/artifact removals.
                     const chunk_backed = if (ctx.index_manager.denseIndex(index_ref.name)) |entry|
-                        entry.chunk_name != null
+                        entry.memberBacked()
                     else
                         false;
                     const external = ctx.index_manager.denseIndexUsesExternalCoverage(index_ref.name);

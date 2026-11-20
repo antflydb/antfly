@@ -18480,7 +18480,7 @@ fn searchDenseInternal(
     if (returnModeRequiresUnitGrouping(req.return_mode) and !entry.supports_unit_grouping)
         return error.UnsupportedHierarchyGrouping;
 
-    const chunk_backed = entry.chunk_name != null;
+    const chunk_backed = entry.memberBacked();
     // Multi-source members need visibility filtering and identity translation,
     // but raw member modes do not collapse unrelated `(artifact, key)` values.
     // Start at the requested score-order window and grow from observed losses
@@ -18954,7 +18954,7 @@ fn searchDenseInternal(
             };
             var doc_key_owned = true;
             errdefer if (doc_key_owned) alloc.free(doc_key);
-            var source_artifact_ref = if (entry.embedding_names.len > 0 or entry.chunk_name != null)
+            var source_artifact_ref = if (entry.embedding_names.len > 0 or chunk_backed)
                 try artifact_ids.decodeArtifactRefAlloc(alloc, doc_key)
             else
                 null;
@@ -18974,7 +18974,7 @@ fn searchDenseInternal(
             errdefer if (stored_data_owned) {
                 if (stored_data) |data| alloc.free(data);
             };
-            const load_stored_before_postprocess = postprocess_req.include_stored and
+            const load_stored_before_postprocess = stored_data == null and postprocess_req.include_stored and
                 !(chunk_backed and group_chunk_parents) and
                 !unresolved_stored_filters;
             if (load_stored_before_postprocess and executor.load_projected_documents == null) {

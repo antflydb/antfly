@@ -24,6 +24,7 @@ const Budget = @import("antfly_local_sources").sql_memory_budget;
 
 const Layout = struct {
     version: u32 = 0,
+    column_lineage: u32 = 0,
     storage_mode: @FieldType(catalog.Table, "storage_mode") = .relational,
     external_base_source: ?@import("antfly_local_sources").serverless_external_source_schema_binding.OwnedExternalTableBinding = null,
     columns: []const catalog.Column = &.{},
@@ -31,7 +32,7 @@ const Layout = struct {
     constraints: []const catalog.Constraint = &.{},
 
     fn table(self: Layout, id: u64, physical_name: []const u8) catalog.Table {
-        return .{ .id = id, .physical_name = physical_name, .schema_version = self.version, .storage_mode = self.storage_mode, .external_base_source = self.external_base_source, .columns = self.columns, .indexes = self.indexes, .constraints = self.constraints };
+        return .{ .id = id, .physical_name = physical_name, .schema_version = self.version, .column_lineage = self.column_lineage, .storage_mode = self.storage_mode, .external_base_source = self.external_base_source, .columns = self.columns, .indexes = self.indexes, .constraints = self.constraints };
     }
 };
 const Entry = struct {
@@ -112,7 +113,7 @@ pub const Cache = struct {
             out.* = constraint;
             out.name = try alloc.dupe(u8, constraint.name);
         }
-        return .{ .external_base_source = if (entry.layout.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.layout.version, .storage_mode = entry.layout.storage_mode, .columns = columns, .indexes = indexes, .constraints = constraints };
+        return .{ .external_base_source = if (entry.layout.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.layout.version, .column_lineage = entry.layout.column_lineage, .storage_mode = entry.layout.storage_mode, .columns = columns, .indexes = indexes, .constraints = constraints };
     }
     fn acquire(self: *Cache, io: std.Io, scratch: std.mem.Allocator, json: []const u8, limit: usize) !*Entry {
         var digest: [32]u8 = undefined;
@@ -190,6 +191,7 @@ fn derive(layout: *Layout, json: []const u8, temporary: std.mem.Allocator, owned
     defer scratch.deinit();
     const alloc = scratch.allocator();
     const parsed = try schema.parseValidatedTableSchema(alloc, json);
+    layout.column_lineage = parsed.column_lineage;
     layout.constraints = try catalog.Constraint.derive(owned, parsed);
     if (parsed.storage_mode == .document) {
         layout.storage_mode = .document;

@@ -36,6 +36,13 @@ pub fn supportName(column: []const u8) [owned_prefix.len + 64]u8 {
 /// This helper does not grant ownership or publication authority: its caller
 /// must persist the dependency and perform normal parent-schema admission.
 pub fn ensureCoverage(alloc: std.mem.Allocator, schema_json: []const u8, columns: []const []const u8) !?[]u8 {
+    return ensureCoverageMany(alloc, schema_json, &.{columns});
+}
+
+pub const ColumnGroup = []const []const u8;
+
+pub fn ensureCoverageMany(alloc: std.mem.Allocator, schema_json: []const u8, groups: []const ColumnGroup) !?[]u8 {
+    if (groups.len == 0) return null;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const owned = arena.allocator();
@@ -50,37 +57,30 @@ pub fn ensureCoverage(alloc: std.mem.Allocator, schema_json: []const u8, columns
             try definitions.appendSlice(existing.array.items);
         }
     }
-    var added = std.StringHashMapUnmanaged(void).empty;
-    for (columns) |column| {
-        if (added.contains(column)) continue;
-        if (parent.relational_indexes) |indexes| {
-            for (indexes.value) |index| {
-                if (eligible(index) and std.mem.eql(u8, index.keys[0].column.?, column)) break;
-            } else {
-                try appendSupport(owned, &definitions, column, columns);
-                try added.put(owned, column, {});
-            }
-        } else {
-            try appendSupport(owned, &definitions, column, columns);
-            try added.put(owned, column, {});
-        }
-    }
-    if (added.count() == 0) return null;
+    var covered = std.StringHashMapUnmanaged(void).empty;
+    var names = std.StringHashMapUnmanaged(void).empty;
+    if (parent.relational_indexes) |indexes| for (indexes.value) |index| {
+        try names.put(owned, index.name, {});
+        if (eligible(index)) try covered.put(owned, index.keys[0].column.?, {});
+    };
+    const original_len = definitions.items.len;
+    for (groups) |columns| for (columns) |column| {
+        if ((try covered.getOrPut(owned, column)).found_existing) continue;
+        const name = try owned.dupe(u8, &supportName(column));
+        if ((try names.getOrPut(owned, name)).found_existing) return error.ForeignKeyPartialSupportIndexConflict;
+        try appendSupport(owned, &definitions, name, column, columns);
+    };
+    if (definitions.items.len == original_len) return null;
     try parsed.value.object.put(owned, "relational_indexes", .{ .array = definitions });
     const encoded = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     errdefer alloc.free(encoded);
     var validated = try @import("mod.zig").parseValidatedTableSchema(owned, encoded);
     defer validated.deinit(owned);
-    try requireCoverage(validated, columns);
+
     return encoded;
 }
 
-fn appendSupport(alloc: std.mem.Allocator, definitions: *std.array_list.Managed(std.json.Value), column: []const u8, columns: []const []const u8) !void {
-    const name = try alloc.dupe(u8, &supportName(column));
-    for (definitions.items) |definition| {
-        const existing = definition.object.get("name") orelse return error.InvalidSchemaUpdateRequest;
-        if (existing == .string and std.mem.eql(u8, existing.string, name)) return error.ForeignKeyPartialSupportIndexConflict;
-    }
+fn appendSupport(alloc: std.mem.Allocator, definitions: *std.array_list.Managed(std.json.Value), name: []const u8, column: []const u8, columns: []const []const u8) !void {
     var includes = std.ArrayList([]const u8).empty;
     for (columns) |other| if (!std.mem.eql(u8, other, column)) {
         var found = false;
@@ -205,6 +205,9 @@ test "distributed txn partial witness automatic support uses one normal covering
     try std.testing.expectEqualStrings("b", added.keys[0].column.?);
     try std.testing.expectEqualStrings("a", added.include_columns.?[0]);
     try std.testing.expect((try ensureCoverage(alloc, updated, &.{ "a", "b" })) == null);
+    const grouped = (try ensureCoverageMany(alloc, schema, &.{ &.{ "a", "b", "b" }, &.{"b"}, &.{ "b", "a" } })).?;
+    defer alloc.free(grouped);
+    try std.testing.expectEqualStrings(updated, grouped);
     const occupied = try std.mem.replaceOwned(u8, alloc, schema, "existing_a", &supportName("b"));
     defer alloc.free(occupied);
     try std.testing.expectError(error.ForeignKeyPartialSupportIndexConflict, ensureCoverage(alloc, occupied, &.{ "a", "b" }));
