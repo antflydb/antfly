@@ -53,6 +53,30 @@ pub const DiscoveryShape = struct {
     }
 };
 
+/// Stack-owned headers for discovery. Pass the original selectors to execution.
+pub const DiscoveryHeaders = struct {
+    entries: [16][2][]const u8 = undefined,
+    value: [64]u8 = undefined,
+
+    pub fn withShape(self: *DiscoveryHeaders, base: []const [2][]const u8, shape: DiscoveryShape) ![]const [2][]const u8 {
+        if (base.len >= self.entries.len) return error.TooManyInferenceHeaders;
+        @memcpy(self.entries[0..base.len], base);
+        self.entries[base.len] = .{ discovery_shape_header, try shape.formatHeader(&self.value) };
+        return self.entries[0 .. base.len + 1];
+    }
+};
+
+pub fn generationHasMedia(messages: anytype) bool {
+    for (messages) |message| {
+        if (message.content) |content| {
+            if (content == .parts) {
+                for (content.parts) |part| if (part != .text) return true;
+            }
+        }
+    }
+    return false;
+}
+
 pub const parent_request_id_header = "X-Antfly-Parent-Request-ID";
 pub const model_activation_header = "X-Antfly-Model-Activation";
 const capability_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;

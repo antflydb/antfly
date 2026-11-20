@@ -64,7 +64,7 @@ pub const Runtime = struct {
     } = null,
 
     pub fn capabilities(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig) !constrained.Capabilities {
-        const caps = try self.resolveCapabilities(a, cfg);
+        const caps = try self.resolveCapabilities(a, cfg, null);
         self.capability_snapshot = caps;
         self.require_execution_lease = self.require_execution_lease or cfg.capability_token != null;
         return caps;
@@ -110,7 +110,7 @@ pub const Runtime = struct {
         context.cancellation = .{ .ptr = self, .is_cancelled_fn = cancellationRequested, .check_fn = checkCancellation };
         return context;
     }
-    fn resolveCapabilities(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig) !constrained.Capabilities {
+    fn resolveCapabilities(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig, shape: ?remote.DiscoveryShape) !constrained.Capabilities {
         try cfg.validate();
         if (cfg.provider != .antfly) return hostedCapabilities(cfg.*);
         var native: ?work.InferenceCapabilities = null;
@@ -128,7 +128,10 @@ pub const Runtime = struct {
             defer headers.deinit(a);
             // Constrained batches are scalar /generate requests, so their lease
             // must be scoped to that concrete operation as well.
-            const lease = try self.cache.getOrDiscoverLeaseWithContext(self.http, cfg.url, cfg.model, .generate, headers.entries[0..headers.count], self.waitContext());
+            var placement: remote.DiscoveryHeaders = .{};
+            const base = headers.entries[0..headers.count];
+            const discovery_headers = if (shape) |invocation| try placement.withShape(base, invocation) else base;
+            const lease = try self.cache.getOrDiscoverLeaseWithContext(self.http, cfg.url, cfg.model, .generate, discovery_headers, self.waitContext());
             native = lease.capabilities;
             cfg.capability_token = if (lease.routing_token) |token| try a.dupe(u8, token.slice()) else null;
             cfg.capability_revision = if (lease.descriptor_revision) |revision| try a.dupe(u8, revision.slice()) else null;
@@ -139,19 +142,24 @@ pub const Runtime = struct {
 
     /// Refresh routing credentials before dispatch, while keeping the model
     /// contract used for packing, probability evidence and response validation.
-    fn bindExecutionLease(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig) !void {
+    fn bindExecutionLease(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig, shape: remote.DiscoveryShape) !void {
         if (cfg.provider != .antfly or cfg.url.len == 0) return;
-        const renewed = try self.resolveCapabilities(a, cfg);
+        const renewed = try self.resolveCapabilities(a, cfg, shape);
         if (self.require_execution_lease and cfg.capability_token == null) return error.InferenceCapabilitiesStale;
         self.require_execution_lease = self.require_execution_lease or cfg.capability_token != null;
         if (self.capability_snapshot) |snapshot| {
             if (!snapshot.sameModelContract(renewed)) return error.InferenceCapabilitiesStale;
         } else self.capability_snapshot = renewed;
     }
-    fn invalidateExecutionLease(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig) !void {
+    fn invalidateExecutionLease(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig, shape: remote.DiscoveryShape) !void {
         const headers = try self.remoteHeaders(a, cfg);
         defer headers.deinit(a);
-        try self.cache.invalidateLease(cfg.url, cfg.model, .generate, headers.entries[0..headers.count], try remote.LeaseIdentity.init(cfg.capability_token, cfg.capability_revision));
+        var placement: remote.DiscoveryHeaders = .{};
+        const base = headers.entries[0..headers.count];
+        const discovery_headers = try placement.withShape(base, shape);
+        const identity = try remote.LeaseIdentity.init(cfg.capability_token, cfg.capability_revision);
+        try self.cache.invalidateLease(cfg.url, cfg.model, .generate, discovery_headers, identity);
+        try self.cache.invalidateLease(cfg.url, cfg.model, .generate, base, identity);
     }
 
     pub fn execute(self: *Runtime, a: Allocator, cfg: generating.GeneratorConfig, mode: constrained.Output, schema: Json, instructions: []const u8, batch: constrained.Batch, inputs: []const []const u8) !constrained.Result {
@@ -190,7 +198,6 @@ pub const Runtime = struct {
                 if (self.runtime.invocation_usage) |sink| sink.record(sink.ptr, request.items, usage.*);
             };
             var cfg = self.cfg;
-            try self.runtime.bindExecutionLease(a, &cfg);
             const wire_schema = try constrained.providerSchema(a, cfg, request.mode, request.schema);
             // Invocation-owned options must never mutate the registered spec.
             cfg.tools_json = null;
@@ -214,6 +221,12 @@ pub const Runtime = struct {
             const schema_text = try std.json.Stringify.valueAlloc(a, request.schema, .{});
             const system = try std.fmt.allocPrint(a, "Return one structured result per input item. Preserve the item IDs exactly. The JSON schema is: {s}", .{schema_text});
             const messages = try constrained.evidenceMessages(a, request, system, cfg.provider == .openai);
+            const shape: remote.DiscoveryShape = .{
+                .items = 1,
+                .media = remote.generationHasMedia(messages),
+                .output_tokens = std.math.cast(usize, cfg.max_tokens),
+            };
+            try self.runtime.bindExecutionLease(a, &cfg, shape);
             var refreshed = false;
             var result = while (true) {
                 const generated = generating.executeChainWithOptions(a, self.runtime.http, &.{.{ .generator = cfg }}, .{
@@ -232,10 +245,10 @@ pub const Runtime = struct {
                         // An authoritative rejection happened before inference.
                         // Revoke even on the final attempt; never resurrect its
                         // stale tuple if rediscovery encounters an outage.
-                        try self.runtime.invalidateExecutionLease(a, cfg);
+                        try self.runtime.invalidateExecutionLease(a, cfg, shape);
                         if (refreshed) return err;
                         try checkpoint(ptr);
-                        try self.runtime.bindExecutionLease(a, &cfg);
+                        try self.runtime.bindExecutionLease(a, &cfg, shape);
                         refreshed = true;
                         continue;
                     }

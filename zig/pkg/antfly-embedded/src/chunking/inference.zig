@@ -301,6 +301,13 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     }
     routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, routing_header_count);
     const routing_headers = routing_header_storage[0..routing_header_count];
+    var placement: remote_capabilities.DiscoveryHeaders = .{};
+    // Model-aware chunking discovers an upstream boundary contract. The
+    // chunk service owns the boundary invocation and its request shape.
+    const discovery_headers = if (capability_task == .chunk)
+        try placement.withShape(routing_headers, .{ .items = 1, .media = input == .binary, .output_tokens = 0 })
+    else
+        routing_headers;
     var capability_lease = dispatch: {
         const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
         defer if (accounting) |hook| hook.finish(hook.ptr, started);
@@ -309,7 +316,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
             endpoint,
             model,
             capability_task,
-            routing_headers,
+            discovery_headers,
             execution.waitContext(),
         );
     };
@@ -400,7 +407,10 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         if (resp.status.code == 409 and stale != null and
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
         {
-            try capability_cache.?.invalidate(endpoint, model, capability_task, routing_headers);
+            try capability_cache.?.invalidateLease(endpoint, model, capability_task, discovery_headers, .{
+                .routing_token = capability_lease.routing_token,
+                .descriptor_revision = capability_lease.descriptor_revision,
+            });
             return error.InferenceCapabilitiesStale;
         }
         if (paged and resp.status.code == 409) {

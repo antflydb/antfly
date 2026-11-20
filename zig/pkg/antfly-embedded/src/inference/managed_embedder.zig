@@ -6437,21 +6437,9 @@ fn remoteEmbeddingHeaders(
     return storage[0..count];
 }
 
-const RemoteEmbeddingPlacement = struct {
-    storage: [5][2][]const u8 = undefined,
-    shape_value: [64]u8 = undefined,
-
-    fn headers(self: *RemoteEmbeddingPlacement, base: []const [2][]const u8, items: usize, media: bool) ![]const [2][]const u8 {
-        std.debug.assert(base.len < self.storage.len);
-        @memcpy(self.storage[0..base.len], base);
-        const shape = remote_capabilities.DiscoveryShape{ .items = @max(items, 1), .media = media, .output_tokens = 0 };
-        self.storage[base.len] = .{
-            remote_capabilities.discovery_shape_header,
-            try shape.formatHeader(&self.shape_value),
-        };
-        return self.storage[0 .. base.len + 1];
-    }
-};
+fn embeddingPlacementHeaders(placement: *remote_capabilities.DiscoveryHeaders, base: []const [2][]const u8, items: usize, media: bool) ![]const [2][]const u8 {
+    return placement.withShape(base, .{ .items = @max(items, 1), .media = media, .output_tokens = 0 });
+}
 
 fn hasEmbeddingMedia(parts: []const template_mod.ContentPart) bool {
     for (parts) |part| {
@@ -6812,8 +6800,8 @@ fn embedWithEntryPartsForTaskOnce(
         }
         var capability_header_storage: [4][2][]const u8 = undefined;
         const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
-        var placement: RemoteEmbeddingPlacement = .{};
-        const placement_headers = try placement.headers(capability_headers, 1, hasEmbeddingMedia(parts));
+        var placement: remote_capabilities.DiscoveryHeaders = .{};
+        const placement_headers = try embeddingPlacementHeaders(&placement, capability_headers, 1, hasEmbeddingMedia(parts));
         const lease = try bindRemoteEmbeddingPartsLease(
             alloc,
             entry,
@@ -7306,8 +7294,8 @@ fn embedPartItemsWithEntry(
     }
     var capability_header_storage: [4][2][]const u8 = undefined;
     const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
-    var placement: RemoteEmbeddingPlacement = .{};
-    const placement_headers = try placement.headers(capability_headers, items.len, hasEmbeddingMedia(items));
+    var placement: remote_capabilities.DiscoveryHeaders = .{};
+    const placement_headers = try embeddingPlacementHeaders(&placement, capability_headers, items.len, hasEmbeddingMedia(items));
     const capability_cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
     const planned_capabilities = planned_lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
     if (planned_lease.scope_digest) |scope| {
@@ -7415,8 +7403,8 @@ fn embedSparseBatchWithEntry(
             }
             var capability_header_storage: [4][2][]const u8 = undefined;
             const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
-            var placement: RemoteEmbeddingPlacement = .{};
-            const placement_headers = try placement.headers(capability_headers, texts.len, false);
+            var placement: remote_capabilities.DiscoveryHeaders = .{};
+            const placement_headers = try embeddingPlacementHeaders(&placement, capability_headers, texts.len, false);
             const lease = try bindRemoteEmbeddingLease(
                 entry,
                 http,
@@ -7829,9 +7817,9 @@ fn prepareRemoteQueryEmbedding(alloc: std.mem.Allocator, entry: *const ManagedEm
     if (entry.api_key) |*key| auth = try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, key);
     var storage: [4][2][]const u8 = undefined;
     const headers = remoteEmbeddingHeaders(entry, auth, &storage);
-    var placement: RemoteEmbeddingPlacement = .{};
+    var placement: remote_capabilities.DiscoveryHeaders = .{};
     const discovery_headers = if (shape) |value|
-        try placement.headers(headers, value.items, value.media)
+        try embeddingPlacementHeaders(&placement, headers, value.items, value.media)
     else
         headers;
     const started = monotonicNowNs();
@@ -8017,8 +8005,8 @@ fn embedBatchWithEntryForTaskOnce(
             }
             var capability_header_storage: [4][2][]const u8 = undefined;
             const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
-            var placement: RemoteEmbeddingPlacement = .{};
-            const placement_headers = try placement.headers(capability_headers, texts.len, false);
+            var placement: remote_capabilities.DiscoveryHeaders = .{};
+            const placement_headers = try embeddingPlacementHeaders(&placement, capability_headers, texts.len, false);
             const lease = try bindRemoteEmbeddingLease(
                 entry,
                 http,

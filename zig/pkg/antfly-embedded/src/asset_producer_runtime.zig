@@ -2037,7 +2037,7 @@ pub const Runtime = struct {
         };
     }
 
-    fn bindExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: *extracting.Config) !?inference_work.InferenceCapabilities {
+    fn bindExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, shape: remote_capabilities.DiscoveryShape) !?inference_work.InferenceCapabilities {
         if (cfg.provider != .antfly or cfg.resolvedUrl() == null) return null;
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
@@ -2049,7 +2049,8 @@ pub const Runtime = struct {
             header_count += 1;
         }
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
-        const headers = header_storage[0..header_count];
+        var placement: remote_capabilities.DiscoveryHeaders = .{};
+        const headers = try placement.withShape(header_storage[0..header_count], shape);
         const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
             self.http,
             cfg.resolvedUrl().?,
@@ -2063,7 +2064,7 @@ pub const Runtime = struct {
         return lease.capabilities;
     }
 
-    fn invalidateExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: extracting.Config) !void {
+    fn invalidateExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: extracting.Config, shape: remote_capabilities.DiscoveryShape) !void {
         if (cfg.provider != .antfly or cfg.resolvedUrl() == null) return;
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
@@ -2075,8 +2076,9 @@ pub const Runtime = struct {
             header_count += 1;
         }
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
-        const headers = header_storage[0..header_count];
-        try self.capabilityCache().invalidate(cfg.resolvedUrl().?, cfg.model, .extract, headers);
+        var placement: remote_capabilities.DiscoveryHeaders = .{};
+        const headers = try placement.withShape(header_storage[0..header_count], shape);
+        try self.capabilityCache().invalidateLease(cfg.resolvedUrl().?, cfg.model, .extract, headers, try remote_capabilities.LeaseIdentity.init(cfg.capability_token, cfg.capability_revision));
     }
 
     fn validateDecisionInput(alloc: Allocator, request: asset_producer.Request) !void {
@@ -2750,7 +2752,8 @@ pub const Runtime = struct {
         var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
         try self.routeExtractorConfig(alloc, &cfg);
-        _ = try self.bindExtractorCapabilityLease(alloc, &cfg);
+        const discovery_shape = try producerDiscoveryShape(alloc, requests);
+        _ = try self.bindExtractorCapabilityLease(alloc, &cfg, discovery_shape);
 
         const inputs = try alloc.alloc(extracting.Input, requests.len);
         var inputs_filled: usize = 0;
@@ -2842,7 +2845,7 @@ pub const Runtime = struct {
             ),
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
-                try self.invalidateExtractorCapabilityLease(alloc, cfg);
+                try self.invalidateExtractorCapabilityLease(alloc, cfg, discovery_shape);
             if (err == error.InvalidExtractionResponse) return error.InvalidExtractorResponse;
             return err;
         };
@@ -2935,25 +2938,6 @@ pub const Runtime = struct {
         }
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
         const auth_headers = header_storage[0..header_count];
-        var capability_lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
-            self.http,
-            cfg.url,
-            cfg.model,
-            .generate_batch,
-            auth_headers,
-            self.execution.waitContext(),
-        );
-        capabilities = capability_lease.capabilities orelse return error.InvalidInferenceCapabilities;
-        try self.recordLeaseExecution(capability_lease);
-        if (capability_lease.routing_token) |*value| {
-            header_storage[header_count] = .{ remote_capabilities.capability_token_header, value.slice() };
-            header_count += 1;
-        }
-        if (capability_lease.descriptor_revision) |*value| {
-            header_storage[header_count] = .{ remote_capabilities.capability_revision_header, value.slice() };
-            header_count += 1;
-        }
-        const headers = header_storage[0..header_count];
         var quota = try generating_runtime.acquireGenerationQuota(alloc, cfg, .{
             .limits = self.limits,
         });
@@ -2976,8 +2960,44 @@ pub const Runtime = struct {
         var start: usize = 0;
         while (start < requests.len) {
             try self.execution.check(platform.time.monotonicNs());
+            var end = @min(start +| capabilities.batch.max_items, requests.len);
+            if (end <= start) return error.InvalidInferenceCapabilities;
+            var placement: remote_capabilities.DiscoveryHeaders = .{};
+            var discovery_headers: []const [2][]const u8 = undefined;
+            var capability_lease: remote_capabilities.CapabilityLease = undefined;
+            // A different contract may shrink the next window. Rediscover the
+            // smaller invocation before using the lease; never widen a window
+            // that was already scoped by the planner or a prior contract.
+            while (true) {
+                const window = requests[start..end];
+                var shape = try producerDiscoveryShape(alloc, window);
+                shape.output_tokens = discoveryOutputTokens(cfg.max_tokens);
+                discovery_headers = try placement.withShape(auth_headers, shape);
+                capability_lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
+                    self.http,
+                    cfg.url,
+                    cfg.model,
+                    .generate_batch,
+                    discovery_headers,
+                    self.execution.waitContext(),
+                );
+                capabilities = capability_lease.capabilities orelse return error.InvalidInferenceCapabilities;
+                const fitting_end = try generatorBatchEnd(alloc, capabilities, remoteAttachmentTransport(capabilities, .base64_payload), requests[0..end], start);
+                if (fitting_end == end) break;
+                end = fitting_end;
+            }
+            try self.recordLeaseExecution(capability_lease);
+            var execution_header_count = header_count;
+            if (capability_lease.routing_token) |*value| {
+                header_storage[execution_header_count] = .{ remote_capabilities.capability_token_header, value.slice() };
+                execution_header_count += 1;
+            }
+            if (capability_lease.descriptor_revision) |*value| {
+                header_storage[execution_header_count] = .{ remote_capabilities.capability_revision_header, value.slice() };
+                execution_header_count += 1;
+            }
+            const headers = header_storage[0..execution_header_count];
             const attachment_transport = remoteAttachmentTransport(capabilities, .base64_payload);
-            const end = try generatorBatchEnd(alloc, capabilities, attachment_transport, requests, start);
             const chunk = requests[start..end];
             try validateGeneratorInvocation(alloc, capabilities, attachment_transport, chunk);
             var body = try antflyGenerateBatchRequestAlloc(alloc, cfg, chunk, attachment_transport);
@@ -3015,7 +3035,10 @@ pub const Runtime = struct {
                 if (resp.status.code == 409 and stale_value != null and
                     std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale_value.?, " \t"), "true"))
                 {
-                    try self.capabilityCache().invalidate(cfg.url, cfg.model, .generate_batch, auth_headers);
+                    try self.capabilityCache().invalidateLease(cfg.url, cfg.model, .generate_batch, discovery_headers, .{
+                        .routing_token = capability_lease.routing_token,
+                        .descriptor_revision = capability_lease.descriptor_revision,
+                    });
                     return error.InferenceCapabilitiesStale;
                 }
                 return mapAntflyGenerateBatchStatus(resp.status.code);
@@ -3059,6 +3082,7 @@ pub const Runtime = struct {
         self: *Runtime,
         alloc: Allocator,
         cfg: *generating_runtime.GeneratorConfig,
+        shape: remote_capabilities.DiscoveryShape,
     ) !?inference_work.InferenceCapabilities {
         if (cfg.provider != .antfly or cfg.url.len == 0) return null;
         var secret = try common_secrets.SecretValue.initConfigOrEnv(
@@ -3079,7 +3103,8 @@ pub const Runtime = struct {
             header_count += 1;
         }
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
-        const headers = header_storage[0..header_count];
+        var placement: remote_capabilities.DiscoveryHeaders = .{};
+        const headers = try placement.withShape(header_storage[0..header_count], shape);
         const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
             self.http,
             cfg.url,
@@ -3097,6 +3122,7 @@ pub const Runtime = struct {
         self: *Runtime,
         alloc: Allocator,
         cfg: generating_runtime.GeneratorConfig,
+        shape: remote_capabilities.DiscoveryShape,
     ) !void {
         if (cfg.provider != .antfly or cfg.url.len == 0) return;
         var secret = try common_secrets.SecretValue.initConfigOrEnv(
@@ -3117,8 +3143,9 @@ pub const Runtime = struct {
             header_count += 1;
         }
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
-        const headers = header_storage[0..header_count];
-        try self.capabilityCache().invalidate(cfg.url, cfg.model, .generate, headers);
+        var placement: remote_capabilities.DiscoveryHeaders = .{};
+        const headers = try placement.withShape(header_storage[0..header_count], shape);
+        try self.capabilityCache().invalidateLease(cfg.url, cfg.model, .generate, headers, try remote_capabilities.LeaseIdentity.init(cfg.capability_token, cfg.capability_revision));
     }
 
     fn tryTranscribeBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -3554,8 +3581,13 @@ pub const Runtime = struct {
                 );
             return result;
         }
+        const discovery_shape: remote_capabilities.DiscoveryShape = .{
+            .items = 1,
+            .media = remote_capabilities.generationHasMedia(&messages),
+            .output_tokens = discoveryOutputTokens(cfg.max_tokens),
+        };
         if (cfg.provider == .antfly and cfg.url.len > 0) {
-            const capabilities = (try self.bindGeneratorCapabilityLease(alloc, &cfg)) orelse
+            const capabilities = (try self.bindGeneratorCapabilityLease(alloc, &cfg, discovery_shape)) orelse
                 return error.InvalidInferenceCapabilities;
             try validateGeneratorInvocation(alloc, capabilities, .base64_payload, &.{request});
             parsed_cfg.generator.capability_token = cfg.capability_token;
@@ -3573,7 +3605,7 @@ pub const Runtime = struct {
             .limits = self.limits,
         }, &messages) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
-                try self.invalidateGeneratorCapabilityLease(alloc, cfg);
+                try self.invalidateGeneratorCapabilityLease(alloc, cfg, discovery_shape);
             return err;
         };
         defer result.deinit();
@@ -3829,7 +3861,8 @@ pub const Runtime = struct {
             capability_auth_count += 1;
         }
         capability_auth_count = try self.execution.routing.appendHeaders(&capability_auth_storage, capability_auth_count);
-        const capability_auth_headers = capability_auth_storage[0..capability_auth_count];
+        var placement: remote_capabilities.DiscoveryHeaders = .{};
+        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .output_tokens = discoveryOutputTokens(request.max_tokens) });
         const discovered_capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
             const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
@@ -3901,7 +3934,7 @@ pub const Runtime = struct {
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale and execution_cfg.provider == .antfly) {
                 const endpoint = execution_cfg.resolvedUrl() orelse return err;
-                try self.capabilityCache().invalidate(endpoint, execution_cfg.model orelse "", .read, capability_auth_headers);
+                try self.capabilityCache().invalidateLease(endpoint, execution_cfg.model orelse "", .read, capability_auth_headers, try remote_capabilities.LeaseIdentity.init(execution_cfg.capability_token, execution_cfg.capability_revision));
             }
             return err;
         };
@@ -3968,7 +4001,8 @@ pub const Runtime = struct {
             &capability_auth_storage,
             capability_auth_count,
         );
-        const capability_auth_headers = capability_auth_storage[0..capability_auth_count];
+        var placement: remote_capabilities.DiscoveryHeaders = .{};
+        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .output_tokens = discoveryOutputTokens(request.max_tokens) });
         const capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
             const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
@@ -4081,7 +4115,7 @@ pub const Runtime = struct {
             }) catch |err| {
                 if (err == error.InferenceCapabilitiesStale and execution_cfg.provider == .antfly) {
                     const endpoint = execution_cfg.resolvedUrl() orelse return err;
-                    try self.capabilityCache().invalidate(endpoint, execution_cfg.model orelse "", .read, capability_auth_headers);
+                    try self.capabilityCache().invalidateLease(endpoint, execution_cfg.model orelse "", .read, capability_auth_headers, try remote_capabilities.LeaseIdentity.init(execution_cfg.capability_token, execution_cfg.capability_revision));
                 }
                 return err;
             };
@@ -4274,7 +4308,8 @@ pub const Runtime = struct {
             capability_auth_count += 1;
         }
         capability_auth_count = try self.execution.routing.appendHeaders(&capability_auth_storage, capability_auth_count);
-        const capability_auth_headers = capability_auth_storage[0..capability_auth_count];
+        var placement: remote_capabilities.DiscoveryHeaders = .{};
+        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = 1, .media = true });
         if (cfg_parsed.value.provider == .antfly) {
             const endpoint = cfg_parsed.value.resolvedUrl() orelse return error.InvalidTranscribingConfig;
             const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
@@ -4321,11 +4356,12 @@ pub const Runtime = struct {
         ) catch |err| {
             if (err == error.InferenceCapabilitiesStale and cfg_parsed.value.provider == .antfly) {
                 const endpoint = cfg_parsed.value.resolvedUrl() orelse return err;
-                try self.capabilityCache().invalidate(
+                try self.capabilityCache().invalidateLease(
                     endpoint,
                     antfly_model.?,
                     .transcribe,
                     capability_auth_headers,
+                    try remote_capabilities.LeaseIdentity.init(execution_cfg.capability_token, execution_cfg.capability_revision),
                 );
             }
             return err;
@@ -4405,10 +4441,11 @@ pub const Runtime = struct {
         try self.routeExtractorConfig(alloc, &cfg);
 
         const local_extractor = isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl());
+        const discovery_shape = try producerDiscoveryShape(alloc, &.{request});
         const capabilities = if (local_extractor)
             try self.extractorCapabilities(alloc, cfg)
         else
-            try self.bindExtractorCapabilityLease(alloc, &cfg);
+            try self.bindExtractorCapabilityLease(alloc, &cfg, discovery_shape);
         if (capabilities) |resolved| {
             try validateExtractorInvocation(
                 alloc,
@@ -4475,7 +4512,7 @@ pub const Runtime = struct {
             ),
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
-                try self.invalidateExtractorCapabilityLease(alloc, cfg);
+                try self.invalidateExtractorCapabilityLease(alloc, cfg, discovery_shape);
             if (err == error.InvalidExtractionResponse) return error.InvalidExtractorResponse;
             return err;
         };
@@ -4889,6 +4926,36 @@ fn inlineImagePixelsAlloc(
     defer alloc.free(decoded);
     std.base64.standard.Decoder.decode(decoded, encoded) catch return error.InvalidDataURI;
     return try inference_work.encodedImagePixels(declared_mime_type, decoded);
+}
+
+fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {
+    var shape: remote_capabilities.DiscoveryShape = .{ .items = @max(1, requests.len), .output_tokens = 0 };
+    const Part = struct { type: ?[]const u8 = null };
+    for (requests) |request| {
+        if (request.media.len != 0) {
+            shape.media = true;
+            break;
+        }
+        if (request.source_parts_json) |raw| {
+            const parts_json = std.mem.trimStart(u8, raw, " \t\r\n");
+            if (parts_json.len == 0 or parts_json[0] != '[') continue;
+            // Skip content fields, including potentially large inline media.
+            var parts = try std.json.parseFromSlice([]const Part, alloc, parts_json, .{ .ignore_unknown_fields = true });
+            defer parts.deinit();
+            for (parts.value) |part| {
+                const kind = part.type orelse continue;
+                if (std.mem.eql(u8, kind, "image_url") or std.mem.eql(u8, kind, "media")) {
+                    shape.media = true;
+                    return shape;
+                }
+            }
+        }
+    }
+    return shape;
+}
+
+fn discoveryOutputTokens(value: ?i64) ?usize {
+    return if (value) |tokens| std.math.cast(usize, tokens) else null;
 }
 
 fn remoteAttachmentTransport(capabilities: ?inference_work.InferenceCapabilities, fallback: inference_work.AttachmentTransport) inference_work.AttachmentTransport {
@@ -7744,8 +7811,14 @@ test "asset producer runtime batches compatible antfly generator requests" {
     defer io_impl.deinit();
     const io = io_impl.io();
 
+    const Fixture = struct {
+        fn discover(req: httpx.testing_mod.RequestInfo) !void {
+            if (req.header(remote_capabilities.discovery_shape_header)) |shape|
+                try std.testing.expectEqualStrings("1:2:0:24", shape);
+        }
+    };
     var server = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .GET, .path = "/ai/v1/models", .respond = .{
+        .{ .method = .GET, .path = "/ai/v1/models", .assert_request = Fixture.discover, .respond = .{
             .body = "{\"generators\":{\"local-generator\":{\"inputs\":[\"text\",\"image\"],\"inference_capabilities\":{\"task\":\"generate\",\"batch\":{\"mode\":\"serial_compatibility\",\"preferred_items\":8,\"max_items\":128,\"max_encoded_bytes\":104857600,\"max_decoded_pixels\":0,\"max_media_parts_per_item\":8,\"per_item_failures\":true}}}}}",
         } },
         .{ .method = .POST, .path = "/generate/batch", .assert_request = expectAntflyGenerateBatchRequest, .respond = .{
@@ -7801,8 +7874,10 @@ test "asset producer runtime batches compatible antfly generator requests" {
     };
 
     try group.concurrent(io, Fiber.run, .{ alloc, producer, cfg_json, &results, &run_err });
-    try server.handleOne();
-    try server.handleOne();
+    try server.handleOne(); // planning
+    try server.handleOne(); // invocation
+    try server.handleOne(); // execution
+    try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
     try group.await(io);
     if (run_err) |err| return err;
     defer {

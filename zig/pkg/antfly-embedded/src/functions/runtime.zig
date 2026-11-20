@@ -1970,6 +1970,9 @@ test "decision functions generated statement renews revoked leases without chang
             try authority(req);
             // The concrete execution is /generate, not /generate/batch.
             try std.testing.expectEqualStrings("model=vision&task=generate&operation=generate", req.query);
+            if (req.header(remote_capabilities.discovery_shape_header)) |shape| {
+                try std.testing.expectEqualStrings("1:1:0:256", shape);
+            }
             if (revoked and scenario == .cancelled_discovery) cancellation.store(true, .release);
         }
         fn request(req: httpx.testing_mod.RequestInfo) !void {
@@ -2026,7 +2029,7 @@ test "decision functions generated statement renews revoked leases without chang
         const requests = [_]decisions.Request{.{ .decider = "judge", .questions = questions, .input = .{ .text = "A B" } }};
         const first = try runtime.provider().evaluateBatch(alloc, &requests);
         try std.testing.expectEqualStrings("same", first[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
-        try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
+        try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
         Fixture.revoked = true;
         routes[0].respond.headers = &Fixture.headers;
         if (scenario == .changed_model) {
@@ -2046,7 +2049,7 @@ test "decision functions generated statement renews revoked leases without chang
                 // Reuse the replacement on a later window, including after the
                 // result has been normalized against the original snapshot.
                 _ = try runtime.provider().evaluateBatch(alloc, &requests);
-                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
                 try std.testing.expectEqual(@as(usize, 4), server.routeHitCount(1));
                 try std.testing.expectEqual(@as(u64, 32), runtime.input_tokens);
                 try std.testing.expectEqual(@as(u64, 16), runtime.output_tokens);
@@ -2054,21 +2057,21 @@ test "decision functions generated statement renews revoked leases without chang
             .changed_model, .changed_limit, .missing_lease => {
                 try std.testing.expectError(error.InferenceCapabilitiesStale, second);
                 try std.testing.expectError(error.InferenceCapabilitiesStale, runtime.provider().evaluateBatch(alloc, &requests));
-                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
                 try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
             },
             .outage => {
                 try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, second);
-                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
                 try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
                 routes[0].respond.status = 200;
                 _ = try runtime.provider().evaluateBatch(alloc, &requests);
-                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 4), server.routeHitCount(0));
                 try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(1));
             },
             .repeatedly_stale => {
                 try std.testing.expectError(error.InferenceCapabilitiesStale, second);
-                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
                 try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(1));
             },
             .cancelled, .cancelled_discovery => {
@@ -2076,12 +2079,12 @@ test "decision functions generated statement renews revoked leases without chang
                 // rather than waiting for its delayed response to complete.
                 try std.testing.expect(@import("antfly_platform").time.monotonicNs() - started < 2 * std.time.ns_per_s);
                 if (second) |_| return error.TestExpectedError else |err| try std.testing.expect(err == error.Cancelled or err == error.Canceled);
-                try std.testing.expectEqual(@as(usize, if (scenario == .cancelled) 1 else 2), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, if (scenario == .cancelled) 2 else 3), server.routeHitCount(0));
                 try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
             },
             .upstream_failure => {
                 if (second) |_| return error.TestExpectedError else |_| {}
-                try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
+                try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
                 try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
             },
         }
@@ -2258,7 +2261,11 @@ test "decision functions late stale responses preserve a renewed execution lease
         // while the first invocation's stale response is still in flight.
         try servers.concurrent(io, Fixture.serve, .{ &server, &server_failure });
         const cache = &runtime.resolved_generators.items[0].cache;
-        const headers: []const [2][]const u8 = &.{ .{ "Authorization", "Bearer fixture" }, .{ "X-Antfly-Source-Table", "docs" } };
+        const headers: []const [2][]const u8 = &.{
+            .{ "Authorization", "Bearer fixture" },
+            .{ "X-Antfly-Source-Table", "docs" },
+            .{ remote_capabilities.discovery_shape_header, "1:1:0:256" },
+        };
         try cache.invalidateLease(server.baseUrl(), "vision", .generate, headers, try remote_capabilities.LeaseIdentity.init("old-token", Fixture.revision));
         const replacement_token = if (rotate_revision_only) "old-token" else "new-token";
         const replacement_revision = if (rotate_revision_only) "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" else Fixture.revision;
@@ -2277,7 +2284,7 @@ test "decision functions late stale responses preserve a renewed execution lease
         try calls.await(io);
         if (client_failure) |err| return err;
         _ = try runtime.provider().evaluateBatch(alloc, &requests);
-        try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+        try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
         try std.testing.expectEqual(@as(usize, 4), server.routeHitCount(1));
         const retained = try cache.routingToken(server.baseUrl(), "vision", .generate, headers);
         try std.testing.expectEqualStrings(replacement_token, retained.?.slice());
