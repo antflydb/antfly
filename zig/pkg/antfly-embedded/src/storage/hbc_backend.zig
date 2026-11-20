@@ -65,6 +65,7 @@ pub const OpenedBackend = union(enum) {
 pub const NativeBackend = struct {
     read_only: bool = false,
     storage: lsm_backend.Storage,
+    storage_lease: ?lsm_backend.NativeStorageLease,
     storage_owner: ?*lsm_backend.NativeStorage,
     storage_owner_allocator: Allocator,
     root_dir: []u8,
@@ -109,6 +110,7 @@ pub const NativeBackend = struct {
         native.* = .{
             .read_only = options.backend_options.backend.read_only,
             .storage = storage,
+            .storage_lease = null,
             .storage_owner = storage_owner,
             .storage_owner_allocator = alloc,
             .root_dir = owned_root,
@@ -123,13 +125,16 @@ pub const NativeBackend = struct {
         const backend = handle.backend;
         const root = try alloc.dupe(u8, backend.root_dir orelse return error.MissingStorageRoot);
         errdefer alloc.free(root);
-        const storage = backend.storage orelse return error.MissingStorageBackend;
+        var lease = try backend.acquireNativeStorageLease();
+        errdefer if (lease) |*retained| retained.deinit();
+        const storage = if (lease) |*retained| retained.storage() else backend.storage orelse return error.MissingStorageBackend;
         const native = try alloc.create(NativeBackend);
         // The native backend still opens files and mappings after the LSM
         // closes. A lease keeps existing handles alive through shutdown, but
         // only the storage owner keeps admission open for new handles.
         native.* = .{
             .storage = storage,
+            .storage_lease = lease,
             .storage_owner = null,
             .storage_owner_allocator = std.heap.page_allocator,
             .root_dir = root,
@@ -138,6 +143,7 @@ pub const NativeBackend = struct {
     }
 
     pub fn close(self: *NativeBackend, alloc: Allocator) void {
+        if (self.storage_lease) |*lease| lease.deinit();
         if (self.storage_owner) |owner| {
             owner.deinit();
             self.storage_owner_allocator.destroy(owner);

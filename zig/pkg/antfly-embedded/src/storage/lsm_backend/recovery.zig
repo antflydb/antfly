@@ -114,7 +114,7 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
             backend.storage = owned.storage();
         }
     }
-    errdefer cleanup(BackendType, backend, false);
+    errdefer cleanup(BackendType, backend, false, null);
     errdefer finishOpenFailure(BackendType, backend);
     if (@hasDecl(BackendType, "initOutputCleanup")) try backend.initOutputCleanup();
 
@@ -275,15 +275,15 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     }
 }
 
-pub fn close(comptime BackendType: type, backend: *BackendType) void {
-    cleanup(BackendType, backend, true);
+pub fn close(comptime BackendType: type, backend: *BackendType, storage_destination: ?*?*storage_io.NativeStorage) void {
+    cleanup(BackendType, backend, true, storage_destination);
 }
 
 pub fn abandon(comptime BackendType: type, backend: *BackendType) void {
-    cleanup(BackendType, backend, false);
+    cleanup(BackendType, backend, false, null);
 }
 
-fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred: bool) void {
+fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred: bool, storage_destination: ?*?*storage_io.NativeStorage) void {
     if (finalize_deferred and backend.root_dir != null and !backend.options.backend.read_only) {
         if (@hasDecl(BackendType, "finalizeDeferredStorageWork")) {
             backend.finalizeDeferredStorageWork() catch |err| {
@@ -414,7 +414,9 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         backend.releaseRootLockState();
     }
     if (@hasField(BackendType, "storage_owner")) {
-        if (backend.storage_owner) |owned| {
+        if (storage_destination) |destination| {
+            destination.* = backend.storage_owner;
+        } else if (backend.storage_owner) |owned| {
             owned.deinit();
             std.heap.page_allocator.destroy(owned);
         }

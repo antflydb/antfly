@@ -1987,11 +1987,7 @@ pub const Backend = struct {
         self.background_executor.drain();
         self.waitForGenerationReadersToDrain();
         self.releaseTrackedResourceUsage();
-        if (destination) |owner| {
-            owner.* = self.storage_owner;
-            self.storage_owner = null;
-        }
-        recovery_mod.close(Backend, self);
+        recovery_mod.close(Backend, self, destination);
     }
 
     pub fn abandonAfterCrash(self: *Backend) void {
@@ -2808,6 +2804,13 @@ pub const Backend = struct {
     pub fn snapshotNativeStorageStats(self: *const Backend) ?storage_io.NativeStorageStats {
         const owner = self.storage_owner orelse return null;
         return owner.snapshotStats();
+    }
+
+    /// Supplies a shareable native storage view for the successor backend.
+    /// The owner must also move at close to continue admitting new handles.
+    pub fn acquireNativeStorageLease(self: *Backend) !?storage_io.NativeStorage.Lease {
+        const owner = self.storage_owner orelse return null;
+        return try owner.acquireLease();
     }
 
     pub fn maintenanceDebtHint(self: *const Backend) u64 {
