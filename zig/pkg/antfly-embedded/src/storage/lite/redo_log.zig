@@ -26,20 +26,30 @@
 //! the format, the writer, and the reader can be reviewed and tested
 //! (`zig test redo_log.zig`) before any commit-path code changes.
 //!
-//! Record layout (§9.2), 24-byte header plus payload:
+//! Record layout (§9.2), 32-byte header plus payload:
 //!
 //! ```
 //! offset  bytes  field
 //! 0       4      magic ("ARDO")
-//! 4       2      format_version
-//! 6       2      header_len (always `header_len`; present for forward
-//!                compatibility the same way lsm_backend/wal.zig's own
-//!                record header carries one)
+//! 4       2      format_version (2; version 1 records stop at offset 24)
+//! 6       2      header_len (32 for version 2, 24 for version 1; present
+//!                for forward compatibility the same way
+//!                lsm_backend/wal.zig's own record header carries one)
 //! 8       4      payload_len
 //! 12      8      commit_sequence
 //! 20      4      crc32 (antfly_hash.Crc32.hash(payload); payload only)
-//! 24      -      payload
+//! 24      8      salt (version 2): chosen at random each time the log
+//!                restarts at its first byte, and repeated in every record
+//!                until the next restart, like SQLite's WAL salts. A
+//!                version 1 record's salt is 0.
+//! 32      -      payload
 //! ```
+//!
+//! A log restart zeroes only the first header, so the retired log's bytes
+//! stay past the live tail. A crash can keep a record and lose its end
+//! marker, exposing them; replay ends the log at the first header whose
+//! salt differs from the log's first record, which retired bytes (written
+//! before the salt was chosen) cannot match.
 //!
 //! Recovery (§9.5) distinguishes two failure modes while replaying a
 //! region, matching `lsm_backend/wal.zig`'s own torn-tail-vs-corrupt
@@ -56,6 +66,7 @@
 //!   unlike a torn tail, a caller must never advance past this point.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const File = std.Io.File;
@@ -68,9 +79,13 @@ pub const magic: u32 = 0x4f445241;
 /// Independent of native.zig's own `format_version`/`indexed_format_version`
 /// (§9.5) -- this is the redo-record wire format version, not the page
 /// format version.
-pub const format_version: u16 = 1;
+pub const format_version: u16 = 2;
 
-pub const header_len: usize = 24;
+pub const header_len: usize = 32;
+
+/// A version 1 header: the first 24 bytes, with no salt.
+pub const legacy_format_version: u16 = 1;
+pub const legacy_header_len: usize = 24;
 
 pub const RecordHeader = struct {
     magic: u32 = magic,
@@ -79,6 +94,7 @@ pub const RecordHeader = struct {
     payload_len: u32,
     commit_sequence: u64,
     crc32: u32,
+    salt: u64 = 0,
 
     pub fn encode(self: RecordHeader, out: *[header_len]u8) void {
         std.mem.writeInt(u32, out[0..4], self.magic, .little);
@@ -87,6 +103,7 @@ pub const RecordHeader = struct {
         std.mem.writeInt(u32, out[8..12], self.payload_len, .little);
         std.mem.writeInt(u64, out[12..20], self.commit_sequence, .little);
         std.mem.writeInt(u32, out[20..24], self.crc32, .little);
+        std.mem.writeInt(u64, out[24..32], self.salt, .little);
     }
 
     /// Decodes a header from exactly `header_len` bytes. Does not validate
@@ -94,6 +111,12 @@ pub const RecordHeader = struct {
     /// since a plain decode needs to be callable on untrusted bytes without
     /// deciding what to do about them.
     pub fn decode(bytes: *const [header_len]u8) RecordHeader {
+        var header = decodeLegacy(bytes[0..legacy_header_len]);
+        if (header.format_version != legacy_format_version) header.salt = std.mem.readInt(u64, bytes[24..32], .little);
+        return header;
+    }
+
+    fn decodeLegacy(bytes: *const [legacy_header_len]u8) RecordHeader {
         return .{
             .magic = std.mem.readInt(u32, bytes[0..4], .little),
             .format_version = std.mem.readInt(u16, bytes[4..6], .little),
@@ -103,12 +126,51 @@ pub const RecordHeader = struct {
             .crc32 = std.mem.readInt(u32, bytes[20..24], .little),
         };
     }
+
+    /// The header's length when it is a well-formed header of a known
+    /// version, else null.
+    fn knownLength(self: RecordHeader) ?usize {
+        if (self.magic != magic) return null;
+        if (self.format_version == format_version and self.header_len == header_len) return header_len;
+        if (self.format_version == legacy_format_version and self.header_len == legacy_header_len) return legacy_header_len;
+        return null;
+    }
 };
+
+/// Reads the header at `offset` (`available` bytes remain there). Version
+/// 1 headers are 24 bytes and carry salt 0.
+const ReadHeader = union(enum) {
+    /// Fewer bytes than a header needs.
+    short,
+    /// An all-zero header: the log's end.
+    zero,
+    /// Not a header of any known version.
+    garbage,
+    record: struct { header: RecordHeader, len: usize },
+};
+
+fn readHeaderAt(file: File, io: Io, offset: u64, available: u64) !ReadHeader {
+    if (available < legacy_header_len) return .short;
+    var buf: [header_len]u8 = @splat(0);
+    const want: usize = @intCast(@min(available, header_len));
+    const got = try file.readPositionalAll(io, buf[0..want], offset);
+    if (got < legacy_header_len) return .short;
+    if (isAllZero(buf[0..legacy_header_len])) return .zero;
+    var header = RecordHeader.decodeLegacy(buf[0..legacy_header_len]);
+    const len = header.knownLength() orelse return .garbage;
+    if (len == header_len) {
+        if (got < header_len) return .short;
+        header.salt = std.mem.readInt(u64, buf[24..32], .little);
+    }
+    return .{ .record = .{ .header = header, .len = len } };
+}
 
 pub const AppendError = error{
     /// The record (header + payload) would not fit in
     /// `[base_offset, base_offset + capacity)`.
     LogFull,
+    /// Reading the log's first header (for its salt) failed.
+    ReadFailed,
     /// `commit_sequence` was not exactly one greater than the last
     /// appended record's sequence (or, for the first append after
     /// `initAt`, not exactly one greater than `start_after_sequence`).
@@ -129,6 +191,9 @@ pub const Writer = struct {
     /// Offset of the next write, relative to `base_offset`.
     tail: u64 = 0,
     last_sequence: ?u64 = null,
+    /// This run of the log's salt; learned on the first append (see
+    /// `currentSalt`).
+    salt: ?u64 = null,
 
     /// Starts a fresh (empty) log region.
     pub fn init(file: File, io: Io, base_offset: u64, capacity: u64) Writer {
@@ -155,6 +220,30 @@ pub const Writer = struct {
         return self.capacity - self.tail;
     }
 
+    /// The salt every record of this run of the log carries: a fresh random
+    /// one when the log restarts at its first byte, else the salt of the
+    /// record there (0 for a version 1 log), whose run this writer resumes.
+    fn currentSalt(self: *Writer) error{ReadFailed}!u64 {
+        if (self.salt) |salt| return salt;
+        const salt: u64 = if (self.tail == 0) self.freshSalt() else switch (readHeaderAt(self.file, self.io, self.base_offset, self.capacity) catch return error.ReadFailed) {
+            .record => |first| first.header.salt,
+            // A resumed log always starts with a record; without one,
+            // nothing can share this run.
+            .short, .zero, .garbage => self.freshSalt(),
+        };
+        self.salt = salt;
+        return salt;
+    }
+
+    fn freshSalt(self: *Writer) u64 {
+        while (true) {
+            var bytes: [8]u8 = undefined;
+            osRandom(&bytes, self);
+            const salt = std.mem.readInt(u64, &bytes, .little);
+            if (salt != 0) return salt;
+        }
+    }
+
     /// Appends one record. Does not fsync -- callers batch many appends
     /// behind one `sync()` call, matching §9.3's "one append, one fsync"
     /// per group.
@@ -171,6 +260,7 @@ pub const Writer = struct {
             .payload_len = @intCast(payload.len),
             .commit_sequence = commit_sequence,
             .crc32 = Crc32.hash(payload),
+            .salt = try self.currentSalt(),
         };
         header.encode(&header_buf);
 
@@ -287,6 +377,46 @@ pub const Writer = struct {
         self.last_sequence = m.last_sequence;
     }
 };
+
+/// Fills `out` from the OS without `Io.random`, which takes the `Io`'s own
+/// mutex and so must not run under every caller this writer has.
+fn osRandom(out: []u8, writer: *const Writer) void {
+    switch (builtin.os.tag) {
+        .linux => {
+            var filled: usize = 0;
+            while (filled < out.len) {
+                const rc = std.os.linux.getrandom(out[filled..].ptr, out.len - filled, 0);
+                if (std.os.linux.errno(rc) != .SUCCESS) break;
+                filled += rc;
+            }
+            if (filled == out.len) return;
+        },
+        .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => {
+            std.c.arc4random_buf(out.ptr, out.len);
+            return;
+        },
+        else => {},
+    }
+    // No OS source: still distinct per run (time, process, position).
+    const Local = struct {
+        var counter = std.atomic.Value(u64).init(0);
+    };
+    var hasher = std.hash.Wyhash.init(Local.counter.fetchAdd(1, .monotonic));
+    hasher.update(std.mem.asBytes(&writer.base_offset));
+    hasher.update(std.mem.asBytes(&writer.last_sequence));
+    const address = @intFromPtr(writer);
+    hasher.update(std.mem.asBytes(&address));
+    var instant: std.c.timespec = undefined;
+    if (builtin.link_libc and std.c.clock_gettime(.MONOTONIC, &instant) == 0) hasher.update(std.mem.asBytes(&instant));
+    var value = hasher.final();
+    var i: usize = 0;
+    while (i < out.len) : (i += 8) {
+        const chunk = std.mem.asBytes(&value);
+        const n = @min(8, out.len - i);
+        @memcpy(out[i..][0..n], chunk[0..n]);
+        value = std.hash.Wyhash.hash(value, chunk);
+    }
+}
 
 /// Writes `first` then `second` contiguously at `offset`, in one vectored
 /// write when the kernel takes it all.
@@ -451,52 +581,37 @@ pub fn replayBounded(
     var payload_buf = std.ArrayList(u8).empty;
     defer payload_buf.deinit(allocator);
 
+    // The salt of the first record this scan reads; see the module doc.
+    var run_salt: ?u64 = null;
+
     while (true) {
         const remaining = capacity - pos;
-        if (remaining < header_len) {
+        const header, const record_header_len = switch (try readHeaderAt(file, io, base_offset + pos, remaining)) {
+            // Too little room left for any header: the region's end.
+            .short => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (remaining < legacy_header_len) .end_of_region else .torn_tail },
+            // Untouched, preallocated space or an end marker: a clean end,
+            // never a torn write (a real torn write leaves whatever bytes
+            // landed, not all-zero bytes).
+            .zero => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region },
+            // A log restart zeroes only the first header, so a restarted
+            // log keeps the retired log's bytes past its live tail; a crash
+            // that keeps a record but loses its end marker exposes them.
+            // Unparseable bytes after the first record of a log that has
+            // been folded (the only kind ever restarted) may be the middle
+            // of a retired record: the end, as in point-in-time recovery.
+            .garbage => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (pos != 0 and (start_after_sequence orelse 0) != 0) .end_of_region else .corrupt_record },
+            .record => |record| .{ record.header, record.len },
+        };
+        // A retired record, or retired payload bytes that happen to read as
+        // a header, never carries this run's salt (chosen after they were
+        // written): the log ends here. And a retired sequence is at or
+        // below the fold that retired it, below every live record, so after
+        // a live record a header that does not move forward is the end too.
+        // What retired bytes cannot present stays corrupt below: this
+        // run's salt with the next sequence and a bad checksum, or a gap.
+        if (run_salt) |salt| if (header.salt != salt) {
             return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region };
-        }
-
-        var header_buf: [header_len]u8 = undefined;
-        // `readPositionalAll` never raises an error for a short read at
-        // end-of-file -- it just returns fewer bytes than requested
-        // (std.Io.File.zig's own `readPositionalAll`: `if (amt == 0) break;`
-        // then returns the accumulated count). A genuine I/O error still
-        // propagates as `err` from the `try` below.
-        const got = try file.readPositionalAll(io, &header_buf, base_offset + pos);
-        if (got < header_len) {
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .torn_tail };
-        }
-
-        if (isAllZero(&header_buf)) {
-            // Untouched, preallocated space: a clean end, never a torn
-            // write (a real torn write leaves whatever bytes landed, not
-            // all-zero bytes, since the region is zero-filled ahead of any
-            // append).
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region };
-        }
-
-        const header = RecordHeader.decode(&header_buf);
-        // A log reset zeroes only the first header, so a reused log keeps
-        // the retired log's bytes past its live tail. Every append writes
-        // an end marker, but a crash can keep a record and lose its marker
-        // (they are not ordered by a sync), exposing those bytes. They are
-        // recognizable without any extra write, much as SQLite's WAL salts
-        // and RocksDB's recycled-log numbers are:
-        //
-        // - A retired record's sequence is at or below the fold that
-        //   retired it, below every live record. After a live record, a
-        //   header that does not move forward is the retired log: its end.
-        // - Unparseable bytes after the first record of a log that has
-        //   been folded (the only kind ever reset) may be the middle of a
-        //   retired record: also the end, as in point-in-time recovery.
-        //
-        // What stale bytes can never present stays corrupt: the next
-        // sequence with a bad checksum, or a gap.
-        const reusable = pos != 0 and (start_after_sequence orelse 0) != 0;
-        if (header.magic != magic or header.format_version != format_version or header.header_len != header_len) {
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (reusable) .end_of_region else .corrupt_record };
-        }
+        };
         if (count != 0 and header.commit_sequence <= last_sequence.?) {
             return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region };
         }
@@ -509,7 +624,7 @@ pub fn replayBounded(
         }
 
         const payload_len: u64 = header.payload_len;
-        if (header_len + payload_len > remaining) {
+        if (record_header_len + payload_len > remaining) {
             // The header is well-formed but claims more payload than the
             // region has left. A real write can never produce this (the
             // writer checks `remaining()` before appending), so this is
@@ -524,7 +639,7 @@ pub fn replayBounded(
         payload_buf.clearRetainingCapacity();
         try payload_buf.resize(allocator, payload_len);
         if (payload_len != 0) {
-            const payload_got = try file.readPositionalAll(io, payload_buf.items, base_offset + pos + header_len);
+            const payload_got = try file.readPositionalAll(io, payload_buf.items, base_offset + pos + record_header_len);
             if (payload_got < payload_len) {
                 return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .torn_tail };
             }
@@ -600,7 +715,8 @@ pub fn replayBounded(
             count += 1;
         }
 
-        pos += header_len + payload_len;
+        if (run_salt == null) run_salt = header.salt;
+        pos += record_header_len + payload_len;
         last_sequence = header.commit_sequence;
     }
 }
@@ -611,19 +727,26 @@ pub fn replayBounded(
 /// authority tell "another writer reset this log and appended" apart from
 /// "the old log is still here" without scanning it.
 pub fn firstRecordNewerThan(allocator: Allocator, file: File, io: Io, base_offset: u64, capacity: u64, floor: u64) !?u64 {
-    if (capacity < header_len) return null;
-    var header_buf: [header_len]u8 = undefined;
-    if (try file.readPositionalAll(io, &header_buf, base_offset) < header_len) return null;
-    if (isAllZero(&header_buf)) return null;
-    const header = RecordHeader.decode(&header_buf);
-    if (header.magic != magic or header.format_version != format_version or header.header_len != header_len) return null;
+    const header, const len = switch (try readHeaderAt(file, io, base_offset, capacity)) {
+        .record => |record| .{ record.header, record.len },
+        .short, .zero, .garbage => return null,
+    };
     if (header.commit_sequence <= floor) return null;
-    if (header_len + @as(u64, header.payload_len) > capacity) return null;
+    if (len + @as(u64, header.payload_len) > capacity) return null;
     const payload = try allocator.alloc(u8, header.payload_len);
     defer allocator.free(payload);
-    if (try file.readPositionalAll(io, payload, base_offset + header_len) < payload.len) return null;
+    if (try file.readPositionalAll(io, payload, base_offset + len) < payload.len) return null;
     if (Crc32.hash(payload) != header.crc32) return null;
     return header.commit_sequence;
+}
+
+/// The salt of the record at the log's start (0 for a version 1 record),
+/// or null when the log does not start with a record.
+pub fn firstRecordSalt(file: File, io: Io, base_offset: u64, capacity: u64) !?u64 {
+    return switch (try readHeaderAt(file, io, base_offset, capacity)) {
+        .record => |record| record.header.salt,
+        .short, .zero, .garbage => null,
+    };
 }
 
 fn isAllZero(bytes: []const u8) bool {
@@ -908,6 +1031,62 @@ test "replay ends a reused log at retired bytes mid-record past a lost end marke
     try testing.expectEqual(StopReason.corrupt_record, fresh.stop_reason);
 }
 
+test "replay ends a reused log at a forged header inside a retired payload" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    // A retired payload holding what reads as the next live record: a
+    // well-formed header with a forward sequence over a payload whose
+    // checksum matches. Only the salt tells it apart.
+    const live = "live";
+    const forged_payload = "zz";
+    const forged: RecordHeader = .{ .payload_len = forged_payload.len, .commit_sequence = 8, .crc32 = Crc32.hash(forged_payload) };
+    var retired_payload: [live.len + header_len + forged_payload.len]u8 = undefined;
+    @memset(retired_payload[0..live.len], 'x');
+    forged.encode(retired_payload[live.len..][0..header_len]);
+    @memcpy(retired_payload[live.len + header_len ..], forged_payload);
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(1, &retired_payload);
+
+    const end = try reuseLosingMarker(io, region.file, capacity, 7, live);
+    const outcome = try replayBounded(testing.allocator, region.file, io, 0, capacity, 5, null, 6, null, null);
+    try testing.expectEqual(@as(u64, 1), outcome.valid_count);
+    try testing.expectEqual(@as(?u64, 7), outcome.last_sequence);
+    try testing.expectEqual(end, outcome.valid_bytes);
+    try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
+}
+
+test "replay reads a version 1 log and its writer continues it" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var pos: u64 = 0;
+    for ([_][]const u8{ "one", "two" }, 1..) |payload, sequence| {
+        var buf: [header_len]u8 = undefined;
+        const legacy: RecordHeader = .{ .format_version = legacy_format_version, .header_len = legacy_header_len, .payload_len = @intCast(payload.len), .commit_sequence = sequence, .crc32 = Crc32.hash(payload) };
+        legacy.encode(&buf);
+        try region.file.writePositionalAll(io, buf[0..legacy_header_len], pos);
+        try region.file.writePositionalAll(io, payload, pos + legacy_header_len);
+        pos += legacy_header_len + payload.len;
+    }
+    const legacy_outcome = try replayBounded(testing.allocator, region.file, io, 0, capacity, null, null, null, null, null);
+    try testing.expectEqual(@as(u64, 2), legacy_outcome.valid_count);
+    try testing.expectEqual(pos, legacy_outcome.valid_bytes);
+
+    // Resuming a version 1 log continues its run: salt 0.
+    var writer = Writer.initAt(region.file, io, 0, capacity, pos, 2);
+    try writer.append(3, "three");
+    try testing.expectEqual(@as(?u64, 0), writer.salt);
+    const outcome = try replayBounded(testing.allocator, region.file, io, 0, capacity, null, null, null, null, null);
+    try testing.expectEqual(@as(u64, 3), outcome.valid_count);
+    try testing.expectEqual(@as(?u64, 3), outcome.last_sequence);
+    try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
+}
+
 test "replay keeps rejecting what retired bytes can never be" {
     const io = testing.io;
     const capacity: u64 = 4096;
@@ -918,7 +1097,7 @@ test "replay keeps rejecting what retired bytes can never be" {
     try writer.append(11, "a");
     try writer.append(12, "b");
     // The next sequence with a bad checksum, after a folded baseline.
-    const bad: RecordHeader = .{ .payload_len = 1, .commit_sequence = 13, .crc32 = 0xdeadbeef };
+    const bad: RecordHeader = .{ .payload_len = 1, .commit_sequence = 13, .crc32 = 0xdeadbeef, .salt = writer.salt.? };
     var header_buf: [header_len]u8 = undefined;
     bad.encode(&header_buf);
     try region.file.writePositionalAll(io, &header_buf, writer.tail);
@@ -928,7 +1107,7 @@ test "replay keeps rejecting what retired bytes can never be" {
     try testing.expectEqual(StopReason.corrupt_record, next.stop_reason);
 
     // A gap past the live tail.
-    const gap: RecordHeader = .{ .payload_len = 1, .commit_sequence = 15, .crc32 = Crc32.hash("c") };
+    const gap: RecordHeader = .{ .payload_len = 1, .commit_sequence = 15, .crc32 = Crc32.hash("c"), .salt = writer.salt.? };
     gap.encode(&header_buf);
     try region.file.writePositionalAll(io, &header_buf, writer.tail);
     const gapped = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
@@ -1009,7 +1188,7 @@ test "a gap among superseded records is tolerated -- a real checkpoint can consu
     // standing in for "checkpoint sequence 12 landed but was never
     // logged."
     var header_buf: [header_len]u8 = undefined;
-    const skip: RecordHeader = .{ .payload_len = 1, .commit_sequence = 13, .crc32 = Crc32.hash("b") };
+    const skip: RecordHeader = .{ .payload_len = 1, .commit_sequence = 13, .crc32 = Crc32.hash("b"), .salt = writer.salt.? };
     skip.encode(&header_buf);
     try region.file.writePositionalAll(io, &header_buf, writer.tail);
     try region.file.writePositionalAll(io, "b", writer.tail + header_len);
@@ -1065,7 +1244,7 @@ test "a superseded run followed by new records tolerates exactly the checkpoint'
     try writer2.append(4, "gamma");
     try writer2.sync();
     var header_buf: [header_len]u8 = undefined;
-    const skip: RecordHeader = .{ .payload_len = 1, .commit_sequence = 6, .crc32 = Crc32.hash("d") };
+    const skip: RecordHeader = .{ .payload_len = 1, .commit_sequence = 6, .crc32 = Crc32.hash("d"), .salt = writer2.salt.? };
     skip.encode(&header_buf);
     try region2.file.writePositionalAll(io, &header_buf, writer2.tail);
     try region2.file.writePositionalAll(io, "d", writer2.tail + header_len);
@@ -1168,7 +1347,7 @@ test "replay stops at a torn tail and reports the valid prefix" {
     // not, while the much larger payload write that follows it is what the
     // crash interrupts.
     var header_buf: [header_len]u8 = undefined;
-    const torn: RecordHeader = .{ .payload_len = @intCast(capacity), .commit_sequence = 3, .crc32 = 0 };
+    const torn: RecordHeader = .{ .payload_len = @intCast(capacity), .commit_sequence = 3, .crc32 = 0, .salt = writer.salt.? };
     torn.encode(&header_buf);
     try region.file.writePositionalAll(io, &header_buf, good_tail);
 
@@ -1292,7 +1471,7 @@ test "a torn append leaves a benign end of region, never a false corrupt_record,
         // it is -- a real, unrecoverable corruption -- since nothing else
         // can tell this apart from genuine on-disk damage.
         var header_buf: [header_len]u8 = undefined;
-        const header: RecordHeader = .{ .payload_len = 3, .commit_sequence = 2, .crc32 = Crc32.hash("two") };
+        const header: RecordHeader = .{ .payload_len = 3, .commit_sequence = 2, .crc32 = Crc32.hash("two"), .salt = writer.salt.? };
         header.encode(&header_buf);
         try region.file.writePositionalAll(io, &header_buf, good_tail);
 
@@ -1347,7 +1526,7 @@ test "replay detects a sequence gap as corruption, not a torn tail" {
     // directly, the way independent corruption (not a local bug in this
     // writer) would produce it.
     var header_buf: [header_len]u8 = undefined;
-    const skip: RecordHeader = .{ .payload_len = 4, .commit_sequence = 3, .crc32 = Crc32.hash("skip") };
+    const skip: RecordHeader = .{ .payload_len = 4, .commit_sequence = 3, .crc32 = Crc32.hash("skip"), .salt = writer.salt.? };
     skip.encode(&header_buf);
     try region.file.writePositionalAll(io, &header_buf, writer.tail);
     try region.file.writePositionalAll(io, "skip", writer.tail + header_len);
@@ -1383,7 +1562,7 @@ test "replay rejects an unsupported format version as corrupt, not benign" {
     try writer.sync();
 
     var header_buf: [header_len]u8 = undefined;
-    var bad: RecordHeader = .{ .payload_len = 2, .commit_sequence = 2, .crc32 = Crc32.hash("hi") };
+    var bad: RecordHeader = .{ .payload_len = 2, .commit_sequence = 2, .crc32 = Crc32.hash("hi"), .salt = writer.salt.? };
     bad.format_version = format_version + 1;
     bad.encode(&header_buf);
     try region.file.writePositionalAll(io, &header_buf, writer.tail);
