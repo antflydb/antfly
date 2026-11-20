@@ -45710,6 +45710,7 @@ pub const DB = struct {
             .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
+            .share_legacy_matches = true,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
         });
@@ -48887,6 +48888,10 @@ pub const DB = struct {
         visitor_ctx: ?*anyopaque = null,
         visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction = undefined,
         alloc: Allocator = undefined,
+        exceptional: []const []const u8 = &.{},
+        exceptional_index: usize = 0,
+        reverse: bool = false,
+        stopped: bool = false,
         observed_rows: ?*usize = null,
 
         fn scan(raw: ?*anyopaque, alloc: Allocator, options: db_query_search.MatchAllCandidateCollectOptions, visitor_ctx: ?*anyopaque, visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) !void {
@@ -48922,6 +48927,24 @@ pub const DB = struct {
             defer if (range_lower) |key| alloc.free(key);
             const range_upper = if (owner_range.end.len != 0) try mappingKeyAlloc(alloc, owner_range.end, kind) else null;
             defer if (range_upper) |key| alloc.free(key);
+            var exceptional: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer exceptional.deinit(alloc);
+            for (options.exceptionalPrimaryKeys()) |id| {
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                if (!owner_range.contains(id)) continue;
+                if (options.primary_key_start_after) |start| if (!std.mem.lessThan(u8, start, id)) continue;
+                if (options.primary_key_stop_before) |stop| if (!std.mem.lessThan(u8, id, stop)) continue;
+                try exceptional.append(alloc, id);
+            }
+            std.mem.sort([]const u8, exceptional.items, {}, struct {
+                fn less(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.lessThan(u8, left, right);
+                }
+            }.less);
+            self.reverse = options.primary_key_reverse;
+            if (self.reverse) std.mem.reverse([]const u8, exceptional.items);
+            self.exceptional = exceptional.items;
+            defer self.exceptional = &.{};
             var lower: []const u8 = lower_owned orelse &prefix;
             if (range_lower) |key| if (std.mem.lessThan(u8, lower, key)) {
                 lower = key;
@@ -48936,11 +48959,15 @@ pub const DB = struct {
             {
                 var probe = try self.db.core.store.beginProbeTxn();
                 defer probe.abort();
-                if (try doc_identity.loadNamespaceTxn(&probe) == null) return;
+                if (try doc_identity.loadNamespaceTxn(&probe) == null) {
+                    _ = try self.drainExceptionalBefore(null);
+                    return;
+                }
             }
             var txn = try self.db.core.store.beginCurrentScanTxn();
             defer txn.abort();
             try self.db.core.store.scanReadTxnWithContext(&txn, lower, upper, .{ .reverse = options.primary_key_reverse }, self, visit);
+            if (!self.stopped) _ = try self.drainExceptionalBefore(null);
         }
 
         fn mappingKeyAlloc(alloc: Allocator, id: []const u8, kind: u8) ![]u8 {
@@ -48966,10 +48993,36 @@ pub const DB = struct {
                 if (!state.isVisibleAt(generation)) return .@"continue";
             } else if (!state.isLive()) return error.InvalidDocIdentity;
             const body = key[2 .. key.len - 2];
-            if (try internal_keys.decodeBodyView(body)) |id| return self.visitId(id);
+            if (try internal_keys.decodeBodyView(body)) |id| return self.visitOrderedId(id);
             const id = try internal_keys.decodeBodyAlloc(self.alloc, body);
             defer self.alloc.free(id);
-            return self.visitId(id);
+            return self.visitOrderedId(id);
+        }
+
+        fn drainExceptionalBefore(self: *@This(), bound: ?[]const u8) !docstore_mod.DocStore.ScanAction {
+            while (self.exceptional_index < self.exceptional.len) {
+                const id = self.exceptional[self.exceptional_index];
+                if (bound) |exclusive| {
+                    const order = std.mem.order(u8, id, exclusive);
+                    if (order == .eq or order == (if (self.reverse) std.math.Order.lt else .gt)) break;
+                }
+                self.exceptional_index += 1;
+                try db_query_search.checkSearchRequestDeadline(self.req);
+                if (try self.visitId(id) == .stop) {
+                    self.stopped = true;
+                    return .stop;
+                }
+            }
+            return .@"continue";
+        }
+
+        fn visitOrderedId(self: *@This(), id: []const u8) !docstore_mod.DocStore.ScanAction {
+            if (try self.drainExceptionalBefore(id) == .stop) return .stop;
+            while (self.exceptional_index < self.exceptional.len and
+                std.mem.eql(u8, self.exceptional[self.exceptional_index], id)) self.exceptional_index += 1;
+            const action = try self.visitId(id);
+            self.stopped = action == .stop;
+            return action;
         }
 
         fn visitId(self: *@This(), id: []const u8) !docstore_mod.DocStore.ScanAction {
@@ -157144,9 +157197,10 @@ test "optional numeric range prefilters dense search without a text index" {
     });
     defer db.close();
     try db.addIndex(.{ .name = "dv", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
+    try db.addIndex(.{ .name = "dv_two", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}" });
     try db.batch(.{ .sync_level = .full_index, .writes = &.{
-        .{ .key = "a", .value = "{\"rank\":9007199254740992,\"_embeddings\":{\"dv\":[1,0]}}" },
-        .{ .key = "b", .value = "{\"rank\":9007199254740993,\"_embeddings\":{\"dv\":[0.9,0.1]}}" },
+        .{ .key = "a", .value = "{\"rank\":9007199254740992,\"_embeddings\":{\"dv\":[1,0],\"dv_two\":[1,0]}}" },
+        .{ .key = "b", .value = "{\"rank\":9007199254740993,\"_embeddings\":{\"dv\":[0.9,0.1],\"dv_two\":[0.9,0.1]}}" },
     } });
 
     // Keep the physical row and its vector while removing one primary
@@ -157177,6 +157231,57 @@ test "optional numeric range prefilters dense search without a text index" {
     try std.testing.expectEqualStrings("a", legacy_scope.legacy.doc_keys[0]);
 
     const all_range = "{\"range\":{\"rank\":{\"gte\":9007199254740992}}}";
+    var shared = (try DB.resolveStructuredDocFilterForComposedCallback(&db, a, .{
+        .filter_query_json = all_range,
+    })).?;
+    defer shared.deinit(a);
+    try std.testing.expectEqual(@as(?usize, 1), shared.include.estimatedCardinality());
+    try std.testing.expectEqualStrings("a", shared.legacy_include.doc_keys[0]);
+
+    var shared_dense = try db.searchDenseProfiled(a, .{
+        .index_name = "dv",
+        .limit = 2,
+        .include_stored = false,
+        .resolved_doc_filter = &shared,
+    }, .{ .vector = &.{ 1, 0 }, .k = 2 });
+    defer shared_dense.result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), shared_dense.result.hits.len);
+
+    var composed = try db.search(a, .{
+        .limit = 2,
+        .include_stored = false,
+        .filter_query_json = all_range,
+        .dense_queries = &.{
+            .{ .name = "first", .index_name = "dv", .query = .{ .vector = &.{ 1, 0 }, .k = 2 } },
+            .{ .name = "second", .index_name = "dv_two", .query = .{ .vector = &.{ 1, 0 }, .k = 2 } },
+        },
+    });
+    defer composed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), composed.hits.len);
+    try std.testing.expect(!std.mem.eql(u8, composed.hits[0].id, composed.hits[1].id));
+
+    var sorted = try db.search(a, .{
+        .limit = 2,
+        .include_stored = false,
+        .filter_query_json = all_range,
+        .order_by = &.{.{ .field = "_id" }},
+    });
+    defer sorted.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sorted.hits.len);
+    try std.testing.expectEqualStrings("a", sorted.hits[0].id);
+    try std.testing.expectEqualStrings("b", sorted.hits[1].id);
+
+    var previous = try db.search(a, .{
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = all_range,
+        .order_by = &.{.{ .field = "_id" }},
+        .search_before = &.{.{ .string = "b" }},
+    });
+    defer previous.deinit();
+    try std.testing.expectEqual(@as(usize, 1), previous.hits.len);
+    try std.testing.expectEqualStrings("a", previous.hits[0].id);
+
     for ([_]struct { exclusion: []const u8, count: usize }{
         .{ .exclusion = "", .count = 2 },
         .{ .exclusion = all_range, .count = 0 },
@@ -157213,6 +157318,49 @@ test "optional numeric range prefilters dense search without a text index" {
         try std.testing.expectEqualStrings("b", result.result.hits[0].id);
         try std.testing.expectEqual(@as(u64, 1), result.profile.native_filter_candidate_count);
     }
+}
+
+test "optional numeric range keeps mixed primary matches for native field sorting" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("range-mixed-primary-sort");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{});
+    defer db.close();
+    try db.setSchema(.{
+        .default_type = "doc",
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{
+            .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+        } }},
+        .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .numeric, .doc_values = true, .sortable = true } }},
+        .index_sort = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
+    });
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .sync_level = .full_index, .writes = &.{
+        .{ .key = "legacy", .value = "{\"body\":\"beacon\",\"rank\":1}" },
+        .{ .key = "mapped", .value = "{\"body\":\"beacon\",\"rank\":2}" },
+    } });
+    const forward = try internal_keys.identityDocToOrdinalKeyAlloc(a, "legacy");
+    defer a.free(forward);
+    const live = try internal_keys.identityLiveDocToOrdinalKeyAlloc(a, "legacy");
+    defer a.free(live);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(forward);
+        try txn.delete(live);
+        try txn.commit();
+    }
+    var sorted = try db_query_search.searchMatchAll(a, .{
+        .index_name = "ft",
+        .limit = 2,
+        .include_stored = false,
+        .filter_query_json = "{\"range\":{\"rank\":{\"gte\":1}}}",
+        .order_by = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
+    }, db.matchAllExecutor());
+    defer sorted.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sorted.hits.len);
+    try std.testing.expectEqualStrings("legacy", sorted.hits[0].id);
+    try std.testing.expectEqualStrings("mapped", sorted.hits[1].id);
 }
 
 test "optional numeric range graph admission preserves legacy indexed predicates" {

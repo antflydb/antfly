@@ -594,6 +594,12 @@ pub const MatchAllCandidateCollectOptions = struct {
     primary_key_stop_before: ?[]const u8 = null,
     primary_key_reverse: bool = false,
     stop_after_accepted: ?usize = null,
+
+    pub fn exceptionalPrimaryKeys(self: MatchAllCandidateCollectOptions) []const []const u8 {
+        const constraints = self.constraints orelse return &.{};
+        if (constraints.legacy_filter != .doc_keys) return &.{};
+        return constraints.legacy_filter.doc_keys;
+    }
 };
 
 pub const MatchAllCandidateConsumer = *const fn (
@@ -1956,6 +1962,7 @@ pub const StructuredFilterResolverExecutor = struct {
     lookup_live_identity: ?*const fn (?*anyopaque, Allocator, []const []const u8, ?u64) anyerror!?[]?doc_set.DocOrdinal = null,
     primary_residual_scope: ?PrimaryResidualScope = null,
     range_projection_current: ?RangeProjectionCurrent = null,
+    share_legacy_matches: bool = false,
     retain_primary_legacy_union: bool = false,
     retain_legacy_union: bool = false,
     legacy_matches: ?*doc_set.ResolvedDocSet = null,
@@ -2016,6 +2023,10 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     var owns_out = true;
     defer if (owns_out) out.deinit(alloc);
     var changed = false;
+    // Graph and explicit text-scope predicates have their own identity
+    // algebra. Keep the mixed result on the retrieval-only shared path.
+    const can_share_legacy = executor.share_legacy_matches and req.graph_queries.len == 0 and
+        req.doc_filter_bindings.len == 0 and req.return_mode == .parent and req.filter_text == null and req.exclusion_text == null;
 
     if (req.filter_text) |filter_text| {
         var include = (try collectFullTextResolvedDocSetAlloc(alloc, req, active_executor, filter_text)) orelse return null;
@@ -2038,7 +2049,9 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     if (req.filter_query_json.len > 0) {
         var scoped = req;
         scoped.resolved_doc_filter = &out;
-        var include = (try collectStructuredFilterResolvedDocSetAlloc(alloc, scoped, active_executor, req.filter_query_json)) orelse return null;
+        var resolver = active_executor;
+        if (can_share_legacy) resolver.legacy_matches = &out.legacy_include;
+        var include = (try collectStructuredFilterResolvedDocSetAlloc(alloc, scoped, resolver, req.filter_query_json)) orelse return null;
         defer include.deinit(alloc);
         const next_include = (try combineComposedScope(alloc, active_executor, &out.include, &include, .intersection, control)) orelse return null;
         out.include.deinit(alloc);
@@ -2049,7 +2062,15 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     if (req.exclusion_query_json.len > 0) {
         var scoped = req;
         scoped.resolved_doc_filter = &out;
-        var exclude = (try collectStructuredFilterResolvedDocSetAlloc(alloc, scoped, active_executor, req.exclusion_query_json)) orelse return null;
+        var resolver = active_executor;
+        if (can_share_legacy) resolver.legacy_matches = &out.legacy_exclude;
+        var exclude = (if (out.legacy_include != .none)
+            try collectExclusionWithinResidualUnion(alloc, req, resolver, &.{
+                .primary_include = out.include,
+                .legacy_filter = out.legacy_include,
+            })
+        else
+            try collectStructuredFilterResolvedDocSetAlloc(alloc, scoped, resolver, req.exclusion_query_json)) orelse return null;
         defer exclude.deinit(alloc);
         const next_exclude = (try combineComposedScope(alloc, active_executor, &out.exclude, &exclude, .union_set, control)) orelse return null;
         out.exclude.deinit(alloc);
@@ -2474,7 +2495,9 @@ fn deriveNativeDocIdConstraintsAlloc(
     errdefer out.deinit(alloc);
 
     if (resolvedDocFilterFromRequest(req)) |filter| {
-        try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, filter, active_executor);
+        if (filter.hasLegacy()) {
+            try applySharedResidualUnionAlloc(alloc, &out, filter, active_executor);
+        } else try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, filter, active_executor);
     }
 
     const resolved_request_doc_ids = !active_executor.project_ordinals_to_doc_ids and active_executor.resolve_doc_ids_to_doc_set != null;
@@ -2719,7 +2742,7 @@ fn deriveNativeDocIdConstraintsAlloc(
 
     if (active_executor.text_snapshot_for_doc_num_projection) |snapshot| {
         const control = query_mod.ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
-        try mergeLegacyResidualTextDocNumsAlloc(alloc, snapshot, &out, control);
+        try mergeLegacyResidualTextDocNumsAlloc(alloc, snapshot, &out, control, .text_doc_num);
     }
 
     if (active_executor.apply_live_all_docs and !out.positive_filter) {
@@ -2830,6 +2853,7 @@ fn mergeLegacyResidualTextDocNumsAlloc(
     snapshot: *const index_mod.IndexSnapshot,
     out: *NativeDocIdConstraints,
     control: query_mod.ExecutionControl,
+    space: enum { text_doc_num, primary_ordinal },
 ) !void {
     const includes = if (out.legacy_filter == .doc_keys) out.legacy_filter.doc_keys else &.{};
     const excludes = if (out.legacy_exclude == .doc_keys) out.legacy_exclude.doc_keys else &.{};
@@ -2850,6 +2874,9 @@ fn mergeLegacyResidualTextDocNumsAlloc(
     }
     var documents = try snapshot.collectGraphKeyFrontierDocNumsAlloc(alloc, frontier, control);
     defer documents.deinit();
+    var included = try std.DynamicBitSetUnmanaged.initEmpty(alloc, frontier.count());
+    defer included.deinit(alloc);
+    for (includes) |key| included.set(slots.get(key).?);
     var excluded = std.DynamicBitSetUnmanaged{};
     defer excluded.deinit(alloc);
     excluded = try std.DynamicBitSetUnmanaged.initEmpty(alloc, frontier.count());
@@ -2862,10 +2889,15 @@ fn mergeLegacyResidualTextDocNumsAlloc(
     var matches = documents.ordinals.iterator();
     while (matches.next()) |match| {
         try control.check();
-        if (excluded.isSet(match.value_ptr.*)) {
-            try removed.append(alloc, match.key_ptr.*);
-        } else {
-            try added.append(alloc, match.key_ptr.*);
+        const number = switch (space) {
+            .text_doc_num => match.key_ptr.*,
+            .primary_ordinal => (try snapshot.docOrdinal(match.key_ptr.*)) orelse return error.UnsupportedQueryRequest,
+        };
+        if (excluded.isSet(match.value_ptr.*)) try removed.append(alloc, number);
+        // When projecting into ordinal space, address inclusion and
+        // exclusion independently so aliasing cannot erase an inclusion.
+        if (space == .primary_ordinal or !excluded.isSet(match.value_ptr.*)) {
+            if (included.isSet(match.value_ptr.*)) try added.append(alloc, number);
         }
     }
     // An excluded key needs no positive candidate even if it matched both.
@@ -3035,6 +3067,37 @@ fn applyLiveAllDocFilterToNativeConstraintsAlloc(
     const resolved_stored_filters_before_live_filter = out.resolved_stored_filters;
     try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &owned_filter, already_filtered_executor);
     out.resolved_stored_filters = resolved_stored_filters_before_live_filter;
+}
+
+fn applySharedResidualUnionAlloc(alloc: Allocator, out: *NativeDocIdConstraints, filter: *const doc_set.ResolvedDocFilter, executor: StructuredFilterResolverExecutor) !void {
+    var ready = executor;
+    ready.live_filter_doc_set = null;
+    ready.nonvisible_doc_set = null;
+    if (!executor.retain_legacy_union) {
+        if (executor.resolve_doc_set_doc_ids == null) return error.UnsupportedQueryRequest;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var flattened = doc_set.ResolvedDocFilter{};
+        defer flattened.deinit(alloc);
+        flattened.include = if (filter.legacy_include == .none)
+            try doc_set.cloneAlloc(alloc, &filter.include)
+        else
+            try mergeResidualPopulationMatches(alloc, scratch.allocator(), executor, &filter.include, &filter.legacy_include);
+        flattened.exclude = if (filter.legacy_exclude == .none)
+            try doc_set.cloneAlloc(alloc, &filter.exclude)
+        else
+            try mergeResidualPopulationMatches(alloc, scratch.allocator(), executor, &filter.exclude, &filter.legacy_exclude);
+        return applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &flattened, ready);
+    }
+    out.legacy_filter = try doc_set.cloneAlloc(alloc, &filter.legacy_include);
+    out.legacy_exclude = try doc_set.cloneAlloc(alloc, &filter.legacy_exclude);
+    if (executor.retain_primary_legacy_union and filter.legacy_include != .none) {
+        out.primary_include = try doc_set.cloneAlloc(alloc, &filter.include);
+        out.positive_filter = true;
+        out.resolved_stored_filters = true;
+        return applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &.{ .exclude = filter.exclude }, ready);
+    }
+    return applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, filter, ready);
 }
 
 fn applyResolvedDocFilterToNativeConstraintsAlloc(
@@ -15987,7 +16050,8 @@ pub fn searchTextQuery(
             if (filter.provesMembership(snapshot, effective_req.text_navigation_plan)) base_search_query = .{ .match_all = {} };
         }
     }
-    const can_apply_live_all_docs = !chunk_backed or (try snapshot.hasDocOrdinalCoverage());
+    const shared_legacy = if (resolvedDocFilterFromRequest(effective_req)) |filter| filter.hasLegacy() else false;
+    const can_apply_live_all_docs = !shared_legacy and (!chunk_backed or try snapshot.hasDocOrdinalCoverage());
     var apply_broad_live_all_docs = can_apply_live_all_docs;
     var live_visibility: ?TextLiveVisibilityProducer = null;
     defer if (live_visibility) |*visibility| visibility.deinit();
@@ -16024,7 +16088,7 @@ pub fn searchTextQuery(
     var resolved_ordinal_filter_handled = false;
     if (!suppress_native_resolved_doc_filter and resolvedTextDocNumFilterFromRequest(effective_req) == null) {
         if (resolvedDocFilterFromRequest(effective_req)) |filter| {
-            if (filter.include != .doc_keys and filter.exclude != .doc_keys and try snapshot.hasDocOrdinalCoverage()) {
+            if (!filter.hasLegacy() and filter.include != .doc_keys and filter.exclude != .doc_keys and try snapshot.hasDocOrdinalCoverage()) {
                 resolved_ordinal_filter_handled = true;
                 if (filter.include != .all or filter.exclude != .none) {
                     if (live_visibility == null) live_visibility = .{
@@ -16083,7 +16147,7 @@ pub fn searchTextQuery(
         constraint_req.filter_query_json = "";
     };
     if (indexed_exclude != null) constraint_req.exclusion_query_json = "";
-    constraint_req.resolved_doc_filter = null;
+    if (!shared_legacy or suppress_native_resolved_doc_filter) constraint_req.resolved_doc_filter = null;
     constraint_req.full_text = null;
     if (suppress_native_resolved_doc_filter) {
         // deriveNativeDocIdConstraintsAlloc's own filter_query_json/
@@ -16117,7 +16181,7 @@ pub fn searchTextQuery(
         .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
         .retain_legacy_union = !chunk_backed and
-            (constraint_req.filter_query_json.len != 0 or constraint_req.exclusion_query_json.len != 0) and
+            (shared_legacy or constraint_req.filter_query_json.len != 0 or constraint_req.exclusion_query_json.len != 0) and
             try snapshot.hasDocOrdinalCoverage(),
         .text_snapshot_for_doc_num_projection = snapshot,
         .apply_live_all_docs = apply_broad_live_all_docs,
@@ -16135,7 +16199,7 @@ pub fn searchTextQuery(
         // postprocess below via effective_req.resolved_doc_filter.
     } else if (resolvedTextDocNumFilterFromRequest(effective_req)) |filter| {
         try applyResolvedTextDocNumFilterAlloc(alloc, &native_constraints, filter);
-    } else if (if (resolved_ordinal_filter_handled) null else resolvedDocFilterFromRequest(effective_req)) |filter| {
+    } else if (if (resolved_ordinal_filter_handled or shared_legacy) null else resolvedDocFilterFromRequest(effective_req)) |filter| {
         try applyResolvedDocFilterToTextDocNumsAlloc(alloc, snapshot, &native_constraints, filter, .{
             .ctx = executor.ctx,
             .text_index_entry = executor.text_index_entry,
@@ -22237,7 +22301,7 @@ pub fn searchMatchAll(
     else
         SortExecutionPlan{ .kind = .none };
 
-    const compact_primary = exec_req.order_by.len == 0 and !requestHasSortPageOptions(exec_req);
+    const compact_primary = exec_req.order_by.len == 0 or planned_sort.kind == .id_seek;
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, exec_req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
@@ -22249,7 +22313,7 @@ pub fn searchMatchAll(
         .live_filter_doc_set = executor.live_filter_doc_set,
         .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
-        .retain_legacy_union = compact_primary,
+        .retain_legacy_union = true,
         .retain_primary_legacy_union = compact_primary,
         .apply_live_all_docs = true,
     });
@@ -22317,6 +22381,16 @@ pub fn searchMatchAll(
             try dropMissingStoredSearchHits(alloc, &out, "match_all");
         }
         return out;
+    }
+
+    if (!compact_primary and (native_constraints.legacy_filter != .none or native_constraints.legacy_exclude != .none)) {
+        const entry = (try executor.text_index_entry(executor.ctx, exec_req.index_name)) orelse return error.UnsupportedQueryRequest;
+        const snapshot = entry.persistent.acquireSnapshot();
+        defer snapshot.release();
+        const control = QueryExecutionControl{ .cancellation = exec_req.cancellation, .deadline_ns = exec_req.execution_deadline_ns };
+        try mergeLegacyResidualTextDocNumsAlloc(alloc, snapshot, &native_constraints, control, .primary_ordinal);
+        native_constraints.legacy_filter.deinit(alloc);
+        native_constraints.legacy_exclude.deinit(alloc);
     }
 
     if (exec_req.order_by.len > 0 and

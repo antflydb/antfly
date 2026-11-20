@@ -1717,13 +1717,17 @@ pub fn applyStoredSearchPatternFilters(
         if (has_positive_doc_ids) {
             keep = resolvedPatternContainsHit(native_include, hit);
         }
+        const legacy_include = if (resolved_filter) |filter| filter.legacy_include == .doc_keys and
+            containsDocId(filter.legacy_include.doc_keys, match_id) else false;
+        const legacy_exclude = if (resolved_filter) |filter| filter.legacy_exclude == .doc_keys and
+            containsDocId(filter.legacy_exclude.doc_keys, match_id) else false;
         if (keep and resolved_include.active) {
-            keep = resolvedPatternContainsHit(resolved_include, hit);
+            keep = legacy_include or resolvedPatternContainsHit(resolved_include, hit);
         }
         if (keep and req.exclude_doc_ids.len > 0) {
             keep = !resolvedPatternContainsHit(native_exclude, hit);
         }
-        if (keep and resolved_exclude.all) {
+        if (keep and (resolved_exclude.all or legacy_exclude)) {
             keep = false;
         }
         if (keep and resolved_exclude.active) {
