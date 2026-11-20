@@ -26,6 +26,7 @@ const replay_chunks = @import("../db/derived/replay_chunks.zig");
 const apply_state = @import("../db/derived/apply_state.zig");
 const replay_reference = @import("../db/derived/replay_reference.zig");
 const internal_keys = @import("../internal_keys.zig");
+const replay_journal_format = @import("../replay_journal_format.zig");
 const native = @import("native.zig");
 const inode_lock = @import("inode_lock.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
@@ -9198,33 +9199,50 @@ fn storeJournalCreditLedger(txn: anytype, ledger: internal_keys.JournalCreditLed
     try txn.put(internal_keys.journal_credit_ledger_key[0..], raw[0..]);
 }
 
-/// WS5: Antfly is unreleased, so this build never speaks the pre-ledger v1
-/// replay layout. An already-initialized journal without a current version
-/// marker is refused outright rather than silently reinterpreted.
-fn requireCurrentReplayJournalFormat(txn: anytype) !void {
-    const raw = txn.get(internal_keys.replay_journal_format_version_key[0..]) catch |err| switch (err) {
-        error.NotFound => return error.UnsupportedReplayJournalFormat,
-        else => return err,
+/// The credit ledger a scan of every lane entry reproduces: what the base
+/// revision's journal is charged when it is upgraded in place.
+fn scanReplayJournalLedger(txn: *Txn) !internal_keys.JournalCreditLedger {
+    var ledger: internal_keys.JournalCreditLedger = .{};
+    const kinds = [_]u8{internal_keys.replay_all_kind} ++ comptime blk: {
+        var ordinals: [replay_hints.len]u8 = undefined;
+        for (replay_hints, 0..) |hint, i| ordinals[i] = replayHintOrdinal(hint);
+        break :blk ordinals;
     };
-    const version = internal_keys.decodeReplayJournalFormatVersion(raw) orelse return error.UnsupportedReplayJournalFormat;
-    if (version != internal_keys.replay_journal_format_v2) return error.UnsupportedReplayJournalFormat;
+    for (kinds) |kind| {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const lower = internal_keys.replayRangeLower(kind, 0);
+        const upper = internal_keys.replayRangeUpper(kind);
+        cursor.setUpperBound(&upper);
+        var entry = cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        while (true) {
+            if (entry.key.len < 2 or entry.key[0] != internal_keys.replay_namespace or entry.key[1] != kind) break;
+            if (entry.key.len == internal_keys.replay_key_len) {
+                ledger = ledger.charged(replay_journal_format.entryCharge(entry.key.len, entry.value.len), 1);
+            }
+            entry = cursor.next() catch |err| switch (err) {
+                error.NotFound => break,
+                else => return err,
+            };
+        }
+    }
+    return ledger;
 }
 
 fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
     _ = alloc;
-    // WS5: refuse a pre-ledger journal on the very first real append it
-    // sees, and stamp a fresh journal with the current version so every
-    // later append (and the retirement transactions that eventually charge
-    // against it) can tell the layout apart from an old one. Low-level tests
-    // that hand-construct replay state never call this function, so they
-    // are unaffected either way.
-    const already_initialized = (txn.get(internal_keys.replay_meta_init_key[0..]) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    }) != null;
-    if (already_initialized) {
-        try requireCurrentReplayJournalFormat(txn);
-    } else {
+    // WS5: upgrade a journal the base revision initialized in this append's
+    // own transaction (a DocStore open normally already did it), and stamp
+    // a fresh journal with the current version so every later append (and
+    // the retirement transactions that eventually charge against it) can
+    // tell the layout apart from an old one.
+    const journal_state = try replay_journal_format.state(txn);
+    if (journal_state == .legacy) try replay_journal_format.upgrade(txn, try scanReplayJournalLedger(txn));
+    const already_initialized = journal_state != .absent;
+    if (!already_initialized) {
         const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_v2);
         try txn.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
     }
@@ -9369,23 +9387,31 @@ fn forEachReplayLane(
         inner_ctx: *anyopaque,
         inner_callback: backend_erased.Store.ReplayCallback,
         max_matched: usize,
+        max_scanned: usize,
         stats: backend_types.ReplayLaneIterationStats = .{ .scan_batches = 1, .fallback_used = true },
 
         fn handle(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            // A record whose hints cannot be read stops the scan before it:
+            // `last_sequence` only ever names a record this lane has
+            // verified, so a worker persisting it never skips a mutation it
+            // still needs.
+            const mask = try change_journal_mod.encodedRecordHintMask(payload);
+            if ((mask & change_journal_mod.singleHintMask(self.hint)) != 0) {
+                var decoded = try change_journal_mod.decodeRecord(self.store.allocator, payload);
+                defer decoded.deinit();
+                const filtered = try encodeReplayPayloadForHint(self.store.allocator, decoded.record, self.hint);
+                defer self.store.allocator.free(filtered);
+                try self.inner_callback(self.inner_ctx, sequence, filtered);
+                self.stats.matched_entries += 1;
+            }
             self.stats.scanned_entries += 1;
             self.stats.last_sequence = sequence;
-            const mask = change_journal_mod.encodedRecordHintMask(payload) catch 0;
-            if ((mask & change_journal_mod.singleHintMask(self.hint)) == 0) return;
-
-            var decoded = try change_journal_mod.decodeRecord(self.store.allocator, payload);
-            defer decoded.deinit();
-            const filtered = try encodeReplayPayloadForHint(self.store.allocator, decoded.record, self.hint);
-            defer self.store.allocator.free(filtered);
-            try self.inner_callback(self.inner_ctx, sequence, filtered);
-
-            self.stats.matched_entries += 1;
             if (self.max_matched != 0 and self.stats.matched_entries >= self.max_matched) {
+                return ReplayLaneFilterStop.ReplayLaneFilterStop;
+            }
+            if (self.max_scanned != 0 and self.stats.scanned_entries >= self.max_scanned) {
+                self.stats.scan_budget_exhausted = true;
                 return ReplayLaneFilterStop.ReplayLaneFilterStop;
             }
         }
@@ -9396,12 +9422,26 @@ fn forEachReplayLane(
         .inner_ctx = context,
         .inner_callback = callback,
         .max_matched = max_entries,
+        .max_scanned = replayLaneFilterScanBudget(max_entries),
     };
     _ = forEachReplayLaneRaw(store, prefix, internal_keys.replay_all_kind, from_sequence, 0, &filter, Filter.handle) catch |err| switch (err) {
         ReplayLaneFilterStop.ReplayLaneFilterStop => {},
         else => return err,
     };
     return filter.stats;
+}
+
+/// A bounded hint-lane batch also bounds the shared entries it scans for
+/// matches, so a sparse consumer never walks (and holds a snapshot across)
+/// the whole backlog in one read. The batch then ends at the last scanned
+/// sequence with `scan_budget_exhausted` set, and the caller resumes there.
+/// An unbounded request (`max_entries == 0`) still scans to the end.
+const replay_lane_filter_scan_budget_min: usize = 256;
+const replay_lane_filter_scan_budget_max: usize = 4096;
+
+fn replayLaneFilterScanBudget(max_entries: usize) usize {
+    if (max_entries == 0) return 0;
+    return @min(@max(max_entries *| 32, replay_lane_filter_scan_budget_min), replay_lane_filter_scan_budget_max);
 }
 
 fn collectReplayEntries(store: *Store, prefix: []const u8, alloc: Allocator, from_sequence: u64) ![]backend_types.ReplayEntry {
@@ -19055,4 +19095,136 @@ test "lite reclamation issue1431 canceled automatic rewrites retry without file 
     defer a.free(value);
     try std.testing.expectEqualStrings("retained value", value);
     try std.testing.expect((try store.file.check()).valid);
+}
+
+fn encodeTestReplayRecord(allocator: Allocator, sequence: u64, hint: change_journal_mod.TargetHint) ![]u8 {
+    const changed_doc_keys = [_][]const u8{"doc:a"};
+    const hints = [_]change_journal_mod.TargetHint{hint};
+    return try change_journal_mod.encodeRecord(allocator, .{
+        .sequence = sequence,
+        .changed_doc_keys = changed_doc_keys[0..],
+        .target_hints = hints[0..],
+    });
+}
+
+test "lite native docstore upgrades a base-revision replay journal on its next append" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-replay-legacy.aflite");
+    defer allocator.free(path);
+
+    const first = try encodeTestReplayRecord(allocator, 1, .full_text);
+    defer allocator.free(first);
+    const second = try encodeTestReplayRecord(allocator, 2, .full_text);
+    defer allocator.free(second);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    {
+        // The base revision's layout: no format marker, no credit ledger,
+        // `next_sequence` under its old key, and a per-hint lane copy.
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(internal_keys.replay_meta_init_key[0..], "");
+        var next_raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &next_raw, 2, .little);
+        try txn.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
+        const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+        try txn.put(all_key[0..], first);
+        const lane_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+        try txn.put(lane_key[0..], first);
+        try txn.commit();
+    }
+
+    var runtime = try store.runtimeStore(allocator);
+    defer runtime.deinit();
+    try runtime.appendReplayOpaque(allocator, 2, second);
+    try std.testing.expectEqual(@as(u64, 3), runtime.nextReplaySequence(0));
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(replay_journal_format.legacy_next_sequence_key[0..]));
+    const version = internal_keys.decodeReplayJournalFormatVersion(try read.get(internal_keys.replay_journal_format_version_key[0..]));
+    try std.testing.expectEqual(@as(?u32, internal_keys.replay_journal_format_v2), version);
+    const ledger = internal_keys.JournalCreditLedger.decode(try read.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 3), ledger.records);
+    try std.testing.expectEqual(@as(u64, 3 * internal_keys.replay_key_len + 2 * first.len + second.len), ledger.bytes);
+}
+
+test "lite native docstore hint lane stops at a record whose hints cannot be read" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-replay-malformed.aflite");
+    defer allocator.free(path);
+
+    const first = try encodeTestReplayRecord(allocator, 1, .full_text);
+    defer allocator.free(first);
+    const third = try encodeTestReplayRecord(allocator, 3, .full_text);
+    defer allocator.free(third);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    var runtime = try store.runtimeStore(allocator);
+    defer runtime.deinit();
+    try runtime.appendReplayOpaque(allocator, 1, first);
+    // A truncated binary record: its hint mask cannot be read.
+    try runtime.appendReplayOpaque(allocator, 2, "CJ2\x00\x01");
+    try runtime.appendReplayOpaque(allocator, 3, third);
+
+    const Seen = struct {
+        sequences: [4]u64 = undefined,
+        count: usize = 0,
+        fn handle(ctx: *@This(), sequence: u64, _: []const u8) !void {
+            ctx.sequences[ctx.count] = sequence;
+            ctx.count += 1;
+        }
+    };
+    var seen: Seen = .{};
+    try std.testing.expectError(error.EndOfStream, runtime.forEachReplayLaneFrom(replayHintOrdinal(.full_text), 1, 0, &seen, Seen.handle));
+    try std.testing.expectEqual(@as(usize, 1), seen.count);
+    try std.testing.expectEqual(@as(u64, 1), seen.sequences[0]);
+}
+
+test "lite native docstore sparse hint lane batches are bounded by scanned entries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-replay-sparse.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    var runtime = try store.runtimeStore(allocator);
+    defer runtime.deinit();
+    const total: u64 = 300;
+    var sequence: u64 = 1;
+    while (sequence <= total) : (sequence += 1) {
+        const payload = try encodeTestReplayRecord(allocator, sequence, if (sequence == total) .full_text else .dense_vector);
+        defer allocator.free(payload);
+        try runtime.appendReplayOpaque(allocator, sequence, payload);
+    }
+
+    const Seen = struct {
+        last: u64 = 0,
+        fn handle(ctx: *@This(), seq: u64, _: []const u8) !void {
+            ctx.last = seq;
+        }
+    };
+    var seen: Seen = .{};
+    var from: u64 = 1;
+    var batches: usize = 0;
+    while (seen.last == 0) : (batches += 1) {
+        const stats = try runtime.forEachReplayLaneFrom(replayHintOrdinal(.full_text), from, 1, &seen, Seen.handle);
+        try std.testing.expect(stats.scanned_entries <= replay_lane_filter_scan_budget_min);
+        if (seen.last == 0) {
+            try std.testing.expect(stats.scan_budget_exhausted);
+            try std.testing.expect(stats.last_sequence >= from);
+            from = stats.last_sequence + 1;
+        }
+        try std.testing.expect(batches < 4);
+    }
+    try std.testing.expectEqual(total, seen.last);
+    try std.testing.expectEqual(@as(usize, 2), batches);
 }

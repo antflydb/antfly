@@ -2611,8 +2611,10 @@ fn catchUpWindowWithOrdered(
     var seen_sequences = std.AutoHashMapUnmanaged(u64, void).empty;
     defer seen_sequences.deinit(gpa);
     ctx.seen_sequences = &seen_sequences;
-    _ = try replay_source.forEachMatchingRecord(gpa, from_sequence, .resolution, max_records, &ctx, Ctx.consume);
-    return ctx.max_seen;
+    const stats = try replay_source.forEachMatchingRecord(gpa, from_sequence, .resolution, max_records, &ctx, Ctx.consume);
+    // A batch bounded by scanned work can end on records without this hint;
+    // they need nothing, so progress covers them too.
+    return @max(ctx.max_seen, stats.last_sequence);
 }
 
 /// Erased shard store + ownership, shared with the promotion runtime so both
