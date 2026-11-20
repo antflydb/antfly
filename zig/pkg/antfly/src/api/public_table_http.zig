@@ -146,6 +146,7 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteQueryError = error{
+        PinnedIndexRequiresSemanticSearch,
         RowPolicyAuthenticationRequired,
         RowPolicyCatalogChanged,
         RowPolicyUnsupported,
@@ -1952,6 +1953,8 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
     };
 }
 
+pub const pinned_index_query_message = "revision-pinned embedding indexes require semantic_search instead of pre-computed query vectors";
+
 pub fn handleTableQueryRequest(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -1979,6 +1982,7 @@ pub fn handleTableQueryRequest(
     };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
+            error.PinnedIndexRequiresSemanticSearch => return .{ .status = 400, .body = try alloc.dupe(u8, pinned_index_query_message) },
             error.RowPolicyAuthenticationRequired => return .{ .status = 403, .body = try alloc.dupe(u8, "row policy authentication required") },
             error.RowPolicyCatalogChanged => return .{ .status = 409, .body = try alloc.dupe(u8, "row policy publication changed") },
             error.RowPolicyUnsupported => return .{ .status = 409, .body = try alloc.dupe(u8, "row policy does not support this query") },

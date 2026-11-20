@@ -1942,6 +1942,7 @@ pub const SemanticStatusResolver = struct {
             .ptr = self,
             .vtable = &.{
                 .bind_index_aliases = bindIndexAliases,
+                .validate_dense_inputs = validateDenseInputs,
                 .resolve_dense_query = resolveDenseQuery,
             },
         };
@@ -1982,6 +1983,40 @@ pub const SemanticStatusResolver = struct {
             try fence.object.put(a, "incarnation", .{ .integer = @intCast(identity.incarnation) });
         };
         return .{ .body = try std.json.Stringify.valueAlloc(alloc, query, .{}), .indexes_json = if (owned_compact) compact else null };
+    }
+
+    fn validateDenseInputs(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest) !void {
+        const unverified_primary = if (req.dense) |dense| dense.model_revision_fence == null else false;
+        const unverified_knn = req.query == .dense_knn and req.query.dense_knn.model_revision_fence == null;
+        const unverified_named = for (req.dense_queries) |dense| {
+            if (dense.query.model_revision_fence == null) break true;
+        } else false;
+        if (!unverified_primary and !unverified_knn and !unverified_named) return;
+
+        const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const indexes_json = self.pinned_indexes_json orelse self.statement_indexes_json orelse indexes: {
+            const server = self.server orelse return;
+            const table = (try server.queryTableDefinition(if (self.catalog_resolver) |resolver| resolver.arena else a, self.catalog_resolver, table_name, .{
+                .deadline_ns = self.query_embedding_deadline_ns,
+                .cancellation = self.query_cancellation orelse .none,
+            })) orelse return;
+            break :indexes table.indexes_json;
+        };
+        if (!table_index_config.mayContainModelRevision(indexes_json)) return;
+        const catalog = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
+        if (catalog != .object) return error.InvalidTableIndexMetadata;
+        if (unverified_primary or unverified_knn) if (req.index_name) |name| {
+            if (catalog.object.get(name)) |config| if (try table_index_config.indexHasModelRevisionPin(a, config))
+                return error.PinnedIndexRequiresSemanticSearch;
+        };
+        for (req.dense_queries) |dense| {
+            if (dense.query.model_revision_fence != null) continue;
+            if (catalog.object.get(dense.index_name)) |config| if (try table_index_config.indexHasModelRevisionPin(a, config))
+                return error.PinnedIndexRequiresSemanticSearch;
+        }
     }
 
     fn resolveDenseQuery(
@@ -15338,6 +15373,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedNodeFilterQuery => return error.UnsupportedNodeFilterQuery,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
+            error.PinnedIndexRequiresSemanticSearch => return error.PinnedIndexRequiresSemanticSearch,
             error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.Timeout => return error.Timeout,
@@ -15717,6 +15753,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedNodeFilterQuery,
                 error.UnsupportedFilterQueryRequest,
                 error.UnsupportedExclusionQueryRequest,
+                error.PinnedIndexRequiresSemanticSearch,
                 => return err,
                 // Seeded personalization is a request-shape contract: seeds
                 // require fresh reads and a pagerank metric. Surface both as
@@ -15930,6 +15967,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedNodeFilterQuery,
             error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest,
+            error.PinnedIndexRequiresSemanticSearch,
             => return err,
             // Seeded personalization is a request-shape contract: seeds
             // require fresh reads and a pagerank metric. Surface both as
@@ -18440,7 +18478,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -18828,7 +18866,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject, error.UnsupportedOperation => return error.MethodNotAllowed,
             else => return if (metadata_authority.isRetryableError(err)) error.NotLeader else error.InternalFailure,
         };
@@ -18863,7 +18901,7 @@ pub const ApiHttpServer = struct {
                 external_table = schema.external_base_source != null;
             }
             if (@import("relational_index_mutation.zig").drop(alloc, before, index_name) catch |err| switch (err) {
-                error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+                error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
                 else => return error.InternalFailure,
             }) |replacement| {
                 defer metadata_table_manager.freeTable(alloc, replacement);
@@ -18885,7 +18923,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
-            error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.PrivacyUnknownArtifactSource,
@@ -19079,7 +19117,7 @@ pub const ApiHttpServer = struct {
         self.source.replaceTableDefinition(table_before, replacement) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
@@ -19141,7 +19179,7 @@ pub const ApiHttpServer = struct {
         self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
-            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidEnrichmentConfig,
@@ -24386,6 +24424,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedNodeFilterQuery => try contextual_operations.textAlloc(self.alloc, 400, "unsupported graph node_filter.filter_query"),
             error.UnsupportedFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .unsupported),
             error.UnsupportedExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .unsupported),
+            error.PinnedIndexRequiresSemanticSearch => try contextual_operations.textAlloc(self.alloc, 400, public_table_http.pinned_index_query_message),
             error.UnsupportedExactSort => try contextualUnsupportedExactSortResponse(self.alloc),
             error.GraphMetricGlobalMaterializationRequired => contextual_operations.jsonWithStatus(
                 422,
@@ -31506,7 +31545,8 @@ fn normalizePublicQueryParseError(err: anyerror) anyerror {
         err == error.InvalidFilterQueryRequest or
         err == error.InvalidExclusionQueryRequest or
         err == error.UnsupportedFilterQueryRequest or
-        err == error.UnsupportedExclusionQueryRequest)
+        err == error.UnsupportedExclusionQueryRequest or
+        err == error.PinnedIndexRequiresSemanticSearch)
     {
         return err;
     }
@@ -64830,4 +64870,22 @@ test "api http query binding generation races return retryable unavailable" {
         try std.testing.expect(parsed.value.object.get("retryable").?.bool);
         try std.testing.expectEqualStrings("storage_read_temporarily_unavailable", parsed.value.object.get("code").?.string);
     }
+}
+
+test "index alias query admission rejects precomputed vectors for a physical model pin" {
+    const alloc = std.testing.allocator;
+    var resolver: SemanticStatusResolver = .{
+        .source = undefined,
+        .statement_indexes_json =
+        \\{"semantic":{"type":"embeddings","embedder":{"provider":"antfly","model":"embed","model_revision":"1111111111111111111111111111111111111111111111111111111111111111"}}}
+        ,
+    };
+    for ([_][]const u8{
+        "{\"embeddings\":{\"semantic\":[1,2]}}",
+        "{\"embeddings\":{\"semantic\":\"AACAPwAAAEA=\"}}",
+    }) |body| {
+        try std.testing.expectError(error.PinnedIndexRequiresSemanticSearch, query_contract.parsePublicQueryRequest(alloc, resolver.iface(), "docs", body));
+    }
+    var allowed = try query_contract.parsePublicQueryRequest(alloc, resolver.iface(), "docs", "{\"embeddings\":{\"other\":[1,2]}}");
+    defer allowed.deinit(alloc);
 }

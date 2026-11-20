@@ -269,6 +269,23 @@ pub fn indexModelRevision(alloc: std.mem.Allocator, value: std.json.Value) !?[32
     return null;
 }
 
+/// An existing physical index name owns a single model revision.
+pub fn validateModelRevisionMutation(alloc: std.mem.Allocator, before: []const u8, after: []const u8) !void {
+    if (std.mem.eql(u8, before, after) or (!mayContainModelRevision(before) and !mayContainModelRevision(after))) return;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const old = try std.json.parseFromSliceLeaky(std.json.Value, a, if (before.len == 0) "{}" else before, .{});
+    const next = try std.json.parseFromSliceLeaky(std.json.Value, a, if (after.len == 0) "{}" else after, .{});
+    if (old != .object or next != .object) return error.InvalidCreateTableRequest;
+    for (old.object.keys(), old.object.values()) |name, existing| {
+        const replacement = next.object.get(name) orelse continue;
+        if (existing != .object or replacement != .object) continue;
+        if (!std.meta.eql(try indexModelRevision(a, existing), try indexModelRevision(a, replacement)))
+            return error.IndexModelRevisionChangeRequiresNewIndex;
+    }
+}
+
 /// Fast rejection for legacy catalog values, including escaped JSON keys.
 pub fn mayContainModelRevision(raw: []const u8) bool {
     return std.mem.indexOf(u8, raw, "model_revision") != null or std.mem.indexOf(u8, raw, "\\u") != null;

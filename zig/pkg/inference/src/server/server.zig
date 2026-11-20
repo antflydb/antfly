@@ -26465,7 +26465,7 @@ pub const Node = struct {
         }
 
         var execution_control = httpInferenceExecutionControl(self, ctx);
-        execution_control.check() catch return embeddingRevisionFailureResponse(ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const model_path = if (request.task == .reader)
             self.resolveReadRequestModelSelection(ctx.allocator, ctx.io, request.model)
         else
@@ -50489,6 +50489,19 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(u16, 409), refused.status.code);
     try std.testing.expect(refused.headers.get(embedding_revision.response_header) == null);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+
+    for ([_][]const u8{ "/ai/v1/models/instances", "/ai/v1/models/instances?model_revision=" ++ wrong }) |path| {
+        var expired = try httpx.Request.init(a, .POST, path);
+        defer expired.deinit();
+        expired.body = activation.body;
+        var expired_ctx = httpx.Context.init(a, io, &expired);
+        defer expired_ctx.deinit();
+        expired_ctx.application_deadline_ns = 0;
+        var timed_out = try node.loadModelInstance(&expired_ctx);
+        defer timed_out.deinit();
+        try std.testing.expectEqual(@as(u16, 504), timed_out.status.code);
+        try std.testing.expect(timed_out.headers.get("X-Antfly-Capability-Stale") == null);
+    }
 }
 
 test "model aware media source diarization emits standalone turns and splits transcript text at word clocks" {

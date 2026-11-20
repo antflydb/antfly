@@ -15190,6 +15190,7 @@ fn searchDenseInternal(
 
     const index_lookup_start = total_start;
     const entry = (try executor.dense_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
+    if (entry.model_revision != null and dense.model_revision_fence == null) return error.PinnedIndexRequiresSemanticSearch;
     if (!std.meta.eql(entry.model_revision, dense.model_revision_fence)) return error.IndexGenerationMismatch;
     profile.index_lookup_ns = platform_time.monotonicNs() - index_lookup_start;
     if (returnModeRequiresUnitGrouping(req.return_mode) and !entry.supports_unit_grouping)

@@ -27518,6 +27518,7 @@ type GlobalStatefulQueryRequest struct {
 	// - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE)
 	//
 	// Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
+	// Revision-pinned embedding indexes require semantic_search and reject pre-computed vectors.
 	Embeddings map[string]Embedding `json:"embeddings,omitempty,omitzero"`
 
 	// Evaluate Evaluate expressions after global retrieval merging, before final
@@ -38626,6 +38627,7 @@ type QueryRequest struct {
 	// - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE)
 	//
 	// Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
+	// Revision-pinned embedding indexes require semantic_search and reject pre-computed vectors.
 	Embeddings map[string]Embedding `json:"embeddings,omitempty,omitzero"`
 
 	// Evaluate Evaluate expressions after global retrieval merging, before final
@@ -43091,6 +43093,7 @@ type StatefulQueryRequest struct {
 	// - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE)
 	//
 	// Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
+	// Revision-pinned embedding indexes require semantic_search and reject pre-computed vectors.
 	Embeddings map[string]Embedding `json:"embeddings,omitempty,omitzero"`
 
 	// Evaluate Evaluate expressions after global retrieval merging, before final

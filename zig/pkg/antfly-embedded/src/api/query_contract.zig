@@ -2490,6 +2490,7 @@ pub const SemanticResolver = struct {
     pub const VTable = struct {
         /// Coordinator-only catalog binding, before parsing or embedding.
         bind_index_aliases: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!?BoundIndexAliases = null,
+        validate_dense_inputs: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, db_mod.types.SearchRequest) anyerror!void = null,
         resolve_dense_query: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3104,6 +3105,8 @@ pub fn parseQueryRequestWithDeadline(
             owned.req.privacy_policy_version = try parsePrivacyPolicyVersion(value);
         };
     }
+    if (semantic_resolver) |resolver| if (resolver.vtable.validate_dense_inputs) |validate|
+        try validate(resolver.ptr, alloc, table_name, owned.req);
     return owned;
 }
 
@@ -3530,6 +3533,7 @@ pub fn isPublicQueryValidationError(err: anyerror) bool {
         error.InvalidExclusionQueryRequest,
         error.UnsupportedFilterQueryRequest,
         error.UnsupportedExclusionQueryRequest,
+        error.PinnedIndexRequiresSemanticSearch,
         error.RerankerCandidateLimitExceeded,
         error.InvalidDecisionSpecification,
         error.InvalidFunctionExpression,

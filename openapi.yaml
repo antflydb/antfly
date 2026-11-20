@@ -36124,7 +36124,7 @@ components:
 
 
             Use when you've already generated embeddings on the client side to avoid redundant embedding
-            calls.
+            calls. Revision-pinned embedding indexes require semantic_search and reject pre-computed vectors.
           additionalProperties:
             $ref: '#/components/schemas/Embedding'
         search_effort:

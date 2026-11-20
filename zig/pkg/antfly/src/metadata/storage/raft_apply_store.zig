@@ -24231,7 +24231,7 @@ pub const RaftApplyStore = struct {
     /// failures still propagate and abort the transaction.
     fn admitTableIndexMutationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, before: metadata.TableRecord, after: metadata.TableRecord) !bool {
         self.validateTableIndexMutationTxn(txn, group_id, before, after) catch |err| switch (err) {
-            error.IndexReferencedByAlias, error.IndexAliasGraphConflict => {
+            error.IndexReferencedByAlias, error.IndexAliasGraphConflict, error.IndexModelRevisionChangeRequiresNewIndex => {
                 try self.recordTableDefinitionRejectionTxn(txn, group_id, before, after);
                 return false;
             },
@@ -24247,6 +24247,7 @@ pub const RaftApplyStore = struct {
     }
     fn validateTableIndexMutationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, before: metadata.TableRecord, after: metadata.TableRecord) !void {
         if (std.mem.eql(u8, before.indexes_json, after.indexes_json)) return;
+        try @import("antfly_local_sources").api_table_index_config.validateModelRevisionMutation(self.alloc, before.indexes_json, after.indexes_json);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -28497,6 +28498,17 @@ test "index alias Raft admission permits rollout and fences returning legacy sto
     try store.putTableRecordTxnModeRaw(&txn, group, try tableKeyForGroup(&buf, group, pinned.table_id), pinned, false);
     try std.testing.expect(!try admitIndexAliasStoreTxn(&store, &txn, group, modern));
     try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, pin_capable));
+    var changed = pinned;
+    changed.indexes_json = try std.mem.replaceOwned(u8, a, pinned.indexes_json, "1111111111111111111111111111111111111111111111111111111111111111", "2222222222222222222222222222222222222222222222222222222222222222");
+    defer a.free(changed.indexes_json);
+    try std.testing.expectError(error.IndexModelRevisionChangeRequiresNewIndex, store.validateTableIndexMutationTxn(&txn, group, pinned, changed));
+    try store.applyTableCompareAndReplaceTxn(&txn, group, pinned, changed);
+    const rejection_key = try RaftApplyStore.resolverRejectionKey(a, group, pinned.table_id);
+    defer a.free(rejection_key);
+    try std.testing.expect((try RaftApplyStore.stagingGet(&txn, rejection_key)) != null);
+    const persisted = try decodeTableRecord(a, try txn.get(try tableKeyForGroup(&buf, group, pinned.table_id)));
+    defer metadata_table_manager.freeTable(a, persisted);
+    try std.testing.expectEqualStrings(pinned.indexes_json, persisted.indexes_json);
     try store.putTableRecordTxnModeRaw(&txn, group, try tableKeyForGroup(&buf, group, plain.table_id), plain, false);
     try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, modern));
 }

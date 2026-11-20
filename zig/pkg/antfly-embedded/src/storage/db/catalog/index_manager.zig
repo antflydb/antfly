@@ -27643,21 +27643,44 @@ pub const IndexManager = struct {
         var cursor = try self.alloc.dupe(u8, lower);
         defer self.alloc.free(cursor);
         var lower_exclusive = false;
+        const max_items = if (entry.model_revision != null)
+            @min(vector_backfill_page_items, @max(1, vector_backfill_page_bytes / (@as(usize, entry.dims) * @sizeOf(f32) + 64)))
+        else
+            vector_backfill_page_items;
         while (true) {
-            var page = try store.scanReadTxnPage(
+            var page = try store.scanReadTxnPageWithOptions(
                 self.alloc,
                 source_txn,
                 cursor,
                 lower_exclusive,
                 if (upper) |buf| buf else "",
-                vector_backfill_page_items,
+                max_items,
                 vector_backfill_page_bytes,
+                .{ .keys_only = entry.model_revision != null },
             );
             defer page.deinit(self.alloc);
             if (page.items.len == 0) break;
             const next_cursor = try self.alloc.dupe(u8, page.items[page.items.len - 1].key);
             var next_cursor_owned = true;
             defer if (next_cursor_owned) self.alloc.free(next_cursor);
+
+            var page_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer page_arena.deinit();
+            const scratch = page_arena.allocator();
+            const document_keys = if (entry.model_revision != null) keys: {
+                const keys = try scratch.alloc(?[]const u8, page.items.len);
+                for (page.items, keys) |doc, *key| {
+                    key.* = null;
+                    if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
+                    const raw = (try internal_keys.decodeStoredDocumentRowKeyAlloc(scratch, doc.key)) orelse continue;
+                    if (self.keyInRange(raw)) key.* = raw;
+                }
+                break :keys keys;
+            } else null;
+            const accepted_values = if (document_keys) |keys|
+                try readPinnedDenseBackfillPage(scratch, source_txn, keys, denseVectorArtifactNameAt(entry, 0))
+            else
+                null;
 
             var items = std.ArrayListUnmanaged(hbc_mod.BatchInsertItem).empty;
             defer {
@@ -27674,27 +27697,24 @@ pub const IndexManager = struct {
             var mapping_batch = try runtime_store.store.beginBatch();
             errdefer mapping_batch.abort();
 
-            for (page.items) |doc| {
-                if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
-                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
-                defer self.alloc.free(raw_key);
+            for (page.items, 0..) |doc, i| {
+                const raw_key = if (document_keys) |keys| keys[i] orelse continue else ordinary: {
+                    if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
+                    break :ordinary (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
+                };
+                defer if (document_keys == null) self.alloc.free(raw_key);
                 if (!self.keyInRange(raw_key)) continue;
-                try items.ensureUnusedCapacity(self.alloc, 1);
-                try pending_mappings.ensureUnusedCapacity(self.alloc, 1);
                 const vector_values = if (entry.model_revision) |revision| blk: {
-                    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(self.alloc, raw_key, denseVectorArtifactNameAt(entry, 0));
-                    defer self.alloc.free(artifact_key);
-                    const accepted = source_txn.get(artifact_key) catch |err| switch (err) {
-                        error.NotFound => continue,
-                        else => return err,
-                    };
-                    if (!std.meta.eql(try enrichment_artifact_codec.denseEmbeddingModelRevision(accepted), @as(?[32]u8, revision)))
-                        return error.ArtifactRepairRequired;
+                    const accepted = accepted_values.?[i] orelse continue;
+                    const actual = enrichment_artifact_codec.denseEmbeddingModelRevision(accepted) catch return error.ArtifactRepairRequired;
+                    if (!std.meta.eql(actual, @as(?[32]u8, revision))) return error.ArtifactRepairRequired;
                     if (try enrichment_artifact_codec.decodeDenseEmbeddingDims(accepted) != entry.dims)
                         return error.ArtifactRepairRequired;
                     break :blk try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(self.alloc, accepted);
                 } else (try self.extractDenseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name, entry.dims, &schema_views)) orelse continue;
                 errdefer self.alloc.free(vector_values);
+                try items.ensureUnusedCapacity(self.alloc, 1);
+                try pending_mappings.ensureUnusedCapacity(self.alloc, 1);
 
                 if (entry.model_revision == null and entry.embedding_names.len == 0) {
                     try self.writeDenseEmbeddingArtifactTxn(
@@ -27741,6 +27761,39 @@ pub const IndexManager = struct {
             lower_exclusive = true;
             if (page.reached_end) break;
         }
+    }
+
+    fn readPinnedDenseBackfillPage(
+        alloc: Allocator,
+        source_txn: *docstore_mod.DocStore.Txn,
+        document_keys: []const ?[]const u8,
+        embedding_name: []const u8,
+    ) ![]?[]const u8 {
+        const Lookup = struct {
+            key: []const u8,
+            row: usize,
+
+            fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                return std.mem.lessThan(u8, lhs.key, rhs.key);
+            }
+        };
+        var lookups: std.ArrayList(Lookup) = .empty;
+        for (document_keys, 0..) |key, row| {
+            const raw = key orelse continue;
+            try lookups.append(alloc, .{
+                .key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, raw, embedding_name),
+                .row = row,
+            });
+        }
+        std.mem.sort(Lookup, lookups.items, {}, Lookup.lessThan);
+        const keys = try alloc.alloc([]const u8, lookups.items.len);
+        for (lookups.items, keys) |lookup, *key| key.* = lookup.key;
+        const values = try alloc.alloc(?[]u8, keys.len);
+        try source_txn.getManySortedOwnedScoped(alloc, keys, values);
+        const result = try alloc.alloc(?[]const u8, document_keys.len);
+        @memset(result, null);
+        for (lookups.items, values) |lookup, value| result[lookup.row] = value;
+        return result;
     }
 
     fn backfillSparseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, resume_from: ?[]const u8) !void {

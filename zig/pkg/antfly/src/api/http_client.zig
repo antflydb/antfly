@@ -4283,6 +4283,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 fn remoteGroupConflictError(body: []const u8) anyerror {
     if (std.mem.eql(u8, body, "DocumentArtifactPublicationFailed")) return error.DocumentArtifactPublicationFailed;
     if (std.mem.eql(u8, body, "IndexGenerationMismatch")) return error.IndexGenerationMismatch;
+    if (std.mem.eql(u8, body, "PinnedIndexRequiresSemanticSearch")) return error.PinnedIndexRequiresSemanticSearch;
     if (std.mem.eql(u8, body, "DecisionConflict") or std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "TopologyChanged") or std.mem.eql(u8, body, "topology changed")) return error.TopologyChanged;

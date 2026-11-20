@@ -13942,6 +13942,7 @@ export interface components {
              *     - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE)
              *
              *     Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
+             *     Revision-pinned embedding indexes require semantic_search and reject pre-computed vectors.
              */
             embeddings?: {
                 [key: string]: components["schemas"]["Embedding"];
