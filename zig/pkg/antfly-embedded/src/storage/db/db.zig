@@ -49081,9 +49081,9 @@ pub const DB = struct {
             defer scratch.deinit();
             const temp = scratch.allocator();
             var resolved: [limit]?[]const u8 = undefined;
-            resolvePrimaryOrdinalKeysCallback(self.db, temp, ordinals, self.req.identity_read_generation, resolved[0..ordinals.len]) catch |err| switch (err) {
-                error.InvalidDocIdentity => return false,
-                else => return err,
+            resolvePrimaryOrdinalKeysCallback(self.db, temp, ordinals, self.req.identity_read_generation, resolved[0..ordinals.len]) catch |err| {
+                if (recoverableSourceIdentityError(err)) return false;
+                return err;
             };
             const Candidate = struct {
                 id: []const u8,
@@ -49123,7 +49123,7 @@ pub const DB = struct {
             var delivery_started = false;
             return self.scanLargeOrderedScopeWithSpill(options, &delivery_started) catch |err| {
                 if (delivery_started) return err;
-                if (@import("../../sql/spill.zig").searchSpillUnavailable(err)) return false;
+                if (recoverableSourceIdentityError(err) or @import("../../sql/spill.zig").searchSpillUnavailable(err)) return false;
                 return err;
             };
         }
@@ -49177,10 +49177,7 @@ pub const DB = struct {
                     }
                 }
                 if (len == 0) break;
-                resolvePrimaryOrdinalKeysCallback(self.db, scratch.allocator(), ordinals[0..len], self.req.identity_read_generation, resolved[0..len]) catch |err| switch (err) {
-                    error.InvalidDocIdentity => return false,
-                    else => return err,
-                };
+                try resolvePrimaryOrdinalKeysCallback(self.db, scratch.allocator(), ordinals[0..len], self.req.identity_read_generation, resolved[0..len]);
                 for (ordinals[0..len], resolved[0..len]) |ordinal, value| {
                     const id = value orelse continue;
                     if (!self.orderedScopeContains(options, id)) continue;
@@ -49432,7 +49429,7 @@ pub const DB = struct {
                 .batch_size = @min(@max(options.scan_batch_size orelse 256, 1), 256),
             };
             defer source_batch.arena.deinit();
-            defer source_batch.recovery.arena.deinit();
+            defer source_batch.recovery.deinit();
             var txn = try self.db.core.store.beginCurrentScanTxn();
             defer txn.abort();
             try self.db.core.store.scanStoredDocumentRowsReadTxnWithContext(&txn, lower, upper orelse &.{}, options.primary_key_reverse, &source_batch, Scan.checkpoint, Scan.visit);
@@ -49450,6 +49447,9 @@ pub const DB = struct {
                 visible: ?bool = null,
             };
             arena: std.heap.ArenaAllocator,
+            // Retain one lazily opened view for the source scan. Individual
+            // read scopes bound each page's pinned blocks and values.
+            read: ?docstore_mod.DocStore.Txn = null,
             reverse: std.StringHashMapUnmanaged(Entry) = .empty,
             missing: std.ArrayListUnmanaged(doc_set.DocOrdinal) = .empty,
             bitmap: ?@import("../../encoding/roaring.zig").Iterator = null,
@@ -49458,6 +49458,11 @@ pub const DB = struct {
             exhausted: bool = false,
             incomplete: ?bool = null,
             explicit_keys: ?std.StringHashMapUnmanaged(void) = null,
+
+            fn deinit(self: *SourceRecovery) void {
+                if (self.read) |*txn| txn.abort();
+                self.arena.deinit();
+            }
         };
 
         /// Resolve the finite ordinal scope once for all failed keys in a
@@ -49495,9 +49500,7 @@ pub const DB = struct {
                 recovery.initialized = true;
             }
             const numbers = if (set.* == .ordinals) set.ordinals else &.{};
-            var read: ?docstore_mod.DocStore.Txn = null;
-            defer if (read) |*txn| txn.abort();
-            try self.recoverKnownSourceKeys(&read, recovery, &pending, ordinals, visible);
+            try self.recoverKnownSourceKeys(&recovery.read, recovery, &pending, ordinals, visible);
             // Keep the original identity error if optional recovery memory
             // cannot be admitted. An incomplete cache cannot prove absence.
             const cache_alloc = recovery.arena.allocator();
@@ -49517,7 +49520,7 @@ pub const DB = struct {
                 recovery.exhausted = len < page.len;
                 if (len == 0) break;
                 std.mem.sort(doc_set.DocOrdinal, page[0..len], {}, std.sort.asc(doc_set.DocOrdinal));
-                var scope = try (try self.sourceRecoveryRead(&read)).openReadScope(self.alloc);
+                var scope = try (try self.sourceRecoveryRead(&recovery.read)).openReadScope(self.alloc);
                 defer scope.close();
                 var encoded: [page.len]@TypeOf(internal_keys.identityOrdinalToDocKey(0)) = undefined;
                 var reverse_keys: [page.len][]const u8 = undefined;
@@ -49537,10 +49540,10 @@ pub const DB = struct {
                         recovery.missing.append(cache_alloc, ordinal) catch return original_error;
                     }
                 }
-                try self.recoverKnownSourceKeys(&read, recovery, &pending, ordinals, visible);
+                try self.recoverKnownSourceKeys(&recovery.read, recovery, &pending, ordinals, visible);
             }
             if (pending.count() == 0) return;
-            if (recovery.incomplete == null) recovery.incomplete = try self.hasLiveMissingSourceIdentity(&read, recovery.missing.items);
+            if (recovery.incomplete == null) recovery.incomplete = try self.hasLiveMissingSourceIdentity(&recovery.read, recovery.missing.items);
             if (!recovery.incomplete.? and recovery.explicit_keys == null) {
                 var explicit: std.StringHashMapUnmanaged(void) = .empty;
                 for ([_]*const doc_set.ResolvedDocSet{ set, &constraints.legacy_filter }) |key_set| {
@@ -158174,7 +158177,7 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
         var visible = [_]bool{ true, true, true, true };
         var resolved: [4]?doc_set.DocOrdinal = @splat(null);
         var recovery: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
-        defer recovery.arena.deinit();
+        defer recovery.deinit();
         try scan.recoverScopedSourceBatch(options, &recovery, a, &failed_keys, &failures, &visible, &resolved);
         try std.testing.expectEqual([4]bool{ true, false, false, true }, visible);
         try std.testing.expectEqual([4]?doc_set.DocOrdinal{ endpoints[0], null, null, endpoints[1] }, resolved);
@@ -158201,7 +158204,7 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
             },
         };
         var bitmap_recovery: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
-        defer bitmap_recovery.arena.deinit();
+        defer bitmap_recovery.deinit();
         try scan.recoverScopedSourceBatch(bitmap_options, &bitmap_recovery, a, &.{writes[1].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
         try std.testing.expect(visible[0] and !bitmap_recovery.exhausted);
         try std.testing.expect(bitmap_recovery.bitmap.?.bitmap == &bitmap_options.constraints.?.primary_include.ordinal_bitmap);
@@ -158222,7 +158225,7 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
 
         var denied_allocator: std.testing.FailingAllocator = .init(a, .{ .fail_index = 0 });
         var denied: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(denied_allocator.allocator()) };
-        defer denied.arena.deinit();
+        defer denied.deinit();
         try std.testing.expectError(error.StorageReadTemporarilyUnavailable, scan.recoverScopedSourceBatch(
             options,
             &denied,
@@ -158241,7 +158244,7 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
             try txn.commit();
         }
         var incomplete: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
-        defer incomplete.arena.deinit();
+        defer incomplete.deinit();
         try std.testing.expectError(error.StorageReadTemporarilyUnavailable, scan.recoverScopedSourceBatch(
             options,
             &incomplete,

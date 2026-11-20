@@ -11307,8 +11307,6 @@ const IndexedPredicateEvaluator = struct {
             evidence.matches.deinit();
             return RangeEvidence.init(self.alloc);
         }
-        evidence.covered.andWith(scope);
-        evidence.matches.andWith(scope);
         return evidence;
     }
 
@@ -11358,7 +11356,9 @@ const IndexedPredicateEvaluator = struct {
         const residual = self.executeStoredRange(stored, &missing) catch |err| {
             missing.deinit();
             evidence.matches.deinit();
-            return err;
+            if (err != error.OutOfMemory) return err;
+            self.discardRangeFrontier();
+            return self.executeStoredRange(stored, scope);
         };
         missing.deinit();
         return self.joinMixedRangeMatches(stored, scope, evidence.matches, residual);
@@ -11384,6 +11384,7 @@ const IndexedPredicateEvaluator = struct {
     fn executeStoredRange(self: IndexedPredicateEvaluator, range: std.json.Value, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
         const load = self.executor.load_many_stored_values orelse return error.UnsupportedQueryRequest;
         var wrapper: std.json.ObjectMap = .empty;
+        defer wrapper.deinit(self.scratch);
         try wrapper.put(self.scratch, "range", range);
         var predicate = try graph_exec.PreparedPatternFilter.initValue(self.alloc, .{ .object = wrapper });
         defer predicate.deinit();
@@ -12529,6 +12530,79 @@ test "optional numeric range discards partial evidence when uncovered scope allo
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.UnsupportedQueryRequest, evaluator.joinMixedRangeMatches(.null, &scope, native, residual));
     try std.testing.expect(memo.range_projection_disabled);
+}
+
+test "optional numeric range returns full stored results after residual or union allocation failure" {
+    const alloc = std.testing.allocator;
+    const Loader = struct {
+        calls: usize = 0,
+        fail_first: bool = true,
+
+        fn load(raw: ?*anyopaque, scratch: Allocator, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.fail_first and self.calls == 1) {
+                try std.testing.expectEqual(@as(usize, 1), keys.len);
+                try std.testing.expectEqualStrings("stored", keys[0]);
+                return error.OutOfMemory;
+            }
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            const values = try scratch.alloc(?[]u8, keys.len);
+            for (keys, values) |key, *value| {
+                value.* = try scratch.dupe(u8, if (std.mem.eql(u8, key, "stored")) "{\"rank\":8}" else "{\"rank\":1}");
+            }
+            return values;
+        }
+    };
+    var loader: Loader = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"rank\":{\"gte\":5}}", .{});
+    defer parsed.deinit();
+    var scope = roaring.RoaringBitmap.init(alloc);
+    defer scope.deinit();
+    try scope.addRange(1, 3);
+    var keys: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    defer keys.deinit(alloc);
+    try keys.put(alloc, 1, "native");
+    try keys.put(alloc, 2, "stored");
+    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    defer memo.deinit(alloc);
+    try memo.covered.?.add(1);
+    const evaluator: IndexedPredicateEvaluator = .{
+        .snapshot = undefined,
+        .analysis = .{},
+        .schema = null,
+        .executor = .{ .ctx = &loader, .text_index_entry = undefined, .load_many_stored_values = Loader.load },
+        .control = .{},
+        .alloc = alloc,
+        .scratch = alloc,
+        .cache_prefix = "",
+        .frontier = keys,
+        .probe_input = &memo,
+    };
+    var evidence = IndexedPredicateEvaluator.RangeEvidence.init(alloc);
+    try evidence.covered.add(1);
+    try evidence.matches.add(1);
+    var retried = try evaluator.finishMixedRange(parsed.value, &scope, evidence);
+    defer retried.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loader.calls);
+    try std.testing.expect(memo.range_projection_disabled and memo.covered == null);
+    try std.testing.expectEqual(@as(usize, 1), retried.cardinality());
+    try std.testing.expect(retried.contains(2));
+
+    loader = .{ .fail_first = false };
+    memo = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    try memo.covered.?.add(1);
+    var failing: std.testing.FailingAllocator = .init(alloc, .{});
+    var native = roaring.RoaringBitmap.init(failing.allocator());
+    try native.add(1);
+    var residual = roaring.RoaringBitmap.init(alloc);
+    try residual.add(65537);
+    failing.fail_index = failing.alloc_index;
+    var joined = try evaluator.joinMixedRangeMatches(parsed.value, &scope, native, residual);
+    defer joined.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loader.calls);
+    try std.testing.expect(memo.range_projection_disabled and memo.covered == null);
+    try std.testing.expect(joined.eql(&retried));
 }
 
 const ResidualIdentityContext = struct {

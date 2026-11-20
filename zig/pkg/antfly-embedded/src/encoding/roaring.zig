@@ -1089,62 +1089,61 @@ pub const RoaringBitmap = struct {
     ///     array: sorted u16 LE values
     ///     bitmap: 1024 x u64 LE words
     pub fn toBytes(self: *const RoaringBitmap, alloc: Allocator) ![]u8 {
-        const n: usize = self.keys.items.len;
-        if (n > std.math.maxInt(u16)) return error.BitmapTooLarge;
-        // Calculate size
+        var count: usize = 0;
         var size: usize = 2;
-        size = try std.math.add(usize, size, try std.math.mul(usize, n, 2));
-        size = try std.math.add(usize, size, try std.math.mul(usize, n, 2));
-        for (self.containers.items) |*c| {
-            const card = c.cardinality();
-            size = try std.math.add(usize, size, if (card <= array_max) card * 2 else bitmap_words * 8);
+        for (self.containers.items) |*container| {
+            const card = container.cardinality();
+            if (card == 0) continue;
+            count += 1;
+            size += 4 + if (card <= array_max) card * 2 else bitmap_words * 8;
         }
+        if (count > std.math.maxInt(u16)) return error.BitmapTooLarge;
 
-        var buf = try alloc.alloc(u8, size);
-        var pos: usize = 0;
+        const buf = try alloc.alloc(u8, size);
+        std.mem.writeInt(u16, buf[0..2], @intCast(count), .little);
+        var key_pos: usize = 2;
+        var card_pos = key_pos + count * 2;
+        var pos = card_pos + count * 2;
+        for (self.keys.items, self.containers.items) |key, *container| {
+            const card = container.cardinality();
+            if (card == 0) continue;
+            std.mem.writeInt(u16, buf[key_pos..][0..2], key, .little);
+            key_pos += 2;
+            std.mem.writeInt(u16, buf[card_pos..][0..2], @intCast(card - 1), .little);
+            card_pos += 2;
 
-        // Num containers
-        buf[pos..][0..2].* = @bitCast(@as(u16, @as(u16, @intCast(n))));
-        pos += 2;
-
-        // Keys
-        for (self.keys.items) |k| {
-            buf[pos..][0..2].* = @bitCast(@as(u16, k));
-            pos += 2;
-        }
-
-        // Cardinalities (stored as card - 1)
-        for (self.containers.items) |*c| {
-            const card: u16 = @intCast(c.cardinality() - 1);
-            buf[pos..][0..2].* = @bitCast(@as(u16, card));
-            pos += 2;
-        }
-
-        // Container data
-        const cards = buf[2 + n * 2 ..][0 .. n * 2];
-        for (self.containers.items, 0..) |*c, i| {
-            switch (c.*) {
-                .array => |*a| {
-                    for (a.items) |v| {
-                        buf[pos..][0..2].* = @bitCast(@as(u16, v));
-                        pos += 2;
-                    }
-                },
-                .bitmap => |b| {
-                    const card_minus_one: u16 = @bitCast(cards[i * 2 ..][0..2].*);
-                    if (card_minus_one < array_max) {
-                        var values = bitmapIterator(b);
-                        while (values.next()) |v| {
-                            buf[pos..][0..2].* = @bitCast(v);
+            switch (container.*) {
+                .array => |*array| {
+                    if (card <= array_max) {
+                        for (array.items) |value| {
+                            std.mem.writeInt(u16, buf[pos..][0..2], value, .little);
                             pos += 2;
                         }
-                    } else for (b) |word| {
-                        buf[pos..][0..8].* = @bitCast(word);
-                        pos += 8;
+                    } else {
+                        // A denied promotion can leave a large array behind.
+                        const bytes = buf[pos..][0 .. bitmap_words * 8];
+                        @memset(bytes, 0);
+                        for (array.items) |value| bytes[value / 8] |= @as(u8, 1) << @as(u3, @truncate(value));
+                        pos += bytes.len;
+                    }
+                },
+                .bitmap => |words| {
+                    if (card <= array_max) {
+                        var values = bitmapIterator(words);
+                        while (values.next()) |value| {
+                            std.mem.writeInt(u16, buf[pos..][0..2], value, .little);
+                            pos += 2;
+                        }
+                    } else {
+                        for (words) |word| {
+                            std.mem.writeInt(u64, buf[pos..][0..8], word, .little);
+                            pos += 8;
+                        }
                     }
                 },
             }
         }
+        std.debug.assert(pos == size);
 
         return buf;
     }
@@ -2953,4 +2952,31 @@ test "optional numeric range bitmap intersection survives denied sparse allocati
     defer decoded.deinit();
     try std.testing.expect(left.eql(&decoded));
     try std.testing.expect(decoded.eql(&left));
+}
+
+test "optional numeric range bitmap serialization handles denied promotion and empty containers" {
+    const alloc = std.testing.allocator;
+    var failing: std.testing.FailingAllocator = .init(alloc, .{});
+    var bitmap = RoaringBitmap.init(failing.allocator());
+    defer bitmap.deinit();
+    try bitmap.addRange(0, array_max);
+    try bitmap.containers.items[0].array.ensureTotalCapacityPrecise(bitmap.alloc, array_max + 1);
+    try bitmap.add(65536);
+    var deleted = RoaringBitmap.init(alloc);
+    defer deleted.deinit();
+    try deleted.add(65536);
+    bitmap.andNotWith(&deleted);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, bitmap.add(65535));
+
+    const bytes = try bitmap.toBytes(alloc);
+    defer alloc.free(bytes);
+    var decoded = try RoaringBitmap.fromBytes(alloc, bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, array_max + 1), decoded.cardinality());
+    try std.testing.expect(decoded.contains(0));
+    try std.testing.expect(decoded.contains(array_max - 1));
+    try std.testing.expect(!decoded.contains(array_max));
+    try std.testing.expect(decoded.contains(65535));
+    try std.testing.expectEqual(@as(usize, 1), decoded.keys.items.len);
 }
