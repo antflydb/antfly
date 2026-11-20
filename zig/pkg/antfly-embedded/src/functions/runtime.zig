@@ -2065,6 +2065,19 @@ test "decision functions generated statement renews revoked leases without chang
                 try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
                 try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(1));
                 routes[0].respond.status = 200;
+                // A failed cold flight imposes a cooldown even after the
+                // endpoint recovers. Advance just that entry's clock.
+                try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, runtime.provider().evaluateBatch(alloc, &requests));
+                try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
+                const cache = &runtime.resolved_generators.items[0].cache;
+                {
+                    cache.mutex.lockUncancelable(io);
+                    defer cache.mutex.unlock(io);
+                    var entries = cache.entries.valueIterator();
+                    while (entries.next()) |entry| {
+                        if (entry.cold_failure != null) entry.refresh_not_before_ns = 0;
+                    }
+                }
                 _ = try runtime.provider().evaluateBatch(alloc, &requests);
                 try std.testing.expectEqual(@as(usize, 4), server.routeHitCount(0));
                 try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(1));
@@ -2107,6 +2120,8 @@ test "decision functions scoped generated image validation and execution share a
         fn catalog(req: httpx.testing_mod.RequestInfo) !void {
             const table = req.header("X-Antfly-Source-Table") orelse return error.MissingScope;
             try std.testing.expectEqualStrings("model=vision&task=generate&operation=generate", req.query);
+            if (req.header(remote_capabilities.discovery_shape_header)) |shape|
+                try std.testing.expectEqualStrings("1:1:1:256", shape);
             routes[0].respond.body = if (std.mem.eql(u8, table, "photos")) vision_catalog else text_catalog;
         }
         fn generate(req: httpx.testing_mod.RequestInfo) !void {
@@ -2155,10 +2170,10 @@ test "decision functions scoped generated image validation and execution share a
     const request = decisions.Request{ .decider = "judge", .questions = questions, .input = input };
     const first = try runtime.provider().withSourceTable("photos").evaluateBatch(alloc, &.{request});
     try std.testing.expectEqualStrings("same", first[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
-    try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
     try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(1));
     try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.provider().withSourceTable("text_docs").evaluateBatch(alloc, &.{request}));
-    try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
     try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(1));
     // Internal batches can carry per-item scopes without a provider override.
     var scoped = request;
@@ -2169,7 +2184,7 @@ test "decision functions scoped generated image validation and execution share a
     // The bound provider remains authoritative over an item's inherited scope.
     scoped.source_table = "text_docs";
     _ = try runtime.provider().withSourceTable("photos").evaluateBatch(alloc, &.{scoped});
-    try std.testing.expectEqual(@as(usize, 2), server.routeHitCount(0));
+    try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(0));
     try std.testing.expectEqual(@as(usize, 3), server.routeHitCount(1));
     try std.testing.expectEqualStrings("default", runtime.source_table);
     group.cancel(io);
