@@ -2449,7 +2449,15 @@ pub const Region = struct {
         hdr.log_checkpoint_sequence.store(0, .monotonic);
         hdr.log_durable_sequence.store(0, .monotonic);
         hdr.log_durable_offset.store(0, .monotonic);
-        hdr.log_generation.store(publishing +% 1, .release);
+        // A reinitialized region's generation is zero: never published.
+        hdr.log_generation.store(0, .release);
+    }
+
+    /// Whether any publication has ever been made to this region. A brand
+    /// new log publishes an all-zero tuple, which this tells apart from a
+    /// region nothing has published to yet.
+    pub fn logStatePublished(self: *const Region) bool {
+        return self.header().log_generation.load(.seq_cst) != 0;
     }
 
     /// Test support: a publisher that died with the generation odd.

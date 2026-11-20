@@ -6068,6 +6068,12 @@ pub const Store = struct {
     pub fn checkpointRedoLog(self: *Store) !void {
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .allocator_service);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        try self.checkpointRedoLogAdmitted();
+    }
+
+    /// `checkpointRedoLog` for a caller already inside this store's writer
+    /// admission: resolves the writer and takes the store mutex.
+    fn checkpointRedoLogAdmitted(self: *Store) anyerror!void {
         if (self.forwardedWriter()) |writer| {
             try writer.checkpointRedoLog();
             self.adoptWriterTip(writer);
@@ -6614,7 +6620,12 @@ pub const Store = struct {
             if (err == error.LiteStorageBudgetExceeded and self.file.redo != null and
                 native.NativeFile.redoLogCapacityForBudget(self.file.redo_log_budget_bytes) < self.file.header.redo_log_capacity)
             {
-                if (self.file.checkpointRedoLog()) |_| {
+                // The group that rejected this write has finished: its
+                // admission and the store mutex no longer cover this retry.
+                // Fold through the serialized path, as any other fold does
+                // (writer resolution included for a forwarded request).
+                const folded = if (forwarded_admission != null) self.checkpointRedoLogAdmitted() else self.checkpointRedoLog();
+                if (folded) |_| {
                     const retry_ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
                     return retry_ticket.wait();
                 } else |_| {}

@@ -324,6 +324,10 @@ pub const Entry = struct {
     /// path/fd, and the overlay is addressed by inode via this `Entry`,
     /// never by path directly.
     redo_overlay: ?redo_overlay.SharedRedoOverlay = null,
+    /// Handles in this process on this inode holding the sidecar writer
+    /// lock. A cold reader's lock probe cannot tell this process's own
+    /// sidecar lock from another process's; this count can.
+    writer_authorities: std.atomic.Value(u32) = .init(0),
     /// perf/lwa-proof-fork: the pid that populated `redo_overlay` above.
     /// This registry (`registry` below) is a plain process-global `var`:
     /// `fork()` duplicates it, `Entry` included, into the child's own
