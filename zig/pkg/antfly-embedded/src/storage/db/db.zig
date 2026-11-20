@@ -157881,37 +157881,39 @@ test "optional numeric range keeps mixed primary matches for native field sortin
             try write.delete(&state_key);
             try write.commit();
         }
-        // The missing state is a valid compatibility key. The mapped row
-        // exists physically but was created after this read generation.
-        const VisitHistorical = struct {
-            fn visit(raw: ?*anyopaque, id: []const u8, ordinal: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
-                const visited: *usize = @ptrCast(@alignCast(raw.?));
-                try std.testing.expectEqualStrings("legacy", id);
-                try std.testing.expectEqual(@as(?doc_set.DocOrdinal, null), ordinal);
-                visited.* += 1;
-                return .@"continue";
-            }
-        };
-        const key_options = db_query_search.MatchAllCandidateCollectOptions{ .constraints = &.{
-            .positive_filter = true,
-            .legacy_filter = .{ .doc_keys = &.{ "legacy", "mapped" } },
-        } };
-        var visited: usize = 0;
-        var historical = DB.PrimaryMatchAllIdentityScan{
-            .db = &db,
-            .req = .{ .identity_read_generation = 0 },
-            .alloc = a,
-            .visitor_ctx = &visited,
-            .visitor = VisitHistorical.visit,
-        };
-        try std.testing.expect(try historical.scanSmallOrderedScope(key_options));
-        try std.testing.expectEqual(@as(usize, 1), visited);
-        var started = false;
-        try std.testing.expect(try historical.scanLargeOrderedScopeWithSpill(key_options, &started));
-        try std.testing.expect(started);
-        try std.testing.expectEqual(@as(usize, 2), visited);
-        try historical.scanSourcePopulation(key_options);
-        try std.testing.expectEqual(@as(usize, 3), visited);
+        {
+            // The missing state is a valid compatibility key. The mapped row
+            // exists physically but was created after this read generation.
+            const VisitHistorical = struct {
+                fn visit(raw: ?*anyopaque, id: []const u8, ordinal: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
+                    const visited: *usize = @ptrCast(@alignCast(raw.?));
+                    try std.testing.expectEqualStrings("legacy", id);
+                    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, null), ordinal);
+                    visited.* += 1;
+                    return .@"continue";
+                }
+            };
+            const key_options = db_query_search.MatchAllCandidateCollectOptions{ .constraints = &.{
+                .positive_filter = true,
+                .legacy_filter = .{ .doc_keys = &.{ "legacy", "mapped" } },
+            } };
+            var visited: usize = 0;
+            var historical = DB.PrimaryMatchAllIdentityScan{
+                .db = &db,
+                .req = .{ .identity_read_generation = 0 },
+                .alloc = a,
+                .visitor_ctx = &visited,
+                .visitor = VisitHistorical.visit,
+            };
+            try std.testing.expect(try historical.scanSmallOrderedScope(key_options));
+            try std.testing.expectEqual(@as(usize, 1), visited);
+            var started = false;
+            try std.testing.expect(try historical.scanLargeOrderedScopeWithSpill(key_options, &started));
+            try std.testing.expect(started);
+            try std.testing.expectEqual(@as(usize, 2), visited);
+            try historical.scanSourcePopulation(key_options);
+            try std.testing.expectEqual(@as(usize, 3), visited);
+        }
 
         var mixed_scope = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(a, &.{mapped_ordinal}) };
         defer mixed_scope.deinit(a);
