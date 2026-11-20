@@ -114,6 +114,7 @@ pub const Continuation = struct {
                 count += 1;
             };
             if (count == 0) continue;
+            if (count > registry.options.max_dependency_packets -| stats.decoded_packets) return error.ResourceLimitExceeded;
             const entry = registry.entries.items[epoch.entry];
             var view = registry.reader.*;
             view.packets = registry.reader.packets[epoch.start..epoch.end];
@@ -142,7 +143,11 @@ pub const Continuation = struct {
                 }
             };
             var capture = Capture{ .slots = slots[0..count], .context = context, .callback = callback };
-            const result = try self.core.?.decodeSelectedWithConfigurations(&view, selected[0..count], &capture, Capture.publish, .{ .session = registry, .base = epoch.start, .independent_start = epoch.independent, .max_refs = epoch.max_refs });
+            const core = self.core.?;
+            const limit = core.options.max_dependency_packets;
+            defer core.options.max_dependency_packets = limit;
+            core.options.max_dependency_packets = limit -| stats.decoded_packets;
+            const result = try core.decodeSelectedWithConfigurations(&view, selected[0..count], &capture, Capture.publish, .{ .session = registry, .base = epoch.start, .independent_start = epoch.independent, .max_refs = epoch.max_refs });
             stats.decoded_packets += result.decoded_packets;
             stats.payload_bytes += result.payload_bytes;
             stats.decode_high_water = @max(stats.decode_high_water, result.decode_high_water + registry.budget.live);
@@ -150,7 +155,69 @@ pub const Continuation = struct {
         return stats;
     }
 };
+/// Arena-owned decode and suffix-bootstrap metadata. Mutable parser state and
+/// provider pointers never enter the shared cache.
+pub const Snapshot = struct {
+    parameter_bytes: usize,
+    entries: []Entry,
+    epochs: []Epoch,
+    packet_configs: []usize,
+    progressive_idrs: []usize,
+    sequence_versions: [32]Versions,
+    picture_versions: [256]Versions,
+
+    fn copyVersions(a: std.mem.Allocator, source: anytype) !@TypeOf(source) {
+        var result: @TypeOf(source) = @splat(.{});
+        for (&result, source) |*dest, versions| {
+            dest.list = .fromOwnedSlice(try a.dupe(Parameter, versions.list.items));
+            for (dest.list.items) |*item| item.bytes = try a.dupe(u8, item.bytes);
+        }
+        return result;
+    }
+
+    pub fn copy(a: std.mem.Allocator, session: *const Session) !Snapshot {
+        const entries = try a.dupe(Entry, session.entries.items);
+        for (entries) |*value| {
+            value.avcc = try a.dupe(u8, value.avcc);
+            if (value.config.groups.explicit) |map| value.config.groups.explicit = try a.dupe(u8, map);
+        }
+        return .{
+            .parameter_bytes = session.budget.live,
+            .entries = entries,
+            .epochs = try a.dupe(Epoch, session.epochs.items),
+            .packet_configs = try a.dupe(usize, session.packet_configs),
+            .progressive_idrs = try a.dupe(usize, session.progressive_idrs.items),
+            .sequence_versions = try copyVersions(a, session.sequence_versions),
+            .picture_versions = try copyVersions(a, session.picture_versions),
+        };
+    }
+
+    pub fn bind(self: *const Snapshot, a: std.mem.Allocator, reader: *media.mp4.Reader, options: h264.Options) !*Session {
+        var reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(Session) }) else media.admission.Token{};
+        errdefer reservation.deinit();
+        const session = try a.create(Session);
+        session.* = .{
+            .borrowed = true,
+            .reservation = reservation,
+            .backing = a,
+            .reader = reader,
+            .length_bytes = reader.track.nal_length_bytes,
+            .options = options,
+            .budget = .{ .backing = a, .limit = options.max_parameter_bytes, .live = self.parameter_bytes, .peak = self.parameter_bytes },
+            .header_budget = .{ .backing = a, .limit = options.max_parameter_bytes },
+            .entries = .fromOwnedSlice(self.entries),
+            .epochs = .fromOwnedSlice(self.epochs),
+            .packet_configs = self.packet_configs,
+            .progressive_idrs = .fromOwnedSlice(self.progressive_idrs),
+            .sequence_versions = self.sequence_versions,
+            .picture_versions = self.picture_versions,
+        };
+        return session;
+    }
+};
+
 pub const Session = struct {
+    borrowed: bool = false,
     backing: std.mem.Allocator,
     budget: Budget,
     reader: *media.mp4.Reader,
@@ -190,6 +257,10 @@ pub const Session = struct {
         return self;
     }
     pub fn deinit(self: *Session) void {
+        var reservation = self.reservation;
+        defer reservation.deinit();
+        defer self.backing.destroy(self);
+        if (self.borrowed) return;
         const allocator = self.budget.allocator();
         for (self.entries.items) |value| {
             value.config.groups.deinit(allocator);
@@ -202,10 +273,6 @@ pub const Session = struct {
         for (&self.picture_versions) |*versions| versions.deinit(allocator);
         allocator.free(self.packet_configs);
         self.releasePlanningHeaders();
-        var reservation = self.reservation;
-        const backing = self.backing;
-        backing.destroy(self);
-        reservation.deinit();
     }
     pub fn releasePlanningHeaders(self: *Session) void {
         const a = self.header_budget.allocator();
@@ -372,6 +439,7 @@ pub const Session = struct {
     /// Append only to an immutable prefix. A scan failure invalidates this owner.
     /// Caller content-bindings verify the prefix before invoking this method.
     pub fn append(self: *Session, reader: *media.mp4.Reader) !void {
+        if (self.borrowed) return error.InvalidVideoIndex;
         if (!self.valid) return error.InvalidVideoDecoder;
         if (reader.packets.len <= self.packet_configs.len or reader.packets.len > self.options.max_parameter_packets) return error.ResourceLimitExceeded;
         self.reader = reader;
@@ -406,6 +474,7 @@ pub const Session = struct {
     }
     /// Allocate the new selector table before changing any retained state.
     pub fn rebase(self: *Session, removed: usize) !void {
+        if (self.borrowed) return error.InvalidVideoIndex;
         if (!self.valid or removed > self.packet_configs.len) return error.InvalidPacketIndex;
         const allocator = self.budget.allocator();
         const selectors = try allocator.dupe(usize, self.packet_configs[removed..]);
@@ -768,4 +837,42 @@ test "dynamic AVC parameter versions retain effective changes across repeated he
     history.rebase(a, 301);
     try std.testing.expectEqualStrings("first change", history.before(0).?.bytes);
     try std.testing.expectEqualStrings("second change", history.before(1).?.bytes);
+}
+
+test "dynamic AVC continuation shares its packet budget across geometry epochs" {
+    const a = std.testing.allocator;
+    // Select a P-picture needing the first IDR, then an IDR in a new epoch.
+    const closed = @embedFile("../testdata/schedule-closed.mp4");
+    const geometry = @embedFile("../testdata/h264-dynamic-geometry.mp4");
+    var first = media.source.Source{ .allocator = a, .identity = "closed", .storage = .{ .borrowed = closed } };
+    var second = media.source.Source{ .allocator = a, .identity = "geometry", .storage = .{ .borrowed = geometry } };
+    var left = try media.mp4.Reader.init(a, &first, .{});
+    defer left.deinit();
+    var right = try media.mp4.Reader.init(a, &second, .{});
+    defer right.deinit();
+    const joined = try std.mem.concat(a, u8, &.{ closed, geometry });
+    defer a.free(joined);
+    var source = media.source.Source{ .allocator = a, .identity = "epochs", .storage = .{ .borrowed = joined } };
+    var view = left;
+    var packets = [_]media.mp4.Packet{ left.packets[0], left.packets[1], right.packets[1] };
+    packets[2].offset += closed.len;
+    view.input = &source;
+    view.packets = &packets;
+    const registry = try Session.init(a, &view, .{ .max_dependency_packets = 2 });
+    defer registry.deinit();
+    const Sink = struct {
+        fn accept(raw: *anyopaque, _: usize, _: *const h264.Frame) !void {
+            const seen: *usize = @ptrCast(@alignCast(raw));
+            seen.* += 1;
+        }
+    };
+    var seen: usize = 0;
+    var continuation = Continuation{ .session = registry };
+    defer continuation.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, continuation.decodeSelected(&.{ 1, 2 }, &seen, Sink.accept));
+    try std.testing.expectEqual(@as(usize, 1), seen);
+    try std.testing.expect(continuation.core == null);
+    registry.options.max_dependency_packets = 3;
+    const stats = try continuation.decodeSelected(&.{ 1, 2 }, &seen, Sink.accept);
+    try std.testing.expectEqual(@as(usize, 3), stats.decoded_packets);
 }

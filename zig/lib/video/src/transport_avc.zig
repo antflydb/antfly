@@ -17,6 +17,7 @@
 const std = @import("std");
 const media = @import("antfly_media");
 const h264 = @import("h264.zig");
+pub const max_configuration_bytes: usize = 2 * @as(usize, std.math.maxInt(u16)) + 11;
 pub const Options = struct {
     transport: media.transport_stream.Limits = .{},
     stream: media.stream.Options = .{},
@@ -158,7 +159,7 @@ fn accessUnits(a: std.mem.Allocator, demux: media.transport_stream.Demux, option
     return .{ .allocator = a, .packets = packets, .reservation = reservation };
 }
 pub fn fromDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transport_stream.Demux, options: Options) !Reader {
-    return normalizeDemux(a, identity, demux, options, null, null);
+    return normalizeDemux(a, identity, demux, options, null, null, null);
 }
 
 const Description = struct {
@@ -166,7 +167,7 @@ const Description = struct {
     backing: *media.stream.Snapshot,
 };
 
-fn normalizeDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transport_stream.Demux, options: Options, description: ?Description, initial_description: ?[]const u8) !Reader {
+fn normalizeDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transport_stream.Demux, options: Options, description: ?Description, initial_description: ?[]const u8, locations: ?NalLocations) !Reader {
     if (demux.packets.len == 0 or demux.packets.len > options.transport.max_packets) return error.ResourceLimitExceeded;
     try options.stream.control.check();
     if (options.configuration) |bytes| if (bytes.len > options.stream.max_bytes) return error.ResourceLimitExceeded;
@@ -180,7 +181,7 @@ fn normalizeDemux(a: std.mem.Allocator, identity: []const u8, demux: media.trans
     var config_reservation = media.admission.Token{};
     defer config_reservation.deinit();
     const track = if (description) |shared| shared.track else blk: {
-        const config_bound = @max(@min(@as(usize, 131081), try std.math.add(usize, demux.bytes.len, 11)), if (options.configuration) |bytes| bytes.len else 0);
+        const config_bound = @max(@min(max_configuration_bytes, try std.math.add(usize, demux.bytes.len, 11)), if (options.configuration) |bytes| bytes.len else 0);
         if (options.stream.admission_pool) |pool| config_reservation = try pool.acquire(.{ .host_bytes = try std.math.mul(usize, config_bound, 12) });
         extracted = if (initial_description) |initial| try a.dupe(u8, initial) else try configuration(a, demux, options);
         const config = try h264.configParse(a, extracted.?);
@@ -218,6 +219,7 @@ fn normalizeDemux(a: std.mem.Allocator, identity: []const u8, demux: media.trans
             if (auds > 1) return error.AmbiguousTransportPictureTiming;
             if (nal[0] & 31 == 5) sync = true;
             if (nal.len + 4 > options.stream.max_bytes -| normalized.items.len) return error.ResourceLimitExceeded;
+            if (locations) |sink| try sink.record(sink.context, sink.origin + (@intFromPtr(nal.ptr) - @intFromPtr(demux.bytes.ptr)), nal.len);
             var prefix: [4]u8 = undefined;
             std.mem.writeInt(u32, &prefix, std.math.cast(u32, nal.len) orelse return error.ResourceLimitExceeded, .big);
             try normalized.appendSlice(a, &prefix);
@@ -250,7 +252,14 @@ fn normalizeDemux(a: std.mem.Allocator, identity: []const u8, demux: media.trans
     return .{ .snapshot = snapshot, .reader = .{ .allocator = a, .input = &snapshot.input, .metadata = metadata, .index_reservation = reservation, .track = result_track, .packets = packets, .limits = options.index }, .next_state = demux.next_state };
 }
 
+pub const NalLocations = struct {
+    context: *anyopaque,
+    origin: usize = 0,
+    record: *const fn (*anyopaque, usize, usize) anyerror!void,
+};
+
 pub const StreamOptions = struct {
+    locations: ?NalLocations = null,
     /// A single clip has one sample description. Subsequent in-band SPS/PPS
     /// remain in the normalized payload and the decoder resolves activation.
     retain_initial_description: bool = false,
@@ -468,7 +477,9 @@ pub const Stream = struct {
         options.configuration = self.configuration;
         options.single_access_unit_duration_ticks = duration;
         options.last_duration_ticks = duration;
-        var source = try normalizeDemux(self.allocator, identity, demux, options, self.description, if (self.options.retain_initial_description) self.configuration else null);
+        var locations = self.options.locations;
+        if (locations) |*sink| sink.origin = self.payload_bytes - self.bytes.items.len;
+        var source = try normalizeDemux(self.allocator, identity, demux, options, self.description, if (self.options.retain_initial_description) self.configuration else null, locations);
         errdefer if (owners_live) source.deinit();
         if (self.description == null) if (self.configuration) |config| if (!std.mem.eql(u8, config, source.reader.track.avcc)) return error.SourceVersionChanged;
         var cfg: ?[]u8 = null;
@@ -531,7 +542,6 @@ pub fn indexClip(a: std.mem.Allocator, identity: []const u8, bytes: []const u8, 
 }
 
 pub fn indexSource(a: std.mem.Allocator, source: *media.source.Source, options: Options) !*@import("live_windows.zig").Builder {
-    if (source.length() > options.transport.max_bytes) return error.ResourceLimitExceeded;
     const windows = @import("live_windows.zig");
     const Collector = struct {
         allocator: std.mem.Allocator,
@@ -549,7 +559,13 @@ pub fn indexSource(a: std.mem.Allocator, source: *media.source.Source, options: 
     errdefer if (collector.owner) |owner| owner.deinit();
     var units = try Stream.init(a, source.identity, .{ .video = options, .retain_initial_description = true }, &collector, Collector.accept);
     defer if (!units.ended) units.deinit();
-    var demux = try media.transport_stream.Stream.init(a, .{}, options.transport, options.stream.control, options.stream.admission_pool, units.consumer());
+    try scanSource(a, source, options, &units, units.consumer());
+    return collector.owner orelse error.EmptyVideo;
+}
+
+pub fn scanSource(a: std.mem.Allocator, source: *media.source.Source, options: Options, units: *Stream, consumer_: media.transport_stream.Consumer) !void {
+    if (source.length() > options.transport.max_bytes) return error.ResourceLimitExceeded;
+    var demux = try media.transport_stream.Stream.init(a, .{}, options.transport, options.stream.control, options.stream.admission_pool, consumer_);
     defer if (!demux.ended) demux.deinit();
     switch (source.storage) {
         .borrowed => |bytes| try demux.push(bytes),
@@ -567,7 +583,6 @@ pub fn indexSource(a: std.mem.Allocator, source: *media.source.Source, options: 
     }
     _ = try demux.finish();
     try units.finish(options.last_duration_ticks);
-    return collector.owner orelse error.EmptyVideo;
 }
 
 /// Request-local state for HLS TS video. Media controls the transport and AES;

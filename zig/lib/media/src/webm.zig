@@ -161,8 +161,22 @@ pub const Reader = struct {
         return clock;
     }
     fn scanSource(allocator: std.mem.Allocator, input: *source.Source, limits: Limits, clock: ?*@import("timeline.zig").SampleClock) !Reader {
-        var index_reservation = if (input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = if (clock == null) limits.max_index_bytes else 0 }) else @import("admission.zig").Token{};
-        errdefer index_reservation.deinit();
+        var memory = @import("admission.zig").TrackedAllocator{
+            .backing = allocator,
+            .reservation = if (input.admission_pool) |pool| try pool.acquire(.{}) else .{},
+            // Packet and cue capacity obey the index limit. The pool admits
+            // moving-growth overlap against the request's working budget.
+            .limit = limits.max_index_bytes *| 2,
+        };
+        errdefer memory.reservation.deinit();
+        var result = readIndex(memory.allocator(), input, limits, clock) catch |err|
+            return if (err == error.OutOfMemory) memory.denied orelse err else err;
+        result.allocator = allocator;
+        result.index_reservation = memory.reservation;
+        return result;
+    }
+
+    fn readIndex(allocator: std.mem.Allocator, input: *source.Source, limits: Limits, clock: ?*@import("timeline.zig").SampleClock) !Reader {
         var scan = Scan{ .input = input, .limits = limits, .clock = clock };
         var cursor: u64 = 0;
         const file_header = try scan.header(cursor, input.length());
@@ -269,7 +283,7 @@ pub const Reader = struct {
         }
         if (clock) |result| {
             if (result.count == 0) return error.EmptyVideoTrack;
-            return .{ .allocator = allocator, .input = input, .index_reservation = index_reservation, .metadata = metadata.?, .track = track, .packets = &.{}, .cues = &.{}, .timestamp_scale_ns = scale };
+            return .{ .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = &.{}, .cues = &.{}, .timestamp_scale_ns = scale };
         }
         if (packets.items.len == 0) return error.EmptyVideoTrack;
         var cues: std.ArrayList(Cue) = .empty;
@@ -288,7 +302,7 @@ pub const Reader = struct {
         for (cues.items, 0..) |cue, i| if (i != 0 and cue.pts == cues.items[i - 1].pts) return error.MalformedMedia;
         const owned_cues = try cues.toOwnedSlice(allocator);
         errdefer allocator.free(owned_cues);
-        return .{ .cues = owned_cues, .index_reservation = index_reservation, .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = try packets.toOwnedSlice(allocator), .timestamp_scale_ns = scale, .duration_seconds = duration_seconds };
+        return .{ .cues = owned_cues, .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = try packets.toOwnedSlice(allocator), .timestamp_scale_ns = scale, .duration_seconds = duration_seconds };
     }
     pub fn deinit(self: *Reader) void {
         if (self.source_timeline) |timeline| self.allocator.free(timeline.samples);

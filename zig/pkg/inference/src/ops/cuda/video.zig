@@ -514,6 +514,21 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     var reader = try media.mp4.Reader.init(allocator, &source, limits);
     defer reader.deinit();
     try validateTrack(reader.track);
+    try ctx.makeCurrent();
+    if (ctx.video_decoder_cache == null) {
+        try state.checkStatus(antfly_nvdec_open(&ctx.video_decoder_cache, ctx.stream, &state, DecodeState.callback));
+        ctx.video_decoder_release = antfly_nvdec_close;
+    }
+    const decoder = ctx.video_decoder_cache;
+    antfly_nvdec_set_budget(decoder.?, ctx, reserveDecoder, releaseDecoder);
+    var decoding = false;
+    var succeeded = false;
+    defer {
+        if (!decoding or succeeded) antfly_nvdec_finish(decoder.?) else {
+            antfly_nvdec_close(decoder.?);
+            ctx.video_decoder_cache = null;
+        }
+    }
     const normalized = try @import("antfly_video").hevc_config.normalizeReader(allocator, &reader);
     defer if (normalized) |config| allocator.free(config);
     const track = reader.track;
@@ -538,26 +553,13 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     if (sampling == .embedding_gemma2) {
         state.embedding_sampler = try embeddingSamplerForReader(&reader, state.sampler.end_us);
     }
-    try ctx.makeCurrent();
-    if (ctx.video_decoder_cache == null) {
-        try state.checkStatus(antfly_nvdec_open(&ctx.video_decoder_cache, ctx.stream, &state, DecodeState.callback));
-        ctx.video_decoder_release = antfly_nvdec_close;
-    }
-    const decoder = ctx.video_decoder_cache;
-    antfly_nvdec_set_budget(decoder.?, ctx, reserveDecoder, releaseDecoder);
-    var succeeded = false;
-    defer {
-        if (succeeded) antfly_nvdec_finish(decoder.?) else {
-            antfly_nvdec_close(decoder.?);
-            ctx.video_decoder_cache = null;
-        }
-    }
     const codec: c_int = switch (track.codec) {
         .avc => 4,
         .hevc => 8,
         .av1 => 11,
         .mjpeg => return error.UnsupportedVideoFormat,
     };
+    decoding = true;
     try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, state.sar.horizontal, state.sar.vertical, @intFromBool(track.pixel_aspect_declared)));
     var annex: std.ArrayList(u8) = .empty;
     defer annex.deinit(allocator);
@@ -572,10 +574,13 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
         try source.control.check();
         var lease = try reader.readPacket(index);
         defer lease.deinit();
-        annex.clearRetainingCapacity();
-        if (track.codec == .av1) try annex.appendSlice(allocator, lease.bytes) else try annexPacket(allocator, &annex, lease.bytes, track.nal_length_bytes);
+        const payload = if (track.codec == .av1) lease.bytes else converted: {
+            annex.clearRetainingCapacity();
+            try annexPacket(allocator, &annex, lease.bytes, track.nal_length_bytes);
+            break :converted annex.items;
+        };
         const pts = if (state.selected_packets != null) @as(i64, @intCast(index)) else try timestampUs(packet.pts, track.timescale);
-        const result = antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), pts, 0);
+        const result = antfly_nvdec_packet(decoder.?, payload.ptr, @intCast(payload.len), pts, 0);
         if (state.failure) |err| return err;
         try state.checkStatus(result);
         state.stats.compressed_bytes += lease.bytes.len;

@@ -220,7 +220,7 @@ pub const Inspection = struct {
             self.webm_index = if (configuration.webm) |input| input.index.* else try video.webm_pictures.index(a, &self.webm_reader, webmDecodeOptions(self.source.control, &self.pool));
             self.owns_webm_index = configuration.webm == null;
             self.webm_index.?.reader = &self.webm_reader;
-            self.gemma4_plan = try adaptedPlan(self.webm_index.?, configuration.sampling, self.source.control);
+            self.gemma4_plan = try webmGemma4Plan(self.webm_index.?, configuration.sampling, self.source.control);
             self.selected = if (self.gemma4_plan) |*plan| try a.dupe(usize, plan.ids()) else try selectWebm(a, self.webm_index.?, configuration.sampling, self.source.control, if (configuration.webm) |input| input.timeline else null);
             self.plan = try inspectSelectedWebmPlan(&self.webm_reader, self.webm_index.?, metal, self.selected.?);
         } else {
@@ -1367,7 +1367,7 @@ pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: 
         const reader = &opened.webm;
         var index = try video.webm_pictures.index(a, reader, webmDecodeOptions(source.control, pool));
         defer index.deinit();
-        if (try adaptedPlan(index, sampling, source.control)) |plan| return a.dupe(i64, plan.timestamps());
+        if (try webmGemma4Plan(index, sampling, source.control)) |plan| return a.dupe(i64, plan.timestamps());
         const selected = try selectWebm(a, index, sampling, source.control, null);
         defer a.free(selected);
         var first: i64 = std.math.maxInt(i64);
@@ -1392,13 +1392,12 @@ pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: 
     }
     return output;
 }
-fn adaptedPlan(index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control) !?video.packet_sampling.Gemma4Plan {
-    if (sampling == .gemma4) if (index.reader) |reader| if (reader.source_timeline) |timeline|
-        return try video.packet_sampling.gemma4AdaptedPictures(timeline, index.pictures, control);
+fn webmGemma4Plan(index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control) !?video.packet_sampling.Gemma4Plan {
+    if (sampling == .gemma4) return try video.packet_sampling.gemma4WebmPictures(index, control);
     return null;
 }
 fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control, timeline: ?*const video.sampling.Timeline) ![]usize {
-    if (try adaptedPlan(index, sampling, control)) |plan| return a.dupe(usize, plan.ids());
+    if (try webmGemma4Plan(index, sampling, control)) |plan| return a.dupe(usize, plan.ids());
     if (sampling == .reference) return index.select();
     var owned: ?video.sampling.Timeline = if (timeline == null and index.sourceTimeline() != null) try index.presentationTimeline(a, control) else null;
     defer if (owned) |*value| value.deinit();

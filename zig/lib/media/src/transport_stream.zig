@@ -156,7 +156,13 @@ const Table = struct {
 /// Borrowed payload valid only during its callback. Copy it for retention.
 /// Continuation PES records retain has_timestamp=false; no clocks are invented.
 pub const Pes = struct { bytes: []const u8, packet: Packet, ordinal: usize };
-pub const Consumer = struct { context: *anyopaque, accept: *const fn (*anyopaque, Pes) anyerror!void };
+pub const Consumer = struct {
+    context: *anyopaque,
+    accept: *const fn (*anyopaque, Pes) anyerror!void,
+    /// Report physical source bytes backing the validated elementary stream.
+    extent_context: ?*anyopaque = null,
+    extent: ?*const fn (*anyopaque, usize, usize, usize) anyerror!void = null,
+};
 
 /// Keep only the fields through DTS. Validate PES stuffing as it arrives so a
 /// timing probe can discard elementary stream bytes immediately.
@@ -191,6 +197,8 @@ const Parser = struct {
     pmt_table: Table = .{},
     pes: std.ArrayList(u8) = .empty,
     pes_started: bool = false,
+    wire_cursor: usize = 0,
+    pes_wire: std.ArrayList(struct { start: usize, len: u8 }) = .empty,
     output: std.ArrayList(u8) = .empty,
     packets: std.ArrayList(Packet) = .empty,
     consumer: ?Consumer = null,
@@ -298,6 +306,16 @@ const Parser = struct {
             if (timed) probe.clock.include(pts);
             probe.size = 0;
         } else if (self.consumer) |consumer| {
+            if (consumer.extent) |extent| {
+                var pos: usize = 0;
+                for (self.pes_wire.items) |part| {
+                    const first = @max(pos, header);
+                    const stop = @min(pos + part.len, end);
+                    if (first < stop) try extent(consumer.extent_context orelse consumer.context, offset + first - header, part.start + (first - pos), stop - first);
+                    pos += part.len;
+                }
+                self.pes_wire.clearRetainingCapacity();
+            }
             try consumer.accept(consumer.context, .{ .bytes = bytes[header..end], .packet = packet_info, .ordinal = count });
         } else {
             try self.packets.append(self.allocator, packet_info);
@@ -328,6 +346,8 @@ const Parser = struct {
     }
     fn packet(self: *Parser, bytes: *const [188]u8) !void {
         try self.control.check();
+        const wire_start = self.wire_cursor;
+        self.wire_cursor = try std.math.add(usize, wire_start, 188);
         if (bytes[0] != 0x47 or bytes[1] & 0x80 != 0) return error.MalformedTransportStream;
         const pid = (@as(u16, bytes[1] & 31) << 8) | bytes[2];
         const start = bytes[1] & 0x40 != 0;
@@ -367,6 +387,9 @@ const Parser = struct {
         if (!self.pes_started) return error.TruncatedTransportPes;
         if (payload.len > self.limits.max_pes_bytes -| self.pesSize()) return error.ResourceLimitExceeded;
         if (self.probe) |probe| return probe.push(payload);
+        if (self.consumer) |consumer| if (consumer.extent != null) {
+            try self.pes_wire.append(self.allocator, .{ .start = wire_start + cursor, .len = @intCast(payload.len) });
+        };
         try self.pes.appendSlice(self.allocator, payload);
     }
 };
@@ -401,6 +424,8 @@ pub const Stream = struct {
     }
     pub fn deinit(self: *Stream) void {
         const a = self.workspace.allocator();
+        self.parser.pes_wire.deinit(a);
+        self.parser.pes_wire = .empty;
         self.parser.pes.deinit(a);
         self.parser.pes = .empty;
         self.parser.output.deinit(a);

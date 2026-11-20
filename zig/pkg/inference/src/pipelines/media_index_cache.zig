@@ -120,6 +120,10 @@ pub const Cache = struct {
         }
     };
     pub fn key(source: *const media.source.Source, webm: bool, max_packets: usize, max_working_bytes: usize) ?[32]u8 {
+        return videoKey(source, if (webm) .webm else .mp4, max_packets, max_working_bytes);
+    }
+    pub const Container = enum(u8) { mp4, webm, transport };
+    pub fn videoKey(source: *const media.source.Source, container: Container, max_packets: usize, max_working_bytes: usize) ?[32]u8 {
         const binding = switch (source.storage) {
             .range => |range| range.immutable_binding orelse return null,
             .borrowed => return null,
@@ -128,7 +132,7 @@ pub const Cache = struct {
         hash.update("media-container-index-v1");
         hash.update(&binding);
         hash.update(source.identity);
-        hash.update(&.{@intFromBool(webm)});
+        hash.update(&.{@backingInt(container)});
         for ([_]u64{ source.length(), max_packets, max_working_bytes }) |n| {
             var raw: [8]u8 = undefined;
             std.mem.writeInt(u64, &raw, n, .little);
@@ -294,8 +298,7 @@ pub const Cache = struct {
         };
         if (planning) |value| switch (value) {
             .mp4 => |owner| {
-                // In-band parameter registries own mutable request context.
-                if (owner.registry == null) entry.mp4_plan = video_owner.Snapshot.copy(entry.arena.allocator(), owner) catch {
+                entry.mp4_plan = video_owner.Snapshot.copy(entry.arena.allocator(), owner) catch {
                     entry.destroy();
                     return null;
                 };

@@ -70,11 +70,27 @@ pub fn gemma4AdaptedPictures(timeline: media.webm.SourceTimeline, pictures: []co
     return planPictures(timeline.timescale, timeline.edit, pictures, timeline.samples, null, control);
 }
 
-fn pictureTime(pic: anytype, samples: ?[]const media.webm.SourceTimeline.Sample) !media.webm.SourceTimeline.Sample {
+pub fn gemma4WebmPictures(index: @import("webm_pictures.zig").Index, control: media.source.Control) !Gemma4Plan {
+    if (index.sourceTimeline()) |source| return gemma4AdaptedPictures(source, index.pictures, control);
+    if (index.pictures.len == 0) return error.EmptyVideo;
+    var bounds = sampling_mod.Bounds{};
+    for (index.pictures, 0..) |picture, i| {
+        if (i % 256 == 0) try control.check();
+        bounds.include(picture.pts, picture.duration);
+    }
+    const declared: ?i64 = if (index.duration_seconds) |seconds| @intFromFloat(seconds * std.time.ns_per_s) else null;
+    const duration = std.math.cast(i64, bounds.end(declared) - bounds.first) orelse return error.TimestampOverflow;
+    if (duration <= 0) return error.EmptyVideoWindow;
+    return planPictures(std.time.ns_per_s, .{ .source_start = bounds.first, .source_duration = duration }, index.pictures, null, null, control);
+}
+
+fn pictureTime(pic: anytype, samples: ?[]const media.webm.SourceTimeline.Sample) !sampling_mod.TimedPicture {
     if (comptime @hasField(@TypeOf(pic), "packet_index")) {
-        const index = pic.packet_index orelse return error.InvalidVideoIndex;
-        if (index >= samples.?.len) return error.InvalidVideoIndex;
-        return samples.?[index];
+        if (samples) |clock| {
+            const index = pic.packet_index orelse return error.InvalidVideoIndex;
+            if (index >= clock.len) return error.InvalidVideoIndex;
+            return .{ .pts = clock[index].pts, .duration = clock[index].duration };
+        }
     }
     return .{ .pts = pic.pts, .duration = pic.duration };
 }
@@ -91,7 +107,7 @@ fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, sample
             if (visible) |mask| if (!mask.isSet(i)) continue;
             const time = try pictureTime(pic, samples);
             origin = @min(origin, time.pts);
-            end = @max(end, @as(i128, time.pts) + time.duration);
+            end = @max(end, @as(i128, time.pts) + (time.duration orelse 0));
         }
         break :infer end - origin;
     };

@@ -99,6 +99,35 @@ pub const TimestampPolicy = struct {
     }
 };
 pub const TimedPicture = struct { pts: i64, duration: ?u64 };
+/// Presentation bounds for reordered pictures, including a trailing picture
+/// whose duration can be inferred from the preceding distinct timestamp.
+pub const Bounds = struct {
+    first: i64 = std.math.maxInt(i64),
+    latest: ?i64 = null,
+    previous: ?i64 = null,
+    last: i128 = std.math.minInt(i128),
+    unknown_tail: bool = false,
+
+    pub fn include(self: *Bounds, pts: i64, duration: ?u64) void {
+        self.first = @min(self.first, pts);
+        self.last = @max(self.last, @as(i128, pts) + (duration orelse 0));
+        if (self.latest == null or pts > self.latest.?) {
+            self.previous = self.latest;
+            self.latest = pts;
+            self.unknown_tail = duration == null;
+        } else if (pts == self.latest.?) {
+            self.unknown_tail = self.unknown_tail or duration == null;
+        } else if (self.previous == null or pts > self.previous.?) self.previous = pts;
+    }
+
+    pub fn end(self: Bounds, declared_end: ?i64) i128 {
+        if (self.unknown_tail) {
+            if (declared_end) |stop| return @max(self.last, stop);
+            if (self.previous) |before| return @max(self.last, 2 * @as(i128, self.latest.?) - before);
+        }
+        return self.last;
+    }
+};
 /// Immutable presentation index. Build once per source; selections are O(K log N).
 /// The augmented tree retains overlapping holds and stable decode-order ties.
 pub const Timeline = struct {
@@ -132,26 +161,15 @@ pub const Timeline = struct {
         if (count == 0) return error.EmptyVideo;
         const entries = try a.alloc(Entry, count);
         errdefer a.free(entries);
-        var first: i64 = std.math.maxInt(i64);
-        var latest: i64 = std.math.minInt(i64);
-        var last: i128 = std.math.minInt(i64);
+        var bounds = Bounds{};
         var i: usize = 0;
         for (pictures, 0..) |picture, id| {
             if (id % 256 == 0) try control.check();
             if (stop) |bound| if (picture.pts < edit.source_start or picture.pts >= bound) continue;
-            first = @min(first, picture.pts);
-            latest = @max(latest, picture.pts);
-            last = @max(last, @as(i128, picture.pts) + (picture.duration orelse 0));
+            bounds.include(picture.pts, picture.duration);
             entries[i] = .{ .id = id, .pts = picture.pts, .stop = @min(stop orelse std.math.maxInt(i128), if (picture.duration) |d| @as(i128, picture.pts) + d else std.math.maxInt(i128)) };
             i += 1;
         }
-        var previous: ?i64 = null;
-        var unknown_tail = false;
-        for (pictures) |picture| {
-            if (picture.pts < latest and (previous == null or picture.pts > previous.?)) previous = picture.pts;
-            if (picture.pts == latest and picture.duration == null) unknown_tail = true;
-        }
-        if (unknown_tail and previous != null) last = @max(last, @as(i128, latest) + (@as(i128, latest) - previous.?));
         std.mem.sort(Entry, entries, {}, struct {
             fn less(_: void, x: Entry, y: Entry) bool {
                 return x.pts < y.pts or (x.pts == y.pts and x.id > y.id);
@@ -167,7 +185,7 @@ pub const Timeline = struct {
             node -= 1;
             maxima[node] = @max(maxima[node * 2], maxima[node * 2 + 1]);
         }
-        return .{ .allocator = a, .entries = entries, .maxima = maxima, .base = base, .first = if (stop != null) edit.source_start else first, .last = stop orelse last };
+        return .{ .allocator = a, .entries = entries, .maxima = maxima, .base = base, .first = if (stop != null) edit.source_start else bounds.first, .last = stop orelse bounds.end(null) };
     }
     pub fn deinit(self: *Timeline) void {
         self.allocator.free(self.entries);
@@ -244,27 +262,13 @@ pub fn cappedSourceTimestamps(a: std.mem.Allocator, pictures: []const TimedPictu
 fn cappedAtOrigin(a: std.mem.Allocator, pictures: []const TimedPicture, timescale: u32, policy: TimestampPolicy, control: media.source.Control, relative: bool) ![]usize {
     try policy.validate();
     if (pictures.len == 0 or timescale == 0) return error.EmptyVideo;
-    var first = pictures[0].pts;
-    var last: i128 = pictures[0].pts;
-    var latest = pictures[0].pts;
+    var bounds = Bounds{};
     for (pictures, 0..) |picture, i| {
         if (i % 256 == 0) try control.check();
-        first = @min(first, picture.pts);
-        latest = @max(latest, picture.pts);
-        last = @max(last, @as(i128, picture.pts) + (picture.duration orelse 0));
+        bounds.include(picture.pts, picture.duration);
     }
-    // Matroska may omit BlockDuration. Infer only the trailing picture's
-    // duration from the preceding distinct presentation timestamp, matching the
-    // indexed video timeline. Never fabricate a rate for a single unknown frame.
-    var previous: ?i64 = null;
-    var unknown_tail = false;
-    for (pictures, 0..) |picture, i| {
-        if (i % 256 == 0) try control.check();
-        if (picture.pts < latest and (previous == null or picture.pts > previous.?)) previous = picture.pts;
-        if (picture.pts == latest and picture.duration == null) unknown_tail = true;
-    }
-    if (unknown_tail and previous != null) last = @max(last, @as(i128, latest) + (@as(i128, latest) - previous.?));
-    if (!relative) first = 0;
+    const first = if (relative) bounds.first else 0;
+    const last = bounds.end(null);
     const inferred = @divFloor((last - first) * 1_000_000_000 + timescale - 1, timescale);
     const end: i128 = policy.end_ns orelse (std.math.cast(i64, inferred) orelse return error.TimestampOverflow);
     if (end <= policy.start_ns) return error.EmptyVideoWindow;

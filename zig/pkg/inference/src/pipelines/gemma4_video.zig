@@ -336,6 +336,10 @@ test "gemma4 video portable encode admits before parsing and refunds malformed i
     try std.testing.expectError(error.MemoryBudgetExceeded, encode(&cb, admission, std.testing.allocator, &projector, "not a video"));
     budget.limits.host_limit_bytes = portable_host_bytes;
     try std.testing.expectError(error.InvalidVideoInput, encode(&cb, admission, std.testing.allocator, &projector, "not a video"));
+    if (@import("builtin").os.tag != .macos) {
+        budget.limits.combined_limit_bytes = portable_host_bytes;
+        try std.testing.expectError(error.HevcDecoderUnavailable, encode(&cb, admission, std.testing.allocator, &projector, @embedFile("../testdata/video/codecs/hevc-hvc1.mp4")));
+    }
     try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), budget.limits.scratch_limit_bytes);
 }
@@ -374,6 +378,7 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
     defer a.free(timestamps);
     const inspected = inspection.find(bytes, reader, configuration).?;
     if (!inspected.webm and inspected.reader.track.codec == .hevc) {
+        if (@import("builtin").os.tag != .macos) return error.HevcDecoderUnavailable;
         const required = try video.apple_hevc.surfaceBytesControlled(inspected.reader.track, source_control);
         if (required > video.apple_hevc.max_surface_bytes) return error.SharedAdmissionExceeded;
         try permit.ensureSurfaces(admission, std.math.cast(usize, required) orelse return error.SharedAdmissionExceeded);

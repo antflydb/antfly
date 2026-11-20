@@ -84,6 +84,37 @@ pub const SeekCache = struct {
     nearest: []usize,
     stamp: Stamp,
     portable: bool,
+    // A paged request borrows sorted verified IDRs and memoizes just its
+    // recently searched intervals. Dense storage remains useful for cold scans.
+    verified: []const usize = &.{},
+    recent: [32]struct { first: usize, last: usize, anchor: usize } = undefined,
+    recent_count: usize = 0,
+    next_slot: usize = 0,
+
+    pub fn forPage(a: std.mem.Allocator, reader: *const media.mp4.Reader, verified: []const usize) SeekCache {
+        return .{ .allocator = a, .nearest = &.{}, .stamp = Stamp.init(reader), .portable = true, .verified = verified };
+    }
+    fn lookup(self: *const SeekCache, index: usize) ?usize {
+        if (self.nearest.len != 0) {
+            const value = self.nearest[index];
+            return if (value == std.math.maxInt(usize)) null else value;
+        }
+        for (self.recent[0..self.recent_count]) |range| if (index >= range.first and index <= range.last) return range.anchor;
+        return if (std.sort.binarySearch(usize, self.verified, index, usizeOrder) != null) index else null;
+    }
+    fn usizeOrder(a: usize, b: usize) std.math.Order {
+        return std.math.order(a, b);
+    }
+    fn remember(self: *SeekCache, first: usize, last: usize, anchor: usize) void {
+        if (self.nearest.len != 0) {
+            @memset(self.nearest[first .. last + 1], anchor);
+            return;
+        }
+        self.recent[self.next_slot] = .{ .first = first, .last = last, .anchor = anchor };
+        self.next_slot = (self.next_slot + 1) % self.recent.len;
+        self.recent_count = @min(self.recent_count + 1, self.recent.len);
+    }
+
     pub fn init(a: std.mem.Allocator, reader: *const media.mp4.Reader, portable: bool) !SeekCache {
         if (reader.input.identity.len == 0) return error.InvalidVideoReaderSelection;
         const nearest = try a.alloc(usize, reader.packets.len);
@@ -107,15 +138,14 @@ const Builder = struct {
         if (self.options.mode == .from_start) return 0;
         var index = selected;
         if (self.options.seek_cache) |cache| {
-            if (cache.nearest[selected] != std.math.maxInt(usize)) return cache.nearest[selected];
+            if (cache.lookup(selected)) |anchor| return anchor;
         }
         while (true) {
             if (self.search_steps >= self.options.max_search_steps) return error.ResourceLimitExceeded;
             self.search_steps += 1;
             if (self.search_steps % 256 == 1) try self.reader.input.control.check();
-            if (self.options.seek_cache) |cache| if (cache.nearest[index] != std.math.maxInt(usize)) {
-                const anchor = cache.nearest[index];
-                @memset(cache.nearest[index .. selected + 1], anchor);
+            if (self.options.seek_cache) |cache| if (cache.lookup(index)) |anchor| {
+                cache.remember(index, selected, anchor);
                 return anchor;
             };
             if (self.reader.packets[index].sync) {
@@ -134,7 +164,7 @@ const Builder = struct {
                     self.probe_bytes += size;
                     if (try (if (self.options.portable_config) avc.isPortableIdr(lease.bytes, self.reader.track.nal_length_bytes) else avc.isIdr(lease.bytes, self.reader.track.nal_length_bytes))) {
                         try self.anchors.append(self.allocator, .{ .index = index, .payload = lease });
-                        if (self.options.seek_cache) |cache| @memset(cache.nearest[index .. selected + 1], index);
+                        if (self.options.seek_cache) |cache| cache.remember(index, selected, index);
                         return index;
                     }
                     lease.deinit();
@@ -142,7 +172,7 @@ const Builder = struct {
                 }
             }
             if (index == 0) {
-                if (self.options.seek_cache) |cache| @memset(cache.nearest[0 .. selected + 1], 0);
+                if (self.options.seek_cache) |cache| cache.remember(0, selected, 0);
                 return 0;
             } // Baseline fallback is not a claimed verified seek.
             index -= 1;

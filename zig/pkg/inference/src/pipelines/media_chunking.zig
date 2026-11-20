@@ -867,31 +867,31 @@ pub const Runner = struct {
         }
         defer self.audio_provider = null;
         const count = self.request.limits.max_index_packets;
-        if (transport) {
-            // Normalization changes packet offsets. Keep this index bound to
-            // its segmented payload for the lifetime of the request.
-            const max_bytes = @import("embedding_gemma2_video.zig").embedding_max_input_bytes;
-            const clip = try video.transport_avc.indexSource(self.allocator, source, .{
-                .index = .{ .max_samples = count, .max_index_bytes = self.request.max_working_bytes },
-                .transport = .{ .max_bytes = max_bytes },
-                .stream = .{ .max_bytes = max_bytes, .control = source.control, .admission_pool = &self.pool, .source_limits = .{ .max_total_bytes = 512 * 1024 * 1024 } },
-            });
-            defer clip.deinit();
-            clip.input.identity = &self.summary.identity.source;
-            var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &clip.reader, &self.pool, self.request.limits);
-            defer owner.deinit();
-            return self.videoWindows(&.{}, &clip.reader, try owner.durationNs(), owner.origin, clip.reader.track.timescale, &owner, null);
-        }
-        const identity = @import("media_index_cache.zig").Cache.key(source, webm, count, self.request.max_working_bytes);
+        const identity = @import("media_index_cache.zig").Cache.videoKey(source, if (transport) .transport else if (webm) .webm else .mp4, count, self.request.max_working_bytes);
+        var build: ?@import("media_speaker_flights.zig").Registry.Lease = if (transport and self.request.index_cache_admission != null and identity != null and self.request.index_cache != null)
+            try self.request.index_cache.?.acquireBuild(identity.?, self.control)
+        else
+            null;
+        defer if (build) |lease| lease.deinit();
         if (identity) |key| if (self.request.index_cache) |cache| if (cache.get(key)) |entry| {
             defer cache.release(entry);
+            if (build) |lease| lease.deinit();
+            build = null;
             switch (entry.data) {
                 .webm => |data| {
                     var reader = data.reader(self.allocator, source);
                     if (entry.webm_plan) |*plan| try self.webmWindowsSnapshot(&reader, plan) else try self.webmWindows(&reader);
                 },
                 .mp4 => |data| {
-                    var reader = data.reader(self.allocator, source);
+                    var view: video.transport_seek.View = undefined;
+                    var normalized: media.source.Source = undefined;
+                    const input = if (transport) bind: {
+                        const plan = entry.mp4_plan orelse return error.InvalidVideoIndex;
+                        view = .{ .map = plan.transport orelse return error.InvalidVideoIndex, .wire = source };
+                        normalized = view.source(&self.summary.identity.source, .{ .max_total_bytes = 512 * 1024 * 1024 });
+                        break :bind &normalized;
+                    } else source;
+                    var reader = data.reader(self.allocator, input);
                     var owner = if (entry.mp4_plan) |*plan| try @import("media_chunking_video.zig").Owner.fromSnapshot(self.allocator, &reader, &self.pool, self.request.limits, plan) else try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
                     defer owner.deinit();
                     try self.videoWindows(bytes, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
@@ -903,7 +903,27 @@ pub const Runner = struct {
         var limits = video.mp4_coded.limits;
         limits.max_samples = count;
         limits.max_index_bytes = self.request.max_working_bytes;
-        var input = try @import("embedding_gemma2_video.zig").ContainerInput.openLimited(self.allocator, source, bytes, webm, .reference, limits, .{ .max_packets = count });
+        if (transport) {
+            var index: video.transport_seek.Index = undefined;
+            try index.build(self.allocator, source, .{
+                .index = limits,
+                .transport = .{ .max_bytes = std.math.cast(usize, source.limits.max_total_bytes) orelse std.math.maxInt(usize), .max_packets = count },
+                .stream = .{ .max_bytes = @as(usize, limits.max_packet_bytes) + video.transport_avc.max_configuration_bytes, .control = source.control, .admission_pool = &self.pool },
+            });
+            defer index.deinit();
+            var view = video.transport_seek.View{ .map = index.mapping(), .wire = source };
+            var normalized = view.source(&self.summary.identity.source, .{ .max_total_bytes = 512 * 1024 * 1024 });
+            var reader = media.mp4.Reader{ .allocator = self.allocator, .input = &normalized, .metadata = .{ .source = null, .bytes = &.{} }, .packets = index.packets.items, .track = index.track.?, .limits = limits };
+            var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
+            defer owner.deinit();
+            owner.transport = view.map;
+            if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission|
+                cache.rememberPlanned(std.heap.smp_allocator, key, .{ .mp4 = reader }, admission, .{ .mp4 = &owner });
+            if (build) |lease| lease.deinit();
+            build = null;
+            return self.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
+        }
+        var input = try @import("embedding_gemma2_video.zig").ContainerInput.openLimited(self.allocator, source, bytes, webm, .reference, limits, .{ .max_packets = count, .max_index_bytes = self.request.max_working_bytes });
         defer input.deinit();
         switch (input) {
             .webm => |*reader| try self.webmWindowsCached(reader, identity),
@@ -920,7 +940,7 @@ pub const Runner = struct {
         return self.webmWindowsCached(reader, null);
     }
     fn webmWindowsCached(self: *Runner, reader: *media.webm.Reader, identity: ?[32]u8) !void {
-        var indexed = try video.webm_pictures.index(self.allocator, reader, .{ .max_packets = self.request.limits.max_index_packets, .max_pictures = self.request.limits.max_index_packets, .decoder = .{ .av1_all_layers = false, .control = reader.input.control } });
+        var indexed = try video.webm_pictures.index(self.allocator, reader, .{ .max_packets = self.request.limits.max_index_packets, .max_pictures = self.request.limits.max_index_packets, .decoder = .{ .av1_all_layers = false, .admission_pool = &self.pool, .control = reader.input.control } });
         defer indexed.deinit();
         const timeline_bytes = try std.math.add(usize, try video.sampling.Timeline.storageBytes(indexed.pictures.len), try std.math.mul(usize, indexed.pictures.len, @sizeOf(video.sampling.TimedPicture)));
         var timeline_reservation = try self.pool.acquire(.{ .host_bytes = timeline_bytes });
@@ -928,23 +948,7 @@ pub const Runner = struct {
         var timeline = try indexed.presentationTimeline(self.allocator, reader.input.control);
         defer timeline.deinit();
         const scale = indexed.timescale();
-        var duration = @divFloor((timeline.last - timeline.first) * std.time.ns_per_s + scale - 1, scale);
-        if (reader.source_timeline == null) {
-            if (reader.duration_seconds) |seconds| {
-                duration = @max(duration, @as(i128, @intFromFloat(seconds * std.time.ns_per_s)) - timeline.first);
-            } else {
-                var last_pts: i64 = std.math.minInt(i64);
-                var last_duration: ?u64 = null;
-                for (indexed.pictures, 0..) |picture, i| {
-                    if (i % 256 == 0) try self.control.check();
-                    if (picture.pts >= last_pts) {
-                        last_pts = picture.pts;
-                        last_duration = picture.duration;
-                    }
-                }
-                if (last_duration == null or last_duration.? == 0) return error.UnknownVideoDuration;
-            }
-        }
+        const duration = @divFloor((timeline.last - timeline.first) * std.time.ns_per_s + scale - 1, scale);
         if (duration <= 0) return error.UnknownVideoDuration;
         const snapshot = @import("media_index_cache.zig").Cache.WebmSnapshot{ .index = indexed, .source_bound = indexed.reader != null, .timeline = timeline, .origin = timeline.first, .duration = duration };
         if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.rememberPlanned(std.heap.smp_allocator, key, .{ .webm = reader.* }, admission, .{ .webm = snapshot });
@@ -1577,7 +1581,7 @@ test "model aware media WebM retains one verified index across range-backed mode
     var result = Qualification{};
     var executor = result.executor();
     executor.preflight = Inspect.preflight;
-    var runner = try Runner.init(std.testing.allocator, .{ .input = .{ .binary = .{ .mime_type = "video/webm", .data = &.{} } }, .native_source = &source, .source_version = "v1", .max_working_bytes = 512 * 1024 * 1024 }, executor, .{}, .{ .context = &result, .accept = Qualification.accept });
+    var runner = try Runner.init(std.testing.allocator, .{ .input = .{ .binary = .{ .mime_type = "video/webm", .data = &.{} } }, .native_source = &source, .source_version = "v1", .max_working_bytes = 8 * 1024 * 1024 }, executor, .{}, .{ .context = &result, .accept = Qualification.accept });
     try std.testing.expect((try runner.run()).complete);
     try std.testing.expect(result.seen > 0);
     try std.testing.expect(provider.bytes < 256 * 1024);
@@ -1957,6 +1961,9 @@ test "model aware media cached planning owns indexes and rebinds sources across 
     const Provider = struct {
         bytes: []const u8,
         reads: usize = 0,
+        // Represent an 80 MiB transport without storing its null packets.
+        padding: usize = 0,
+        allow_padding: bool = true,
         controller: memory.AdmissionController = .{},
         fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1967,30 +1974,46 @@ test "model aware media cached planning owns indexes and rebinds sources across 
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.reads += 1;
             const first: usize = @intCast(offset);
-            const count = @min(out.len, self.bytes.len - first);
-            @memcpy(out[0..count], self.bytes[first..][0..count]);
+            const count = @min(out.len, self.bytes.len + self.padding - first);
+            const payload = @min(count, self.bytes.len -| first);
+            if (payload > 0) @memcpy(out[0..payload], self.bytes[first..][0..payload]);
+            if (payload < count) {
+                if (!self.allow_padding) return error.UnexpectedRangeRead;
+                @memset(out[payload..count], 0xff);
+                const pos = first + payload - self.bytes.len;
+                for ([_]u8{ 0x47, 0x1f, 0xff, 0x10 }, 0..) |byte, k| {
+                    var at = payload + (k + 188 - pos % 188) % 188;
+                    while (at < count) : (at += 188) out[at] = byte;
+                }
+            }
             return count;
         }
     };
     const a = std.testing.allocator;
-    inline for (.{ "mjpeg-vfr.mov", "h264-frameonly.mp4", "vp8.webm", "codecs/av1.mp4", "codecs/hevc-hvc1.mp4" }) |name| {
+    inline for (.{ "mjpeg-vfr.mov", "h264-frameonly.mp4", "h264-two-pps.mp4", "closed-split.ts", "vp8.webm", "codecs/av1.mp4", "codecs/hevc-hvc1.mp4" }) |name| {
         const webm = std.mem.endsWith(u8, name, ".webm");
         var cache: Cache = .{};
         defer cache.deinit();
         var provider = Provider{ .bytes = @embedFile("../testdata/video/" ++ name) };
-        var next_provider = Provider{ .bytes = provider.bytes };
-        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = provider.bytes.len, .immutable_binding = @splat(1) } } };
-        const request = Request{ .input = .{ .binary = .{ .mime_type = if (webm) "video/webm" else "video/mp4", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 250 * std.time.ns_per_ms, .step_ns = 250 * std.time.ns_per_ms, .max_frames = 1 }, .max_chunks = 1 };
+        const transport = std.mem.endsWith(u8, name, ".ts");
+        if (transport) provider.padding = 188 * 450_000;
+        var next_provider = Provider{ .bytes = provider.bytes, .padding = provider.padding, .allow_padding = false };
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = provider.bytes.len + provider.padding, .immutable_binding = @splat(1) } }, .limits = .{ .max_total_bytes = 256 * 1024 * 1024 } };
+        const request = Request{ .input = .{ .binary = .{ .mime_type = if (webm) "video/webm" else if (transport) "video/mp2t" else "video/mp4", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 250 * std.time.ns_per_ms, .step_ns = 250 * std.time.ns_per_ms, .max_frames = 1 }, .max_chunks = 1 };
         var first = Qualification{};
         var runner = try Runner.init(a, request, first.executor(), .{}, .{ .context = &first, .accept = Qualification.accept });
         const summary = try runner.run();
         var pinned = source;
         pinned.identity = &summary.identity.source;
-        const hit = cache.get(Cache.key(&pinned, webm, request.limits.max_index_packets, request.max_working_bytes).?).?;
+        const hit = cache.get(Cache.videoKey(&pinned, if (transport) .transport else if (webm) .webm else .mp4, request.limits.max_index_packets, request.max_working_bytes).?).?;
         if (webm or std.mem.eql(u8, name, "codecs/av1.mp4")) {
             try std.testing.expect(hit.webm_plan != null);
             try std.testing.expect(hit.webm_plan.?.index.reader == null);
-        } else try std.testing.expect(hit.mp4_plan != null);
+        } else {
+            try std.testing.expect(hit.mp4_plan != null);
+            if (std.mem.endsWith(u8, name, ".ts")) try std.testing.expect(hit.mp4_plan.?.transport != null);
+            if (std.mem.eql(u8, name, "h264-two-pps.mp4")) try std.testing.expect(hit.mp4_plan.?.registry != null);
+        }
         cache.release(hit);
         var cursor: [85]u8 = undefined;
         var resumed = request;
