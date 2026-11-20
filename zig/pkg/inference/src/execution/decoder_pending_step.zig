@@ -63,6 +63,17 @@ pub const AcceptedTokens = struct {
     }
 };
 
+/// Transactional paged append may fail before publication; compatibility
+/// owners may advance the cursor before reporting an error. Reserve only the
+/// mutation that actually happened, so either failure contract cleans up safely.
+fn reserveGeneratedPosition(state: *state_mod.NativeDecodeState, reserved: *bool) !usize {
+    if (reserved.*) return error.InvalidPendingDecodeStep;
+    const before = state.total_tokens;
+    defer reserved.* = state.total_tokens > before;
+    var runtime = state_mod.BorrowedDecodeStateRuntime.init(state);
+    return runtime.appendGeneratedToken();
+}
+
 pub const Readback = struct {
     observation: @import("pending_observation.zig").Span = .{},
     context: Context,
@@ -84,13 +95,8 @@ pub const Readback = struct {
         return backend.beginI32ScalarDownload(candidate);
     }
 
-    /// Match the existing placeholder reservation ordering. An errored append
-    /// is cleaned up by the same bounded truncate used by the legacy route.
     pub fn reservePosition(self: *Readback) !usize {
-        if (self.reserved_position) return error.InvalidPendingDecodeStep;
-        self.reserved_position = true;
-        var runtime = self.context.runtime();
-        return runtime.appendGeneratedToken();
+        return reserveGeneratedPosition(self.context.state, &self.reserved_position);
     }
 
     pub fn retainLookahead(self: *Readback, tensor: ops.CT) !void {
@@ -202,10 +208,7 @@ pub const GreedyFrame = struct {
     }
 
     pub fn reserveLookahead(self: *GreedyFrame) !usize {
-        if (self.reserved_position) return error.InvalidPendingDecodeStep;
-        self.reserved_position = true;
-        var runtime = self.context.runtime();
-        return runtime.appendGeneratedToken();
+        return reserveGeneratedPosition(self.context.state, &self.reserved_position);
     }
 
     pub fn commitPosition(self: *GreedyFrame) !void {
@@ -269,6 +272,71 @@ pub const GreedyFrame = struct {
         self.reserved_position = false;
     }
 };
+
+test "pending readback failed atomic reservation preserves paired KV owners and retained views" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const runtime = @import("../runtime/root.zig");
+    const a = std.testing.allocator;
+    const Probe = struct {
+        cancelled: usize = 0,
+        fn cancel(raw: *anyopaque, _: ops.PendingI32ScalarDownload) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cancelled += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |paired| {
+        for (0..2) |failure_step| {
+            var failing = std.testing.FailingAllocator.init(a, .{});
+            var manager = runtime.kv.manager.KvManager.init(a);
+            defer manager.deinit();
+            const cfg = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 };
+            const pool = try manager.addPool(cfg);
+            var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, cfg);
+            defer storage.deinit();
+            var state = state_mod.NativeDecodeState.initPaged(failing.allocator(), &manager, pool, null);
+            state.kv_storage = if (paired) &storage else null;
+            defer state.deinit();
+            try state.notePrefill(2);
+            // Fill the published ID bank: one more token must grow its payload
+            // and retirement metadata, either of which can fail before commit.
+            const before_tokens = state.kv_block_ids.capacity * 2;
+            try state.appendGeneratedTokens(before_tokens - state.total_tokens);
+            const sequence = state.sequence_id.?;
+            const held = state.kvView().?;
+            const ids = try a.dupe(runtime.kv.block.KvBlockId, state.kv_block_ids.items);
+            defer a.free(ids);
+            var probe = Probe{};
+            var table = @import("../ops/native_compute.zig").vtable_impl;
+            table.cancelI32ScalarDownload = Probe.cancel;
+            const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
+            const model = model_mod.Config{};
+            const context = Context{ .allocator = a, .backend = &backend, .model = &model, .state = &state };
+            var step = Readback{ .context = context, .pending = .{ .handle = 11 } };
+            defer step.deinit();
+            failing.fail_index = failing.alloc_index + failure_step;
+            try std.testing.expectError(error.OutOfMemory, step.reservePosition());
+            try std.testing.expect(!step.reserved_position);
+            // Restore allocation before cleanup: an erroneous truncate must not
+            // be hidden by another allocation failure in the cleanup path.
+            failing.fail_index = std.math.maxInt(usize);
+            step.deinit();
+            try std.testing.expectEqual(@as(usize, 1), probe.cancelled);
+            try std.testing.expectEqual(before_tokens, state.total_tokens);
+            try std.testing.expectEqual(before_tokens, manager.tokenCount(sequence).?);
+            if (paired) try std.testing.expectEqual(before_tokens, storage.tokenCount(sequence).?);
+            try std.testing.expectEqual(held.logical_blocks.?.ptr, state.kvView().?.logical_blocks.?.ptr);
+            try std.testing.expectEqualSlices(runtime.kv.block.KvBlockId, ids, state.kv_block_ids.items);
+            try std.testing.expectEqualSlices(runtime.kv.block.KvBlockId, ids, held.logical_blocks.?);
+            try std.testing.expectEqual(held.token_count, state.kvView().?.token_count);
+            // The same state remains usable after the refused reservation.
+            var retry = Readback{ .context = context, .pending = null };
+            try std.testing.expectEqual(before_tokens + 1, try retry.reservePosition());
+            try retry.rollback();
+            retry.deinit();
+            try std.testing.expectEqual(before_tokens, state.total_tokens);
+        }
+    }
+}
 
 test "pending readback owns download lookahead and real KV reservation across acceptance rollback and errors" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
