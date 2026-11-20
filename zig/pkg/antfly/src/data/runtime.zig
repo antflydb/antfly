@@ -12467,6 +12467,29 @@ pub const DataServer = struct {
         }
     }
 
+    fn readDagActivationControl(
+        self: *DataServer,
+        allocator: std.mem.Allocator,
+        table: []const u8,
+        cancellation: antfly.db.types.CancellationToken,
+        comptime T: type,
+        route: DagActivationRoute,
+        control: anytype,
+    ) !T {
+        try cancellation.check();
+        try route.validate();
+        const json = try std.json.Stringify.valueAlloc(allocator, control, .{ .emit_strings_as_arrays = true });
+        defer allocator.free(json);
+        var reads = self.read_source.source();
+        reads.route_fence = route.fence;
+        var response = (try reads.lookupGroupLocal(allocator, route.fence.route.group_id, table, "", .{
+            .relational_topology_json = json,
+            .cancellation = cancellation,
+        }, .read_index)) orelse return error.GraphConstraintNotReady;
+        defer response.deinit(allocator);
+        return std.json.parseFromSliceLeaky(T, allocator, response.json, .{ .allocate = .alloc_always });
+    }
+
     /// Advance an activation whose source fences have already been installed.
     /// The caller supplies the pinned catalog routes and owns publication of
     /// the terminal catalog decision.
@@ -12490,18 +12513,7 @@ pub const DataServer = struct {
             cancellation: antfly.db.types.CancellationToken,
 
             fn read(self_port: @This(), comptime T: type, route: DagActivationRoute, control: anytype) !T {
-                try self_port.cancellation.check();
-                try route.validate();
-                const json = try std.json.Stringify.valueAlloc(self_port.alloc, control, .{ .emit_strings_as_arrays = true });
-                defer self_port.alloc.free(json);
-                var reads = self_port.server.read_source.source();
-                reads.route_fence = route.fence;
-                var response = (try reads.lookupGroupLocal(self_port.alloc, route.fence.route.group_id, self_port.table, "", .{
-                    .relational_topology_json = json,
-                    .cancellation = self_port.cancellation,
-                }, .read_index)) orelse return error.GraphConstraintNotReady;
-                defer response.deinit(self_port.alloc);
-                return std.json.parseFromSliceLeaky(T, self_port.alloc, response.json, .{ .allocate = .alloc_always });
+                return self_port.server.readDagActivationControl(self_port.alloc, self_port.table, self_port.cancellation, T, route, control);
             }
 
             pub fn readSource(self_port: @This(), _: std.mem.Allocator, source: DagEffects.ScanRequest) !DagEffects.ScanPage {
@@ -12578,8 +12590,8 @@ pub const DataServer = struct {
         }, cancellation);
     }
 
-    /// Run one activation step. The scheduling owner must durably
-    /// commit the returned phase before invoking this again.
+    /// Resume from the authority's ordered job record. The caller provides the
+    /// pinned plan and an initial progress value for a new attempt.
     pub fn advanceDagActivationJob(
         self: *DataServer,
         alloc: std.mem.Allocator,
@@ -12619,18 +12631,41 @@ pub const DataServer = struct {
                 try p.server.releaseDagActivationOnRoutes(p.allocator, p.table, p.manifest, p.route, p.sources, p.cancellation);
             }
         };
-        try cancellation.check();
-        return progress.advance(manifest, catalog.binding.digest, catalog.binding.epoch, Port{
-            .server = self,
-            .allocator = alloc,
-            .table = table_name,
-            .manifest = manifest,
-            .route = route,
-            .sources = source_routes,
-            .catalog = catalog,
-            .targets = targets,
-            .cancellation = cancellation,
+        if (!std.mem.eql(u8, &manifest.authority_namespace, &route.namespace) or
+            !std.meta.eql(progress.fence, manifest.fence)) return error.GraphConstraintRevisionChanged;
+        if (!std.mem.eql(u8, &progress.catalog_digest, &catalog.binding.digest) or progress.catalog_epoch != catalog.binding.epoch)
+            return error.GraphConstraintRevisionChanged;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const current = try self.readDagActivationControl(arena.allocator(), table_name, cancellation, ?DagEffects.JobProgress, route, .{
+            .mode = @as(enum { dag_activation_job_status }, .dag_activation_job_status),
+            .dag_job = .{ .namespace = route.namespace, .attempt = manifest.fence.activation },
         });
+        const next = if (current) |previous|
+            try previous.advance(manifest, catalog.binding.digest, catalog.binding.epoch, Port{
+                .server = self,
+                .allocator = alloc,
+                .table = table_name,
+                .manifest = manifest,
+                .route = route,
+                .sources = source_routes,
+                .catalog = catalog,
+                .targets = targets,
+                .cancellation = cancellation,
+            })
+        else
+            progress;
+        if (!std.meta.eql(current, @as(?DagEffects.JobProgress, next))) {
+            try localRaftBatchGroupRoutedWithCancellation(self, alloc, route.fence, table_name, .{
+                .dag_source_fence = .{
+                    .namespace = route.namespace,
+                    .action = .activation_job,
+                    .fence = manifest.fence,
+                    .activation_job = .{ .expected = current, .next = next },
+                },
+            }, cancellation);
+        }
+        return next;
     }
 
     fn localRaftBatchGroupRoutedWithCancellation(

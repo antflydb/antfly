@@ -1075,7 +1075,9 @@ pub const Operations = struct {
             var probe = std.json.parseFromSlice(Probe, alloc, input.options.relational_topology_json, .{ .ignore_unknown_fields = true }) catch return error.InvalidArgument;
             defer probe.deinit();
             if (probe.value.mode) |mode| {
-                if (std.mem.eql(u8, mode, "dag_activation_checkpoint") or std.mem.eql(u8, mode, "dag_activation_source_page")) {
+                if (std.mem.eql(u8, mode, "dag_activation_checkpoint") or std.mem.eql(u8, mode, "dag_activation_source_page") or
+                    std.mem.eql(u8, mode, "dag_activation_job_status"))
+                {
                     if (!dag_activation.isLookupControl(input.options.relational_topology_json) or
                         input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
                         input.options.restore_staging_plan_id != null or input.options.include_primary_digest or

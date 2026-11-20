@@ -110,11 +110,132 @@ test "DAG ordered scan positions require terminal markers before switching roots
     try std.testing.expectError(error.InvalidDagMutation, ScanPosition.requireSuccessor(first, "\x00\x00\x00\x00\x01junk"));
 }
 
+/// Persist the returned progress before advancing again. A failed or ambiguous
+/// step can be retried using the previous progress and the same pinned plan.
+pub const JobProgress = struct {
+    fence: SourceFence,
+    catalog_digest: Digest,
+    catalog_epoch: u64,
+    owner_epoch: u64,
+    phase: enum { acquire, scan, publish, release, complete, abandon_cycle, rejected_cycle } = .acquire,
+    next_domain: usize = 0,
+
+    pub fn advance(
+        self: JobProgress,
+        manifest: anytype,
+        catalog_digest: Digest,
+        catalog_epoch: u64,
+        port: anytype,
+    ) !JobProgress {
+        if (!std.meta.eql(self.fence, manifest.fence) or
+            !std.mem.eql(u8, &self.catalog_digest, &catalog_digest) or
+            self.catalog_epoch != catalog_epoch) return error.GraphConstraintRevisionChanged;
+        if (self.owner_epoch == 0) return error.InvalidDagMutation;
+        if (switch (self.phase) {
+            .acquire => self.next_domain != 0,
+            .scan, .abandon_cycle, .rejected_cycle => self.next_domain >= manifest.domains.len,
+            .publish, .release, .complete => self.next_domain != manifest.domains.len,
+        }) return error.InvalidDagMutation;
+
+        var next = self;
+        switch (self.phase) {
+            .acquire => {
+                try port.acquire();
+                next.phase = .scan;
+            },
+            .scan => {
+                const done = port.scan(manifest.domains[self.next_domain].id, self.owner_epoch) catch |err| {
+                    if (err != error.GraphCycle) return err;
+                    next.phase = .abandon_cycle;
+                    return next;
+                };
+                if (done) {
+                    next.next_domain += 1;
+                    if (next.next_domain == manifest.domains.len) next.phase = .publish;
+                }
+            },
+            .publish => {
+                try port.publish(self.owner_epoch);
+                next.phase = .release;
+            },
+            .release => {
+                try port.release();
+                next.phase = .complete;
+            },
+            .abandon_cycle => {
+                try port.release();
+                next.phase = .rejected_cycle;
+            },
+            .complete, .rejected_cycle => {},
+        }
+        return next;
+    }
+};
+
+pub const ActivationJobUpdate = struct {
+    expected: ?JobProgress = null,
+    next: JobProgress,
+
+    const prefix = "\x00\x00__metadata__:dag-activation-job:";
+
+    fn jobKey(attempt: Digest) [prefix.len + @sizeOf(Digest)]u8 {
+        return prefix.* ++ attempt;
+    }
+
+    pub fn read(alloc: std.mem.Allocator, txn: anytype, attempt: Digest) !?JobProgress {
+        const raw = txn.get(&jobKey(attempt)) catch |err| {
+            if (err == error.NotFound) return null;
+            return err;
+        };
+        if (raw.len > 4096) return error.InvalidDagAuthority;
+        const parsed = std.json.parseFromSlice(JobProgress, alloc, raw, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidDagAuthority,
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, &parsed.value.fence.activation, &attempt)) return error.InvalidDagAuthority;
+        return parsed.value;
+    }
+
+    pub fn stage(self: ActivationJobUpdate, alloc: std.mem.Allocator, txn: anytype, fence: SourceFence) !void {
+        if (!std.meta.eql(fence, self.next.fence) or self.next.owner_epoch == 0 or self.next.catalog_epoch == 0)
+            return error.InvalidDagMutation;
+        if (self.expected) |expected| {
+            if (!std.meta.eql(expected.fence, fence) or expected.owner_epoch != self.next.owner_epoch or
+                expected.catalog_epoch != self.next.catalog_epoch or !std.mem.eql(u8, &expected.catalog_digest, &self.next.catalog_digest))
+                return error.InvalidDagMutation;
+            const same_position = expected.next_domain == self.next.next_domain;
+            const advances_domain = self.next.next_domain > expected.next_domain and self.next.next_domain - expected.next_domain == 1;
+            const advances_phase = switch (expected.phase) {
+                .acquire => self.next.phase == .scan and same_position,
+                .scan => switch (self.next.phase) {
+                    .scan, .publish => advances_domain,
+                    .abandon_cycle => same_position,
+                    else => false,
+                },
+                .publish => self.next.phase == .release and same_position,
+                .release => self.next.phase == .complete and same_position,
+                .abandon_cycle => self.next.phase == .rejected_cycle and same_position,
+                .complete, .rejected_cycle => false,
+            };
+            if (!advances_phase) return error.InvalidDagMutation;
+        } else if (self.next.phase != .acquire or self.next.next_domain != 0) return error.InvalidDagMutation;
+
+        const current = try read(alloc, txn, fence.activation);
+        if (std.meta.eql(current, @as(?JobProgress, self.next))) return;
+        if (!std.meta.eql(current, self.expected)) return error.GraphConstraintRevisionChanged;
+        const raw = try std.json.Stringify.valueAlloc(alloc, self.next, .{ .emit_strings_as_arrays = true });
+        defer alloc.free(raw);
+        try txn.put(&jobKey(fence.activation), raw);
+    }
+};
+
 pub const SourceFenceCommand = struct {
     namespace: [24]u8,
-    action: enum { acquire, release, scan },
+    action: enum { acquire, release, scan, activation_job },
     fence: SourceFence,
     scan: ?Scan = null,
+    activation_job: ?ActivationJobUpdate = null,
 
     pub const Scan = struct {
         domain: Digest,
@@ -204,7 +325,8 @@ pub const SourceFenceCommand = struct {
 
     pub fn validateRequest(req: anytype) !void {
         const command = req.dag_source_fence orelse return;
-        if ((command.action == .scan) != (command.scan != null)) return error.InvalidBatchRequest;
+        if ((command.action == .scan) != (command.scan != null) or
+            (command.action == .activation_job) != (command.activation_job != null)) return error.InvalidBatchRequest;
         if (command.scan) |scan| {
             if (scan.owner_epoch == 0) return error.InvalidBatchRequest;
             const initializing = scan.page == null and scan.previous_owner_epoch == null;
@@ -1930,6 +2052,18 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try ordered.stageScan(alloc, &txn);
     ordered.scan.?.page = .{ .after = second_end, .next = "\x00\x00\x00\x02\x01", .replacements = &.{} };
     try std.testing.expectError(error.InvalidDagMutation, ordered.stageScan(alloc, &txn));
+    const initial_job: JobProgress = .{ .fence = fence, .catalog_digest = @splat(7), .catalog_epoch = 4, .owner_epoch = 1 };
+    const create_job: ActivationJobUpdate = .{ .next = initial_job };
+    try create_job.stage(alloc, &txn, fence);
+    try create_job.stage(alloc, &txn, fence);
+    var scanning_job = initial_job;
+    scanning_job.phase = .scan;
+    try (ActivationJobUpdate{ .expected = initial_job, .next = scanning_job }).stage(alloc, &txn, fence);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, create_job.stage(alloc, &txn, fence));
+    var skipped = scanning_job;
+    skipped.phase = .release;
+    try std.testing.expectError(error.InvalidDagMutation, (ActivationJobUpdate{ .expected = scanning_job, .next = skipped }).stage(alloc, &txn, fence));
+    try std.testing.expectEqualDeep(@as(?JobProgress, scanning_job), try ActivationJobUpdate.read(alloc, &txn, fence.activation));
     try Contributions.finishActivation(&txn, ordered_id, 1, versions, second_end);
     try Contributions.finishActivation(&txn, ordered_id, 1, versions, second_end);
     const release: SourceFenceCommand = .{ .namespace = @splat(0), .action = .release, .fence = fence };
