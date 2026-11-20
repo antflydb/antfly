@@ -46421,11 +46421,13 @@ test "embeddinggemma2 pretrained video matches official F32 oracle" {
     const oracle = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_VIDEO_ORACLE") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const metal = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL");
+    const cuda = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_CUDA");
+    const backend: @import("../backends/backends.zig").BackendType = if (cuda) .cuda else if (metal) .metal else .native;
     var node = try Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .process_termination_available = true, .generation_budget_overrides = .{ .host_limit_bytes = 6 * 1024 * 1024 * 1024, .backend_limit_bytes = 12 * 1024 * 1024 * 1024, .combined_limit_bytes = 18 * 1024 * 1024 * 1024, .scratch_limit_bytes = 8 * 1024 * 1024 * 1024 } });
     defer node.deinit();
     try node.attachIo(std.testing.io);
-    node.session_manager.required_backend = if (metal) .metal else .native;
-    node.model_manager.session_manager.required_backend = if (metal) .metal else .native;
+    node.session_manager.required_backend = backend;
+    node.model_manager.session_manager.required_backend = backend;
     var handle = try node.model_manager.acquireFromDirWithControl(model, node.extractionExecutionControl(null));
     defer handle.release();
     const loaded = handle.get();
@@ -46445,6 +46447,9 @@ test "embeddinggemma2 pretrained video matches official F32 oracle" {
     var failures: usize = 0;
     for (reference.value.object.get("cases").?.array.items) |case| {
         const name = case.object.get("name").?.string;
+        // The resident NVDEC route consumes a single coded AVC/HEVC/AV1 clip.
+        // The remaining oracle cases use mixed parts or the MJPEG decoder.
+        if (cuda and !std.mem.eql(u8, name, "h264_video")) continue;
         if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_CASE")) |selected| if (!std.mem.eql(u8, selected, name)) continue;
         var bytes: std.ArrayList([]u8) = .empty;
         defer {
@@ -46490,9 +46495,9 @@ test "embeddinggemma2 pretrained video matches official F32 oracle" {
             norm += @as(f64, actual) * actual;
         }
         const cosine = try @import("antfly_decisions").scoring.cosine(result.vector, &expected, 768);
-        std.debug.print("embeddinggemma2 video={s} metal={} tokens={d} cosine={d:.9} max_abs={d:.9}\n", .{ name, metal, result.input_tokens, cosine, max_abs });
+        std.debug.print("embeddinggemma2 video={s} backend={s} tokens={d} cosine={d:.9} max_abs={d:.9}\n", .{ name, @tagName(backend), result.input_tokens, cosine, max_abs });
         try rows.append(a, .{ .name = name, .tokens = result.input_tokens, .cosine = cosine, .max_abs = max_abs, .norm = @sqrt(norm) });
-        failures += @intFromBool(cosine < @as(f64, if (metal) 0.9999 else 0.99999) or max_abs > @as(f64, if (metal) 1e-3 else 1e-4));
+        failures += @intFromBool(cosine < @as(f64, if (backend != .native) 0.9999 else 0.99999) or max_abs > @as(f64, if (backend != .native) 1e-3 else 1e-4));
         try std.testing.expectApproxEqAbs(@as(f64, 1), @sqrt(norm), 1e-5);
 
         if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VIDEO_PLAN") and std.mem.eql(u8, name, "h264_video")) {
@@ -46670,7 +46675,7 @@ test "embeddinggemma2 pretrained video matches official F32 oracle" {
     }
     try std.testing.expect(rows.items.len != 0);
     if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_VIDEO_REPORT")) |path| {
-        const report = try std.json.Stringify.valueAlloc(a, .{ .backend = if (metal) "metal" else "native", .model_identity = loaded.embedding_identity, .cases = rows.items, .failures = failures }, .{ .whitespace = .indent_2 });
+        const report = try std.json.Stringify.valueAlloc(a, .{ .backend = @tagName(backend), .model_identity = loaded.embedding_identity, .cases = rows.items, .failures = failures }, .{ .whitespace = .indent_2 });
         defer a.free(report);
         try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = report });
     }

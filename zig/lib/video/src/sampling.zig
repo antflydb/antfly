@@ -57,6 +57,27 @@ pub fn embeddingGemma2(allocator: std.mem.Allocator, metadata: Metadata, options
     return output;
 }
 
+// An undated presentation ends at the next distinct visible PTS. All outputs
+// tied at the preceding PTS share that interval, including across an edit.
+fn precedingHold(pictures: anytype, edit: media.timeline.Edit, control: media.source.Control) !?i64 {
+    if (edit.source_duration == null or @typeInfo(@TypeOf(pictures[0].duration)) != .optional) return null;
+    var preceding: ?i64 = null;
+    for (pictures, 0..) |pic, i| {
+        if (i % 256 == 0) try control.check();
+        if (pic.pts == edit.source_start) return null;
+        if (pic.pts < edit.source_start) preceding = @max(preceding orelse pic.pts, pic.pts);
+    }
+    return preceding;
+}
+
+fn visibleInEdit(pts: i64, duration: ?u64, edit: media.timeline.Edit, preceding: ?i64) bool {
+    const length = edit.source_duration orelse return true;
+    if (pts >= @as(i128, edit.source_start) + length) return false;
+    if (pts >= edit.source_start) return true;
+    if (duration) |d| return @as(i128, pts) + d > edit.source_start;
+    return pts == preceding;
+}
+
 /// Return original picture ordinals in the reference processor's presentation
 /// order. Keep decode preroll in the reader but omit it from an explicit edit.
 pub fn referencePictures(a: std.mem.Allocator, pictures: anytype, scale: u32, edit: media.timeline.Edit, control: media.source.Control) ![]usize {
@@ -64,25 +85,12 @@ pub fn referencePictures(a: std.mem.Allocator, pictures: anytype, scale: u32, ed
     const order = try a.alloc(usize, pictures.len);
     defer a.free(order);
     var count: usize = 0;
-    var previous: ?usize = null;
-    var starts_at_edit = false;
+    const preceding = try precedingHold(pictures, edit, control);
     for (pictures, 0..) |picture, id| {
         if (id % 256 == 0) try control.check();
-        if (picture.pts == edit.source_start) starts_at_edit = true;
-        if (!edit.contains(picture.pts)) {
-            if (picture.pts < edit.source_start and (previous == null or picture.pts > pictures[previous.?].pts)) previous = id;
-            const duration: ?u64 = picture.duration;
-            if (picture.pts >= edit.source_start or duration == null or @as(i128, picture.pts) + duration.? <= edit.source_start) continue;
-        }
+        if (!visibleInEdit(picture.pts, picture.duration, edit, preceding)) continue;
         order[count] = id;
         count += 1;
-    }
-    if (previous) |id| {
-        const duration: ?u64 = pictures[id].duration;
-        if (duration == null and !starts_at_edit) {
-            order[count] = id;
-            count += 1;
-        }
     }
     if (count == 0) return error.EmptyVideo;
     const Less = struct {
@@ -201,25 +209,12 @@ pub const Timeline = struct {
     /// pictures that start inside the edit or remain displayed across its start.
     pub fn initEdited(a: std.mem.Allocator, pictures: []const TimedPicture, control: media.source.Control, edit: media.timeline.Edit) !Timeline {
         const stop: ?i128 = if (edit.source_duration) |d| @as(i128, edit.source_start) + d else null;
-        // Only the latest undated picture before an edit can still be held.
-        var preceding: ?i64 = null;
-        if (stop != null) for (pictures, 0..) |pic, i| {
-            if (i % 256 == 0) try control.check();
-            if (pic.pts < edit.source_start) preceding = @max(preceding orelse pic.pts, pic.pts);
-        };
-        const Visible = struct {
-            fn overlaps(pic: TimedPicture, begin: i64, end: i128, prior: ?i64) bool {
-                if (pic.pts >= end) return false;
-                if (pic.pts >= begin) return true;
-                if (pic.duration) |duration| return @as(i128, pic.pts) + duration > begin;
-                return pic.pts == prior;
-            }
-        };
-        const count = if (stop) |bound| blk: {
+        const preceding = try precedingHold(pictures, edit, control);
+        const count = if (stop != null) blk: {
             var n: usize = 0;
             for (pictures, 0..) |pic, i| {
                 if (i % 256 == 0) try control.check();
-                if (Visible.overlaps(pic, edit.source_start, bound, preceding)) n += 1;
+                if (visibleInEdit(pic.pts, pic.duration, edit, preceding)) n += 1;
             }
             break :blk n;
         } else pictures.len;
@@ -230,7 +225,7 @@ pub const Timeline = struct {
         var i: usize = 0;
         for (pictures, 0..) |picture, id| {
             if (id % 256 == 0) try control.check();
-            if (stop) |bound| if (!Visible.overlaps(picture, edit.source_start, bound, preceding)) continue;
+            if (!visibleInEdit(picture.pts, picture.duration, edit, preceding)) continue;
             bounds.include(picture.pts, picture.duration);
             entries[i] = .{ .id = id, .pts = picture.pts, .stop = @min(stop orelse std.math.maxInt(i128), if (picture.duration) |d| @as(i128, picture.pts) + d else std.math.maxInt(i128)) };
             i += 1;
@@ -614,4 +609,23 @@ test "source timestamp sampling never revives a superseded undated picture" {
     defer a.free(linear);
     try std.testing.expectEqualSlices(usize, &.{ 1, 2, 0 }, indexed);
     try std.testing.expectEqualSlices(usize, indexed, linear);
+}
+
+test "reference and indexed edit sampling retain tied undated outputs until the next distinct PTS" {
+    const a = std.testing.allocator;
+    const pictures = [_]TimedPicture{ .{ .pts = 2, .duration = null }, .{ .pts = 2, .duration = null }, .{ .pts = 8, .duration = 2 } };
+    for ([_]i64{ 4, 8 }) |begin| {
+        const edit = media.timeline.Edit{ .source_start = begin, .source_duration = 2 };
+        const selected = try referencePictures(a, &pictures, 1, edit, .{});
+        defer a.free(selected);
+        var timeline = try Timeline.initEdited(a, &pictures, .{}, edit);
+        defer timeline.deinit();
+        if (begin == 4) {
+            try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, selected);
+            try std.testing.expectEqual(2, timeline.entries.len);
+        } else {
+            try std.testing.expectEqualSlices(usize, &.{ 2, 2 }, selected);
+            try std.testing.expectEqual(1, timeline.entries.len);
+        }
+    }
 }
