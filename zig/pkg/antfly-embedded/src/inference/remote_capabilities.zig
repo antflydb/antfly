@@ -86,6 +86,17 @@ pub const DiscoveryMediaGeometry = struct {
     batch: DiscoveryMediaCost = .{},
     first: DiscoveryMediaCost = .{},
 
+    /// Round upward to shared cache envelopes with at most eight steps per
+    /// power of two. Exact discovery remains available at tight limits.
+    pub fn roundedUp(self: DiscoveryMediaGeometry) DiscoveryMediaGeometry {
+        const Round = struct {
+            fn cost(value: DiscoveryMediaCost) DiscoveryMediaCost {
+                return .{ .encoded = roundDiscoveryUpperBound(value.encoded), .framed = roundDiscoveryUpperBound(value.framed), .pixels = roundDiscoveryUpperBound(value.pixels) };
+            }
+        };
+        return .{ .batch = Round.cost(self.batch), .first = Round.cost(self.first) };
+    }
+
     pub fn fits(self: DiscoveryMediaGeometry, caps: work.InferenceCapabilities) bool {
         const bytes = if (caps.framed_attachments) self.batch.framed else self.batch.encoded;
         if (caps.batch.max_encoded_media_bytes) |limit| if (bytes > limit) return false;
@@ -94,13 +105,24 @@ pub const DiscoveryMediaGeometry = struct {
     }
 };
 
+pub fn roundDiscoveryUpperBound(value: anytype) @TypeOf(value) {
+    if (value < 8) return value;
+    const shift = @bitSizeOf(@TypeOf(value)) - 1 - @clz(value) - 3;
+    const mask = (@as(@TypeOf(value), 1) << @intCast(shift)) - 1;
+    if (value > std.math.maxInt(@TypeOf(value)) - mask) return std.math.maxInt(@TypeOf(value));
+    return (value + mask) & ~mask;
+}
+
 pub const discovery_media_header = "X-Antfly-Inference-Discovery-Media";
+pub const discovery_rounded_media_header = "X-Antfly-Inference-Discovery-Media-Rounded";
 
 /// Stack-owned headers for discovery. Pass the original selectors to execution.
 pub const DiscoveryHeaders = struct {
     entries: [16][2][]const u8 = undefined,
     value: [64]u8 = undefined,
     media_value: [125]u8 = undefined,
+    reader_wire_value: [176]u8 = undefined,
+    reader_mime_value: [7]u8 = undefined,
 
     pub fn withShape(self: *DiscoveryHeaders, base: []const [2][]const u8, shape: DiscoveryShape) ![]const [2][]const u8 {
         if (base.len >= self.entries.len) return error.TooManyInferenceHeaders;
@@ -114,6 +136,35 @@ pub const DiscoveryHeaders = struct {
         const first = geometry.first;
         self.entries[shaped.len] = .{ discovery_media_header, try std.fmt.bufPrint(&self.media_value, "{d}:{d}:{d}:{d}:{d}:{d}", .{ batch.encoded, batch.framed, batch.pixels, first.encoded, first.framed, first.pixels }) };
         return self.entries[0 .. shaped.len + 1];
+    }
+    pub fn withReaderWire(self: *DiscoveryHeaders, shaped: []const [2][]const u8, json_only: bool, batch: anytype, first: @TypeOf(batch), rounded: bool) ![]const [2][]const u8 {
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        const mode = if (json_only) "json" else "auto";
+        var costs = [8]usize{ batch.json_bytes, batch.framed_bytes, batch.metadata_bytes, batch.mime_bytes, first.json_bytes, first.framed_bytes, first.metadata_bytes, first.mime_bytes };
+        if (rounded) for (&costs, 0..) |*cost, index| {
+            if (index % 4 != 3) cost.* = roundDiscoveryUpperBound(cost.*);
+        };
+        self.entries[shaped.len] = .{ "X-Antfly-Inference-Discovery-Reader-Transport", try std.fmt.bufPrint(&self.reader_wire_value, "{s}:{d}:{d}:{d}:{d}:{d}:{d}:{d}:{d}", .{ mode, costs[0], costs[1], costs[2], costs[3], costs[4], costs[5], costs[6], costs[7] }) };
+        return self.entries[0 .. shaped.len + 1];
+    }
+
+    pub fn withReaderMime(self: *DiscoveryHeaders, shaped: []const [2][]const u8, batch: u8, first: u8) ![]const [2][]const u8 {
+        if (batch == 0) return shaped;
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        self.entries[shaped.len] = .{ "X-Antfly-Inference-Discovery-Reader-MIME", try std.fmt.bufPrint(&self.reader_mime_value, "{d}:{d}", .{ batch, first }) };
+        return self.entries[0 .. shaped.len + 1];
+    }
+
+    pub fn withReaderBatchContract(self: *DiscoveryHeaders, shaped: []const [2][]const u8) ![]const [2][]const u8 {
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        self.entries[shaped.len] = .{ "X-Antfly-Inference-Discovery-Reader-Cardinality", "one_per_item" };
+        return self.entries[0 .. shaped.len + 1];
+    }
+
+    pub fn withRoundedMediaMarker(self: *DiscoveryHeaders, geometry: []const [2][]const u8) ![]const [2][]const u8 {
+        if (geometry.len >= self.entries.len or geometry.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        self.entries[geometry.len] = .{ discovery_rounded_media_header, "true" };
+        return self.entries[0 .. geometry.len + 1];
     }
 };
 
@@ -598,7 +649,7 @@ pub const Cache = struct {
                     err,
                 );
                 if (owner_context_error == null and completion.err != null and
-                    (err == error.RemoteCapabilityDiscoveryTransient or err == error.RemoteCapabilitySelectorAbsent))
+                    (err == error.RemoteCapabilityDiscoveryTransient or err == error.RemoteCapabilitySelectorAbsent or err == error.InferenceDiscoveryRequiresExactGeometry or err == error.InferenceDiscoveryRequiresJsonTransport or err == error.InferenceDiscoveryShapeRejected))
                 {
                     // A failed cold flight has no lease to defer. Remember its
                     // cooldown in the same bounded cache as positive entries.
@@ -1360,6 +1411,13 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
     };
 }
 
+fn optionalReaderWireLimit(value: std.json.Value, field: []const u8) !?usize {
+    const limit = value.object.get(field) orelse return null;
+    if (limit == .null) return null;
+    if (limit != .integer or limit.integer < 0) return error.InvalidInferenceCapabilities;
+    return std.math.cast(usize, limit.integer) orelse error.InvalidInferenceCapabilities;
+}
+
 pub fn parseModelCapabilities(
     alloc: std.mem.Allocator,
     payload: []const u8,
@@ -1400,6 +1458,13 @@ pub fn parseModelCapabilities(
     }
     if (@as(u8, @bitCast(modalities)) == 0) return null;
     const exact = if (resolved) |wire| wire.exact else null;
+    const declared_cardinality: ?work.ResultCardinality = if (exact) |value| value.result_cardinality else blk: {
+        const native = info.object.get("inference_capabilities") orelse break :blk null;
+        if (native != .object) break :blk null;
+        const cardinality = native.object.get("result_cardinality") orelse break :blk null;
+        if (cardinality != .string) break :blk null;
+        break :blk std.meta.stringToEnum(work.ResultCardinality, cardinality.string);
+    };
     var result = work.InferenceCapabilities{
         .task = task,
         .input_modalities = modalities,
@@ -1433,7 +1498,8 @@ pub fn parseModelCapabilities(
             .per_item_failures = false,
         },
         .output = if (exact) |value| value.output else outputForTask(task),
-        .result_cardinality = if (exact) |value| value.result_cardinality else resultCardinalityForTask(task),
+        .result_cardinality = declared_cardinality orelse resultCardinalityForTask(task),
+        .remote_result_cardinality_declared = declared_cardinality != null,
         .prompt_policy = if (exact) |value| value.prompt_policy else promptPolicyForTask(task),
         .task_limits = if (exact) |value| value.task_limits else .{},
         .image_transform = if (exact) |value| value.image_transform else null,
@@ -1448,6 +1514,21 @@ pub fn parseModelCapabilities(
         .numeric_responses_v1 = if (exact) |value| value.numeric_responses_v1 else false,
         .rerank_documents_v1 = if (exact) |value| value.rerank_documents_v1 else false,
     };
+    if (task == .read) {
+        if (info.object.get("inference_capabilities")) |native| if (native == .object) {
+            if (native.object.get("transport_limits")) |limits| if (limits == .object) {
+                if (limits.object.get("json")) |json| if (json == .object) {
+                    result.remote_json_max_request_bytes = try optionalReaderWireLimit(json, "max_request_bytes");
+                };
+                if (limits.object.get("framed_attachments")) |framed| if (framed == .object) {
+                    result.remote_framed_max_request_bytes = try optionalReaderWireLimit(framed, "max_request_bytes");
+                    result.remote_framed_max_attachments = try optionalReaderWireLimit(framed, "max_attachments");
+                    result.remote_framed_max_metadata_bytes = try optionalReaderWireLimit(framed, "max_metadata_bytes");
+                    result.remote_framed_max_mime_bytes = try optionalReaderWireLimit(framed, "max_mime_bytes");
+                };
+            };
+        };
+    }
     if (resolved == null) if (capability_values) |values| {
         for (values.items) |value| {
             if (value == .string) try result.batch.applyManifestCapability(value.string);
@@ -1489,6 +1570,9 @@ fn discoveryResponseError(response: httpx.Response) anyerror {
     if (response.status.code == 413) {
         if (response.headers.get("X-Antfly-Inference-Discovery-Error")) |reason| {
             if (std.mem.eql(u8, reason, "items")) return error.InferenceDiscoveryTooManyItems;
+            if (std.mem.eql(u8, reason, "shape")) return error.InferenceDiscoveryShapeRejected;
+            if (std.mem.eql(u8, reason, "geometry")) return error.InferenceDiscoveryRequiresExactGeometry;
+            if (std.mem.eql(u8, reason, "json")) return error.InferenceDiscoveryRequiresJsonTransport;
         }
     }
     return discoveryStatusError(response.status.code, capabilityStaleResponse(response));
@@ -1760,6 +1844,7 @@ fn discoverWithContextOnce(
         .follow_redirects = false,
         .headers = headers,
         .timeout_ms = timeout_ms,
+        .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .cancellation = httpx.CancellationToken.fromCallback(
             context.cancellation.ptr,
             context.cancellation.is_cancelled_fn,
