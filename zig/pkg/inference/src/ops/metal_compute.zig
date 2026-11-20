@@ -113,7 +113,7 @@ const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 const ocrLogitSummary = @import("../util/ocr_parity.zig").ocrLogitSummary;
 
 const WeightStore = gpu_hosted_store_mod.WeightStore;
-const audio_tape = @import("metal_audio_execution.zig");
+const audio_tape = @import("../execution/audio_schedule.zig");
 const NativeWeightStore = native_compute_mod.WeightStore;
 const CT = ops.CT;
 const MetalTensor = metal_tensor_mod.MetalTensor;
@@ -38223,6 +38223,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .counters = .{ .frame_submissions = memory.frame_submit_count },
                 .memory = .{ .scope = .backend_runtime_buffers, .live_bytes = memory.total_bytes },
                 .process = @import("../backends/metal_telemetry.zig").runtimeProcessSnapshot(),
+                .device_memory = if (self.provider_impl.raw_decode_runtime) |runtime| .{
+                    .scope = .metal_device_worker_process,
+                    .allocated_bytes = metal_runtime.currentAllocatedSize(runtime),
+                } else null,
             },
             .native_quant_null = false,
             .provider = provider_stats,

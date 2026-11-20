@@ -121,10 +121,11 @@ Direct task placement is independent for each stage: an explicitly placed
 Whisper decoder receives its own manager policy, including split encoder/decoder
 artifacts. Provider policy is fixed before creating a serving node. Task controls
 are forwarded to execution or rejected when the selected task/provider cannot
-honor them; parser acceptance alone is not support. Transcription currently has
-no PJRT request-resident decoder and rejects explicit cache enablement.
+honor them; parser acceptance alone is not support. Transcription uses the shared
+request-owned PJRT encoder/decoder cache when the learned-position contract and
+arithmetic policy qualify. Explicit cache enablement fails on unsupported paths.
 
-`execution/pjrt_generation_request.zig` owns one stable execution request shared
+`pipelines/pjrt_generation_request.zig` owns one stable execution request shared
 by HTTP generation and direct text/media reading. Its compute provider, graph
 cache and generation pipeline retire in that order's reverse, under the provider
 guard. Callers retain the model handle, generation slot and prepaid media lease
@@ -327,6 +328,26 @@ incompatible head owns its compatibility drain; cancellation or timeout removes
 that hold and wakes the next FIFO waiter. An adopted final-page resource instead
 keeps the epoch in retirement until its last outstanding cleanup completes.
 Cancelling a waiter cannot reopen that retirement or weaken epoch join bounds.
+
+The server broker installs `execution/tensor_dispatch.zig` callbacks; synchronous
+Source preparation, batch signature qualification, admission, lane entry and
+output custody belong to execution. Tasks no longer import a server dispatch
+implementation for their production stage interfaces. Direct encoder/decoder
+tasks qualify resident incremental receivers through `decoder_stage`; custom
+dispatchers retain their scheduling contract. Encoder placement decisions publish
+exact capability/ABI fallback reasons through the uniform diagnostic report.
+
+`execution/audio_schedule.zig` owns the existing audio instruction tape and its
+arena layout. Alias lifetime propagation uses ML's same allocation-free liveness
+implementation, preserving the tape's splitting/coalescing reuse policy and
+escaping views. Instruction-capacity and checked storage-size bounds apply before
+arena allocation. This does not establish complete physical ownership of every
+operation executed by that tape.
+
+Metal reports the device's instantaneous worker-process allocation gauge alongside
+tracked project allocations. It includes vendor resources visible to the driver;
+it is neither a per-request peak nor a second ownership ledger. No inferred
+"untracked bytes" subtraction combines these separately sampled scopes.
 
 ## Remaining migration boundaries
 

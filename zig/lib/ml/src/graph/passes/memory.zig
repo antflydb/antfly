@@ -97,15 +97,24 @@ pub const AliasLivenessOptions = struct {
     propagation: enum { sources, backing_group } = .backing_group,
 };
 
-pub fn computeAliasLastUse(allocator: std.mem.Allocator, last_use: []const u32, sources: []const NodeId, options: AliasLivenessOptions) ![]u32 {
+fn validateAliasSources(last_use: []const u32, sources: []const NodeId, options: AliasLivenessOptions) !void {
     if (last_use.len != sources.len) return error.InvalidAliasSources;
     if (options.reachable) |reachable| if (reachable.len != sources.len) return error.InvalidReachability;
     for (sources, 0..) |source, index| {
         if (options.reachable) |reachable| if (!reachable[index]) continue;
         if (source != null_node and source >= index) return error.InvalidAliasSource;
     }
-    const result = try allocator.dupe(u32, last_use);
-    errdefer allocator.free(result);
+}
+
+/// Allocation-free owner of the same alias lifetime rules used by graph plans.
+/// result may be last_use itself; otherwise they must not overlap. roots is
+/// needed only for backing-group mode and must not overlap either array.
+/// Callers retain their own scratch and cannot create hidden planner allocations.
+pub fn computeAliasLastUseInto(result: []u32, last_use: []const u32, sources: []const NodeId, roots: []NodeId, options: AliasLivenessOptions) !void {
+    try validateAliasSources(last_use, sources, options);
+    if (result.len != last_use.len) return error.InvalidAliasScratch;
+    if (options.propagation == .backing_group and roots.len != sources.len) return error.InvalidAliasScratch;
+    if (result.ptr != last_use.ptr) @memcpy(result, last_use);
     if (options.propagation == .sources) {
         var index = sources.len;
         while (index != 0) {
@@ -114,10 +123,8 @@ pub fn computeAliasLastUse(allocator: std.mem.Allocator, last_use: []const u32, 
             const source = sources[index];
             if (source != null_node) result[source] = @max(result[source], result[index]);
         }
-        return result;
+        return;
     }
-    const roots = try allocator.alloc(NodeId, sources.len);
-    defer allocator.free(roots);
     for (sources, roots, 0..) |source, *root, index| {
         root.* = @intCast(index);
         if (options.reachable) |reachable| if (!reachable[index]) continue;
@@ -131,6 +138,15 @@ pub fn computeAliasLastUse(allocator: std.mem.Allocator, last_use: []const u32, 
         if (options.reachable) |reachable| if (!reachable[index]) continue;
         result[index] = result[root];
     }
+}
+
+pub fn computeAliasLastUse(allocator: std.mem.Allocator, last_use: []const u32, sources: []const NodeId, options: AliasLivenessOptions) ![]u32 {
+    try validateAliasSources(last_use, sources, options);
+    const result = try allocator.alloc(u32, last_use.len);
+    errdefer allocator.free(result);
+    const roots: []NodeId = if (options.propagation == .backing_group) try allocator.alloc(NodeId, sources.len) else &.{};
+    defer if (roots.len != 0) allocator.free(roots);
+    try computeAliasLastUseInto(result, last_use, sources, roots, options);
     return result;
 }
 
@@ -453,4 +469,23 @@ test "alias lifetime authority separates handle retirement from backing-group do
         }
     };
     try std.testing.checkAllAllocationFailures(a, Case.run, .{});
+}
+
+test "alias liveness caller scratch matches owned results and validates before mutation" {
+    const a = std.testing.allocator;
+    const sources = [_]NodeId{ null_node, 0, 1, 0 };
+    const original = [_]u32{ 1, 2, 7, 5 };
+    for ([_]AliasLivenessOptions{ .{ .propagation = .sources }, .{ .propagation = .backing_group } }) |options| {
+        const owned = try computeAliasLastUse(a, &original, &sources, options);
+        defer a.free(owned);
+        var result = original;
+        var roots: [4]NodeId = undefined;
+        try computeAliasLastUseInto(&result, &result, &sources, &roots, options);
+        try std.testing.expectEqualSlices(u32, owned, &result);
+    }
+    var result = original;
+    try std.testing.expectError(error.InvalidAliasSource, computeAliasLastUseInto(&result, &original, &.{ null_node, 2, 1, 0 }, &.{}, .{ .propagation = .sources }));
+    try std.testing.expectEqualSlices(u32, &original, &result);
+    try std.testing.expectError(error.InvalidAliasScratch, computeAliasLastUseInto(&result, &original, &sources, &.{}, .{}));
+    try std.testing.expectEqualSlices(u32, &original, &result);
 }

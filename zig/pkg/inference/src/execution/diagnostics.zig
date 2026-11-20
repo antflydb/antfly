@@ -117,7 +117,27 @@ pub const NativeProgramConstruction = struct {
         initial_definition_host_scratch_bytes: ?usize = null,
     } = null,
 };
+/// Immutable cold routing decision. This event reports placement selection,
+/// never numerical completion, an allocation peak or a backend kernel count.
+pub const StagePlacement = struct {
+    source_backend: @import("../backends/backends.zig").BackendType,
+    destination_backend: @import("../backends/backends.zig").BackendType,
+    reason: Reason,
+    pub const Reason = enum {
+        resident_pair,
+        resident_incremental,
+        dispatcher_host_only,
+        no_source_context,
+        foreign_context,
+        missing_resident_entry,
+        missing_controlled_entry,
+        unsupported_encoder_signature,
+        unsupported_decoder_signature,
+    };
+};
+
 pub const Snapshot = struct {
+    stage_placement: ?StagePlacement = null,
     native_program_construction: ?NativeProgramConstruction = null,
     native_definition_templates: ?NativeDefinitionTemplates = null,
     report: ?@import("invocation_report.zig").Report = null,

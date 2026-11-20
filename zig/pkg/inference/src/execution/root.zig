@@ -39,6 +39,8 @@ pub const native_decoder_program = @import("native_decoder_program.zig");
 pub const decoder_storage = @import("decoder_storage.zig");
 pub const sequence_pool = @import("sequence_pool.zig");
 pub const text_inputs = @import("text_inputs.zig");
+pub const audio_schedule = @import("audio_schedule.zig");
+pub const tensor_dispatch = @import("tensor_dispatch.zig");
 pub const submission = @import("submission.zig");
 
 pub const reader_pool = @import("reader_pool.zig");

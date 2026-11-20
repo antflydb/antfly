@@ -78,6 +78,15 @@ pub const Decoder = struct {
         return initWithOptions(allocator, session, encoder, encoder_length, encoder_mask, vocab_size, control, .{});
     }
 
+    /// Promote a qualified resident encoder source under runtime ownership.
+    /// The task supplies its initial-query contract and keeps only token policy.
+    pub fn initForEncoder(allocator: std.mem.Allocator, session: backends.Session, encoder: *stages.EncoderOutputs, encoder_length: usize, encoder_mask: []const i64, vocab_size: usize, control: ?Control, options: Options) !Decoder {
+        if (control) |active| try active.check();
+        var source = if (options.allow_native) try retainIncrementalSource(allocator, encoder, session) else null;
+        defer if (source) |*value| value.deinit();
+        return initWithSource(allocator, session, encoder, encoder_length, encoder_mask, vocab_size, control, options, if (source) |*value| value else null);
+    }
+
     pub fn initWithOptions(allocator: std.mem.Allocator, session: backends.Session, encoder: *const stages.EncoderOutputs, encoder_length: usize, encoder_mask: []const i64, vocab_size: usize, control: ?Control, options: Options) !Decoder {
         return initWithSource(allocator, session, encoder, encoder_length, encoder_mask, vocab_size, control, options, null);
     }

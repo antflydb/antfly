@@ -148,7 +148,7 @@ pub const GenerativeQualificationTrace = struct {
 pub const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const RerankingPipeline = struct {
-    batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
+    batch_dispatch: ?@import("../execution/tensor_dispatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     session: backends.Session,
     tok: Tokenizer,

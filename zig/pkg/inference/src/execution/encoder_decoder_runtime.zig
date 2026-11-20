@@ -44,30 +44,36 @@ pub const EncoderOutputs = union(enum) {
 
 /// Qualification precedes encoder execution: a rejected pair takes its host
 /// reference once. Merged-cache decoders have a separate stateful contract.
+const PlacementReason = @import("diagnostics.zig").StagePlacement.Reason;
+
 pub fn supportsResidentPair(encoder: backends.Session, decoder: backends.Session, controlled: bool) bool {
-    const source = encoder.shared_compute_context orelse return false;
-    if (decoder.shared_compute_context != source) return false;
-    if (encoder.vtable.runResident == null or decoder.vtable.runResidentInputs == null) return false;
-    if (controlled and (encoder.vtable.runResidentWithControl == null or decoder.vtable.runResidentInputsWithControl == null)) return false;
+    return residentPairPlacement(encoder, decoder, controlled) == .resident_pair;
+}
+
+pub fn residentPairPlacement(encoder: backends.Session, decoder: backends.Session, controlled: bool) PlacementReason {
+    const source = encoder.shared_compute_context orelse return .no_source_context;
+    if (decoder.shared_compute_context != source) return .foreign_context;
+    if (encoder.vtable.runResident == null or decoder.vtable.runResidentInputs == null) return .missing_resident_entry;
+    if (controlled and (encoder.vtable.runResidentWithControl == null or decoder.vtable.runResidentInputsWithControl == null)) return .missing_controlled_entry;
     const outputs = encoder.outputInfo();
-    if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 3) return false;
+    if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 3) return .unsupported_encoder_signature;
     const logits = decoder.outputInfo();
-    if (logits.len != 1 or logits[0].dtype != .f32 or logits[0].shape.len != 3) return false;
-    if (decoder.inputInfo().len > 4) return false;
+    if (logits.len != 1 or logits[0].dtype != .f32 or logits[0].shape.len != 3) return .unsupported_decoder_signature;
+    if (decoder.inputInfo().len > 4) return .unsupported_decoder_signature;
     var tokens = false;
     var hidden = false;
     for (decoder.inputInfo()) |input| {
         if (std.mem.eql(u8, input.name, "input_ids")) {
-            if (tokens or input.dtype != .i64 or input.shape.len != 2) return false;
+            if (tokens or input.dtype != .i64 or input.shape.len != 2) return .unsupported_decoder_signature;
             tokens = true;
         } else if (std.mem.eql(u8, input.name, "encoder_hidden_states")) {
-            if (hidden or input.dtype != .f32 or input.shape.len != 3) return false;
+            if (hidden or input.dtype != .f32 or input.shape.len != 3) return .unsupported_decoder_signature;
             hidden = true;
         } else if ((std.mem.eql(u8, input.name, "encoder_attention_mask") or std.mem.eql(u8, input.name, "decoder_attention_mask"))) {
-            if (input.dtype != .i64 or input.shape.len != 2) return false;
-        } else return false;
+            if (input.dtype != .i64 or input.shape.len != 2) return .unsupported_decoder_signature;
+        } else return .unsupported_decoder_signature;
     }
-    return tokens and hidden;
+    return if (tokens and hidden) .resident_pair else .unsupported_decoder_signature;
 }
 
 /// The optional synchronous dispatch capability has the existing run method;
@@ -92,11 +98,13 @@ const EncoderRoute = struct {
     dispatched: bool,
     resident: bool,
     incremental: ?Incremental.Receiver,
+    placement: PlacementReason,
 };
 fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, allow_incremental: bool) EncoderRoute {
     const dispatched = if (comptime @TypeOf(dispatch) == @TypeOf(null)) false else if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) dispatch != null else true;
     const incremental = if (allow_incremental) Incremental.qualify(encoder, decoder) else null;
-    return .{ .dispatched = dispatched, .incremental = incremental, .resident = supportsResidentDispatch(dispatch) and (incremental != null or supportsResidentPair(encoder, decoder, control != null)) };
+    const placement: PlacementReason = if (!supportsResidentDispatch(dispatch)) .dispatcher_host_only else if (incremental != null) .resident_incremental else residentPairPlacement(encoder, decoder, control != null);
+    return .{ .dispatched = dispatched, .incremental = incremental, .placement = placement, .resident = placement == .resident_pair or placement == .resident_incremental };
 }
 
 /// The owning task calls this before its model/provider lane. Qualification is
@@ -112,6 +120,7 @@ pub fn prepareEncoderPermit(encoder: backends.Session, decoder: backends.Session
 fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit, allow_incremental: bool) !EncoderOutputs {
     if (supplied) |permit| if (permit.session.ptr != encoder.ptr or permit.session.vtable != encoder.vtable) return error.InvalidStagePermit;
     const selected = encoderRoute(encoder, decoder, dispatch, control, allow_incremental);
+    observePlacement(encoder, decoder, selected.placement);
     const dispatched = selected.dispatched;
     const incremental = selected.incremental;
     if (selected.resident) {
@@ -142,6 +151,20 @@ fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decode
     return encodeHost(allocator, encoder, inputs, dispatch, control, supplied);
 }
 
+fn observePlacement(encoder: backends.Session, decoder: backends.Session, reason: PlacementReason) void {
+    const binding = encoder.invocation_diagnostics orelse return;
+    if (!binding.diagnostics.isEnabled()) return;
+    publishPlacement(binding.diagnostics, encoder.backend(), decoder.backend(), reason);
+}
+
+noinline fn publishPlacement(publisher: *@import("diagnostics.zig").Diagnostics, source: backends.BackendType, destination: backends.BackendType, reason: PlacementReason) void {
+    publisher.publish(.{
+        .scope = .session_preparation,
+        .operation = .encoder,
+        .stage_placement = .{ .source_backend = source, .destination_backend = destination, .reason = reason },
+    });
+}
+
 /// A custom dispatcher without the typed capability chooses the existing
 /// host route before encoder work. Its public scheduling policy is never bypassed.
 fn supportsResidentDispatch(dispatch: anytype) bool {
@@ -168,7 +191,7 @@ fn encodeHost(allocator: std.mem.Allocator, encoder: backends.Session, inputs: [
             if (dispatch) |selected| return .{ .host = try selected.run(allocator, encoder, supplied, null, inputs, control) };
         } else return .{ .host = try dispatch.run(allocator, encoder, supplied, null, inputs, control) };
     }
-    return .{ .host = try @import("../server/tensor_microbatch.zig").runSerial(allocator, encoder, supplied, inputs, control) };
+    return .{ .host = try @import("tensor_dispatch.zig").runSerial(allocator, encoder, supplied, inputs, control) };
 }
 
 /// Address-stable borrowed inputs for the common full-prefix decoder ABI.
@@ -449,4 +472,13 @@ test "encoder cold preparation shares host fallback and typed dispatcher qualifi
     try prepareEncoderPermit(session, session, &dispatcher, null, true, &permit);
     try std.testing.expect(permit.output_retirement_shell == null);
     try std.testing.expect(!encoderRoute(session, session, &dispatcher, null, true).resident);
+    try std.testing.expectEqual(PlacementReason.dispatcher_host_only, encoderRoute(session, session, &dispatcher, null, true).placement);
+    try std.testing.expectEqual(PlacementReason.no_source_context, residentPairPlacement(session, session, false));
+    var diagnostics = @import("diagnostics.zig").Diagnostics{};
+    diagnostics.configure(true);
+    publishPlacement(&diagnostics, .native, .cuda, .foreign_context);
+    const observed = diagnostics.snapshot().?;
+    try std.testing.expectEqual(PlacementReason.foreign_context, observed.report.?.stage_placement.?.reason);
+    try std.testing.expect(observed.execution == null);
+    try std.testing.expect(observed.report.?.transfers == null);
 }

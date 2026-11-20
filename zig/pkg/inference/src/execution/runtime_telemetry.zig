@@ -177,7 +177,18 @@ pub const Cuda = struct {
         return result;
     }
 };
+/// Independent driver gauge, including vendor-owned resources invisible to
+/// project allocation wrappers. Never subtract this from an ownership ledger:
+/// samples are not atomic and the scopes intentionally cover different owners.
+pub const DeviceMemory = struct {
+    scope: enum { metal_device_worker_process },
+    allocated_bytes: u64,
+    sampling: enum { instantaneous_without_completion_wait } = .instantaneous_without_completion_wait,
+    invocation_peak: enum { unavailable } = .unavailable,
+};
+
 pub const Snapshot = struct {
+    device_memory: ?DeviceMemory = null,
     resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
     terminal_native_bodies: ?@import("runtime_observation.zig").NativeBodies = null,
     selected_native_dispatches: ?@import("runtime_observation.zig").NativeDispatches = null,
@@ -206,6 +217,7 @@ pub const Snapshot = struct {
     process: ?Process = null,
     pub fn since(self: Snapshot, before: Snapshot) Snapshot {
         return .{
+            .device_memory = self.device_memory,
             .resolved_project_metal_dispatches = self.resolved_project_metal_dispatches,
             .terminal_native_bodies = self.terminal_native_bodies,
             .selected_native_dispatches = self.selected_native_dispatches,
@@ -263,3 +275,10 @@ pub const VideoOwnedResources = struct {
         return .{ .root_identity = value.root_identity, .coverage = if (value.lifetime_metadata_failures == 0) .tracked_authored_resources else .partial_metadata_failure, .live_bytes = value.live_bytes, .interval_peak_bytes = value.interval_peak_bytes, .lifetime_peak_bytes = value.lifetime_peak_bytes, .buffer_allocations = value.buffer_allocations, .buffer_frees = value.buffer_frees, .texture_allocations = value.texture_allocations, .texture_frees = value.texture_frees, .lifetime_metadata_failures = value.lifetime_metadata_failures, .interval_metadata_failures = value.interval_metadata_failures };
     }
 };
+
+test "driver memory remains an independent instantaneous gauge across invocation intervals" {
+    const before = Snapshot{ .device_memory = .{ .scope = .metal_device_worker_process, .allocated_bytes = 2048 } };
+    const after = Snapshot{ .device_memory = .{ .scope = .metal_device_worker_process, .allocated_bytes = 1536 } };
+    try std.testing.expectEqual(@as(u64, 1536), after.since(before).device_memory.?.allocated_bytes);
+    try std.testing.expect((Snapshot{}).since(before).device_memory == null);
+}

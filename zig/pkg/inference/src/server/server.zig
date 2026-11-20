@@ -6612,7 +6612,7 @@ pub const Node = struct {
             const media = try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, .native, estimate.?.media_admission);
             var media_lease = try model.session.withAdmissionControl(execution_control).admitRetainedMedia(media.host_scratch_bytes, media.backend_scratch_bytes);
             defer media_lease.deinit();
-            const execution = try @import("../execution/pjrt_generation_request.zig").Request.create(allocator, io, model, model_path, .{
+            const execution = try @import("../pipelines/pjrt_generation_request.zig").Request.create(allocator, io, model, model_path, .{
                 .media_host_bytes = media.host_scratch_bytes,
                 .media_bucket_rows = self.config.pjrt_media_bucket_rows,
                 .decoder_cache = self.config.pjrt_decoder_cache,
@@ -18888,7 +18888,7 @@ pub const Node = struct {
         var preparation = model.session.withAdmissionControl(control).admitRetainedMedia(media.host_scratch_bytes, media.backend_scratch_bytes) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer preparation.deinit();
-        const execution = @import("../execution/pjrt_generation_request.zig").Request.create(ctx.allocator, ctx.io, model, model_path, .{
+        const execution = @import("../pipelines/pjrt_generation_request.zig").Request.create(ctx.allocator, ctx.io, model, model_path, .{
             .media_host_bytes = media.host_scratch_bytes,
             .media_bucket_rows = self.config.pjrt_media_bucket_rows,
             .decoder_cache = self.config.pjrt_decoder_cache,

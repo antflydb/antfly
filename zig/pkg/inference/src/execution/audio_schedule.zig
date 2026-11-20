@@ -17,9 +17,11 @@
 // and an admitted activation arena, never request tensors, allocators, or pins.
 // Replay binds current inputs and frees temporary wrappers at last use.
 const std = @import("std");
-const ops = @import("ops.zig");
+const ops = @import("../ops/ops.zig");
+const memory = @import("ml").graph.passes.memory;
 const CT = ops.CT;
 pub const capacity = 2048;
+pub const instruction_capacity = 1024;
 pub const Constant = struct { id: u16, model: bool, name: [256]u8, len: u16, required: bool = true, bound: ?CT = null };
 pub const Plan = struct {
     key: u64 = 0,
@@ -75,7 +77,16 @@ pub const Plan = struct {
     /// Assign non-overlapping lifetimes to linear outputs. Escaping values
     /// and their view ancestors remain independently owned by the caller.
     pub fn layout(self: *Plan) !usize {
-        var ends = self.last_use;
+        if (self.count > self.nodes.len or self.count > instruction_capacity or self.output >= capacity) return error.AudioScheduleInvalid;
+        var ends: [capacity]u32 = undefined;
+        for (self.last_use, &ends) |end, *target| target.* = end;
+        var sources: [capacity]u32 = @splat(@import("ml").graph.null_node);
+        for (self.nodes[0..self.count]) |node| {
+            if (node.output >= capacity or node.input_count > node.inputs.len) return error.AudioScheduleInvalid;
+            for (node.inputs[0..node.input_count]) |input| if (input >= capacity) return error.AudioScheduleInvalid;
+            if (node.args == .sliceLastDim) sources[node.output] = node.args.sliceLastDim.tensor;
+        }
+        try memory.computeAliasLastUseInto(&ends, &ends, &sources, &.{}, .{ .propagation = .sources });
         var escaping: [capacity]bool = @splat(false);
         escaping[self.output] = true;
         var n = self.count;
@@ -84,14 +95,13 @@ pub const Plan = struct {
             const node = &self.nodes[n];
             switch (node.args) {
                 .sliceLastDim => |a| {
-                    ends[a.tensor] = @max(ends[a.tensor], ends[node.output]);
                     if (escaping[node.output]) escaping[a.tensor] = true;
                 },
                 else => {},
             }
         }
         const Range = struct { offset: usize, bytes: usize, end: u16 };
-        var ranges: [1024]Range = undefined;
+        var ranges: [instruction_capacity]Range = undefined;
         var used: usize = 0;
         var peak: usize = 0;
         for (self.nodes[0..self.count], 0..) |*node, i| {
@@ -99,7 +109,7 @@ pub const Plan = struct {
             if (escaping[node.output] or (self.linear_only and node.prepared_slot == null)) continue;
             const d = node.outputDimensions() orelse continue;
             const bytes = try std.math.mul(usize, try std.math.mul(usize, d.rows, d.out_dim), 4);
-            const size = std.mem.alignForward(usize, bytes, 4096);
+            const size = (try std.math.add(usize, bytes, 4095)) & ~@as(usize, 4095);
             // Keep a partition ordered by offset. Adjacent expired ranges
             // can satisfy a wider producer without growing retained storage.
             var cursor: usize = 0;
@@ -125,10 +135,10 @@ pub const Plan = struct {
                     ranges[j].bytes = size;
                     used += 1;
                 }
-                ranges[j].end = ends[node.output];
+                ranges[j].end = @intCast(ends[node.output]);
             } else {
                 node.arena_offset = peak;
-                ranges[used] = .{ .offset = peak, .bytes = size, .end = ends[node.output] };
+                ranges[used] = .{ .offset = peak, .bytes = size, .end = @intCast(ends[node.output]) };
                 used += 1;
                 peak = try std.math.add(usize, peak, size);
             }
@@ -186,7 +196,7 @@ pub const Capture = struct {
     plan: *Plan,
     failed: bool = false,
     handles: [capacity]?CT = @splat(null),
-    nodes: [1024]Node = undefined,
+    nodes: [instruction_capacity]Node = undefined,
     constants: [512]Constant = undefined,
     pub fn init(plan: *Plan, inputs: []const CT) Capture {
         std.debug.assert(!plan.metadata_owned);
@@ -221,7 +231,7 @@ pub const Capture = struct {
     }
     pub fn append(self: *Capture, node: Node, ct: CT) void {
         if (self.failed) return;
-        if (self.plan.count == 1024 or self.plan.next_id == capacity) {
+        if (self.plan.count == self.nodes.len or self.plan.next_id == capacity) {
             self.failed = true;
             return;
         }
@@ -572,4 +582,27 @@ test "embeddinggemma2 audio arena randomized lifetimes never overlap live output
             };
         };
     }
+}
+
+test "audio arena uses its full declared instruction capacity and rejects overflowing storage" {
+    const a = std.testing.allocator;
+    const count = instruction_capacity;
+    const nodes = try a.alloc(Node, count + 1);
+    defer a.free(nodes);
+    const plan = try a.create(Plan);
+    defer a.destroy(plan);
+    plan.* = .{ .nodes = nodes, .count = count, .output = 0 };
+    for (nodes[0..count], 0..) |*node, index| {
+        node.* = .{ .output = @intCast(index + 1), .output_rows = 1, .output_dim = 1, .args = .{ .clampScalar = .{ .input = 0, .min_value = null, .max_value = null } } };
+        plan.last_use[index + 1] = count;
+    }
+    try std.testing.expectEqual(@as(usize, count * 4096), try plan.layout());
+    for (nodes[0..count], 0..) |node, index| try std.testing.expectEqual(@as(?usize, index * 4096), node.arena_offset);
+    plan.count = count + 1;
+    try std.testing.expectError(error.AudioScheduleInvalid, plan.layout());
+    plan.count = count;
+    nodes[0].output_dim = std.math.maxInt(usize) / 4;
+    try std.testing.expectError(error.Overflow, plan.layout());
+    plan.output = capacity;
+    try std.testing.expectError(error.AudioScheduleInvalid, plan.layout());
 }

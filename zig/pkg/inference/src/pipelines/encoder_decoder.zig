@@ -66,7 +66,7 @@ pub const EncoderDecoderResult = struct {
 pub const EncoderDecoderPipeline = struct {
     /// Cached composite runtimes lend sessions for a handle-scoped invocation.
     owns_sessions: bool = true,
-    batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
+    batch_dispatch: ?@import("../execution/tensor_dispatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     encoder: backends.Session,
     decoder: backends.Session,
@@ -160,7 +160,12 @@ pub const EncoderDecoderPipeline = struct {
             .{ .name = "attention_mask", .data = @constCast(std.mem.sliceAsBytes(mask)), .shape = &shape, .dtype = .i64, .allocator = allocator, .owns_data = false, .owns_shape = false },
         };
         if (self.execution_control) |control| try control.update(.executing, 0, 1);
-        var encoded = try stage_runtime.encode(allocator, self.encoder, self.decoder, &inputs, self.batch_dispatch, self.execution_control);
+        // An installed dispatcher retains its public scheduling contract.
+        // Direct tasks can use the runtime's stateful resident receiver.
+        var encoded = if (self.batch_dispatch == null)
+            try stage_runtime.encodeForIncrementalWithPermit(allocator, self.encoder, self.decoder, &inputs, self.batch_dispatch, self.execution_control, null)
+        else
+            try stage_runtime.encode(allocator, self.encoder, self.decoder, &inputs, self.batch_dispatch, self.execution_control);
         defer encoded.deinit(allocator);
         return self.greedyDecodeOutputs(allocator, &encoded, mask, input_ids.len);
     }
@@ -180,7 +185,7 @@ pub const EncoderDecoderPipeline = struct {
     fn greedyDecodeOutputs(
         self: *EncoderDecoderPipeline,
         allocator: std.mem.Allocator,
-        encoder_outputs: *const stage_runtime.EncoderOutputs,
+        encoder_outputs: *stage_runtime.EncoderOutputs,
         encoder_attention_mask: []const i64,
         encoder_seq_len: usize,
     ) !EncoderDecoderResult {
@@ -194,7 +199,7 @@ pub const EncoderDecoderPipeline = struct {
         defer allocator.free(dec_ids_i64);
         dec_ids_i64[0] = self.config.decoder_start_token_id;
 
-        var numerical = try decoder_stage.Decoder.initWithOptions(allocator, self.decoder, encoder_outputs, encoder_seq_len, encoder_attention_mask, self.config.vocab_size, self.execution_control, .{ .allow_native = false, .output_rows = .full_prefix });
+        var numerical = try decoder_stage.Decoder.initForEncoder(allocator, self.decoder, encoder_outputs, encoder_seq_len, encoder_attention_mask, self.config.vocab_size, self.execution_control, .{ .allow_native = self.batch_dispatch == null, .output_rows = .full_prefix, .expected_initial_query_rows = 1 });
         defer numerical.deinit();
 
         for (0..max_len) |step| {
@@ -572,13 +577,13 @@ test "encoder decoder task shares actual resident and host route owner without c
         if (kind == .native) {
             task.execution_control = null;
             const Case = struct {
-                fn run(allocator: std.mem.Allocator, pipeline: *EncoderDecoderPipeline, values: *const stage_runtime.EncoderOutputs) !void {
+                fn run(allocator: std.mem.Allocator, pipeline: *EncoderDecoderPipeline, values: *stage_runtime.EncoderOutputs) !void {
                     var result = try pipeline.greedyDecodeOutputs(allocator, values, &.{1}, 1);
                     defer result.deinit();
                     try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, result.text_ids);
                 }
             };
-            try std.testing.checkAllAllocationFailures(a, Case.run, .{ &task, @as(*const stage_runtime.EncoderOutputs, &encoded) });
+            try std.testing.checkAllAllocationFailures(a, Case.run, .{ &task, @as(*stage_runtime.EncoderOutputs, &encoded) });
         }
     }
 }

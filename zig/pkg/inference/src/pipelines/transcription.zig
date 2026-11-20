@@ -278,7 +278,7 @@ pub const TranscriptionPipeline = struct {
     /// allocations. Queued/microbatched and accelerator runs keep their own
     /// execution ownership and must not borrow this request-local credit.
     native_workspace: ?*@import("../backends/admitted_allocator.zig").AdmittedAllocator = null,
-    batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
+    batch_dispatch: ?@import("../execution/tensor_dispatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     encoder: backends.Session,
     decoder: backends.Session,

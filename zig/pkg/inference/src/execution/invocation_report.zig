@@ -20,6 +20,7 @@ const storage = @import("storage_accounting.zig");
 const Specializations = @import("specialization_cache.zig").Stats;
 pub const Report = struct {
     schema_version: u8 = 1,
+    stage_placement: ?@import("diagnostics.zig").StagePlacement = null,
     operation: []const u8,
     publication_scope: []const u8,
     synchronous_interval: enum { invocation_body, pending_phase_only } = .invocation_body,
@@ -83,6 +84,7 @@ pub const Report = struct {
     retained_device_owner_count: ?usize = null,
     detached_bytes_added_to_backend_gauge: bool = false,
     worker_process: ?runtime.Process = null,
+    device_memory: ?runtime.DeviceMemory = null,
     /// Actual planned-owner class gauges; lifetime peaks remain lifetime peaks.
     program_storage_scope: []const u8 = "unavailable",
     program_constants: ?storage.Usage = null,
@@ -126,6 +128,8 @@ pub const Report = struct {
         report.video_owned_resources = value.runtime.video_owned_resources;
         report.batch = value.batch;
         report.pending_interval = value.pending_interval;
+        report.stage_placement = value.stage_placement;
+        report.device_memory = value.runtime.device_memory;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());
         if (value.program_error) |failure| {
