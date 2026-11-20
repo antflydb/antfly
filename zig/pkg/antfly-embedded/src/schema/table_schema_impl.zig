@@ -26,6 +26,7 @@ const relational_native = @import("../storage/relational_index.zig");
 
 pub const TableSchema = struct {
     version: u32 = 0,
+    column_lineage: u32 = 0,
     storage_mode: StorageMode = .document,
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     default_type: []const u8 = "",
@@ -788,6 +789,15 @@ fn parseSchemaRequest(alloc: std.mem.Allocator, body: []const u8, allow_inferenc
         try validateRelationalExpressions(alloc, schema);
     }
     return try stringifyJsonValue(alloc, parsed.value);
+}
+
+// A stamp copied by an older writer only proves continuity at its own version.
+pub fn columnLineage(root: std.json.ObjectMap, version: u32) u32 {
+    const stamp = root.get("x-antfly-column-lineage") orelse return version;
+    if (stamp != .object) return version;
+    if ((exactU64JsonNumber(stamp.object.get("version") orelse return version) orelse return version) != version) return version;
+    const start = exactU64JsonNumber(stamp.object.get("start") orelse return version) orelse return version;
+    return if (start <= version) @intCast(start) else version;
 }
 
 pub fn parseSchema(alloc: std.mem.Allocator, schema_json: []const u8) !TableSchema {
@@ -2596,6 +2606,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("version")) |version| {
         if (version != .null) parsed.version = std.math.cast(u32, exactU64JsonNumber(version) orelse return error.InvalidSchemaUpdateRequest) orelse return error.InvalidSchemaUpdateRequest;
     }
+    parsed.column_lineage = columnLineage(root, parsed.version);
     if (root.get("storage_mode")) |storage_mode| {
         if (storage_mode != .null) {
             if (storage_mode != .string) return error.InvalidSchemaUpdateRequest;

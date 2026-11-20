@@ -920,11 +920,11 @@ fn chunkStorageKeyForArtifactRefAlloc(alloc: Allocator, artifact_ref: types.Arti
     if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) return try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
     if (artifact_ref.kind != .embedding) return null;
     const source = artifact_ref.source orelse return null;
-    if (source.kind != .chunk) return null;
+    if (source.kind != .chunk and !(source.kind == .asset and source.unit_id != null)) return null;
     const chunk_ref = types.ArtifactRef{
         .document_id = artifact_ref.document_id,
         .name = source.name,
-        .kind = .chunk,
+        .kind = source.kind,
         .chunk_id = source.chunk_id,
         .window_index = source.window_index,
         .unit_id = source.unit_id,
@@ -1006,7 +1006,7 @@ fn hydrateDirectChunkAncestors(
     const chunk_payloads = try loadDirectChunkPayloads(alloc, owned.hits, shaper);
     defer freeOptionalOwnedBytes(alloc, chunk_payloads);
 
-    if (req.include_stored) {
+    defer if (req.include_stored) {
         for (owned.hits, 0..) |*hit, i| {
             if (hit.stored_data != null) continue;
             if (chunk_payloads[i]) |payload| {
@@ -1014,7 +1014,7 @@ fn hydrateDirectChunkAncestors(
                 chunk_payloads[i] = null;
             }
         }
-    }
+    };
 
     try hydrateArtifactRevisions(alloc, &owned, chunk_payloads, shaper);
     if (!req.hierarchy_include_source and !req.hierarchy_include_unit) return owned;
@@ -1024,14 +1024,31 @@ fn hydrateDirectChunkAncestors(
     for (owned.hits, 0..) |hit, i| {
         const chunk_key = (try chunkStorageKeyForHitAlloc(alloc, hit)) orelse continue;
         defer alloc.free(chunk_key);
-        const payload = chunk_payloads[i] orelse hit.stored_data orelse continue;
+        const payload = chunk_payloads[i] orelse hit.stored_data;
         const info = parseChunkAncestorInfoAlloc(alloc, chunk_key, payload) catch |err| switch (err) {
             error.InvalidChunkArtifact, error.InvalidInternalUserKey => continue,
             else => return err,
         };
         if (req.hierarchy_include_source) source_count += 1;
-        if (req.hierarchy_include_unit and info.unit_key != null) unit_count += 1;
         infos[i] = info;
+        if (req.hierarchy_include_unit and info.unit_key != null and hit.ancestor_unit_data == null) {
+            // A direct unit member and its unit ancestor share a storage key.
+            // Reuse the complete member payload even when the hit itself has
+            // already been projected to a smaller set of requested fields.
+            if (std.mem.eql(u8, chunk_key, info.unit_key.?)) {
+                if (chunk_payloads[i]) |full| {
+                    if (req.include_stored and hit.stored_data == null) {
+                        owned.hits[i].ancestor_unit_data = try alloc.dupe(u8, full);
+                    } else {
+                        owned.hits[i].ancestor_unit_data = full;
+                        chunk_payloads[i] = null;
+                    }
+                }
+                // This key was already read, including a definitive miss.
+                alloc.free(info.unit_key.?);
+                infos[i].?.unit_key = null;
+            } else unit_count += 1;
+        }
     }
 
     if (req.hierarchy_include_source and source_count > 0) {
@@ -1069,12 +1086,11 @@ fn hydrateArtifactRevisions(alloc: Allocator, result: *types.SearchResult, paylo
             defer state_key.deinit(alloc);
             try internal_keys.appendDocumentPrefix(&state_key, alloc, ref.document_id);
             try state_key.append(alloc, internal_keys.asset_state_kind);
-            // An embedding hit reports its source chunk (see reconcileArtifactRef),
-            // and its payload above is that chunk's: fingerprint the chunk
-            // producer's state too, so both revisions describe the reported member.
+            // Dense hits report the source chunk or document unit. Fingerprint
+            // the producer that owns that member's payload.
             const producer = if (ref.kind == .chunk and ref.source != null and ref.source.?.kind == .asset)
                 ref.source.?.name
-            else if (ref.kind == .embedding and ref.source != null and ref.source.?.kind == .chunk)
+            else if (ref.kind == .embedding and ref.source != null and (ref.source.?.kind == .chunk or (ref.source.?.kind == .asset and ref.source.?.unit_id != null)))
                 ref.source.?.name
             else
                 ref.name;
@@ -1180,7 +1196,7 @@ fn loadDirectChunkPayloads(
     return loaded;
 }
 
-fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload: []const u8) !ChunkAncestorInfo {
+fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload: ?[]const u8) !ChunkAncestorInfo {
     var decoded = (try artifact_ids.decodeArtifactRefAlloc(alloc, chunk_key)) orelse return error.InvalidChunkArtifact;
     defer decoded.deinit(alloc);
     // Native keys own source identity. Generic asset payloads are application
@@ -1191,7 +1207,7 @@ fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload:
         .parent_doc_key = parent_doc_key,
         .unit_key = if (decoded.unit_id) |unit| try internal_keys.documentUnitArtifactKeyAlloc(alloc, parent_doc_key, decoded.name, unit) else null,
     };
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload orelse return error.InvalidChunkArtifact, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidChunkArtifact;
     const object = parsed.value.object;
@@ -1277,7 +1293,8 @@ fn hydrateDirectChunkUnitAncestors(
     const unit_keys = try alloc.alloc([]const u8, unit_count);
     defer alloc.free(unit_keys);
     var index: usize = 0;
-    for (infos) |maybe_info| {
+    for (infos, result.hits) |maybe_info, hit| {
+        if (hit.ancestor_unit_data != null) continue;
         const info = maybe_info orelse continue;
         const unit_key = info.unit_key orelse continue;
         unit_keys[index] = unit_key;
@@ -1300,7 +1317,7 @@ fn hydrateDirectChunkUnitAncestors(
     index = 0;
     for (result.hits, infos) |*hit, maybe_info| {
         const info = maybe_info orelse continue;
-        if (info.unit_key == null) continue;
+        if (info.unit_key == null or hit.ancestor_unit_data != null) continue;
         if (loaded[index]) |bytes| {
             hit.ancestor_unit_data = bytes;
             loaded[index] = null;
@@ -2096,9 +2113,7 @@ pub fn resolveChunkParentId(
     resolver: ChunkParentResolver,
 ) ![]u8 {
     if (hit.artifact_ref) |artifact_ref| {
-        if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) {
-            return try alloc.dupe(u8, artifact_ref.document_id);
-        }
+        return try alloc.dupe(u8, artifact_ref.document_id);
     }
 
     if (internal_keys.isChunkArtifactRecordKey(hit.id) or internal_keys.isAssetArtifactKey(hit.id)) {
@@ -2111,9 +2126,7 @@ pub fn resolveChunkParentId(
     }) |artifact_ref_value| {
         var artifact_ref = artifact_ref_value;
         defer artifact_ref.deinit(alloc);
-        if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) {
-            return try alloc.dupe(u8, artifact_ref.document_id);
-        }
+        return try alloc.dupe(u8, artifact_ref.document_id);
     }
 
     const stored = if (hit.stored_data) |stored_data|
@@ -2128,6 +2141,25 @@ pub fn resolveChunkParentId(
     const parent = parsed.value.object.get("_parent_doc_key") orelse parsed.value.object.get("parent_doc_key") orelse return try alloc.dupe(u8, hit.id);
     if (parent != .string) return error.InvalidChunkArtifact;
     return try alloc.dupe(u8, parent.string);
+}
+
+test "source grouping trusts a whole document embedding in a mixed page index" {
+    const a = std.testing.allocator;
+    const loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!?[]u8 {
+            return error.UnexpectedDocumentRead;
+        }
+    };
+    var hit: types.SearchHit = .{
+        .id = @constCast("doc"),
+        .artifact_ref = .{ .kind = .embedding, .name = @constCast("text"), .document_id = @constCast("doc") },
+    };
+    for ([_]?[]u8{ null, @constCast("{\"parent_doc_key\":\"other\"}") }) |payload| {
+        hit.stored_data = payload;
+        const parent = try resolveChunkParentId(a, hit, .{ .ctx = null, .load_stored = loader.load });
+        defer a.free(parent);
+        try std.testing.expectEqualStrings("doc", parent);
+    }
 }
 
 const ArtifactIdentityMatch = enum {
@@ -4068,6 +4100,78 @@ test "native asset members hydrate source authority and revision identity" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "direct PDF member preserves stored page metadata with independent ancestor projection" {
+    const alloc = std.testing.allocator;
+    const Loader = struct {
+        unit: []const u8,
+        reads: usize = 0,
+        missing: bool = false,
+        const page = "{\"unit_id\":\"page:000001\",\"text\":\"extracted text\",\"provenance\":{\"page_number\":1,\"width\":612}}";
+        fn load(raw: ?*anyopaque, a: Allocator, key: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!std.mem.eql(u8, key, self.unit)) return null;
+            self.reads += 1;
+            return if (self.missing) null else try a.dupe(u8, page);
+        }
+    };
+    const unit = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc", "pages", "page:000001");
+    defer alloc.free(unit);
+    const embedding = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, unit, "visual");
+    defer alloc.free(embedding);
+    const projected_page = "{\"unit_id\":\"page:000001\"}";
+    for ([_]bool{ true, false, false }, [_]bool{ false, false, true }) |projected, missing| {
+        const hits = try alloc.alloc(types.SearchHit, 1);
+        hits[0] = .{
+            .id = try alloc.dupe(u8, unit),
+            .artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, embedding),
+            .stored_data = if (projected) try alloc.dupe(u8, projected_page) else null,
+        };
+        var loader: Loader = .{ .unit = unit, .missing = missing };
+        var result = try reshapeChunkBackedResult(alloc, .{ .return_mode = .member, .include_stored = true, .hierarchy_include_unit = true }, .{ .alloc = alloc, .hits = hits, .total_hits = 1 }, .{ .ctx = &loader, .load_stored = Loader.load, .resolve_parent_id = TestChunkParentShaper.resolveParentId, .load_parent_stored = TestChunkParentShaper.loadParentStored });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), loader.reads);
+        if (missing) {
+            try std.testing.expect(result.hits[0].stored_data == null);
+            try std.testing.expect(result.hits[0].ancestor_unit_data == null);
+            continue;
+        }
+        try std.testing.expectEqualStrings(if (projected) projected_page else Loader.page, result.hits[0].stored_data.?);
+        try std.testing.expectEqualStrings(Loader.page, result.hits[0].ancestor_unit_data.?);
+    }
+}
+
+test "direct PDF member and page embedding share the page producer derivation" {
+    const a = std.testing.allocator;
+    const page = try internal_keys.documentUnitArtifactKeyAlloc(a, "doc", "pages", "page:000001");
+    defer a.free(page);
+    const embedding = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, page, "visual");
+    defer a.free(embedding);
+    var state: std.ArrayList(u8) = .empty;
+    defer state.deinit(a);
+    try internal_keys.appendDocumentPrefix(&state, a, "doc");
+    try state.append(a, internal_keys.asset_state_kind);
+    try internal_keys.appendEncodedComponent(&state, a, "pages");
+    const Loader = struct {
+        key: []const u8,
+        reads: usize = 0,
+        fn load(raw: ?*anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqualStrings(self.key, key);
+            self.reads += 1;
+            return try alloc.dupe(u8, "page producer state");
+        }
+    };
+    var loader: Loader = .{ .key = state.items };
+    const hits = try a.alloc(types.SearchHit, 2);
+    for (hits, [_][]const u8{ page, embedding }) |*hit, key| hit.* = .{ .id = try a.dupe(u8, page), .artifact_ref = try artifact_ids.decodeArtifactRefAlloc(a, key), .stored_data = try a.dupe(u8, "{}") };
+    var result: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = @intCast(hits.len) };
+    defer result.deinit();
+    try hydrateArtifactRevisions(a, &result, &.{ null, null }, .{ .ctx = &loader, .load_stored = Loader.load, .load_parent_stored = TestChunkParentShaper.loadParentStored, .resolve_parent_id = TestChunkParentShaper.resolveParentId });
+    try std.testing.expectEqual(@as(usize, 1), loader.reads);
+    try std.testing.expectEqualStrings(hits[0].artifact_ref.?.revision.?, hits[1].artifact_ref.?.revision.?);
+    try std.testing.expectEqualStrings(hits[0].artifact_ref.?.derivation_revision.?, hits[1].artifact_ref.?.derivation_revision.?);
 }
 
 test "a dense chunk member reports its chunk with the chunk's revisions" {

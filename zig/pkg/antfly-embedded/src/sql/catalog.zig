@@ -118,6 +118,7 @@ pub const Table = struct {
     id: u64,
     physical_name: []const u8,
     schema_version: u32,
+    column_lineage: ?u32 = null,
     storage_mode: enum { relational, document } = .relational,
     /// External bindings are read-only and pinned by the serving cursor.
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,

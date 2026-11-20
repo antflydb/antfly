@@ -385,7 +385,7 @@ pub const DenseSearchExecutor = struct {
         entry: *index_manager_mod.IndexManager.DenseIndex,
         key: []const u8,
     ) anyerror![]u8 = null,
-    lookup_residual_vector_ids: ?*const fn (?*anyopaque, Allocator, []const u8, []const []const u8) anyerror![]u64 = null,
+    lookup_residual_vector_ids: ?*const fn (?*anyopaque, Allocator, []const u8, []const []const u8, QueryExecutionControl) anyerror![]u64 = null,
     lookup_vector_id: *const fn (
         ctx: ?*anyopaque,
         index_name: []const u8,
@@ -10290,6 +10290,7 @@ const IndexedPredicateEvaluator = struct {
         };
 
         attempted: bool = false,
+        range_projection_disabled: bool = false,
         batches: std.ArrayListUnmanaged(Batch) = .empty,
         covered: ?roaring.RoaringBitmap = null,
         scanned_legacy: ?roaring.RoaringBitmap = null,
@@ -10340,6 +10341,18 @@ const IndexedPredicateEvaluator = struct {
                 entry.value_ptr.* = ordinal;
                 merged.pairs[used.*] = pair;
                 used.* += 1;
+            }
+        }
+
+        fn publishCoverage(self: *FrontierProbeInput, alloc: Allocator, keys: std.AutoHashMapUnmanaged(u32, []const u8), control: QueryExecutionControl) !void {
+            errdefer {
+                self.deinit(alloc);
+                self.* = .{ .attempted = true, .range_projection_disabled = self.range_projection_disabled };
+            }
+            var ordinals = keys.keyIterator();
+            while (ordinals.next()) |ordinal| {
+                try control.check();
+                try self.covered.?.add(ordinal.*);
             }
         }
 
@@ -10542,13 +10555,17 @@ const IndexedPredicateEvaluator = struct {
                 // Rebuild only the current scope when a merge cannot fit the
                 // graph work budget alongside its input batches.
                 memo.deinit(self.alloc);
-                memo.* = .{ .attempted = true, .covered = roaring.RoaringBitmap.init(self.alloc) };
+                memo.* = .{
+                    .attempted = true,
+                    .range_projection_disabled = memo.range_projection_disabled,
+                    .covered = roaring.RoaringBitmap.init(self.alloc),
+                };
                 missing.clearRetainingCapacity();
                 try self.collectMissingProbeOrdinals(memo, scope, frontier, &missing);
                 try self.extendProbeScope(memo, missing, null);
             };
-            var ordinals = (if (self.key_domain != null) frontier else missing).keyIterator();
-            while (ordinals.next()) |ordinal| try memo.covered.?.add(ordinal.*);
+            // Discard the physical batches if the last publication step fails.
+            try memo.publishCoverage(self.alloc, if (self.key_domain != null) frontier else missing, self.control);
         }
         var requested = scope.iterator();
         var physical_candidates = roaring.RoaringBitmap.init(self.alloc);
@@ -11188,15 +11205,32 @@ const IndexedPredicateEvaluator = struct {
         return bytes;
     }
 
+    fn collectKeyRangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !RangeEvidence {
+        var physical = try self.collectPhysicalProbeScope(scope);
+        defer physical.deinit();
+        return self.collectRangeEvidence(query, &physical, true);
+    }
+
+    fn discardRangeFrontier(self: IndexedPredicateEvaluator) void {
+        if (self.probe_input) |memo| {
+            memo.deinit(self.alloc);
+            memo.* = .{ .range_projection_disabled = true };
+        }
+    }
+
     fn rangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !RangeEvidence {
+        if (self.probe_input) |memo| {
+            if (memo.range_projection_disabled) return RangeEvidence.init(self.alloc);
+        }
         if (self.key_domain != null) {
             if (self.probe_input == null) return RangeEvidence.init(self.alloc);
-            var physical = self.collectPhysicalProbeScope(scope) catch |err| switch (err) {
-                error.OutOfMemory => return RangeEvidence.init(self.alloc),
+            return self.collectKeyRangeEvidence(query, scope) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    self.discardRangeFrontier();
+                    return RangeEvidence.init(self.alloc);
+                },
                 else => return err,
             };
-            defer physical.deinit();
-            return self.collectRangeEvidence(query, &physical, true);
         }
         const cache = &self.snapshot.graph_predicates;
         const coverage_key = try std.fmt.allocPrint(self.scratch, "range-field:{s}:{s}", .{ self.presence_cache_prefix orelse self.cache_prefix, query.numeric_range.field });
@@ -11277,8 +11311,6 @@ const IndexedPredicateEvaluator = struct {
             evidence.matches.deinit();
             return RangeEvidence.init(self.alloc);
         }
-        evidence.covered.andWith(scope);
-        evidence.matches.andWith(scope);
         return evidence;
     }
 
@@ -11292,32 +11324,103 @@ const IndexedPredicateEvaluator = struct {
         if (self.key_domain != null and (scope.cardinality() <= 128 or scope.cardinality() *| 32 <= self.snapshot.filterPhysicalDocCount())) {
             return self.executeStoredRange(stored, scope);
         }
-        var evidence = self.rangeEvidence(query, scope) catch |err| switch (err) {
+        const evidence = self.rangeEvidence(query, scope) catch |err| switch (err) {
             error.StorageReadTemporarilyUnavailable => return self.executeStoredRange(stored, scope),
+            error.OutOfMemory => {
+                self.discardRangeFrontier();
+                return self.executeStoredRange(stored, scope);
+            },
             else => return err,
         };
-        defer evidence.covered.deinit();
-        errdefer evidence.matches.deinit();
+        return self.finishMixedRange(stored, scope, evidence);
+    }
+
+    fn finishMixedRange(self: IndexedPredicateEvaluator, stored: std.json.Value, scope: *const roaring.RoaringBitmap, owned: RangeEvidence) !roaring.RoaringBitmap {
+        var evidence = owned;
         evidence.covered.andWith(scope);
         evidence.matches.andWith(scope);
-        if (evidence.covered.cardinality() == scope.cardinality()) return evidence.matches;
-        var missing = try scope.cloneExact(self.alloc);
-        defer missing.deinit();
+        const covered_count = evidence.covered.cardinality();
+        const scope_count = scope.cardinality();
+        if (covered_count == scope_count) {
+            evidence.covered.deinit();
+            return evidence.matches;
+        }
+        if (covered_count == 0) {
+            evidence.covered.deinit();
+            evidence.matches.deinit();
+            return self.executeStoredRange(stored, scope);
+        }
+        var missing = scope.cloneExact(self.alloc) catch {
+            evidence.covered.deinit();
+            evidence.matches.deinit();
+            self.discardRangeFrontier();
+            return self.executeStoredRange(stored, scope);
+        };
         missing.andNotWith(&evidence.covered);
-        var residual = try self.executeStoredRange(stored, &missing);
-        defer residual.deinit();
-        try evidence.matches.orWith(&residual);
-        return evidence.matches;
+        evidence.covered.deinit();
+        // If the budget cannot pay for a replay, reserve the result before
+        // reading residual rows. Rejected rows only clear preexisting bits.
+        if (self.budget) |budget| {
+            if (scope_count +| (scope_count - covered_count) > budget.remaining_anchors) {
+                evidence.matches.orWith(&missing) catch {
+                    missing.deinit();
+                    evidence.matches.deinit();
+                    self.discardRangeFrontier();
+                    return self.executeStoredRange(stored, scope);
+                };
+                self.evaluateStoredRange(stored, &missing, &evidence.matches, true) catch |err| {
+                    missing.deinit();
+                    evidence.matches.deinit();
+                    if (err != error.OutOfMemory) return err;
+                    self.discardRangeFrontier();
+                    return self.executeStoredRange(stored, scope);
+                };
+                missing.deinit();
+                return evidence.matches;
+            }
+        }
+        const residual = self.executeStoredRange(stored, &missing) catch |err| {
+            missing.deinit();
+            evidence.matches.deinit();
+            if (err != error.OutOfMemory) return err;
+            self.discardRangeFrontier();
+            return self.executeStoredRange(stored, scope);
+        };
+        missing.deinit();
+        return self.joinMixedRangeMatches(stored, scope, evidence.matches, residual);
+    }
+
+    fn joinMixedRangeMatches(self: IndexedPredicateEvaluator, stored: std.json.Value, scope: *const roaring.RoaringBitmap, native_matches: roaring.RoaringBitmap, stored_matches: roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        var native = native_matches;
+        var residual = stored_matches;
+        if (native.isEmpty()) {
+            native.deinit();
+            return residual;
+        }
+        native.orWith(&residual) catch {
+            native.deinit();
+            residual.deinit();
+            self.discardRangeFrontier();
+            return self.executeStoredRange(stored, scope);
+        };
+        residual.deinit();
+        return native;
     }
 
     fn executeStoredRange(self: IndexedPredicateEvaluator, range: std.json.Value, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        var matches = roaring.RoaringBitmap.init(self.alloc);
+        errdefer matches.deinit();
+        try self.evaluateStoredRange(range, scope, &matches, false);
+        return matches;
+    }
+
+    fn evaluateStoredRange(self: IndexedPredicateEvaluator, range: std.json.Value, scope: *const roaring.RoaringBitmap, matches: *roaring.RoaringBitmap, comptime prefilled: bool) !void {
         const load = self.executor.load_many_stored_values orelse return error.UnsupportedQueryRequest;
         var wrapper: std.json.ObjectMap = .empty;
+        defer wrapper.deinit(self.scratch);
         try wrapper.put(self.scratch, "range", range);
         var predicate = try graph_exec.PreparedPatternFilter.initValue(self.alloc, .{ .object = wrapper });
         defer predicate.deinit();
-        var matches = roaring.RoaringBitmap.init(self.alloc);
-        errdefer matches.deinit();
         var row = std.heap.ArenaAllocator.init(self.alloc);
         defer row.deinit();
 
@@ -11330,7 +11433,10 @@ const IndexedPredicateEvaluator = struct {
             while (count < ordinals.len) {
                 const ordinal = docs.next() orelse break;
                 if (self.missing_rows) |missing| {
-                    if (missing.contains(ordinal)) continue;
+                    if (missing.contains(ordinal)) {
+                        if (prefilled) matches.removeRetainingStorage(ordinal);
+                        continue;
+                    }
                 }
                 ordinals[count] = ordinal;
                 if (self.frontier) |frontier| frontier_keys[count] = frontier.get(ordinal) orelse return error.InvalidData;
@@ -11354,12 +11460,15 @@ const IndexedPredicateEvaluator = struct {
                 const value = raw orelse {
                     const missing = self.missing_rows orelse return error.StorageReadTemporarilyUnavailable;
                     try missing.add(ordinal);
+                    if (prefilled) matches.removeRetainingStorage(ordinal);
                     continue;
                 };
-                if (try predicate.matchesStored(scratch, key, value)) try matches.add(ordinal);
+                const matched = try predicate.matchesStored(scratch, key, value);
+                if (prefilled) {
+                    if (!matched) matches.removeRetainingStorage(ordinal);
+                } else if (matched) try matches.add(ordinal);
             }
         }
-        return matches;
     }
 
     fn resolveOrdinals(self: IndexedPredicateEvaluator, docs: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
@@ -12303,6 +12412,257 @@ test "optional numeric range frontier memo coalesces small extensions" {
         try std.testing.expectEqual(doc % 7, try memo.ordinalForDoc(doc));
         try std.testing.expectEqual(doc % 7 == 3, selected.contains(doc));
     }
+}
+
+test "optional numeric range frontier publication discards mappings after allocation failure" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .range_projection_disabled = true, .covered = roaring.RoaringBitmap.init(alloc) };
+    defer memo.deinit(alloc);
+    var map: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    try map.put(alloc, 1, 1);
+    const pairs = try alloc.dupe(u64, &.{(@as(u64, 1) << 32) | 1});
+    try memo.appendBatch(alloc, .{ .pairs = pairs, .ordinals = map }, .{});
+    var keys: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    defer keys.deinit(alloc);
+    try keys.put(alloc, 1, "one");
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, memo.publishCoverage(alloc, keys, .{}));
+    try std.testing.expect(memo.covered == null);
+    try std.testing.expect(memo.range_projection_disabled);
+    try std.testing.expectEqual(@as(usize, 0), memo.batches.items.len);
+}
+
+test "optional numeric range releases a published frontier when candidate allocation fails" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    defer memo.deinit(alloc);
+    var map: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    try map.put(alloc, 1, 1);
+    const pairs = try alloc.dupe(u64, &.{(@as(u64, 1) << 32) | 1});
+    try memo.appendBatch(alloc, .{ .pairs = pairs, .ordinals = map }, .{});
+    try memo.covered.?.add(1);
+
+    var domain = roaring.RoaringBitmap.init(alloc);
+    defer domain.deinit();
+    try domain.add(1);
+    const key_domain: std.StringHashMapUnmanaged(u32) = .empty;
+    const evaluator: IndexedPredicateEvaluator = .{
+        .snapshot = undefined,
+        .analysis = .{},
+        .schema = null,
+        .executor = undefined,
+        .control = .{},
+        .alloc = alloc,
+        .scratch = alloc,
+        .cache_prefix = "",
+        .frontier = .empty,
+        .key_domain = &key_domain,
+        .probe_input = &memo,
+    };
+    failing.fail_index = failing.alloc_index;
+    var evidence = try evaluator.rangeEvidence(.{ .numeric_range = .{ .field = "rank" } }, &domain);
+    defer evidence.covered.deinit();
+    defer evidence.matches.deinit();
+    try std.testing.expectEqual(@as(usize, 0), evidence.covered.cardinality());
+    try std.testing.expectEqual(@as(usize, 0), memo.batches.items.len);
+    try std.testing.expect(memo.range_projection_disabled);
+}
+
+test "optional numeric range releases a published frontier when evidence allocation fails" {
+    const backing = std.testing.allocator;
+    var segment = segment_mod.SegmentWriter.init(backing);
+    defer segment.deinit();
+    try segment.addStoredDoc("one", "{}");
+    var witnesses = [_]segment_mod.NumericRangeWitness{.{ .field = "rank", .coverage = .empty }};
+    try segment.addNumericRangeWitnesses(&witnesses);
+    const bytes = try segment.build();
+    defer backing.free(bytes);
+    var writer = try index_mod.IndexWriter.init(backing);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const snapshot = writer.acquireSnapshot();
+    defer snapshot.release();
+
+    var failing: std.testing.FailingAllocator = .init(backing, .{});
+    const alloc = failing.allocator();
+    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    defer memo.deinit(alloc);
+    var map: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    try map.put(alloc, 0, 1);
+    const pairs = try alloc.dupe(u64, &.{@as(u64, 1) << 32});
+    try memo.appendBatch(alloc, .{ .pairs = pairs, .ordinals = map }, .{});
+    try memo.covered.?.add(1);
+    var domain = roaring.RoaringBitmap.init(backing);
+    defer domain.deinit();
+    try domain.add(1);
+    const key_domain: std.StringHashMapUnmanaged(u32) = .empty;
+    const evaluator: IndexedPredicateEvaluator = .{
+        .snapshot = snapshot,
+        .analysis = .{},
+        .schema = null,
+        .executor = undefined,
+        .control = .{},
+        .alloc = alloc,
+        .scratch = alloc,
+        .cache_prefix = "",
+        .frontier = .empty,
+        .key_domain = &key_domain,
+        .probe_input = &memo,
+    };
+    const before = failing.alloc_index;
+    var physical = try evaluator.collectPhysicalProbeScope(&domain);
+    physical.deinit();
+    const projection_allocations = failing.alloc_index - before;
+    failing.fail_index = failing.alloc_index + projection_allocations;
+    var evidence = try evaluator.rangeEvidence(.{ .numeric_range = .{ .field = "rank" } }, &domain);
+    defer evidence.covered.deinit();
+    defer evidence.matches.deinit();
+    try std.testing.expectEqual(@as(usize, 0), evidence.covered.cardinality());
+    try std.testing.expectEqual(@as(usize, 0), memo.batches.items.len);
+    try std.testing.expect(memo.range_projection_disabled);
+}
+
+test "optional numeric range discards partial evidence when uncovered scope allocation fails" {
+    const backing = std.testing.allocator;
+    var failing: std.testing.FailingAllocator = .init(backing, .{});
+    const alloc = failing.allocator();
+    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    defer memo.deinit(alloc);
+    try memo.covered.?.add(1);
+    var scope = roaring.RoaringBitmap.init(backing);
+    defer scope.deinit();
+    try scope.addRange(1, 3);
+    var evidence = IndexedPredicateEvaluator.RangeEvidence.init(backing);
+    try evidence.covered.add(1);
+    try evidence.matches.add(1);
+    const evaluator: IndexedPredicateEvaluator = .{
+        .snapshot = undefined,
+        .analysis = .{},
+        .schema = null,
+        .executor = .{ .ctx = null, .text_index_entry = undefined },
+        .control = .{},
+        .alloc = alloc,
+        .scratch = alloc,
+        .cache_prefix = "",
+        .probe_input = &memo,
+    };
+    failing.fail_index = failing.alloc_index;
+    // The sentinel error confirms that the stored evaluator was called after
+    // the clone failed. The testing allocator checks evidence ownership.
+    try std.testing.expectError(error.UnsupportedQueryRequest, evaluator.finishMixedRange(.null, &scope, evidence));
+    try std.testing.expect(memo.range_projection_disabled);
+    try std.testing.expect(memo.covered == null);
+    var disabled = try evaluator.rangeEvidence(.{ .numeric_range = .{ .field = "rank" } }, &scope);
+    defer disabled.covered.deinit();
+    defer disabled.matches.deinit();
+    try std.testing.expectEqual(@as(usize, 0), disabled.covered.cardinality());
+
+    memo.range_projection_disabled = false;
+    failing.fail_index = std.math.maxInt(usize);
+    var native = roaring.RoaringBitmap.init(alloc);
+    try native.add(1);
+    var residual = roaring.RoaringBitmap.init(backing);
+    try residual.add(65537);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.UnsupportedQueryRequest, evaluator.joinMixedRangeMatches(.null, &scope, native, residual));
+    try std.testing.expect(memo.range_projection_disabled);
+}
+
+test "optional numeric range returns full stored results after residual or union allocation failure" {
+    const alloc = std.testing.allocator;
+    const Loader = struct {
+        calls: usize = 0,
+        fail_first: bool = true,
+        expected_count: usize = 2,
+
+        fn load(raw: ?*anyopaque, scratch: Allocator, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.fail_first and self.calls == 1) {
+                try std.testing.expectEqual(@as(usize, 1), keys.len);
+                try std.testing.expectEqualStrings("stored", keys[0]);
+                return error.OutOfMemory;
+            }
+            try std.testing.expectEqual(self.expected_count, keys.len);
+            const values = try scratch.alloc(?[]u8, keys.len);
+            for (keys, values) |key, *value| {
+                value.* = try scratch.dupe(u8, if (std.mem.eql(u8, key, "stored")) "{\"rank\":8}" else "{\"rank\":1}");
+            }
+            return values;
+        }
+    };
+    var loader: Loader = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"rank\":{\"gte\":5}}", .{});
+    defer parsed.deinit();
+    var scope = roaring.RoaringBitmap.init(alloc);
+    defer scope.deinit();
+    try scope.addRange(1, 3);
+    var keys: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    defer keys.deinit(alloc);
+    try keys.put(alloc, 1, "native");
+    try keys.put(alloc, 2, "stored");
+    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    defer memo.deinit(alloc);
+    try memo.covered.?.add(1);
+    const evaluator: IndexedPredicateEvaluator = .{
+        .snapshot = undefined,
+        .analysis = .{},
+        .schema = null,
+        .executor = .{ .ctx = &loader, .text_index_entry = undefined, .load_many_stored_values = Loader.load },
+        .control = .{},
+        .alloc = alloc,
+        .scratch = alloc,
+        .cache_prefix = "",
+        .frontier = keys,
+        .probe_input = &memo,
+    };
+    var evidence = IndexedPredicateEvaluator.RangeEvidence.init(alloc);
+    try evidence.covered.add(1);
+    try evidence.matches.add(1);
+    var retried = try evaluator.finishMixedRange(parsed.value, &scope, evidence);
+    defer retried.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loader.calls);
+    try std.testing.expect(memo.range_projection_disabled and memo.covered == null);
+    try std.testing.expectEqual(@as(usize, 1), retried.cardinality());
+    try std.testing.expect(retried.contains(2));
+
+    loader = .{ .fail_first = false };
+    memo = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    try memo.covered.?.add(1);
+    var failing: std.testing.FailingAllocator = .init(alloc, .{});
+    var native = roaring.RoaringBitmap.init(failing.allocator());
+    try native.add(1);
+    var residual = roaring.RoaringBitmap.init(alloc);
+    try residual.add(65537);
+    failing.fail_index = failing.alloc_index;
+    var joined = try evaluator.joinMixedRangeMatches(parsed.value, &scope, native, residual);
+    defer joined.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loader.calls);
+    try std.testing.expect(memo.range_projection_disabled and memo.covered == null);
+    try std.testing.expect(joined.eql(&retried));
+
+    loader = .{ .fail_first = false, .expected_count = 1 };
+    var budget = WorkBudget.init(10, 10);
+    budget.remaining_anchors = scope.cardinality();
+    var budgeted = evaluator;
+    budgeted.budget = &budget;
+    var partial = IndexedPredicateEvaluator.RangeEvidence.init(alloc);
+    try partial.covered.add(1);
+    try partial.matches.add(1);
+    var exact_budget = try budgeted.finishMixedRange(parsed.value, &scope, partial);
+    defer exact_budget.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loader.calls);
+    try std.testing.expectEqual(@as(usize, 1), budget.remaining_anchors);
+    try std.testing.expectEqual(@as(usize, 2), exact_budget.cardinality());
+    var one_row = roaring.RoaringBitmap.init(alloc);
+    defer one_row.deinit();
+    try one_row.add(2);
+    var next_clause = try budgeted.executeStoredRange(parsed.value, &one_row);
+    defer next_clause.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining_anchors);
+    try std.testing.expect(next_clause.eql(&retried));
 }
 
 const ResidualIdentityContext = struct {
@@ -14579,6 +14939,7 @@ fn deriveNativeDenseConstraintsAlloc(
     index_name: []const u8,
     apply_live_all_docs: bool,
 ) !NativeDenseConstraints {
+    const control: QueryExecutionControl = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
     const bench_profile = getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
     const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     var doc_constraints_ns: u64 = 0;
@@ -14629,7 +14990,7 @@ fn deriveNativeDenseConstraintsAlloc(
         if (doc_constraints.filter_doc_ids.len > 0) {
             const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
             const mapped_doc_ids = if (doc_constraints.filter_query_json_resolved)
-                try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name)
+                try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name, control)
             else
                 try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name);
             errdefer alloc.free(mapped_doc_ids);
@@ -14647,7 +15008,7 @@ fn deriveNativeDenseConstraintsAlloc(
             mapped_owned = true;
         }
         if (doc_constraints.legacy_filter == .doc_keys) {
-            const legacy = try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.legacy_filter.doc_keys, executor, index_name);
+            const legacy = try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.legacy_filter.doc_keys, executor, index_name, control);
             defer alloc.free(legacy);
             const merged = try unionVectorIdsAlloc(alloc, mapped, legacy);
             if (mapped_owned) alloc.free(mapped);
@@ -14687,14 +15048,14 @@ fn deriveNativeDenseConstraintsAlloc(
     if (doc_constraints.exclude_doc_ids.len > 0) {
         const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const mapped_excludes = if (doc_constraints.exclusion_query_json_resolved)
-            try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name)
+            try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name, control)
         else
             try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name);
         if (bench_profile) exclude_doc_ids_ns += platform_time.monotonicNs() - phase_start_ns;
         try mergeNativeExcludeIds(alloc, &out, mapped_excludes, req.exclude_ids);
     }
     if (doc_constraints.legacy_exclude == .doc_keys) {
-        const legacy = try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.legacy_exclude.doc_keys, executor, index_name);
+        const legacy = try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.legacy_exclude.doc_keys, executor, index_name, control);
         try mergeNativeExcludeIds(alloc, &out, legacy, req.exclude_ids);
     }
     if (out.exclude_ids.len == 0 and req.exclude_ids.len > 0) {
@@ -14884,9 +15245,19 @@ fn appendDocIds(
     }
 }
 
-fn denseVectorIdsForResidualKeysAlloc(alloc: Allocator, keys: []const []const u8, executor: DenseSearchExecutor, name: []const u8) ![]u64 {
-    if (executor.lookup_residual_vector_ids) |lookup| return lookup(executor.ctx, alloc, name, keys);
-    return denseVectorIdsForDocIdsAlloc(alloc, keys, executor, name);
+fn denseVectorIdsForResidualKeysAlloc(alloc: Allocator, keys: []const []const u8, executor: DenseSearchExecutor, name: []const u8, control: QueryExecutionControl) ![]u64 {
+    try control.check();
+    if (executor.lookup_residual_vector_ids) |lookup| return lookup(executor.ctx, alloc, name, keys, control);
+    var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer ids.deinit(alloc);
+    var result: std.ArrayListUnmanaged(u64) = .empty;
+    errdefer result.deinit(alloc);
+    for (keys) |key| {
+        try control.check();
+        const id = (try executor.lookup_vector_id(executor.ctx, name, key)) orelse continue;
+        if (!(try ids.getOrPut(alloc, id)).found_existing) try result.append(alloc, id);
+    }
+    return result.toOwnedSlice(alloc);
 }
 
 fn denseVectorIdsForDocIdsAlloc(
@@ -18169,7 +18540,7 @@ fn searchDenseInternal(
     if (returnModeRequiresUnitGrouping(req.return_mode) and !entry.supports_unit_grouping)
         return error.UnsupportedHierarchyGrouping;
 
-    const chunk_backed = entry.chunk_name != null;
+    const chunk_backed = entry.memberBacked();
     // Multi-source members need visibility filtering and identity translation,
     // but raw member modes do not collapse unrelated `(artifact, key)` values.
     // Start at the requested score-order window and grow from observed losses
@@ -18643,7 +19014,7 @@ fn searchDenseInternal(
             };
             var doc_key_owned = true;
             errdefer if (doc_key_owned) alloc.free(doc_key);
-            var source_artifact_ref = if (entry.embedding_names.len > 0 or entry.chunk_name != null)
+            var source_artifact_ref = if (entry.embedding_names.len > 0 or chunk_backed)
                 try artifact_ids.decodeArtifactRefAlloc(alloc, doc_key)
             else
                 null;
@@ -18663,7 +19034,7 @@ fn searchDenseInternal(
             errdefer if (stored_data_owned) {
                 if (stored_data) |data| alloc.free(data);
             };
-            const load_stored_before_postprocess = postprocess_req.include_stored and
+            const load_stored_before_postprocess = stored_data == null and postprocess_req.include_stored and
                 !(chunk_backed and group_chunk_parents) and
                 !unresolved_stored_filters;
             if (load_stored_before_postprocess and executor.load_projected_documents == null) {
