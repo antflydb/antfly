@@ -712,7 +712,7 @@ pub const MatchAllExecutor = struct {
     ) anyerror!bool = null,
 };
 
-pub const PrimaryCandidateVisitor = *const fn (?*anyopaque, []const u8, ?doc_set.DocOrdinal, bool) anyerror!docstore_mod.DocStore.ScanAction;
+pub const PrimaryCandidateVisitor = *const fn (?*anyopaque, []const u8, ?doc_set.DocOrdinal, bool, bool) anyerror!docstore_mod.DocStore.ScanAction;
 
 pub const MatchAllCandidateCollector = struct {
     ctx: ?*anyopaque,
@@ -23584,10 +23584,10 @@ fn collectMatchAllCandidateStateWithOptions(
 
     if (collector.scan_primary_ids) |scan| {
         const Visitor = struct {
-            fn visit(raw: ?*anyopaque, id: []const u8, ordinal: ?doc_set.DocOrdinal, unique: bool) anyerror!docstore_mod.DocStore.ScanAction {
+            fn visit(raw: ?*anyopaque, id: []const u8, ordinal: ?doc_set.DocOrdinal, unique: bool, expiry_checked: bool) anyerror!docstore_mod.DocStore.ScanAction {
                 const target: *MatchAllCandidateCollectState = @ptrCast(@alignCast(raw.?));
                 try checkSearchRequestDeadline(target.req);
-                try target.consumeKey(try target.alloc.dupe(u8, id), @as(?doc_set.DocOrdinal, ordinal), unique);
+                try target.consumeKey(try target.alloc.dupe(u8, id), @as(?doc_set.DocOrdinal, ordinal), unique, expiry_checked);
                 if (target.shouldStopAfterAccepted()) {
                     target.stopped_early = true;
                     return .stop;
@@ -23780,14 +23780,14 @@ const MatchAllCandidateCollectState = struct {
     }
 
     fn consumeRawKey(self: *@This(), raw_key_owned: []u8) !void {
-        return self.consumeKey(raw_key_owned, null, false);
+        return self.consumeKey(raw_key_owned, null, false, false);
     }
 
-    fn consumeKey(self: *@This(), raw_key_owned: []u8, resolved: ??doc_set.DocOrdinal, unique: bool) !void {
+    fn consumeKey(self: *@This(), raw_key_owned: []u8, resolved: ??doc_set.DocOrdinal, unique: bool, expiry_checked: bool) !void {
         var raw_key = raw_key_owned;
         errdefer self.alloc.free(raw_key);
 
-        if (try self.collector.is_expired_key(self.collector.ctx, self.alloc, raw_key)) {
+        if (!expiry_checked and try self.collector.is_expired_key(self.collector.ctx, self.alloc, raw_key)) {
             self.alloc.free(raw_key);
             return;
         }

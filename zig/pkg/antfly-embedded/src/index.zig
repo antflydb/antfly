@@ -1338,6 +1338,33 @@ test "optional numeric range ordinal directory reclaims only unpinned navigation
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.graph_predicate_cache).used_bytes);
 }
 
+test "optional numeric range cursor ordinal spill preserves newest mappings across batches" {
+    const a = std.testing.allocator;
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d" }) |id| try segment.addStoredDoc(id, "{}");
+    try segment.addDocOrdinals(&.{ 9, 3, 9, 1 });
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const snapshot = writer.acquireSnapshot();
+    defer snapshot.release();
+
+    var projection: IndexSnapshot.SortOrdinalBatchProjection = .{};
+    defer projection.deinit(a);
+    try projection.buildOrdinalSpill(a, snapshot, .{});
+    var first = try projection.project(a, snapshot, &.{ 9, 2 }, .{});
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.ordinals.count());
+    try std.testing.expectEqual(@as(?u32, 9), first.ordinals.get(2));
+    var second = try projection.project(a, snapshot, &.{ 1, 3 }, .{});
+    defer second.deinit();
+    try std.testing.expectEqual(@as(?u32, 1), second.ordinals.get(3));
+    try std.testing.expectEqual(@as(?u32, 3), second.ordinals.get(1));
+}
+
 test "graph predicate cache clones outside locks and pins evicted membership" {
     const a = std.testing.allocator;
     var manager = resource_manager_mod.ResourceManager.init(.{});
@@ -2562,14 +2589,6 @@ pub const IndexSnapshot = struct {
                 shared.stored_key_directory_lock.unlock();
                 return directory;
             }
-            if (sort_projection) |projection| {
-                // A single batch is cheaper as a bounded scan on a cold
-                // segment. Only recurring lookups can amortize the sort.
-                if (projection.key_batches < 2 or manager == null) {
-                    shared.stored_key_directory_lock.unlock();
-                    return null;
-                }
-            }
             if (flight_slot.*) |active| {
                 _ = active.refs.fetchAdd(1, .monotonic);
                 shared.stored_key_directory_lock.unlock();
@@ -2590,6 +2609,14 @@ pub const IndexSnapshot = struct {
                 }
                 // Interrupted builders leave the next live reader free to retry.
                 continue;
+            }
+            if (sort_projection) |projection| {
+                // A single batch is cheaper as a bounded scan on a cold
+                // segment. Only recurring lookups can amortize the sort.
+                if (projection.key_batches < 2 or manager == null) {
+                    shared.stored_key_directory_lock.unlock();
+                    return null;
+                }
             }
             if (manager) |owner| {
                 if (shared.stored_key_directory_reclaimer == 0) {
@@ -2801,6 +2828,12 @@ pub const IndexSnapshot = struct {
     /// read each legacy ordinal sidecar at most once across all batches.
     pub const SortOrdinalBatchProjection = struct {
         const fallback_ordinal_limit = 4096;
+        const spill = @import("sql/spill.zig");
+        const Datum = @import("sql/scalar.zig").Datum;
+
+        spill_control: query_mod.ExecutionControl = .{},
+        spill_manager: ?spill.Manager = null,
+        ordinal_file: ?spill.File = null,
         remaining_scan_rows: u64 = 0,
         key_batches: u64 = 0,
         attempted_navigation: bool = false,
@@ -2825,6 +2858,8 @@ pub const IndexSnapshot = struct {
         }
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.ordinal_file) |*file| file.close();
+            if (self.spill_manager) |*manager| manager.deinit();
             if (self.navigation) |navigation| navigation.release();
             self.fallback.deinit(alloc);
             self.scanned.deinit(alloc);
@@ -2841,6 +2876,10 @@ pub const IndexSnapshot = struct {
             var out = GraphFrontierDocs.init(alloc);
             errdefer out.deinit();
             if (ordinals.len == 0) return out;
+            if (self.ordinal_file) |*file| {
+                try readOrdinalSpill(file, ordinals, &out);
+                return out;
+            }
             if (self.navigation) |navigation| {
                 try addNavigation(snapshot, alloc, navigation, ordinals, control, &out);
                 return out;
@@ -2886,6 +2925,11 @@ pub const IndexSnapshot = struct {
                         return out;
                     }
                 }
+                if (!retain_segment) {
+                    try self.buildOrdinalSpill(alloc, snapshot, control);
+                    try readOrdinalSpill(&self.ordinal_file.?, ordinals, &out);
+                    return out;
+                }
                 try self.chargeScan(segment.reader.doc_count);
                 try lease.entry.shared.lockDeletionSharedWithControl(control);
                 defer lease.entry.shared.unlockDeletionShared();
@@ -2896,20 +2940,101 @@ pub const IndexSnapshot = struct {
                     if (lease.entry.shared.deleted) |deleted| if (deleted.contains(local)) continue;
                     const ordinal = (try cursor.get(local)) orelse continue;
                     const global = offset + local;
-                    if (retain_segment) {
-                        const slot = try self.fallback.getOrPut(alloc, ordinal);
-                        if (!slot.found_existing or slot.value_ptr.* < global) slot.value_ptr.* = global;
-                    } else {
-                        const i_ordinal = firstAtLeast(sorted, ordinal);
-                        if (i_ordinal < sorted.len and sorted[i_ordinal] == ordinal) try out.add(global, ordinal);
-                    }
+                    const slot = try self.fallback.getOrPut(alloc, ordinal);
+                    if (!slot.found_existing or slot.value_ptr.* < global) slot.value_ptr.* = global;
                 }
-                if (retain_segment) self.scanned.set(i);
+                self.scanned.set(i);
             }
             for (ordinals) |ordinal| {
                 if (self.fallback.get(ordinal)) |doc| try out.add(doc, ordinal);
             }
             return out;
+        }
+
+        fn buildOrdinalSpill(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, control: query_mod.ExecutionControl) !void {
+            const Check = struct {
+                fn run(raw: *anyopaque) !void {
+                    const projection: *SortOrdinalBatchProjection = @ptrCast(@alignCast(raw));
+                    try projection.spill_control.check();
+                }
+            };
+            self.spill_control = control;
+            self.spill_manager = .{
+                .alloc = alloc,
+                .io = snapshot.read_context_io orelse std.Io.Threaded.global_single_threaded.io(),
+                .context = self,
+                .checkpoint = Check.run,
+            };
+            const manager = &self.spill_manager.?;
+            var sorter = spill.Sort.init(alloc, manager, &.{.{}}, 512 * 1024);
+            defer sorter.deinit();
+            var offset: u32 = 0;
+            for (snapshot.segments, 0..) |segment, i| {
+                try control.check();
+                defer offset += segment.reader.doc_count;
+                if (segment.liveDocCount() == 0) continue;
+                var lease = try snapshot.leaseSegment(i);
+                defer lease.deinit();
+                try lease.entry.shared.lockDeletionSharedWithControl(control);
+                defer lease.entry.shared.unlockDeletionShared();
+                var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+                for (0..segment.reader.doc_count) |doc| {
+                    if (doc % 256 == 0) try control.check();
+                    const local: u32 = @intCast(doc);
+                    if (lease.entry.shared.deleted) |deleted| if (deleted.contains(local)) continue;
+                    const ordinal = (try cursor.get(local)) orelse continue;
+                    try sorter.add(.{ .keys = &.{Datum.fromJson(.{ .integer = ordinal })}, .values = &.{}, .ordinal = offset + local });
+                }
+            }
+            try sorter.finish();
+            var file = try manager.create();
+            errdefer file.close();
+            var pending: ?u64 = null;
+            var buffer: [4096]u8 = undefined;
+            var len: usize = 0;
+            while (try sorter.nextLeased()) |row| {
+                defer row.release();
+                const ordinal: u32 = @intCast((try row.keyCell(0)).value.integer);
+                const pair = (@as(u64, ordinal) << 32) | row.row.ordinal;
+                if (pending) |previous| {
+                    if (previous >> 32 == ordinal) {
+                        pending = @max(previous, pair);
+                        continue;
+                    }
+                    std.mem.writeInt(u64, buffer[len..][0..8], previous, .big);
+                    len += 8;
+                    if (len == buffer.len) {
+                        try file.writeRaw(file.size, &buffer);
+                        len = 0;
+                    }
+                }
+                pending = pair;
+            }
+            if (pending) |pair| {
+                std.mem.writeInt(u64, buffer[len..][0..8], pair, .big);
+                len += 8;
+            }
+            if (len != 0) try file.writeRaw(file.size, buffer[0..len]);
+            self.ordinal_file = file;
+        }
+
+        fn readOrdinalSpill(file: *spill.File, ordinals: []const u32, out: *GraphFrontierDocs) !void {
+            for (ordinals) |ordinal| {
+                var lo: u64 = 0;
+                var hi = file.size / 8;
+                var bytes: [8]u8 = undefined;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    try file.readRaw(mid * 8, &bytes);
+                    const pair = std.mem.readInt(u64, &bytes, .big);
+                    const key: u32 = @intCast(pair >> 32);
+                    if (key == ordinal) {
+                        try out.add(@truncate(pair), ordinal);
+                        break;
+                    }
+                    if (key < ordinal) lo = mid + 1 else hi = mid;
+                }
+            }
         }
 
         fn addNavigation(

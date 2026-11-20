@@ -48942,6 +48942,7 @@ pub const DB = struct {
             }
             if (options.require_complete_primary_population and !options.hasCompletePrimaryKeyScope()) {
                 if (try self.scanSmallOrderedScope(options)) return;
+                if (try self.scanLargeOrderedScope(options)) return;
                 try self.scanSourcePopulation(options);
                 return;
             }
@@ -49088,6 +49089,96 @@ pub const DB = struct {
             return true;
         }
 
+        fn scanLargeOrderedScope(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !bool {
+            if (comptime builtin.os.tag == .freestanding) return false;
+            const constraints = options.constraints orelse return false;
+            if (!constraints.positive_filter) return false;
+            const set = if (constraints.primary_include_compact) constraints.primary_include else doc_set.ResolvedDocSet{ .ordinals = constraints.filter_doc_nums };
+            if (set == .all) return false;
+            const spill = @import("../../sql/spill.zig");
+            const Datum = @import("../../sql/scalar.zig").Datum;
+            const Check = struct {
+                fn run(raw: *anyopaque) !void {
+                    const source_scan: *PrimaryMatchAllIdentityScan = @ptrCast(@alignCast(raw));
+                    try db_query_search.checkSearchRequestDeadline(source_scan.req);
+                }
+            };
+            var manager = spill.Manager{
+                .alloc = self.alloc,
+                .io = std.Io.Threaded.global_single_threaded.io(),
+                .context = self,
+                .checkpoint = Check.run,
+            };
+            defer manager.deinit();
+            var ordered = spill.Sort.init(self.alloc, &manager, &.{.{ .descending = options.primary_key_reverse }}, 512 * 1024);
+            defer ordered.deinit();
+            const unknown_ordinal: u64 = @as(u64, std.math.maxInt(u32)) + 1;
+            const legacy = if (constraints.legacy_filter == .doc_keys) constraints.legacy_filter.doc_keys else &.{};
+            const direct = if (set == .doc_keys) set.doc_keys else &.{};
+            for ([_][]const []const u8{ direct, legacy }) |keys| {
+                for (keys) |id| {
+                    try Check.run(self);
+                    if (!self.orderedScopeContains(options, id)) continue;
+                    try ordered.add(.{ .keys = &.{Datum.fromJson(.{ .string = id })}, .values = &.{}, .ordinal = unknown_ordinal });
+                }
+            }
+
+            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+            defer scratch.deinit();
+            var iterator = if (set == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
+            const numbers = if (set == .ordinals) set.ordinals else &.{};
+            var offset: usize = 0;
+            while (true) {
+                try Check.run(self);
+                _ = scratch.reset(.retain_capacity);
+                var ordinals: [256]doc_set.DocOrdinal = undefined;
+                var resolved: [256]?[]const u8 = undefined;
+                var len: usize = 0;
+                while (len < ordinals.len) : (len += 1) {
+                    if (iterator) |*cursor| {
+                        ordinals[len] = cursor.next() orelse break;
+                    } else {
+                        if (offset == numbers.len) break;
+                        ordinals[len] = numbers[offset];
+                        offset += 1;
+                    }
+                }
+                if (len == 0) break;
+                resolvePrimaryOrdinalKeysCallback(self.db, scratch.allocator(), ordinals[0..len], self.req.identity_read_generation, resolved[0..len]) catch |err| switch (err) {
+                    error.InvalidDocIdentity => return false,
+                    else => return err,
+                };
+                for (ordinals[0..len], resolved[0..len]) |ordinal, value| {
+                    const id = value orelse continue;
+                    if (!self.orderedScopeContains(options, id)) continue;
+                    try ordered.add(.{ .keys = &.{Datum.fromJson(.{ .string = id })}, .values = &.{}, .ordinal = ordinal });
+                }
+            }
+            try ordered.finish();
+            var last: std.ArrayListUnmanaged(u8) = .empty;
+            defer last.deinit(self.alloc);
+            var have_last = false;
+            while (try ordered.nextLeased()) |row| {
+                defer row.release();
+                try Check.run(self);
+                const id = (try row.keyCell(0)).value.string;
+                if (have_last and std.mem.eql(u8, id, last.items)) continue;
+                last.clearRetainingCapacity();
+                try last.appendSlice(self.alloc, id);
+                have_last = true;
+                const ordinal = std.math.cast(doc_set.DocOrdinal, row.row.ordinal);
+                if (try self.visitIdWithOrdinal(id, ordinal, true) == .stop) return true;
+            }
+            return true;
+        }
+
+        fn orderedScopeContains(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions, id: []const u8) bool {
+            if (!self.db.core.byteRange().contains(id)) return false;
+            if (options.primary_key_start_after) |after| if (!std.mem.lessThan(u8, after, id)) return false;
+            if (options.primary_key_stop_before) |before| if (!std.mem.lessThan(u8, id, before)) return false;
+            return true;
+        }
+
         fn scanSourcePopulation(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
             const Scan = struct {
                 owner: *PrimaryMatchAllIdentityScan,
@@ -49095,6 +49186,8 @@ pub const DB = struct {
                 keys: [256][]const u8 = undefined,
                 len: usize = 0,
                 batch_size: usize,
+                ttl_duration: u64,
+                now: u64,
 
                 fn checkpoint(raw: ?*anyopaque, _: []const u8) !docstore_mod.DocStore.ScanAction {
                     const source_batch: *@This() = @ptrCast(@alignCast(raw.?));
@@ -49130,8 +49223,12 @@ pub const DB = struct {
                             if (visible[i]) ordinals[i] = ordinal;
                         }
                     }
-                    for (keys, ordinals[0..keys.len], visible[0..keys.len]) |id, ordinal, include| {
-                        if (include and try owner.visitor(owner.visitor_ctx, id, ordinal, true) == .stop) {
+                    const timestamps = if (source_batch.ttl_duration == 0) null else try loadDocumentTimestampsManyWithIdentityShape(owner.db, source_batch.arena.allocator(), keys, true);
+                    for (keys, ordinals[0..keys.len], visible[0..keys.len], 0..) |id, ordinal, include, i| {
+                        if (timestamps) |values| if (values[i]) |ts| {
+                            if (ttl_mod.isExpired(ts, source_batch.ttl_duration, source_batch.now)) continue;
+                        };
+                        if (include and try owner.visitor(owner.visitor_ctx, id, ordinal, true, true) == .stop) {
                             owner.stopped = true;
                             return .stop;
                         }
@@ -49163,6 +49260,8 @@ pub const DB = struct {
             var source_batch = Scan{
                 .owner = self,
                 .arena = std.heap.ArenaAllocator.init(self.alloc),
+                .ttl_duration = ttlDurationNs(self.db),
+                .now = currentTimeNs(),
                 .batch_size = @min(@max(options.scan_batch_size orelse 256, 1), 256),
             };
             defer source_batch.arena.deinit();
@@ -49203,7 +49302,7 @@ pub const DB = struct {
                 }
                 const unique = options.exceptionalPrimaryKeys().len == 0;
                 for (ordinal_batch, values[0..ordinal_batch.len]) |ordinal, value| {
-                    if (value) |id| if (try self.visitor(self.visitor_ctx, id, ordinal, unique) == .stop) return;
+                    if (value) |id| if (try self.visitor(self.visitor_ctx, id, ordinal, unique, false) == .stop) return;
                 }
                 offset += ordinal_batch.len;
             }
@@ -49263,7 +49362,7 @@ pub const DB = struct {
             if (try self.drainExceptionalBefore(id) == .stop) return .stop;
             while (self.exceptional_index < self.exceptional.len and
                 std.mem.eql(u8, self.exceptional[self.exceptional_index], id)) self.exceptional_index += 1;
-            const action = try self.visitor(self.visitor_ctx, id, ordinal, true);
+            const action = try self.visitor(self.visitor_ctx, id, ordinal, true, false);
             self.stopped = action == .stop;
             return action;
         }
@@ -49292,7 +49391,7 @@ pub const DB = struct {
                 if (!(if (self.req.identity_read_generation) |at| state.isVisibleAt(at) else state.isLive())) break :identity null;
                 break :identity ordinal;
             };
-            return self.visitor(self.visitor_ctx, id, ordinal, unique);
+            return self.visitor(self.visitor_ctx, id, ordinal, unique, false);
         }
     };
 
@@ -54207,6 +54306,10 @@ fn isExpiredDocumentKey(self: *DB, alloc: Allocator, key: []const u8) !bool {
 }
 
 fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]?i128 {
+    return loadDocumentTimestampsManyWithIdentityShape(self, alloc, keys, false);
+}
+
+fn loadDocumentTimestampsManyWithIdentityShape(self: *DB, alloc: Allocator, keys: []const []const u8, raw_ids: bool) ![]?i128 {
     const timestamps = try alloc.alloc(?i128, keys.len);
     errdefer alloc.free(timestamps);
     @memset(timestamps, null);
@@ -54224,7 +54327,7 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
     }
 
     for (keys, 0..) |key, i| {
-        if (internal_keys.isInternalUserKey(key)) continue;
+        if (!raw_ids and internal_keys.isInternalUserKey(key)) continue;
         try pending.append(alloc, .{
             .original_index = i,
             .store_key = try internal_keys.ttlKeyAlloc(alloc, key),
@@ -100438,7 +100541,7 @@ test "db default full text index searches template chunk text when chunker full 
     var range_hits: usize = 0;
     var range_scan = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{}, .observed_rows = &range_rows };
     const RangeVisitor = struct {
-        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool) !docstore_mod.DocStore.ScanAction {
+        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
             const count: *usize = @ptrCast(@alignCast(raw.?));
             count.* += 1;
             try std.testing.expectEqualStrings("doc:a\x00tail", id);
@@ -149044,7 +149147,7 @@ test "db live primary directory bounds reads after deletion and survives reopen 
     try db.batch(.{ .writes = &writes, .sync_level = .full_index });
     try db.batch(.{ .deletes = &deleted, .sync_level = .full_index });
     const Visitor = struct {
-        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool) !docstore_mod.DocStore.ScanAction {
+        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
             const count: *usize = @ptrCast(@alignCast(raw.?));
             count.* += 1;
             try std.testing.expectEqualStrings("z", id);
@@ -149108,7 +149211,7 @@ test "db primary scan retains historical identity visibility (#1095)" {
     var seen: usize = 0;
     var historical = DB.PrimaryMatchAllIdentityScan{ .db = &db, .req = .{ .identity_read_generation = created } };
     const Visitor = struct {
-        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool) !docstore_mod.DocStore.ScanAction {
+        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
             const count: *usize = @ptrCast(@alignCast(raw.?));
             count.* += 1;
             try std.testing.expectEqualStrings("a", id);
@@ -157767,8 +157870,26 @@ test "optional numeric range keeps mixed primary matches for native field sortin
             try txn.commit();
         }
 
+        var wide_ordinals: [257]doc_set.DocOrdinal = undefined;
+        wide_ordinals[0] = mapped_ordinal;
+        for (wide_ordinals[1..], 0..) |*ordinal, i| ordinal.* = std.math.maxInt(u32) - @as(u32, @intCast(i));
+        var wide_scope = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(a, &wide_ordinals) };
+        defer wide_scope.deinit(a);
+        var wide_executor = unordered_executor;
+        wide_executor.live_filter_doc_set = null;
+        wide_executor.nonvisible_doc_set = null;
+        var wide = try db_query_search.searchMatchAll(a, .{
+            .limit = 1,
+            .include_stored = false,
+            .resolved_doc_filter = &wide_scope,
+            .order_by = &.{.{ .field = "_id" }},
+        }, wide_executor);
+        defer wide.deinit();
+        try std.testing.expectEqual(@as(usize, 1), wide.hits.len);
+        try std.testing.expectEqualStrings("mapped", wide.hits[0].id);
+
         const StopAfterOne = struct {
-            fn visit(raw: ?*anyopaque, _: []const u8, _: ?doc_set.DocOrdinal, _: bool) !docstore_mod.DocStore.ScanAction {
+            fn visit(raw: ?*anyopaque, _: []const u8, _: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
                 const visited: *usize = @ptrCast(@alignCast(raw.?));
                 visited.* += 1;
                 return .stop;
