@@ -7908,6 +7908,10 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
     const Auth = struct {
         fn check(request: httpx.testing_mod.RequestInfo) !void {
             try std.testing.expectEqualStrings("Bearer reader-bearer", request.header("Authorization") orelse return error.MissingHeader);
+            if (request.method == .GET) {
+                if (request.header(remote_capabilities.discovery_shape_header)) |shape|
+                    try std.testing.expectEqualStrings("1:2:1:-", shape);
+            }
             if (framed and request.method == .POST) {
                 try std.testing.expectEqualStrings(httpx.attachment_envelope.content_type, request.header("Content-Type") orelse return error.MissingHeader);
                 var envelope = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, request.body, .{});
@@ -7986,8 +7990,9 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
         }
     };
     try group.concurrent(io, Fiber.run, .{ alloc, producer, &requests, &result, &run_err });
-    try server.handleOne();
-    try server.handleOne();
+    try server.handleOne(); // planning
+    try server.handleOne(); // invocation
+    try server.handleOne(); // execution
     try group.await(io);
     if (run_err) |err| return err;
     var batch = result.?;
@@ -8060,8 +8065,9 @@ test "asset producer runtime preserves generator item failures" {
         }
     };
     try group.concurrent(io, Fiber.run, .{ alloc, producer, &requests, &result, &run_err });
-    try server.handleOne();
-    try server.handleOne();
+    try server.handleOne(); // planning
+    try server.handleOne(); // invocation
+    try server.handleOne(); // execution
     try group.await(io);
     if (run_err) |err| return err;
     var batch = result.?;
