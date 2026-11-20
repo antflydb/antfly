@@ -385,7 +385,7 @@ pub const DenseSearchExecutor = struct {
         entry: *index_manager_mod.IndexManager.DenseIndex,
         key: []const u8,
     ) anyerror![]u8 = null,
-    lookup_residual_vector_ids: ?*const fn (?*anyopaque, Allocator, []const u8, []const []const u8) anyerror![]u64 = null,
+    lookup_residual_vector_ids: ?*const fn (?*anyopaque, Allocator, []const u8, []const []const u8, QueryExecutionControl) anyerror![]u64 = null,
     lookup_vector_id: *const fn (
         ctx: ?*anyopaque,
         index_name: []const u8,
@@ -10290,6 +10290,7 @@ const IndexedPredicateEvaluator = struct {
         };
 
         attempted: bool = false,
+        range_projection_disabled: bool = false,
         batches: std.ArrayListUnmanaged(Batch) = .empty,
         covered: ?roaring.RoaringBitmap = null,
         scanned_legacy: ?roaring.RoaringBitmap = null,
@@ -10340,6 +10341,18 @@ const IndexedPredicateEvaluator = struct {
                 entry.value_ptr.* = ordinal;
                 merged.pairs[used.*] = pair;
                 used.* += 1;
+            }
+        }
+
+        fn publishCoverage(self: *FrontierProbeInput, alloc: Allocator, keys: std.AutoHashMapUnmanaged(u32, []const u8), control: QueryExecutionControl) !void {
+            errdefer {
+                self.deinit(alloc);
+                self.* = .{ .attempted = true };
+            }
+            var ordinals = keys.keyIterator();
+            while (ordinals.next()) |ordinal| {
+                try control.check();
+                try self.covered.?.add(ordinal.*);
             }
         }
 
@@ -10547,8 +10560,8 @@ const IndexedPredicateEvaluator = struct {
                 try self.collectMissingProbeOrdinals(memo, scope, frontier, &missing);
                 try self.extendProbeScope(memo, missing, null);
             };
-            var ordinals = (if (self.key_domain != null) frontier else missing).keyIterator();
-            while (ordinals.next()) |ordinal| try memo.covered.?.add(ordinal.*);
+            // Discard the physical batches if the last publication step fails.
+            try memo.publishCoverage(self.alloc, if (self.key_domain != null) frontier else missing, self.control);
         }
         var requested = scope.iterator();
         var physical_candidates = roaring.RoaringBitmap.init(self.alloc);
@@ -11190,9 +11203,13 @@ const IndexedPredicateEvaluator = struct {
 
     fn rangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !RangeEvidence {
         if (self.key_domain != null) {
-            if (self.probe_input == null) return RangeEvidence.init(self.alloc);
+            const memo = self.probe_input orelse return RangeEvidence.init(self.alloc);
+            if (memo.range_projection_disabled) return RangeEvidence.init(self.alloc);
             var physical = self.collectPhysicalProbeScope(scope) catch |err| switch (err) {
-                error.OutOfMemory => return RangeEvidence.init(self.alloc),
+                error.OutOfMemory => {
+                    memo.range_projection_disabled = true;
+                    return RangeEvidence.init(self.alloc);
+                },
                 else => return err,
             };
             defer physical.deinit();
@@ -12303,6 +12320,24 @@ test "optional numeric range frontier memo coalesces small extensions" {
         try std.testing.expectEqual(doc % 7, try memo.ordinalForDoc(doc));
         try std.testing.expectEqual(doc % 7 == 3, selected.contains(doc));
     }
+}
+
+test "optional numeric range frontier publication discards mappings after allocation failure" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    defer memo.deinit(alloc);
+    var map: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    try map.put(alloc, 1, 1);
+    const pairs = try alloc.dupe(u64, &.{(@as(u64, 1) << 32) | 1});
+    try memo.appendBatch(alloc, .{ .pairs = pairs, .ordinals = map }, .{});
+    var keys: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    defer keys.deinit(alloc);
+    try keys.put(alloc, 1, "one");
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, memo.publishCoverage(alloc, keys, .{}));
+    try std.testing.expect(memo.covered == null);
+    try std.testing.expectEqual(@as(usize, 0), memo.batches.items.len);
 }
 
 const ResidualIdentityContext = struct {
@@ -14579,6 +14614,7 @@ fn deriveNativeDenseConstraintsAlloc(
     index_name: []const u8,
     apply_live_all_docs: bool,
 ) !NativeDenseConstraints {
+    const control: QueryExecutionControl = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
     const bench_profile = getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
     const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     var doc_constraints_ns: u64 = 0;
@@ -14629,7 +14665,7 @@ fn deriveNativeDenseConstraintsAlloc(
         if (doc_constraints.filter_doc_ids.len > 0) {
             const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
             const mapped_doc_ids = if (doc_constraints.filter_query_json_resolved)
-                try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name)
+                try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name, control)
             else
                 try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name);
             errdefer alloc.free(mapped_doc_ids);
@@ -14647,7 +14683,7 @@ fn deriveNativeDenseConstraintsAlloc(
             mapped_owned = true;
         }
         if (doc_constraints.legacy_filter == .doc_keys) {
-            const legacy = try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.legacy_filter.doc_keys, executor, index_name);
+            const legacy = try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.legacy_filter.doc_keys, executor, index_name, control);
             defer alloc.free(legacy);
             const merged = try unionVectorIdsAlloc(alloc, mapped, legacy);
             if (mapped_owned) alloc.free(mapped);
@@ -14687,14 +14723,14 @@ fn deriveNativeDenseConstraintsAlloc(
     if (doc_constraints.exclude_doc_ids.len > 0) {
         const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const mapped_excludes = if (doc_constraints.exclusion_query_json_resolved)
-            try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name)
+            try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name, control)
         else
             try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name);
         if (bench_profile) exclude_doc_ids_ns += platform_time.monotonicNs() - phase_start_ns;
         try mergeNativeExcludeIds(alloc, &out, mapped_excludes, req.exclude_ids);
     }
     if (doc_constraints.legacy_exclude == .doc_keys) {
-        const legacy = try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.legacy_exclude.doc_keys, executor, index_name);
+        const legacy = try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.legacy_exclude.doc_keys, executor, index_name, control);
         try mergeNativeExcludeIds(alloc, &out, legacy, req.exclude_ids);
     }
     if (out.exclude_ids.len == 0 and req.exclude_ids.len > 0) {
@@ -14884,9 +14920,19 @@ fn appendDocIds(
     }
 }
 
-fn denseVectorIdsForResidualKeysAlloc(alloc: Allocator, keys: []const []const u8, executor: DenseSearchExecutor, name: []const u8) ![]u64 {
-    if (executor.lookup_residual_vector_ids) |lookup| return lookup(executor.ctx, alloc, name, keys);
-    return denseVectorIdsForDocIdsAlloc(alloc, keys, executor, name);
+fn denseVectorIdsForResidualKeysAlloc(alloc: Allocator, keys: []const []const u8, executor: DenseSearchExecutor, name: []const u8, control: QueryExecutionControl) ![]u64 {
+    try control.check();
+    if (executor.lookup_residual_vector_ids) |lookup| return lookup(executor.ctx, alloc, name, keys, control);
+    var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer ids.deinit(alloc);
+    var result: std.ArrayListUnmanaged(u64) = .empty;
+    errdefer result.deinit(alloc);
+    for (keys) |key| {
+        try control.check();
+        const id = (try executor.lookup_vector_id(executor.ctx, name, key)) orelse continue;
+        if (!(try ids.getOrPut(alloc, id)).found_existing) try result.append(alloc, id);
+    }
+    return result.toOwnedSlice(alloc);
 }
 
 fn denseVectorIdsForDocIdsAlloc(

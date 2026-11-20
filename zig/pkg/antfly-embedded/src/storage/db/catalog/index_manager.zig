@@ -29689,8 +29689,10 @@ pub const IndexManager = struct {
             var keys: [ordinals.len][]const u8 = undefined;
             var values: [ordinals.len]?[]u8 = @splat(null);
             var key_count: usize = 0;
+            var unique_ordinals: [ordinals.len]u32 = undefined;
             for (ordinals[0..len], 0..) |ordinal, i| {
                 if (i != 0 and ordinals[i - 1] == ordinal) continue;
+                unique_ordinals[key_count] = ordinal;
                 storage[key_count] = internal_keys.identityOrdinalToDocKey(ordinal);
                 keys[key_count] = &storage[key_count];
                 key_count += 1;
@@ -29699,11 +29701,24 @@ pub const IndexManager = struct {
             defer key_arena.deinit();
             try primary_txn.getManySortedOwnedScoped(key_arena.allocator(), keys[0..key_count], values[0..key_count]);
             if (direct) {
+                var proven: [ordinals.len]bool = @splat(false);
+                if (locator_complete) try sparse_mod.SparseIndex.proveProjectionDocNums(
+                    key_arena.allocator(),
+                    &sparse_txn,
+                    unique_ordinals[0..key_count],
+                    values[0..key_count],
+                    proven[0..key_count],
+                    control,
+                );
                 var present: usize = 0;
-                for (values[0..key_count]) |value| if (value) |key| {
-                    keys[present] = key;
-                    present += 1;
-                };
+                for (values[0..key_count], unique_ordinals[0..key_count], proven[0..key_count]) |value, ordinal, aligned| {
+                    if (aligned) {
+                        if (!(try seen.getOrPut(alloc, ordinal)).found_existing) try out.append(alloc, ordinal);
+                    } else if (value) |key| {
+                        keys[present] = key;
+                        present += 1;
+                    }
+                }
                 const physical = try entry.index.docNumsForDocIdsDeferredAlloc(alloc, &sparse_txn, keys[0..present], .{ .keys = &misses, .allocator = miss_alloc }, control);
                 defer alloc.free(physical);
                 for (physical) |doc_num| {
@@ -34870,6 +34885,11 @@ pub const IndexManager = struct {
     }
 
     pub fn lookupDenseVectorIdsForParentKeysAlloc(self: *IndexManager, alloc: Allocator, store: *docstore_mod.DocStore, name: []const u8, keys: []const []const u8) ![]u64 {
+        return self.lookupDenseVectorIdsForParentKeysControlledAlloc(alloc, store, name, keys, .{});
+    }
+
+    pub fn lookupDenseVectorIdsForParentKeysControlledAlloc(self: *IndexManager, alloc: Allocator, store: *docstore_mod.DocStore, name: []const u8, keys: []const []const u8, control: @import("../../../search/query.zig").ExecutionControl) ![]u64 {
+        try control.check();
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
         var runtime = try initRuntimeStore(self.alloc, store);
         defer runtime.deinit();
@@ -34880,6 +34900,7 @@ pub const IndexManager = struct {
         var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer ids.deinit(alloc);
         for (keys) |key| {
+            try control.check();
             var matched_member = false;
             if (!internal_keys.isInternalUserKey(key)) {
                 if (entry.embedding_names.len != 0) {
@@ -34889,6 +34910,7 @@ pub const IndexManager = struct {
                     defer cursor.close();
                     var item = try cursor.seekAtOrAfter(prefix);
                     while (item) |row| : (item = try cursor.next()) {
+                        try control.check();
                         if (!std.mem.startsWith(u8, row.key, prefix)) break;
                         for (entry.embedding_names) |embedding| {
                             if (!((internal_keys.isEmbeddingArtifactKey(row.key) and internal_keys.matchesEmbeddingArtifactName(row.key, embedding)) or
@@ -34904,6 +34926,7 @@ pub const IndexManager = struct {
                     var cursor = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &read, key, chunk);
                     defer cursor.close();
                     while (try cursor.next()) |row| {
+                        try control.check();
                         if (!internal_keys.matchesChunkArtifactName(row.key, chunk)) continue;
                         if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, row.key)) |id| {
                             try ids.put(alloc, id, {});
@@ -41976,6 +41999,23 @@ test "dense index unions multiple embedding artifact sources without overwriting
     // preserve artifact identity exactly like the named maintenance API.
     try manager.applyDenseEmbeddingWrites(&store, &writes);
 
+    const CancelProjection = struct {
+        checks: usize = 0,
+
+        fn check(raw: *const anyopaque) bool {
+            const state: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            state.checks += 1;
+            return state.checks == 3;
+        }
+    };
+    var cancellation: CancelProjection = .{};
+    try std.testing.expectError(error.Canceled, manager.lookupDenseVectorIdsForParentKeysControlledAlloc(
+        alloc,
+        &store,
+        "document_vectors",
+        &.{doc_key},
+        .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = CancelProjection.check } },
+    ));
     const parent_vectors = try manager.lookupDenseVectorIdsForParentKeysAlloc(alloc, &store, "document_vectors", &.{doc_key});
     defer alloc.free(parent_vectors);
     try std.testing.expectEqual(@as(usize, 2), parent_vectors.len);

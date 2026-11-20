@@ -48742,9 +48742,9 @@ pub const DB = struct {
         return try self.core.index_manager.lookupDenseDocKey(self.core.store, index_name, vector_id);
     }
 
-    fn denseResidualVectorIdsCallback(ctx: ?*anyopaque, alloc: Allocator, name: []const u8, keys: []const []const u8) anyerror![]u64 {
+    fn denseResidualVectorIdsCallback(ctx: ?*anyopaque, alloc: Allocator, name: []const u8, keys: []const []const u8, control: db_query_search.QueryExecutionControl) anyerror![]u64 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return self.core.index_manager.lookupDenseVectorIdsForParentKeysAlloc(alloc, self.core.store, name, keys);
+        return self.core.index_manager.lookupDenseVectorIdsForParentKeysControlledAlloc(alloc, self.core.store, name, keys, control);
     }
 
     fn denseVectorIdCallback(
@@ -49302,11 +49302,6 @@ pub const DB = struct {
                     const source_batch: *@This() = @ptrCast(@alignCast(raw.?));
                     try db_query_search.checkSearchRequestDeadline(source_batch.owner.req);
                     const id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(source_batch.arena.allocator(), key)) orelse return .@"continue";
-                    if (source_batch.prefix) |bound| {
-                        bound.last_key.clearRetainingCapacity();
-                        try bound.last_key.appendSlice(source_batch.owner.alloc, id);
-                        bound.has_key = true;
-                    }
                     source_batch.keys[source_batch.len] = id;
                     source_batch.len += 1;
                     return if (source_batch.len == source_batch.batch_size) source_batch.flush() else .@"continue";
@@ -49322,9 +49317,11 @@ pub const DB = struct {
                         var txn = try owner.db.core.store.beginProbeTxn();
                         defer txn.abort();
                         const temp = source_batch.arena.allocator();
-                        const mapped = try doc_identity.lookupOrdinalsTxnAlloc(temp, &txn, keys);
+                        const mapped = doc_identity.lookupOrdinalsTxnAlloc(temp, &txn, keys) catch |err|
+                            return source_batch.rejectSpeculativeBatch(err);
                         for (keys, mapped, 0..) |id, forward, i| {
-                            switch (try owner.resolvePreparedIdentity(temp, &txn, id, @as(??doc_set.DocOrdinal, forward))) {
+                            switch (owner.resolvePreparedIdentity(temp, &txn, id, @as(??doc_set.DocOrdinal, forward)) catch |err|
+                                return source_batch.rejectSpeculativeBatch(err)) {
                                 .invisible => visible[i] = false,
                                 .unmapped => {},
                                 .visible => |ordinal| ordinals[i] = ordinal,
@@ -49341,6 +49338,11 @@ pub const DB = struct {
                             return .stop;
                         }
                     }
+                    if (source_batch.prefix) |bound| {
+                        bound.last_key.clearRetainingCapacity();
+                        try bound.last_key.appendSlice(owner.alloc, keys[keys.len - 1]);
+                        bound.has_key = true;
+                    }
                     // A full batch that did not fill the page encountered
                     // rejected rows. Amortize subsequent identity probes.
                     if (source_batch.len == source_batch.batch_size)
@@ -49348,6 +49350,13 @@ pub const DB = struct {
                     source_batch.len = 0;
                     _ = source_batch.arena.reset(.retain_capacity);
                     return .@"continue";
+                }
+
+                fn rejectSpeculativeBatch(source_batch: *@This(), err: anyerror) !docstore_mod.DocStore.ScanAction {
+                    if (source_batch.prefix == null or (err != error.InvalidDocIdentity and err != error.StorageReadTemporarilyUnavailable)) return err;
+                    source_batch.exhausted_budget = true;
+                    source_batch.len = 0;
+                    return .stop;
                 }
             };
             const owner_range = self.db.core.byteRange();
@@ -157875,6 +157884,18 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
     }, db.matchAllExecutor());
     defer counted.deinit();
     try std.testing.expectEqual(@as(u32, 7), counted.total_hits);
+
+    {
+        // The speculative scan encounters this unrelated row in either
+        // direction. The ordered scope can answer from valid identities.
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for ([_]usize{ 2, 77 }) |i| {
+            const key = try internal_keys.identityDocToOrdinalKeyAlloc(scratch, writes[i].key);
+            try txn.put(key, "malformed");
+        }
+        try txn.commit();
+    }
 
     const Record = struct {
         expected: []const u8,

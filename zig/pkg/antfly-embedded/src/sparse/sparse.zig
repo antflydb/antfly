@@ -5789,6 +5789,43 @@ pub const SparseIndex = struct {
         return @intCast(doc_num);
     }
 
+    /// Confirm live physical ordinals against authoritative primary keys in a
+    /// sorted page. A collision or missing reverse record needs key lookup.
+    pub fn proveProjectionDocNums(
+        alloc: Allocator,
+        txn: *backend_erased.ReadTxn,
+        ordinals: []const u32,
+        primary_keys: []const ?[]const u8,
+        proven: []bool,
+        control: @import("../search/query.zig").ExecutionControl,
+    ) !void {
+        var storage: [256][9]u8 = undefined;
+        var keys: [256][]const u8 = undefined;
+        var values: [256]?[]const u8 = undefined;
+        std.debug.assert(ordinals.len <= storage.len and ordinals.len == primary_keys.len and proven.len == ordinals.len);
+        if (ordinals.len == 0) return;
+        try control.check();
+        var reads = try txn.openReadScope(alloc);
+        defer reads.close();
+        for (ordinals, 0..) |ordinal, i| keys[i] = revKey(&storage[i], ordinal);
+        try reads.getManySorted(keys[0..ordinals.len], values[0..ordinals.len]);
+        var positions: [256]usize = undefined;
+        var count: usize = 0;
+        @memset(proven, false);
+        for (primary_keys, values[0..ordinals.len], 0..) |primary, physical, i| {
+            if (primary != null and physical != null and std.mem.eql(u8, primary.?, physical.?)) {
+                positions[count] = i;
+                count += 1;
+            }
+        }
+        if (count == 0) return;
+        try control.check();
+        try reads.reset();
+        for (positions[0..count], 0..) |position, i| keys[i] = docTombstoneKey(&storage[i], ordinals[position]);
+        try reads.getManySorted(keys[0..count], values[0..count]);
+        for (positions[0..count], values[0..count]) |position, tombstone| proven[position] = tombstone == null;
+    }
+
     pub fn docNumsForDocIdsAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, doc_ids: []const []const u8) ![]const u32 {
         return try self.docNumsForDocIdsDeferredAlloc(alloc, txn, doc_ids, null, .{});
     }
@@ -7523,6 +7560,23 @@ const NoDocMapRead = struct {
         return error.UnexpectedDocMapScan;
     }
 };
+
+test "optional numeric range sparse projection proves only aligned live physical ordinals" {
+    const alloc = std.testing.allocator;
+    var index = try SparseIndex.open(alloc, "unused", .{ .backend = .mem });
+    defer index.close();
+    try index.batchWithOptions(&.{
+        .{ .doc_id = "aligned", .doc_num = 1, .vec = .{ .indices = &.{1}, .values = &.{2} } },
+        .{ .doc_id = "other", .doc_num = 2, .vec = .{ .indices = &.{1}, .values = &.{2} } },
+        .{ .doc_id = "removed", .doc_num = 3, .vec = .{ .indices = &.{1}, .values = &.{2} } },
+    }, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    try index.batchWithOptions(&.{}, &.{"removed"}, .{});
+    var txn = try index.beginReadTxn();
+    defer txn.abort();
+    var aligned: [4]bool = undefined;
+    try SparseIndex.proveProjectionDocNums(alloc, &txn, &.{ 1, 2, 3, 4 }, &.{ "aligned", "collision", "removed", "missing" }, &aligned, .{});
+    try std.testing.expectEqual([4]bool{ true, false, false, false }, aligned);
+}
 
 test "sparse locator backfill refuses corrupt roots and future incarnations" {
     const a = std.testing.allocator;
