@@ -394,10 +394,27 @@ fn andContainers(alloc: Allocator, self: *Container, other: *const Container) vo
         .bitmap => |sb| switch (other.*) {
             .bitmap => |ob| bitmapAndSimd(sb, ob),
             .array => |*oa| {
-                // bitmap & array -> filter array values present in bitmap
+                // Prefer a compact result. If its allocation is denied,
+                // the existing bitmap can represent the exact intersection.
                 var arr: std.ArrayListUnmanaged(u16) = .empty;
                 for (oa.items) |v| {
-                    if (bitmapGet(sb, v)) arr.append(alloc, v) catch unreachable;
+                    if (!bitmapGet(sb, v)) continue;
+                    arr.append(alloc, v) catch {
+                        arr.deinit(alloc);
+                        var next_word: usize = 0;
+                        var i: usize = 0;
+                        while (i < oa.items.len) {
+                            const word: usize = oa.items[i] / 64;
+                            @memset(sb[next_word..word], 0);
+                            var mask: u64 = 0;
+                            while (i < oa.items.len and oa.items[i] / 64 == word) : (i += 1)
+                                mask |= @as(u64, 1) << @as(u6, @truncate(oa.items[i]));
+                            sb[word] &= mask;
+                            next_word = word + 1;
+                        }
+                        @memset(sb[next_word..], 0);
+                        return;
+                    };
                 }
                 alloc.free(sb);
                 self.* = .{ .array = arr };
@@ -1040,17 +1057,23 @@ pub const RoaringBitmap = struct {
                     .array => |rhs_array| {
                         if (!std.mem.eql(u16, lhs_array.items, rhs_array.items)) return false;
                     },
-                    .bitmap => return false,
+                    .bitmap => |rhs_bitmap| if (!arrayEqualsBitmap(lhs_array.items, rhs_bitmap)) return false,
                 },
                 .bitmap => |lhs_bitmap| switch (rhs) {
                     .bitmap => |rhs_bitmap| {
                         if (!std.mem.eql(u64, lhs_bitmap, rhs_bitmap)) return false;
                     },
-                    .array => return false,
+                    .array => |rhs_array| if (!arrayEqualsBitmap(rhs_array.items, lhs_bitmap)) return false,
                 },
             }
         }
 
+        return true;
+    }
+
+    fn arrayEqualsBitmap(values: []const u16, words: []const u64) bool {
+        if (values.len != bitmapPopcount(words)) return false;
+        for (values) |value| if (!bitmapGet(words, value)) return false;
         return true;
     }
 
@@ -1073,10 +1096,8 @@ pub const RoaringBitmap = struct {
         size = try std.math.add(usize, size, try std.math.mul(usize, n, 2));
         size = try std.math.add(usize, size, try std.math.mul(usize, n, 2));
         for (self.containers.items) |*c| {
-            switch (c.*) {
-                .array => |*a| size = try std.math.add(usize, size, try std.math.mul(usize, a.items.len, 2)),
-                .bitmap => size = try std.math.add(usize, size, bitmap_words * 8),
-            }
+            const card = c.cardinality();
+            size = try std.math.add(usize, size, if (card <= array_max) card * 2 else bitmap_words * 8);
         }
 
         var buf = try alloc.alloc(u8, size);
@@ -1100,7 +1121,8 @@ pub const RoaringBitmap = struct {
         }
 
         // Container data
-        for (self.containers.items) |*c| {
+        const cards = buf[2 + n * 2 ..][0 .. n * 2];
+        for (self.containers.items, 0..) |*c, i| {
             switch (c.*) {
                 .array => |*a| {
                     for (a.items) |v| {
@@ -1109,8 +1131,15 @@ pub const RoaringBitmap = struct {
                     }
                 },
                 .bitmap => |b| {
-                    for (b) |word| {
-                        buf[pos..][0..8].* = @bitCast(@as(u64, word));
+                    const card_minus_one: u16 = @bitCast(cards[i * 2 ..][0..2].*);
+                    if (card_minus_one < array_max) {
+                        var values = bitmapIterator(b);
+                        while (values.next()) |v| {
+                            buf[pos..][0..2].* = @bitCast(v);
+                            pos += 2;
+                        }
+                    } else for (b) |word| {
+                        buf[pos..][0..8].* = @bitCast(word);
                         pos += 8;
                     }
                 },
@@ -2903,4 +2932,25 @@ test "logical value live membership seeks clips and agrees with owned subtractio
     try std.testing.expect(clipped.next() == null);
     var empty = matched.liveIterator(null, 0);
     try std.testing.expect(empty.next() == null);
+}
+
+test "optional numeric range bitmap intersection survives denied sparse allocation" {
+    const backing = std.testing.allocator;
+    var failing: std.testing.FailingAllocator = .init(backing, .{});
+    var left = RoaringBitmap.init(failing.allocator());
+    defer left.deinit();
+    try left.addRange(0, 9000);
+    var right = RoaringBitmap.init(backing);
+    defer right.deinit();
+    for ([_]u32{ 1, 63, 64, 150, 8192, 10000 }) |value| try right.add(value);
+    failing.fail_index = failing.alloc_index;
+    left.andWith(&right);
+    try std.testing.expectEqual(@as(usize, 5), left.cardinality());
+    for ([_]u32{ 1, 63, 64, 150, 8192 }) |value| try std.testing.expect(left.contains(value));
+    const encoded = try left.toBytes(backing);
+    defer backing.free(encoded);
+    var decoded = try RoaringBitmap.fromBytes(backing, encoded);
+    defer decoded.deinit();
+    try std.testing.expect(left.eql(&decoded));
+    try std.testing.expect(decoded.eql(&left));
 }

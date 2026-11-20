@@ -49495,8 +49495,8 @@ pub const DB = struct {
                 recovery.initialized = true;
             }
             const numbers = if (set.* == .ordinals) set.ordinals else &.{};
-            var read = try self.db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
-            defer read.abort();
+            var read: ?docstore_mod.DocStore.Txn = null;
+            defer if (read) |*txn| txn.abort();
             try self.recoverKnownSourceKeys(&read, recovery, &pending, ordinals, visible);
             // Keep the original identity error if optional recovery memory
             // cannot be admitted. An incomplete cache cannot prove absence.
@@ -49517,7 +49517,7 @@ pub const DB = struct {
                 recovery.exhausted = len < page.len;
                 if (len == 0) break;
                 std.mem.sort(doc_set.DocOrdinal, page[0..len], {}, std.sort.asc(doc_set.DocOrdinal));
-                var scope = try read.openReadScope(self.alloc);
+                var scope = try (try self.sourceRecoveryRead(&read)).openReadScope(self.alloc);
                 defer scope.close();
                 var encoded: [page.len]@TypeOf(internal_keys.identityOrdinalToDocKey(0)) = undefined;
                 var reverse_keys: [page.len][]const u8 = undefined;
@@ -49565,7 +49565,7 @@ pub const DB = struct {
 
         fn recoverKnownSourceKeys(
             self: *@This(),
-            read: *docstore_mod.DocStore.Txn,
+            read: *?docstore_mod.DocStore.Txn,
             recovery: *SourceRecovery,
             pending: *std.StringHashMapUnmanaged(usize),
             ordinals: []?doc_set.DocOrdinal,
@@ -49610,7 +49610,7 @@ pub const DB = struct {
             }
         }
 
-        fn hasLiveMissingSourceIdentity(self: *@This(), read: *docstore_mod.DocStore.Txn, missing: []doc_set.DocOrdinal) !bool {
+        fn hasLiveMissingSourceIdentity(self: *@This(), read: *?docstore_mod.DocStore.Txn, missing: []doc_set.DocOrdinal) !bool {
             var offset: usize = 0;
             while (offset < missing.len) {
                 const page = missing[offset..@min(offset + 256, missing.len)];
@@ -49623,9 +49623,14 @@ pub const DB = struct {
             return false;
         }
 
-        fn readSourceVisibility(self: *@This(), read: *docstore_mod.DocStore.Txn, ordinals: []const doc_set.DocOrdinal, visible: []bool) !void {
+        fn sourceRecoveryRead(self: *@This(), read: *?docstore_mod.DocStore.Txn) !*docstore_mod.DocStore.Txn {
+            if (read.* == null) read.* = try self.db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+            return &read.*.?;
+        }
+
+        fn readSourceVisibility(self: *@This(), read: *?docstore_mod.DocStore.Txn, ordinals: []const doc_set.DocOrdinal, visible: []bool) !void {
             try db_query_search.checkSearchRequestDeadline(self.req);
-            var scope = try read.openReadScope(self.alloc);
+            var scope = try (try self.sourceRecoveryRead(read)).openReadScope(self.alloc);
             defer scope.close();
             var encoded: [256]@TypeOf(internal_keys.identityOrdinalStateKey(0)) = undefined;
             var keys: [256][]const u8 = undefined;
@@ -158176,7 +158181,8 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
         const loaded_ordinals = recovery.offset;
         visible[0] = false;
         resolved[0] = null;
-        try scan.recoverScopedSourceBatch(options, &recovery, a, &.{writes[78].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+        var cached_scan: DB.PrimaryMatchAllIdentityScan = .{ .db = undefined, .req = scan.req, .alloc = a };
+        try cached_scan.recoverScopedSourceBatch(options, &recovery, a, &.{writes[78].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
         try std.testing.expect(visible[0]);
         try std.testing.expectEqual(@as(?doc_set.DocOrdinal, endpoints[1]), resolved[0]);
         try std.testing.expectEqual(loaded_ordinals, recovery.offset);

@@ -11215,9 +11215,11 @@ const IndexedPredicateEvaluator = struct {
     }
 
     fn rangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !RangeEvidence {
-        if (self.key_domain != null) {
-            const memo = self.probe_input orelse return RangeEvidence.init(self.alloc);
+        if (self.probe_input) |memo| {
             if (memo.range_projection_disabled) return RangeEvidence.init(self.alloc);
+        }
+        if (self.key_domain != null) {
+            if (self.probe_input == null) return RangeEvidence.init(self.alloc);
             return self.collectKeyRangeEvidence(query, scope) catch |err| switch (err) {
                 error.OutOfMemory => {
                     self.discardRangeFrontier();
@@ -11335,11 +11337,12 @@ const IndexedPredicateEvaluator = struct {
         var evidence = owned;
         evidence.covered.andWith(scope);
         evidence.matches.andWith(scope);
-        if (evidence.covered.cardinality() == scope.cardinality()) {
+        const covered_count = evidence.covered.cardinality();
+        if (covered_count == scope.cardinality()) {
             evidence.covered.deinit();
             return evidence.matches;
         }
-        if (evidence.covered.cardinality() == 0) {
+        if (covered_count == 0) {
             evidence.covered.deinit();
             evidence.matches.deinit();
             return self.executeStoredRange(stored, scope);
@@ -11350,14 +11353,32 @@ const IndexedPredicateEvaluator = struct {
             self.discardRangeFrontier();
             return self.executeStoredRange(stored, scope);
         };
-        defer evidence.covered.deinit();
-        errdefer evidence.matches.deinit();
-        defer missing.deinit();
         missing.andNotWith(&evidence.covered);
-        var residual = try self.executeStoredRange(stored, &missing);
-        defer residual.deinit();
-        try evidence.matches.orWith(&residual);
-        return evidence.matches;
+        evidence.covered.deinit();
+        const residual = self.executeStoredRange(stored, &missing) catch |err| {
+            missing.deinit();
+            evidence.matches.deinit();
+            return err;
+        };
+        missing.deinit();
+        return self.joinMixedRangeMatches(stored, scope, evidence.matches, residual);
+    }
+
+    fn joinMixedRangeMatches(self: IndexedPredicateEvaluator, stored: std.json.Value, scope: *const roaring.RoaringBitmap, native_matches: roaring.RoaringBitmap, stored_matches: roaring.RoaringBitmap) !roaring.RoaringBitmap {
+        var native = native_matches;
+        var residual = stored_matches;
+        if (native.isEmpty()) {
+            native.deinit();
+            return residual;
+        }
+        native.orWith(&residual) catch {
+            native.deinit();
+            residual.deinit();
+            self.discardRangeFrontier();
+            return self.executeStoredRange(stored, scope);
+        };
+        residual.deinit();
+        return native;
     }
 
     fn executeStoredRange(self: IndexedPredicateEvaluator, range: std.json.Value, scope: *const roaring.RoaringBitmap) !roaring.RoaringBitmap {
@@ -12494,6 +12515,20 @@ test "optional numeric range discards partial evidence when uncovered scope allo
     try std.testing.expectError(error.UnsupportedQueryRequest, evaluator.finishMixedRange(.null, &scope, evidence));
     try std.testing.expect(memo.range_projection_disabled);
     try std.testing.expect(memo.covered == null);
+    var disabled = try evaluator.rangeEvidence(.{ .numeric_range = .{ .field = "rank" } }, &scope);
+    defer disabled.covered.deinit();
+    defer disabled.matches.deinit();
+    try std.testing.expectEqual(@as(usize, 0), disabled.covered.cardinality());
+
+    memo.range_projection_disabled = false;
+    failing.fail_index = std.math.maxInt(usize);
+    var native = roaring.RoaringBitmap.init(alloc);
+    try native.add(1);
+    var residual = roaring.RoaringBitmap.init(backing);
+    try residual.add(65537);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.UnsupportedQueryRequest, evaluator.joinMixedRangeMatches(.null, &scope, native, residual));
+    try std.testing.expect(memo.range_projection_disabled);
 }
 
 const ResidualIdentityContext = struct {
