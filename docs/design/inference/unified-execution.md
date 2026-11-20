@@ -236,6 +236,21 @@ Accuracy qualification retains its independent F32 reference, relative-error
 limit and generated-token checks. This does not establish performance across
 models or qualify automatic CUDA BF16 selection.
 
+For the default CUDA BF16 resident schedule, single-row linear projections use
+F32 products and a reduction over row-major weights. Existing BF16 publication
+boundaries remain intact; inputs are not rounded to obtain this schedule.
+Multi-row projections and attention keep the qualified vendor GEMM path, and
+explicit GEMM overrides retain their original behavior. This lowering uses the
+shared HLO compiler rather than a model-specific native kernel. On shared GB10,
+the qualified Qwen3-0.6B short-prompt comparison improves from 138.0 ms uncached
+to 111.0 ms cached; the 1,173-token prompt improves from 1,059.0 to 169.9 ms.
+A same-binary ABBA control improves the accurate cached short-prompt baseline
+from 176.4 to 110.6 ms. All three pass exact-token, quality, median, p95 and
+AA/BB gates. CPU/CUDA projection oracles, the continuation matrix through 2,047
+initial tokens and 16 continuation steps, and three frozen failing-context
+limits also pass. These are Qwen request-latency results, not broader serving
+or model qualification; automatic CUDA BF16 selection remains gated.
+
 KV capacity remains bucketed in 64-row increments. Prefill query geometry is
 separate: prompts below 64 rows use power-of-two query buckets, bounding padded
 work below twice the logical prompt without creating an unbounded shape cache.

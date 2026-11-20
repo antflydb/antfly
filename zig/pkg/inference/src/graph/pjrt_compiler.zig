@@ -92,6 +92,8 @@ pub const CompileOptions = struct {
     wide_single_row_norm: bool = false,
     /// Evaluate compact rotary coefficients before their BF16 publication.
     wide_rotary_trig: bool = false,
+    /// Fuse single-row projections as F32 products/reduction, without changing input precision.
+    reduce_single_row_linear: bool = false,
     precision: @import("../execution/precision.zig").Policy = .f32,
     /// Request-private fixed-capacity state. Position is a runtime scalar;
     /// no sequence-length-specialized decode executables or host KV readbacks.
@@ -478,7 +480,7 @@ pub fn compilePartitionWithOptions(
                 const w = try getHloId(node_map, ins[1]);
                 const bias = try getHloId(node_map, ins[2]);
                 const wt = try transposeLastTwo(&b, w);
-                const mm = try b.matmul(x, wt);
+                const mm = try emitLinear(&b, x, w, wt, options.reduce_single_row_linear, &reducer_comp, &needs_reducer);
                 node_map[nid] = try b.add(mm, bias);
             },
 
@@ -486,7 +488,7 @@ pub fn compilePartitionWithOptions(
                 const x = try getHloId(node_map, ins[0]);
                 const w = try getHloId(node_map, ins[1]);
                 const wt = try transposeLastTwo(&b, w);
-                node_map[nid] = try b.matmul(x, wt);
+                node_map[nid] = try emitLinear(&b, x, w, wt, options.reduce_single_row_linear, &reducer_comp, &needs_reducer);
             },
 
             .fused_linear_no_bias_pair => {
@@ -495,8 +497,8 @@ pub fn compilePartitionWithOptions(
                 const w2 = try getHloId(node_map, ins[2]);
                 const wt1 = try transposeLastTwo(&b, w1);
                 const wt2 = try transposeLastTwo(&b, w2);
-                node_map[nid] = try b.matmul(x, wt1);
-                try pair_seconds.put(allocator, node_id, try b.matmul(x, wt2));
+                node_map[nid] = try emitLinear(&b, x, w1, wt1, options.reduce_single_row_linear, &reducer_comp, &needs_reducer);
+                try pair_seconds.put(allocator, node_id, try emitLinear(&b, x, w2, wt2, options.reduce_single_row_linear, &reducer_comp, &needs_reducer));
             },
 
             .fused_rms_norm => |attrs| {
@@ -873,6 +875,23 @@ fn emitCausalVisibility(a: Allocator, b: *hlo.Builder, heads: i64, rows: i64, ke
         allowed = try b.logicalAnd(allowed, try b.compare(key, try b.subtract(query, span), "GE"));
     }
     return b.broadcast(allowed, &.{ 1, 2 }, hlo.Shape.init(.pred, &.{ heads, rows, keys }));
+}
+
+/// A row-vector projection is a bandwidth-bound reduction, rather than a matrix
+/// multiplication. Keep the graph's exact F32 operands (including prior BF16
+/// publication) and let XLA fuse product/reduction without a GEMM custom call.
+/// Multi-row projections retain the provider's tuned matrix multiplication.
+fn emitLinear(b: *hlo.Builder, x: hlo.Id, weight: hlo.Id, transposed: hlo.Id, enabled: bool, reducer: *const hlo.Computation, needs_reducer: *bool) !hlo.Id {
+    const xs = b.getInst(x).shape;
+    const ws = b.getInst(weight).shape;
+    if (!enabled or xs.element_type != .f32 or ws.element_type != .f32 or xs.dimensions.len != 2 or ws.dimensions.len != 2 or xs.dimensions[0] != 1)
+        return b.matmul(x, transposed);
+    if (xs.dimensions[1] != ws.dimensions[1]) return error.UnsupportedShape;
+    const vector = try b.reshape(x, hlo.Shape.init(.f32, &.{xs.dimensions[1]}));
+    const products = try b.multiply(weight, try b.broadcast(vector, &.{1}, ws));
+    const sums = try b.reduce(products, try b.constantScalarF32(0), &.{1}, hlo.Shape.init(.f32, &.{ws.dimensions[0]}), reducer.id);
+    needs_reducer.* = true;
+    return b.reshape(sums, hlo.Shape.init(.f32, &.{ 1, ws.dimensions[0] }));
 }
 
 fn roundBf16(b: *hlo.Builder, id: hlo.Id, enabled: bool) !hlo.Id {
@@ -2626,4 +2645,58 @@ test "PJRT full prefix causal mask excludes future keys below finite sentinels" 
     const actual = try outputs[0].toFloat32WithShape(a, &.{ 2, 2 });
     defer a.free(actual);
     try std.testing.expectEqualSlices(f32, &.{ 3, 7, 99, 101 }, actual);
+}
+
+test "PJRT single row linear reduction preserves F32 operands and multi row fallback" {
+    const a = std.testing.allocator;
+    var client = pjrt.pjrt.Client.initFromEnv(a) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    const width = 1024;
+    const outputs_count = 3;
+    for ([_]usize{ 1, 2 }) |rows| {
+        var sum_builder = hlo.Builder.init(a, "linear_sum");
+        defer sum_builder.deinit();
+        sum_builder.next_id = 1_000_001;
+        sum_builder.base_id = sum_builder.next_id;
+        const left = try sum_builder.parameter(0, hlo.Shape.scalar(.f32), "left");
+        const right = try sum_builder.parameter(1, hlo.Shape.scalar(.f32), "right");
+        _ = try sum_builder.add(left, right);
+        var sum = sum_builder.build();
+        sum.id = 1_000_000;
+        var b = hlo.Builder.init(a, "main");
+        defer b.deinit();
+        const x = try b.parameter(0, hlo.Shape.init(.f32, &.{ @intCast(rows), width }), "x");
+        const weight = try b.parameter(1, hlo.Shape.init(.f32, &.{ outputs_count, width }), "weight");
+        var needs_sum = false;
+        _ = try emitLinear(&b, x, weight, try transposeLastTwo(&b, weight), true, &sum, &needs_sum);
+        try std.testing.expectEqual(rows == 1, needs_sum);
+        const module = hlo.Module.initWithAux("linear_reduction", b.build(), if (needs_sum) &.{sum} else &.{});
+        const bytes = try module.serialize(a);
+        defer a.free(bytes);
+        var executable = try client.compile(bytes, 1);
+        defer executable.deinit();
+        var values: [2 * width]f32 = undefined;
+        var weights: [outputs_count * width]f32 = undefined;
+        // Values deliberately are not BF16 representable: this optimization
+        // must not introduce a new rounding boundary to obtain a fast GEMV.
+        for (&values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 1024 + 0.000003;
+        for (&weights, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) / 128 + 0.000001;
+        var xb = try client.bufferFromHostFloat32(values[0 .. rows * width], &.{ @intCast(rows), width });
+        defer xb.deinit();
+        var wb = try client.bufferFromHostFloat32(&weights, &.{ outputs_count, width });
+        defer wb.deinit();
+        const results = try executable.execute(&.{ xb, wb }, a);
+        defer a.free(results);
+        defer for (results) |*v| v.deinit();
+        const actual = try results[0].toFloat32WithShape(a, &.{ @intCast(rows), outputs_count });
+        defer a.free(actual);
+        for (actual, 0..) |got, i| {
+            var expected: f64 = 0;
+            for (0..width) |k| expected += @as(f64, values[(i / outputs_count) * width + k] * weights[(i % outputs_count) * width + k]);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), got, 0.0000001);
+        }
+    }
 }

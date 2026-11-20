@@ -521,6 +521,7 @@ pub fn createExecutorWithOptions(
     if (options.resident_capacity != 0 and std.ascii.eqlIgnoreCase(try client.platformName(), "cuda")) {
         compile_options.wide_single_row_norm = true;
         compile_options.wide_rotary_trig = options.precision == .bf16;
+        compile_options.reduce_single_row_linear = options.precision == .bf16 and client.compile_options.gpu_gemm == .provider_default;
     }
     var program_options = client.compile_options;
     if (options.resident_capacity != 0) {
