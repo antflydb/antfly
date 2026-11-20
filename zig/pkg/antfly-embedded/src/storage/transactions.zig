@@ -384,10 +384,7 @@ pub const DagDomainPrepare = struct {
         witness.* = .{};
         switch (try dag.Storage.beginUnreserved(writer, self.domain, self.epoch, self.revision, self.attempt)) {
             .terminal => return self.requireAccepted(writer),
-            .reserved => |token| {
-                try dag.Contributions.prepare(alloc, writer, token, self.producer_versions, self.replacements, budget, witness);
-                return dag.Contributions.accept(alloc, writer, token, self.producer_versions, self.replacements);
-            },
+            .reserved => |token| return dag.Contributions.prepareAndAccept(alloc, writer, token, self.producer_versions, self.replacements, budget, witness),
         }
     }
 

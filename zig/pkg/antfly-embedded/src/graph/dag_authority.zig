@@ -1585,6 +1585,15 @@ pub const Contributions = struct {
 
     /// Stage the participant's vote in the reserved snapshot.
     pub fn prepare(alloc: A, txn: anytype, token: Token, versions: Digest, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness) !void {
+        _ = try validateReplacements(alloc, txn, token, versions, replacements, budget, witness, false);
+    }
+
+    /// Validate and install one exact delta in the same writer snapshot.
+    pub fn prepareAndAccept(alloc: A, txn: anytype, token: Token, versions: Digest, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness) !Receipt {
+        return (try validateReplacements(alloc, txn, token, versions, replacements, budget, witness, true)).?;
+    }
+
+    fn validateReplacements(alloc: A, txn: anytype, token: Token, versions: Digest, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness, comptime accept_now: bool) !?Receipt {
         var memory: validation.Memory = .{ .parent = alloc, .budget = budget };
         const bounded = memory.allocator();
         var arena = std.heap.ArenaAllocator.init(bounded);
@@ -1604,6 +1613,10 @@ pub const Contributions = struct {
             }
             return err;
         };
+        if (!accept_now) return null;
+        const receipt = try Storage.accept(alloc, txn, token, delta.adjacency, delta.membership);
+        try stageManifests(alloc, txn, token.domain, replacements);
+        return receipt;
     }
 
     /// Stage the committed decision, effective manifests and accepted adjacency
