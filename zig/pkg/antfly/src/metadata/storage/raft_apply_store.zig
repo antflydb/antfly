@@ -12963,6 +12963,13 @@ pub const RaftApplyStore = struct {
             }
             return null;
         };
+        // Disabled owners still owe their final acknowledgements after promotion.
+        // Once those are durable the historical stamp no longer governs reads.
+        // Keep the publication record so a later enable advances its generation.
+        if (stamp.phase == .disabled) {
+            if (try system_catalog_storage.hasPolicyPublicationWork(alloc, txn, group_id, table_id)) return error.RowPolicyCatalogChanged;
+            return null;
+        }
         if (stamp.topology_generation != 0 and
             !std.mem.eql(u8, &stamp.schema_record_digest, &(@as([32]u8, @splat(0)))))
         {
@@ -40304,6 +40311,57 @@ test "row-policy publication persists exact owner ACKs and leader install cut" {
         const stale_ack = try std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = 9, .change = .{ .acknowledge = .{ .table_id = 7, .generation = 2, .receipt = receipt } } }, .{});
         defer alloc.free(stale_ack);
         try std.testing.expectError(error.RowPolicyCatalogChanged, reopened.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = stale_ack }));
+        // Finish the replacement, then disable through each real owner ACK.
+        // The final ACK releases the old schema fence for new cursors.
+        var revision: u64 = 9;
+        var generation: u64 = 2;
+        var epoch: u64 = 9;
+        for ([_]sql_policies.Publication.Phase{ .pending_install, .serving_install, .pending_disable, .serving_disable, .disabled }) |phase| {
+            if (phase == .pending_disable) {
+                const disable = try reopened.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = false, .expected_revision = revision });
+                defer alloc.free(disable);
+                try reopened.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = disable });
+                revision += 1;
+                generation += 1;
+                epoch = revision;
+            }
+            if (phase == .disabled) try std.testing.expectError(error.RowPolicyCatalogChanged, reopened.sqlPolicyPublicationStatusJson(alloc, group, 7));
+            const bundle = try reopened.sqlPolicyInstallSnapshotJson(alloc, group, .{ .table_id = 7, .expected_generation = generation, .expected_catalog_epoch = epoch, .expected_phase = phase, .owner_group_id = owner.group_id, .expected_descriptor_digest = owner.descriptor_digest });
+            defer alloc.free(bundle);
+            var ack = receipt;
+            ack.phase = phase;
+            ack.catalog_epoch = epoch;
+            ack.applied_index += revision;
+            std.crypto.hash.sha2.Sha256.hash(bundle, &ack.bundle_digest, .{});
+            const ack_bytes = try std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = revision, .change = .{ .acknowledge = .{ .table_id = 7, .generation = generation, .receipt = ack } } }, .{});
+            defer alloc.free(ack_bytes);
+            try reopened.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = ack_bytes });
+            revision += 1;
+            const next: sql_policies.Publication.Phase = switch (phase) {
+                .pending_install => .serving_install,
+                .serving_install => .active,
+                .pending_disable => .serving_disable,
+                .serving_disable => .disabled,
+                .disabled => break,
+                .active => unreachable,
+            };
+            const promote_bytes = try std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = revision, .change = .{ .promote = .{ .table_id = 7, .generation = generation, .phase = next } } }, .{});
+            defer alloc.free(promote_bytes);
+            try reopened.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = promote_bytes });
+            revision += 1;
+        }
+        var updated = table;
+        updated.schema_json = try @import("../../api/tables.zig").normalizeSchemaVersion(alloc, table.schema_json, 2);
+        defer alloc.free(updated.schema_json);
+        try reopened.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = updated } });
+        const observed = (try reopened.getTable(alloc, group, 7)).?;
+        defer metadata_table_manager.freeTable(alloc, observed);
+        try std.testing.expectEqualStrings(updated.schema_json, observed.schema_json);
+        const disabled_status = try reopened.sqlPolicyPublicationStatusJson(alloc, group, 7);
+        defer alloc.free(disabled_status);
+        try std.testing.expectEqualStrings("null", disabled_status);
+        const read = try reopened.resolveSystemCatalogIdentities(alloc, group, .{ .cursor_bindings = &.{.{ .target = .{ .database = "default", .namespace = "public", .table = binding.name }, .physical = table.name, .id = 7, .version = 2 }}, .include_source_epoch = true });
+        try std.testing.expect(!read.cursor_policies.?.protected);
         const fence = try reopened.getTableTransitionFence(group, table.table_id);
         try reopened.applyStandaloneCommand(group, .{ .apply_table_topology = .{ .drop = .{
             .table_id = table.table_id,

@@ -1365,6 +1365,12 @@ fn executeMultiTableCommitOnce(
         participants.deinit(alloc);
     }
 
+    var table_groups: std.StringHashMapUnmanaged(ParticipantGroups) = .empty;
+    defer {
+        var it = table_groups.valueIterator();
+        while (it.next()) |groups| groups.deinit(alloc);
+        table_groups.deinit(alloc);
+    }
     // Cascades can enlist additional tables after SQL admission. All participants
     // in a transaction must prepare against the same metadata incarnation.
     var bound_incarnation: ?[16]u8 = null;
@@ -1376,6 +1382,9 @@ fn executeMultiTableCommitOnce(
         var routing = (try table_catalog.transactionRoutingSnapshot(alloc, catalog, table.table_name)) orelse return error.TableNotFound;
         defer routing.deinit(alloc);
         const topology_epoch = routing.topology_epoch;
+        const slot = try table_groups.getOrPut(alloc, table.table_name);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        const groups = slot.value_ptr;
 
         if (bound_incarnation) |incarnation| {
             const actual = routing.snapshot.status.metadata_incarnation orelse return error.CatalogGenerationChanged;
@@ -1387,100 +1396,88 @@ fn executeMultiTableCommitOnce(
             if (routing.snapshot.status.metadata_group_id != fence.metadata_group_id or
                 !std.meta.eql(routing.snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
                 return error.TopologyChanged;
-            const range = for (routing.ranges) |candidate| {
-                if (candidate.group_id == fence.route.group_id) break candidate;
-            } else return error.TopologyChanged;
-            const manager = @import("../metadata/table_manager.zig");
-            if (range.table_id != fence.table_id or
-                manager.rangeDocIdentityRangeId(range.*) != fence.route.range_id or
-                fence.route.identity_namespace.table_id != range.table_id or
-                fence.route.identity_namespace.shard_id != manager.rangeDocIdentityShardId(range.*) or
-                fence.route.identity_namespace.range_id != manager.rangeDocIdentityRangeId(range.*)) return error.TopologyChanged;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, fence.route.group_id, topology_epoch);
-            participant.route_fence = fence;
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, fence.route.group_id, topology_epoch);
+            if (participant.route_fence) |*existing| {
+                if (!@import("antfly_local_sources").api_range_read_guards.sameOwner(existing.*, fence)) return error.TopologyChanged;
+                existing.catalog_revision = @max(existing.catalog_revision, fence.catalog_revision);
+            } else participant.route_fence = fence;
             for (owner.proofs) |proof| try participant.range_guards.append(alloc, proof);
         }
 
         for (table.writes) |write| {
             const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.writes.append(alloc, write);
         }
         for (table.deletes) |key| {
             const group_id = routing.resolveGroupForKey(key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.deletes.append(alloc, key);
         }
         for (table.graph_writes) |edge| {
             const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.graph_writes.append(alloc, edge);
         }
         for (table.graph_deletes) |edge| {
             const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.graph_deletes.append(alloc, edge);
         }
         for (table.predicates) |predicate| {
             const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.predicates.append(alloc, predicate);
         }
         for (table.transforms) |transform| {
             const group_id = routing.resolveGroupForKey(transform.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.transforms.append(alloc, transform);
         }
         for (table.integrity) |operation| {
             const group_id = routing.resolveGroupForKey(operation.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.integrity.append(alloc, operation);
         }
         for (table.integrity_commands) |command| {
             const group_id = routing.resolveGroupForKey(&command.address.routing) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             try participant.integrity_commands.append(alloc, command);
         }
         if (table.relational_activation) |command| {
             const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             if (participant.relational_activation != null) return error.InvalidTxnRequest;
             participant.relational_activation = command;
         }
         if (table.relational_retirement) |command| {
             const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             if (participant.relational_retirement != null) return error.InvalidTxnRequest;
             participant.relational_retirement = command;
         }
         if (table.relational_index_maintenance) |command| {
             const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
             if (group_id != command.owner_group_id) return error.PreparedGenerationChanged;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
             if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
             participant.relational_index_maintenance = command;
         }
-        if (table.commit_requires == .direct_enrichments) {
-            const present = for (participants.items) |participant| {
-                if (std.mem.eql(u8, participant.table_name, table.table_name)) break true;
-            } else false;
-            if (!present) _ = try ensureParticipantTxn(alloc, &participants, table.table_name, routing.resolveGroupForKey("") orelse return error.UnknownGroup, topology_epoch);
+        if (table.commit_requires == .direct_enrichments and groups.count() == 0) {
+            _ = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, routing.resolveGroupForKey("") orelse return error.UnknownGroup, topology_epoch);
         }
-        if (bound_incarnation != null) {
-            // The snapshot supplies both the incarnation checked above and the
-            // range identity validated by each participant at prepare.
-            var pending: std.AutoHashMapUnmanaged(u64, *ParticipantTxn) = .empty;
-            defer pending.deinit(alloc);
-            for (participants.items) |*participant| {
-                if (participant.route_fence == null and std.mem.eql(u8, participant.table_name, table.table_name))
-                    try pending.put(alloc, participant.group_id, participant);
-            }
+        // Match all enlisted owner proofs in one traversal of this table's
+        // ranges. Guarded reads keep their observed fence and bound writes get
+        // a fence from the same routing snapshot used to choose their group.
+        if (bound_incarnation != null or table.range_guards.len != 0) {
+            var remaining = groups.count();
             for (routing.ranges) |range| {
-                if (pending.count() == 0) break;
-                const entry = pending.fetchRemove(range.group_id) orelse continue;
+                if (remaining == 0) break;
+                const index = groups.get(range.group_id) orelse continue;
+                const participant = &participants.items[index];
                 const manager = @import("../metadata/table_manager.zig");
                 const range_id = manager.rangeDocIdentityRangeId(range.*);
-                entry.value.route_fence = .{
+                const fence: @import("../metadata/api.zig").CatalogRouteFence = .{
                     .metadata_group_id = routing.snapshot.status.metadata_group_id,
                     .metadata_incarnation = routing.snapshot.status.metadata_incarnation,
                     .catalog_revision = 0,
@@ -1488,11 +1485,19 @@ fn executeMultiTableCommitOnce(
                     .topology_epoch = topology_epoch,
                     .route = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = range.table_id, .shard_id = manager.rangeDocIdentityShardId(range.*), .range_id = range_id } },
                 };
+                if (participant.route_fence) |observed| {
+                    if (observed.table_id != fence.table_id or observed.route.range_id != range_id or
+                        !std.meta.eql(observed.route.identity_namespace, fence.route.identity_namespace)) return error.TopologyChanged;
+                } else if (bound_incarnation != null) {
+                    participant.route_fence = fence;
+                }
+                remaining -= 1;
             }
-            if (pending.count() != 0) return error.TopologyChanged;
+            if (remaining != 0) return error.TopologyChanged;
         }
-        for (participants.items) |*participant| {
-            if (!std.mem.eql(u8, participant.table_name, table.table_name)) continue;
+        for (groups.values()) |index| {
+            const participant = &participants.items[index];
+            if (participant.topology_epoch != topology_epoch) return error.TopologyChanged;
             if (participant.row_policy_principal_proof.len != 0 and
                 (!std.mem.eql(u8, participant.row_policy_principal_proof, table.row_policy_principal_proof) or
                     !std.mem.eql(u8, participant.row_policy_database, table.row_policy_database) or
@@ -2371,21 +2376,26 @@ fn firstFanoutError(slots: []const ParticipantFanoutSlot) ?usize {
     return null;
 }
 
+// Indices survive relocation of the shared list and preserve first-enlistment order.
+const ParticipantGroups = std.AutoArrayHashMapUnmanaged(u64, usize);
+
 fn ensureParticipantTxn(
     alloc: std.mem.Allocator,
     grouped: *std.ArrayListUnmanaged(ParticipantTxn),
+    groups: *ParticipantGroups,
     table_name: []const u8,
     group_id: u64,
     topology_epoch: u64,
 ) !*ParticipantTxn {
-    for (grouped.items) |*participant| {
-        if (participant.group_id == group_id and std.mem.eql(u8, participant.table_name, table_name)) {
-            if (participant.topology_epoch != topology_epoch) return error.TopologyChanged;
-            return participant;
-        }
+    const slot = try groups.getOrPut(alloc, group_id);
+    if (slot.found_existing) {
+        const participant = &grouped.items[slot.value_ptr.*];
+        if (participant.topology_epoch != topology_epoch) return error.TopologyChanged;
+        return participant;
     }
+    slot.value_ptr.* = grouped.items.len;
     try grouped.append(alloc, .{ .table_name = table_name, .group_id = group_id, .topology_epoch = topology_epoch });
-    return &grouped.items[grouped.items.len - 1];
+    return &grouped.items[slot.value_ptr.*];
 }
 
 pub const participantIdForGroup = @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroup;
@@ -5704,10 +5714,11 @@ fn consumerTests() type {
                     const metadata_transition_state = @import("../metadata/transition_state.zig");
                     return .{
                         .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .metrics = .{} },
-                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
+                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{ .{ .table_id = 7, .name = "docs", .placement_role = "data" }, .{ .table_id = 8, .name = "audit", .placement_role = "data" } })[0..]),
                         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
                             .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
                             .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                            .{ .group_id = 8001, .table_id = 8, .start_key = "", .end_key = null },
                         })[0..]),
                         .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                         .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
@@ -5727,6 +5738,8 @@ fn consumerTests() type {
                 semantic_prepares: usize = 0,
                 activation_prepares: usize = 0,
                 range_prepares: usize = 0,
+                bound_prepares: usize = 0,
+                includes_audit: bool = false,
                 coordinator_group: u64 = 7001,
                 resolves: std.ArrayListUnmanaged(struct {
                     group_id: u64,
@@ -5757,12 +5770,23 @@ fn consumerTests() type {
 
                 fn begin(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnBeginRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    try std.testing.expectEqual(@as(usize, 2), req.participants.len);
+                    try std.testing.expectEqual(@as(usize, if (self.includes_audit) 3 else 2), req.participants.len);
+                    if (self.includes_audit) {
+                        try std.testing.expectEqualStrings("table2:00000004:docs:7002", req.participants[0]);
+                        try std.testing.expectEqualStrings("table2:00000005:audit:8001", req.participants[1]);
+                        try std.testing.expectEqualStrings("table2:00000004:docs:7001", req.participants[2]);
+                    }
                     try self.begins.append(std.testing.allocator, group_id);
                 }
 
                 fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnPrepareRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (req.route_fence) |fence| {
+                        try std.testing.expectEqual(group_id, fence.route.group_id);
+                        try std.testing.expectEqual(@as(u64, if (group_id == 8001) 8 else 7), fence.table_id);
+                        try std.testing.expectEqual(@as([32]u8, @splat('1')), fence.metadata_incarnation.?);
+                        self.bound_prepares += 1;
+                    }
                     try std.testing.expect(req.req.writes.len + req.req.deletes.len + req.req.predicates.len + req.req.integrity.len + req.req.range_guards.len > 0);
                     if (req.req.range_guards.len != 0) {
                         try std.testing.expectEqual(@as(u64, 7002), group_id);
@@ -5809,7 +5833,9 @@ fn consumerTests() type {
                 fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnAcknowledgeRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqual(self.coordinator_group, group_id);
-                    try std.testing.expectEqualStrings(if (group_id == 7001) "table2:00000004:docs:7002" else "table2:00000004:docs:7001", req.participant);
+                    const other_docs = if (group_id == 7001) "table2:00000004:docs:7002" else "table2:00000004:docs:7001";
+                    try std.testing.expect(std.mem.eql(u8, req.participant, other_docs) or
+                        (self.includes_audit and std.mem.eql(u8, req.participant, "table2:00000005:audit:8001")));
                     try self.acknowledgements.append(std.testing.allocator, group_id);
                 }
             };
@@ -5941,11 +5967,20 @@ fn consumerTests() type {
                 .proofs = &.{.{ .bucket = 100, .generation = 9007199254740993 }},
             };
             recorder.coordinator_group = 7002;
-            const guarded = try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("40112233445566778899aabbccddeeff"), 50_000, 50_001, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .range_guards = (&observation)[0..1] }}, .write, null);
+            recorder.includes_audit = true;
+            const guarded = try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("40112233445566778899aabbccddeeff"), 50_000, 50_001, &.{
+                .{ .table_name = "docs", .bound_catalog_incarnation = @splat(0x11), .range_guards = (&observation)[0..1] },
+                .{ .table_name = "audit", .writes = &.{.{ .key = "log", .value = "{}" }} },
+                .{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
+            }, .write, null);
             try std.testing.expect(guarded == .committed);
-            try std.testing.expectEqual(@as(usize, 2), guarded.committed.participant_count);
+            try std.testing.expectEqual(@as(usize, 3), guarded.committed.participant_count);
+            try std.testing.expectEqual(@as(usize, 3), recorder.bound_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.range_prepares);
             const prior_begins = recorder.begins.items.len;
+            var stale = observation;
+            stale.fence.route.range_id +%= 1;
+            try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(3), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = &.{ stale, observation } }}, .write, null));
             observation.fence.metadata_incarnation = @splat('2');
             try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("50112233445566778899aabbccddeeff"), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = (&observation)[0..1] }}, .write, null));
             try std.testing.expectEqual(prior_begins, recorder.begins.items.len);

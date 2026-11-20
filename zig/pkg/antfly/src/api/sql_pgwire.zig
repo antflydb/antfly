@@ -712,7 +712,7 @@ const OwnedRead = struct {
     }
 };
 
-const ReadRevision = struct { grants: u64, token: u64, roles: ?u64 };
+const ReadRevision = struct { grants: u64, token: u64 };
 
 // Capture the exact executable binding before either kind of reader can touch
 // rows. Preserve existing after-write receipt validation on the same binding.
@@ -734,6 +734,9 @@ const CursorAdmission = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.previous) |validator| try validator.validate(validator.ptr, scratch, binding);
         self.captured = try RetainedRead.capture(self.out, self.adapter, self.credential, self.native.identity.* orelse return error.Unauthorized, binding, self.native.context, self.native.revision, self.admitted);
+        // A later native operator may mint another owner proof. Bind its role
+        // set under the same manager lock that signs that proof.
+        self.native.identity.*.?.bound_policy_roles = self.captured.?.role_digest;
     }
 };
 
@@ -742,7 +745,9 @@ const RetainedRead = struct {
     adapter: *Adapter,
     policies: []const OwnedRead.Policy,
     bindings: []const Domain.CursorBinding,
-    admitted: ReadRevision,
+    validated: ReadRevision,
+    validated_stamp: ?wire.CatalogStamp = null,
+    role_digest: ?[32]u8 = null,
     cut: Cut,
     const Cut = struct { policies: Domain.CursorPolicies, stamp: ?wire.CatalogStamp, revision: ?u64 };
 
@@ -759,9 +764,10 @@ const RetainedRead = struct {
             if (name == null and policy.graph_revision == null) return error.InvalidSqlBackendResponse;
             target.* = .{ .target = if (name) |n| .{ .database = n.database.?, .namespace = n.namespace.?, .table = n.table } else null, .physical = policy.resource, .id = policy.id, .version = policy.graph_revision orelse policy.schema_version };
         }
-        var result: RetainedRead = .{ .adapter = adapter, .policies = policies, .bindings = bindings, .admitted = admitted, .cut = undefined };
+        var result: RetainedRead = .{ .adapter = adapter, .policies = policies, .bindings = bindings, .validated = admitted, .cut = undefined };
         result.cut = try result.readCut(temp.allocator(), context, revision, null);
-        if (!std.meta.eql(admitted, credential.readRevision())) return error.Forbidden;
+        if (result.cut.policies.protected) result.role_digest = try usermgr.UserManager.roleDigest(temp.allocator(), identity.roles);
+        result.validated = try result.validateAccess(temp.allocator(), credential);
         return result;
     }
 
@@ -852,18 +858,14 @@ const RetainedRead = struct {
         return reply;
     }
 
-    fn check(self: *const RetainedRead, a: std.mem.Allocator, credential: *Credential, request: wire.Request, materialized: bool) !void {
-        try request.check();
-        try credential.validate();
-        if (self.adapter.server.cfg.user_manager != credential.manager) return error.Unauthorized;
-        // Every role mutation publishes the manager's authorization revision.
-        // Only enter the role graph or reconstruct filters when that stamp moves.
-        if (credential.grantRevision() != self.admitted.grants or credential.trusted_revision != self.admitted.token) {
-            if (self.cut.policies.protected and (credential.trusted_revision != self.admitted.token or
-                (if (credential.manager) |manager| manager.rowPolicyRoleRevision() else null) != self.admitted.roles)) return error.Forbidden;
-            if (materialized) return error.Forbidden;
+    fn validateAccess(self: *const RetainedRead, a: std.mem.Allocator, credential: *Credential) !ReadRevision {
+        const revision = credential.readRevision();
+        if (!std.meta.eql(revision, self.validated)) {
             var fresh = try credential.identity(a);
             defer fresh.deinit(a);
+            if (self.role_digest) |digest| {
+                if (!std.meta.eql(digest, try usermgr.UserManager.roleDigest(a, fresh.roles))) return error.Forbidden;
+            }
             for (self.bindings) |binding| if (binding.target) |target| {
                 const logical = try target.resourceNameAlloc(a);
                 defer a.free(logical);
@@ -871,22 +873,34 @@ const RetainedRead = struct {
             };
             try OwnedRead.validateProjectedPolicies(a, &fresh, self.policies);
         }
-        var context = try requestContext(credential, &request).platformDeadline();
-        if (self.cut.stamp) |stamp| context.bound_catalog_incarnation = stamp.relation_epoch.incarnation;
-        const cut = try self.readCut(a, context, if (materialized) self.cut.revision else null, self.cut.stamp);
-        if (!std.meta.eql(cut.policies, self.cut.policies)) return error.RowPolicyCatalogChanged;
-        if (materialized and !std.meta.eql(self.cut.stamp, cut.stamp)) return error.CatalogGenerationChanged;
+        return revision;
     }
 
-    fn validateBuffered(raw: *const anyopaque, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request, materialized: bool) !void {
-        const self: *const RetainedRead = @ptrCast(@alignCast(raw));
+    fn check(self: *RetainedRead, a: std.mem.Allocator, credential: *Credential, request: wire.Request, materialized: bool) !void {
+        try request.check();
+        try credential.validate();
+        if (self.adapter.server.cfg.user_manager != credential.manager) return error.Unauthorized;
+        const revision = try self.validateAccess(a, credential);
+        var context = try requestContext(credential, &request).platformDeadline();
+        if (self.validated_stamp orelse self.cut.stamp) |stamp| context.bound_catalog_incarnation = stamp.relation_epoch.incarnation;
+        const cut = try self.readCut(a, context, if (materialized) self.cut.revision else null, self.validated_stamp orelse self.cut.stamp);
+        if (!std.meta.eql(cut.policies, self.cut.policies)) return error.RowPolicyCatalogChanged;
+        if (materialized and !std.meta.eql(self.cut.stamp, cut.stamp)) return error.CatalogGenerationChanged;
+        // Advance both hints only after the complete check. The original cut
+        // still owns the incarnation, policy digest and materialization fence.
+        self.validated = revision;
+        self.validated_stamp = cut.stamp;
+    }
+
+    fn validateBuffered(raw: *anyopaque, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request, materialized: bool) !void {
+        const self: *RetainedRead = @ptrCast(@alignCast(raw));
         var job: StreamJob = .{ .adapter = self.adapter, .alloc = a, .credential = @ptrCast(@alignCast(identity.context)), .request = request, .buffered = self, .materialized = materialized };
         try job.dispatch();
     }
 };
 
 const StreamJob = struct {
-    buffered: ?*const RetainedRead = null,
+    buffered: ?*RetainedRead = null,
     materialized: bool = false,
     adapter: *Adapter,
     alloc: std.mem.Allocator,
@@ -1047,7 +1061,7 @@ const Credential = struct {
     }
 
     fn readRevision(self: *Credential) ReadRevision {
-        return .{ .grants = self.grantRevision(), .roles = if (self.manager) |m| m.rowPolicyRoleRevision() else null, .token = self.trusted_revision };
+        return .{ .grants = self.grantRevision(), .token = self.trusted_revision };
     }
 
     fn descriptionRevision(self: *Credential) !u64 {
@@ -1250,6 +1264,7 @@ const Job = struct {
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
             for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             self.description = .{
+                .is_select = compiled.statement == .select,
                 .stamp = if (probe.sampled and probe.catalog == null) null else .{ .catalog = probe.catalog, .authority = authority_revision, .reusable = !compiled.uses_current_setting },
                 .columns = columns,
                 .parameter_types = parameter_types,
@@ -2401,12 +2416,14 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     server.cfg.user_manager = &manager;
     // SQL roles can change while the same ordinary table grant remains valid.
     try manager.addRoleToUser("alice", "reader");
-    var retained: RetainedRead = .{ .adapter = &adapter, .admitted = credential.readRevision(), .bindings = &.{}, .policies = &.{}, .cut = .{ .policies = .{ .digest = @splat(0), .protected = true }, .stamp = null, .revision = null } };
+    var retained: RetainedRead = .{ .adapter = &adapter, .validated = credential.readRevision(), .bindings = &.{}, .policies = &.{}, .cut = .{ .policies = .{ .digest = @splat(0), .protected = true }, .stamp = null, .revision = null } };
+    retained.role_digest = try usermgr.UserManager.roleDigest(alloc, &.{"reader"});
     try manager.removeRoleFromUser("alice", "reader");
     try std.testing.expect(try http.tablePermissionCurrentlyAllowed(admitted, "docs", .read));
     try std.testing.expectError(error.Forbidden, retained.check(alloc, credential, authority.request, false));
-    retained.admitted = credential.readRevision();
+    retained.validated = credential.readRevision();
     retained.cut.policies.protected = false;
+    retained.role_digest = null;
     retained.policies = &retained_policies;
     retained.bindings = &.{.{ .id = 17, .physical = "private-table-17", .version = 1, .target = .{ .database = "default", .namespace = "public", .table = "docs" } }};
     try manager.setRowFilter("alice", "docs", "{\"term\":{\"tenant_id\":\"allowed\"}}");
@@ -2676,6 +2693,7 @@ test "SQL pgwire retained reads track the serving policy even without a catalog 
         schema_version: u64 = 1,
         compact: bool = false,
         calls: usize = 0,
+        binding_lookups: usize = 0,
         fn call(raw: *anyopaque, a: std.mem.Allocator, ctx: operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
@@ -2688,6 +2706,7 @@ test "SQL pgwire retained reads track the serving policy even without a catalog 
                     var reply: Domain.ResolvedMany = .{ .revision = self.revision, .tables = &.{}, .source_epoch = .{ .incarnation = @splat(1), .revision = 2 } };
                     if (request.cursor_bindings.len != 0) {
                         if (!self.compact) return error.UnknownField;
+                        if (request.cursor_catalog_cut == null or request.cursor_catalog_cut.?.revision != self.revision) self.binding_lookups += 1;
                         var hash = std.crypto.hash.Blake3.init(.{});
                         var protected = false;
                         try Domain.CursorPolicies.observe(&hash, &protected, request.cursor_bindings[0], stamp);
@@ -2710,13 +2729,45 @@ test "SQL pgwire retained reads track the serving policy even without a catalog 
     defer api.deinit();
     var adapter: Adapter = .{ .server = &api };
     const bindings = [_]Domain.CursorBinding{.{ .id = 7, .physical = "physical", .version = 1, .target = .{ .database = "default", .namespace = "public", .table = "docs" } }};
-    var retained: RetainedRead = .{ .adapter = &adapter, .admitted = undefined, .policies = &.{}, .bindings = &bindings, .cut = undefined };
+    var retained: RetainedRead = .{ .adapter = &adapter, .validated = undefined, .policies = &.{}, .bindings = &bindings, .cut = undefined };
     const original = try retained.readCut(a, .{}, 10, null);
     try std.testing.expect(original.policies.protected);
     fake.compact = true;
     fake.calls = 0;
     try std.testing.expectEqualDeep(original, try retained.readCut(a, .{}, 10, original.stamp));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    const casbin = @import("antfly_casbin");
+    var store = usermgr.MemoryStore.init(a);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(a);
+    defer policies.deinit();
+    var manager = try usermgr.UserManager.init(a, store.iface(), try usermgr.initDefaultEnforcer(a, policies.iface()));
+    defer manager.deinit();
+    api.cfg.user_manager = &manager;
+    defer api.cfg.user_manager = null;
+    var grant = try usermgr.Permission.initOwned(a, .table, "docs", .read);
+    defer grant.deinit(a);
+    var user = try manager.createUser("alice", "secret", &.{grant});
+    defer user.deinit(a);
+    try manager.addRoleToUser("alice", "reader");
+    const credential = try Credential.authenticate(a, &manager, "alice", "secret");
+    defer Credential.release(credential, a);
+    retained.validated = credential.readRevision();
+    retained.role_digest = try usermgr.UserManager.roleDigest(a, &.{"reader"});
+    retained.cut = original;
+    retained.policies = &.{.{ .resource = "physical", .filter = null }};
+    var cancel = std.atomic.Value(bool).init(false);
+    const req: wire.Request = .{ .statement = "", .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } }, .cancel_requested = &cancel };
+    try manager.addRoleToSubject("bob", "auditor");
+    fake.revision += 1;
+    fake.binding_lookups = 0;
+    for (0..3) |_| try retained.check(a, credential, req, false);
+    try std.testing.expectEqual(@as(usize, 1), fake.binding_lookups);
+    try std.testing.expectEqualDeep(credential.readRevision(), retained.validated);
+    try manager.addRoleToSubject("reader", "inherited");
+    try std.testing.expectError(error.Forbidden, retained.check(a, credential, req, false));
+    try std.testing.expect(!std.meta.eql(credential.readRevision(), retained.validated));
+    fake.revision = 10;
     fake.generation += 1;
     const changed = try retained.readCut(a, .{}, 10, original.stamp);
     try std.testing.expect(!std.meta.eql(original.policies, changed.policies));

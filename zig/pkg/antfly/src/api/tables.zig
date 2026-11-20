@@ -4009,6 +4009,12 @@ const IndexLifetimes = struct {
     births: std.json.ArrayHashMap(u32),
 };
 const index_lifetimes_field = "x-antfly-index-lifetimes";
+
+/// These fields describe catalog object history and never change row semantics.
+pub fn removeBindingHistory(root: *std.json.ObjectMap) void {
+    _ = root.orderedRemove(index_lifetimes_field);
+    _ = root.orderedRemove("x-antfly-column-lineage");
+}
 const IndexLifetimesProjection = struct {
     version: u32 = 0,
     @"x-antfly-index-lifetimes": ?IndexLifetimes = null,
@@ -4150,8 +4156,7 @@ fn normalizeSchemaRecord(alloc: std.mem.Allocator, schema_json: []const u8, vers
     if (parsed.value != .object) return error.InvalidSchemaUpdateRequest;
     const root = &parsed.value.object;
     if (format == .lineage_v1) {
-        _ = root.orderedRemove(index_lifetimes_field);
-        _ = root.orderedRemove("x-antfly-column-lineage");
+        removeBindingHistory(root);
         if (predecessor) |old| try stampSchemaLifetimes(parsed.arena.allocator(), root, old, version);
     }
 

@@ -119,10 +119,11 @@ pub const DescriptionStamp = struct {
 };
 
 pub const CursorAuthority = struct {
-    ptr: *const anyopaque,
-    validate: *const fn (*const anyopaque, std.mem.Allocator, Identity, Request, bool) anyerror!void,
+    ptr: *anyopaque,
+    validate: *const fn (*anyopaque, std.mem.Allocator, Identity, Request, bool) anyerror!void,
 };
 pub const Description = struct {
+    is_select: bool = false,
     stamp: ?DescriptionStamp = null,
     columns: []const Column = &.{},
     parameter_types: []const Type = &.{},

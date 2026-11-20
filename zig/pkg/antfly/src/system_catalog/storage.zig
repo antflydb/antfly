@@ -67,6 +67,18 @@ fn policyPublicationWorkKeyAlloc(alloc: std.mem.Allocator, group_id: u64, table_
     return key;
 }
 
+/// The work index and serving stamp are committed in the same transaction.
+pub fn hasPolicyPublicationWork(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
+    const key = try policyPublicationWorkKeyAlloc(alloc, group_id, table_id);
+    defer alloc.free(key);
+    const value = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, value, &.{1})) return error.InvalidRowPolicyPublication;
+    return true;
+}
+
 pub fn policyPublicationNeedsWork(publication: policies.Publication) bool {
     return switch (publication.phase) {
         .active => false,

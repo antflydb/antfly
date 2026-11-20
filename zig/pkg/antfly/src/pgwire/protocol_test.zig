@@ -79,6 +79,7 @@ const Mock = struct {
     unknown_commit: bool = false,
     cursor_revoked: bool = false,
     buffered_filter_changed: bool = false,
+    revoke_on_buffered_resume: bool = false,
     stream_fail_at: ?usize = null,
     failed_transactions: usize = 0,
     canceled: std.atomic.Value(bool) = .init(false),
@@ -234,10 +235,10 @@ const Mock = struct {
         return desc.stamp.?.catalog.?.catalog_revision == self.catalog_revision;
     }
 
-    fn validateBuffered(raw: *const anyopaque, _: std.mem.Allocator, _: backend.Identity, req: backend.Request, _: bool) !void {
+    fn validateBuffered(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, req: backend.Request, materialized: bool) !void {
         const self: *const Mock = @ptrCast(@alignCast(raw));
         try req.check();
-        if (self.cursor_revoked or self.buffered_filter_changed) return error.Forbidden;
+        if (self.cursor_revoked or self.buffered_filter_changed or (self.revoke_on_buffered_resume and !materialized)) return error.Forbidden;
     }
     fn describe(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Description {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -259,7 +260,7 @@ const Mock = struct {
         if (self.cursor_revoked) return error.Forbidden;
         if (self.ddl_pending or self.ddl_unknown) return .{ .columns = &.{} };
         if (self.expected_result_tag != null) return .{ .columns = &.{}, .binding_guard = "immutable-catalog-binding" };
-        if (self.json_null_results) return .{ .columns = &.{.{ .name = "j", .type = .json }} };
+        if (self.json_null_results) return .{ .is_select = true, .columns = &.{.{ .name = "j", .type = .json }} };
         if (self.array_results) return .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .jsonb }} };
         return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.settingEpoch() };
     }
@@ -1572,6 +1573,34 @@ test "pgwire pull failure and disconnect close snapshots before releasing identi
         try std.testing.expectEqual(@as(usize, 0), mock.executions);
         try std.testing.expectEqual(@as(usize, 1), mock.releases);
     }
+}
+
+test "pgwire suspended materialized SELECT rechecks authority before sending more rows" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "q", "SELECT j FROM t", false);
+    try bind(&input.writer, "p", "q", null);
+    try execute(&input.writer, "p", 1);
+    try execute(&input.writer, "p", 1);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .json_null_results = true, .revoke_on_buffered_resume = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    var rows: usize = 0;
+    var denied = false;
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        const payload = try cursor.take(length - 4);
+        if (tag == 'D') rows += 1;
+        if (tag == 'E') denied = std.mem.indexOf(u8, payload, "42501") != null;
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows);
+    try std.testing.expect(denied);
+    try std.testing.expectEqual(@as(usize, 1), mock.executions);
 }
 
 test "pgwire distinguishes JSON null from SQL NULL in text and binary suspended portals" {

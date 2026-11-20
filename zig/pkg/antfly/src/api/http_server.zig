@@ -2035,6 +2035,7 @@ pub const AuthenticatedIdentity = struct {
     /// intersect the request's admitted permission snapshot with this live
     /// policy source so revocation can take effect within a long request.
     live_user_manager: ?*usermgr.UserManager = null,
+    bound_policy_roles: ?[32]u8 = null,
     catalog_aliases: []CatalogAlias = &.{},
     /// Stable identity of the credential that authenticated this request.
     /// Multiple API keys owned by one user must not become interchangeable
@@ -8826,7 +8827,7 @@ pub const ApiHttpServer = struct {
             .write => .write,
             else => return error.RowPolicyAuthenticationRequired,
         };
-        return manager.signRowPolicyRolesAuthorized(
+        return manager.signBoundRowPolicyRoles(
             self.alloc,
             identity.username,
             identity.credential_principal,
@@ -8836,6 +8837,7 @@ pub const ApiHttpServer = struct {
             issuer,
             bound_scope,
             @intCast(@divFloor(self.internalAuthRealtimeNs(), std.time.ns_per_s)),
+            identity.bound_policy_roles,
         );
     }
 
@@ -60369,6 +60371,7 @@ pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedId
     owned.is_internal_service = value.is_internal_service;
     owned.mcp_creation_discovery = value.mcp_creation_discovery;
     owned.live_user_manager = value.live_user_manager;
+    owned.bound_policy_roles = value.bound_policy_roles;
     for (value.catalog_aliases) |alias| try appendCatalogAlias(alloc, &owned, alias.logical, alias.physical);
     return owned;
 }
