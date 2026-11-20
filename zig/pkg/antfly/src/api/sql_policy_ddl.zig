@@ -201,7 +201,8 @@ test "SQL policy DDL writes a durable draft only and never publishes it" {
                     break :blk alloc.dupe(u8, "{\"revision\":7,\"next_id\":42}");
                 },
                 .resolve_many => |request| blk: {
-                    try std.testing.expect(request.include_query_definitions);
+                    try std.testing.expectEqual(@as(usize, 1), request.targets.len);
+                    try std.testing.expectEqualStrings("accounts", request.targets[0].table);
                     break :blk std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{ .revision = 7, .tables = &.{.{ .table_id = 17, .name = "table:immutable-17", .query_definition = .{ .table_id = 17, .schema_json = schema_json, .read_schema_json = "", .indexes_json = "{}" } }} }, .{});
                 },
                 .setting_snapshot => |scope| std.json.Stringify.valueAlloc(alloc, settings.RawSnapshot{ .scope = scope, .epoch = 1, .definitions = &.{} }, .{}),
