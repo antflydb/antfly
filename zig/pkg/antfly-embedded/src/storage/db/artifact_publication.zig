@@ -1184,8 +1184,15 @@ pub fn prepareBaseVectors(alloc: std.mem.Allocator, command: Command, catalogs: 
                 if (!std.meta.eql(try codec.denseEmbeddingModelRevision(value), required_revision) or
                     (required_revision != null and !std.meta.eql(command.execution_identity, required_revision)))
                     return error.InvalidBatchRequest;
-                const vector = try codec.decodeDenseEmbeddingAlloc(scratch, value);
-                if (vector.len != dims) return error.InvalidBatchRequest;
+                const vector: []const f32 = if (required_revision != null) pinned: {
+                    if (try codec.decodeDenseEmbeddingDims(value) != dims) return error.InvalidBatchRequest;
+                    // Pinned projection loads the accepted artifact and checks its revision.
+                    break :pinned &.{};
+                } else legacy: {
+                    const decoded = try codec.decodeDenseEmbeddingAlloc(scratch, value);
+                    if (decoded.len != dims) return error.InvalidBatchRequest;
+                    break :legacy decoded;
+                };
                 for (consumers.items) |consumer| try dense.append(scratch, .{ .index_name = consumer.name, .doc_key = identity.doc_key, .artifact_key = artifact_key, .vector = vector });
             } else {
                 if (header.kind != .sparse_embedding) return error.InvalidBatchRequest;
@@ -1527,6 +1534,8 @@ test "ordered artifact inventory publication projects every shared consumer and 
     var pinned = try prepareBaseVectors(alloc, command, catalogs);
     defer pinned.deinit();
     try std.testing.expectEqualStrings("pinned", pinned.batch.dense_embeddings[0].index_name);
+    try std.testing.expectEqualStrings(pinned_key, pinned.batch.dense_embeddings[0].artifact_key.?);
+    try std.testing.expectEqual(@as(usize, 0), pinned.batch.dense_embeddings[0].vector.len);
     try @import("online_vector_artifacts.zig").validate(pinned_key, pinned_payload);
 }
 

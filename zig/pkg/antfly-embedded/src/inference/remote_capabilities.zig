@@ -1521,7 +1521,10 @@ fn loadMissingModelInstance(
     defer response.deinit();
     if (response.ok()) return true;
     if (response.status.code == 404 or response.status.code == 405 or response.status.code == 501) return false;
-    const failure = modelInstanceStatusError(alloc, response.status.code, response.body orelse "");
+    const failure = if (context.required_model_revision != null and capabilityStaleResponse(response))
+        error.RemoteCapabilityDiscoveryTransient
+    else
+        modelInstanceStatusError(alloc, response.status.code, response.body orelse "");
     if (failure == error.RemoteCapabilityDiscoveryTransient) recordDiscoveryRetryHint(alloc, io, response, context);
     return failure;
 }
@@ -1637,8 +1640,12 @@ fn discoverWithContextOnce(
     const capabilities = try parseModelCapabilities(alloc, body, model, operation.task());
     if (required_revision) |revision| {
         const descriptor = capabilities orelse return error.RemoteCapabilitySelectorAbsent;
-        if (!descriptor.model_revision_pinning or !std.meta.eql(descriptor.model_revision, @as(?[32]u8, revision)))
-            return error.RemoteCapabilityDiscoveryRejected;
+        if (!descriptor.model_revision_pinning) return error.RemoteCapabilityDiscoveryRejected;
+        const observed_revision = descriptor.model_revision orelse return error.RemoteCapabilityDiscoveryRejected;
+        if (!std.mem.eql(u8, &observed_revision, &revision)) {
+            recordDiscoveryRetryHint(alloc, io, response, context);
+            return error.RemoteCapabilityDiscoveryTransient;
+        }
     }
     if (capabilities == null) {
         if (response.headers.get(capability_selector_rejected_header)) |value| {
@@ -2651,6 +2658,52 @@ test "model activation preserves the instance eviction retry contract without we
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, modelInstanceStatusError(a, 408, "{\"error\":\"INFERENCE_CANCELLED\",\"retryable\":false}"));
 }
 
+test "revision-scoped model activation treats a stale proof rejection as retryable" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Fixture = struct {
+        fn serve(service: *httpx.TestServer) std.Io.Cancelable!void {
+            service.handleOne() catch {};
+        }
+    };
+    for ([_]bool{ false, true }) |pinned| {
+        var server = try httpx.TestServer.start(alloc, io, &.{.{
+            .method = .POST,
+            .path = "/ai/v1/models/instances",
+            .respond = .{
+                .status = 409,
+                .body = "{}",
+                .headers = &.{
+                    .{ .name = capability_stale_header, .value = "true" },
+                    .{ .name = "Retry-After", .value = "1" },
+                },
+            },
+        }});
+        defer server.deinit();
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Fixture.serve, .{&server});
+        var http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        defer http.deinit();
+        var retry_at: u64 = 0;
+        const result = loadMissingModelInstance(alloc, io, &http, server.baseUrl(), "cold", .embed, &.{}, .{
+            .deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s,
+            .required_model_revision = if (pinned) @as([32]u8, @splat(0x11)) else null,
+            .retry_not_before_ns = &retry_at,
+        });
+        if (pinned) {
+            try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, result);
+            try std.testing.expect(retry_at > monotonicNowNs(io));
+        } else {
+            try std.testing.expectError(error.RemoteCapabilityDiscoveryRejected, result);
+            try std.testing.expectEqual(@as(u64, 0), retry_at);
+        }
+        try group.await(io);
+    }
+}
+
 test "model activation honors caller expiry and cancellation during the load request" {
     const a = std.testing.allocator;
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -2707,7 +2760,7 @@ test "remote Antfly dense output geometry is optional bounded metadata" {
     try std.testing.expect(legacy.dense_output == null);
 }
 
-test "revision-scoped embedding discovery rejects an unpinned or different descriptor" {
+test "revision-scoped embedding discovery cools down revision mismatches and rejects unpinned descriptors" {
     const alloc = std.testing.allocator;
     const requested: [32]u8 = @splat(0x11);
     const sha = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -2766,9 +2819,9 @@ test "revision-scoped embedding discovery rejects an unpinned or different descr
                 const alias = try scopeDigest(alloc, server.baseUrl(), "model", .embed, &.{});
                 try std.testing.expect(!std.mem.eql(u8, &pinned, &alias));
             },
-            .changed, .unpinned => try std.testing.expectError(error.RemoteCapabilityDiscoveryRejected, result),
+            .unpinned => try std.testing.expectError(error.RemoteCapabilityDiscoveryRejected, result),
             .missing => try std.testing.expectError(error.RemoteCapabilitySelectorAbsent, result),
-            .busy => {
+            .changed, .busy => {
                 try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, result);
                 const first_delay = retry_at;
                 try std.testing.expect(first_delay > monotonicNowNs(io));
