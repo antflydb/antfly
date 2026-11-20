@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Release-readiness checks for the Lite quickstart and Wikipedia walkthrough."""
+"""Release-readiness checks for the public quickstart."""
 
 from __future__ import annotations
 
@@ -28,7 +28,6 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 QUICKSTART = REPO / "docs" / "guides" / "quickstart.mdx"
-WIKIPEDIA_GUIDE = REPO / "docs" / "guides" / "wikipedia-search.mdx"
 # Pages on the launch path (home -> install -> docs). Their fenced blocks and
 # cURL payloads get the same static checks as the quickstart.
 LAUNCH_PAGES = (
@@ -36,6 +35,7 @@ LAUNCH_PAGES = (
     REPO / "docs" / "downloads.mdx",
     REPO / "docs" / "guides" / "inference.mdx",
     REPO / "docs" / "guides" / "hybrid-search.mdx",
+    REPO / "docs" / "guides" / "cloud-migration.mdx",
 )
 DOCS_DIR = REPO / "docs"
 # Terminology is fixed, not decorative. Prose must not use these forms.
@@ -94,15 +94,18 @@ def check_shell(block: str, index: object) -> None:
 
 
 def check_json_payloads(source: str) -> None:
-    payloads = re.findall(r"\s-d '(\{.*?\})'", source, re.DOTALL)
-    payloads += re.findall(r"<<'JSON'\n(.*?)^JSON$", source, re.MULTILINE | re.DOTALL)
+    payloads = re.findall(
+        r"(?:\s-d|--(?:embedder|chunker|reranker|pruner|generator|index|schema|filter-query|aggregations)) '(\{.*?\})'",
+        source,
+        re.DOTALL,
+    )
     if not payloads:
         fail("no request JSON payloads found")
     for index, payload in enumerate(payloads, start=1):
         try:
             json.loads(payload)
         except json.JSONDecodeError as error:
-            fail(f"cURL JSON payload {index} is invalid: {error}")
+            fail(f"request JSON payload {index} is invalid: {error}")
 
 
 def check_page_blocks(path: Path) -> None:
@@ -122,7 +125,7 @@ def check_page_blocks(path: Path) -> None:
         try:
             json.loads(payload)
         except json.JSONDecodeError as error:
-            fail(f"{path.name} cURL JSON payload {index} is invalid: {error}")
+            fail(f"{path.name} request JSON payload {index} is invalid: {error}")
 
 
 def check_terminology() -> None:
@@ -172,7 +175,7 @@ def check_recording_coverage_wait(tape: str) -> None:
         cursor = index + 1
         while command.endswith("\\"):
             if cursor >= len(lines) or lines[cursor] != "Enter":
-                fail("the Wikipedia recording must enter each continued command")
+                fail("the quickstart recording must enter each continued command")
             cursor += 1
             continued = (
                 re.fullmatch(r"Type(?:@\S+)? `([^`]*)`", lines[cursor])
@@ -180,7 +183,7 @@ def check_recording_coverage_wait(tape: str) -> None:
                 else None
             )
             if continued is None:
-                fail("the Wikipedia recording has an incomplete source-coverage wait")
+                fail("the quickstart recording has an incomplete source-coverage wait")
             command = command[:-1] + continued[1]
             cursor += 1
         following = []
@@ -189,7 +192,7 @@ def check_recording_coverage_wait(tape: str) -> None:
             cursor += 1
         waits.append((command, following))
     if len(waits) != 1:
-        fail("the Wikipedia recording must have one source-coverage wait")
+        fail("the quickstart recording must have one source-coverage wait")
     command, following = waits[0]
     try:
         args = shlex.split(command)
@@ -203,7 +206,7 @@ def check_recording_coverage_wait(tape: str) -> None:
     ):
         values = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg in flags]
         if values != [expected]:
-            fail(f"the Wikipedia recording wait requires {flags[-1]} {expected}")
+            fail(f"the quickstart recording wait requires {flags[-1]} {expected}")
     directives = [
         line.strip()
         for line in following
@@ -216,7 +219,7 @@ def check_recording_coverage_wait(tape: str) -> None:
         or directives[0] != "Enter"
         or directives[1] not in {"Wait@2700s /❯/", "Wait+Line@2700s /❯/"}
     ):
-        fail("the Wikipedia recording must wait for the prompt after source coverage")
+        fail("the quickstart recording must wait for the prompt after source coverage")
 
 
 def main() -> int:
@@ -224,9 +227,7 @@ def main() -> int:
         check_page_blocks(page)
     check_terminology()
 
-    check_page_blocks(QUICKSTART)
-    check_json_payloads(QUICKSTART.read_text(encoding="utf-8"))
-    source = WIKIPEDIA_GUIDE.read_text(encoding="utf-8")
+    source = QUICKSTART.read_text(encoding="utf-8")
     go_example = GO_EXAMPLE.read_text(encoding="utf-8")
     quickstart_tape = QUICKSTART_TAPE.read_text(encoding="utf-8")
 
@@ -236,10 +237,10 @@ def main() -> int:
     demo_config = json.loads((REPO / "wikipedia-config.json").read_text())
     for name, config in demo_config["indexes"].items():
         if config["embedder"]["model"] != embedding_model:
-            fail(f"the {name} recording index must use the Wikipedia walkthrough embedding model")
+            fail(f"the {name} recording index must use the quickstart embedding model")
         if config.get("dimension", 768) != 768:
             fail(f"the {name} recording index must match EmbeddingGemma2's dimensions")
-    for label, example in (("Wikipedia walkthrough", source), ("Go example", go_example)):
+    for label, example in (("quickstart", source), ("Go example", go_example)):
         if embedding_model not in example:
             fail(f"{label} must use EmbeddingGemma2")
         if "clipclap" in example.lower() or "Qwen3-Embedding" in example:
@@ -270,16 +271,15 @@ def main() -> int:
         "wiki-articles.json ": "the downloaded fixture must be identified as JSONL",
         "--streaming=false": "the retrieval CLI uses the --no-streaming switch",
         "eligible-source-covered": "source-covered already excludes skipped documents",
-        "Q4_K_M": "the Wikipedia walkthrough must use the published Q4_0 variant",
-        "--followup": "the Wikipedia walkthrough should request only the grounded answer",
-        "--reasoning": "the Wikipedia walkthrough should request only the grounded answer",
+        "Q4_K_M": "the Gemma quickstart must use the published Q4_0 variant",
+        "--followup": "the quickstart should request only the grounded answer",
+        "--reasoning": "the quickstart should request only the grounded answer",
     }
     for token, message in forbidden.items():
         if token in source:
             fail(f"{message}: found {token!r}")
 
     required = (
-        'export PATH="$HOME/.local/bin:$PATH"',
         "wiki-articles.jsonl",
         "2,446 of the 10,000",
         "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank",
@@ -297,10 +297,10 @@ def main() -> int:
     )
     for token in required:
         if token not in source:
-            fail(f"Wikipedia walkthrough is missing required release guidance: {token!r}")
+            fail(f"quickstart is missing required release guidance: {token!r}")
 
     if source.count("antfly load --table wikipedia") != 1:
-        fail("the Wikipedia walkthrough must have exactly one shared Wikipedia ingestion step")
+        fail("the quickstart must have exactly one shared Wikipedia ingestion step")
     if source.index("antfly load --table wikipedia") > source.index("## Search"):
         fail("the shared ingestion step must precede every search example")
     load_blocks = [
@@ -323,7 +323,7 @@ def main() -> int:
         "thumbnail": "--until searchable-artifacts=250",
     }
     if len(wait_blocks) != len(expected_waits):
-        fail("the Wikipedia walkthrough must have one text wait and one image wait")
+        fail("the quickstart must have one text wait and one image wait")
     for index, condition in expected_waits.items():
         matching = [block for block in wait_blocks if f"--index {index}" in block]
         if (
@@ -333,16 +333,16 @@ def main() -> int:
         ):
             fail(f"the {index} wait must use {condition} with a 45-minute timeout")
     if "rg '" in source:
-        fail("Wikipedia walkthrough troubleshooting must not require undeclared ripgrep tooling")
+        fail("quickstart troubleshooting must not require undeclared ripgrep tooling")
     check_recording_coverage_wait(quickstart_tape)
     if "--until searchable-artifacts=1" in quickstart_tape:
-        fail("the Wikipedia recording must not retain the legacy single-artifact wait")
+        fail("the quickstart recording must not retain the legacy single-artifact wait")
     if "wiki-articles.jsonl" not in quickstart_tape:
-        fail("the Wikipedia recording must load the documented JSONL fixture")
+        fail("the quickstart recording must load the documented JSONL fixture")
     if "--sync-level full_text" not in quickstart_tape:
-        fail("the Wikipedia recording must fence full-text visibility before waiting")
+        fail("the quickstart recording must fence full-text visibility before waiting")
     if "Wait@1200s /ready/" in quickstart_tape:
-        fail("the Wikipedia recording must not wait for the complete-only ready state")
+        fail("the quickstart recording must not wait for the complete-only ready state")
 
     for token in (
         'NewAntflyClient("http://127.0.0.1:8080", http.DefaultClient)',
@@ -356,7 +356,7 @@ def main() -> int:
         if token not in go_example:
             fail(f"compile-checked Go example must contain {token!r}")
 
-    print("Lite quickstart and Wikipedia walkthrough documentation checks passed")
+    print("quickstart documentation checks passed")
     return 0
 
 

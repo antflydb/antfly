@@ -120,7 +120,7 @@ SELECT id FROM docs WHERE content @@@ antfly_postgres.hybrid(
 
 ### 4. Add an Embeddings Index for Semantic Search
 
-The table that `CREATE INDEX` creates has no embeddings index. Add one in Antfly over the `content` field, with a model pulled as in [Search Wikipedia with local AI](/docs/guides/wikipedia-search):
+The table that `CREATE INDEX` creates has no embeddings index. Add one in Antfly over the `content` field, with a model pulled as in the [Quickstart](/docs/guides/quickstart):
 
 ```bash
 curl -X POST http://127.0.0.1:8080/db/v1/tables/docs/indexes/content_embeddings \

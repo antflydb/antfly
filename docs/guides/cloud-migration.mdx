@@ -1,0 +1,121 @@
+---
+title: Move a database to Antfly Cloud
+description: Upload a consistent Lite snapshot, verify the managed copy, and export a copy to your own host
+prerequisites:
+  - "An existing Lite database and its compatible Antfly runtime"
+  - "An Antfly Cloud organization with billing and Lite access"
+tags: [cloud, lite, migration]
+---
+
+Move the complete database from the [Quickstart](/docs/guides/quickstart) to
+Antfly Cloud, then run the same CLI query against the managed copy. Import
+creates a new database, including its tables and indexes. You do not need to
+create an empty database or load the documents again.
+
+## Before you start
+
+Sign up at [Antfly Cloud](https://platform.antfly.io), verify your email, create
+an organization, and complete billing setup. Review the displayed price and any
+introductory terms. If Lite creation is unavailable for your organization,
+contact Antfly. See [Cloud getting started](/docs/cloud/getting-started).
+
+Use the runtime that created your local file to snapshot it. The Quickstart uses
+[v0.3.1](https://github.com/antflydb/antfly/releases/tag/v0.3.1); Cloud uses its
+own runtime, and import preflight must accept the snapshot. Models, credentials,
+and external media dependencies need separate configuration. The Quickstart's
+keyword-only database does not need a model.
+
+## Snapshot the local database
+
+In the `antfly-quickstart` directory, create a consistent copy while the server
+is running:
+
+```bash
+antfly lite snapshot quickstart.aflite --out upload.aflite
+```
+
+Use a new output file and keep the original database. Do not copy a live
+`.aflite` file directly while an application is writing it.
+
+## Import into Cloud
+
+1. Choose **Bring a Lite database** and select `upload.aflite`.
+2. Choose **Upload or resume snapshot**. Wait for compatibility verification,
+   then choose **Review and create database**.
+3. Wait for **Ready**. Create an API key with read/write access restricted to
+   the imported `wikipedia` table, and copy the instance endpoint.
+
+For another database, scope the key to the tables your application uses.
+
+## Connect the CLI and verify
+
+In Bash, replace `INSTANCE_ID` and read the key without echoing it:
+
+```bash
+unset ANTFLY_USERNAME ANTFLY_PASSWORD ANTFLY_DATABASE ANTFLY_NAMESPACE
+export ANTFLY_URL=https://platform.antfly.io/cloud/v1/INSTANCE_ID
+read -r -s -p 'API key: ' ANTFLY_TOKEN
+printf '\n'
+export ANTFLY_TOKEN
+```
+
+`ANTFLY_URL` is the server base URL; the CLI adds `/db/v1`. Keep the key out of
+source control and public browser code. Repeat the Quickstart query:
+
+```bash
+antfly query --table wikipedia \
+  --full-text-search 'body:"Korea"' \
+  --fields "title,url" \
+  --limit 5
+```
+
+Compare the article IDs, titles, and URLs with the local results. Do not rerun
+table creation or ingestion. The CLI request stays the same; the endpoint and
+authentication change.
+
+The two copies are independent. Later local writes do not sync to Cloud. For an
+application cutover, pause writes before the final snapshot, verify the managed
+copy, then switch the application. An embedded Lite application needs an HTTP
+client or adapter to connect to Cloud.
+
+## Export a copy to your own host
+
+Export from the instance page and download the snapshot to a new file. Keep
+that download untouched. Use a runtime compatible with the exported file and
+its managed runtime; a local CLI version alone does not establish compatibility.
+
+Stop any local server using port 8080, then serve a working copy:
+
+```bash
+mkdir returned-lite
+cp downloaded.aflite returned-lite/database.aflite
+cd returned-lite
+antfly standalone --storage-engine lite --storage-path "$PWD/database.aflite"
+```
+
+A Cloud-created file can contain standalone table namespaces. Serving it through
+the Lite-backed HTTP API preserves that access path. Add a separate `--data-dir`
+if you need to isolate other server state.
+
+In another terminal, reconnect the CLI locally and repeat the query:
+
+```bash
+unset ANTFLY_URL ANTFLY_TOKEN
+antfly query --table wikipedia \
+  --full-text-search 'body:"Korea"' \
+  --fields "title,url" \
+  --limit 5
+```
+
+For semantic search or new enriched writes, configure compatible inference and
+credentials on the destination. The local Quickstart's optional 8 GiB inference
+budget is not a managed Lite capacity guarantee.
+
+## Finish
+
+Revoke temporary keys when finished. Exporting a snapshot or stopping a local
+process does not delete the managed database or cancel its commitment. Review
+[Billing and usage](/docs/cloud/billing-usage).
+
+If the managed database sleeps after inactivity, choose **Resume database** and
+wait for **Ready** before retrying. Queries do not wake it automatically.

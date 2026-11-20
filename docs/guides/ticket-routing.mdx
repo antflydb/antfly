@@ -75,7 +75,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
 
 ## Before You Start
 
-Antfly running with the embedding, reranking, and generation models pulled (see [Search Wikipedia with local AI](/docs/guides/wikipedia-search)), a Postgres with `wal_level = logical`, and its connection string stored as a secret:
+Antfly running with the embedding, reranking, and generation models pulled (the [optional AI steps in the Quickstart](/docs/guides/quickstart#optional-local-ai) leave you there), a Postgres with `wal_level = logical`, and its connection string stored as a secret:
 
 ```bash
 antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
