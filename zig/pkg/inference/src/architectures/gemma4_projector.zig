@@ -7604,6 +7604,43 @@ fn writeVideoTestProjector(a: std.mem.Allocator, path: []const u8, unified: bool
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = bytes.items });
 }
 
+test "gemma4 video portable generation projects edited AV1 above the embedding input limit" {
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    const compat = @import("../io/compat.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/video.gguf", .{tmp.sub_path});
+    defer a.free(path);
+    try writeVideoTestProjector(a, path, false, 2);
+    const absolute = try compat.cwd().realPathFileAlloc(compat.io(), path, a);
+    defer a.free(absolute);
+    const projector = try ProjectorStore.open(a, absolute);
+    defer projector.close();
+
+    const original = @embedFile("../testdata/video/codecs/av1.mp4");
+    const bytes = try a.alloc(u8, 64 * 1024 * 1024 + 8);
+    defer a.free(bytes);
+    @memcpy(bytes[0..original.len], original);
+    const padding = bytes[original.len..];
+    @memset(padding, 0);
+    std.mem.writeInt(u32, padding[0..4], @intCast(padding.len), .big);
+    @memcpy(padding[4..8], "free");
+    const edit = std.mem.indexOf(u8, original, "elst").? + 4;
+    std.mem.writeInt(u32, bytes[edit + 8 ..][0..4], 2000, .big);
+    std.mem.writeInt(i32, bytes[edit + 12 ..][0..4], 6144, .big);
+    try std.testing.expectError(error.ResourceLimitExceeded, @import("../pipelines/embedding_gemma2_video.zig").selectedPresentationUs(a, bytes, .{}, .reference, null));
+    var projected = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{}, a, projector, bytes);
+    defer projected.deinit();
+    try std.testing.expectEqualSlices(i64, &.{ 125000, 1125000 }, projected.timestamps_us);
+    try std.testing.expectEqual(@as(usize, 2), projected.images.tokens_per_image.len);
+}
+
 test "gemma4 video CUDA and portable preparation share the video resize policy" {
     if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.SkipZigTest;
     const cuda = @import("../ops/cuda/cuda_compute.zig");
@@ -7694,6 +7731,9 @@ test "gemma4 video CUDA projects resident frames and matches native patch projec
             try std.testing.expectEqual(@as(usize, 32), fallback.timestamps_us.len);
             try std.testing.expectEqual(@as(i64, 0), fallback.timestamps_us[0]);
             try std.testing.expectEqual(@as(i64, 60000000), fallback.timestamps_us[31]);
+            const prompt = try @import("gemma4_multimodal.zig").expandVideoPromptText(a, "<|video|>", fallback.timestamps_us);
+            defer a.free(prompt);
+            try std.testing.expect(std.mem.endsWith(u8, prompt, "01:00 <|image|>"));
         }
         const cfg = try parseConfig(&projector.gguf.parsed);
         const g = targetGeometry(cfg, 160, 96);

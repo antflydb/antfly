@@ -24,7 +24,17 @@ const PPS = struct { bytes: []u8, sps: usize };
 const Parameter = struct { at: ?usize, kind: u8, id: usize, bytes: []u8, original: bool };
 pub const Entry = struct { avcc: []u8, config: h264.Config, sps_hash: [32]u8 };
 pub const Epoch = struct { start: usize, end: usize, entry: usize, independent: bool = false, max_refs: usize };
-pub const Context = struct { session: *Session, base: usize, independent_start: bool = false, max_refs: usize };
+pub const Context = struct {
+    session: *Session,
+    base: usize,
+    independent_start: bool = false,
+    max_refs: usize,
+
+    pub fn progressiveRestart(self: Context, relative_target: usize) ?usize {
+        const packet = self.session.progressiveRestart(self.base, self.base + relative_target) orelse return null;
+        return packet - self.base;
+    }
+};
 /// Forward selections retain DPB/assembly state within a compatible epoch.
 /// Crossing an SPS geometry/representation epoch constructs a fresh owner;
 /// parameter changes inside an epoch use the same validated registry as replay.
@@ -448,6 +458,14 @@ pub const Session = struct {
         for (self.epochs.items) |epoch| if (index >= epoch.start and index < epoch.end) return epoch;
         return error.MissingVideoParameterSet;
     }
+    /// Last complete progressive IDR in this epoch at or before the target.
+    pub fn progressiveRestart(self: *const Session, epoch_start: usize, target: usize) ?usize {
+        const after = std.sort.upperBound(usize, self.progressive_idrs.items, target, packetOrder);
+        if (after == 0) return null;
+        const packet = self.progressive_idrs.items[after - 1];
+        return if (packet >= epoch_start) packet else null;
+    }
+
     /// Replay an immutable registry with request-local IO, cancellation counters
     /// and decoder allocation ownership. Only metadata slices are shared; this
     /// temporary view is never deinitialized as a registry owner.
@@ -514,8 +532,8 @@ pub const Session = struct {
                 if (options.picture_observer == null) {
                     end = start + 1;
                     while (end < first) : (end += 1) {
-                        const after = std.sort.upperBound(usize, self.progressive_idrs.items, indexes[slots[end]], packetOrder);
-                        if (after != 0 and self.progressive_idrs.items[after - 1] > indexes[slots[end - 1]] + 1) break;
+                        if (self.progressiveRestart(epoch.start, indexes[slots[end]])) |restart|
+                            if (restart > indexes[slots[end - 1]] + 1) break;
                     }
                 }
                 var capture = Capture{ .slots = slots[start..end], .context = context, .callback = callback };

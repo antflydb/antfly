@@ -126,15 +126,14 @@ pub const Owner = struct {
     pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits) !Owner {
         if (reader.packets.len == 0) return error.EmptyVideo;
         if (reader.input.identity.len == 0) return error.InvalidVideoReaderSelection;
-        const registry = if (reader.track.inband_parameter_sets) try video.h264_dynamic.Session.initPlanning(a, reader, .{ .max_parameter_packets = reader.packets.len }) else null;
+        var planning = video.h264_pictures.Options.forTrack(reader.packets.len);
+        planning.decode.max_dependency_packets = limits.max_dependency_packets;
+        const registry = if (reader.track.requiresAvcRegistry()) try video.h264_dynamic.Session.initPlanning(a, reader, planning.decode) else null;
         errdefer if (registry) |owner| owner.deinit();
         var logical: ?video.h264_pictures.Index = null;
         errdefer if (logical) |*index| index.deinit();
-        if (reader.track.codec == .avc) {
-            const cfg = try video.h264.configParse(a, reader.track.avcc);
-            defer cfg.groups.deinit(a);
-            if (reader.track.inband_parameter_sets or !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes or cfg.groups.count > 1 or cfg.redundant) logical = try video.h264_pictures.planning(a, reader, .{ .max_packets = reader.packets.len, .max_pictures = reader.packets.len }, registry);
-        }
+        if (try video.packet_sampling.needsLogicalIndex(a, reader.track))
+            logical = try video.h264_pictures.planning(a, reader, planning, registry);
         const count = if (logical) |index| index.pictures.len else reader.packets.len;
         var metadata_bytes = try std.math.add(usize, try video.sampling.Timeline.storageBytes(count), try std.math.mul(usize, count, @sizeOf(video.sampling.TimedPicture)));
         if (reader.track.codec == .avc) metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, reader.packets.len, @sizeOf(usize)));
@@ -162,6 +161,9 @@ pub const Owner = struct {
         errdefer timeline.deinit();
         var seek_cache: ?video.decode_plan.SeekCache = if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null;
         errdefer if (seek_cache) |*cache| cache.deinit();
+        if (registry) |owner| {
+            for (owner.progressive_idrs.items) |packet| seek_cache.?.nearest[packet] = packet;
+        }
         var dependencies: ?Dependencies = if (logical) |index| try Dependencies.init(a, index) else null;
         errdefer if (dependencies) |*index| index.deinit();
         return .{ .metadata_reservation = metadata_reservation, .dependencies = dependencies, .timeline = timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool, .limits = limits };

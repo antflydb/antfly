@@ -1605,8 +1605,12 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
     const coded_pixels = try std.math.mul(usize, cfg.coded_width, cfg.coded_height);
     if (coded_pixels > options.max_pixels) return error.ResourceLimitExceeded;
     var start = if (live.initialized) live.next_packet else first_index;
+    // A cold progressive run can reuse the validated slice-prefix index.
+    // Field and partition assemblies still resolve their reset from payloads.
+    const restart = if (live.initialized) start else if (configurations) |epoch| epoch.progressiveRestart(start) else null;
+    start = restart orelse start;
     var dependency_count: usize = 0;
-    while (!live.initialized) {
+    while (restart == null) {
         if (dependency_count >= options.max_dependency_packets) return error.ResourceLimitExceeded;
         dependency_count += 1;
         if (reader.packets[start].size > options.max_packet_bytes) return error.ResourceLimitExceeded;

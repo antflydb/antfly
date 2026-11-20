@@ -176,9 +176,9 @@ pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gp
 
 test "video prompt allowance is independent of the image token setting" {
     const messages = [_]Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
-    try std.testing.expectEqual(@as(usize, 2560), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma }));
-    try std.testing.expectEqual(@as(usize, 2560), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma, .mm_tokens_per_image = 280 }));
-    try std.testing.expectEqual(@as(usize, 1408), try nativeGenerationPromptTokenLimit(.{ .family = .gemma, .max_position_embeddings = 4096 }, null, 128, 0, nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma })));
+    try std.testing.expectEqual(@as(usize, 2848), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma }));
+    try std.testing.expectEqual(@as(usize, 2848), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma, .mm_tokens_per_image = 280 }));
+    try std.testing.expectEqual(@as(usize, 1120), try nativeGenerationPromptTokenLimit(.{ .family = .gemma, .max_position_embeddings = 4096 }, null, 128, 0, nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma })));
     const rendered = try formatMessages(std.testing.allocator, &messages);
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "<|video|> describe") != null);

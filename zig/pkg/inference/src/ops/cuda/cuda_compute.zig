@@ -13570,7 +13570,7 @@ fn allocPinnedTempSlot(
             return slot.buffer;
         }
         self.stats.temp_buffer_misses += 1;
-        slot.buffer = try buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
+        slot.buffer = try allocFreshTempBufferUnlocked(self, len, .required);
         slot.requested_len = len;
         self.noteDeviceBytes(len);
         self.stats.device_alloc_calls += 1;
@@ -14007,7 +14007,9 @@ fn allocDeviceBufferOrdinary(self: *CudaCompute, len: usize) !buffer_mod.DeviceB
     return allocDeviceBufferOrdinaryWithPolicy(self, len, .required);
 }
 
-fn allocDeviceBufferOrdinaryWithPolicy(self: *CudaCompute, len: usize, policy: enum { required, optional }) !buffer_mod.DeviceBuffer {
+const TempAllocPolicy = enum { required, optional };
+
+fn allocDeviceBufferOrdinaryWithPolicy(self: *CudaCompute, len: usize, policy: TempAllocPolicy) !buffer_mod.DeviceBuffer {
     const lock_sample = self.temp_scan_profile.beginLock(0);
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
@@ -14072,47 +14074,34 @@ fn allocDeviceBufferOrdinaryWithPolicy(self: *CudaCompute, len: usize, policy: e
         return buffer;
     }
     self.stats.temp_buffer_misses += 1;
-    const buffer = buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |err| {
-        if (policy == .optional) return err;
-
-        if (err == error.CudaMemoryLimitExceeded) {
-            // Physical retention is charged to this owner. A new shape may
-            // need space occupied by idle exact-size cache entries. Reclaim
-            // those entries before retrying; active/pinned buffers stay live.
-            try forceDrainDeferredDeviceFreesUnlocked(self);
-            while (true) {
-                const retry = buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |retry_err| {
-                    if (retry_err != error.CudaMemoryLimitExceeded) return retry_err;
-                    // Another CUDA owner may consume physical VRAM even when
-                    // our quota has room. Reclaim idle buffers until allocation
-                    // succeeds; keep active and graph-pinned buffers intact.
-                    if (self.temp_buffers.buffers.items.len == 0) return error.ResourceLimitExceeded;
-                    var idle = self.temp_buffers.pop().?;
-                    self.stats.temp_buffer_evictions += 1;
-                    self.stats.device_free_calls += 1;
-                    idle.free(&self.ctx);
-                    continue;
-                };
-                self.noteDeviceBytes(len);
-                self.stats.device_alloc_calls += 1;
-                traceCudaTempAlloc(self, seq, "alloc_budget_retry", len, retry);
-                return retry;
-            }
-        }
-        if (self.deferred_device_frees.items.len != 0) {
-            try forceDrainDeferredDeviceFreesUnlocked(self);
-            const retry = try buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
-            self.noteDeviceBytes(len);
-            self.stats.device_alloc_calls += 1;
-            traceCudaTempAlloc(self, seq, "alloc_miss_retry", len, retry);
-            return retry;
-        }
+    const buffer = allocFreshTempBufferUnlocked(self, len, policy) catch |err| {
+        if (policy == .required and err == error.CudaMemoryLimitExceeded) return error.ResourceLimitExceeded;
         return err;
     };
     self.noteDeviceBytes(len);
     self.stats.device_alloc_calls += 1;
     traceCudaTempAlloc(self, seq, "alloc_miss", len, buffer);
     return buffer;
+}
+
+/// Caller holds temp_buffer_mutex. Only idle or deferred allocations can be
+/// reclaimed. Active tensors and existing graph slots retain their addresses.
+fn allocFreshTempBufferUnlocked(self: *CudaCompute, len: usize, policy: TempAllocPolicy) !buffer_mod.DeviceBuffer {
+    return buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |err| {
+        if (policy == .optional or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return err;
+        if (err != error.CudaMemoryLimitExceeded and self.deferred_device_frees.items.len == 0) return err;
+        try forceDrainDeferredDeviceFreesUnlocked(self);
+        while (true) {
+            return buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |retry_err| {
+                if (retry_err != error.CudaMemoryLimitExceeded) return retry_err;
+                var idle = self.temp_buffers.pop() orelse return retry_err;
+                self.stats.temp_buffer_evictions += 1;
+                self.stats.device_free_calls += 1;
+                idle.free(&self.ctx);
+                continue;
+            };
+        }
+    };
 }
 
 /// Persistent state uses only exact ordinary-cache allocations. It must never
@@ -39753,7 +39742,7 @@ test "Gemma4 CUDA projector optional scratch leaves graph slots available after 
     try std.testing.expectError(error.CudaMemoryLimitExceeded, allocDeviceBufferOrdinaryWithPolicy(&compute, 1024, .optional));
     try std.testing.expectError(error.CudaMemoryLimitExceeded, allocDeviceBufferOrdinaryWithPolicy(&compute, 1024, .required));
     try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items[0].requested_len);
-    try budget.setLimit(before.limit);
+    defer budget.setLimit(before.limit) catch unreachable;
     var required = try allocDeviceBufferOrdinaryWithPolicy(&compute, 256, .required);
     defer releaseDeviceBuffer(&compute, &required);
     try std.testing.expectEqual(required.ptr, compute.temp_pinned_slots.items[0].buffer.ptr);

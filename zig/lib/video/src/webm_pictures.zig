@@ -121,13 +121,15 @@ const Collect = struct {
     }
 };
 pub fn index(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options) !Index {
+    if (reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
+    const packet_count = reader.packets.len;
     const picture_budget = std.math.mul(usize, @max(options.max_pictures, 8), 2 * @sizeOf(Picture)) catch return error.ResourceLimitExceeded;
-    const restart_budget = std.math.mul(usize, @max(options.max_packets, 8), 2 * @sizeOf(Restart)) catch return error.ResourceLimitExceeded;
+    const restart_budget = std.math.mul(usize, packet_count, 2 * @sizeOf(Restart)) catch return error.ResourceLimitExceeded;
     const array_budget = std.math.add(usize, picture_budget, restart_budget) catch return error.ResourceLimitExceeded;
     const metadata_bytes = std.math.add(usize, array_budget, @sizeOf(@import("codecs/av1_headers.zig").Session)) catch return error.ResourceLimitExceeded;
     var reservation = if (options.decoder.admission_pool) |pool| try pool.acquire(.{ .host_bytes = metadata_bytes }) else media.admission.Token{};
     errdefer reservation.deinit();
-    var collector = Collect{ .allocator = a, .limit = options.max_pictures, .restart_limit = options.max_packets };
+    var collector = Collect{ .allocator = a, .limit = options.max_pictures, .restart_limit = packet_count };
     defer collector.restarts.deinit(a);
     defer collector.pictures.deinit(a);
     if (options.strategy == .headers) {

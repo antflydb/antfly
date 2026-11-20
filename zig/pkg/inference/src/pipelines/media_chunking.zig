@@ -1579,6 +1579,32 @@ test "model aware media streaming audio retains only forward windows and overlap
     }
 }
 
+test "model aware media multi-PPS AVC chunk window binds the active parameter registry" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 128 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var source = media.source.Source{ .allocator = a, .identity = "multi-pps-window", .storage = .{ .borrowed = @embedFile("../testdata/video/h264-two-pps.mp4") }, .admission_pool = &pool };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    for (reader.packets) |*packet| packet.sync = false;
+    var owner = try @import("media_chunking_video.zig").Owner.init(a, &reader, &pool, .{});
+    defer owner.deinit();
+    const policy = video.sampling.TimestampPolicy{ .end_ns = std.time.ns_per_s };
+    var window = try owner.prepare(policy);
+    defer window.deinit();
+    try window.bind(policy, &pool);
+    try std.testing.expect(owner.registry != null and window.selection.?.selected.len > 0);
+    const Count = struct {
+        fn frame(raw: *anyopaque, _: usize, _: *const video.h264.Frame) !void {
+            const delivered: *usize = @ptrCast(@alignCast(raw));
+            delivered.* += 1;
+        }
+    };
+    var delivered: usize = 0;
+    _ = try video.h264.decodeSelected(a, &window.coded.reader, window.selection.?.selected, .{}, &delivered, Count.frame);
+    try std.testing.expectEqual(window.selection.?.selected.len, delivered);
+}
+
 test "model aware media immutable MP4 windows bind metadata without reading or copying coded packets" {
     const a = std.testing.allocator;
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 128 * 1024 * 1024 } };

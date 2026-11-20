@@ -26,7 +26,11 @@ const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Session = @import("../backends/session.zig").Session;
 const memory = @import("../runtime/tier/memory.zig");
 
-pub const token_allowance = video.packet_sampling.gemma4_max_frames * (projector_mod.video_tokens_per_frame + 10);
+// At most one token per ASCII timestamp byte, two separating spaces and two
+// vision boundary tokens. Minutes can exceed two digits on portable decoders.
+const max_minutes = std.math.maxInt(i64) / (60 * std.time.us_per_s);
+const timestamp_bytes = std.fmt.comptimePrint("{d}:59", .{max_minutes}).len;
+pub const token_allowance = video.packet_sampling.gemma4_max_frames * (projector_mod.video_tokens_per_frame + timestamp_bytes + 4);
 
 const sampling: embedding_video.Sampling = .gemma4;
 
@@ -151,6 +155,7 @@ fn reservationControlled(bytes: []const u8, control: Control) Reservation {
 }
 
 pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
+    if (bytes.len > video.packet_sampling.gemma4_max_input_bytes) return error.VideoInputTooLarge;
     if (cb.kind() == .cuda) {
         // NVDEC takes a narrower set of clips than the catalog advertises, and
         // some rejections only surface mid-bitstream. Portable decoding decides
@@ -859,7 +864,7 @@ test "gemma4 video AV1 MP4 preserves the edit across portable selection and deco
     // Start between frames at 0.375 s and retain exactly two seconds.
     std.mem.writeInt(u32, bytes[edit + 8 ..][0..4], 2000, .big);
     std.mem.writeInt(i32, bytes[edit + 12 ..][0..4], 6144, .big);
-    var scope = embedding_video.InspectionScope{ .allocator = a };
+    var scope = embedding_video.InspectionScope{ .allocator = a, .limit = inspection_bytes };
     defer scope.deinit();
     const config = embedding_video.Configuration{ .sampling = .gemma4, .inspection_scope = &scope, .decoder = .{ .policy = .portable } };
     const times = try embedding_video.selectedConfiguredPresentationUs(a, bytes, .{}, config);
@@ -902,7 +907,7 @@ test "gemma4 video multi-PPS supports embedding sampling and sparse long-clip de
     // both previous limits without a second large checked-in bitstream.
     var reader = original;
     reader.track.timescale = 30;
-    reader.packets = try a.alloc(media.mp4.Packet, 4200);
+    reader.packets = try a.alloc(media.mp4.Packet, 12_000);
     defer a.free(reader.packets);
     for (reader.packets, 0..) |*packet, i| {
         packet.* = original.packets[i % original.packets.len];
@@ -910,7 +915,7 @@ test "gemma4 video multi-PPS supports embedding sampling and sparse long-clip de
         packet.duration = 1;
         packet.sync = false; // Prove restart decisions come from the active slice headers.
     }
-    var scope = embedding_video.InspectionScope{ .allocator = a };
+    var scope = embedding_video.InspectionScope{ .allocator = a, .limit = inspection_bytes };
     defer scope.deinit();
     const config = embedding_video.Configuration{ .sampling = .gemma4 };
     _ = try scope.inspect(bytes, &reader, .{}, config, false);
@@ -924,7 +929,11 @@ test "gemma4 video multi-PPS supports embedding sampling and sparse long-clip de
         }
     };
     var counter = Counter{};
+    const before_reads = source.reads;
+    const before_bytes = source.total_bytes;
     const stats = try entry.configurations.?.decodeSelectedBorrowed(a, &reader, entry.selected.?, &counter, Counter.publish);
     try std.testing.expectEqual(@as(usize, 32), counter.seen.count());
+    try std.testing.expectEqual(stats.decoded_packets, source.reads - before_reads);
+    try std.testing.expectEqual(stats.payload_bytes, source.total_bytes - before_bytes);
     try std.testing.expect(stats.decoded_packets <= 32 * original.packets.len);
 }

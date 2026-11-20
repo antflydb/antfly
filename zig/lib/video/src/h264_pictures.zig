@@ -19,7 +19,20 @@ const media = @import("antfly_media");
 const h264 = @import("h264.zig");
 const dynamic = @import("h264_dynamic.zig");
 const sampling = @import("sampling.zig");
-pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 8192, decode: h264.Options = .{ .max_dependency_packets = 8192, .max_parameter_packets = 8192 } };
+pub const Options = struct {
+    max_packets: usize = 8192,
+    max_pictures: usize = 8192,
+    decode: h264.Options = .{ .max_dependency_packets = 8192, .max_parameter_packets = 8192 },
+    /// Header planning follows the already admitted container index. Pixel replay
+    /// retains its independent dependency limit and registry byte ceiling.
+    pub fn forTrack(packet_count: usize) Options {
+        var options = Options{};
+        options.max_packets = packet_count;
+        options.max_pictures = packet_count;
+        options.decode.max_parameter_packets = packet_count;
+        return options;
+    }
+};
 pub const Index = struct {
     allocator: std.mem.Allocator,
     pictures: []h264.Picture,

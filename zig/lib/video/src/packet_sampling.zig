@@ -21,6 +21,7 @@ const h264_pictures = @import("h264_pictures.zig");
 const sampling_mod = @import("sampling.zig");
 
 pub const Sampling = union(enum) { reference, timestamps: sampling_mod.TimestampPolicy, source_timestamps: sampling_mod.TimestampPolicy, gemma4 };
+pub const gemma4_max_input_bytes = 256 * 1024 * 1024;
 pub const gemma4_max_frames = (sampling_mod.TimestampPolicy{}).max_frames;
 
 pub fn presentationUs(pts: i64, origin: i64, scale: u32) !i64 {
@@ -123,20 +124,21 @@ pub const Gemma4Plan = struct {
     }
 };
 
+pub fn needsLogicalIndex(a: std.mem.Allocator, track: media.mp4.Track) !bool {
+    if (track.codec != .avc) return false;
+    if (track.requiresAvcRegistry()) return true;
+    const cfg = try h264.configParse(a, track.avcc);
+    defer cfg.groups.deinit(a);
+    return !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes or cfg.groups.count > 1 or cfg.redundant;
+}
+
 /// Immutable software inputs may need multiple coded members to assemble one picture.
 /// The decoder validates entropy and pixels later, under its own admission.
 pub fn gemma4PortablePlan(a: std.mem.Allocator, reader: *media.mp4.Reader, registry: ?*@import("h264_dynamic.zig").Session) !Gemma4Plan {
-    if (reader.track.codec == .avc) {
-        const complex = if (registry != null or reader.track.requiresAvcRegistry()) true else blk: {
-            const cfg = try h264.configParse(a, reader.track.avcc);
-            defer cfg.groups.deinit(a);
-            break :blk !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes or cfg.groups.count > 1 or cfg.redundant;
-        };
-        if (complex) {
-            var logical = try h264_pictures.planning(a, reader, .{}, registry);
-            defer logical.deinit();
-            return gemma4Pictures(reader, logical.pictures, reader.input.control);
-        }
+    if (registry != null or try needsLogicalIndex(a, reader.track)) {
+        var logical = try h264_pictures.planning(a, reader, h264_pictures.Options.forTrack(reader.packets.len), registry);
+        defer logical.deinit();
+        return gemma4Pictures(reader, logical.pictures, reader.input.control);
     }
     return gemma4Pictures(reader, reader.packets, reader.input.control);
 }
@@ -184,17 +186,10 @@ pub fn selectConfigured(a: std.mem.Allocator, reader: *const media.mp4.Reader, s
         const plan = try gemma4PortablePlan(a, &mutable, registry);
         return a.dupe(usize, plan.ids());
     }
-    if (reader.track.codec == .avc) {
-        const complex = if (reader.track.requiresAvcRegistry()) true else blk: {
-            const cfg = try h264.configParse(a, reader.track.avcc);
-            defer cfg.groups.deinit(a);
-            break :blk !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes or cfg.groups.count > 1 or cfg.redundant;
-        };
-        if (complex) {
-            var logical = try h264_pictures.indexMode(a, &mutable, .{}, sampling == .source_timestamps, registry);
-            defer logical.deinit();
-            return selectLogical(a, reader, logical, sampling, reader.input.control);
-        }
+    if (try needsLogicalIndex(a, reader.track)) {
+        var logical = try h264_pictures.indexMode(a, &mutable, .{}, sampling == .source_timestamps, registry);
+        defer logical.deinit();
+        return selectLogical(a, reader, logical, sampling, reader.input.control);
     }
     if (sampling != .reference) {
         const metadata = try a.alloc(sampling_mod.TimedPicture, reader.packets.len);

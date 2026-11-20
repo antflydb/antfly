@@ -223,7 +223,7 @@ test "embeddinggemma2 video container preflight shares six second sampling and c
 /// Inspection under the caller's host preprocessing permit, without NVDEC.
 /// hev1 also reads sample zero to resolve in-band parameter sets before sizing.
 pub fn inspectEmbedding(allocator: std.mem.Allocator, bytes: []const u8, control: media.source.Control) !EmbeddingInspection {
-    if (bytes.len > 256 * 1024 * 1024) return error.VideoInputTooLarge;
+    if (bytes.len > packet_sampling.gemma4_max_input_bytes) return error.VideoInputTooLarge;
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
     var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(true));
     defer reader.deinit();
