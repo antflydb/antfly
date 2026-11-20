@@ -342,7 +342,19 @@ arena layout. Alias lifetime propagation uses ML's same allocation-free liveness
 implementation, preserving the tape's splitting/coalescing reuse policy and
 escaping views. Instruction-capacity and checked storage-size bounds apply before
 arena allocation. This does not establish complete physical ownership of every
-operation executed by that tape.
+operation executed by that tape. Prepared clipped projections declare an explicit
+input-clamp workspace as well as their output. Serial projections share one
+scratch tail, with its view metadata funded before replay. The tuned fused
+projection remains first choice; an unfused fallback consumes the supplied span
+without allocating a clamp tensor. Optional scratch pressure preserves the old
+output bank. A staged, backed-off upgrade can later fund a separate scratch bank
+without invalidating queued output references or resetting replay selection.
+Partial upgrades retire only their own quota and views before retry.
+
+Decoder construction publishes the actual native, compiled, merged-graph or
+full-prefix state route and requested policy through the uniform report. Failed
+construction publishes an owned error and no numerical counters or completion
+claim. These are request-construction observations, not a backend memory census.
 
 Metal reports the device's instantaneous worker-process allocation gauge alongside
 tracked project allocations. It includes vendor resources visible to the driver;

@@ -92,6 +92,13 @@ pub const Decoder = struct {
     }
 
     pub fn initWithSource(allocator: std.mem.Allocator, session: backends.Session, encoder: *const stages.EncoderOutputs, encoder_length: usize, encoder_mask: []const i64, vocab_size: usize, control: ?Control, options: Options, source: ?*const Native.Source) !Decoder {
+        return prepareSource(allocator, session, encoder, encoder_length, encoder_mask, vocab_size, control, options, source) catch |err| {
+            observeRoute(session, encoder, options, .failed, err);
+            return err;
+        };
+    }
+
+    fn prepareSource(allocator: std.mem.Allocator, session: backends.Session, encoder: *const stages.EncoderOutputs, encoder_length: usize, encoder_mask: []const i64, vocab_size: usize, control: ?Control, options: Options, source: ?*const Native.Source) !Decoder {
         const host: ?backends.Tensor = switch (encoder.*) {
             .host => |outputs| if (outputs.len != 0) outputs[0] else return error.NoEncoderOutput,
             .resident => null,
@@ -103,6 +110,8 @@ pub const Decoder = struct {
         errdefer if (native) |*value| value.deinit();
         var compiled = if (native == null and options.allow_native and host != null) try @import("resident_decoder.zig").Decoder.initEncoderDecoder(allocator, session, encoder_length, options.compiled_cache, control) else null;
         errdefer if (compiled) |*value| value.deinit();
+        const incremental = if (options.allow_merged and native == null and compiled == null and host != null) merged.State.init(allocator, session, host.?, encoder_mask, vocab_size) else null;
+        observeRoute(session, encoder, options, if (native != null) .native_incremental else if (compiled != null) .compiled_incremental else if (incremental != null) .merged_incremental else .full_prefix, null);
         return .{
             .allocator = allocator,
             .session = session,
@@ -113,8 +122,35 @@ pub const Decoder = struct {
             .native = native,
             .compiled = compiled,
             .options = options,
-            .incremental = if (options.allow_merged and native == null and compiled == null and host != null) merged.State.init(allocator, session, host.?, encoder_mask, vocab_size) else null,
+            .incremental = incremental,
         };
+    }
+
+    fn observeRoute(session: backends.Session, encoder: *const stages.EncoderOutputs, options: Options, selected: @import("diagnostics.zig").DecoderRoute.Selection, failure: ?anyerror) void {
+        const binding = session.invocation_diagnostics orelse return;
+        if (!binding.diagnostics.isEnabled()) return;
+        publishRoute(binding.diagnostics, .{
+            .selected = selected,
+            .backend = session.backend(),
+            .encoder_storage = switch (encoder.*) {
+                .host => .host,
+                .resident => .resident,
+            },
+            .native_allowed = options.allow_native,
+            .merged_allowed = options.allow_merged,
+            .compiled_cache_requested = options.compiled_cache,
+            .expected_initial_query_rows = options.expected_initial_query_rows,
+            .requested_rows = if (options.output_rows == .full_prefix) .full_prefix else .final_available,
+        }, failure);
+    }
+    noinline fn publishRoute(publisher: *@import("diagnostics.zig").Diagnostics, route: @import("diagnostics.zig").DecoderRoute, failure: ?anyerror) void {
+        publisher.publish(.{
+            .scope = .session_preparation,
+            .operation = .decoder_init,
+            .decoder_route = route,
+            .outcome = if (failure != null) .failed else .success,
+            .error_name = if (failure) |err| @import("diagnostics.zig").Text.init(@errorName(err)) else null,
+        });
     }
 
     pub fn deinit(self: *Decoder) void {
@@ -202,7 +238,10 @@ test "decoder route retains actual host output rows without copies and cancels b
     const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..], "decoder.onnx" });
     defer a.free(path);
     const imported = @import("../backends/imported_onnx_session.zig");
-    const session = try imported.createSessionWithOptions(a, path, .native, .{ .graph_runtime_strategy = .compiled_preferred });
+    var session = try imported.createSessionWithOptions(a, path, .native, .{ .graph_runtime_strategy = .compiled_preferred });
+    var diagnostics = @import("diagnostics.zig").Diagnostics{};
+    diagnostics.configure(true);
+    session.invocation_diagnostics = .{ .diagnostics = &diagnostics };
     var session_open = true;
     defer if (session_open) session.close();
     var hidden = try backends.Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 2, 4 }, &.{ -2, 1, 2, -1, 3, -1, 1, 0 });
@@ -213,6 +252,16 @@ test "decoder route retains actual host output rows without copies and cancels b
     var decoder_open = true;
     defer if (decoder_open) decoder.deinit();
     try std.testing.expect(decoder.native == null and decoder.incremental == null);
+    const route = diagnostics.snapshot().?.report.?.decoder_route.?;
+    try std.testing.expectEqual(@import("diagnostics.zig").DecoderRoute.Selection.full_prefix, route.selected);
+    try std.testing.expectEqual(backends.BackendType.native, route.backend);
+    try std.testing.expect(diagnostics.snapshot().?.execution == null);
+    const missing = stages.EncoderOutputs{ .host = &.{} };
+    try std.testing.expectError(error.NoEncoderOutput, Decoder.init(a, session, &missing, 2, &.{ 1, 1 }, 4, null));
+    const failed = diagnostics.snapshot().?;
+    try std.testing.expectEqual(@import("diagnostics.zig").DecoderRoute.Selection.failed, failed.report.?.decoder_route.?.selected);
+    try std.testing.expectEqualStrings("NoEncoderOutput", failed.report.?.failure.bytes[0..failed.report.?.failure.len]);
+    try std.testing.expect(failed.execution == null and failed.report.?.transfers == null);
     var row = try decoder.step(&.{ 0, 1 }, null, null);
     defer row.deinit();
     try std.testing.expect(row.owned_logits == null);

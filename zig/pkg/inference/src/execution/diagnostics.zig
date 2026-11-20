@@ -136,7 +136,22 @@ pub const StagePlacement = struct {
     };
 };
 
+/// Request-owned state selection after construction, separate from numerical
+/// dispatch and independently sampled memory/kernel counters.
+pub const DecoderRoute = struct {
+    pub const Selection = enum { native_incremental, compiled_incremental, merged_incremental, full_prefix, failed };
+    selected: Selection,
+    backend: @import("../backends/backends.zig").BackendType,
+    encoder_storage: enum { host, resident },
+    native_allowed: bool,
+    merged_allowed: bool,
+    compiled_cache_requested: ?bool,
+    expected_initial_query_rows: ?usize,
+    requested_rows: enum { final_available, full_prefix },
+};
+
 pub const Snapshot = struct {
+    decoder_route: ?DecoderRoute = null,
     stage_placement: ?StagePlacement = null,
     native_program_construction: ?NativeProgramConstruction = null,
     native_definition_templates: ?NativeDefinitionTemplates = null,

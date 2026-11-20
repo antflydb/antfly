@@ -21754,7 +21754,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             state.workspace_hits += 1;
             break :blk workspace.views[index];
         } else null;
-        return audioPreparedLinearOp(ctx, input, slot, rows, in_dim, out_dim, null, output);
+        return audioPreparedLinearOp(ctx, &.{ .input = input, .slot = slot, .rows = rows, .in_dim = in_dim, .out_dim = out_dim, .output = output });
     }
     fn audioTapeAppend(self: *MetalCompute, capture: *audio_tape.Capture, node: audio_tape.Node, output: CT) void {
         _ = self;
@@ -21857,7 +21857,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return tensor;
     }
     fn audioFreezePlan(self: *MetalCompute, plan: *audio_tape.Plan) !void {
-        const bytes = plan.count * (@sizeOf(audio_tape.Node) + @sizeOf(?CT)) + plan.constant_count * @sizeOf(audio_tape.Constant);
+        const bytes = plan.count * (@sizeOf(audio_tape.Node) + 2 * @sizeOf(?CT)) + plan.constant_count * @sizeOf(audio_tape.Constant);
         const cache = if (self.data.tier_cache) |*v| v else return error.AudioScheduleAdmission;
         self.data.prefetch.lock();
         cache.reserve(.host, bytes) catch |err| {
@@ -21876,7 +21876,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const constants = try a.dupe(audio_tape.Constant, plan.constants[0..plan.constant_count]);
         errdefer a.free(constants);
         const outputs = try a.alloc(?CT, plan.count);
+        errdefer a.free(outputs);
         @memset(outputs, null);
+        const workspaces = try a.alloc(?CT, plan.count);
+        @memset(workspaces, null);
+        plan.workspaces = workspaces;
         plan.nodes = nodes;
         plan.constants = constants;
         plan.outputs = outputs;
@@ -21885,7 +21889,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan.host_bytes += bytes;
     }
     fn audioTryPrepare(self: *MetalCompute, plan: *audio_tape.Plan) !void {
-        if (plan.prepared or self.provider_impl.audio_schedule_clock < plan.retry_after) return;
+        if (self.provider_impl.audio_schedule_clock < plan.retry_after) return;
+        if (plan.prepared) {
+            if (plan.input_workspace_bytes != 0 or plan.input_workspace_wanted_bytes == 0 or plan.input_workspace_wanted_bytes > 64 * 1024 * 1024 or plan.workspaces.len != plan.count) return;
+            self.audioUpgradeInputWorkspace(plan) catch |err| {
+                plan.retry_after = self.provider_impl.audio_schedule_clock + plan.retry_delay;
+                plan.retry_delay = @min(@as(u8, 64), plan.retry_delay *| 2);
+                switch (err) {
+                    error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.OutOfMemory, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => return,
+                    else => return err,
+                }
+            };
+            return;
+        }
         self.audioPreparePlan(plan) catch |err| {
             self.audioUnpreparePlan(plan);
             plan.retry_after = self.provider_impl.audio_schedule_clock + plan.retry_delay;
@@ -21896,6 +21912,40 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         };
         plan.selection = .{};
+        plan.retry_delay = 1;
+        if (plan.input_workspace_wanted_bytes != 0 and plan.input_workspace_bytes == 0) plan.retry_after = self.provider_impl.audio_schedule_clock + 1;
+    }
+
+    /// A refused optional tail can recover without dropping the active output
+    /// bank, resetting selection history or invalidating queued old commands.
+    /// Stage every quota and view before publishing the complete scratch bank.
+    fn audioUpgradeInputWorkspace(self: *MetalCompute, plan: *audio_tape.Plan) !void {
+        var views: [audio_tape.instruction_capacity]?CT = @splat(null);
+        var staged = audio_tape.Plan{ .host_bytes = 0, .metadata_bytes = 0, .workspaces = views[0..plan.count] };
+        errdefer self.audioUnpreparePlan(&staged);
+        const bank = (try self.audioPlanBuffer(&staged, plan.input_workspace_wanted_bytes, false)) orelse return error.AudioScheduleAdmission;
+        staged.arena = self.audioPersistentCt(&staged, bank) catch |err| {
+            var owned = bank;
+            owned.deinit();
+            return err;
+        };
+        for (plan.nodes[0..plan.count], 0..) |node, i| if (node.inputWorkspaceShape()) |shape| {
+            const bytes = try std.math.mul(usize, try std.math.mul(usize, shape.rows, shape.width), @sizeOf(f32));
+            const view = try bank.retainedView(0, bytes, &.{ @intCast(shape.rows), @intCast(shape.width) });
+            views[i] = self.audioPersistentCt(&staged, view) catch |err| {
+                var owned = view;
+                owned.deinit();
+                return err;
+            };
+        };
+        const host = try std.math.add(usize, plan.host_bytes, staged.host_bytes);
+        const backend = try std.math.add(usize, plan.backend_bytes, staged.backend_bytes);
+        @memcpy(plan.workspaces, views[0..plan.count]);
+        plan.input_workspace_bank = staged.arena;
+        if (plan.drop_ct == null) plan.drop_ct = staged.drop_ct;
+        plan.input_workspace_bytes = plan.input_workspace_wanted_bytes;
+        plan.host_bytes = host;
+        plan.backend_bytes = backend;
         plan.retry_delay = 1;
     }
     fn audioUnpreparePlan(self: *MetalCompute, plan: *audio_tape.Plan) void {
@@ -21909,6 +21959,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan.host_bytes = plan.metadata_bytes;
         plan.backend_bytes = 0;
         plan.arena_size = 0;
+        plan.input_workspace_wanted_bytes = 0;
         plan.drop_ct = null;
         plan.prepared = false;
         for (plan.constants[0..plan.constant_count]) |*c| c.required = true;
@@ -22020,16 +22071,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 };
             }
         }
-        const arena_size = try plan.layout();
-        if (arena_size > 0 and arena_size <= 64 * 1024 * 1024) {
-            {
-                const mt = (try self.audioPlanBuffer(plan, arena_size, false)) orelse return error.AudioScheduleAdmission;
+        const recipe = try plan.arenaLayout();
+        plan.input_workspace_wanted_bytes = recipe.input_workspace_bytes;
+        // Preserve the previous output-bank eligibility and admission fallback.
+        // Optional clamp scratch must not evict an otherwise fitting bank.
+        if (recipe.outputs_bytes <= 64 * 1024 * 1024) {
+            var workspace_bytes = if (plan.workspaces.len == plan.count and recipe.input_workspace_bytes <= 64 * 1024 * 1024) recipe.input_workspace_bytes else 0;
+            var bytes = try std.math.add(usize, recipe.outputs_bytes, workspace_bytes);
+            var bank: ?MetalTensor = if (bytes != 0) try self.audioPlanBuffer(plan, bytes, false) else null;
+            if (bank == null and workspace_bytes != 0) {
+                workspace_bytes = 0;
+                bytes = recipe.outputs_bytes;
+                if (bytes != 0) bank = try self.audioPlanBuffer(plan, bytes, false);
+            }
+            if (bank) |mt| {
                 plan.arena = self.audioPersistentCt(plan, mt) catch |err| {
                     var owned = mt;
                     owned.deinit();
                     return err;
                 };
-                plan.arena_size = arena_size;
+                plan.arena_size = bytes;
+                plan.input_workspace_bytes = workspace_bytes;
                 for (plan.nodes[0..plan.count], 0..) |node, i| if (node.arena_offset) |offset| {
                     if (plan.outputs.len == 0 or plan.linear_only) continue;
                     const d = node.outputDimensions().?;
@@ -22040,7 +22102,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         return err;
                     };
                 };
-            }
+                if (workspace_bytes != 0) for (plan.nodes[0..plan.count], 0..) |node, i| if (node.inputWorkspaceShape()) |shape| {
+                    const needed = try std.math.mul(usize, try std.math.mul(usize, shape.rows, shape.width), @sizeOf(f32));
+                    const view = try mt.retainedView(recipe.outputs_bytes, needed, &.{ @intCast(shape.rows), @intCast(shape.width) });
+                    plan.workspaces[i] = self.audioPersistentCt(plan, view) catch |err| {
+                        var owned = view;
+                        owned.deinit();
+                        return err;
+                    };
+                };
+            } else if (recipe.outputs_bytes != 0) return error.AudioScheduleAdmission;
         }
         plan.prepared = true;
     }
@@ -22154,17 +22225,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (rc != 0) return error.MetalKernelFailed;
         return true;
     }
-    fn audioPreparedLinearOp(ctx: *anyopaque, input: CT, slot: usize, rows: usize, in_dim: usize, out_dim: usize, clip: ?ops.ClippedLinearParams, output: ?CT) anyerror!?CT {
+    fn audioPreparedLinearOp(ctx: *anyopaque, request: *const ops.AudioPreparedLinearRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input = request.input;
+        const slot = request.slot;
+        const rows = request.rows;
+        const in_dim = request.in_dim;
+        const out_dim = request.out_dim;
+        const clip = request.clip;
+        const output = request.output;
+        const input_elements = try std.math.mul(usize, rows, in_dim);
+        const output_elements = try std.math.mul(usize, rows, out_dim);
+        if (rows == 0 or in_dim == 0 or out_dim == 0) return error.InvalidTensorShape;
+        if (clip) |params| {
+            try params.validate();
+            if (params.rows != rows or params.in_dim != in_dim or params.out_dim != out_dim) return error.InvalidTensorShape;
+        }
         if (!metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, slot, in_dim, out_dim)) return null;
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
         defer self.retireTemporaryWorkspaceValue(&x);
-        if (x.elemCount() != rows * in_dim) return error.InvalidTensorShape;
+        if (x.elemCount() != input_elements) return error.InvalidTensorShape;
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         if (output) |ct| if (toBuf(ct).metal_tensor) |*tensor| tensor.invalidateHostMirror();
-        var mt = if (output) |ct| try denseDeviceF32(ct).?.retainedCopy() else try MetalTensor.deviceAllocate(runtime, rows * out_dim * 4, .private, &.{ @intCast(rows), @intCast(out_dim) });
+        var mt = if (output) |ct| try (denseDeviceF32(ct) orelse return error.InvalidPreparedProjectionOutput).retainedCopy() else try MetalTensor.deviceAllocate(runtime, try std.math.mul(usize, output_elements, @sizeOf(f32)), .private, &.{ std.math.cast(i32, rows) orelse return error.InvalidTensorShape, std.math.cast(i32, out_dim) orelse return error.InvalidTensorShape });
         var moved = false;
         defer if (!moved) mt.deinit();
+        const output_bytes = try std.math.mul(usize, output_elements, @sizeOf(f32));
+        if (mt.isReadOnlyPhysical() or !deviceTensorMatchesLinearRows(&mt, rows, out_dim) or mt.deviceByteLen() < output_bytes or
+            mt.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or
+            (mt.deviceHandle() == x.deviceHandle() and kernel_geometry.byteRangesOverlap(mt.deviceByteOffset(), output_bytes, x.deviceByteOffset(), x.deviceByteLen()))) return error.InvalidPreparedProjectionOutput;
         var fused = false;
         if (clip) |p| {
             const rc = metal_runtime.antfly_metal_clipped_linear(runtime, x.deviceHandle(), x.deviceByteOffset(), slot, &p, mt.deviceHandle(), mt.deviceByteOffset());
@@ -22174,10 +22263,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!fused) {
             var clipped: ?CT = null;
             defer if (clipped) |ct| freeOp(ctx, ct);
+            var prepared_operand: ?MetalTensor = null;
             if (clip) |p| if (p.flags & 3 != 0) {
-                clipped = try clampScalarOp(ctx, input, if (p.flags & 1 != 0) p.input_min else null, if (p.flags & 2 != 0) p.input_max else null);
+                if (request.input_workspace != null and denseDeviceF32(input) != null) {
+                    const scratch = request.input_workspace.?;
+                    const target = denseDeviceF32(scratch) orelse return error.InvalidPreparedProjectionWorkspace;
+                    const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, in_dim), @sizeOf(f32));
+                    if (target.isReadOnlyPhysical() or !deviceTensorMatchesLinearRows(&target, rows, in_dim) or target.deviceByteLen() < bytes or
+                        target.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or
+                        (target.deviceHandle() == x.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), bytes, x.deviceByteOffset(), x.deviceByteLen())) or
+                        (target.deviceHandle() == mt.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), bytes, mt.deviceByteOffset(), mt.deviceByteLen()))) return error.InvalidPreparedProjectionWorkspace;
+                    toBuf(scratch).metal_tensor.?.invalidateHostMirror();
+                    if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, x, target, p.flags & 3, p.input_min, p.input_max, false)) return error.MetalKernelFailed;
+                    prepared_operand = target;
+                } else {
+                    clipped = try clampScalarOp(ctx, input, if (p.flags & 1 != 0) p.input_min else null, if (p.flags & 2 != 0) p.input_max else null);
+                }
             };
-            const operand = if (clipped) |ct| denseDeviceF32(ct).? else x;
+            const operand = prepared_operand orelse if (clipped) |ct| denseDeviceF32(ct).? else x;
             if (!try metal_runtime.decoderRuntimeApplyAudioLinearInto(self.provider_impl, slot, operand, rows, in_dim, out_dim, mt)) return error.AudioSchedulePreparedSlotMissing;
             if (clip) |p| if (p.flags & 28 != 0) {
                 if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, mt, mt, (p.flags >> 2) & 3, p.output_min, p.output_max, p.flags & 16 != 0)) return error.AudioScheduleRouteChanged;
@@ -22291,7 +22394,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
             plan.selection.record(replay, elapsed);
             if (replay) plan.replay_ns = elapsed else plan.eager_ns = elapsed;
-            if (stats) std.debug.print("metal_audio_schedule replay={} replays={d} encode_ns={d} encoders={d} arena_bytes={d} backend_bytes={d}\n", .{ replay, plan.replays, elapsed, metal_runtime.runtimeMemorySnapshot(p.raw_decode_runtime).compute_encoder_count -| before_encoders, plan.arena_size, plan.backend_bytes });
+            if (stats) std.debug.print("metal_audio_schedule replay={} replays={d} encode_ns={d} encoders={d} arena_bytes={d} input_workspace_bytes={d} backend_bytes={d}\n", .{ replay, plan.replays, elapsed, metal_runtime.runtimeMemorySnapshot(p.raw_decode_runtime).compute_encoder_count -| before_encoders, plan.arena_size, plan.input_workspace_bytes, plan.backend_bytes });
             return out;
         }
         if (p.audio_schedule_clock < plan.retry_after) return try run(context, inputs);
@@ -52334,7 +52437,7 @@ test "embeddinggemma2 Metal BF16 storage candidate completed projection comparis
         for (0..9) |iteration| for (0..2) |phase| {
             const route = phase ^ (iteration & 1);
             const started = @import("antfly_platform").time.monotonicNs();
-            const output = (try MetalCompute.audioPreparedLinearOp(&compute, input, route, rows, hidden, width, null, null)).?;
+            const output = (try MetalCompute.audioPreparedLinearOp(&compute, &.{ .input = input, .slot = route, .rows = rows, .in_dim = hidden, .out_dim = width })).?;
             defer cb.free(output);
             const actual = try cb.toFloat32(output, a);
             defer a.free(actual);
@@ -59622,4 +59725,151 @@ test "metal mapped F32 weights prove current source and pin actual mapping beyon
 test "metal mapped F32 weight borrowing unwinds source metadata and every pin allocation failure" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, mappedF32WeightBorrowCase, .{});
+}
+
+test "Metal prepared audio projection consumes disjoint clamp workspace after fused decline without tensor allocation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const runtime = compute.provider_impl.raw_decode_runtime.?;
+    const width = 64;
+    const rows = 3;
+    // This original F16 slot deliberately cannot enter the F32 fused kernel.
+    // Compare the original unfused implementation with the same tuned slot.
+    var weights: [width * width]f16 = @splat(0);
+    for (0..width) |i| weights[i * width + i] = 1;
+    const bias: [width]f32 = @splat(0);
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_prepare_linear_f16(runtime, 0, @ptrCast(&weights), @sizeOf(@TypeOf(weights)), &bias, width, width));
+    compute.provider_impl.raw_linear_slot_kinds[0] = .dense;
+    compute.provider_impl.raw_linear_slots_prepared[0] = true;
+    compute.provider_impl.raw_linear_slot_in_dims[0] = width;
+    compute.provider_impl.raw_linear_slot_out_dims[0] = width;
+    var values: [rows * width]f32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) / 4;
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&values, &.{ rows, width }));
+    defer cb.free(input);
+    const zeros: [rows * width]f32 = @splat(0);
+    const reference = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&zeros, &.{ rows, width }));
+    defer cb.free(reference);
+    const destination = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&zeros, &.{ rows, width }));
+    defer cb.free(destination);
+    const workspace = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&zeros, &.{ rows, width }));
+    defer cb.free(workspace);
+    const params = ops.ClippedLinearParams{ .rows = rows, .in_dim = width, .out_dim = width, .flags = 3 | 4 | 8 | 16, .input_min = -0.75, .input_max = 0.75, .output_min = -0.5, .output_max = 0.5 };
+    const source = MetalCompute.denseDeviceF32(input).?;
+    const result = MetalCompute.denseDeviceF32(destination).?;
+    try std.testing.expectEqual(@as(c_int, -1), metal_runtime_mod.antfly_metal_clipped_linear(runtime, source.deviceHandle(), source.deviceByteOffset(), 0, &params, result.deviceHandle(), result.deviceByteOffset()));
+    var request = ops.AudioPreparedLinearRequest{ .input = input, .slot = 0, .rows = rows, .in_dim = width, .out_dim = width, .clip = params, .output = reference };
+    try std.testing.expectEqual(reference, (try MetalCompute.audioPreparedLinearOp(&compute, &request)).?);
+    const expected = try cb.toFloat32(reference, a);
+    defer a.free(expected);
+    request.output = destination;
+    request.input_workspace = workspace;
+    for (0..4) |_| {
+        const before = metal_tensor_mod.memoryStatsSnapshot();
+        try std.testing.expectEqual(destination, (try MetalCompute.audioPreparedLinearOp(&compute, &request)).?);
+        const after = metal_tensor_mod.memoryStatsSnapshot();
+        // Counts only project-owned MetalTensor device allocations, never
+        // opaque MPS allocations or driver-wide completion/ownership.
+        try std.testing.expectEqual(before.device_owned_buffers_created, after.device_owned_buffers_created);
+        const actual = try cb.toFloat32(destination, a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+    }
+    request.input_workspace = input;
+    try std.testing.expectError(error.InvalidPreparedProjectionWorkspace, MetalCompute.audioPreparedLinearOp(&compute, &request));
+    request.input_workspace = destination;
+    try std.testing.expectError(error.InvalidPreparedProjectionWorkspace, MetalCompute.audioPreparedLinearOp(&compute, &request));
+    request.input_workspace = workspace;
+    request.output = input;
+    try std.testing.expectError(error.InvalidPreparedProjectionOutput, MetalCompute.audioPreparedLinearOp(&compute, &request));
+}
+
+test "Metal audio optional clamp scratch preserves a fitting output bank and funds complete recipe after pressure clears" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{});
+    defer store.tier_cache.?.deinitAdmission();
+    defer store.lazy_weights.deinit(a);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const width = 2048;
+    const output_width = 32;
+    const weights = try a.alloc(f32, width * output_width);
+    defer a.free(weights);
+    @memset(weights, 0);
+    const weight = try cb.fromFloat32Shape(weights, &.{ output_width, width });
+    defer cb.free(weight);
+    const bias = try cb.fromFloat32Shape(&@as([output_width]f32, @splat(0)), &.{output_width});
+    defer cb.free(bias);
+    try std.testing.expect(try cb.decoderRuntimePrepareLinear(&.{ .slot = 0, .weight = weight, .bias = bias, .in_dim = width, .out_dim = output_width, .prefer_f32_mps_fallback = true }));
+    const plan = try a.create(audio_tape.Plan);
+    defer a.destroy(plan);
+    var nodes: [2]audio_tape.Node = undefined;
+    nodes[0] = .{ .output = 1, .prepared_slot = 0, .args = .{ .clippedLinear = .{ .input = 0, .weight = 0, .p = .{ .rows = 3, .in_dim = width, .out_dim = output_width, .flags = 3, .input_min = -1, .input_max = 1, .output_min = 0, .output_max = 0 } } } };
+    nodes[1] = .{ .output = 2, .output_rows = 3, .output_dim = output_width, .args = .{ .silu = .{ .input = 1 } } };
+    plan.* = .{ .nodes = &nodes, .count = 2, .output = 2 };
+    plan.last_use[1] = 1;
+    const cache = &store.tier_cache.?;
+    try cache.reserve(.host, @sizeOf(audio_tape.Plan));
+    defer {
+        plan.deinit();
+        cache.noteRelease(.host, plan.host_bytes);
+        cache.noteRelease(.backend, plan.backend_bytes);
+    }
+    try compute.audioFreezePlan(plan);
+    const recipe = try plan.arenaLayout();
+    const runtime = compute.provider_impl.raw_decode_runtime.?;
+    const output_bound = metal_runtime_mod.antfly_metal_audio_allocation_bytes(runtime, recipe.outputs_bytes, 0);
+    const full_bound = metal_runtime_mod.antfly_metal_audio_allocation_bytes(runtime, recipe.total_bytes, 0);
+    try std.testing.expect(full_bound > output_bound);
+    cache.budget.backend_limit_bytes = output_bound;
+    try compute.audioTryPrepare(plan);
+    try std.testing.expect(plan.prepared);
+    try std.testing.expectEqual(recipe.outputs_bytes, plan.arena_size);
+    try std.testing.expectEqual(@as(usize, 0), plan.input_workspace_bytes);
+    try std.testing.expect(plan.outputs[0] != null and plan.workspaces[0] == null);
+    const old_output = plan.outputs[0].?;
+    const old_arena = plan.arena.?;
+    const metadata = plan.metadata_bytes;
+    cache.budget.backend_limit_bytes = full_bound + output_bound;
+    const old_host = cache.host_bytes;
+    const old_backend = cache.backend_bytes;
+    plan.selection = .{ .eager_count = 5, .replay_count = 5 };
+    const selection = plan.selection;
+    // Let SDK allocation succeed, then refuse its first persistent wrapper.
+    // The staged owner must retire only its own delta, never the old bank.
+    cache.budget.host_limit_bytes = old_host + metal_tensor_mod.device_buffer_ref_bytes;
+    compute.provider_impl.audio_schedule_clock = plan.retry_after;
+    try compute.audioTryPrepare(plan);
+    try std.testing.expectEqual(old_host, cache.host_bytes);
+    try std.testing.expectEqual(old_backend, cache.backend_bytes);
+    try std.testing.expectEqual(old_output, plan.outputs[0].?);
+    try std.testing.expect(plan.prepared and plan.input_workspace_bank == null and plan.workspaces[0] == null);
+    try std.testing.expect(std.meta.eql(selection, plan.selection));
+    try std.testing.expect(plan.retry_after > compute.provider_impl.audio_schedule_clock);
+    cache.budget.host_limit_bytes = 0;
+    compute.provider_impl.audio_schedule_clock = plan.retry_after;
+    try compute.audioTryPrepare(plan);
+    try std.testing.expect(plan.prepared);
+    try std.testing.expectEqual(recipe.outputs_bytes, plan.arena_size);
+    try std.testing.expectEqual(recipe.input_workspace_bytes, plan.input_workspace_bytes);
+    try std.testing.expectEqual(old_output, plan.outputs[0].?);
+    try std.testing.expectEqual(old_arena, plan.arena.?);
+    try std.testing.expect(plan.input_workspace_bank != null and plan.workspaces[0] != null);
+    try std.testing.expect(std.meta.eql(selection, plan.selection));
+    compute.audioUnpreparePlan(plan);
+    try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
+    try std.testing.expectEqual(metadata, cache.host_bytes);
 }

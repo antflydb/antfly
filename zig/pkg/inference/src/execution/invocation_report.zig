@@ -21,6 +21,7 @@ const Specializations = @import("specialization_cache.zig").Stats;
 pub const Report = struct {
     schema_version: u8 = 1,
     stage_placement: ?@import("diagnostics.zig").StagePlacement = null,
+    decoder_route: ?@import("diagnostics.zig").DecoderRoute = null,
     operation: []const u8,
     publication_scope: []const u8,
     synchronous_interval: enum { invocation_body, pending_phase_only } = .invocation_body,
@@ -129,6 +130,7 @@ pub const Report = struct {
         report.batch = value.batch;
         report.pending_interval = value.pending_interval;
         report.stage_placement = value.stage_placement;
+        report.decoder_route = value.decoder_route;
         report.device_memory = value.runtime.device_memory;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());

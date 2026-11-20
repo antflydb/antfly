@@ -2976,7 +2976,7 @@ pub const ComputeBackend = struct {
         embeddingModelScalar: ?*const fn (ctx: *anyopaque, layer: usize) ?f32 = null,
         embeddingModelLinear: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelProjection, input: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT = null,
         audioNodeInto: ?*const fn (ctx: *anyopaque, node: *const anyopaque, values: []const ?CT, output: CT) anyerror!bool = null,
-        audioPreparedLinear: ?*const fn (ctx: *anyopaque, input: CT, slot: usize, rows: usize, in_dim: usize, out_dim: usize, clip: ?ClippedLinearParams, output: ?CT) anyerror!?CT = null,
+        audioPreparedLinear: ?*const fn (ctx: *anyopaque, request: *const AudioPreparedLinearRequest) anyerror!?CT = null,
         audioArenaView: ?*const fn (ctx: *anyopaque, arena: CT, offset: usize, rows: usize, dim: usize) anyerror!CT = null,
         audioSetControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
         audioStorage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
@@ -7465,6 +7465,19 @@ test "embeddinggemma2 audio frontend bounds every kernel index and ABI" {
 }
 
 /// Scalar bounds are applied during input loads and the GEMM epilogue.
+/// Cold-prepared projection destinations. input_workspace belongs to the
+/// current synchronous invocation and may never alias input or output bytes.
+pub const AudioPreparedLinearRequest = struct {
+    input: CT,
+    slot: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    clip: ?ClippedLinearParams = null,
+    output: ?CT = null,
+    input_workspace: ?CT = null,
+};
+
 pub const ClippedLinearParams = extern struct {
     rows: u32,
     in_dim: u32,

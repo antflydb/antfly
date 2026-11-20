@@ -39,9 +39,13 @@ pub const Plan = struct {
     retry_after: u64 = 0,
     retry_delay: u8 = 1,
     outputs: []?CT = &.{},
+    workspaces: []?CT = &.{},
     backend_bytes: usize = 0,
     arena: ?CT = null,
     arena_size: usize = 0,
+    input_workspace_bytes: usize = 0,
+    input_workspace_wanted_bytes: usize = 0,
+    input_workspace_bank: ?CT = null,
     drop_ct: ?*const fn (CT) void = null,
     prepared: bool = false,
     linear_only: bool = false,
@@ -58,6 +62,7 @@ pub const Plan = struct {
             std.heap.c_allocator.free(self.nodes);
             std.heap.c_allocator.free(self.constants);
             std.heap.c_allocator.free(self.outputs);
+            std.heap.c_allocator.free(self.workspaces);
         }
     }
     pub fn dropPrepared(self: *Plan) void {
@@ -70,9 +75,16 @@ pub const Plan = struct {
                 drop(ct);
                 output.* = null;
             };
+            for (self.workspaces) |*workspace| if (workspace.*) |ct| {
+                drop(ct);
+                workspace.* = null;
+            };
+            if (self.input_workspace_bank) |ct| drop(ct);
             if (self.arena) |ct| drop(ct);
         }
         self.arena = null;
+        self.input_workspace_bytes = 0;
+        self.input_workspace_bank = null;
     }
     /// Assign non-overlapping lifetimes to linear outputs. Escaping values
     /// and their view ancestors remain independently owned by the caller.
@@ -145,6 +157,20 @@ pub const Plan = struct {
         }
         return peak;
     }
+    pub const ArenaLayout = struct { outputs_bytes: usize, input_workspace_bytes: usize, total_bytes: usize };
+
+    /// Serialized projections share one disjoint scratch tail. Both fused and
+    /// unfused paths are funded before replay; no clamp temporary is implicit.
+    pub fn arenaLayout(self: *Plan) !ArenaLayout {
+        const outputs = try self.layout();
+        var scratch: usize = 0;
+        for (self.nodes[0..self.count]) |node| if (node.inputWorkspaceShape()) |shape| {
+            const bytes = try std.math.mul(usize, try std.math.mul(usize, shape.rows, shape.width), @sizeOf(f32));
+            scratch = @max(scratch, (try std.math.add(usize, bytes, 4095)) & ~@as(usize, 4095));
+        };
+        return .{ .outputs_bytes = outputs, .input_workspace_bytes = scratch, .total_bytes = try std.math.add(usize, outputs, scratch) };
+    }
+
     pub fn replay(self: *Plan, cb: *const ops.ComputeBackend, inputs: []const CT) !CT {
         var values: [capacity]?CT = @splat(null);
         var owned: [capacity]bool = @splat(false);
@@ -170,7 +196,7 @@ pub const Plan = struct {
                 const d = node.outputDimensions().?;
                 if (cb.vtable.audioArenaView) |view| hint = try view(cb.ptr, arena, offset, d.rows, d.out_dim);
             };
-            const result = node.run(cb, &values, hint) catch |err| {
+            const result = node.run(cb, &values, hint, if (self.workspaces.len > i) self.workspaces[i] else null) catch |err| {
                 if (!persistent) if (hint) |ct| cb.free(ct);
                 return err;
             };
@@ -290,6 +316,14 @@ pub const Node = struct {
         if (self.prepared_slot != null) return self.linearDimensions();
         return null;
     }
+    pub const WorkspaceShape = struct { rows: usize, width: usize };
+    pub fn inputWorkspaceShape(self: *const Node) ?WorkspaceShape {
+        if (self.prepared_slot == null) return null;
+        return switch (self.args) {
+            .clippedLinear => |a| if (a.p.flags & 3 != 0) .{ .rows = a.p.rows, .width = a.p.in_dim } else null,
+            else => null,
+        };
+    }
     pub fn linearDimensions(self: *const Node) ?LinearDimensions {
         return switch (self.args) {
             .linearNoBias => |a| .{ .rows = a.rows, .in_dim = a.in_dim, .out_dim = a.out_dim },
@@ -302,7 +336,7 @@ pub const Node = struct {
             else => null,
         };
     }
-    fn run(self: *const Node, cb: *const ops.ComputeBackend, values: *[capacity]?CT, hint: ?CT) !CT {
+    fn run(self: *const Node, cb: *const ops.ComputeBackend, values: *[capacity]?CT, hint: ?CT, workspace: ?CT) !CT {
         if (self.prepared_slot) |slot| if (cb.vtable.audioPreparedLinear) |linear| {
             const d = self.linearDimensions().?;
             const id = switch (self.args) {
@@ -315,7 +349,7 @@ pub const Node = struct {
                 .clippedLinear => |a| a.p,
                 else => null,
             };
-            return (try linear(cb.ptr, values[id].?, slot, d.rows, d.in_dim, d.out_dim, p, hint)) orelse error.AudioSchedulePreparedSlotMissing;
+            return (try linear(cb.ptr, &.{ .input = values[id].?, .slot = slot, .rows = d.rows, .in_dim = d.in_dim, .out_dim = d.out_dim, .clip = p, .output = hint, .input_workspace = workspace })) orelse error.AudioSchedulePreparedSlotMissing;
         };
         if (hint) |output| if (cb.vtable.audioNodeInto) |into| {
             if (try into(cb.ptr, self, values, output)) return output;
@@ -605,4 +639,22 @@ test "audio arena uses its full declared instruction capacity and rejects overfl
     try std.testing.expectError(error.Overflow, plan.layout());
     plan.output = capacity;
     try std.testing.expectError(error.AudioScheduleInvalid, plan.layout());
+}
+
+test "audio arena recipe funds one disjoint maximum clipped projection workspace" {
+    const a = std.testing.allocator;
+    const plan = try a.create(Plan);
+    defer a.destroy(plan);
+    var nodes: [3]Node = undefined;
+    plan.* = .{ .nodes = &nodes, .count = 3, .output = 3 };
+    for (&nodes, 0..) |*node, i| node.* = .{ .prepared_slot = i, .output = @intCast(i + 1), .args = .{ .clippedLinear = .{ .input = 0, .weight = 0, .p = .{ .rows = 3, .in_dim = if (i == 1) 512 else 32, .out_dim = 32, .flags = if (i == 2) 16 else 3, .input_min = -1, .input_max = 1, .output_min = -2, .output_max = 2 } } } };
+    plan.last_use[1] = 2;
+    plan.last_use[2] = 2;
+    const recipe = try plan.arenaLayout();
+    try std.testing.expectEqual(@as(usize, 8192), recipe.outputs_bytes);
+    try std.testing.expectEqual(@as(usize, 8192), recipe.input_workspace_bytes);
+    try std.testing.expectEqual(@as(usize, 16384), recipe.total_bytes);
+    try std.testing.expect(nodes[2].inputWorkspaceShape() == null);
+    nodes[1].prepared_slot = null;
+    try std.testing.expectEqual(@as(usize, 4096), (try plan.arenaLayout()).input_workspace_bytes);
 }
