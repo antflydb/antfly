@@ -2392,6 +2392,13 @@ pub const KernelModule = struct {
     runtime_jit_pending_routes: JitProductionRoutes = .{},
     runtime_jit_qualified_scope: JitRouteScope = .{},
     runtime_jit_stats: RuntimeJitStats = .{},
+    small_q4_q8_decode: bool = false,
+    small_q4_q8_gate_up_down_calls: usize = 0,
+    small_q4_q8_projection_calls: usize = 0,
+    q4_q8_gate_up_k2560_n10240: driver_mod.CUfunction = null,
+    q4_q8_down_k10240_n2560: driver_mod.CUfunction = null,
+    q4_q8_projection_k2560_n256: driver_mod.CUfunction = null,
+    q4_q8_projection_k256_n2560: driver_mod.CUfunction = null,
     fill_f32: driver_mod.CUfunction = null,
     copy_f32: driver_mod.CUfunction = null,
     copy_u8: driver_mod.CUfunction = null,
@@ -3849,6 +3856,10 @@ pub const KernelModule = struct {
         }
         errdefer gqa_attention_decode_splitk_online_workspace.free(ctx);
 
+        loaded.q4_q8_gate_up_k2560_n10240 = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9) loadOptionalFunction(ctx, module, "termite_gemma4_small_ffn_pair_q8_1_f32") else null;
+        loaded.q4_q8_down_k10240_n2560 = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9) loadOptionalFunction(ctx, module, "termite_gemma4_small_ffn_down_q8_1_f32") else null;
+        loaded.q4_q8_projection_k2560_n256 = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9) loadOptionalFunction(ctx, module, "termite_gemma4_small_ple_gate_q8_1_f32") else null;
+        loaded.q4_q8_projection_k256_n2560 = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9) loadOptionalFunction(ctx, module, "termite_gemma4_small_ple_projection_q8_1_f32") else null;
         loaded.gqa_attention_generated_workspace = gqa_attention_generated_workspace;
         loaded.gqa_attention_decode_splitk_online_workspace = gqa_attention_decode_splitk_online_workspace;
         loaded.gqa_decode_profile = gqa_decode_profile;
@@ -4317,7 +4328,7 @@ pub const KernelModule = struct {
     /// No buffer allocation or numerical work occurs during selection.
     pub const Q4_0Q8_1Recipe = struct {
         pub const Family = enum { tile4, tile4_w8, tile8 };
-        const Leaf = enum { generic, rows2, rows4, rows8, attention2048, attention4096, down, down_rows, down_w10 };
+        const Leaf = enum { generic, rows2, rows4, rows8, attention2048, attention4096, down, down_rows, down_w10, k256_n2560, k2560_n256, down_single };
         family: Family,
         leaf: Leaf = .generic,
         function: driver_mod.CUfunction,
@@ -4328,6 +4339,9 @@ pub const KernelModule = struct {
         switch (family) {
             .tile8 => return .{ .family = family, .function = self.linear_q4_0_q8_1_f32_tile8 orelse return null, .variant = if (rows > 1) .tile8_rows else .single },
             .tile4 => {
+                if (self.small_q4_q8_decode and rows == 1 and in_dim == 256 and out_dim == 2560) {
+                    if (self.q4_q8_projection_k256_n2560) |function| return .{ .family = family, .leaf = .k256_n2560, .function = function, .variant = variant };
+                }
                 if (rows == 1 and out_dim == 2560) {
                     if (in_dim == 2048) {
                         if (self.linear_q4_0_q8_1_f32_tile4_e4b_attn_2048) |function| return .{ .family = family, .leaf = .attention2048, .function = function, .variant = variant };
@@ -4338,6 +4352,13 @@ pub const KernelModule = struct {
                 return .{ .family = family, .function = self.linear_q4_0_q8_1_f32_tile4 orelse return null, .variant = variant };
             },
             .tile4_w8 => {
+                if (self.small_q4_q8_decode and rows == 1) {
+                    if (in_dim == 2560 and out_dim == 256) {
+                        if (self.q4_q8_projection_k2560_n256) |function| return .{ .family = family, .leaf = .k2560_n256, .function = function, .variant = variant };
+                    } else if (in_dim == 10240 and out_dim == 2560) {
+                        if (self.q4_q8_down_k10240_n2560) |function| return .{ .family = family, .leaf = .down_single, .function = function, .variant = variant };
+                    }
+                }
                 if (rows > 1) {
                     if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_ROWS8_C4", false)) {
                         if (@field(self, row_schedules.linear8.kernel_field)) |function| return .{ .family = family, .leaf = .rows8, .function = function, .variant = .rows8_c4 };
@@ -12278,6 +12299,9 @@ pub const KernelModule = struct {
     pub inline fn launchQ4_0Q8_1Recipe(recipe: Q4_0Q8_1Recipe, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input_q8_1: buffer_mod.DeviceBuffer, weight_raw: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!void {
         if (recipe.function == null) return error.CudaKernelUnavailable;
         switch (recipe.leaf) {
+            .k256_n2560 => if (rows != 1 or in_dim != 256 or out_dim != 2560 or recipe.family != .tile4) return error.InvalidCudaState,
+            .k2560_n256 => if (rows != 1 or in_dim != 2560 or out_dim != 256 or recipe.family != .tile4_w8) return error.InvalidCudaState,
+            .down_single => if (rows != 1 or in_dim != 10240 or out_dim != 2560 or recipe.family != .tile4_w8) return error.InvalidCudaState,
             .attention2048 => if (rows != 1 or in_dim != 2048 or out_dim != 2560) return error.InvalidCudaState,
             .attention4096 => if (rows != 1 or in_dim != 4096 or out_dim != 2560) return error.InvalidCudaState,
             .down, .down_w10 => if (rows != 1 or in_dim != 10240 or out_dim != 2560) return error.InvalidCudaState,
@@ -12296,6 +12320,19 @@ pub const KernelModule = struct {
         var input_ptr = input_q8_1.ptr;
         var weight_ptr = weight_raw.ptr;
         switch (recipe.leaf) {
+            .k256_n2560, .k2560_n256 => {
+                var rows_u32: u32 = 1;
+                var in_dim_u32 = try toU32(in_dim);
+                var out_dim_u32 = try toU32(out_dim);
+                var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+                const columns: usize = if (recipe.leaf == .k256_n2560) 8 else 1;
+                const threads: usize = if (recipe.leaf == .k256_n2560) q4_0_tiled_threads_w4 else q4_0_tiled_threads;
+                return launchBlocks(recipe.function, ctx, out_dim / columns, threads, &params);
+            },
+            .down_single => {
+                var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr });
+                return launchBlocks(recipe.function, ctx, out_dim, q4_0_tiled_threads, &params);
+            },
             .rows2 => return launchQ4Q8Rows(row_schedules.linear2, recipe.function, ctx, dst_ptr, input_ptr, weight_ptr, rows, in_dim, out_dim),
             .rows4 => return launchQ4Q8Rows(row_schedules.linear4, recipe.function, ctx, dst_ptr, input_ptr, weight_ptr, rows, in_dim, out_dim),
             .rows8 => return launchQ4Q8Rows(row_schedules.linear8, recipe.function, ctx, dst_ptr, input_ptr, weight_ptr, rows, in_dim, out_dim),
@@ -12328,11 +12365,23 @@ pub const KernelModule = struct {
         try launch2d(recipe.function, ctx, (out_dim + columns - 1) / columns, rows, threads, &params);
     }
 
+    pub fn noteQ4_0Q8_1Recipe(self: *KernelModule, recipe: Q4_0Q8_1Recipe) void {
+        switch (recipe.leaf) {
+            .k256_n2560, .k2560_n256 => self.small_q4_q8_projection_calls += 1,
+            .down_single => self.small_q4_q8_gate_up_down_calls += 1,
+            else => {},
+        }
+    }
+
     pub inline fn launchLinearQ4_0Q8_1Tile4F32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input_q8_1: buffer_mod.DeviceBuffer, weight_raw: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!void {
-        return launchQ4_0Q8_1Recipe(self.q4_0Q8_1Recipe(.tile4, rows, in_dim, out_dim) orelse return error.CudaKernelUnavailable, ctx, dst, input_q8_1, weight_raw, rows, in_dim, out_dim);
+        const recipe = self.q4_0Q8_1Recipe(.tile4, rows, in_dim, out_dim) orelse return error.CudaKernelUnavailable;
+        try launchQ4_0Q8_1Recipe(recipe, ctx, dst, input_q8_1, weight_raw, rows, in_dim, out_dim);
+        self.noteQ4_0Q8_1Recipe(recipe);
     }
     pub inline fn launchLinearQ4_0Q8_1Tile4W8F32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input_q8_1: buffer_mod.DeviceBuffer, weight_raw: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!void {
-        return launchQ4_0Q8_1Recipe(self.q4_0Q8_1Recipe(.tile4_w8, rows, in_dim, out_dim) orelse return error.CudaKernelUnavailable, ctx, dst, input_q8_1, weight_raw, rows, in_dim, out_dim);
+        const recipe = self.q4_0Q8_1Recipe(.tile4_w8, rows, in_dim, out_dim) orelse return error.CudaKernelUnavailable;
+        try launchQ4_0Q8_1Recipe(recipe, ctx, dst, input_q8_1, weight_raw, rows, in_dim, out_dim);
+        self.noteQ4_0Q8_1Recipe(recipe);
     }
     pub inline fn launchLinearQ4_0Q8_1Tile8F32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input_q8_1: buffer_mod.DeviceBuffer, weight_raw: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!void {
         return launchQ4_0Q8_1Recipe(self.q4_0Q8_1Recipe(.tile8, rows, in_dim, out_dim) orelse return error.CudaKernelUnavailable, ctx, dst, input_q8_1, weight_raw, rows, in_dim, out_dim);
@@ -12430,7 +12479,10 @@ pub const KernelModule = struct {
         source_cols: usize,
         source_start: usize,
         activation: u8,
+        exact_e4b_reduction: bool,
     ) driver_mod.Error!void {
+        if (exact_e4b_reduction and (ctx.info.compute_major != 8 or ctx.info.compute_minor != 9 or
+            rows != 1 or in_dim != 2560 or out_dim != 256)) return error.InvalidCudaState;
         const function = self.linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4 orelse return error.CudaKernelUnavailable;
         if (in_dim == 0 or in_dim % q4_0_values_per_block != 0 or q4_0_values_per_block != q8_1_values_per_block) return error.InvalidCudaState;
         if (source_start > source_cols or out_dim > source_cols - source_start) return error.InvalidCudaState;
@@ -12453,7 +12505,8 @@ pub const KernelModule = struct {
         var source_start_u32 = try toU32(source_start);
         var activation_u32: u32 = activation;
         var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &source_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &source_cols_u32, &source_start_u32, &activation_u32 });
-        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
+        const threads = if (exact_e4b_reduction) q4_0_tiled_threads else q4_0_tiled_threads_w4;
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, threads, &params);
     }
 
     pub fn launchLinearQ4KF32(
@@ -13578,6 +13631,14 @@ pub const KernelModule = struct {
         var weight_gate_ptr = weight_gate.ptr;
         var weight_up_ptr = weight_up.ptr;
         var activation_u32: u32 = activation;
+        if (self.small_q4_q8_decode and rows == 1 and in_dim == 2560 and out_dim == 10240) {
+            if (self.q4_q8_gate_up_k2560_n10240) |small| {
+                var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&input_ptr), @ptrCast(&weight_gate_ptr), @ptrCast(&weight_up_ptr), @ptrCast(&activation_u32) };
+                try launchBlocks(small, ctx, out_dim, q4_0_tiled_threads_w5, &params);
+                self.small_q4_q8_gate_up_down_calls += 1;
+                return;
+            }
+        }
         if (rows == 1 and in_dim == 2560 and out_dim == 10240) {
             if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_TILE4_W5_E4B_FFN", true)) {
                 if (self.linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn) |function| {
@@ -23203,6 +23264,35 @@ test "CUDA immutable packed activation recipes preserve row and special shape se
     try std.testing.expectEqual(KernelModule.Q4_0Q8_1Recipe.Leaf.down, module.q4_0Q8_1Recipe(.tile4_w8, 1, 10240, 2560).?.leaf);
 }
 
+test "CUDA immutable packed singleton recipes freeze opt-in geometry before context access" {
+    var module: KernelModule = .{};
+    module.linear_q4_0_q8_1_f32_tile4 = @ptrFromInt(16);
+    module.linear_q4_0_q8_1_f32_tile4_w8 = @ptrFromInt(32);
+    module.q4_q8_projection_k256_n2560 = @ptrFromInt(48);
+    module.q4_q8_projection_k2560_n256 = @ptrFromInt(64);
+    module.q4_q8_down_k10240_n2560 = @ptrFromInt(80);
+    const Case = struct { family: KernelModule.Q4_0Q8_1Recipe.Family, width: usize, columns: usize, leaf: KernelModule.Q4_0Q8_1Recipe.Leaf };
+    for ([_]Case{
+        .{ .family = .tile4, .width = 256, .columns = 2560, .leaf = .k256_n2560 },
+        .{ .family = .tile4_w8, .width = 2560, .columns = 256, .leaf = .k2560_n256 },
+        .{ .family = .tile4_w8, .width = 10240, .columns = 2560, .leaf = .down_single },
+    }) |case| {
+        module.small_q4_q8_decode = false;
+        try std.testing.expectEqual(KernelModule.Q4_0Q8_1Recipe.Leaf.generic, module.q4_0Q8_1Recipe(case.family, 1, case.width, case.columns).?.leaf);
+        module.small_q4_q8_decode = true;
+        const recipe = module.q4_0Q8_1Recipe(case.family, 1, case.width, case.columns).?;
+        try std.testing.expectEqual(case.leaf, recipe.leaf);
+        try std.testing.expectEqual(KernelModule.Q4_0Q8_1Recipe.Leaf.generic, module.q4_0Q8_1Recipe(case.family, 2, case.width, case.columns).?.leaf);
+        module.small_q4_q8_decode = false;
+        var ctx: context_mod.CudaContext = undefined;
+        try std.testing.expectError(error.InvalidCudaState, KernelModule.launchQ4_0Q8_1Recipe(recipe, &ctx, .{}, .{}, .{}, 2, case.width, case.columns));
+        try std.testing.expectError(error.InvalidCudaState, KernelModule.launchQ4_0Q8_1Recipe(recipe, &ctx, .{}, .{}, .{}, 1, case.width + 32, case.columns));
+        module.noteQ4_0Q8_1Recipe(recipe);
+    }
+    try std.testing.expectEqual(@as(usize, 2), module.small_q4_q8_projection_calls);
+    try std.testing.expectEqual(@as(usize, 1), module.small_q4_q8_gate_up_down_calls);
+}
+
 test "CUDA immutable packed special leaves preserve integer oracle bounds and captured addresses" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -23233,8 +23323,16 @@ test "CUDA immutable packed special leaves preserve integer oracle bounds and ca
     } else {
         _ = Env.unsetenv(row_flag);
     };
+    // Exercise the packaged schedules on the available CUDA device without
+    // broadening their separately qualified SM89 production admission.
+    module.q4_q8_projection_k256_n2560 = loadOptionalFunction(&ctx, module.module, "termite_gemma4_small_ple_projection_q8_1_f32") orelse return error.CudaKernelUnavailable;
+    module.q4_q8_projection_k2560_n256 = loadOptionalFunction(&ctx, module.module, "termite_gemma4_small_ple_gate_q8_1_f32") orelse return error.CudaKernelUnavailable;
+    module.q4_q8_down_k10240_n2560 = loadOptionalFunction(&ctx, module.module, "termite_gemma4_small_ffn_down_q8_1_f32") orelse return error.CudaKernelUnavailable;
     const Case = struct { rows: usize, width: usize, columns: usize, family: KernelModule.Q4_0Q8_1Recipe.Family, leaf: KernelModule.Q4_0Q8_1Recipe.Leaf };
     for ([_]Case{
+        .{ .rows = 1, .width = 256, .columns = 2560, .family = .tile4, .leaf = .k256_n2560 },
+        .{ .rows = 1, .width = 2560, .columns = 256, .family = .tile4_w8, .leaf = .k2560_n256 },
+        .{ .rows = 1, .width = 10240, .columns = 2560, .family = .tile4_w8, .leaf = .down_single },
         .{ .rows = 3, .width = 32, .columns = 9, .family = .tile4, .leaf = .generic },
         .{ .rows = 3, .width = 32, .columns = 9, .family = .tile8, .leaf = .generic },
         .{ .rows = 3, .width = 32, .columns = 9, .family = .tile4_w8, .leaf = .rows2 },
@@ -23246,6 +23344,10 @@ test "CUDA immutable packed special leaves preserve integer oracle bounds and ca
         .{ .rows = 1, .width = 10240, .columns = 2560, .family = .tile4_w8, .leaf = .down_w10 },
         .{ .rows = 3, .width = 10240, .columns = 2560, .family = .tile4_w8, .leaf = .down_rows },
     }) |case| {
+        module.small_q4_q8_decode = switch (case.leaf) {
+            .k256_n2560, .k2560_n256, .down_single => true,
+            else => false,
+        };
         try std.testing.expectEqual(@as(c_int, 0), Env.setenv(down_flag, if (case.leaf == .down_w10) "1" else "0", 1));
         try std.testing.expectEqual(@as(c_int, 0), Env.setenv(row_flag, if (case.leaf == .rows8) "1" else "0", 1));
         const row2 = module.linear_q4_0_q8_1_f32_tile4_w8_rows2;

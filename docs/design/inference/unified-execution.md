@@ -157,6 +157,14 @@ window. Managed qualification fixtures use the real registry publication gate
 and hardlink shared immutable weights, rather than inventing capability metadata
 or modifying the default model directory.
 
+CUDA singleton Q4/Q8 schedules use the same immutable recipe for ordinary and
+assigned-output projection. Exact row/width/column checks bind the function, ABI,
+threads and grid before submission. Upstream SM89 opt-in qualification is retained;
+reusing a packaged kernel in a GB10 oracle does not widen that serving gate.
+Video color conversion stays in the shared embedded-module owner; RGB rescaling,
+processor options and patch interpretation stay in the model adapter. The shared
+image-layout proof covers both cached and uncached resident resize paths.
+
 ## Kernel ownership and validation
 
 `ops/kernel_descriptor.zig` describes operation semantics and requirements;

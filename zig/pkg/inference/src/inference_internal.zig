@@ -134,6 +134,7 @@ pub const finetune = struct {
 pub const RunPermit = @import("backends/session.zig").RunPermit;
 pub const antfly_image = @import("antfly_image");
 pub const architectures = struct {
+    pub const gpt = @import("architectures/gpt.zig");
     pub const gemma4_projector = @import("architectures/gemma4_projector.zig");
     pub const gliner_boundary_engine = @import("architectures/gliner/boundary_engine.zig");
     pub const gliner_boundary_request_device = @import("architectures/gliner/boundary_request_device.zig");

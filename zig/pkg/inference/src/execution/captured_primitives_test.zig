@@ -24,14 +24,16 @@ const Fixture = struct {
         return @import("../backends/compute_factory.zig").createMetal(allocator, &self.metal_weights.?, null, std.testing.io, .{}, .{ .require_f32_linears = true });
     }
     fn importMetal(_: *anyopaque, cb: *const ops.ComputeBackend, input: *const Tensor, _: std.mem.Allocator) anyerror!ops.CT {
-        // Floating-point uploads use the ordinary provider API; the optional
-        // constant-byte hook provides exact integer storage without conversion.
-        if (input.dtype == .f32) return tensor(cb, input.*);
-        const dtype: ops.GraphDType = switch (input.dtype) {
-            .i64 => .i64,
+        // Force real device inputs even when ordinary F32 uploads are lazy.
+        // Integer masks retain exact storage through the typed constant hook.
+        const resident = switch (input.dtype) {
+            .f32 => try cb.ensureDeviceResidentOwned(try tensor(cb, input.*)),
+            .i64 => (try cb.fromConstantBytes(input.data, .i64, input.shape)) orelse return error.UnsupportedTensorType,
             else => return error.UnsupportedTensorType,
         };
-        return (try cb.fromConstantBytes(input.data, dtype, input.shape)) orelse error.UnsupportedTensorType;
+        errdefer cb.free(resident);
+        try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(cb, resident));
+        return resident;
     }
     fn import(_: *anyopaque, cb: *const ops.ComputeBackend, input: *const Tensor, _: std.mem.Allocator) anyerror!ops.CT {
         const native: *@import("../ops/native_compute.zig").NativeCompute = @ptrCast(@alignCast(cb.ptr));
@@ -272,6 +274,7 @@ fn qualifyTarget(kind: Kind, precision: @import("precision.zig").Policy, bf16_pr
             defer held.deinit();
             const actual_backend = held.backend(0);
             try std.testing.expectEqual(ops.BackendKind.metal, actual_backend.kind());
+            try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(actual_backend, held.result.outputs[0]));
             const actual_values = try actual_backend.toFloat32(held.result.outputs[0], a);
             defer a.free(actual_values);
             try std.testing.expectEqual(values.len, actual_values.len);

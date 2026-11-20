@@ -311,6 +311,22 @@ pub const ProjectedVideo = struct {
 
 /// Decode one bounded MP4 clip and project each selected frame directly from
 /// CUDA memory. Only timestamp/count metadata is retained on the host.
+// Model RGB rescaling and planar patch interpretation belong to the adapter;
+// bicubic resize and tensor-layout operations remain provider primitives.
+fn prepareResidentRgbPatches(compute: anytype, rgb: CT, width: u32, height: u32, target_width: u32, target_height: u32) !CT {
+    const cb = compute.computeBackend();
+    const centered = try compute.preprocessEmbeddingGemma2ResidentRgb(rgb, width, height, target_width, target_height);
+    defer cb.free(centered);
+    const scaled = (try cb.multiplyScalar(centered, 0.5)) orelse return error.UnsupportedVideoBackend;
+    defer cb.free(scaled);
+    const pixels = (try cb.addScalar(scaled, 0.5)) orelse return error.UnsupportedVideoBackend;
+    defer cb.free(pixels);
+    const rows: i64 = @as(i64, target_width / 16) * (target_height / 16);
+    const planar = try cb.primTranspose(pixels, &.{ 0, 2, 1 }, &.{ rows, 256, 3 });
+    defer cb.free(planar);
+    return cb.primReshape(planar, &.{ rows, 768 });
+}
+
 pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, bytes: []const u8, grow_automatic_scratch: bool) !ProjectedVideo {
     return encodeProjectedVideoWithSession(cb, allocator, projector, bytes, grow_automatic_scratch, null);
 }
@@ -420,7 +436,17 @@ pub fn encodeProjectedVideoWithSession(
             const g = targetGeometry(self.cfg, display[0], display[1]);
             if (self.geometry) |previous| if (!std.meta.eql(previous, g)) try self.flush();
             self.geometry = g;
-            const patches = try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
+            const gpu_compute: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+            const patches = if (gpu_compute.ctx.info.compute_major >= 8 and self.cfg.patch_size == 16 and
+                std.mem.eql(f32, &self.cfg.image_mean, &.{ 0, 0, 0 }) and
+                std.mem.eql(f32, &self.cfg.image_std, &.{ 1, 1, 1 }) and
+                platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_BICUBIC", true))
+            bicubic: {
+                const raster = frame.rasterSize();
+                const rgb = try self.preprocess.rgb8WithSwscale601(gpu_compute, frame, platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VIDEO_SWSCALE_RGB", false));
+                defer self.cb.free(rgb);
+                break :bicubic try prepareResidentRgbPatches(gpu_compute, rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height));
+            } else try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
             self.pending[self.pending_count] = .{ .patches = patches, .timestamp = frame.timestamp_us, .repetitions = frame.repetitions };
             self.pending_count += 1;
             if (self.pending_count == self.capacity) try self.flush();
@@ -3514,7 +3540,9 @@ fn prepareImageView(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg:
 fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, decoded: image.ImageU8, geometry: Geometry) !PreparedImage {
     try decoded.validate();
     if (store.cb.kind() == .metal and store.gguf == null and cfg.embedding_gemma2_f32_attention) return .{ .allocator = allocator, .pixels = &.{}, .geometry = geometry, .source = decoded, .source_owned = false };
-    return prepareImagePixels(allocator, cfg, decoded, geometry, store.gguf == null);
+    const upstream_bicubic = store.gguf == null or (store.cb.kind() == .cuda and cfg.patch_size == 16 and !cfg.direct_unified and
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_IMAGE_BICUBIC", false));
+    return prepareImagePixels(allocator, cfg, decoded, geometry, upstream_bicubic);
 }
 
 /// Codec, resize and rescale only. Learned patch normalization remains in

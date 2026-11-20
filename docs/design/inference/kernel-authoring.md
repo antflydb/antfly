@@ -38,6 +38,7 @@ The agent-facing rules are in `zig/pkg/inference/src/ops/AGENTS.md`.
 | BF16 projection epilogues | `src/ops/cuda/projection_epilogues_bf16.zig`, `prototypes/projection_dot_bias_bf16.py` | SM121 tiles, explicit FP32 bias rounding, GELU versus residual epilogue and input/output precision |
 | BF16 projection with top-1 reduction | `src/ops/cuda/projection_top1_bf16.zig` | Fixed K1024/N248320 schedule, suppression policy, two-stage reduction and 32768/16-byte shared memory |
 | Embedded CUDA program ownership | `src/ops/cuda/embedded_module.zig` | Transactional entry lookup, lazy per-image ownership and direct caller-owned launches |
+| Q4_0/Q8_1 singleton projections | `src/tile/families/native/cuda/projection_direct.cu`, `src/ops/cuda/kernels.zig` | Exact K/N geometry, single-row admission, column ownership, 4/5/8-warp schedules, F32 publication and immutable ordinary/prepared launch identity |
 | Dense projection admission | `dense_projection_policy.zig` | Workload, rows, output width, quant layout and packed-expert exclusion |
 
 Paths above are relative to `zig/pkg/inference`; Metal helpers live under
@@ -94,6 +95,18 @@ Use operation, storage and schedule names for new helpers, entrypoints and sourc
 owners. For example, `antfly_qkv_rope_two_axis_bf16` describes its contract;
 a model-prefixed copy would hide that reuse opportunity. Keep shape variants
 under the existing static family and catalog.
+
+The imported SM89 small-projection symbols retain their upstream device ABI.
+Their host fields and immutable recipe leaves describe Q4/Q8 operations and exact
+K/N geometry; extend that family rather than adding a model-specific launcher.
+Ordinary and assigned-output execution share the checked launcher and successful
+launch counters. Model/device qualification remains in the calling adapter.
+
+RGB conversion similarly exposes its BT.601 policy as an operation. The model
+adapter selects processor compatibility and interprets planar patches. Residual
+projector GEMMs preflight every required vendor plan before numerical submission;
+a submitted error propagates and drains scratch rather than selecting another
+arithmetic path after partially writing the result.
 
 A new production export must have a production dispatch path, not just a
 registry lookup or a numerical test. Trace computed field names, vtables,
