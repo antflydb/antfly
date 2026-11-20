@@ -35,6 +35,24 @@ const capability_cache_max_entries: usize = 64;
 const capability_cache_max_flights: usize = 16;
 const capability_discovery_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const capability_activation_timeout_ns: u64 = 5 * 60 * std.time.ns_per_s;
+pub const discovery_shape_header = "X-Antfly-Inference-Discovery-Shape";
+
+/// Placement-only facts available before encoding an execution payload.
+/// The proxy derives the authoritative budget from the body at execution.
+pub const DiscoveryShape = struct {
+    items: usize,
+    media: bool = false,
+    output_tokens: ?usize = null,
+
+    pub fn formatHeader(self: DiscoveryShape, buf: *[64]u8) ![]const u8 {
+        if (self.items == 0) return error.InvalidInferenceDiscoveryShape;
+        if (self.output_tokens) |tokens| {
+            return std.fmt.bufPrint(buf, "1:{d}:{d}:{d}", .{ self.items, @intFromBool(self.media), tokens });
+        }
+        return std.fmt.bufPrint(buf, "1:{d}:{d}:-", .{ self.items, @intFromBool(self.media) });
+    }
+};
+
 pub const parent_request_id_header = "X-Antfly-Parent-Request-ID";
 pub const model_activation_header = "X-Antfly-Model-Activation";
 const capability_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
@@ -2662,4 +2680,55 @@ test "remote Antfly dense output geometry is optional bounded metadata" {
     }) |shape| try std.testing.expectError(error.InvalidInferenceCapabilities, parseModelCapabilities(std.testing.allocator, prefix ++ shape ++ suffix, "model", .embed));
     const legacy = (try parseModelCapabilities(std.testing.allocator, "{\"embedders\":{\"model\":{\"inputs\":[\"text\"]}}}", "model", .embed)).?;
     try std.testing.expect(legacy.dense_output == null);
+}
+
+test "remote capability discovery forwards placement shape and separates cached leases" {
+    const Fixture = struct {
+        fn expectBatch(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("1:2:1:0", req.header(discovery_shape_header).?);
+            try std.testing.expectEqualStrings("write-heavy", req.header("X-Antfly-Inference-Workload-Type").?);
+        }
+        fn serve(server: *httpx.TestServer) !void {
+            try server.handleOne();
+        }
+    };
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = httpx.TestServer.start(allocator, io, &.{.{
+        .path = "/ai/v1/models",
+        .assert_request = Fixture.expectBatch,
+        .respond = .{ .body = "{\"embedders\":{\"model\":{\"inputs\":[\"image\"]}}}" },
+    }}) catch |err| switch (err) {
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    var http = httpx.Client.init(allocator, io);
+    defer http.deinit();
+    var cache = Cache.init(allocator, io);
+    defer cache.deinit();
+    var single_value: [64]u8 = undefined;
+    var batch_value: [64]u8 = undefined;
+    const single = try (DiscoveryShape{ .items = 1, .output_tokens = 0 }).formatHeader(&single_value);
+    const batch = try (DiscoveryShape{ .items = 2, .media = true, .output_tokens = 0 }).formatHeader(&batch_value);
+    const small_headers: []const [2][]const u8 = &.{
+        .{ "X-Antfly-Inference-Workload-Type", "write-heavy" },
+        .{ discovery_shape_header, single },
+    };
+    const batch_headers: []const [2][]const u8 = &.{
+        small_headers[0],
+        .{ discovery_shape_header, batch },
+    };
+    const key = try capabilityCacheKeyAlloc(allocator, server.baseUrl(), "model", .embed, small_headers);
+    defer allocator.free(key);
+    try cache.admitLocked(key, null, null, null, monotonicNowNs(io));
+    var handler = try io.concurrent(Fixture.serve, .{&server});
+    defer handler.cancel(io) catch {};
+    const lease = try cache.getOrDiscoverLease(&http, server.baseUrl(), "model", .embed, batch_headers);
+    try handler.await(io);
+    try std.testing.expect(lease.capabilities.?.input_modalities.image);
+    const small = try cache.getOrDiscoverLease(&http, server.baseUrl(), "model", .embed, small_headers);
+    try std.testing.expect(small.capabilities == null);
 }
