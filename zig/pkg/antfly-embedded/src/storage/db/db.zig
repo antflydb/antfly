@@ -45666,12 +45666,12 @@ pub const DB = struct {
         if (req.dense_queries.len > 0) {
             for (req.dense_queries) |named| {
                 if (self.core.denseIndex(named.index_name)) |entry| {
-                    if (entry.chunk_name != null) return true;
+                    if (entry.memberBacked()) return true;
                 }
             }
         } else if (req.dense != null) {
             if (self.core.denseIndex(req.index_name)) |entry| {
-                if (entry.chunk_name != null) return true;
+                if (entry.memberBacked()) return true;
             }
         }
 
@@ -47027,7 +47027,7 @@ pub const DB = struct {
         // query and instead carries it through to applyStoredSearchPatternFilters'
         // parent-aware matcher, same as the full-text arm (issue #931/#957).
         const chunk_backed_for_filter = if (self.core.denseIndex(req.index_name)) |entry|
-            entry.chunk_name != null
+            entry.memberBacked()
         else
             false;
         const member_mode_for_filter = req.return_mode == .member or req.return_mode == .chunk;
@@ -47182,7 +47182,7 @@ pub const DB = struct {
         // through to applyStoredSearchPatternFilters' parent-aware matcher
         // instead of applying it natively (issue #931/#957).
         const chunk_backed_for_filter = if (self.core.denseIndex(identity_prefix_filter.req.index_name)) |entry|
-            entry.chunk_name != null
+            entry.memberBacked()
         else
             false;
         const member_mode_for_filter = identity_prefix_filter.req.return_mode == .member or identity_prefix_filter.req.return_mode == .chunk;
@@ -48119,7 +48119,7 @@ pub const DB = struct {
         try self.enforcePortableRuntimeGate();
         if (ttlDurationNs(self) != 0) return declineDenseSnapshot("ttl");
         const entry = (try denseIndexCallback(self, req.index_name)) orelse return error.IndexNotFound;
-        if (entry.chunk_name != null or entry.embedding_names.len != 0) return declineDenseSnapshot("result_shape");
+        if (entry.memberBacked() or entry.embedding_names.len != 0) return declineDenseSnapshot("result_shape");
         const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
         const summary = self.core.identity_visibility.summary orelse return declineDenseSnapshot("identity_summary");
         if (!doc_identity.allVisibleFromSummary(summary, snapshot_req.identity_read_generation)) return declineDenseSnapshot("visibility");
@@ -48534,7 +48534,7 @@ pub const DB = struct {
         // identity stays unchanged so text/vector fusion merges the same member.
         inline for (.{ self.core.index_manager.denseIndex(req.index_name), self.core.index_manager.sparseIndex(req.index_name) }) |selected| {
             if (selected) |entry| {
-                if (chunk_backed and entry.embedding_names.len == 0 and entry.chunk_name != null)
+                if (chunk_backed and entry.embedding_names.len == 0)
                     presence.embedding_presence_name = entry.embedding_name orelse entry.config.name;
             }
         }
@@ -53441,7 +53441,7 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
         // Named vector members resolve their public hit id to the source
         // document/chunk, which may be shared by several embeddings. The
         // artifact reference retains the member's authoritative stored key.
-        const key = if (embedding_presence_name != null and internal_keys.isChunkArtifactRecordKey(hit.id))
+        const key = if (embedding_presence_name != null and (internal_keys.isChunkArtifactRecordKey(hit.id) or internal_keys.isDocumentUnitArtifactRecordKey(hit.id)))
             try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, hit.id, embedding_presence_name.?)
         else if (hit.artifact_ref) |artifact_ref|
             try artifact_ids.internalKeyForArtifactRefAlloc(scratch, artifact_ref)
@@ -62913,7 +62913,7 @@ const denseIndexIsArtifactBacked = local_mutation.denseIndexIsArtifactBacked;
 /// at most one vector per source document use the current incarnation's
 /// outcome tuple even when vectors live in artifacts.
 fn densePublicationTargetUsesArtifactCounter(entry: anytype) bool {
-    return entry.external or entry.chunk_name != null or entry.embedding_names.len > 1;
+    return entry.external or entry.memberBacked() or entry.embedding_names.len > 1;
 }
 
 fn denseCoverageMatchesTarget(active_count: u64, expected_count: u64) bool {
@@ -136947,7 +136947,7 @@ test "db dense lsm cache profile benchmark" {
     for (0..reps) |_| {
         const total_start = monotonicTimeNs();
         const profiled_entry = dense_entry;
-        const chunk_backed = profiled_entry.chunk_name != null;
+        const chunk_backed = profiled_entry.memberBacked();
         const group_chunk_parents = db_query_search.shouldGroupChunkParents(req, chunk_backed);
         const effective_k: u32 = if (group_chunk_parents)
             @intCast(profiled_entry.index.metadata.active_count)

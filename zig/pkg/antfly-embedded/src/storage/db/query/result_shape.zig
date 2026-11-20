@@ -920,11 +920,11 @@ fn chunkStorageKeyForArtifactRefAlloc(alloc: Allocator, artifact_ref: types.Arti
     if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) return try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
     if (artifact_ref.kind != .embedding) return null;
     const source = artifact_ref.source orelse return null;
-    if (source.kind != .chunk) return null;
+    if (source.kind != .chunk and !(source.kind == .asset and source.unit_id != null)) return null;
     const chunk_ref = types.ArtifactRef{
         .document_id = artifact_ref.document_id,
         .name = source.name,
-        .kind = .chunk,
+        .kind = source.kind,
         .chunk_id = source.chunk_id,
         .window_index = source.window_index,
         .unit_id = source.unit_id,

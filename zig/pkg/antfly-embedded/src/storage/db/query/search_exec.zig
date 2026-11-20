@@ -15194,7 +15194,7 @@ fn searchDenseInternal(
     if (returnModeRequiresUnitGrouping(req.return_mode) and !entry.supports_unit_grouping)
         return error.UnsupportedHierarchyGrouping;
 
-    const chunk_backed = entry.chunk_name != null;
+    const chunk_backed = entry.memberBacked();
     // Multi-source members need visibility filtering and identity translation,
     // but raw member modes do not collapse unrelated `(artifact, key)` values.
     // Start at the requested score-order window and grow from observed losses
@@ -15668,7 +15668,7 @@ fn searchDenseInternal(
             };
             var doc_key_owned = true;
             errdefer if (doc_key_owned) alloc.free(doc_key);
-            var source_artifact_ref = if (entry.embedding_names.len > 0 or entry.chunk_name != null)
+            var source_artifact_ref = if (entry.embedding_names.len > 0 or chunk_backed)
                 try artifact_ids.decodeArtifactRefAlloc(alloc, doc_key)
             else
                 null;
@@ -15683,12 +15683,15 @@ fn searchDenseInternal(
             }
             profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
 
-            var stored_data: ?[]u8 = null;
-            var stored_data_owned = false;
+            var stored_data = if (entry.has_pdf_page_members and raw_member_mode and postprocess_req.include_stored)
+                try pdfPageHitProjection(alloc, source_artifact_ref)
+            else
+                null;
+            var stored_data_owned = stored_data != null;
             errdefer if (stored_data_owned) {
                 if (stored_data) |data| alloc.free(data);
             };
-            const load_stored_before_postprocess = postprocess_req.include_stored and
+            const load_stored_before_postprocess = stored_data == null and postprocess_req.include_stored and
                 !(chunk_backed and group_chunk_parents) and
                 !unresolved_stored_filters;
             if (load_stored_before_postprocess and executor.load_projected_documents == null) {
@@ -17188,6 +17191,22 @@ fn lookupDenseHitDocOrdinal(
     if (!denseHitPageNeedsDocOrdinals(req)) return null;
     const lookup = executor.lookup_doc_ordinal orelse return null;
     return try lookup(executor.ctx, alloc, doc_key, req.identity_read_generation);
+}
+
+// The producer persists the page vector under a unit key plus the embedding
+// suffix. Its page number is intrinsic to that identity, so historical vectors
+// can expose the same projection without storing or backfilling a second row.
+fn pdfPageHitProjection(alloc: Allocator, artifact: ?types.ArtifactRef) !?[]u8 {
+    const ref = artifact orelse return null;
+    const unit = switch (ref.kind) {
+        .asset => ref.unit_id,
+        .embedding => if (ref.source) |source| (if (source.kind == .asset) source.unit_id else null) else null,
+        .chunk => null,
+    } orelse return null;
+    if (!std.mem.startsWith(u8, unit, "page:")) return null;
+    const page = std.fmt.parseInt(u32, unit["page:".len..], 10) catch return null;
+    if (page == 0) return null;
+    return try std.json.Stringify.valueAlloc(alloc, .{ .unit_id = unit, .unit_type = "page", .provenance = .{ .page_number = page } }, .{});
 }
 
 fn loadMissingProjectedDenseHitDocuments(

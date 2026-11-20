@@ -181,3 +181,91 @@ def test_page_unit_cursor_survives_reopen_and_fences_source_changes(storage_engi
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+@pytest.mark.real_model
+@pytest.mark.e2e_resource("antfly_process")
+def test_published_pdf_page_image_hits(embeddinggemma2_model_available):
+    binary = os.environ.get("ANTFLY_BIN", str(harness.DEFAULT_ANTFLY_BIN))
+    server = harness.StandaloneAntflyServer(
+        binary, "127.0.0.1", 0, storage_engine="lite", inference_host_budget_mb=6144
+    )
+    failed = True
+    try:
+        root = server.api_url + "/tables/pages"
+
+        def api(method, path, body=None):
+            response = requests.request(method, root + path, json=body, timeout=180)
+            assert response.ok, response.text
+            return response.json()
+
+        api("POST", "", {"num_shards": 1})
+        api(
+            "POST",
+            "/indexes/images",
+            {
+                "type": "embeddings",
+                "dimension": 768,
+                "embedding_name": "visual",
+                "embedder": {
+                    "provider": "antfly",
+                    "model": harness.EMBEDDINGGEMMA2_MODEL,
+                },
+                "enrichments": [
+                    {
+                        "name": "visual",
+                        "kind": "embedding",
+                        "field": "url",
+                        "embedding_input": "pdf_page_images",
+                        "expected_dims": 768,
+                    }
+                ],
+            },
+        )
+        pdf = (
+            Path(__file__).resolve().parents[2]
+            / "lib/pdf/testdata/simple_text_fixture.pdf"
+        )
+        url = (
+            "data:application/pdf;base64," + base64.b64encode(pdf.read_bytes()).decode()
+        )
+        api("POST", "/batch", {"inserts": {"one": {"url": url}}, "sync_level": "write"})
+
+        def published():
+            status = api("GET", "/indexes/images")["status"]
+            return (
+                status.get("publication", {}).get("complete")
+                and status.get("searchable_vectors") == 1
+            )
+
+        assert wait_until(published, timeout_s=180, interval_s=0.25), (
+            server.debug_logs()
+        )
+        for extra in ({}, {"hierarchy": {}}):
+            result = api(
+                "POST",
+                "/query",
+                {
+                    "indexes": ["images"],
+                    "semantic_search": "brass lantern",
+                    "fields": [],
+                    "limit": 1,
+                    "profile": True,
+                    **extra,
+                },
+            )["responses"][0]
+            assert result["status"] == 200, result
+            assert result["profile"]["dense_search"]["raw_hit_count"] == 1
+            hits = result["hits"]["hits"]
+            assert len(hits) == 1, result
+            hit = hits[0]
+            hierarchy = hit["hierarchy"]
+            ref = hierarchy["artifact" if extra else "matched_artifact"]
+            if extra:
+                assert hierarchy["parent_doc_key"] == "one", hit
+            assert ref["unit_id"] == "page:000001", hit
+            if not extra:
+                assert hit["_id"] == "one", hit
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

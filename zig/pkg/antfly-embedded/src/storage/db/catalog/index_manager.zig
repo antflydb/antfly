@@ -2359,6 +2359,10 @@ pub const IndexManager = struct {
         /// True only when every indexed member has a durable document-unit
         /// identity. Source and parent grouping remain available independently.
         supports_unit_grouping: bool = false,
+        /// Page-image producers persist a vector per physical PDF page. The
+        /// page key itself has no stored document or chunk row.
+        has_pdf_page_members: bool = false,
+
         /// Cached physical catalog identity. Set only after a validated v2
         /// pointer or during atomic adoption of a certified native candidate;
         /// maintenance/status checks therefore never reread control files.
@@ -2384,6 +2388,10 @@ pub const IndexManager = struct {
                 verified.generation == checkpoint.generation and
                 verified.config_hash == checkpoint.config_hash and
                 verified.published_count == certified_count;
+        }
+
+        pub fn memberBacked(self: *const DenseIndex) bool {
+            return self.chunk_name != null or self.has_pdf_page_members;
         }
 
         /// Only an open or publication boundary may establish this proof.
@@ -18293,7 +18301,21 @@ pub const IndexManager = struct {
         if (dense.external or dense.embedding_names.len > 1) return true;
         const generator = try parseDenseGeneratorConfig(self.alloc, cfg.config_json);
         defer if (generator) |value| value.deinit(self.alloc);
-        return self.denseChunkSourceName(dense, generator) != null;
+        return self.denseChunkSourceName(dense, generator) != null or self.denseHasPdfPageMembers(dense, generator);
+    }
+
+    fn denseHasPdfPageMembers(self: *const IndexManager, dense: DenseConfig, generator: ?GeneratorConfig) bool {
+        if (generator) |value| return value.embedding_input == .pdf_page_images;
+        if (dense.external) return false;
+        if (dense.embedding_name) |name| {
+            if (self.getEnrichment(.embedding, name)) |embedding| return embedding.embedding_input == .pdf_page_images;
+        }
+        for (dense.embedding_names) |name| {
+            if (self.getEnrichment(.embedding, name)) |embedding| {
+                if (embedding.embedding_input == .pdf_page_images) return true;
+            }
+        }
+        return false;
     }
 
     // Keep resident construction, quarantine accounting and artifact references
@@ -24582,6 +24604,7 @@ pub const IndexManager = struct {
                     .metric = dense_cfg.metric,
                     .external = dense_cfg.external,
                     .managed_direct_field = !dense_cfg.external and dense_generator == null and referenced_embedding == null and dense_cfg.embedding_names.len == 0,
+                    .has_pdf_page_members = self.denseHasPdfPageMembers(dense_cfg, dense_generator),
                     .leann_transient = leann_transient,
                     .leann_text_only = leann_storage == .auto,
                     .leann_media_int8 = leann_transient and if (dense_cfg.leann) |leann_opts| leann_opts.media_int8 else false,
@@ -29360,7 +29383,7 @@ pub const IndexManager = struct {
             defer read_txn.abort();
             for (keys) |key| {
                 const vector_id = (try self.resolveDenseVectorIdForDeleteTxn(&read_txn, entry.config.name, key)) orelse continue;
-                const ordinal = if (entry.chunk_name == null and entry.embedding_names.len == 0)
+                const ordinal = if (!entry.memberBacked() and entry.embedding_names.len == 0)
                     (try doc_identity.lookupOrdinalTxn(self.alloc, &read_txn, key)) orelse
                         try self.lookupDenseVectorOrdinalTxn(&read_txn, entry.config.name, vector_id)
                 else
@@ -34672,7 +34695,7 @@ pub const IndexManager = struct {
         errdefer batch.abort();
         const txn = batch.asTxn();
         const ordinal = if (self.denseIndex(index_name)) |entry|
-            if (entry.chunk_name == null and entry.embedding_names.len == 0) try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key) else null
+            if (!entry.memberBacked() and entry.embedding_names.len == 0) try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key) else null
         else
             null;
         try self.clearDenseVectorMappingTxn(txn, index_name, doc_key, vector_id);
@@ -34792,7 +34815,7 @@ pub const IndexManager = struct {
         index_name: []const u8,
         ordinals: []const doc_identity.DocOrdinal,
     ) ![]u64 {
-        const prefer_primary_mapping = if (self.denseIndex(index_name)) |entry| entry.chunk_name == null and entry.embedding_names.len == 0 else false;
+        const prefer_primary_mapping = if (self.denseIndex(index_name)) |entry| !entry.memberBacked() and entry.embedding_names.len == 0 else false;
         if (prefer_primary_mapping) {
             const entry = self.denseIndex(index_name) orelse return try alloc.alloc(u64, 0);
             if (try self.lookupPrimaryDenseCachedVectorIdsForOrdinalsAlloc(alloc, entry, ordinals)) |cached| {
@@ -34861,7 +34884,7 @@ pub const IndexManager = struct {
         for (missing.items) |item| {
             const ordinal = (try self.lookupDenseVectorOrdinalTxn(&txn, index_name, item.vector_id)) orelse continue;
             out[item.source_index] = ordinal;
-            if (entry.chunk_name == null and entry.embedding_names.len == 0) {
+            if (!entry.memberBacked() and entry.embedding_names.len == 0) {
                 try entry.vector_ordinals.put(self.alloc, item.vector_id, ordinal);
                 try entry.ordinal_vector_ids.put(self.alloc, ordinal, item.vector_id);
             }
