@@ -4215,7 +4215,7 @@ pub const Runtime = struct {
         var json_only = @TypeOf(request) == readers.Request;
         const batch_wire = try readers.measureReaderWire(alloc, cfg, request);
         json_size_hint.* = batch_wire.json_bytes;
-        var framed_failure: ?anyerror = null;
+        var framed_too_many_items = false;
         var first_request = request;
         first_request.images = request.images[0..@min(request.images.len, 1)];
         const first_wire = if (request.images.len > 1) try readers.measureReaderWire(alloc, cfg, first_request) else batch_wire;
@@ -4235,14 +4235,14 @@ pub const Runtime = struct {
                     json_only = true;
                     continue;
                 },
-                error.InferenceDiscoveryShapeRejected => return if (framed_failure == error.InferenceDiscoveryTooManyItems) error.InferenceDiscoveryTooManyItems else err,
+                error.InferenceDiscoveryShapeRejected => return if (framed_too_many_items) error.InferenceDiscoveryTooManyItems else err,
                 error.InferenceDiscoveryRequiresExactGeometry, error.InferenceDiscoveryTooManyItems, error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryRejected => {
                     if (rounded) {
                         rounded = false;
                         continue;
                     }
                     if (!json_only) {
-                        framed_failure = err;
+                        framed_too_many_items = err == error.InferenceDiscoveryTooManyItems;
                         json_only = true;
                         continue;
                     }
@@ -4250,7 +4250,7 @@ pub const Runtime = struct {
                         complete = false;
                         continue;
                     }
-                    return if (framed_failure == error.InferenceDiscoveryTooManyItems) framed_failure.? else err;
+                    return if (framed_too_many_items) error.InferenceDiscoveryTooManyItems else err;
                 },
                 else => return err,
             };
@@ -4263,7 +4263,7 @@ pub const Runtime = struct {
             if (!json_only) {
                 if (lease.capabilities) |caps| {
                     if (caps.framed_attachments and !framedReaderWireFits(caps, batch_wire, request.images.len)) {
-                        framed_failure = error.InferenceDiscoveryTooManyItems;
+                        framed_too_many_items = true;
                         json_only = true;
                         rounded = false;
                         continue;
