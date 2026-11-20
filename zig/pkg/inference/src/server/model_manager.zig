@@ -10201,6 +10201,13 @@ pub const ModelManager = struct {
         pub fn values(self: *const EmbeddingRevisions) []const [32]u8 {
             return self.revisions[0..self.len];
         }
+
+        pub fn contains(self: *const EmbeddingRevisions, expected: [32]u8) bool {
+            for (self.values()) |candidate| {
+                if (std.mem.eql(u8, &candidate, &expected)) return true;
+            }
+            return false;
+        }
     };
 
     /// This is a bounded list of eligible recipes, not proof that the weights
@@ -10210,6 +10217,16 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         manifest: manifest_mod.ModelManifest,
         control: InferenceExecutionControl,
+    ) !EmbeddingRevisions {
+        return self.embeddingRevisionCandidates(model_dir, manifest, control, false);
+    }
+
+    fn embeddingRevisionCandidates(
+        self: *ModelManager,
+        model_dir: []const u8,
+        manifest: manifest_mod.ModelManifest,
+        control: InferenceExecutionControl,
+        include_unavailable: bool,
     ) !EmbeddingRevisions {
         var result: EmbeddingRevisions = .{};
         try control.check();
@@ -10233,6 +10250,7 @@ pub const ModelManager = struct {
             (try session_factory.resolveCudaA4bInferenceConfigForModelListing(self.allocator, model_dir, manifest, null)) != null;
         for (candidates) |backend| {
             if (!backend.available()) continue;
+            if (!include_unavailable and self.pinnedBackendIsUnavailable(model_dir, backend)) continue;
             if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) continue;
             if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
             if (manifest.embedding_style == .embedding_gemma2 and backend != .native and backend != .metal and backend != .cuda) continue;
@@ -10251,9 +10269,19 @@ pub const ModelManager = struct {
         expected: [32]u8,
         control: InferenceExecutionControl,
     ) !ModelHandle {
-        return self.acquireVerifiedPinnedEmbedding(model_dir, expected, control) catch |err| switch (err) {
-            error.ChecksumMismatch => error.PinnedEmbeddingArtifactUnavailable,
-            else => err,
+        return self.acquireVerifiedPinnedEmbedding(model_dir, expected, control) catch |err| {
+            if (isPinnedBackendLoadFailure(err)) return error.PinnedEmbeddingBackendUnavailable;
+            return switch (err) {
+                error.ChecksumMismatch, error.InvalidManagedDownload, error.ModelArtifactNotPublished, error.FileNotFound, error.NotDir => error.PinnedEmbeddingArtifactUnavailable,
+                else => err,
+            };
+        };
+    }
+
+    fn isPinnedBackendLoadFailure(err: anyerror) bool {
+        return switch (err) {
+            error.ModelBackendUnhealthy, error.CudaUnavailable, error.CudaSymbolMissing, error.CudaBackendUnavailable, error.MetalUnavailable, error.RequiredBackendUnavailable, error.NoBackendAvailable, error.NoModelFileFound => true,
+            else => false,
         };
     }
 
@@ -10268,23 +10296,36 @@ pub const ModelManager = struct {
         const io = control.io orelse try self.componentPlanIo();
         var manifest = try manifest_mod.loadBoundFromDir(self.allocator, io, model_dir, publication, false);
         defer manifest.deinit();
-        const declared = try self.declaredEmbeddingRevisions(model_dir, manifest, control);
+        const declared = try self.embeddingRevisionCandidates(model_dir, manifest, control, true);
         var compatible: [EmbeddingRevisions.max_backends]backends.BackendType = undefined;
         var count: usize = 0;
+        var known_recipe = false;
         for (declared.values(), declared.backends[0..declared.len]) |revision, backend| {
             if (!std.mem.eql(u8, &revision, &expected)) continue;
+            known_recipe = true;
+            if (self.pinnedBackendIsUnavailable(model_dir, backend)) continue;
+            if (backend == .cuda and !try backends.probeCudaDeviceWithControl(control)) continue;
             compatible[count] = backend;
             count += 1;
         }
-        if (count == 0) return error.InferenceCapabilitiesStale;
+        if (count == 0) return if (known_recipe) error.PinnedEmbeddingBackendUnavailable else error.InferenceCapabilitiesStale;
         const default_backends = self.defaultModelBackends(model_dir);
-        var handle = if (std.mem.eql(backends.BackendType, compatible[0..count], default_backends))
-            try self.acquireFromDirWithControl(model_dir, control)
+        const acquired = if (std.mem.eql(backends.BackendType, compatible[0..count], default_backends))
+            self.acquireFromDirWithControl(model_dir, control)
         else
-            try self.acquireFromDirWithPreferredBackendsAndControl(model_dir, compatible[0..count], false, control);
+            self.acquireFromDirWithPreferredBackendsAndControl(model_dir, compatible[0..count], false, control);
+        var handle = acquired catch |err| {
+            if (count == 1 and isPinnedBackendLoadFailure(err)) markModelBackendUnhealthy(self, model_dir, compatible[0]);
+            return err;
+        };
         errdefer handle.releaseObservation();
         if (!std.meta.eql(handle.get().durable_embedding_revision, @as(?[32]u8, expected))) return error.InferenceCapabilitiesStale;
         return handle;
+    }
+
+    fn pinnedBackendIsUnavailable(self: *ModelManager, model_dir: []const u8, backend: backends.BackendType) bool {
+        if (backend == .cuda and backends.knownCudaDeviceAvailability() == false) return true;
+        return modelBackendIsUnhealthy(self, model_dir, backend);
     }
 
     fn acquireResidentPinnedEmbedding(
@@ -10300,7 +10341,8 @@ pub const ModelManager = struct {
         defer self.unlockLoadedModels();
         for (candidates) |backend| {
             const model = (try self.lookupLoadedModelLocked(model_dir, &.{backend}, false, defaults.cache_policy)) orelse continue;
-            if (!std.meta.eql(model.managed_publication, @as(?[32]u8, publication)) or
+            if (self.pinnedBackendIsUnavailable(model_dir, model.session.backend()) or
+                !std.meta.eql(model.managed_publication, @as(?[32]u8, publication)) or
                 !std.meta.eql(model.durable_embedding_revision, @as(?[32]u8, expected))) continue;
             model.active_handles += 1;
             return .{ .manager = self, .model = model };
@@ -17470,6 +17512,23 @@ test "capi resolver model identity uses receipt digests before load and survives
     const vision_identity = try modelIdentity(a, io, first_path, vision_manifest);
     try std.testing.expectEqual(@import("antfly_image").processing.executionRevision(original), vision_identity);
     try std.testing.expectEqual(vision_identity, try modelIdentity(a, io, second_path, vision_manifest));
+    if (backends.BackendType.native.available()) {
+        var sessions = backends.SessionManager.initWithIo(a, io);
+        sessions.required_backend = null;
+        sessions.required_backend_invalid = false;
+        sessions.preferred_backends = &.{.native};
+        var manager = ModelManager.init(a, sessions);
+        defer manager.deinit();
+        var bound_manifest = manifest;
+        bound_manifest.managed_publication = try managed_receipt.publicationGeneration(a, io, first_path);
+        const initial = try manager.declaredEmbeddingRevisions(first_path, bound_manifest, .{ .io = io });
+        try std.testing.expectEqual(@as(usize, 1), initial.len);
+        markModelBackendUnhealthy(&manager, first_path, .native);
+        const unhealthy = try manager.declaredEmbeddingRevisions(first_path, bound_manifest, .{ .io = io });
+        try std.testing.expectEqual(@as(usize, 0), unhealthy.len);
+        const other = try manager.declaredEmbeddingRevisions(second_path, bound_manifest, .{ .io = io });
+        try std.testing.expectEqual(initial.revisions[0], other.revisions[0]);
+    }
     const copied = try modelIdentity(a, io, second_path, manifest);
     try std.testing.expectEqualSlices(u8, &original, &copied);
     LegacyArtifactDigestCache.entries = @splat(null); // a reopened owner/process

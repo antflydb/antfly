@@ -617,13 +617,7 @@ pub const SessionManager = struct {
             return preferred;
         if (!self.uninterruptibleBackendsAllowed()) return backendOrderWithCudaAvailability(scratch, preferred, false);
         if (comptime !build_options.enable_cuda) return backendOrderWithCudaAvailability(scratch, preferred, false);
-        const known = cuda_probe.load(.acquire);
-        if (known != .unknown) return backendOrderWithCudaAvailability(scratch, preferred, known == .present);
-        var guard: execution_control.UninterruptibleGuard = if (control) |active| try active.enterUninterruptible(.uninterruptible) else .{};
-        defer guard.deinit();
-        const cuda_available = cudaDeviceAvailable();
-        if (control) |active| try active.check();
-        return backendOrderWithCudaAvailability(scratch, preferred, cuda_available);
+        return backendOrderWithCudaAvailability(scratch, preferred, try probeCudaDeviceWithControl(control));
     }
 
     pub fn bestAvailable(self: *const SessionManager) ?BackendType {
@@ -712,6 +706,24 @@ pub fn cudaDeviceAvailable() bool {
     const present = probeCudaDevice();
     cuda_probe.store(if (present) .present else .absent, .release);
     return present;
+}
+
+/// Read cached device evidence without initializing a driver on discovery.
+pub fn knownCudaDeviceAvailability() ?bool {
+    return switch (cuda_probe.load(.acquire)) {
+        .unknown => null,
+        .absent => false,
+        .present => true,
+    };
+}
+
+pub fn probeCudaDeviceWithControl(control: ?execution_control.InferenceExecutionControl) !bool {
+    if (knownCudaDeviceAvailability()) |available| return available;
+    var guard: execution_control.UninterruptibleGuard = if (control) |active| try active.enterUninterruptible(.uninterruptible) else .{};
+    defer guard.deinit();
+    const available = cudaDeviceAvailable();
+    if (control) |active| try active.check();
+    return available;
 }
 
 fn preferredBackendsForOverride(backend: BackendType) []const BackendType {

@@ -2105,6 +2105,18 @@ fn acknowledgeEmbeddingRevision(ctx: *httpx.Context, revision: ?[32]u8) !void {
     }
 }
 
+fn pinnedEmbeddingPreflightFailure(ctx: *httpx.Context, revision: ?[32]u8, err: anyerror) !?httpx.Response {
+    if (revision == null) return null;
+    return switch (err) {
+        error.ChecksumMismatch, error.InvalidManagedDownload, error.ModelArtifactNotPublished, error.PinnedEmbeddingArtifactUnavailable => try embeddingArtifactFailureResponse(ctx),
+        error.PinnedEmbeddingBackendUnavailable => blk: {
+            try ctx.setHeader("X-Antfly-Embedding-Backend-Unavailable", "true");
+            break :blk try transientCapacityFailureResponse(ctx, "EMBEDDING_BACKEND_UNAVAILABLE", "this replica cannot load the pinned embedding backend", "embedding_backend_unavailable");
+        },
+        else => null,
+    };
+}
+
 fn embeddingArtifactFailureResponse(ctx: *httpx.Context) !httpx.Response {
     try ctx.setHeader("X-Antfly-Embedding-Artifact-Unavailable", "true");
     return transientCapacityFailureResponse(ctx, "EMBEDDING_ARTIFACT_UNAVAILABLE", "this replica could not verify an embedding artifact", "embedding_artifact_unavailable");
@@ -14541,8 +14553,10 @@ pub const Node = struct {
         // Read only the lightweight manifest first so media can be admitted
         // before loading tokenizer, weights, or accelerator sessions.
         const model_name: ?[]const u8 = if (request.model.len > 0) request.model else null;
-        const model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "embedders") catch |err|
+        const model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "embedders") catch |err| {
+            if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
             return requestModelResolutionError(ctx, err);
+        };
         const model_path = model_path_selection.path;
         execution_control = model_path_selection.bind(execution_control);
         defer ctx.allocator.free(model_path);
@@ -14551,13 +14565,17 @@ pub const Node = struct {
         // Request validation never scans its GGUF tokenizer arrays, and the
         // failed runtime can be reclaimed before a recovery replacement loads.
         const cached_manifest = if (metal_runtime.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
-            self.model_manager.copyCachedQwenEmbeddingManifestWithControl(ctx.allocator, model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
-                return modelLoadFailureResponse(ctx, err)
+            self.model_manager.copyCachedQwenEmbeddingManifestWithControl(ctx.allocator, model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err| {
+                if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
+                return modelLoadFailureResponse(ctx, err);
+            }
         else
             null;
         var owned_admission_manifest = cached_manifest orelse
-            self.embeddingManifestSelected(ctx.allocator, model_path_selection, execution_control) catch |err|
+            self.embeddingManifestSelected(ctx.allocator, model_path_selection, execution_control) catch |err| {
+            if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
             return modelLoadFailureResponse(ctx, err);
+        };
         defer owned_admission_manifest.deinit();
         const admission_manifest = &owned_admission_manifest;
         validateQwen3EmbeddingDimensions(admission_manifest, requested_dimensions) catch |err| {
@@ -14577,7 +14595,7 @@ pub const Node = struct {
                 reserved_units = required_units;
             }
             return self.createGroupedEmbedding(ctx, model_path, admission_manifest, executor_contract, request, borrowed_attachments, .{ .media = media_admission, .reserved_units = &reserved_units, .audio_working_bytes = audio_admission.max_decode_working_bytes }, execution_control) catch |err| {
-                if (err == error.PinnedEmbeddingArtifactUnavailable) return embeddingArtifactFailureResponse(ctx);
+                if (err == error.PinnedEmbeddingArtifactUnavailable or err == error.PinnedEmbeddingBackendUnavailable) return (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)).?;
                 return groupedEmbeddingFailureResponse(ctx, err);
             };
         }
@@ -14663,7 +14681,7 @@ pub const Node = struct {
             }, &attempt, Attempt.run) catch |err|
                 {
                     if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
-                    if (err == error.PinnedEmbeddingArtifactUnavailable) return embeddingArtifactFailureResponse(ctx);
+                    if (err == error.PinnedEmbeddingArtifactUnavailable or err == error.PinnedEmbeddingBackendUnavailable) return (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)).?;
                     if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
                     return inferenceFailureResponse(ctx, err);
                 };
@@ -14902,7 +14920,7 @@ pub const Node = struct {
             .execution_control = execution_control,
         }, &attempt, Attempt.run) catch |err| {
             if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
-            if (err == error.PinnedEmbeddingArtifactUnavailable) return embeddingArtifactFailureResponse(ctx);
+            if (err == error.PinnedEmbeddingArtifactUnavailable or err == error.PinnedEmbeddingBackendUnavailable) return (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)).?;
             if (err == error.EmbeddingIdentityMismatch) return ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = "embedding assets or recipe differ from the pinned index identity" });
             if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
             if (isEmbedRequestOptionError(err)) {
@@ -26506,13 +26524,18 @@ pub const Node = struct {
             self.resolveReadRequestModelSelection(ctx.allocator, ctx.io, request.model)
         else
             self.resolveRequestModelSelection(ctx.allocator, ctx.io, request.model, runtimeTaskDir(request.task));
-        const selected = model_path catch |err| return requestModelResolutionError(ctx, err);
+        const selected = model_path catch |err| {
+            if (try pinnedEmbeddingPreflightFailure(ctx, expected_revision, err)) |response| return response;
+            return requestModelResolutionError(ctx, err);
+        };
         const resolved_path = selected.path;
         defer ctx.allocator.free(resolved_path);
         execution_control = selected.bind(execution_control);
 
-        var manifest = self.loadBoundManifest(ctx.allocator, resolved_path, false, execution_control) catch |err|
+        var manifest = self.loadBoundManifest(ctx.allocator, resolved_path, false, execution_control) catch |err| {
+            if (try pinnedEmbeddingPreflightFailure(ctx, expected_revision, err)) |response| return response;
             return modelLoadFailureResponse(ctx, err);
+        };
         defer manifest.deinit();
         if (!manifestMatchesModelListingTask(runtimeListingTask(request.task), @tagName(manifest.model_type), &manifest)) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model does not support the requested task" });
@@ -26563,7 +26586,7 @@ pub const Node = struct {
             var handle = if (expected_revision) |required|
                 self.model_manager.acquirePinnedEmbedding(resolved_path, required, execution_control) catch |err| {
                     if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
-                    if (err == error.PinnedEmbeddingArtifactUnavailable) return embeddingArtifactFailureResponse(ctx);
+                    if (try pinnedEmbeddingPreflightFailure(ctx, expected_revision, err)) |response| return response;
                     return modelLoadFailureResponse(ctx, err);
                 }
             else
@@ -26742,22 +26765,29 @@ pub const Node = struct {
             var catalog = try std.json.parseFromSlice(std.json.Value, ctx.allocator, json_body, .{});
             defer catalog.deinit();
             if (catalog.value == .object) if (catalog.value.object.getPtr(category)) |models| if (models.* == .object) if (models.object.getPtr(name)) |info| if (info.* == .object) {
-                const path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| return requestModelResolutionError(ctx, err);
+                const embedding = std.mem.eql(u8, operation, "embed");
+                const include_revisions = if (ctx.query("model_revision_candidates")) |flag| std.mem.eql(u8, flag, "1") else false;
+                const requested_revision = ctx.query("model_revision");
+                const replica_probe = embedding and (include_revisions or requested_revision != null);
+                const path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| {
+                    if (replica_probe and (err == error.InvalidManagedDownload or err == error.ChecksumMismatch)) return embeddingArtifactFailureResponse(ctx);
+                    return requestModelResolutionError(ctx, err);
+                };
                 const path = path_selection.path;
                 defer ctx.allocator.free(path);
                 const control = self.bindModelSelection(path_selection, httpInferenceExecutionControl(self, ctx));
-                var manifest = self.loadBoundManifest(ctx.allocator, path, false, control) catch |err| return modelLoadFailureResponse(ctx, err);
+                var manifest = self.loadBoundManifest(ctx.allocator, path, false, control) catch |err| {
+                    if (replica_probe and (err == error.InvalidManagedDownload or err == error.ChecksumMismatch or err == error.ModelArtifactNotPublished)) return embeddingArtifactFailureResponse(ctx);
+                    return modelLoadFailureResponse(ctx, err);
+                };
                 defer manifest.deinit();
                 var dense_output = manifest.denseEmbeddingOutput();
-                const embedding = std.mem.eql(u8, operation, "embed");
                 var durable_revision: ?[32]u8 = null;
-                const include_revisions = if (ctx.query("model_revision_candidates")) |flag| std.mem.eql(u8, flag, "1") else false;
-                const requested_revision = ctx.query("model_revision");
                 var cached_model = self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 defer if (cached_model) |*handle| handle.releaseObservation();
                 const declared = if (embedding and manifest.managed_publication != null and (cached_model == null or include_revisions or requested_revision != null))
                     self.model_manager.declaredEmbeddingRevisions(path, manifest, control) catch |err| {
-                        if (err == error.ChecksumMismatch) return embeddingArtifactFailureResponse(ctx);
+                        if (err == error.ChecksumMismatch or err == error.InvalidManagedDownload or err == error.ModelArtifactNotPublished) return embeddingArtifactFailureResponse(ctx);
                         return modelLoadFailureResponse(ctx, err);
                     }
                 else
@@ -26768,7 +26798,13 @@ pub const Node = struct {
                     dense_output = serving.manifest.denseEmbeddingOutput();
                     if (embedding) {
                         durable_revision = serving.durable_embedding_revision;
-                        if (serving.managed_publication != null) break :loaded durable_revision;
+                        if (serving.managed_publication != null) {
+                            if (replica_probe) {
+                                const retained = if (durable_revision) |active| declared.contains(active) else false;
+                                if (!retained) durable_revision = if (declared.len > 0) declared.revisions[0] else null;
+                            }
+                            break :loaded durable_revision;
+                        }
                     }
                     if (serving.resolution_revision) |loaded_revision| break :loaded loaded_revision;
                     if (embedding) return error.InvalidEmbeddingIdentity;
@@ -26798,9 +26834,7 @@ pub const Node = struct {
                     var requested: [32]u8 = undefined;
                     if (required.len != 64) return embeddingRevisionFailureResponse(ctx);
                     _ = std.fmt.hexToBytes(&requested, required) catch return embeddingRevisionFailureResponse(ctx);
-                    if (!std.meta.eql(durable_revision, @as(?[32]u8, requested)) and !for (declared.values()) |candidate| {
-                        if (std.mem.eql(u8, &candidate, &requested)) break true;
-                    } else false)
+                    if (!std.meta.eql(durable_revision, @as(?[32]u8, requested)) and !declared.contains(requested))
                         return embeddingRevisionFailureResponse(ctx);
                     durable_revision = requested;
                     revision = requested;
@@ -50795,6 +50829,20 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     var repaired = try node.listModels(&repaired_context);
     defer repaired.deinit();
     try std.testing.expectEqual(@as(u16, 200), repaired.status.code);
+
+    for ([_]?[]const u8{ weights[0..1], null }) |contents| {
+        if (contents) |data| {
+            try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/model.safetensors", .data = data });
+        } else {
+            try tmp.dir.deleteFile(io, "embedders/acme/other/model.safetensors");
+        }
+        var broken_context = httpx.Context.init(a, io, &managed_activation);
+        defer broken_context.deinit();
+        var broken = try node.loadModelInstance(&broken_context);
+        defer broken.deinit();
+        try std.testing.expectEqual(@as(u16, 503), broken.status.code);
+        try std.testing.expectEqualStrings("true", broken.headers.get("X-Antfly-Embedding-Artifact-Unavailable").?);
+    }
 
     for ([_][]const u8{ "/ai/v1/models/instances", "/ai/v1/models/instances?model_revision=" ++ wrong }) |path| {
         var expired = try httpx.Request.init(a, .POST, path);
