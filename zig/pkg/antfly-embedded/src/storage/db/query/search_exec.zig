@@ -385,6 +385,7 @@ pub const DenseSearchExecutor = struct {
         entry: *index_manager_mod.IndexManager.DenseIndex,
         key: []const u8,
     ) anyerror![]u8 = null,
+    lookup_residual_vector_ids: ?*const fn (?*anyopaque, Allocator, []const u8, []const []const u8) anyerror![]u64 = null,
     lookup_vector_id: *const fn (
         ctx: ?*anyopaque,
         index_name: []const u8,
@@ -1955,6 +1956,7 @@ pub const StructuredFilterResolverExecutor = struct {
     lookup_live_identity: ?*const fn (?*anyopaque, Allocator, []const []const u8, ?u64) anyerror!?[]?doc_set.DocOrdinal = null,
     primary_residual_scope: ?PrimaryResidualScope = null,
     range_projection_current: ?RangeProjectionCurrent = null,
+    retain_primary_legacy_union: bool = false,
     retain_legacy_union: bool = false,
     legacy_matches: ?*doc_set.ResolvedDocSet = null,
     structured_visibility_verified: ?*bool = null,
@@ -2415,6 +2417,48 @@ fn collectStructuredFilterWithinConstraints(
     return collectStructuredFilterResolvedDocSetAlloc(alloc, scoped, executor, json);
 }
 
+fn collectExclusionWithinResidualUnion(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: StructuredFilterResolverExecutor,
+    constraints: *const NativeDocIdConstraints,
+) !?doc_set.ResolvedDocSet {
+    var ordinal_scope = if (resolvedDocFilterFromRequest(req)) |prior| prior.* else doc_set.ResolvedDocFilter{};
+    ordinal_scope.include = constraints.primary_include;
+    var scoped = req;
+    scoped.resolved_doc_filter = &ordinal_scope;
+    var local = executor;
+    local.legacy_matches = null;
+    var rows_visible = false;
+    local.structured_visibility_verified = &rows_visible;
+    var known = (try collectStructuredFilterResolvedDocSetAlloc(alloc, scoped, local, req.exclusion_query_json)) orelse return null;
+    errdefer known.deinit(alloc);
+
+    var keys = req;
+    keys.filter_doc_ids = constraints.legacy_filter.doc_keys;
+    keys.filter_doc_ids_positive = true;
+    var keys_visible = false;
+    local.structured_visibility_verified = &keys_visible;
+    var legacy = (try collectStructuredFilterResolvedDocSetAlloc(alloc, keys, local, req.exclusion_query_json)) orelse {
+        known.deinit(alloc);
+        return null;
+    };
+    defer legacy.deinit(alloc);
+    if (executor.structured_visibility_verified) |verified| verified.* = rows_visible and keys_visible;
+    if (legacy == .none) return known;
+    if (try doc_set.unionAlloc(alloc, &known, &legacy)) |united| {
+        known.deinit(alloc);
+        return united;
+    }
+    if (legacy == .doc_keys and (known == .ordinals or known == .ordinal_bitmap)) {
+        executor.legacy_matches.?.* = legacy;
+        legacy = .none;
+        return known;
+    }
+    known.deinit(alloc);
+    return null;
+}
+
 fn deriveNativeDocIdConstraintsAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -2542,7 +2586,14 @@ fn deriveNativeDocIdConstraintsAlloc(
                 application.live_filter_doc_set = null;
                 application.nonvisible_doc_set = null;
             }
-            try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, application);
+            if (out.legacy_filter != .none) {
+                out.primary_include.deinit(alloc);
+                out.primary_include = try doc_set.cloneAlloc(alloc, &owned_resolved);
+            }
+            if (out.legacy_filter != .none and application.retain_primary_legacy_union) {
+                out.positive_filter = true;
+                out.resolved_stored_filters = true;
+            } else try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, application);
             out.filter_query_json_resolved = true;
         } else if (try collectStructuredFilterDocIdsAlloc(alloc, req, active_executor, req.filter_query_json)) |doc_ids| {
             try mergeNativePositiveKeys(alloc, &out, doc_ids, true);
@@ -2611,7 +2662,7 @@ fn deriveNativeDocIdConstraintsAlloc(
         const resolved_exclusion = if (out.legacy_filter == .none)
             try collectStructuredFilterWithinConstraints(alloc, req, resolver, &out, req.exclusion_query_json)
         else
-            try collectStructuredFilterResolvedDocSetAlloc(alloc, req, resolver, req.exclusion_query_json);
+            try collectExclusionWithinResidualUnion(alloc, req, resolver, &out);
         if (resolved_exclusion) |resolved| {
             var owned_resolved = resolved;
             defer owned_resolved.deinit(alloc);
@@ -2668,8 +2719,7 @@ fn deriveNativeDocIdConstraintsAlloc(
 
     if (active_executor.text_snapshot_for_doc_num_projection) |snapshot| {
         const control = query_mod.ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
-        try mergeLegacyResidualTextDocNumsAlloc(alloc, snapshot, &out.legacy_filter, &out.filter_doc_nums, &out.filter_doc_nums_owned, control);
-        try mergeLegacyResidualTextDocNumsAlloc(alloc, snapshot, &out.legacy_exclude, &out.exclude_doc_nums, &out.exclude_doc_nums_owned, control);
+        try mergeLegacyResidualTextDocNumsAlloc(alloc, snapshot, &out, control);
     }
 
     if (active_executor.apply_live_all_docs and !out.positive_filter) {
@@ -2778,26 +2828,49 @@ fn applyResolvedTextDocNumFilterAlloc(
 fn mergeLegacyResidualTextDocNumsAlloc(
     alloc: Allocator,
     snapshot: *const index_mod.IndexSnapshot,
-    legacy: *const doc_set.ResolvedDocSet,
-    doc_nums: *[]const u32,
-    owned: *bool,
+    out: *NativeDocIdConstraints,
     control: query_mod.ExecutionControl,
 ) !void {
-    if (legacy.* != .doc_keys) return;
+    const includes = if (out.legacy_filter == .doc_keys) out.legacy_filter.doc_keys else &.{};
+    const excludes = if (out.legacy_exclude == .doc_keys) out.legacy_exclude.doc_keys else &.{};
+    if (includes.len == 0 and excludes.len == 0) return;
+    var slots: std.StringHashMapUnmanaged(u32) = .empty;
+    defer slots.deinit(alloc);
     var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
     defer frontier.deinit(alloc);
-    for (legacy.doc_keys, 0..) |key, i| {
-        try control.check();
-        try frontier.put(alloc, std.math.cast(u32, i) orelse return error.InvalidData, key);
+    for ([_][]const []const u8{ includes, excludes }) |keys| {
+        for (keys) |key| {
+            try control.check();
+            const slot = try slots.getOrPut(alloc, key);
+            if (slot.found_existing) continue;
+            const id = std.math.cast(u32, frontier.count()) orelse return error.InvalidData;
+            slot.value_ptr.* = id;
+            try frontier.put(alloc, id, key);
+        }
     }
     var documents = try snapshot.collectGraphKeyFrontierDocNumsAlloc(alloc, frontier, control);
     defer documents.deinit();
-    if (documents.bitmap.cardinality() == 0) return;
-    const added = try alloc.alloc(u32, documents.bitmap.cardinality());
-    defer alloc.free(added);
-    var iter = documents.bitmap.iterator();
-    for (added) |*number| number.* = iter.next().?;
-    try mergeResidualDocNumsAlloc(alloc, doc_nums, owned, added);
+    var excluded = std.DynamicBitSetUnmanaged{};
+    defer excluded.deinit(alloc);
+    excluded = try std.DynamicBitSetUnmanaged.initEmpty(alloc, frontier.count());
+    for (excludes) |key| excluded.set(slots.get(key).?);
+
+    var added = std.ArrayListUnmanaged(u32).empty;
+    defer added.deinit(alloc);
+    var removed = std.ArrayListUnmanaged(u32).empty;
+    defer removed.deinit(alloc);
+    var matches = documents.ordinals.iterator();
+    while (matches.next()) |match| {
+        try control.check();
+        if (excluded.isSet(match.value_ptr.*)) {
+            try removed.append(alloc, match.key_ptr.*);
+        } else {
+            try added.append(alloc, match.key_ptr.*);
+        }
+    }
+    // An excluded key needs no positive candidate even if it matched both.
+    try mergeResidualDocNumsAlloc(alloc, &out.filter_doc_nums, &out.filter_doc_nums_owned, added.items);
+    try mergeResidualDocNumsAlloc(alloc, &out.exclude_doc_nums, &out.exclude_doc_nums_owned, removed.items);
 }
 
 fn mergeResidualDocNumsAlloc(alloc: Allocator, doc_nums: *[]const u32, owned: *bool, added: []const u32) !void {
@@ -12531,6 +12604,8 @@ const BorrowedDocNumSet = struct {
 };
 
 const NativeDocIdConstraintMembership = struct {
+    legacy_filter: ?BorrowedDocIdSet = null,
+    legacy_exclude: ?BorrowedDocIdSet = null,
     filter_doc_ids: ?BorrowedDocIdSet = null,
     exclude_doc_ids: ?BorrowedDocIdSet = null,
     filter_doc_nums: ?BorrowedDocNumSet = null,
@@ -12543,10 +12618,14 @@ const NativeDocIdConstraintMembership = struct {
         if (constraints.exclude_doc_ids.len > 0) out.exclude_doc_ids = try BorrowedDocIdSet.initAlloc(alloc, constraints.exclude_doc_ids);
         if (constraints.filter_doc_nums.len > 0) out.filter_doc_nums = try BorrowedDocNumSet.initAlloc(alloc, constraints.filter_doc_nums);
         if (constraints.exclude_doc_nums.len > 0) out.exclude_doc_nums = try BorrowedDocNumSet.initAlloc(alloc, constraints.exclude_doc_nums);
+        if (constraints.legacy_filter == .doc_keys) out.legacy_filter = try BorrowedDocIdSet.initAlloc(alloc, constraints.legacy_filter.doc_keys);
+        if (constraints.legacy_exclude == .doc_keys) out.legacy_exclude = try BorrowedDocIdSet.initAlloc(alloc, constraints.legacy_exclude.doc_keys);
         return out;
     }
 
     pub fn deinit(self: *NativeDocIdConstraintMembership, alloc: Allocator) void {
+        if (self.legacy_filter) |*set| set.deinit(alloc);
+        if (self.legacy_exclude) |*set| set.deinit(alloc);
         if (self.filter_doc_ids) |*set| set.deinit(alloc);
         if (self.exclude_doc_ids) |*set| set.deinit(alloc);
         if (self.filter_doc_nums) |*set| set.deinit(alloc);
@@ -14154,7 +14233,11 @@ fn deriveNativeDenseConstraintsAlloc(
         }
         if (doc_constraints.filter_doc_ids.len > 0) {
             const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const mapped_doc_ids = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name);
+            const mapped_doc_ids = if (doc_constraints.filter_query_json_resolved)
+                try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name)
+            else
+                try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.filter_doc_ids, executor, index_name);
+            errdefer alloc.free(mapped_doc_ids);
             if (bench_profile) filter_doc_ids_ns += platform_time.monotonicNs() - phase_start_ns;
             if (mapped_owned) {
                 const intersect_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
@@ -14169,7 +14252,7 @@ fn deriveNativeDenseConstraintsAlloc(
             mapped_owned = true;
         }
         if (doc_constraints.legacy_filter == .doc_keys) {
-            const legacy = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.legacy_filter.doc_keys, executor, index_name);
+            const legacy = try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.legacy_filter.doc_keys, executor, index_name);
             defer alloc.free(legacy);
             const merged = try unionVectorIdsAlloc(alloc, mapped, legacy);
             if (mapped_owned) alloc.free(mapped);
@@ -14208,12 +14291,15 @@ fn deriveNativeDenseConstraintsAlloc(
     }
     if (doc_constraints.exclude_doc_ids.len > 0) {
         const phase_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        const mapped_excludes = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name);
+        const mapped_excludes = if (doc_constraints.exclusion_query_json_resolved)
+            try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name)
+        else
+            try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.exclude_doc_ids, executor, index_name);
         if (bench_profile) exclude_doc_ids_ns += platform_time.monotonicNs() - phase_start_ns;
         try mergeNativeExcludeIds(alloc, &out, mapped_excludes, req.exclude_ids);
     }
     if (doc_constraints.legacy_exclude == .doc_keys) {
-        const legacy = try denseVectorIdsForDocIdsAlloc(alloc, doc_constraints.legacy_exclude.doc_keys, executor, index_name);
+        const legacy = try denseVectorIdsForResidualKeysAlloc(alloc, doc_constraints.legacy_exclude.doc_keys, executor, index_name);
         try mergeNativeExcludeIds(alloc, &out, legacy, req.exclude_ids);
     }
     if (out.exclude_ids.len == 0 and req.exclude_ids.len > 0) {
@@ -14401,6 +14487,11 @@ fn appendDocIds(
         }
         if (!exists) try out.append(alloc, id);
     }
+}
+
+fn denseVectorIdsForResidualKeysAlloc(alloc: Allocator, keys: []const []const u8, executor: DenseSearchExecutor, name: []const u8) ![]u64 {
+    if (executor.lookup_residual_vector_ids) |lookup| return lookup(executor.ctx, alloc, name, keys);
+    return denseVectorIdsForDocIdsAlloc(alloc, keys, executor, name);
 }
 
 fn denseVectorIdsForDocIdsAlloc(
@@ -22146,6 +22237,7 @@ pub fn searchMatchAll(
     else
         SortExecutionPlan{ .kind = .none };
 
+    const compact_primary = exec_req.order_by.len == 0 and !requestHasSortPageOptions(exec_req);
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, exec_req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
@@ -22157,6 +22249,8 @@ pub fn searchMatchAll(
         .live_filter_doc_set = executor.live_filter_doc_set,
         .nonvisible_doc_set = executor.nonvisible_doc_set,
         .project_ordinals_to_doc_ids = false,
+        .retain_legacy_union = compact_primary,
+        .retain_primary_legacy_union = compact_primary,
         .apply_live_all_docs = true,
     });
     defer native_constraints.deinit(alloc);
@@ -22365,7 +22459,7 @@ pub fn searchMatchAll(
     var candidates = executor.collect_candidates(executor.ctx, alloc, postprocess_req, if (postprocess_req.order_by.len > 0) .{
         .candidate_limit = exact_sort_budget,
         .constraints = &native_constraints,
-    } else .{}) catch |err| {
+    } else if (native_constraints.legacy_filter != .none or native_constraints.legacy_exclude != .none) .{ .constraints = &native_constraints } else .{}) catch |err| {
         if (postprocess_req.order_by.len > 0 and err == error.QueryCandidateBudgetExceeded) {
             logExactSortBudgetRejection(
                 "match_all",
@@ -22546,7 +22640,7 @@ fn applyMatchAllDocIdConstraintsAlloc(
     candidates: *MatchAllCandidates,
     constraints: *const NativeDocIdConstraints,
 ) !void {
-    if (!constraints.positive_filter and constraints.exclude_doc_ids.len == 0 and constraints.exclude_doc_nums.len == 0) return;
+    if (!constraints.positive_filter and constraints.exclude_doc_ids.len == 0 and constraints.exclude_doc_nums.len == 0 and constraints.legacy_exclude == .none) return;
 
     var membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
     defer membership.deinit(alloc);
@@ -22594,8 +22688,16 @@ fn matchAllCandidateAllowedWithMembership(
     constraints: *const NativeDocIdConstraints,
     membership: ?*const NativeDocIdConstraintMembership,
 ) bool {
-    if (constraints.positive_filter) {
-        if (constraints.filter_doc_ids.len == 0 and constraints.filter_doc_nums.len == 0) return false;
+    const in_legacy = constraints.legacy_filter == .doc_keys and
+        (if (membership) |m| m.legacy_filter.?.contains(candidate.id) else containsDocId(constraints.legacy_filter.doc_keys, candidate.id));
+    if (constraints.legacy_exclude == .doc_keys and
+        (if (membership) |m| m.legacy_exclude.?.contains(candidate.id) else containsDocId(constraints.legacy_exclude.doc_keys, candidate.id))) return false;
+    if (constraints.positive_filter and !in_legacy) {
+        if (constraints.filter_doc_ids.len == 0 and constraints.filter_doc_nums.len == 0) {
+            if (constraints.legacy_filter == .none) return false;
+            const ordinal = candidate.ordinal orelse return false;
+            if (!constraints.primary_include.containsOrdinal(ordinal)) return false;
+        }
         if (constraints.filter_doc_ids.len > 0) {
             const contains = if (membership) |m|
                 m.containsFilterDocId(candidate.id)

@@ -47307,6 +47307,7 @@ pub const DB = struct {
             .lookup_doc_key = denseDocKeyCallback,
             .resolve_hit_key = resolveDenseHitKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
+            .lookup_residual_vector_ids = denseResidualVectorIdsCallback,
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
             .all_docs_visible_fast = allDocsVisibleFastCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
@@ -47455,6 +47456,7 @@ pub const DB = struct {
             .lookup_doc_key = denseDocKeyCallback,
             .resolve_hit_key = resolveDenseHitKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
+            .lookup_residual_vector_ids = denseResidualVectorIdsCallback,
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
             .all_docs_visible_fast = allDocsVisibleFastCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
@@ -48719,6 +48721,11 @@ pub const DB = struct {
         return try self.core.index_manager.lookupDenseDocKey(self.core.store, index_name, vector_id);
     }
 
+    fn denseResidualVectorIdsCallback(ctx: ?*anyopaque, alloc: Allocator, name: []const u8, keys: []const []const u8) anyerror![]u64 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return self.core.index_manager.lookupDenseVectorIdsForParentKeysAlloc(alloc, self.core.store, name, keys);
+    }
+
     fn denseVectorIdCallback(
         ctx: ?*anyopaque,
         index_name: []const u8,
@@ -49465,9 +49472,13 @@ pub const DB = struct {
         req: types.SearchRequest,
         keys: []const []const u8,
     ) ![]bool {
+        return self.filterGraphKeysWithKnownOrdinalsAlloc(alloc, req, keys, null);
+    }
+
+    fn filterGraphKeysWithKnownOrdinalsAlloc(self: *DB, alloc: Allocator, req: types.SearchRequest, keys: []const []const u8, known: ?[]const ?doc_set.DocOrdinal) ![]bool {
         var filter_req = req;
         filter_req.include_stored = false;
-        const admission = try self.filterGraphKeysWithOrdinalsAlloc(alloc, filter_req, keys);
+        const admission = try self.filterGraphKeyMembershipAlloc(alloc, filter_req, keys, known);
         alloc.free(admission.ordinals);
         return admission.allowed;
     }
@@ -49761,10 +49772,14 @@ pub const DB = struct {
         original_req: types.SearchRequest,
         keys: []const []const u8,
     ) !GraphKeyAdmission {
+        return self.filterGraphKeyMembershipAlloc(alloc, original_req, keys, null);
+    }
+
+    fn filterGraphKeyMembershipAlloc(self: *DB, alloc: Allocator, original_req: types.SearchRequest, keys: []const []const u8, known: ?[]const ?doc_set.DocOrdinal) !GraphKeyAdmission {
         var indexed_filter = try self.graphRequestWithIndexedFilterForKeysAlloc(original_req, keys, null);
         defer indexed_filter.deinit();
         const req = indexed_filter.req;
-        const ordinals = try self.lookupLiveDocOrdinalsNoLock(
+        const ordinals = if (known) |values| try alloc.dupe(?doc_set.DocOrdinal, values) else try self.lookupLiveDocOrdinalsNoLock(
             alloc,
             keys,
             req.identity_read_generation,
@@ -49906,13 +49921,22 @@ pub const DB = struct {
         decisions: std.StringHashMapUnmanaged(bool) = .empty,
         clause_membership: db_query_search.IndexedClauseMembership = .{},
 
-        fn canReuseIndexedRequest(self: *GraphNodeAdmissionCache, alloc: Allocator, cached: ?*const AlgebraicDocFilterRequest, keys: []const []const u8) !bool {
-            const prepared = cached orelse return false;
-            if (prepared.graph_memory == null) return true;
+        fn reusableIndexedOrdinalsAlloc(self: *GraphNodeAdmissionCache, alloc: Allocator, cached: ?*const AlgebraicDocFilterRequest, keys: []const []const u8) !?[]?doc_set.DocOrdinal {
+            const prepared = cached orelse return null;
+            if (prepared.graph_memory == null) return null;
             const ordinals = try self.db.lookupLiveDocOrdinalsNoLock(alloc, keys, self.req.identity_read_generation);
-            defer alloc.free(ordinals);
-            for (ordinals) |ordinal| if (ordinal == null) return false;
-            return true;
+            errdefer alloc.free(ordinals);
+            if (std.mem.indexOfScalar(?doc_set.DocOrdinal, ordinals, null) != null) {
+                if (try lookupLiveIdentityDirectoryAlloc(self.db, alloc, keys, self.req.identity_read_generation, false)) |recovered| {
+                    defer alloc.free(recovered);
+                    for (ordinals, recovered) |*ordinal, fallback| ordinal.* = ordinal.* orelse fallback;
+                }
+            }
+            for (ordinals) |ordinal| if (ordinal == null) {
+                alloc.free(ordinals);
+                return null;
+            };
+            return ordinals;
         }
 
         fn init(
@@ -49991,12 +50015,14 @@ pub const DB = struct {
                 const clause_cache: db_query_search.IndexedClauseCache = .{ .memory = &self.clause_membership, .alloc = self.alloc, .budget = self.req.graph_work_budget };
                 var scoped_request: ?AlgebraicDocFilterRequest = null;
                 defer if (scoped_request) |*entry| entry.deinit();
-                if (!try self.canReuseIndexedRequest(result_alloc, if (self.indexed_request_filter) |*cached| cached else null, missing_keys.items)) {
+                const request_ordinals = try self.reusableIndexedOrdinalsAlloc(result_alloc, if (self.indexed_request_filter) |*cached| cached else null, missing_keys.items);
+                defer if (request_ordinals) |values| result_alloc.free(values);
+                if (request_ordinals == null and (self.indexed_request_filter == null or self.indexed_request_filter.?.graph_memory != null)) {
                     const prepared = try self.db.graphRequestWithIndexedFilterForKeysAlloc(self.req, missing_keys.items, clause_cache);
                     if (prepared.frontier_scoped or self.indexed_request_filter != null) scoped_request = prepared else self.indexed_request_filter = prepared;
                 }
                 const request_filter = if (scoped_request) |*entry| entry else &self.indexed_request_filter.?;
-                const missing_mask = try self.db.filterGraphKeysAlloc(result_alloc, request_filter.req, missing_keys.items);
+                const missing_mask = try self.db.filterGraphKeysWithKnownOrdinalsAlloc(result_alloc, request_filter.req, missing_keys.items, request_ordinals);
                 defer result_alloc.free(missing_mask);
                 if (missing_mask.len != missing_keys.items.len) {
                     return error.InvalidGraphNodeAdmissionResult;
@@ -50015,7 +50041,9 @@ pub const DB = struct {
                     if (query_keys.items.len > 0) {
                         var scoped_node: ?AlgebraicDocFilterRequest = null;
                         defer if (scoped_node) |*entry| entry.deinit();
-                        if (!try self.canReuseIndexedRequest(result_alloc, if (self.indexed_node_filter) |*cached| cached else null, query_keys.items)) {
+                        const node_ordinals = try self.reusableIndexedOrdinalsAlloc(result_alloc, if (self.indexed_node_filter) |*cached| cached else null, query_keys.items);
+                        defer if (node_ordinals) |values| result_alloc.free(values);
+                        if (node_ordinals == null and (self.indexed_node_filter == null or self.indexed_node_filter.?.graph_memory != null)) {
                             var filter_req = self.req;
                             filter_req.filter_query_json = filter_query_json;
                             filter_req.exclusion_query_json = "";
@@ -50026,7 +50054,7 @@ pub const DB = struct {
                         }
                         const node_filter = if (scoped_node) |*entry| entry else &self.indexed_node_filter.?;
                         if (node_filter.resolved_doc_filter != null) {
-                            const mask = try self.db.filterGraphKeysAlloc(result_alloc, node_filter.req, query_keys.items);
+                            const mask = try self.db.filterGraphKeysWithKnownOrdinalsAlloc(result_alloc, node_filter.req, query_keys.items, node_ordinals);
                             defer result_alloc.free(mask);
                             for (query_positions.items, mask) |position, allowed| missing_mask[position] = allowed;
                         } else {
@@ -157153,6 +157181,14 @@ test "optional numeric range prefilters dense search without a text index" {
         .{ .exclusion = "", .count = 2 },
         .{ .exclusion = all_range, .count = 0 },
     }) |case| {
+        var primary = try db.search(a, .{
+            .limit = 2,
+            .include_stored = false,
+            .filter_query_json = all_range,
+            .exclusion_query_json = case.exclusion,
+        });
+        defer primary.deinit();
+        try std.testing.expectEqual(case.count, primary.hits.len);
         var mixed = try db.searchDenseProfiled(a, .{
             .index_name = "dv",
             .limit = 2,

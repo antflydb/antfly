@@ -34792,6 +34792,58 @@ pub const IndexManager = struct {
         return try self.alloc.dupe(u8, raw);
     }
 
+    pub fn lookupDenseVectorIdsForParentKeysAlloc(self: *IndexManager, alloc: Allocator, store: *docstore_mod.DocStore, name: []const u8, keys: []const []const u8) ![]u64 {
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        var runtime = try initRuntimeStore(self.alloc, store);
+        defer runtime.deinit();
+        var mappings = try runtime.store.beginRead();
+        defer mappings.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer ids.deinit(alloc);
+        for (keys) |key| {
+            var matched_member = false;
+            if (!internal_keys.isInternalUserKey(key)) {
+                if (entry.embedding_names.len != 0) {
+                    const prefix = try internal_keys.documentExactPrefixAlloc(alloc, key);
+                    defer alloc.free(prefix);
+                    var cursor = try read.openPhysicalCursorAdapter();
+                    defer cursor.close();
+                    var item = try cursor.seekAtOrAfter(prefix);
+                    while (item) |row| : (item = try cursor.next()) {
+                        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                        for (entry.embedding_names) |embedding| {
+                            if (!((internal_keys.isEmbeddingArtifactKey(row.key) and internal_keys.matchesEmbeddingArtifactName(row.key, embedding)) or
+                                (internal_keys.isDerivedEmbeddingArtifactKey(row.key) and internal_keys.matchesDerivedEmbeddingArtifactName(row.key, embedding)))) continue;
+                            if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, row.key)) |id| {
+                                try ids.put(alloc, id, {});
+                                matched_member = true;
+                            }
+                            break;
+                        }
+                    }
+                } else if (entry.chunk_name) |chunk| {
+                    var cursor = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &read, key, chunk);
+                    defer cursor.close();
+                    while (try cursor.next()) |row| {
+                        if (!internal_keys.matchesChunkArtifactName(row.key, chunk)) continue;
+                        if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, row.key)) |id| {
+                            try ids.put(alloc, id, {});
+                            matched_member = true;
+                        }
+                    }
+                }
+            }
+            if (!matched_member) if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, key)) |id| try ids.put(alloc, id, {});
+        }
+        const result = try alloc.alloc(u64, ids.count());
+        var iter = ids.keyIterator();
+        for (result) |*id| id.* = iter.next().?.*;
+        std.mem.sort(u64, result, {}, std.sort.asc(u64));
+        return result;
+    }
+
     pub fn lookupDenseVectorIdsForOrdinalsAlloc(
         self: *IndexManager,
         alloc: Allocator,
@@ -41846,6 +41898,12 @@ test "dense index unions multiple embedding artifact sources without overwriting
     // Exercise the generic dispatch path used by enrichment batching. It must
     // preserve artifact identity exactly like the named maintenance API.
     try manager.applyDenseEmbeddingWrites(&store, &writes);
+
+    const parent_vectors = try manager.lookupDenseVectorIdsForParentKeysAlloc(alloc, &store, "document_vectors", &.{doc_key});
+    defer alloc.free(parent_vectors);
+    try std.testing.expectEqual(@as(usize, 2), parent_vectors.len);
+    try std.testing.expect(containsU64(parent_vectors, deterministicDenseVectorId(title_artifact)));
+    try std.testing.expect(containsU64(parent_vectors, deterministicDenseVectorId(body_artifact)));
 
     try std.testing.expect(!entry.supports_unit_grouping);
     try std.testing.expectEqual(@as(u64, 2), entry.index.stats().active_count);
