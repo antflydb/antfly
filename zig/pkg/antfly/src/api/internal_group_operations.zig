@@ -1076,7 +1076,8 @@ pub const Operations = struct {
             defer probe.deinit();
             if (probe.value.mode) |mode| {
                 if (std.mem.eql(u8, mode, "dag_activation_checkpoint") or std.mem.eql(u8, mode, "dag_activation_source_page") or
-                    std.mem.eql(u8, mode, "dag_activation_job_status"))
+                    std.mem.eql(u8, mode, "dag_activation_job_status") or
+                    std.mem.eql(u8, mode, "dag_activation_job_plan"))
                 {
                     if (!dag_activation.isLookupControl(input.options.relational_topology_json) or
                         input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or

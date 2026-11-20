@@ -28,7 +28,8 @@ pub const max_lookup_control_bytes: usize = 4 * max_source_page_bytes + 8192;
 pub fn isLookupControl(json: []const u8) bool {
     return std.mem.startsWith(u8, json, "{\"mode\":\"dag_activation_checkpoint\"") or
         std.mem.startsWith(u8, json, "{\"mode\":\"dag_activation_source_page\"") or
-        std.mem.startsWith(u8, json, "{\"mode\":\"dag_activation_job_status\"");
+        std.mem.startsWith(u8, json, "{\"mode\":\"dag_activation_job_status\"") or
+        std.mem.startsWith(u8, json, "{\"mode\":\"dag_activation_job_plan\"");
 }
 
 pub const ScanRequest = struct {

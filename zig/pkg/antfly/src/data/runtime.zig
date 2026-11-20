@@ -12590,6 +12590,42 @@ pub const DataServer = struct {
         }, cancellation);
     }
 
+    const StoredDagActivationPlan = struct {
+        domains: []const DagEffects.ScanDomain,
+        authority_route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+        catalog: DagInventory.Command,
+        targets: []const DagInventory.DagActivationTarget,
+    };
+
+    /// Recover a known attempt using only its authority route and identity.
+    pub fn resumeDagActivationJob(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        route: DagActivationRoute,
+        attempt: DagAuthority.Digest,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !DagEffects.JobProgress {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const scope = .{ .namespace = route.namespace, .attempt = attempt };
+        const raw = (try self.readDagActivationControl(scratch, table_name, cancellation, ?[]const u8, route, .{
+            .mode = @as(enum { dag_activation_job_plan }, .dag_activation_job_plan),
+            .dag_job = scope,
+        })) orelse return error.GraphConstraintNotReady;
+        const plan = try std.json.parseFromSliceLeaky(StoredDagActivationPlan, scratch, raw, .{});
+        if (!std.mem.eql(u8, &route.namespace, &plan.authority_route.namespace))
+            return error.GraphConstraintRevisionChanged;
+        const progress = (try self.readDagActivationControl(scratch, table_name, cancellation, ?DagEffects.JobProgress, route, .{
+            .mode = @as(enum { dag_activation_job_status }, .dag_activation_job_status),
+            .dag_job = scope,
+        })) orelse return error.GraphConstraintNotReady;
+        const manifest = try DagEffects.ScanManifest.init(plan.domains, route.namespace, attempt);
+        return self.advanceDagActivationJob(alloc, table_name, manifest, route, plan.source_routes, plan.catalog, plan.targets, progress, cancellation);
+    }
+
     /// Resume from the authority's ordered job record. The caller provides the
     /// pinned plan and an initial progress value for a new attempt.
     pub fn advanceDagActivationJob(
@@ -12656,12 +12692,19 @@ pub const DataServer = struct {
         else
             progress;
         if (!std.meta.eql(current, @as(?DagEffects.JobProgress, next))) {
+            const plan_json = if (current == null) try std.json.Stringify.valueAlloc(arena.allocator(), StoredDagActivationPlan{
+                .domains = manifest.domains,
+                .authority_route = route,
+                .source_routes = source_routes,
+                .catalog = catalog,
+                .targets = targets,
+            }, .{ .emit_strings_as_arrays = true }) else null;
             try localRaftBatchGroupRoutedWithCancellation(self, alloc, route.fence, table_name, .{
                 .dag_source_fence = .{
                     .namespace = route.namespace,
                     .action = .activation_job,
                     .fence = manifest.fence,
-                    .activation_job = .{ .expected = current, .next = next },
+                    .activation_job = .{ .expected = current, .next = next, .plan_json = plan_json },
                 },
             }, cancellation);
         }

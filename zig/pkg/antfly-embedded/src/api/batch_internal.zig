@@ -113,6 +113,17 @@ test "distributed txn private control wire carries only an isolated DAG source f
     var takeover_parsed = try parseInternalBatchRequest(alloc, takeover_encoded);
     defer takeover_parsed.deinit(alloc);
     try std.testing.expectEqualDeep(scan.dag_source_fence, takeover_parsed.req.dag_source_fence);
+    var job = request;
+    job.dag_source_fence.?.action = .activation_job;
+    job.dag_source_fence.?.activation_job = .{
+        .next = .{ .fence = job.dag_source_fence.?.fence, .catalog_digest = @splat(4), .catalog_epoch = 5, .owner_epoch = 6 },
+        .plan_json = "{\"id\":7}",
+    };
+    const job_encoded = try encodeBatchRequest(alloc, job);
+    defer alloc.free(job_encoded);
+    var job_parsed = try parseInternalBatchRequest(alloc, job_encoded);
+    defer job_parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(job.dag_source_fence, job_parsed.req.dag_source_fence);
 }
 
 test "internal isolated controls preserve neutral document versions across owner and forwarded codecs" {
@@ -2209,7 +2220,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     try @import("../graph/dag_authority.zig").SourceFenceCommand.validateRequest(req);
     if (req.dag_source_fence) |control| {
         try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"dag_source_fence_v1\"},\"_dag_source_fence\":");
-        try writer.print("{f}", .{std.json.fmt(control, .{ .emit_strings_as_arrays = true })});
+        try writer.print("{f}", .{std.json.fmt(control, .{ .emit_strings_as_arrays = control.activation_job == null })});
     }
     if (req.artifact_catalog) |control| {
         if (control.dag_activations != null) {

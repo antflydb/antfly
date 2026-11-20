@@ -175,7 +175,10 @@ pub const JobProgress = struct {
 pub const ActivationJobUpdate = struct {
     expected: ?JobProgress = null,
     next: JobProgress,
+    plan_json: ?[]const u8 = null,
 
+    pub const max_plan_bytes = 2 * 1024 * 1024;
+    const plan_prefix = "\x00\x00__metadata__:dag-activation-plan:";
     const prefix = "\x00\x00__metadata__:dag-activation-job:";
 
     fn jobKey(attempt: Digest) [prefix.len + @sizeOf(Digest)]u8 {
@@ -195,6 +198,17 @@ pub const ActivationJobUpdate = struct {
         defer parsed.deinit();
         if (!std.mem.eql(u8, &parsed.value.fence.activation, &attempt)) return error.InvalidDagAuthority;
         return parsed.value;
+    }
+
+    /// Borrow the frozen activation plan from the current storage snapshot.
+    pub fn readPlan(txn: anytype, attempt: Digest) !?[]const u8 {
+        const raw = txn.get(&(plan_prefix.* ++ attempt)) catch |err| {
+            if (err == error.NotFound) return null;
+            return err;
+        };
+        if (raw.len == 0 or raw.len > max_plan_bytes or !std.unicode.utf8ValidateSlice(raw))
+            return error.InvalidDagAuthority;
+        return raw;
     }
 
     pub fn stage(self: ActivationJobUpdate, alloc: std.mem.Allocator, txn: anytype, fence: SourceFence) !void {
@@ -221,9 +235,24 @@ pub const ActivationJobUpdate = struct {
             if (!advances_phase) return error.InvalidDagMutation;
         } else if (self.next.phase != .acquire or self.next.next_domain != 0) return error.InvalidDagMutation;
 
+        if ((self.expected == null) != (self.plan_json != null)) return error.InvalidDagMutation;
+        if (self.plan_json) |plan| {
+            if (plan.len == 0 or plan.len > max_plan_bytes or !std.unicode.utf8ValidateSlice(plan))
+                return error.InvalidDagMutation;
+        }
         const current = try read(alloc, txn, fence.activation);
-        if (std.meta.eql(current, @as(?JobProgress, self.next))) return;
+        if (std.meta.eql(current, @as(?JobProgress, self.next))) {
+            if (self.plan_json) |plan| {
+                const stored = (try readPlan(txn, fence.activation)) orelse return error.InvalidDagAuthority;
+                if (!std.mem.eql(u8, stored, plan)) return error.GraphConstraintRevisionChanged;
+            }
+            return;
+        }
         if (!std.meta.eql(current, self.expected)) return error.GraphConstraintRevisionChanged;
+        if (self.plan_json) |plan| {
+            const plan_id = plan_prefix.* ++ fence.activation;
+            try txn.put(&plan_id, plan);
+        }
         const raw = try std.json.Stringify.valueAlloc(alloc, self.next, .{ .emit_strings_as_arrays = true });
         defer alloc.free(raw);
         try txn.put(&jobKey(fence.activation), raw);
@@ -2053,9 +2082,14 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     ordered.scan.?.page = .{ .after = second_end, .next = "\x00\x00\x00\x02\x01", .replacements = &.{} };
     try std.testing.expectError(error.InvalidDagMutation, ordered.stageScan(alloc, &txn));
     const initial_job: JobProgress = .{ .fence = fence, .catalog_digest = @splat(7), .catalog_epoch = 4, .owner_epoch = 1 };
-    const create_job: ActivationJobUpdate = .{ .next = initial_job };
+    const create_job: ActivationJobUpdate = .{ .next = initial_job, .plan_json = "{}" };
     try create_job.stage(alloc, &txn, fence);
     try create_job.stage(alloc, &txn, fence);
+    try std.testing.expectEqualStrings("{}", (try ActivationJobUpdate.readPlan(&txn, fence.activation)).?);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, (ActivationJobUpdate{
+        .next = initial_job,
+        .plan_json = "[]",
+    }).stage(alloc, &txn, fence));
     var scanning_job = initial_job;
     scanning_job.phase = .scan;
     try (ActivationJobUpdate{ .expected = initial_job, .next = scanning_job }).stage(alloc, &txn, fence);
