@@ -302,6 +302,7 @@ pub const CublasLt = struct {
     handle: Handle,
     owner_context: driver_mod.CUcontext,
     owner_device: driver_mod.CUdevice,
+    version: ?usize = null,
     fns: Table,
     tensor_core_plans: std.AutoHashMapUnmanaged(TensorCorePlanKey, CachedTensorCorePlan) = .empty,
     tensor_core_plans_mutex: std.atomic.Mutex = .unlocked,
@@ -447,6 +448,7 @@ pub const CublasLt = struct {
             .handle = handle,
             .owner_context = ctx.ctx,
             .owner_device = ctx.device,
+            .version = if (lib.lookup(*const fn () callconv(.c) usize, "cublasLtGetVersion")) |get_version| get_version() else null,
             .fns = fns,
         };
     }

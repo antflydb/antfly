@@ -37,6 +37,7 @@ const transient_names = [_][]const u8{
     "RemoteDocumentFetchFailed",
     "ConnectionResetByPeer",
     "ConnectionTimedOut",
+    "TlsTransportReadFailed",
     "Timeout",
     // The managed embedding adapters' normalized name for a local provider's
     // admission refusal (see managed_embedder.normalizeLocalEmbeddingError).

@@ -3207,11 +3207,12 @@ pub const IndexWriter = struct {
         try self.addSegmentWithIdOwned(seg_id, owned);
     }
 
-    /// Like addSegmentWithId(), but takes ownership of segment_bytes on success.
+    /// Like addSegmentWithId(), but consumes segment_bytes even on error.
     pub fn addSegmentWithIdOwned(self: *IndexWriter, seg_id: u64, segment_bytes: []u8) !void {
         try self.addSegmentWithIdData(seg_id, SegmentData.fromOwnedHeap(segment_bytes));
     }
 
+    /// Consumes segment_data on success and on error.
     pub fn addSegmentWithIdData(self: *IndexWriter, seg_id: u64, segment_data: SegmentData) !void {
         self.lockMutex();
         defer self.mu.unlock();

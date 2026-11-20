@@ -12,13 +12,16 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import tempfile
 
 import numpy as np
 
 
 
 def sha(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def classifications(candidate, reference, tolerance, allow_boundary_changes, tasks=None):
@@ -126,28 +129,83 @@ def compare(candidate, reference, fixture, tolerance, allow_boundary_changes=Fal
             "passed": matched and delta <= tolerance}
 
 
+def run_decide_serving(bench, model, manifest, output_dir):
+    """Render requests and run the loaded public Decide pipeline with auto precision."""
+    if manifest.get("architecture") != "span" or manifest.get("precision") != "bf16":
+        raise ValueError("Automatic Decide serving requires a span BF16 manifest")
+    if sha(model / "model.safetensors") != manifest["model_sha256"]:
+        raise ValueError("Serving model differs from the BF16 reference")
+    requests = []
+    for case in manifest["cases"]:
+        if case.get("kind", "classification") != "classification":
+            raise ValueError("Expected classification cases for Decide serving")
+        tasks = {}
+        for task in json.loads(case["schema_json"])["classifications"]:
+            tasks[task["name"]] = {key: value for key, value in task.items()
+                                   if key not in ("name", "threshold")}
+            if "threshold" in task:
+                tasks[task["name"]]["cls_threshold"] = task["threshold"]
+        requests.append({"id": case["id"], "texts": case["texts"], "tasks": tasks})
+    with tempfile.TemporaryDirectory(dir=output_dir) as directory:
+        fixture = Path(directory) / "cases.json"
+        fixture.write_text(json.dumps({"format_version": 1, "cases": requests}))
+        result = subprocess.run(
+            [str(bench.resolve()), "--model-dir", str(model), "--backend", "cuda",
+             "--precision", "auto", "--controlled", "1", "--cases", str(fixture),
+             "--all-cases", "1", "--warmup", "0", "--reps", "3"],
+            check=True, stdout=subprocess.PIPE, text=True, timeout=1800,
+        )
+    rows = [json.loads(line) for line in result.stdout.splitlines() if line]
+    cases = []
+    for index, (case, row) in enumerate(zip(manifest["cases"], rows, strict=True)):
+        ids, mask = case["inputs"][:2]
+        batch, length = ids["shape"]
+        tokens = [[token for token, keep in zip(ids["data"][start:start + length],
+                   mask["data"][start:start + length], strict=True) if keep]
+                  for start in range(0, batch * length, length)]
+        if (row["case_index"] != index or row["backend"] != "cuda"
+                or row["requested_precision"] != "auto" or row["precision"] != "bf16_full"
+                or row["model_variant"] != "decide_deberta"
+                or row["batch_size"] != batch or row["physical_batch_limit"] != 8
+                or row["prepared_input_ids"] != tokens
+                or row["cuda_transfers"]["matmul_tuning_searches"] != 0
+                or row["cuda_transfers"]["bf16_attention_calls"] == 0):
+            raise ValueError(f"{case['id']}: automatic BF16 serving evidence differs")
+        cases.append({"id": case["id"],
+                      "physical_forwards": row["bf16_physical_forwards_per_call"],
+                      "logits": [[v for item in row["decisions"] for v in item["raw_logits"]]]})
+    return {"cases": cases}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("manifest", "native", "reference", "out"):
+    for name in ("manifest", "reference", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
+    candidate = parser.add_mutually_exclusive_group(required=True)
+    candidate.add_argument("--native", type=Path)
+    candidate.add_argument("--serving-bench", type=Path)
+    parser.add_argument("--model", type=Path, help="Original Decide checkpoint for --serving-bench")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--max-confidence-delta", type=float, default=0.02)
     parser.add_argument("--allow-boundary-changes", action="store_true")
     args = parser.parse_args()
     if args.out.exists() or not 0 < args.max_confidence_delta <= 0.02:
         parser.error("Use a fresh output and a confidence limit in (0, 0.02]")
-    manifest, native, reference = (json.loads(p.read_text()) for p in
-                                   (args.manifest, args.native, args.reference))
+    if (args.serving_bench is None) != (args.model is None):
+        parser.error("--serving-bench and --model must be supplied together")
+    manifest, reference = (json.loads(p.read_text()) for p in (args.manifest, args.reference))
     if (reference.get("precision") != "bf16" or reference.get("dtype") != "torch.bfloat16"
             or reference.get("model_sha256") != manifest["model_sha256"]
             or reference.get("manifest_sha256") != sha(args.manifest)
             or reference.get("inference_mode") is not True
             or reference.get("autocast") is not False):
         raise ValueError("Reference is not authenticated Python CUDA BF16 for this manifest")
-    if native.get("incomplete", False):
-        raise ValueError("Incomplete native run cannot qualify")
     if reference.get("matmul_settings", {}).get("allow_bf16_reduced_precision_reduction") is not True:
         raise ValueError("Reference must record the stock CUDA BF16 reduction setting")
+    native = (run_decide_serving(args.serving_bench, args.model, manifest, args.out.parent)
+              if args.serving_bench else json.loads(args.native.read_text()))
+    if native.get("incomplete", False):
+        raise ValueError("Incomplete native run cannot qualify")
     ids = [c["id"] for c in manifest["cases"]]
     if not ids or len(set(ids)) != len(ids) or any(
             [c["id"] for c in report["cases"]] != ids for report in (native, reference)):
@@ -166,7 +224,9 @@ def main():
               "max_confidence_delta": args.max_confidence_delta,
               "allow_boundary_changes": args.allow_boundary_changes,
               "entity_selection_requires_exact_match": True,
-              "provenance": {str(p): sha(p) for p in (args.manifest, args.native, args.reference, Path(__file__))},
+              "candidate": "automatic BF16 loaded Decide" if args.serving_bench else "prepared native outputs",
+              "provenance": {str(p): sha(p) for p in
+                             (args.manifest, args.serving_bench or args.native, args.reference, Path(__file__))},
               "cases": rows}
     args.out.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     print(f"{sum(r['passed'] for r in rows)}/{len(rows)} cases passed")

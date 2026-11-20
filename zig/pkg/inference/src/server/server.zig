@@ -26544,15 +26544,18 @@ pub const Node = struct {
         try ctx.setHeader("X-Antfly-Generation-Placement-Version", "1");
         const catalog_publication = @import("../registry/catalog_publication.zig");
         const catalog_generation = catalog_publication.read(ctx.allocator, ctx.io, self.config.models_dir) catch |err| return requestModelResolutionError(ctx, err);
-        const json_body = self.listModelsJsonAlloc(ctx.allocator, ctx.io) catch |err| {
+        const model = try ctx.queryDecoded("model");
+        const task = ctx.query("task");
+        const scoped_embedding = if (task != null and std.mem.eql(u8, task.?, "embed")) model else null;
+        const json_body = self.listModelsJsonAllocScoped(ctx.allocator, ctx.io, scoped_embedding) catch |err| {
             if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
             return err;
         };
         defer ctx.allocator.free(json_body);
         // Scoped discovery pins one embedding or generator generation without
         // loading weights. Avoid fingerprinting every model in an unscoped catalog.
-        if (try ctx.queryDecoded("model")) |name| if (ctx.query("task")) |task| if (std.mem.eql(u8, task, "embed") or std.mem.eql(u8, task, "generate")) {
-            const category: []const u8 = if (std.mem.eql(u8, task, "embed")) "embedders" else "generators";
+        if (model) |name| if (task) |operation| if (std.mem.eql(u8, operation, "embed") or std.mem.eql(u8, operation, "generate")) {
+            const category: []const u8 = if (std.mem.eql(u8, operation, "embed")) "embedders" else "generators";
             var catalog = try std.json.parseFromSlice(std.json.Value, ctx.allocator, json_body, .{});
             defer catalog.deinit();
             if (catalog.value == .object) if (catalog.value.object.getPtr(category)) |models| if (models.* == .object) if (models.object.getPtr(name)) |info| if (info.* == .object) {
@@ -26567,12 +26570,12 @@ pub const Node = struct {
                     defer handle.release();
                     // Geometry and revision must describe the same serving generation.
                     dense_output = handle.get().manifest.denseEmbeddingOutput();
-                    break :loaded handle.get().resolution_revision orelse if (std.mem.eql(u8, task, "embed")) return error.InvalidEmbeddingIdentity else try self.model_manager.modelIdentityForManifest(path, manifest);
+                    break :loaded handle.get().resolution_revision orelse if (std.mem.eql(u8, operation, "embed")) return error.InvalidEmbeddingIdentity else try self.model_manager.modelIdentityForManifest(path, manifest);
                 } else try self.model_manager.modelIdentityForManifest(path, manifest);
                 const hex = std.fmt.bytesToHex(revision, .lower);
                 const catalog_allocator = catalog.arena.allocator();
                 try info.object.put(catalog_allocator, "model_revision", .{ .string = &hex });
-                if (std.mem.eql(u8, task, "generate")) {
+                if (std.mem.eql(u8, operation, "generate")) {
                     catalog_publication.require(ctx.allocator, ctx.io, self.config.models_dir, catalog_generation) catch |err| return modelLoadFailureResponse(ctx, err);
                     return ctx.json(catalog.value);
                 }
@@ -26604,6 +26607,10 @@ pub const Node = struct {
     /// (e.g. the antfly server's /connections endpoint) can list the embedded
     /// node's models without going through HTTP. Caller owns the result.
     pub fn listModelsJsonAlloc(self: *Node, a: std.mem.Allocator, io: std.Io) ![]u8 {
+        return self.listModelsJsonAllocScoped(a, io, null);
+    }
+
+    fn listModelsJsonAllocScoped(self: *Node, a: std.mem.Allocator, io: std.Io, scoped_embedding: ?[]const u8) ![]u8 {
         var buf = std.ArrayListUnmanaged(u8).empty;
         defer buf.deinit(a);
         var body = std.ArrayListUnmanaged(u8).empty;
@@ -26621,18 +26628,20 @@ pub const Node = struct {
             try selection_mod.Inventory.loadStable(a, io, self.config.models_dir);
         defer inventory.deinit();
         const discovered = inventory.discovered;
+        const selected_path = if (scoped_embedding) |name| inventory.lookup(name, "embedders") catch null else null;
 
         var discovered_listings = std.ArrayListUnmanaged(DiscoveredModelListing).empty;
         defer {
             for (discovered_listings.items) |*listing| listing.deinit();
             discovered_listings.deinit(a);
         }
-        try discovered_listings.ensureTotalCapacity(a, discovered.len);
+        try discovered_listings.ensureTotalCapacity(a, if (scoped_embedding == null) discovered.len else 1);
         // Candidates whose manifest cannot be read stay visible with their
         // error, so one malformed directory never hides a model silently.
         var rejected_listings = std.ArrayListUnmanaged(RejectedModelListing).empty;
         defer rejected_listings.deinit(a);
         for (discovered, 0..) |entry, entry_index| {
+            if (scoped_embedding != null and (selected_path == null or !std.mem.eql(u8, selected_path.?, entry.path))) continue;
             // A directory spelling is not proof of a format or immutable pin.
             // Unmanaged installations may advertise only literal legacy names.
             if (inventory.names[entry_index].len == 0) continue;
@@ -26656,7 +26665,7 @@ pub const Node = struct {
                 .code = .artifact_unreadable,
                 .message = "model compatibility could not be determined",
             };
-            discovered_listings.appendAssumeCapacity(.{
+            try discovered_listings.append(a, .{
                 .entry_index = entry_index,
                 .manifest = manifest,
                 .reader_supported = reader_candidate and
@@ -26695,7 +26704,8 @@ pub const Node = struct {
             canonical_discovered_dirs.deinit(a);
         }
 
-        for (discovered) |entry| {
+        const scan_loaded = scoped_embedding == null or selected_path == null;
+        for (if (scan_loaded) discovered else &.{}) |entry| {
             const canonical_path = realPathExistingAlloc(a, io, entry.path) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -26710,7 +26720,7 @@ pub const Node = struct {
             };
         }
 
-        const canonical_models_dir: ?[]u8 = realPathExistingAlloc(a, io, self.config.models_dir) catch |err| blk: {
+        const canonical_models_dir: ?[]u8 = if (!scan_loaded) null else realPathExistingAlloc(a, io, self.config.models_dir) catch |err| blk: {
             if (err == error.OutOfMemory) return err;
             break :blk null;
         };
@@ -26738,6 +26748,11 @@ pub const Node = struct {
                     a.free(canonical_model_dir);
                     return err;
                 } orelse {
+                    a.free(canonical_model_dir);
+                    continue;
+                };
+                if (scoped_embedding) |name| if (!std.mem.eql(u8, name, identifier)) {
+                    a.free(identifier);
                     a.free(canonical_model_dir);
                     continue;
                 };
@@ -26771,6 +26786,10 @@ pub const Node = struct {
             try body.appendSlice(a, task);
             try body.appendSlice(a, "\":{");
 
+            if (scoped_embedding != null and !std.mem.eql(u8, task, "embedders")) {
+                try body.append(a, '}');
+                continue;
+            }
             var model_count: usize = 0;
             var listed_model_names = std.StringHashMapUnmanaged(void).empty;
             defer listed_model_names.deinit(a);
@@ -26963,23 +26982,25 @@ pub const Node = struct {
         try buf.appendSlice(a, body.items);
         // Keep ML schemas in their own group while allowing task-aware pool
         // discovery to find predictors through the same bounded catalog.
-        _ = tabular_mod.discovery.discover(io, a, &self.tabular_registry, self.config.ml_dir) catch {};
-        const predictors = try self.tabular_registry.list(a);
-        defer a.free(predictors);
         try buf.appendSlice(a, ",\"predictors\":{");
-        for (predictors, 0..) |info, index| {
-            if (index > 0) try buf.append(a, ',');
-            try jsonEncodeString(&buf, a, info.name);
-            try buf.append(a, ':');
-            const encoded = try std.json.Stringify.valueAlloc(a, api.PredictorInfo{
-                .task = predictorTaskFromTabular(info.task),
-                .num_features = @intCast(info.num_features),
-                .num_outputs = @intCast(info.num_outputs),
-                .feature_names = if (info.feature_names.len > 0) info.feature_names else null,
-                .source_framework = if (info.source_framework.len > 0) info.source_framework else null,
-            }, .{});
-            defer a.free(encoded);
-            try buf.appendSlice(a, encoded);
+        if (scoped_embedding == null) {
+            _ = tabular_mod.discovery.discover(io, a, &self.tabular_registry, self.config.ml_dir) catch {};
+            const predictors = try self.tabular_registry.list(a);
+            defer a.free(predictors);
+            for (predictors, 0..) |info, index| {
+                if (index > 0) try buf.append(a, ',');
+                try jsonEncodeString(&buf, a, info.name);
+                try buf.append(a, ':');
+                const encoded = try std.json.Stringify.valueAlloc(a, api.PredictorInfo{
+                    .task = predictorTaskFromTabular(info.task),
+                    .num_features = @intCast(info.num_features),
+                    .num_outputs = @intCast(info.num_outputs),
+                    .feature_names = if (info.feature_names.len > 0) info.feature_names else null,
+                    .source_framework = if (info.source_framework.len > 0) info.source_framework else null,
+                }, .{});
+                defer a.free(encoded);
+                try buf.appendSlice(a, encoded);
+            }
         }
         try buf.appendSlice(a, "}}");
 
@@ -26995,26 +27016,28 @@ pub const Node = struct {
         // Composite discovery reads only bounded declarative metadata. It
         // never loads model weights or exposes private provider bindings.
         const ca = catalog.arena.allocator();
-        const native_info = try self.documentCatalogInfo(ca, null, "read");
-        try catalog.value.object.getPtr("readers").?.object.put(ca, "antfly/native-document", native_info);
-        for (discovered) |entry| {
-            // Resolve each advertised operation independently; never let one
-            // same-named registration overwrite another task's definition.
-            for ([_]document_contract.Operation{ .read, .extract }) |operation| {
-                const definition_bytes = self.documentDefinition(ca, entry.name, operation) catch |err| {
-                    if (err == error.OutOfMemory) return err;
-                    continue;
-                } orelse continue;
-                const parsed = document_contract.Definition.parse(ca, definition_bytes) catch |err| {
-                    if (err == error.OutOfMemory) return err;
-                    continue;
-                };
-                const definition = parsed.value;
-                const is_read = operation == .read;
-                if ((is_read and definition.read == null) or (!is_read and definition.extract == null)) continue;
-                const scope = if (is_read) "readers" else "extractors";
-                const task = if (is_read) "read" else "extract";
-                try catalog.value.object.getPtr(scope).?.object.put(ca, entry.path, try self.documentCatalogInfo(ca, definition, task));
+        if (scoped_embedding == null) {
+            const native_info = try self.documentCatalogInfo(ca, null, "read");
+            try catalog.value.object.getPtr("readers").?.object.put(ca, "antfly/native-document", native_info);
+            for (discovered) |entry| {
+                // Resolve each advertised operation independently; never let one
+                // same-named registration overwrite another task's definition.
+                for ([_]document_contract.Operation{ .read, .extract }) |operation| {
+                    const definition_bytes = self.documentDefinition(ca, entry.name, operation) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        continue;
+                    } orelse continue;
+                    const parsed = document_contract.Definition.parse(ca, definition_bytes) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        continue;
+                    };
+                    const definition = parsed.value;
+                    const is_read = operation == .read;
+                    if ((is_read and definition.read == null) or (!is_read and definition.extract == null)) continue;
+                    const scope = if (is_read) "readers" else "extractors";
+                    const task = if (is_read) "read" else "extract";
+                    try catalog.value.object.getPtr(scope).?.object.put(ca, entry.path, try self.documentCatalogInfo(ca, definition, task));
+                }
             }
         }
         // Descriptors retain installation identity until ownership is finalized.
@@ -27024,6 +27047,7 @@ pub const Node = struct {
             for (discovered, inventory.names) |entry, names| {
                 const descriptor = models.object.get(entry.path) orelse continue;
                 for (names) |selector| {
+                    if (scoped_embedding) |name| if (!std.mem.eql(u8, name, selector)) continue;
                     const owner = (inventory.lookup(selector, task) catch continue) orelse continue;
                     if (std.mem.eql(u8, owner, entry.path)) try models.object.put(ca, selector, descriptor);
                 }
@@ -50403,6 +50427,15 @@ test "scoped model discovery resolves dense geometry without loading weights" {
         // Identity inspection may fingerprint this file, but loading it fails.
         .data = "metadata-only fixture",
     });
+    try tmp.dir.createDirPath(io, "embedders/acme/other");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "embedders/acme/other/config.json",
+        .data = @embedFile("../architectures/embedding_gemma2_config.json"),
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "embedders/acme/other/model.safetensors",
+        .data = "second metadata-only fixture",
+    });
     const models_path = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(models_path);
     var node = try Node.init(a, .{ .models_dir = models_path });
@@ -50418,7 +50451,9 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
     defer parsed.deinit();
-    const model = parsed.value.object.get("embedders").?.object.get("acme/demo").?;
+    const embedders = parsed.value.object.get("embedders").?.object;
+    try std.testing.expectEqual(@as(usize, 1), embedders.count());
+    const model = embedders.get("acme/demo").?;
     const shape = model.object.get("dense_output") orelse return error.MissingDenseOutput;
     try std.testing.expectEqual(@as(i64, 768), shape.object.get("native_dimensions").?.integer);
     try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);

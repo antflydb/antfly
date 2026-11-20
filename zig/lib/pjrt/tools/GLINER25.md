@@ -9,7 +9,7 @@ measurement timelines belong in ignored `evidence/` directories.
 
 Base's automatic route retains FP32 weights/state and uses compensated Tensor
 Core projections. Decide additionally selects its qualified BF16 profile on
-NVIDIA L4 SM89, driver API >=13000 and cuBLAS 130400 or 130401. Other artifacts,
+NVIDIA L4 SM89, driver API >=13000 and matching cuBLAS and cuBLASLt versions of 130400 or 130401. Other artifacts,
 GPUs/runtimes and training retain existing routes. Full serving policy and
 workspace/admission limits are documented in the
 [model guide](../../../pkg/inference/models/gliner2/GLINER25.md#qualified-decide-bf16-default-on-nvidia-l4).
@@ -109,6 +109,21 @@ reduction setting. Confidence drift is capped at 0.02. Threshold changes require
 a reference distance <=0.02; argmax changes require a reference probability gap
 <=0.04 and per-label drift <=0.02. Decisions outside those bands must match.
 Entity selection still requires exact matches. Base BF16 remains unqualified.
+
+The FP32 CUDA oracle test explicitly selects FP32. Run the separate automatic
+BF16 gate through the loaded Decide API with the same manifest and Python
+reference. It requires the BF16 route, identical prepared token IDs, the
+eight-row physical limit, and the confidence and decision bounds above.
+
+```sh
+zig build --build-file zig/pkg/inference/build.zig bench-gliner25-decide-build \
+  -Doptimize=ReleaseFast -Dcuda=true -Dcuda-artifacts=sm89 \
+  --cache-dir "$PWD/.zig-cache/native" --prefix "$PWD/zig-out" -j1
+flock /tmp/antfly-l4-bench.lock python zig/lib/pjrt/tools/qualify_gliner25_bf16.py \
+  --model "$MODEL_DIR" --serving-bench zig-out/bin/antfly-inference-gliner25-decide-bench \
+  --manifest "$EVIDENCE/validation.json" --reference "$EVIDENCE/torch.json" \
+  --out "$EVIDENCE/serving-qualification.json" --allow-boundary-changes
+```
 
 The prepared benchmark records actual encoder dtype and physical forward counts.
 The loaded-model benchmark (`bench-gliner25-decide-build`) also defaults to

@@ -565,6 +565,13 @@ fn distinctInputBatches(environment: [*:0]const u8, comptime role: enum { base, 
     node.model_manager.session_manager.preferred_backends = &.{.cuda};
     node.model_manager.session_manager.required_backend = .cuda;
     try node.attachIo(std.testing.io);
+    if (role == .decide) {
+        // These cohorts compare FP32 singleton and batched execution and
+        // check idle admission before any BF16-derived weights are cached.
+        var handle = try node.model_manager.acquireFromDirWithGlinerCudaPrecision(directory, .fp32);
+        defer handle.release();
+        try std.testing.expectEqual(false, factory.glinerCudaBf16Enabled(handle.get().session).?);
+    }
     const transport = try Loopback.initWithCapacity(a, &node, 16);
     defer transport.deinit();
     try transport.start();

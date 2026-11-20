@@ -218,8 +218,17 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
     }) });
     core_bench.root_module.strip = ctx.strip;
     core_bench.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    core_bench.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
     core_bench.root_module.link_libc = true;
     ctx.step("bench-gliner25-core-build", "Build prepared GLiNER2.5 encoder/classifier comparison").dependOn(&b.addInstallArtifact(core_bench, .{}).step);
+    const gemma4_core = b.addExecutable(.{ .name = "antfly-gemma4-core", .root_module = b.createModule(.{ .root_source_file = ctx.path("src/bench/gemma4_core.zig"), .target = ctx.target, .optimize = ctx.optimize }) });
+    gemma4_core.root_module.strip = ctx.strip;
+    gemma4_core.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gemma4_core.root_module.link_libc = true;
+    const gemma4_check = b.addExecutable(.{ .name = "antfly-gemma4-core-check", .root_module = gemma4_core.root_module });
+    ctx.step("check-gemma4-core", "Type-check the native Gemma 4 full-generation worker").dependOn(&gemma4_check.step);
+    ctx.step("bench-gemma4-core-build", "Build full native Gemma 4 text/media generation benchmark").dependOn(&b.addInstallArtifact(gemma4_core, .{}).step);
+
     const decide_bench = b.addExecutable(.{
         .name = "antfly-inference-gliner25-decide-bench",
         .root_module = b.createModule(.{

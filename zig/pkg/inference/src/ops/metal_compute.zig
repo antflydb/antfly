@@ -29398,7 +29398,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .slot = ple_proj_norm_slot,
             .input = projected_flat,
             .hidden_size = request.ple_hidden_size,
-            .eps = request.norm_eps,
+            // The projection scale is folded out of this normalization.
+            .eps = request.norm_eps * @as(f32, @floatFromInt(request.hidden_size)),
         }, &self.timing_stats)) orelse return null;
         defer normed_flat.deinit();
 

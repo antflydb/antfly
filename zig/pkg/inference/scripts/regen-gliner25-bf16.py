@@ -24,6 +24,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--write", action="store_true")
+    mode.add_argument("--check", action="store_true")
     mode.add_argument("--check-source-policy", action="store_true")
     args = parser.parse_args()
     package = Path(__file__).resolve().parents[1]
@@ -61,7 +62,8 @@ def main():
             raise RuntimeError("GLiNER BF16 artifact is not reproducible")
         else:
             record = json.loads(metadata.read_text())
-            if any(record.get(key) != value for key, value in expected.items()):
+            if record.get("nvcc_version") != version or any(
+                    record.get(key) != value for key, value in expected.items()):
                 raise RuntimeError("GLiNER BF16 metadata is stale")
     print("GLiNER BF16 artifact check passes")
 

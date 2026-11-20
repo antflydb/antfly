@@ -815,7 +815,7 @@ without a compiler or network access.
 
 The original dense `fastino/GLiNER2.5-Decide` checkpoint automatically uses the
 qualified BF16 profile on NVIDIA L4 (SM89), CUDA driver API version at least
-13000 and cuBLAS handle version 130400 or 130401. Qualification pins the complete source
+13000 and matching cuBLAS and cuBLASLt versions of 130400 or 130401. Qualification pins the complete source
 weight and tokenizer/configuration identity; Base, Q8_0, Decide-1B, training and
 other GPUs/runtimes retain their existing policies. Optional kernel/runtime
 preparation happens before weight upload; failure preserves the FP32 route.

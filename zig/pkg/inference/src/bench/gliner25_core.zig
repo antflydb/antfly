@@ -3,6 +3,7 @@
 //! Prepared encoder/classifier comparison; excludes tokenization and decoding.
 const std = @import("std");
 const inference = @import("inference_internal");
+const linalg = @import("inference_linalg");
 const factory = inference.architectures.session_factory;
 const deberta = inference.architectures.deberta;
 const decision = inference.architectures.gliner_decision_head;
@@ -21,6 +22,18 @@ fn now() u64 {
 }
 fn boundaryForward(cb: *const inference.ops.ComputeBackend, cfg: inference.models.gliner_boundary.Config, prepared: *const processor.PreparedBatch, entities: bool, bf16_encoder: bool) !Forward {
     const b = prepared.samples.len;
+    if (cb.kind() == .native) {
+        if (entities) return error.UnsupportedNativeEntityComparison;
+        var encoded = try inference.architectures.gliner_boundary_engine.encodeNative(cb, A, &cfg, prepared, .{});
+        defer encoded.deinit();
+        var classified = try inference.architectures.gliner_boundary_tasks.classifyNative(cb, A, &cfg, .{
+            .choices = b * prepared.classification_width,
+            .choice_states = encoded.classification_states,
+        }, .{});
+        defer classified.deinit();
+        const values = try A.dupe(f32, classified.logits);
+        return .{ .values = values, .ended = now() };
+    }
     const words = prepared.word_width;
     const queries = prepared.query_width;
     var encoded = try inference.architectures.gliner_boundary_engine_device.encodeDevice(cb, A, &cfg, prepared, .{ .experimental_bf16_encoder = bf16_encoder });
@@ -69,11 +82,21 @@ const entity_schema = "{\"entities\":[\"person\",\"location\",\"organization\",\
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(A);
     defer A.free(args);
-    if (args.len != 7) return error.ExpectedModelManifestOutputWarmupsIterationsPrecision;
+    if (args.len != 7 and args.len != 8) return error.ExpectedModelManifestOutputWarmupsIterationsPrecisionOptionalBackend;
+    const backend_name = if (args.len == 8) args[7] else "cuda";
+    const native = std.mem.eql(u8, backend_name, "native");
+    if (!native and !std.mem.eql(u8, backend_name, "cuda")) return error.InvalidBackend;
     const warmups = try std.fmt.parseInt(usize, args[4], 10);
     const iterations = try std.fmt.parseInt(usize, args[5], 10);
     if (warmups > 100 or iterations == 0 or iterations > 100) return error.InvalidIterations;
     const precision = std.meta.stringToEnum(factory.GlinerCudaPrecision, args[6]) orelse return error.InvalidPrecision;
+    if (native and precision != .auto and precision != .fp32) return error.UnsupportedNativePrecision;
+    const cpu_threads = linalg.pool.cachedCpuCount();
+    var math_io = std.Io.Threaded.init(A, .{
+        .async_limit = .limited(cpu_threads - 1),
+        .concurrent_limit = .limited(cpu_threads - 1),
+    });
+    defer math_io.deinit();
     const raw = try std.Io.Dir.cwd().readFileAlloc(init.io, args[2], A, .limited(16 * 1024 * 1024));
     defer A.free(raw);
     const parsed = try std.json.parseFromSlice(Manifest, A, raw, .{ .ignore_unknown_fields = true });
@@ -85,11 +108,14 @@ pub fn main(init: std.process.Init) !void {
     const cfg = try inference.models.deberta.parseConfig(A, cfg_raw);
     // Exercise the production default constructor when qualifying auto;
     // explicit precision remains the diagnostic/control entry point.
-    const session = if (precision == .auto)
+    const session = if (native)
+        try factory.createNativeSession(A, args[1])
+    else if (precision == .auto)
         try factory.createCudaSession(A, args[1])
     else
         try factory.createGlinerCudaSessionWithPrecision(A, args[1], precision);
     defer session.close();
+    if (native) factory.attachIo(session, if (cpu_threads == 1 or inference.native_compute.native.useBlas()) std.Io.Threaded.global_single_threaded.io() else math_io.io());
     const boundary_config = if (parsed.value.architecture == .boundary) try factory.getGlinerBoundaryConfig(session) else null;
     const tokenizer_path = try std.fs.path.join(A, &.{ args[1], "tokenizer.json" });
     defer A.free(tokenizer_path);
@@ -194,7 +220,7 @@ pub fn main(init: std.process.Init) !void {
         defer backend.free(weight);
         break :blk @tagName(try backend.tensorDType(weight));
     };
-    const report = try std.json.Stringify.valueAlloc(A, .{ .scope = "prepared input host tensors, encoder and requested heads through synchronized float32 outputs; includes forward temporary allocations; excludes tokenization, final decoding, model load, backend-handle setup and post-readback cleanup", .precision = args[6], .encoder_dtype = encoder_dtype, .cases = results.items, .cuda = factory.getCudaRuntimeStats(session) }, .{ .whitespace = .indent_2 });
+    const report = try std.json.Stringify.valueAlloc(A, .{ .scope = "prepared input host tensors, encoder and requested heads through synchronized float32 outputs; includes forward temporary allocations; excludes tokenization, final decoding, model load, backend-handle setup and post-readback cleanup", .backend = backend_name, .effective_cpu_threads = cpu_threads, .x86_kernel = if (linalg.x86.enabled) @tagName(linalg.x86.selected()) else null, .system_blas = if (native) inference.native_compute.native.useBlas() else false, .precision = args[6], .encoder_dtype = encoder_dtype, .cases = results.items, .cuda = factory.getCudaRuntimeStats(session) }, .{ .whitespace = .indent_2 });
     defer A.free(report);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[3], .data = report });
 }

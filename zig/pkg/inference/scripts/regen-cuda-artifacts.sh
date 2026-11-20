@@ -120,7 +120,7 @@ check_source_policy() {
 }
 
 check_source_policy
-if [ "$source_policy_only" = "true" ] || [ "$mode" = "check" ]; then
+if [ "$source_policy_only" = "true" ]; then
   python3 "$script_dir/regen-gliner25-fast-f32.py" --check-source-policy
   python3 "$script_dir/regen-gliner25-bf16.py" --check-source-policy
 fi
@@ -492,6 +492,10 @@ required_symbols=(
   antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1
   antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1
   termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn
+  termite_gemma4_small_ffn_pair_q8_1_f32
+  termite_gemma4_small_ffn_down_q8_1_f32
+  termite_gemma4_small_ple_gate_q8_1_f32
+  termite_gemma4_small_ple_projection_q8_1_f32
   termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn
   termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2
   termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4
@@ -637,6 +641,8 @@ build_sm89() {
       exit 1
     fi
   fi
+  NVCC="$(command -v "$nvcc")" python3 "$script_dir/regen-gliner25-fast-f32.py" "--$mode"
+  NVCC="$(command -v "$nvcc")" python3 "$script_dir/regen-gliner25-bf16.py" "--$mode"
   write_or_check "$tmp_sm89" "$sm89_dst" "sm89"
 }
 
@@ -660,5 +666,3 @@ case "$artifact_mode" in
     exit 2
     ;;
 esac
-
-python3 "$script_dir/regen-gliner25-fast-f32.py" "--$mode"
