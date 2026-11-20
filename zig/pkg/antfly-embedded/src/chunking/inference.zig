@@ -314,7 +314,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     var placement: remote_capabilities.DiscoveryHeaders = .{};
     var boundary_value: ?[]u8 = null;
     defer if (boundary_value) |value| alloc.free(value);
-    var discovery_base: [3][2][]const u8 = undefined;
+    var discovery_base: [4][2][]const u8 = undefined;
     @memcpy(discovery_base[0..routing_header_count], routing_headers);
     var discovery_count = routing_header_count;
     if (boundary_model) |model| {
@@ -322,6 +322,25 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         discovery_base[discovery_count] = .{ "X-Antfly-Inference-Chunk-Boundary", boundary_value.? };
         discovery_count += 1;
     }
+    var requirements: ?[]u8 = null;
+    defer if (requirements) |value| alloc.free(value);
+    if (!cfg.page and !(if (cfg.embedding) |target| target.allow_partial orelse false else false)) if (resolved_outputs) |outputs| {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var entries: std.ArrayList([]const u8) = .empty;
+        if (boundary_value) |value| try entries.append(a, value);
+        for (outputs.value.targets) |target| {
+            if (!target.required or std.mem.eql(u8, target.name, outputs.value.boundary_model)) continue;
+            const task = if (target.kind == .embedding) "embed" else @tagName(target.kind);
+            try entries.append(a, try std.fmt.allocPrint(a, "{s}:{s}", .{ task, target.model }));
+        }
+        if (entries.items.len > 1) {
+            requirements = try std.json.Stringify.valueAlloc(alloc, entries.items, .{});
+            discovery_base[discovery_count] = .{ "X-Antfly-Inference-Chunk-Requirements", requirements.? };
+            discovery_count += 1;
+        }
+    };
     const discovery_headers = try placement.withShape(discovery_base[0..discovery_count], .{ .items = 1, .media = input != .text, .output_tokens = 0 });
     var capability_lease = dispatch: {
         const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;

@@ -26542,7 +26542,35 @@ pub const Node = struct {
 
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader("X-Antfly-Generation-Placement-Version", "1");
-        if (ctx.header("X-Antfly-Inference-Chunk-Boundary")) |boundary| {
+        if (ctx.header("X-Antfly-Inference-Chunk-Requirements")) |requirements| {
+            if (requirements.len > 128 * 1024) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+            const parsed = std.json.parseFromSlice([]const []const u8, ctx.allocator, requirements, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" }),
+            };
+            defer parsed.deinit();
+            if (parsed.value.len == 0 or parsed.value.len > 17) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+            for (parsed.value) |requirement| {
+                const colon = std.mem.indexOfScalar(u8, requirement, ':') orelse return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                const task = requirement[0..colon];
+                const name = requirement[colon + 1 ..];
+                if (name.len == 0 or name.len > 4096) return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                if (std.mem.eql(u8, task, "diarize")) {
+                    const path = self.resolveChunkSpeakerPath(ctx.allocator, name) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return ctx.status(404).json(.{ .@"error" = "SpeakerModelUnavailable" }),
+                    };
+                    ctx.allocator.free(path);
+                } else {
+                    const category = if (std.mem.eql(u8, task, "embed")) "embedders" else if (std.mem.eql(u8, task, "transcribe")) "transcribers" else if (std.mem.eql(u8, task, "classify")) "classifiers" else return ctx.status(400).json(.{ .@"error" = "InvalidChunkRequirements" });
+                    const selected = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| return requestModelResolutionError(ctx, err);
+                    ctx.allocator.free(selected.path);
+                }
+            }
+            try ctx.setHeader("X-Antfly-Inference-Chunk-Boundary-Available", "true");
+            if (std.mem.eql(u8, ctx.query("chunk_boundary_probe") orelse "", "1"))
+                return ctx.status(204).text("");
+        } else if (ctx.header("X-Antfly-Inference-Chunk-Boundary")) |boundary| {
             if (std.mem.startsWith(u8, boundary, "diarize:")) {
                 const name = boundary["diarize:".len..];
                 const path = self.resolveChunkSpeakerPath(ctx.allocator, name) catch |err| switch (err) {
@@ -26551,6 +26579,8 @@ pub const Node = struct {
                 };
                 ctx.allocator.free(path);
                 try ctx.setHeader("X-Antfly-Inference-Chunk-Boundary-Available", "true");
+                if (std.mem.eql(u8, ctx.query("chunk_boundary_probe") orelse "", "1"))
+                    return ctx.status(204).text("");
             }
         }
         const catalog_publication = @import("../registry/catalog_publication.zig");

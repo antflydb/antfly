@@ -44,10 +44,15 @@ pub const DiscoveryShape = struct {
     media: bool = false,
     modalities: work.Modalities = .{},
     output_tokens: ?usize = null,
+    candidates: ?usize = null,
 
     pub fn formatHeader(self: DiscoveryShape, buf: *[64]u8) ![]const u8 {
         if (self.items == 0) return error.InvalidInferenceDiscoveryShape;
         const mask: u8 = @bitCast(self.modalities);
+        if (self.candidates) |count| {
+            if (self.output_tokens) |tokens| return std.fmt.bufPrint(buf, "3:{d}:{d}:{d}:{d}", .{ self.items, mask, tokens, count });
+            return std.fmt.bufPrint(buf, "3:{d}:{d}:-:{d}", .{ self.items, mask, count });
+        }
         if (mask != 0) {
             if (self.output_tokens) |tokens|
                 return std.fmt.bufPrint(buf, "2:{d}:{d}:{d}", .{ self.items, mask, tokens });

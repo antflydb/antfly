@@ -1664,7 +1664,7 @@ pub const Runtime = struct {
                 if (parsed.generator.url.len == 0) break :blk .serial_compatibility;
                 const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse
                     break :blk .serial_compatibility;
-                break :blk capabilities.batch.mode;
+                break :blk if (capabilities.batch.mode == .none) .serial_compatibility else capabilities.batch.mode;
             },
             // Transcription has one input per provider call. The compatibility
             // batch preserves result order with bounded concurrency: 8 calls
@@ -1984,20 +1984,18 @@ pub const Runtime = struct {
     fn extractorCapabilitiesForRequests(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, requests: []const asset_producer.Request) !?inference_work.InferenceCapabilities {
         if (cfg.provider != .antfly or cfg.resolvedUrl() == null)
             return self.extractorCapabilities(alloc, cfg.*);
-        var count = requests.len;
-        var shape: remote_capabilities.DiscoveryShape = undefined;
-        var caps = (try self.bindExtractorWindow(alloc, cfg, requests, &count, &shape)) orelse return null;
-        caps.batch.max_items = @min(caps.batch.max_items, count);
+        var shape = try homogeneousDiscoveryShape(alloc, requests);
+        var caps = (try self.bindExtractorWindow(alloc, cfg, &shape)) orelse return null;
+        caps.batch.max_items = @min(caps.batch.max_items, shape.items);
         caps.batch.preferred_items = @min(caps.batch.preferred_items, caps.batch.max_items);
         return caps;
     }
 
-    fn bindExtractorWindow(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, requests: []const asset_producer.Request, count: *usize, shape: *remote_capabilities.DiscoveryShape) !?inference_work.InferenceCapabilities {
+    fn bindExtractorWindow(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, shape: *remote_capabilities.DiscoveryShape) !?inference_work.InferenceCapabilities {
         while (true) {
-            shape.* = try producerDiscoveryShape(alloc, requests[0..count.*]);
             return self.bindExtractorCapabilityLease(alloc, cfg, shape.*) catch |err| {
-                if (err != error.InferenceDiscoveryTooManyItems or count.* <= 1) return err;
-                count.* /= 2;
+                if (err != error.InferenceDiscoveryTooManyItems or shape.items <= 1) return err;
+                shape.items /= 2;
                 continue;
             };
         }
@@ -2744,13 +2742,14 @@ pub const Runtime = struct {
             var active: inference_work.InferenceCapabilities = undefined;
             var end = @min(start +| item_limit, requests.len);
             if (end <= start) return error.InvalidInferenceCapabilities;
-            var shape: remote_capabilities.DiscoveryShape = .{ .items = end - start };
+            var shape = if (remote) try homogeneousDiscoveryShape(alloc, requests[start..end]) else remote_capabilities.DiscoveryShape{ .items = end - start };
+            end = start + shape.items;
             while (true) {
                 if (remote) {
-                    var count = end - start;
-                    active = (try self.bindExtractorWindow(alloc, &cfg, requests[start..end], &count, &shape)) orelse return error.InvalidInferenceCapabilities;
-                    if (count < end - start) item_limit = @min(item_limit, count);
-                    end = start + count;
+                    shape.items = end - start;
+                    active = (try self.bindExtractorWindow(alloc, &cfg, &shape)) orelse return error.InvalidInferenceCapabilities;
+                    if (shape.items < end - start) item_limit = @min(item_limit, shape.items);
+                    end = start + shape.items;
                     item_limit = @min(item_limit, active.batch.max_items);
                 } else active = local_capabilities.?;
                 if (!remote and active.batch.mode == .none) return error.BatchIncompatible;
@@ -2991,6 +2990,9 @@ pub const Runtime = struct {
             try self.execution.check(platform.time.monotonicNs());
             var end = @min(start +| @min(if (capabilities) |caps| caps.batch.max_items else requests.len, discovery_item_limit), requests.len);
             if (end <= start) return error.InvalidInferenceCapabilities;
+            var shape = try homogeneousDiscoveryShape(alloc, requests[start..end]);
+            shape.output_tokens = discoveryOutputTokens(cfg.max_tokens);
+            end = start + shape.items;
             var placement: remote_capabilities.DiscoveryHeaders = .{};
             var discovery_headers: []const [2][]const u8 = undefined;
             var capability_lease: remote_capabilities.CapabilityLease = undefined;
@@ -2998,9 +3000,7 @@ pub const Runtime = struct {
             // smaller invocation before using the lease; never widen a window
             // that was already scoped by the planner or a prior contract.
             while (true) {
-                const window = requests[start..end];
-                var shape = try producerDiscoveryShape(alloc, window);
-                shape.output_tokens = discoveryOutputTokens(cfg.max_tokens);
+                shape.items = end - start;
                 discovery_headers = try placement.withShape(auth_headers, shape);
                 capability_lease = self.capabilityCache().getOrDiscoverLeaseWithContext(
                     self.http,
@@ -4965,6 +4965,18 @@ fn inlineImagePixelsAlloc(
     defer alloc.free(decoded);
     std.base64.standard.Decoder.decode(decoded, encoded) catch return error.InvalidDataURI;
     return try inference_work.encodedImagePixels(declared_mime_type, decoded);
+}
+
+fn homogeneousDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {
+    var first = try producerDiscoveryShape(alloc, requests[0..@min(requests.len, 1)]);
+    if (requests.len <= 1) return first;
+    const mask: u8 = @bitCast(first.modalities);
+    for (requests[1..]) |request| {
+        const item = try producerDiscoveryShape(alloc, &.{request});
+        if (item.media != first.media or @as(u8, @bitCast(item.modalities)) != mask) break;
+        first.items += 1;
+    }
+    return first;
 }
 
 fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {

@@ -523,7 +523,7 @@ pub fn rerankContentWithOptions(
                 capability_cache = &fallback_cache.?;
             }
             var placement: remote_capabilities.DiscoveryHeaders = .{};
-            const discovery_headers = try placement.withShape(headers, .{ .items = 1, .media = has_media, .modalities = .{ .text = true, .image = has_media }, .output_tokens = 0 });
+            const discovery_headers = try placement.withShape(headers, .{ .items = 1, .media = has_media, .modalities = .{ .text = true, .image = has_media }, .output_tokens = 0, .candidates = documents.len });
             var capability_identity: remote_capabilities.LeaseIdentity = .{};
             if (cfg.model.len > 0) {
                 const capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
