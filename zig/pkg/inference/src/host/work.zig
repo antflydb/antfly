@@ -1066,6 +1066,10 @@ pub const InferenceCapabilities = struct {
     borrowed_rasters: bool = false,
     /// Physical local transport ceilings, distinct from model codec limits.
     attachment_payload_max_bytes: ?usize = null,
+    remote_json_max_request_bytes: ?usize = null,
+    remote_framed_max_request_bytes: ?usize = null,
+    remote_framed_max_attachments: ?usize = null,
+    remote_framed_max_metadata_bytes: ?usize = null,
     attachment_metadata_max_bytes: ?usize = null,
     /// Complete linked-worker envelope, including metadata, framing and payload.
     /// Applies even to text-only invocations with no physical attachments.

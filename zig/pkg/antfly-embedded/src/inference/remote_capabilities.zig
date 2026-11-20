@@ -1385,6 +1385,13 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
     };
 }
 
+fn optionalReaderWireLimit(value: std.json.Value, field: []const u8) !?usize {
+    const limit = value.object.get(field) orelse return null;
+    if (limit == .null) return null;
+    if (limit != .integer or limit.integer < 0) return error.InvalidInferenceCapabilities;
+    return std.math.cast(usize, limit.integer) orelse error.InvalidInferenceCapabilities;
+}
+
 pub fn parseModelCapabilities(
     alloc: std.mem.Allocator,
     payload: []const u8,
@@ -1473,6 +1480,20 @@ pub fn parseModelCapabilities(
         .numeric_responses_v1 = if (exact) |value| value.numeric_responses_v1 else false,
         .rerank_documents_v1 = if (exact) |value| value.rerank_documents_v1 else false,
     };
+    if (task == .read) {
+        if (info.object.get("inference_capabilities")) |native| if (native == .object) {
+            if (native.object.get("transport_limits")) |limits| if (limits == .object) {
+                if (limits.object.get("json")) |json| if (json == .object) {
+                    result.remote_json_max_request_bytes = try optionalReaderWireLimit(json, "max_request_bytes");
+                };
+                if (limits.object.get("framed_attachments")) |framed| if (framed == .object) {
+                    result.remote_framed_max_request_bytes = try optionalReaderWireLimit(framed, "max_request_bytes");
+                    result.remote_framed_max_attachments = try optionalReaderWireLimit(framed, "max_attachments");
+                    result.remote_framed_max_metadata_bytes = try optionalReaderWireLimit(framed, "max_metadata_bytes");
+                };
+            };
+        };
+    }
     if (resolved == null) if (capability_values) |values| {
         for (values.items) |value| {
             if (value == .string) try result.batch.applyManifestCapability(value.string);

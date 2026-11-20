@@ -43,6 +43,7 @@ fn readHttpStatusError(status: u16, capability_stale: bool) anyerror {
 }
 
 fn readAntflyHttpError(alloc: Allocator, status: u16, capability_stale: bool, body: []const u8) anyerror {
+    if (status == 413) return error.ReaderRequestTooLarge;
     if (document_failure.capacityRefusal(alloc, status, body)) return error.InferenceCapacityUnavailable;
     if (status == 400) {
         if (document_failure.recognized(alloc, body)) |failure| {
@@ -63,6 +64,7 @@ test "reader preserves native OCR truncation across HTTP without accepting arbit
         try std.testing.expectEqual(error.ReadRequestFailed, readAntflyHttpError(a, 400, false, body));
     try std.testing.expectEqual(error.ReadRequestFailed, readAntflyHttpError(a, 400, false, &@as([4097]u8, @splat(' '))));
     try std.testing.expectEqual(error.InferenceCapabilitiesStale, readAntflyHttpError(a, 409, true, "{}"));
+    try std.testing.expectEqual(error.ReaderRequestTooLarge, readAntflyHttpError(a, 413, false, "{}"));
 }
 
 test "reader classifies retryable HTTP statuses" {
@@ -514,6 +516,9 @@ fn deinitConfigValue(alloc: Allocator, cfg: Config) void {
 }
 
 pub const RemoteOptions = struct {
+    max_request_bytes: ?usize = null,
+    max_attachments: ?usize = null,
+    max_metadata_bytes: ?usize = null,
     source_table: []const u8 = "",
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
@@ -626,6 +631,9 @@ const AntflyReaderState = struct {
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
     timeout_ms: ?u64 = null,
+    max_request_bytes: ?usize = null,
+    max_attachments: ?usize = null,
+    max_metadata_bytes: ?usize = null,
     cancellation: ?httpx.CancellationToken = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
@@ -657,6 +665,9 @@ const AntflyReaderState = struct {
             .capability_revision = capability_revision,
             .source_table = source_table,
             .timeout_ms = options.timeout_ms,
+            .max_request_bytes = options.max_request_bytes,
+            .max_attachments = options.max_attachments,
+            .max_metadata_bytes = options.max_metadata_bytes,
             .cancellation = options.cancellation,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
@@ -740,6 +751,7 @@ const AntflyReaderState = struct {
             .max_tokens = req.max_tokens orelse self.max_tokens,
         });
         defer alloc.free(body);
+        if (self.max_request_bytes) |limit| if (body.len > limit) return error.ReaderRequestTooLarge;
 
         const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
         defer alloc.free(url);
@@ -783,6 +795,8 @@ const AntflyReaderState = struct {
 
     fn readEncodedReported(self: *AntflyReaderState, alloc: Allocator, req: EncodedRequest) !BatchResult {
         try validateEncodedRequest(req);
+        if (req.images.len > @min(self.max_attachments orelse std.math.maxInt(usize), (httpx.attachment_envelope.Limits{}).max_attachments))
+            return error.ReaderRequestTooLarge;
         const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
         defer alloc.free(images);
         const attachment_urls = try alloc.alloc([]u8, req.images.len);
@@ -807,6 +821,10 @@ const AntflyReaderState = struct {
             .max_tokens = req.max_tokens orelse self.max_tokens,
         });
         defer alloc.free(metadata);
+        if (metadata.len > @min(self.max_metadata_bytes orelse std.math.maxInt(usize), (httpx.attachment_envelope.Limits{}).max_metadata_bytes)) return error.ReaderRequestTooLarge;
+        if (self.max_request_bytes) |limit| {
+            if ((try httpx.attachment_envelope.encodedSize(metadata, attachments)) > limit) return error.ReaderRequestTooLarge;
+        }
         var body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, metadata, attachments);
         defer body.deinit();
 
