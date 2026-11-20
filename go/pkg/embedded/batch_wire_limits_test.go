@@ -17,16 +17,33 @@ package embedded
 
 import (
 	"math"
+	"strconv"
 	"testing"
 )
 
 func TestBatchWireSizerRejectsLengthsTheFormatCannotEncode(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("an int cannot hold a 4 GiB field length here")
+	}
+	// Run-time conversions: the constants overflow a 32-bit int.
+	var limit uint64 = math.MaxUint32
 	var s batchWireSizer
-	if err := s.addLength(math.MaxUint32); err != nil {
+	if err := s.addLength(int(limit)); err != nil {
 		t.Fatalf("a 4 GiB - 1 field fits the u32 prefix: %v", err)
 	}
-	if err := s.addLength(math.MaxUint32 + 1); err == nil {
+	if err := s.addLength(int(limit + 1)); err == nil {
 		t.Fatal("a field longer than MaxUint32 must be refused, not truncated")
+	}
+}
+
+func TestBatchWireSizerRejectsALengthWhosePrefixWouldWrap(t *testing.T) {
+	// On a 32-bit int, MaxInt fits the u32 prefix, but 4 + MaxInt wraps.
+	var s batchWireSizer
+	if err := s.addLength(math.MaxInt); err == nil {
+		t.Fatal("a field whose prefixed size passes MaxInt must be refused")
+	}
+	if err := s.addLength(-1); err == nil {
+		t.Fatal("a negative length must be refused")
 	}
 }
 
