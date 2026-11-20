@@ -8073,6 +8073,24 @@ pub const NativeFile = struct {
     /// its log scan before reporting busy.
     const cold_replay_slot_wait_ms: i64 = 1000;
 
+    /// Whether a cold scan found records past what the checkpoint slot
+    /// already makes durable (`covered`): only those need the recovery
+    /// barrier's sync.
+    fn coldScanFoundSuffix(outcome: redo_log.ReplayOutcome, covered: u64) bool {
+        return outcome.valid_count != 0 and (outcome.last_sequence orelse 0) > covered;
+    }
+
+    fn coldRecoverySync(self: *NativeFile, io: std.Io) !void {
+        if (builtin.is_test) {
+            test_cold_recovery_sync.count += 1;
+            if (test_cold_recovery_sync.fail) |err| {
+                test_cold_recovery_sync.fail = null;
+                return err;
+            }
+        }
+        try self.file.sync(io);
+    }
+
     fn recoverRedoLog(self: *NativeFile, allocator: Allocator, io: std.Io, test_hook: if (builtin.is_test) ?*const fn (?*anyopaque) void else void, test_ctx: if (builtin.is_test) ?*anyopaque else void) !void {
         var checkpoint = self.activeCheckpoint();
         // perf/lwa-fold-boundary: the real, durable fold boundary this
@@ -8206,8 +8224,11 @@ pub const NativeFile = struct {
             max_sequence: ?u64,
             skip: bool,
             check: ColdScanCheck,
+            /// Whether a found suffix needs `coldRecoveryBarrier`'s sync.
+            barrier: bool,
             compact: ?CompactCheckpoint = null,
             outcome: ?redo_log.ReplayOutcome = null,
+            synced: bool = false,
         };
         const Populate = struct {
             fn populate(ctx: *PopulateCtx, overlay: *redo_overlay.SharedRedoOverlay, pop_allocator: Allocator) anyerror!void {
@@ -8233,6 +8254,13 @@ pub const NativeFile = struct {
                 full_outcome.valid_bytes += ctx.start_offset;
                 // A failure here discards the overlay this call built.
                 try ctx.check.verify(full_outcome);
+                // The overlay this call built stays private until it
+                // returns, and a failure discards it: sync the suffix it
+                // holds before anything in this process can serve it.
+                if (ctx.barrier and coldScanFoundSuffix(full_outcome, ctx.check.covered)) {
+                    try ctx.file.coldRecoverySync(ctx.io);
+                    ctx.synced = true;
+                }
                 ctx.compact = rctx.compact;
                 ctx.outcome = full_outcome;
             }
@@ -8260,6 +8288,15 @@ pub const NativeFile = struct {
         // Holding the sidecar writer lock (or an external writer lease) is
         // writer authority: nothing else appends while this open scans.
         const holds_authority = self.holdsWriterAuthority();
+        // An unbounded scan reads whatever the log holds, including a
+        // record a previous writer appended and then failed to sync (its
+        // rollback can leave the bytes). The fence (or the absence of any
+        // writer) means nothing appends now, so a suffix the scan found
+        // past the checkpoint is made durable before anything serves it:
+        // this completes the recovery barrier a writer would. A writer
+        // also syncs before publishing the watermark, which advertises
+        // durability.
+        const needs_barrier = !self.no_sync and (!self.read_only or !holds_authority);
         cold_scan: while (true) {
             // A fold that published between the catch-up above and this pin may
             // already have zero-filled the log from `folded_through`, and the
@@ -8344,7 +8381,7 @@ pub const NativeFile = struct {
             // that publication names this very fold boundary.
             const fold_start: u64 = if (observed_checkpoint == folded_through and published_fold_start <= self.header.redo_log_capacity) published_fold_start else 0;
             catch_up_start = fold_start;
-            pctx = .{ .file = self, .io = io, .start_after_sequence = folded_through, .start_offset = fold_start, .max_sequence = replay_ceiling, .skip = skip_scan, .check = scan_check };
+            pctx = .{ .file = self, .io = io, .start_after_sequence = folded_through, .start_offset = fold_start, .max_sequence = replay_ceiling, .skip = skip_scan, .check = scan_check, .barrier = needs_barrier and replay_ceiling == null };
             if (skip_scan) {
                 meta_outcome = .{ .valid_count = 0, .valid_bytes = published_offset, .last_sequence = replay_ceiling, .stop_reason = .durable_ceiling };
                 break :cold_scan;
@@ -8496,6 +8533,9 @@ pub const NativeFile = struct {
         // consistent with it: every in-process commit keeps the overlay
         // and the real log in lockstep by construction.
         const outcome = pctx.outcome orelse meta_outcome;
+        // The populate above synced whatever suffix it installed. An
+        // existing overlay catches up below, so sync before it does.
+        if (needs_barrier and replay_ceiling == null and !pctx.synced and coldScanFoundSuffix(outcome, @max(checkpoint.commit_sequence, folded_through))) try self.coldRecoverySync(io);
         if (pctx.compact orelse meta_ctx.compact) |compact| {
             // perf/lwa-restore-open-txn: a bare (non-Txn) commit (schema/
             // catalog bookkeeping, a transaction-manager intent record,
@@ -8614,24 +8654,14 @@ pub const NativeFile = struct {
             if (catch_up.outcome.valid_count != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
             shared.noteApplied(catch_up.outcome.last_sequence orelse 0);
         }
-        // An unbounded scan read whatever the log holds, including a record
-        // a previous writer appended and then failed to sync (its rollback
-        // can leave the bytes). The fence (or the absence of any writer)
-        // means nothing appends now, so make what was read durable before
-        // serving it: this completes the recovery barrier a writer would.
-        if (replay_ceiling == null and !holds_authority and !self.no_sync) try self.file.sync(io);
         // Only an opener with writer authority publishes the watermark. A
         // read-only scan can finish behind a live writer and would move it
-        // backwards. The scan may also have accepted records a writer
-        // appended and had not yet synced: make them durable first, since
-        // the watermark advertises durability.
+        // backwards. The barrier above already made what the scan accepted
+        // durable.
         //
         // A scan bounded by the watermark learned nothing the writer had not
         // already published, and its position may lag a surviving suffix.
-        if (!self.read_only and replay_ceiling == null) {
-            if (!self.no_sync) try self.file.sync(io);
-            self.publishRedoLogState();
-        }
+        if (!self.read_only and replay_ceiling == null) self.publishRedoLogState();
     }
 
     /// Turns every page the redo log's overlay is still carrying into a
@@ -36601,6 +36631,88 @@ test "lite redo log cold open tolerates a corrupt-looking record at or past the 
     const value = (try reopened.getDocumentAlloc(a, "alpha")) orelse return error.TestUnexpectedResult;
     defer a.free(value);
     try std.testing.expectEqualStrings("one", value);
+}
+
+/// Counts (and can fail) `coldRecoverySync`; tests run one at a time.
+var test_cold_recovery_sync: struct { count: u32 = 0, fail: ?anyerror = null } = .{};
+
+test "lite redo log an unbounded cold open syncs only a suffix it found" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    defer test_cold_recovery_sync = .{};
+
+    const empty_path = try testPath(a, tmp, "redo-cold-barrier-empty.aflite");
+    defer a.free(empty_path);
+    {
+        var writer = try NativeFile.createWithRedoLog(a, io, empty_path, .{}, 64 * 1024);
+        writer.close();
+    }
+    {
+        var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, empty_path);
+        defer region.close();
+        region.resetLogStateForTest();
+        test_cold_recovery_sync = .{};
+        var reader = try NativeFile.openWithIo(a, io, empty_path, .{ .read_only = true });
+        reader.close();
+        try std.testing.expectEqual(@as(u32, 0), test_cold_recovery_sync.count);
+    }
+
+    const path = try testPath(a, tmp, "redo-cold-barrier-suffix.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer writer.close();
+        try writer.beginTransaction();
+        try writer.putDocument("alpha", "one");
+        try writer.commitTransaction();
+    }
+    var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
+    defer region.close();
+    region.resetLogStateForTest();
+    test_cold_recovery_sync = .{};
+    {
+        var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+        defer reader.close();
+        try expectRedoDocument(&reader, "alpha", "one");
+    }
+    try std.testing.expectEqual(@as(u32, 1), test_cold_recovery_sync.count);
+}
+
+test "lite redo log a failed cold barrier keeps the recovered suffix unserved" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    defer test_cold_recovery_sync = .{};
+    const path = try testPath(a, tmp, "redo-cold-barrier-fail.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer writer.close();
+        try writer.beginTransaction();
+        try writer.putDocument("alpha", "one");
+        try writer.commitTransaction();
+    }
+    var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
+    defer region.close();
+    region.resetLogStateForTest();
+
+    // The first opener populates the overlay: a failed sync discards it.
+    test_cold_recovery_sync = .{ .fail = error.InputOutput };
+    try std.testing.expectError(error.InputOutput, NativeFile.openWithIo(a, io, path, .{ .read_only = true }));
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reader.close();
+    try expectRedoDocument(&reader, "alpha", "one");
+    try std.testing.expectEqual(@as(u32, 2), test_cold_recovery_sync.count);
+
+    // A later opener finds the overlay already built: its failed barrier
+    // fails the open before it decodes anything into the shared overlay.
+    region.resetLogStateForTest();
+    test_cold_recovery_sync = .{ .fail = error.InputOutput };
+    try std.testing.expectError(error.InputOutput, NativeFile.openWithIo(a, io, path, .{ .read_only = true }));
+    try std.testing.expectEqual(@as(u32, 1), test_cold_recovery_sync.count);
 }
 
 test "lite redo log cold open stays strict about corruption when the region carries no publication" {
