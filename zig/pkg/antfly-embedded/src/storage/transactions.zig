@@ -1033,11 +1033,12 @@ pub const TxnManager = struct {
         }
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
+        const changes_sources = intents.len != 0 or extra_batch.graph_sources.len != 0 or extra_batch.prepared_enrichments_json != null;
         try self.applyBatchWithParticipant(writes.items, extra_batch.deletes, null, .{
             .previous = if (previous_admission) |old| old.reservation() else 0,
             .next = admission.reservation(),
-        }, null, if (intents.len != 0 or extra_batch.graph_sources.len != 0 or extra_batch.prepared_enrichments_json != null or extra_batch.dag_prepare != null) .{
-            .prepare = .{ .id = txn_id, .payload = extra_batch.dag_prepare },
+        }, null, if (changes_sources or extra_batch.dag_prepare != null) .{
+            .prepare = .{ .id = txn_id, .payload = extra_batch.dag_prepare, .changes_sources = changes_sources },
         } else null);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
@@ -2816,6 +2817,10 @@ pub const TxnManager = struct {
         if (dag_batch) |op| switch (op) {
             .prepare => |prepare| {
                 try dag.SourceFence.requireWritable(&batch);
+                // A source participant must prove its final contribution before
+                // voting yes. Authority-only reservations carry no source writes.
+                if (prepare.changes_sources and try @import("db/artifact_publication.zig").LocalDagBinding.hasBindings(&batch))
+                    return error.GraphConstraintNotReady;
                 if (prepare.payload) |payload| try stageDagPrepare(self.alloc, &batch, prepare.id, payload);
             },
             .resolve => |resolve| try stageDagResolution(self.alloc, &batch, resolve.id, resolve.status),
@@ -2853,7 +2858,7 @@ pub fn isDagAuthorityKey(key: []const u8) bool {
 
 const max_dag_domains_per_participant = 64;
 const DagBatch = union(enum) {
-    prepare: struct { id: TxnId, payload: ?DagPrepare },
+    prepare: struct { id: TxnId, payload: ?DagPrepare, changes_sources: bool },
     resolve: struct { id: TxnId, status: TxnStatus },
 };
 
@@ -5381,6 +5386,31 @@ test "DAG activation fence drains prepared writers and rejects new votes" {
     try manager.writeIntents(second, intents, &.{});
     try manager.resolveIntents(second, .aborted, 103);
     try std.testing.expect(!try manager.hasTopologySensitiveTransactions());
+    const publication = @import("db/artifact_publication.zig");
+    const binding: publication.LocalDagBinding = .{ .table_identity = @splat(5), .edge_types = &.{"links"} };
+    const domain = try dag.domain(binding.table_identity, 7, "g", "links");
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try dag.Storage.activateNewIncarnation(&writer, domain, 1);
+        try binding.stage(alloc, &writer, .{
+            .producer_kind = .graph,
+            .namespace = @splat(6),
+            .authority_epoch = 1,
+            .catalog_digest = @splat(0),
+            .producer_name = "g",
+            .producer_generation = 7,
+            .sources = &.{},
+            .mutations = &.{},
+            .publication_digest = @splat(0),
+        });
+        try writer.commit();
+    }
+    const third: TxnId = @splat(7);
+    try manager.initTransaction(third, 104);
+    try std.testing.expectError(error.GraphConstraintNotReady, manager.writeIntents(third, intents, &.{}));
+    try std.testing.expect(!try manager.hasIntents(third));
+    try manager.resolveIntents(third, .aborted, 105);
 }
 
 test "DAG co-located publication rolls back authority and output together" {
