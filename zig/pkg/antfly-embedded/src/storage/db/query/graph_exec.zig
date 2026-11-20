@@ -4919,35 +4919,26 @@ fn jsonValueMatchesStandardRange(value: std.json.Value, lower: ?PatternJsonRange
             }
         }
     }
-    if (value == .integer or value == .float) {
-        // Keep integers exact, including mixed integer/float comparisons.
-        // This is the same scalar order used by relational predicate indexes.
-        if (lower) |bound| {
-            if (bound.value != .integer and bound.value != .float) return error.InvalidArgument;
-            const order = try @import("../../../sql/scalar.zig").compare(value, bound.value);
-            if (order == .lt or (!bound.inclusive and order == .eq)) return false;
-        }
-        if (upper) |bound| {
-            if (bound.value != .integer and bound.value != .float) return error.InvalidArgument;
-            const order = try @import("../../../sql/scalar.zig").compare(value, bound.value);
-            if (order == .gt or (!bound.inclusive and order == .eq)) return false;
-        }
-        return true;
-    }
+    if (isStandardRangeNumber(value)) return error.InvalidArgument;
 
     if (jsonDateNsFromValue(value)) |candidate| {
         const min_value = if (lower) |bound| jsonDateNsFromValue(bound.value) catch null else null;
         const max_value = if (upper) |bound| jsonDateNsFromValue(bound.value) catch null else null;
-        if (min_value != null or max_value != null) {
-            if (min_value) |min| {
-                if (candidate < min or (!(lower.?.inclusive) and candidate == min)) return false;
-            }
-            if (max_value) |max| {
-                if (candidate > max or (!(upper.?.inclusive) and candidate == max)) return false;
-            }
+        if ((min_value != null or max_value != null) and
+            (lower == null or min_value != null) and (upper == null or max_value != null))
+        {
+            if (min_value) |min| if (candidate < min or (!lower.?.inclusive and candidate == min)) return false;
+            if (max_value) |max| if (candidate > max or (!upper.?.inclusive and candidate == max)) return false;
             return true;
         }
     } else |_| {}
+
+    // Numeric bounds can match only numeric values or the temporal forms
+    // handled above. Never order a stored string against a numeric token.
+    if (lower) |bound| if (isStandardRangeNumber(bound.value)) return false;
+    if (upper) |bound| if (isStandardRangeNumber(bound.value)) return false;
+    if (lower) |bound| if (std.meta.activeTag(value) != std.meta.activeTag(bound.value)) return false;
+    if (upper) |bound| if (std.meta.activeTag(value) != std.meta.activeTag(bound.value)) return false;
 
     var candidate_buf: [64]u8 = undefined;
     const candidate = jsonScalarTermSlice(value, &candidate_buf) catch return false;

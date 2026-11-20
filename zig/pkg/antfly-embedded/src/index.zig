@@ -2446,6 +2446,37 @@ pub const IndexSnapshot = struct {
         return self.extendGraphFrontierDocNumsAlloc(alloc, frontier, null, &scanned, &scanned, control);
     }
 
+    pub fn collectGraphKeyFrontierDocNumsAlloc(self: *IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl) !GraphFrontierDocs {
+        var docs = GraphFrontierDocs.init(alloc);
+        errdefer docs.deinit();
+        var keys: std.StringHashMapUnmanaged(u32) = .empty;
+        defer keys.deinit(alloc);
+        var entries = frontier.iterator();
+        while (entries.next()) |entry| {
+            try control.check();
+            try keys.put(alloc, entry.value_ptr.*, entry.key_ptr.*);
+        }
+        var scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
+        defer scratch.deinit();
+        var offset: u32 = 0;
+        for (self.segments, 0..) |segment, index| {
+            try control.check();
+            defer offset += segment.reader.doc_count;
+            if (segment.liveDocCount() == 0) continue;
+            var lease = try self.leaseSegment(index);
+            defer lease.deinit();
+            const live = LiveGraphFrontier{ .target = &docs, .shared = lease.entry.shared, .offset = offset, .control = control };
+            for (0..segment.reader.doc_count) |i| {
+                if (i % 256 == 0) try control.check();
+                const doc: u32 = @intCast(i);
+                scratch.reset();
+                const key = (try lease.entry.reader.storedIdScoped(scratch.allocator(), doc)) orelse continue;
+                if (keys.get(key)) |slot| try live.add(offset + doc, slot);
+            }
+        }
+        return docs;
+    }
+
     pub fn extendGraphFrontierDocNumsAlloc(
         self: *IndexSnapshot,
         alloc: Allocator,

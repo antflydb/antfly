@@ -717,7 +717,7 @@ pub fn lookupOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?Do
     return std.mem.readInt(u32, raw[0..4], .big);
 }
 
-fn lookupLiveOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
+pub fn lookupLiveOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
     const key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, doc_id);
     defer alloc.free(key);
     const value = txn.get(key) catch |err| switch (err) {

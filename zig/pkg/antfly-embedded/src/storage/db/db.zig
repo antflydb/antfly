@@ -45704,6 +45704,7 @@ pub const DB = struct {
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .lookup_live_identity = lookupLiveIdentityDirectoryCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .primary_residual_scope = primaryResidualScopeCallback,
             .range_projection_current = rangeProjectionCurrentCallback,
@@ -46719,45 +46720,174 @@ pub const DB = struct {
         return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, generation);
     }
 
+    fn lookupLiveIdentityDirectoryCallback(ctx: ?*anyopaque, alloc: Allocator, keys: []const []const u8, generation: ?u64) anyerror!?[]?doc_set.DocOrdinal {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        doc_identity.requireLiveDirectoryTxn(&txn) catch |err| switch (err) {
+            error.InvalidDocIdentity => return null,
+            else => return err,
+        };
+        const ordinals = try doc_identity.lookupOrdinalsTxnAlloc(alloc, &txn, keys);
+        errdefer alloc.free(ordinals);
+        for (keys, ordinals) |key, *slot| {
+            const id = slot.* orelse try doc_identity.lookupLiveOrdinalTxn(alloc, &txn, key) orelse {
+                // A stored row with neither lookup key can predate the live
+                // directory. Let the compatibility path consult reverse IDs.
+                const stored_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
+                defer alloc.free(stored_key);
+                _ = txn.get(stored_key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                alloc.free(ordinals);
+                return null;
+            };
+            const state = (try doc_identity.lookupStateTxn(&txn, id)) orelse {
+                alloc.free(ordinals);
+                return null;
+            };
+            const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+            slot.* = if (visible) id else null;
+        }
+        return ordinals;
+    }
+
+    fn resolveGraphDocIdsToDocSetCallback(ctx: ?*anyopaque, alloc: Allocator, keys: []const []const u8, generation: ?u64) anyerror!doc_set.ResolvedDocSet {
+        var resolved = try resolveDocIdsToDocSetCallback(ctx, alloc, keys, generation);
+        errdefer resolved.deinit(alloc);
+        if (resolved != .doc_keys) return resolved;
+        if (try lookupLiveIdentityDirectoryCallback(ctx, alloc, resolved.doc_keys, generation)) |ordinals| {
+            defer alloc.free(ordinals);
+            var mapped: std.ArrayListUnmanaged(doc_set.DocOrdinal) = .empty;
+            defer mapped.deinit(alloc);
+            for (ordinals) |ordinal| try mapped.append(alloc, ordinal orelse return resolved);
+            const out = try doc_set.fromOrdinalsWithPolicyAlloc(alloc, mapped.items, .{});
+            resolved.deinit(alloc);
+            return out;
+        }
+        return resolved;
+    }
+
     fn primaryResidualScopeCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
         generation: ?u64,
         control: db_query_search.QueryExecutionControl,
-    ) anyerror!?doc_set.ResolvedDocSet {
+    ) anyerror!?db_query_search.PrimaryResidualPopulation {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        var scope = try self.broadLiveDocSetCachedAllocControlled(alloc, generation, control);
-        errdefer scope.deinit(alloc);
-        if (scope == .all) {
-            const Scan = struct {
-                alloc: Allocator,
-                control: db_query_search.QueryExecutionControl,
-                keys: std.ArrayListUnmanaged([]const u8) = .empty,
-
-                fn collect(ctx_raw: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
-                    const state: *@This() = @ptrCast(@alignCast(ctx_raw.?));
-                    try state.control.check();
-                    const id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse return .@"continue";
-                    errdefer state.alloc.free(id);
-                    try state.keys.append(state.alloc, id);
-                    return .@"continue";
-                }
-            };
-            var state = Scan{ .alloc = alloc, .control = control };
-            errdefer {
-                for (state.keys.items) |key| alloc.free(key);
-                state.keys.deinit(alloc);
-            }
-            const lower = [_]u8{internal_keys.user_namespace};
-            const upper = [_]u8{internal_keys.user_namespace + 1};
-            try self.core.store.scanWithContext(&lower, &upper, .{}, &state, Scan.collect);
-            scope = .{ .doc_keys = try state.keys.toOwnedSlice(alloc) };
-        }
+        try control.check();
         const duration = ttlDurationNs(self);
-        if (duration == 0 and scope != .doc_keys) return scope;
-        const visible = try self.primaryResidualVisibleBatches(alloc, &scope, generation, duration, control);
-        scope.deinit(alloc);
-        return visible;
+        const cached = cached: {
+            const at = generation orelse break :cached null;
+            lockAtomic(&self.core.identity_visibility.live_mutex);
+            defer self.core.identity_visibility.live_mutex.unlock();
+            if (self.core.identity_visibility.live_generation != at) break :cached null;
+            const scope = if (self.core.identity_visibility.live_set) |*value| value else break :cached null;
+            if (scope.* == .all) break :cached null;
+            break :cached try doc_set.cloneAlloc(alloc, scope);
+        };
+        if (cached) |value| {
+            var scope = value;
+            if (duration == 0) return .{ .rows = scope };
+            defer scope.deinit(alloc);
+            return .{ .rows = try self.primaryResidualVisibleBatches(alloc, &scope, generation, duration, control) };
+        }
+
+        const Scan = struct {
+            db: *DB,
+            alloc: Allocator,
+            read: *docstore_mod.DocStore.Txn,
+            generation: ?u64,
+            duration: u64,
+            now: u64,
+            control: db_query_search.QueryExecutionControl,
+            batch: *std.heap.ArenaAllocator,
+            keys: [64][]const u8 = undefined,
+            count: usize = 0,
+            complete_forward: bool = true,
+            rows: @import("../../encoding/roaring.zig").RoaringBitmap,
+            legacy: std.ArrayListUnmanaged([]const u8) = .empty,
+
+            fn checkpoint(raw: ?*anyopaque, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(raw.?));
+                try state.control.check();
+                return .@"continue";
+            }
+
+            fn collect(raw: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const state: *@This() = @ptrCast(@alignCast(raw.?));
+                const id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.batch.allocator(), key)) orelse return .@"continue";
+                state.keys[state.count] = id;
+                state.count += 1;
+                if (state.count == state.keys.len) try state.flush();
+                return .@"continue";
+            }
+
+            fn flush(state: *@This()) !void {
+                if (state.count == 0) return;
+                try state.control.check();
+                const a = state.batch.allocator();
+                const keys = state.keys[0..state.count];
+                const mapped = try doc_identity.lookupOrdinalsTxnAlloc(a, state.read, keys);
+                const timestamps = if (state.duration != 0) try loadDocumentTimestampsMany(state.db, a, keys) else null;
+                for (keys, mapped, 0..) |key, forward, index| {
+                    if (timestamps) |values| if (values[index]) |ts| if (ttl_mod.isExpired(ts, state.duration, state.now)) continue;
+                    if (forward == null) state.complete_forward = false;
+                    const ordinal = forward orelse try doc_identity.lookupLiveOrdinalTxn(a, state.read, key);
+                    if (ordinal) |id| if (try doc_identity.lookupStateTxn(state.read, id)) |identity| {
+                        if (if (state.generation) |at| identity.isVisibleAt(at) else identity.isLive()) {
+                            try state.rows.add(id);
+                        } else state.complete_forward = false;
+                        continue;
+                    };
+                    state.complete_forward = false;
+                    const copy = try state.alloc.dupe(u8, key);
+                    errdefer state.alloc.free(copy);
+                    try state.legacy.append(state.alloc, copy);
+                }
+                state.count = 0;
+                _ = state.batch.reset(.retain_capacity);
+            }
+        };
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        var batch_arena = std.heap.ArenaAllocator.init(alloc);
+        defer batch_arena.deinit();
+        var stream = Scan{
+            .db = self,
+            .alloc = alloc,
+            .read = &read,
+            .generation = generation,
+            .duration = duration,
+            .now = currentTimeNs(),
+            .control = control,
+            .batch = &batch_arena,
+            .rows = .init(alloc),
+        };
+        errdefer stream.rows.deinit();
+        errdefer {
+            for (stream.legacy.items) |key| alloc.free(key);
+            stream.legacy.deinit(alloc);
+        }
+        const lower = [_]u8{internal_keys.user_namespace};
+        const upper = [_]u8{internal_keys.user_namespace + 1};
+        try self.core.store.scanDocumentRowsReadTxnWithContext(&read, &lower, &upper, &stream, Scan.checkpoint, Scan.collect);
+        try stream.flush();
+        if (duration == 0 and stream.complete_forward) {
+            if (generation) |at| {
+                const scope: doc_set.ResolvedDocSet = .{ .ordinal_bitmap = stream.rows };
+                if (doc_set.cloneAlloc(self.alloc, &scope)) |copy| {
+                    lockAtomic(&self.core.identity_visibility.live_mutex);
+                    defer self.core.identity_visibility.live_mutex.unlock();
+                    if (self.core.identity_visibility.live_set) |*old| old.deinit(self.alloc);
+                    self.core.identity_visibility.live_set = copy;
+                    self.core.identity_visibility.live_generation = at;
+                } else |_| {}
+            }
+        }
+        const legacy: doc_set.ResolvedDocSet = if (stream.legacy.items.len == 0) .none else .{ .doc_keys = try stream.legacy.toOwnedSlice(alloc) };
+        return .{ .rows = .{ .ordinal_bitmap = stream.rows }, .legacy = legacy };
     }
 
     fn primaryResidualVisibleBatches(
@@ -46771,33 +46901,6 @@ pub const DB = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const now = currentTimeNs();
-        if (scope.* == .doc_keys) {
-            var kept: std.ArrayListUnmanaged([]const u8) = .empty;
-            errdefer {
-                for (kept.items) |key| alloc.free(key);
-                kept.deinit(alloc);
-            }
-            var start: usize = 0;
-            while (start < scope.doc_keys.len) {
-                try control.check();
-                _ = scratch.reset(.retain_capacity);
-                const portion = scope.doc_keys[start..@min(start + 64, scope.doc_keys.len)];
-                start += portion.len;
-                const a = scratch.allocator();
-                const visible = try self.resolveDocSetForIdsNoLockAtGenerationAlloc(a, portion, generation);
-                const ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(a, &visible, generation)) orelse return error.StorageReadTemporarilyUnavailable;
-                const timestamps = if (duration != 0) try loadDocumentTimestampsMany(self, a, ids) else null;
-                for (ids, 0..) |id, index| {
-                    try control.check();
-                    if (timestamps) |values| if (values[index]) |ts| if (ttl_mod.isExpired(ts, duration, now)) continue;
-                    const copy = try alloc.dupe(u8, id);
-                    errdefer alloc.free(copy);
-                    try kept.append(alloc, copy);
-                }
-            }
-            if (kept.items.len == 0) return .none;
-            return .{ .doc_keys = try kept.toOwnedSlice(alloc) };
-        }
         if (scope.* == .none) return .none;
         if (scope.* != .ordinal_bitmap) return error.InvalidData;
         var visible = @import("../../encoding/roaring.zig").RoaringBitmap.init(alloc);
@@ -49473,7 +49576,8 @@ pub const DB = struct {
     }
 
     fn graphPriorKeyOrdinalsAlloc(self: *DB, alloc: Allocator, keys: []const []const u8, generation: ?u64) !doc_set.ResolvedDocSet {
-        const ordinals = try self.lookupLiveDocOrdinalsNoLock(alloc, keys, generation);
+        const ordinals = (try lookupLiveIdentityDirectoryCallback(self, alloc, keys, generation)) orelse
+            try self.lookupLiveDocOrdinalsNoLock(alloc, keys, generation);
         defer alloc.free(ordinals);
         var bitmap = @import("../../encoding/roaring.zig").RoaringBitmap.init(alloc);
         errdefer bitmap.deinit();
@@ -49497,10 +49601,13 @@ pub const DB = struct {
             for (keys, ordinals, 0..) |key, ordinal, slot| {
                 if (ordinal != null) continue;
                 try control.check();
-                if (try doc_identity.lookupOrdinalTxn(alloc, &txn, key)) |id| {
+                const known = (try doc_identity.lookupOrdinalTxn(alloc, &txn, key)) orelse try doc_identity.lookupLiveOrdinalTxn(alloc, &txn, key);
+                if (known) |id| {
                     // A mapped but invisible identity cannot become a legacy
                     // row merely because its stored payload still exists.
-                    if (try doc_identity.lookupStateTxn(&txn, id) != null) continue;
+                    if (try doc_identity.lookupStateTxn(&txn, id)) |identity| {
+                        if (!(if (req.identity_read_generation) |at| identity.isVisibleAt(at) else identity.isLive())) continue;
+                    }
                 }
                 try candidates.append(alloc, .{ .id = @constCast(key) });
                 try positions.append(alloc, slot);
@@ -49531,13 +49638,20 @@ pub const DB = struct {
             .ctx = self,
             .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .text_index_entry = textIndexEntryCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .lookup_live_identity = lookupLiveIdentityDirectoryCallback,
+            .resolve_doc_ids_to_doc_set = resolveGraphDocIdsToDocSetCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .range_projection_current = rangeProjectionCurrentCallback,
             .identity_read_generation = req.identity_read_generation,
         };
         const ordinals = if (keys) |ids| try self.lookupLiveDocOrdinalsNoLock(a, ids, req.identity_read_generation) else null;
         defer if (ordinals) |ids| a.free(ids);
+        if (ordinals) |ids| if (std.mem.indexOfScalar(?doc_set.DocOrdinal, ids, null) != null) {
+            if (try lookupLiveIdentityDirectoryCallback(self, a, keys.?, req.identity_read_generation)) |known| {
+                defer a.free(known);
+                for (ids, known) |*slot, ordinal| slot.* = slot.* orelse ordinal;
+            }
+        };
         const legacy = if (keys) |ids| try self.graphLegacyVisibilityAlloc(a, ids, ordinals.?, req) else null;
         defer if (legacy) |mask| a.free(mask);
         const key_domain = if (legacy) |mask| std.mem.indexOfScalar(bool, mask, true) != null else false;
@@ -156848,6 +156962,17 @@ test "optional numeric range reconciles witnessed text coverage with primary ide
         try std.testing.expectEqual(@as(usize, 1), result.result.hits.len);
         try std.testing.expectEqualStrings(case.expected, result.result.hits[0].id);
     }
+    const empty_posting = try db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = "{\"disjuncts\":[{\"match\":{\"field\":\"missing_field\",\"text\":\"beacon\"}}," ++ range ++ "]}",
+    }, &.{ "a", "b", "c" });
+    defer a.free(empty_posting);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, false }, empty_posting);
+    try std.testing.expectError(error.InvalidArgument, db.filterGraphKeysAlloc(a, .{
+        .index_name = "ft",
+        .filter_query_json = "{\"range\":{\"rank\":{\"gte\":1,\"lt\":\"abc\"}}}",
+    }, &.{"b"}));
+
     const graph = try db.filterGraphKeysAlloc(a, .{ .index_name = "ft", .filter_query_json = range }, &.{ "a", "b", "c" });
     defer a.free(graph);
     try std.testing.expectEqualSlices(bool, &.{ true, false, false }, graph);
@@ -156974,7 +157099,20 @@ test "optional numeric range prefilters dense search without a text index" {
     }
     var scope = (try DB.primaryResidualScopeCallback(&db, a, null, .{})).?;
     defer scope.deinit(a);
-    try std.testing.expect(scope == .doc_keys);
+    try std.testing.expectEqual(@as(?usize, 2), scope.rows.estimatedCardinality());
+    try std.testing.expect(scope.legacy == .none);
+    const live_key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(a, "a");
+    defer a.free(live_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(live_key);
+        try txn.commit();
+    }
+    var legacy_scope = (try DB.primaryResidualScopeCallback(&db, a, null, .{})).?;
+    defer legacy_scope.deinit(a);
+    try std.testing.expectEqual(@as(?usize, 1), legacy_scope.rows.estimatedCardinality());
+    try std.testing.expectEqualStrings("a", legacy_scope.legacy.doc_keys[0]);
 
     for ([_][]const []const u8{ &.{}, &.{ "a", "b" } }) |ids| {
         var result = try db.searchDenseProfiled(a, .{
