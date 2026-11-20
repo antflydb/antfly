@@ -155,6 +155,12 @@ pub const DiscoveryHeaders = struct {
         return self.entries[0 .. shaped.len + 1];
     }
 
+    pub fn withReaderBatchContract(self: *DiscoveryHeaders, shaped: []const [2][]const u8) ![]const [2][]const u8 {
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        self.entries[shaped.len] = .{ "X-Antfly-Inference-Discovery-Reader-Cardinality", "one_per_item" };
+        return self.entries[0 .. shaped.len + 1];
+    }
+
     pub fn withRoundedMediaMarker(self: *DiscoveryHeaders, geometry: []const [2][]const u8) ![]const [2][]const u8 {
         if (geometry.len >= self.entries.len or geometry.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
         self.entries[geometry.len] = .{ discovery_rounded_media_header, "true" };
@@ -1452,6 +1458,13 @@ pub fn parseModelCapabilities(
     }
     if (@as(u8, @bitCast(modalities)) == 0) return null;
     const exact = if (resolved) |wire| wire.exact else null;
+    const declared_cardinality: ?work.ResultCardinality = if (exact) |value| value.result_cardinality else blk: {
+        const native = info.object.get("inference_capabilities") orelse break :blk null;
+        if (native != .object) break :blk null;
+        const cardinality = native.object.get("result_cardinality") orelse break :blk null;
+        if (cardinality != .string) break :blk null;
+        break :blk std.meta.stringToEnum(work.ResultCardinality, cardinality.string);
+    };
     var result = work.InferenceCapabilities{
         .task = task,
         .input_modalities = modalities,
@@ -1485,7 +1498,8 @@ pub fn parseModelCapabilities(
             .per_item_failures = false,
         },
         .output = if (exact) |value| value.output else outputForTask(task),
-        .result_cardinality = if (exact) |value| value.result_cardinality else resultCardinalityForTask(task),
+        .result_cardinality = declared_cardinality orelse resultCardinalityForTask(task),
+        .remote_result_cardinality_declared = declared_cardinality != null,
         .prompt_policy = if (exact) |value| value.prompt_policy else promptPolicyForTask(task),
         .task_limits = if (exact) |value| value.task_limits else .{},
         .image_transform = if (exact) |value| value.image_transform else null,

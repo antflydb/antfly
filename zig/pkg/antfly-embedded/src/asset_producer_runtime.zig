@@ -4227,6 +4227,7 @@ pub const Runtime = struct {
             if (complete) headers.* = try placement.withMediaGeometry(headers.*, if (rounded) rounded_geometry else geometry);
             headers.* = try placement.withReaderWire(headers.*, json_only, batch_wire, first_wire, rounded);
             headers.* = try placement.withReaderMime(headers.*, mime_shape.batch, mime_shape.first);
+            if (request.require_batch_contract and request.images.len > 1) headers.* = try placement.withReaderBatchContract(headers.*);
             if (rounded) headers.* = try placement.withRoundedMediaMarker(headers.*);
             const lease = cache.getOrDiscoverLeaseWithContext(self.http, endpoint, model, .read, headers.*, wait) catch |err| switch (err) {
                 error.InferenceDiscoveryRequiresJsonTransport => {
@@ -4254,7 +4255,7 @@ pub const Runtime = struct {
                 else => return err,
             };
             if (request.images.len > 1) {
-                if (request.require_batch_contract and lease.capabilities == null) return error.InferenceDiscoveryTooManyItems;
+                if (request.require_batch_contract and !(if (lease.capabilities) |caps| caps.remote_result_cardinality_declared else false)) return error.InferenceDiscoveryTooManyItems;
                 if (lease.capabilities) |caps| {
                     if (caps.result_cardinality != .one_per_item) return error.InferenceDiscoveryTooManyItems;
                 }

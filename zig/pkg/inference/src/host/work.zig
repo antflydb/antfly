@@ -1045,6 +1045,7 @@ pub const DenseEmbeddingOutput = struct {
 };
 
 pub const InferenceCapabilities = struct {
+    remote_result_cardinality_declared: bool = false,
     /// Stable model/tokenizer identity, available before loading weights.
     model_revision: ?[32]u8 = null,
     /// The HTTP embed executor enforces model_revision and acknowledges it
