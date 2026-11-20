@@ -150,6 +150,25 @@ fn mergeReaderExecution(report: *inference_work.ExecutionReport, chunk: readers.
         report.fallback_reason = chunk.fallback_reason orelse "reader_fallback";
 }
 
+test "reader split windows share the original response budget" {
+    const FakeReader = struct {
+        fn read(_: *Runtime, alloc: Allocator, _: readers.Config, request: readers.Request) !readers.BatchResult {
+            if (request.images.len > 1) return error.InferenceDiscoveryTooManyItems;
+            const expected: usize = if (std.mem.eql(u8, request.images[0], "first")) 10 else 4;
+            try std.testing.expectEqual(@as(?usize, expected), request.max_response_bytes);
+            const items = try alloc.alloc(readers.Result, 1);
+            errdefer alloc.free(items);
+            items[0] = .{ .text = try alloc.dupe(u8, "text") };
+            return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 }, .response_body_bytes = 6 };
+        }
+    };
+    var runtime: Runtime = undefined;
+    try std.testing.expectError(error.ResponseTooLarge, runtime.readImageWindows(std.testing.allocator, .{ .provider = .antfly }, readers.Request{
+        .images = &.{ "first", "second" },
+        .max_response_bytes = 10,
+    }, FakeReader.read));
+}
+
 test "reader execution report preserves mixed native and fallback completion" {
     var report = inference_work.ExecutionReport{};
     try mergeReaderExecution(&report, .{
@@ -3400,7 +3419,9 @@ pub const Runtime = struct {
         else
             capabilities.batch.max_items;
         var reader_batch = capabilities.batch;
+        var remaining_response_bytes = self.responseLimitForTask(.reader, total_images);
         while (image_offset < total_images) {
+            if (remaining_response_bytes == 0) return error.ResponseTooLarge;
             // Encoded images carry identity per item, so compatible pages from
             // different documents may share a model batch without losing
             // attribution. URL-only inputs retain the conservative legacy
@@ -3422,13 +3443,13 @@ pub const Runtime = struct {
                 flat_source_fingerprints.items[image_offset..image_end],
                 &chunk_fingerprint_buffer,
             );
-            const chunk_batch = (if (uses_encoded_media)
+            var chunk_batch = (if (uses_encoded_media)
                 self.readEncodedImagesWithConfigReported(alloc, cfg_parsed.value, .{
                     .images = flat_encoded.items[image_offset..image_end],
                     .prompt = shared_prompt,
                     .max_tokens = cfg_parsed.value.max_tokens,
                     .source_fingerprint = chunk_source_fingerprint,
-                    .max_response_bytes = self.responseLimitForTask(.reader, image_end - image_offset),
+                    .max_response_bytes = @min(remaining_response_bytes, self.responseLimitForTask(.reader, image_end - image_offset)),
                 })
             else
                 self.readImagesWithConfigReported(alloc, cfg_parsed.value, .{
@@ -3437,7 +3458,7 @@ pub const Runtime = struct {
                     .max_tokens = cfg_parsed.value.max_tokens,
                     .inline_content_trust = if (requests[0].inline_media_trusted) .trusted_internal else .untrusted,
                     .source_fingerprint = chunk_source_fingerprint,
-                    .max_response_bytes = self.responseLimitForTask(.reader, image_end - image_offset),
+                    .max_response_bytes = @min(remaining_response_bytes, self.responseLimitForTask(.reader, image_end - image_offset)),
                 })) catch |err| {
                 const attempted = image_end - image_offset;
                 if (local_reader) return err;
@@ -3445,6 +3466,12 @@ pub const Runtime = struct {
                 reader_batch.max_items = reader_chunk_max_images;
                 continue;
             };
+            const charged = chunk_batch.responseBytes();
+            if (charged > remaining_response_bytes) {
+                chunk_batch.deinit(alloc);
+                return error.ResponseTooLarge;
+            }
+            remaining_response_bytes -= charged;
             const chunk_results = chunk_batch.items;
             if (chunk_results.len != image_end - image_offset) {
                 for (chunk_results) |*result| readers.deinitResult(alloc, result);
@@ -3929,8 +3956,11 @@ pub const Runtime = struct {
             for (results[0..filled]) |*item| readers.deinitResult(alloc, item);
             alloc.free(results);
         }
+        var remaining_response_bytes = request.max_response_bytes;
         while (filled < request.images.len) {
+            if (remaining_response_bytes == 0) return error.ResponseTooLarge;
             var window = request;
+            window.max_response_bytes = remaining_response_bytes;
             window.images = request.images[filled..@min(filled +| limit, request.images.len)];
             var batch = readOnce(self, alloc, cfg, window) catch |err| {
                 limit = smallerReaderWindow(err, window.images.len) orelse return err;
@@ -3947,6 +3977,14 @@ pub const Runtime = struct {
                         return error.InvalidReaderResponseIdentity;
                     }
                 }
+            }
+            if (remaining_response_bytes) |remaining| {
+                const charged = batch.responseBytes();
+                if (charged > remaining) {
+                    batch.deinit(alloc);
+                    return error.ResponseTooLarge;
+                }
+                remaining_response_bytes = remaining - charged;
             }
             @memcpy(results[filled..][0..batch.items.len], batch.items);
             filled += batch.items.len;
@@ -4329,6 +4367,8 @@ pub const Runtime = struct {
         return .{
             .items = items,
             .execution = adapted.execution,
+            .usage = adapted.usage,
+            .response_body_bytes = adapted.response_body_bytes,
         };
     }
 

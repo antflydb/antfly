@@ -493,11 +493,13 @@ pub const TaskResourceLimits = struct {
 
 /// Inline value ownership allows plans to outlive discovery-cache entries.
 pub const RoutingToken = struct {
-    bytes: [128]u8 = undefined,
+    const max_len = 160;
+
+    bytes: [max_len]u8 = undefined,
     len: u8 = 0,
 
     pub fn init(value: []const u8) !RoutingToken {
-        if (value.len == 0 or value.len > 128)
+        if (value.len == 0 or value.len > max_len)
             return error.InvalidCapabilityRoutingToken;
         var result = RoutingToken{};
         @memcpy(result.bytes[0..value.len], value);

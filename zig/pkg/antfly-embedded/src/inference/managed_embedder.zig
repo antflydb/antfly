@@ -7879,13 +7879,48 @@ fn textWindowPlacement(count: usize) remote_capabilities.DiscoveryShape {
 }
 
 fn sameTextWindowContract(prior: remote_capabilities.CapabilityLease, current: remote_capabilities.CapabilityLease) bool {
+    const old_caps = prior.capabilities;
+    const new_caps = current.capabilities;
+    const old_model = if (old_caps) |caps| caps.model_revision else null;
+    const new_model = if (new_caps) |caps| caps.model_revision else null;
+    if (!std.meta.eql(old_model, new_model)) return false;
+    if (old_model != null and old_caps.?.model_revision_pinning and new_caps.?.model_revision_pinning) {
+        return old_caps.?.output == new_caps.?.output and
+            old_caps.?.result_cardinality == new_caps.?.result_cardinality and
+            std.meta.eql(old_caps.?.dense_output, new_caps.?.dense_output);
+    }
     if (prior.descriptor_revision) |expected| {
         const actual = current.descriptor_revision orelse return false;
-        if (!std.mem.eql(u8, expected.slice(), actual.slice())) return false;
-    } else if (current.descriptor_revision != null) return false;
-    const old_model = if (prior.capabilities) |caps| caps.model_revision else null;
-    const new_model = if (current.capabilities) |caps| caps.model_revision else null;
-    return std.meta.eql(old_model, new_model);
+        return std.mem.eql(u8, expected.slice(), actual.slice());
+    }
+    return current.descriptor_revision == null;
+}
+
+test "split text windows compare pinned output identity across placement contracts" {
+    const prior: remote_capabilities.CapabilityLease = .{
+        .descriptor_revision = try remote_capabilities.CapabilityRevision.init("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .capabilities = .{
+            .task = .embed,
+            .input_modalities = .{ .text = true },
+            .input_granularity = .chunk,
+            .output = .embedding,
+            .model_revision = @splat(1),
+            .model_revision_pinning = true,
+            .dense_output = .{ .native_dimensions = 3, .minimum_dimensions = 3 },
+        },
+    };
+    var current = prior;
+    current.descriptor_revision = try remote_capabilities.CapabilityRevision.init("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    current.capabilities.?.numeric_responses_v1 = true;
+    try std.testing.expect(sameTextWindowContract(prior, current));
+    current.capabilities.?.dense_output.?.native_dimensions = 4;
+    try std.testing.expect(!sameTextWindowContract(prior, current));
+    current.capabilities = prior.capabilities;
+    current.capabilities.?.model_revision = @splat(2);
+    try std.testing.expect(!sameTextWindowContract(prior, current));
+    current.capabilities = prior.capabilities;
+    current.capabilities.?.model_revision_pinning = false;
+    try std.testing.expect(!sameTextWindowContract(prior, current));
 }
 
 fn embedSmallerTextWindows(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType) ![]const []const f32 {
@@ -7902,6 +7937,7 @@ fn embedSmallerTextWindows(alloc: std.mem.Allocator, entry: *const ManagedEmbedd
         for (results[0..filled]) |vector| alloc.free(vector);
         alloc.free(results);
     }
+    var placement_refreshes: usize = 0;
     while (filled < texts.len) {
         const count = @min(limit, texts.len - filled);
         bounded.planned_embedding_lease = null;
@@ -7915,7 +7951,13 @@ fn embedSmallerTextWindows(alloc: std.mem.Allocator, entry: *const ManagedEmbedd
                 return error.InferenceCapabilitiesStale;
         } else witness = placement;
         bounded.planned_embedding_lease = placement;
-        const vectors = try embedTextWindow(alloc, &bounded, texts[filled..][0..count], dims, task_type);
+        const vectors = embedTextWindow(alloc, &bounded, texts[filled..][0..count], dims, task_type) catch |err| {
+            if (err != error.InferenceCapabilitiesStale or placement_refreshes >= 3) return err;
+            placement_refreshes += 1;
+            try ensureEntryDeadline(&bounded);
+            continue;
+        };
+        placement_refreshes = 0;
         if (vectors.len != count) {
             db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
             return error.InvalidEmbeddingResponse;
