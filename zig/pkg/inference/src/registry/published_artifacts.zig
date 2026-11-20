@@ -315,6 +315,12 @@ pub const PublishedArtifacts = struct {
         }
         return error.InvalidManagedDownload;
     }
+    /// Return the portable receipt name of a file selected by this acquisition.
+    pub fn receiptMemberPath(self: *const PublishedArtifacts, path: []const u8) ![]const u8 {
+        const receipt = self.receipt orelse return error.InvalidManagedDownload;
+        return receipt.artifacts[try self.indexForPath(path)].path;
+    }
+
     /// Read an already selected sidecar and authenticate its actual bytes
     /// against the original member's contract, even if the pathname changes.
     pub fn readPath(self: *const PublishedArtifacts, path: []const u8, max_bytes: usize) ![]u8 {

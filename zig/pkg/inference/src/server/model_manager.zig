@@ -3027,13 +3027,31 @@ fn receiptedModelRevision(
     return result;
 }
 
+// Bind each selected artifact to its execution role. The receipt covers all
+// bytes, but two executable selections can use different members of it.
+fn embeddingArtifactRevision(manifest: manifest_mod.ModelManifest, receipt_revision: [32]u8, artifacts: *const PublishedArtifacts) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(&receipt_revision);
+    inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {
+        if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest, field)) == ?[]const u8) {
+            if (@field(manifest, field)) |path| {
+                hash.update(field);
+                hash.update(&.{0});
+                hash.update(try artifacts.receiptMemberPath(path));
+                hash.update(&.{0});
+            }
+        }
+    }
+    return hash.finalResult();
+}
+
 /// Durable indexes require a stable vector recipe in addition to model content.
 /// Gemma's qualified native and Metal recipes are compatible. Other backends
 /// retain separate identities until their embedding recipes are qualified.
 /// Bump the domain when the generic embedding recipe changes incompatibly.
 fn durableEmbeddingRevision(manifest: manifest_mod.ModelManifest, artifact_revision: [32]u8, backend: backends.BackendType) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly-durable-embedding-v1\x00");
+    hash.update("antfly-durable-embedding-v2\x00");
     hash.update(&artifact_revision);
     if (manifest.embedding_style == .embedding_gemma2) {
         const gemma = @import("../models/embedding_gemma2_identity.zig");
@@ -10239,7 +10257,7 @@ pub const ModelManager = struct {
         if (!hasCompleteChecksums(&artifacts)) return result;
         if (try artifacts.hasRejectedChecksum(&self.verified_artifacts)) return error.ChecksumMismatch;
         const declared = try receiptedModelRevision(self.allocator, io, &artifacts.receipt.?, null, control, false);
-        const artifact_revision = imagePreprocessingRevision(manifest, declared);
+        const artifact_revision = try embeddingArtifactRevision(manifest, imagePreprocessingRevision(manifest, declared), &artifacts);
         const manager = &self.session_manager;
         if (manager.required_backend_invalid) return result;
         var required: [1]backends.BackendType = undefined;
@@ -10661,7 +10679,7 @@ pub const ModelManager = struct {
             .chunk_planning = chunk_planning,
             .resolution_revision = resolution_revision,
             .durable_embedding_revision = if (hasCompleteChecksums(&tokenizer_artifacts))
-                durableEmbeddingRevision(man, resolution_revision, session.backend())
+                durableEmbeddingRevision(man, try embeddingArtifactRevision(man, resolution_revision, &tokenizer_artifacts), session.backend())
             else
                 null,
             .native_kv_asset_generation = native_kv_asset_generation,
@@ -17625,6 +17643,41 @@ test "durable embedding revision fences backend execution recipes" {
     try std.testing.expectEqual(native, durableEmbeddingRevision(manifest, artifacts, .metal));
     try std.testing.expect(!std.mem.eql(u8, &native, &durableEmbeddingRevision(manifest, artifacts, .cuda)));
     try std.testing.expect(!std.mem.eql(u8, &native, &durableEmbeddingRevision(manifest, @splat(2), .native)));
+}
+
+test "durable embedding revision fences the selected receipt members across relocations" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var first_revision: ?[32]u8 = null;
+    for ([_][]const u8{ "original", "relocated" }) |directory| {
+        try tmp.dir.createDirPath(io, directory);
+        var dir = try tmp.dir.openDir(io, directory, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "first.gguf", .data = "first" });
+        try dir.writeFile(io, .{ .sub_path = "second.gguf", .data = "second" });
+        try dir.writeFile(io, .{ .sub_path = ".antfly-download-complete.json", .data =
+            \\{"version":1,"artifacts":[{"path":"first.gguf","size":5,"sha256":"a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e"},{"path":"second.gguf","size":6,"sha256":"16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4"}]}
+        });
+        for ([_][]const u8{ "first.gguf", "second.gguf" }, 0..) |file, index| {
+            const path = try dir.realPathFileAlloc(io, file, a);
+            defer a.free(path);
+            var artifacts = try PublishedArtifacts.init(a, io, path, null);
+            defer artifacts.deinit();
+            const manifest: manifest_mod.ModelManifest = .{ .allocator = a, .gguf_path = path };
+            const declared = try receiptedModelRevision(a, io, &artifacts.receipt.?, null, .{}, false);
+            const verified = try modelIdentityWithArtifacts(a, io, path, manifest, &artifacts, .{});
+            const discovery_revision = durableEmbeddingRevision(manifest, try embeddingArtifactRevision(manifest, imagePreprocessingRevision(manifest, declared), &artifacts), .native);
+            const serving_revision = durableEmbeddingRevision(manifest, try embeddingArtifactRevision(manifest, verified, &artifacts), .native);
+            try std.testing.expectEqual(discovery_revision, serving_revision);
+            if (first_revision) |first| {
+                try std.testing.expectEqual(index == 0, std.mem.eql(u8, &first, &serving_revision));
+            } else {
+                first_revision = serving_revision;
+            }
+        }
+    }
 }
 
 test "embeddinggemma2 planning precision follows required backend before preferences" {
