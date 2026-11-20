@@ -957,6 +957,11 @@ pub fn compatibilitySummaryForBackend(
     man: *const manifest_mod.ModelManifest,
     backend: backends.BackendType,
 ) !?CompatibilitySummary {
+    return compatibilitySummaryForBackendWithControl(allocator, model_dir, man, backend, .{});
+}
+
+fn compatibilitySummaryForBackendWithControl(allocator: std.mem.Allocator, model_dir: []const u8, man: *const manifest_mod.ModelManifest, backend: backends.BackendType, control: InferenceExecutionControl) !?CompatibilitySummary {
+    try control.check();
     const candidate = artifactCandidateForBackend(man.*, backend) orelse return null;
 
     // Split GGUF Qwen3-VL promotions are Metal-only. The official integrated
@@ -1001,13 +1006,14 @@ pub fn compatibilitySummaryForBackend(
         .requires_image = manifestRequiresInput(man, "image"),
         .requires_audio = manifestRequiresInput(man, "audio"),
     };
+    try control.check();
     if (candidate == .gguf) {
         var maybe_report = session_factory.inspectGgufModelForListing(
             allocator,
             model_dir,
             candidate_manifest,
         ) catch |err| {
-            if (err == error.OutOfMemory) return err;
+            if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
             return .{
                 .level = .incompatible,
                 .code = .artifact_unreadable,
@@ -1043,13 +1049,15 @@ pub fn compatibilitySummaryForBackend(
             }
         }
     }
+    try control.check();
     if (candidate == .safetensors) {
-        safetensors_mod.validateArtifactSet(
+        safetensors_mod.validateArtifactSetWithControl(
             allocator,
             man.safetensors_path,
             man.safetensors_index_path,
+            control,
         ) catch |err| {
-            if (err == error.OutOfMemory) return err;
+            if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
             return .{
                 .level = .incompatible,
                 .code = .artifact_unreadable,
@@ -1058,9 +1066,10 @@ pub fn compatibilitySummaryForBackend(
         };
     }
     if (candidate != .onnx) session_factory.validateJinaRetrievalAdapter(allocator, man.*, backend) catch |err| {
-        if (err == error.OutOfMemory) return err;
+        if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
         return .{ .level = .incompatible, .code = .artifact_unreadable, .message = "the selected Jina retrieval adapter is incomplete, invalid, or unreadable" };
     };
+    try control.check();
     if (try validateNativeCompanionsForBackend(
         allocator,
         man,
@@ -1098,8 +1107,8 @@ pub fn compatibilitySummaryForBackend(
         }
         if (duplicate) continue;
 
-        var artifacts = backends.imported_onnx_session.inspectArtifactSetWithBase(allocator, path, base) catch |err| {
-            if (err == error.OutOfMemory) return err;
+        var artifacts = backends.imported_onnx_session.inspectArtifactSetWithControl(allocator, path, base, null, control) catch |err| {
+            if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
             return .{
                 .level = .incompatible,
                 .code = .invalid_graph,
@@ -1108,8 +1117,8 @@ pub fn compatibilitySummaryForBackend(
         };
         artifacts.deinit();
 
-        backends.imported_onnx_session.inspectGraphCompatibilityWithContext(allocator, path, base, logical_path) catch |err| {
-            if (err == error.OutOfMemory) return err;
+        backends.imported_onnx_session.inspectGraphCompatibilityWithControl(allocator, path, base, logical_path, control) catch |err| {
+            if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
             return .{
                 .level = .incompatible,
                 .code = .invalid_graph,
@@ -1117,6 +1126,7 @@ pub fn compatibilitySummaryForBackend(
             };
         };
     }
+    try control.check();
     return summaryFromAssessment(assessment);
 }
 
@@ -1140,13 +1150,18 @@ pub fn compatibilitySummaryForBackends(
     man: *const manifest_mod.ModelManifest,
     preferred_backends: []const backends.BackendType,
 ) !CompatibilitySummary {
+    return compatibilitySummaryForBackendsWithControl(allocator, model_dir, man, preferred_backends, .{});
+}
+
+pub fn compatibilitySummaryForBackendsWithControl(allocator: std.mem.Allocator, model_dir: []const u8, man: *const manifest_mod.ModelManifest, preferred_backends: []const backends.BackendType, control: InferenceExecutionControl) !CompatibilitySummary {
     var best: ?CompatibilitySummary = null;
     for (preferred_backends) |backend| {
-        const summary = try compatibilitySummaryForBackend(
+        const summary = try compatibilitySummaryForBackendWithControl(
             allocator,
             model_dir,
             man,
             backend,
+            control,
         ) orelse continue;
         best = selectBetterCompatibility(best, summary);
         if (best.?.level == .compatible) return best.?;
@@ -1406,8 +1421,13 @@ fn componentDependencySignature(
     io: std.Io,
     dependencies: []const []const u8,
 ) !ComponentPlanKey {
+    return componentDependencySignatureWithControl(io, dependencies, .{});
+}
+
+fn componentDependencySignatureWithControl(io: std.Io, dependencies: []const []const u8, control: InferenceExecutionControl) !ComponentPlanKey {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     for (dependencies) |path| {
+        try control.check();
         updateComponentPlanKeySlice(&hash, path);
         const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
             hash.update("missing");
@@ -2819,6 +2839,11 @@ fn ownSelectedFirstBackendPreference(
 }
 
 fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    return resolutionModelRevisionWithControl(a, io, manifest, .{});
+}
+
+fn resolutionModelRevisionWithControl(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest, control: InferenceExecutionControl) ![32]u8 {
+    try control.check();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -2829,12 +2854,13 @@ fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_
         }
     }
     if (manifest.safetensors_index_path) |path| {
-        const raw = try @import("../util/c_file.zig").readFile(alloc, path);
+        const raw = try @import("../util/c_file.zig").readFileWithControl(alloc, io, path, control);
         const index = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
         if (index == .object) if (index.object.get("weight_map")) |weights| {
             if (weights != .object) return error.InvalidModelLayout;
             var seen: std.StringHashMapUnmanaged(void) = .empty;
             for (weights.object.values()) |file| {
+                try control.check();
                 if (file != .string) return error.InvalidModelLayout;
                 const slot = try seen.getOrPut(alloc, file.string);
                 if (!slot.found_existing) try paths.append(alloc, try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path).?, file.string }));
@@ -2844,18 +2870,19 @@ fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_
     var external: std.ArrayList([]const u8) = .empty;
     var inspected_primary = false;
     for (paths.items) |path| {
+        try control.check();
         const primary = (manifest.onnx_path != null and std.mem.eql(u8, path, manifest.onnx_path.?)) or
             (manifest.onnx_logical_path != null and std.mem.eql(u8, path, manifest.onnx_logical_path.?));
         if (primary and inspected_primary) continue;
         if (!primary and !std.mem.endsWith(u8, path, ".onnx")) continue;
         const base = if (primary and manifest.onnx_logical_path != null) std.fs.path.dirname(manifest.onnx_logical_path.?) else null;
-        var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithBase(alloc, if (primary) manifest.onnx_path.? else path, base);
+        var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithControl(alloc, if (primary) manifest.onnx_path.? else path, base, null, control);
         defer artifacts.deinit();
         if (primary) inspected_primary = true;
         for (artifacts.external_paths) |tensor_path| try external.append(alloc, try alloc.dupe(u8, tensor_path));
     }
     try paths.appendSlice(alloc, external.items);
-    return componentDependencySignature(io, paths.items);
+    return componentDependencySignatureWithControl(io, paths.items, control);
 }
 
 // Legacy managed receipts may lack a digest. Hash those files once per local
@@ -2866,10 +2893,6 @@ const LegacyArtifactDigestCache = struct {
     var entries: [256]?Entry = @splat(null);
     var next: usize = 0;
     var forbid_hashing_for_test: bool = false;
-
-    fn digest(io: std.Io, artifact: managed_receipt.ValidatedArtifact) ![32]u8 {
-        return digestWithControl(io, artifact, .{});
-    }
 
     fn digestWithControl(io: std.Io, artifact: managed_receipt.ValidatedArtifact, control: InferenceExecutionControl) ![32]u8 {
         try control.check();
@@ -2929,12 +2952,13 @@ const LegacyArtifactDigestCache = struct {
 /// Stable identity before loading weights. Managed receipts use relative paths
 /// and pinned content digests, so copying/restoring a model preserves reuse.
 pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
-    return modelIdentityWithArtifacts(a, io, model_dir, manifest, null);
+    return modelIdentityWithArtifacts(a, io, model_dir, manifest, null, .{});
 }
 
 /// Cold construction shares its receipt and checksum proofs with tokenizer
 /// preparation instead of hashing a large embedded-tokenizer GGUF twice.
-fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest, published: ?*PublishedArtifacts) ![32]u8 {
+fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest, published: ?*PublishedArtifacts, control: InferenceExecutionControl) ![32]u8 {
+    try control.check();
     var owned: ?managed_receipt.ValidatedReceipt = null;
     defer if (owned) |*validated| validated.deinit();
     const receipt: ?*managed_receipt.ValidatedReceipt = if (published) |source|
@@ -2956,15 +2980,16 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
         }.less);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         for (artifacts) |artifact| {
+            try control.check();
             var decoded: [32]u8 = undefined;
             if (published) |source| {
-                try source.verifyFile(artifact.path);
+                try source.verifyFileWithControl(artifact.path, control);
                 if (artifact.sha256) |digest| {
                     // verifyFile authenticated this digest against the actual
                     // file and retained its complete construction stamp.
                     _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
-                } else decoded = try LegacyArtifactDigestCache.digest(io, artifact);
-            } else decoded = try LegacyArtifactDigestCache.digest(io, artifact);
+                } else decoded = try LegacyArtifactDigestCache.digestWithControl(io, artifact, control);
+            } else decoded = try LegacyArtifactDigestCache.digestWithControl(io, artifact, control);
             if (artifact.sha256) |digest| {
                 if (digest.len != 64) return error.InvalidManagedDownload;
                 var expected: [32]u8 = undefined;
@@ -2979,7 +3004,7 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
         hash.final(&result);
         return imagePreprocessingRevision(manifest, result);
     }
-    return imagePreprocessingRevision(manifest, try resolutionModelRevision(a, io, manifest));
+    return imagePreprocessingRevision(manifest, try resolutionModelRevisionWithControl(a, io, manifest, control));
 }
 
 fn imagePreprocessingRevision(manifest: manifest_mod.ModelManifest, artifacts: [32]u8) [32]u8 {
@@ -10012,7 +10037,7 @@ pub const ModelManager = struct {
         defer proof.deinit();
         var bound = try BoundModelSource.init(&proof, model_dir, ModelSource.kindForPath(model_dir), &man, null);
         defer bound.deinit();
-        const revision = try modelIdentityWithArtifacts(self.allocator, io, model_dir, man, &artifacts);
+        const revision = try modelIdentityWithArtifacts(self.allocator, io, model_dir, man, &artifacts, control);
         const planning = try chunkPlanningSnapshotWithControl(self.allocator, io, man, revision, control);
         const gemma_compat = tokenizerGemmaCompat(man, model_dir);
         const kind = try tokenizerKindWithArtifacts(man, &artifacts, gemma_compat);
@@ -10070,9 +10095,13 @@ pub const ModelManager = struct {
         const identity = if (man.embedding_style == .embedding_gemma2)
             try self.chunkPlanningGemmaIdentity(model_dir, man, io, control)
         else
-            std.fmt.bytesToHex(try modelIdentity(self.allocator, io, model_dir, man), .lower);
+            std.fmt.bytesToHex(try modelIdentityWithArtifacts(self.allocator, io, model_dir, man, null, control), .lower);
         _ = try self.publicationForRequest(model_dir, control);
         return identity;
+    }
+
+    pub fn modelIdentityForManifestWithControl(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest, io: std.Io, control: InferenceExecutionControl) ![32]u8 {
+        return modelIdentityWithArtifacts(self.allocator, io, model_dir, manifest, null, control);
     }
 
     pub fn modelIdentityForManifest(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
@@ -10145,7 +10174,7 @@ pub const ModelManager = struct {
         defer tokenizer_artifacts.deinit();
         tokenizer_artifacts.verification_cache = &self.verified_artifacts;
         const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
-        const resolution_revision = try modelIdentityWithArtifacts(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man, &tokenizer_artifacts);
+        const resolution_revision = try modelIdentityWithArtifacts(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man, &tokenizer_artifacts, .{});
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
             try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
@@ -18870,7 +18899,7 @@ test "model selection embedded SentencePiece accounts and verifies independent o
         var shared = try PublishedArtifacts.init(a, counted_io, root, null);
         defer shared.deinit();
         Probe.opens = 0;
-        _ = try modelIdentityWithArtifacts(a, counted_io, root, man, &shared);
+        _ = try modelIdentityWithArtifacts(a, counted_io, root, man, &shared, .{});
         _ = try tokenizerLoadAdmissionPlanWithArtifacts(a, root, &man, .sentencepiece, &shared);
         const tokenizer = try loadSentencePieceTokenizerWithArtifacts(a, &man, &shared);
         defer {
