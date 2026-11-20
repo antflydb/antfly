@@ -37,7 +37,9 @@
 //!                lsm_backend/wal.zig's own record header carries one)
 //! 8       4      payload_len
 //! 12      8      commit_sequence
-//! 20      4      crc32 (antfly_hash.Crc32.hash(payload); payload only)
+//! 20      4      crc32: version 2 covers payload_len, commit_sequence,
+//!                salt and the payload (`RecordHeader.checksum`); version 1
+//!                covers the payload only
 //! 24      8      salt (version 2): chosen at random each time the log
 //!                restarts at its first byte, and repeated in every record
 //!                until the next restart, like SQLite's WAL salts. A
@@ -113,6 +115,29 @@ pub const RecordHeader = struct {
     pub fn decode(bytes: *const [header_len]u8) RecordHeader {
         var header = decodeLegacy(bytes[0..legacy_header_len]);
         if (header.format_version != legacy_format_version) header.salt = std.mem.readInt(u64, bytes[24..32], .little);
+        return header;
+    }
+
+    /// The checksum this header's record must carry. Version 2 covers the
+    /// header's own fields with the payload, so damage to a committed
+    /// record's salt or sequence fails it rather than reading as another
+    /// run's record.
+    pub fn checksum(self: RecordHeader, payload: []const u8) u32 {
+        if (self.format_version == legacy_format_version) return Crc32.hash(payload);
+        var fields: [20]u8 = undefined;
+        std.mem.writeInt(u32, fields[0..4], self.payload_len, .little);
+        std.mem.writeInt(u64, fields[4..12], self.commit_sequence, .little);
+        std.mem.writeInt(u64, fields[12..20], self.salt, .little);
+        var crc = Crc32.init();
+        crc.update(&fields);
+        crc.update(payload);
+        return crc.final();
+    }
+
+    /// This header with the checksum `payload` gives it.
+    pub fn sealed(self: RecordHeader, payload: []const u8) RecordHeader {
+        var header = self;
+        header.crc32 = header.checksum(payload);
         return header;
     }
 
@@ -256,12 +281,12 @@ pub const Writer = struct {
         if (record_len > self.remaining()) return error.LogFull;
 
         var header_buf: [header_len]u8 = undefined;
-        const header: RecordHeader = .{
+        const header = (RecordHeader{
             .payload_len = @intCast(payload.len),
             .commit_sequence = commit_sequence,
-            .crc32 = Crc32.hash(payload),
+            .crc32 = 0,
             .salt = try self.currentSalt(),
-        };
+        }).sealed(payload);
         header.encode(&header_buf);
 
         const offset = self.base_offset + self.tail;
@@ -583,6 +608,9 @@ pub fn replayBounded(
 
     // The salt of the first record this scan reads; see the module doc.
     var run_salt: ?u64 = null;
+    // Only a folded log is ever restarted, so only one can hold a retired
+    // run's bytes past its live tail.
+    const restartable = (start_after_sequence orelse 0) != 0;
 
     while (true) {
         const remaining = capacity - pos;
@@ -599,7 +627,7 @@ pub fn replayBounded(
             // Unparseable bytes after the first record of a log that has
             // been folded (the only kind ever restarted) may be the middle
             // of a retired record: the end, as in point-in-time recovery.
-            .garbage => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (pos != 0 and (start_after_sequence orelse 0) != 0) .end_of_region else .corrupt_record },
+            .garbage => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence) },
             .record => |record| .{ record.header, record.len },
         };
         // A retired record, or retired payload bytes that happen to read as
@@ -610,11 +638,12 @@ pub fn replayBounded(
         // What retired bytes cannot present stays corrupt below: this
         // run's salt with the next sequence and a bad checksum, or a gap.
         if (run_salt) |salt| if (header.salt != salt) {
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region };
+            // A retired run's record is whole under its own salt: the end.
+            // Anything else here (a committed record with a damaged salt,
+            // retired payload bytes that read as a header) is unclear.
+            const retired = try recordIntact(allocator, file, io, base_offset + pos, remaining, header, record_header_len, &payload_buf);
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (retired and restartable) .end_of_region else try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence) };
         };
-        if (count != 0 and header.commit_sequence <= last_sequence.?) {
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region };
-        }
 
         if (max_sequence) |ceiling| {
             const new_record = start_after_sequence == null or header.commit_sequence > start_after_sequence.?;
@@ -645,7 +674,7 @@ pub fn replayBounded(
             }
         }
 
-        if (Crc32.hash(payload_buf.items) != header.crc32) {
+        if (header.checksum(payload_buf.items) != header.crc32) {
             return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
         }
 
@@ -736,8 +765,58 @@ pub fn firstRecordNewerThan(allocator: Allocator, file: File, io: Io, base_offse
     const payload = try allocator.alloc(u8, header.payload_len);
     defer allocator.free(payload);
     if (try file.readPositionalAll(io, payload, base_offset + len) < payload.len) return null;
-    if (Crc32.hash(payload) != header.crc32) return null;
+    if (header.checksum(payload) != header.crc32) return null;
     return header.commit_sequence;
+}
+
+/// Whether the record whose header is at `offset` is whole: its payload is
+/// all there and matches its checksum. Reuses `buf`.
+fn recordIntact(allocator: Allocator, file: File, io: Io, offset: u64, available: u64, header: RecordHeader, header_bytes: usize, buf: *std.ArrayList(u8)) !bool {
+    const payload_len: u64 = header.payload_len;
+    if (header_bytes + payload_len > available) return false;
+    buf.clearRetainingCapacity();
+    try buf.resize(allocator, payload_len);
+    if (try file.readPositionalAll(io, buf.items, offset + header_bytes) < payload_len) return false;
+    return header.checksum(buf.items) == header.crc32;
+}
+
+/// How a scan stops at `pos` on bytes that are neither this run's next
+/// record nor its end. After a restart they may be the retired run's
+/// (exposed by a lost end marker); or a committed record may be damaged.
+/// The retired run's bytes were written before this run's salt was chosen,
+/// so any later header carrying it means the run continues past `pos`:
+/// damage, corrupt. With none, `pos` is the run's end. A log that was never
+/// restarted (or a version 1 run, salt 0) holds no retired bytes: corrupt.
+fn unclearStop(file: File, io: Io, base_offset: u64, capacity: u64, pos: u64, restartable: bool, run_salt: ?u64, last_sequence: ?u64) !StopReason {
+    const salt = run_salt orelse return .corrupt_record;
+    if (!restartable or salt == 0 or pos == 0) return .corrupt_record;
+    return if (try laterRunHeader(file, io, base_offset, capacity, pos + 1, salt, last_sequence orelse 0)) .corrupt_record else .end_of_region;
+}
+
+/// Whether a version 2 header with `salt` and a sequence past `after`
+/// appears anywhere in `[from, capacity)`.
+fn laterRunHeader(file: File, io: Io, base_offset: u64, capacity: u64, from: u64, salt: u64, after: u64) !bool {
+    var prefix: [8]u8 = undefined;
+    std.mem.writeInt(u32, prefix[0..4], magic, .little);
+    std.mem.writeInt(u16, prefix[4..6], format_version, .little);
+    std.mem.writeInt(u16, prefix[6..8], @intCast(header_len), .little);
+    var chunk: [64 * 1024]u8 = undefined;
+    var start = from;
+    while (start + header_len <= capacity) {
+        const want: usize = @intCast(@min(chunk.len, capacity - start));
+        const got = try file.readPositionalAll(io, chunk[0..want], base_offset + start);
+        if (got < header_len) return false;
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, chunk[0..got], at, &prefix)) |found| : (at = found + 1) {
+            if (found + header_len > got) break;
+            const header = RecordHeader.decode(chunk[found..][0..header_len]);
+            if (header.salt == salt and header.commit_sequence > after) return true;
+        }
+        if (got < want) return false;
+        // Overlap so a header straddling the chunk boundary is seen.
+        start += got - (header_len - 1);
+    }
+    return false;
 }
 
 /// The salt of the record at the log's start (0 for a version 1 record),
@@ -1042,7 +1121,7 @@ test "replay ends a reused log at a forged header inside a retired payload" {
     // checksum matches. Only the salt tells it apart.
     const live = "live";
     const forged_payload = "zz";
-    const forged: RecordHeader = .{ .payload_len = forged_payload.len, .commit_sequence = 8, .crc32 = Crc32.hash(forged_payload) };
+    const forged = (RecordHeader{ .payload_len = forged_payload.len, .commit_sequence = 8, .crc32 = 0 }).sealed(forged_payload);
     var retired_payload: [live.len + header_len + forged_payload.len]u8 = undefined;
     @memset(retired_payload[0..live.len], 'x');
     forged.encode(retired_payload[live.len..][0..header_len]);
@@ -1087,6 +1166,41 @@ test "replay reads a version 1 log and its writer continues it" {
     try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
 }
 
+test "replay rejects a damaged salt inside a run, not a short log" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(11, "a");
+    const second = writer.tail;
+    try writer.append(12, "b");
+    const third = writer.tail;
+    try writer.append(13, "c");
+
+    // One flipped salt byte in the committed middle record: it fails its
+    // own checksum, and the run's next record follows it.
+    var byte: [1]u8 = undefined;
+    _ = try region.file.readPositionalAll(io, &byte, second + 24);
+    byte[0] ^= 0x5a;
+    try region.file.writePositionalAll(io, &byte, second + 24);
+    const damaged = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, damaged.stop_reason);
+    try testing.expectEqual(second, damaged.valid_bytes);
+
+    // Damage to the last record's salt leaves nothing of the run after it:
+    // indistinguishable from the run's end without a durable watermark.
+    byte[0] ^= 0x5a;
+    try region.file.writePositionalAll(io, &byte, second + 24);
+    _ = try region.file.readPositionalAll(io, &byte, third + 24);
+    byte[0] ^= 0x5a;
+    try region.file.writePositionalAll(io, &byte, third + 24);
+    const last = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.end_of_region, last.stop_reason);
+    try testing.expectEqual(third, last.valid_bytes);
+}
+
 test "replay keeps rejecting what retired bytes can never be" {
     const io = testing.io;
     const capacity: u64 = 4096;
@@ -1107,7 +1221,7 @@ test "replay keeps rejecting what retired bytes can never be" {
     try testing.expectEqual(StopReason.corrupt_record, next.stop_reason);
 
     // A gap past the live tail.
-    const gap: RecordHeader = .{ .payload_len = 1, .commit_sequence = 15, .crc32 = Crc32.hash("c"), .salt = writer.salt.? };
+    const gap = (RecordHeader{ .payload_len = 1, .commit_sequence = 15, .crc32 = 0, .salt = writer.salt.? }).sealed("c");
     gap.encode(&header_buf);
     try region.file.writePositionalAll(io, &header_buf, writer.tail);
     const gapped = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
@@ -1188,7 +1302,7 @@ test "a gap among superseded records is tolerated -- a real checkpoint can consu
     // standing in for "checkpoint sequence 12 landed but was never
     // logged."
     var header_buf: [header_len]u8 = undefined;
-    const skip: RecordHeader = .{ .payload_len = 1, .commit_sequence = 13, .crc32 = Crc32.hash("b"), .salt = writer.salt.? };
+    const skip = (RecordHeader{ .payload_len = 1, .commit_sequence = 13, .crc32 = 0, .salt = writer.salt.? }).sealed("b");
     skip.encode(&header_buf);
     try region.file.writePositionalAll(io, &header_buf, writer.tail);
     try region.file.writePositionalAll(io, "b", writer.tail + header_len);
@@ -1244,7 +1358,7 @@ test "a superseded run followed by new records tolerates exactly the checkpoint'
     try writer2.append(4, "gamma");
     try writer2.sync();
     var header_buf: [header_len]u8 = undefined;
-    const skip: RecordHeader = .{ .payload_len = 1, .commit_sequence = 6, .crc32 = Crc32.hash("d"), .salt = writer2.salt.? };
+    const skip = (RecordHeader{ .payload_len = 1, .commit_sequence = 6, .crc32 = 0, .salt = writer2.salt.? }).sealed("d");
     skip.encode(&header_buf);
     try region2.file.writePositionalAll(io, &header_buf, writer2.tail);
     try region2.file.writePositionalAll(io, "d", writer2.tail + header_len);
@@ -1471,7 +1585,7 @@ test "a torn append leaves a benign end of region, never a false corrupt_record,
         // it is -- a real, unrecoverable corruption -- since nothing else
         // can tell this apart from genuine on-disk damage.
         var header_buf: [header_len]u8 = undefined;
-        const header: RecordHeader = .{ .payload_len = 3, .commit_sequence = 2, .crc32 = Crc32.hash("two"), .salt = writer.salt.? };
+        const header = (RecordHeader{ .payload_len = 3, .commit_sequence = 2, .crc32 = 0, .salt = writer.salt.? }).sealed("two");
         header.encode(&header_buf);
         try region.file.writePositionalAll(io, &header_buf, good_tail);
 
@@ -1526,7 +1640,7 @@ test "replay detects a sequence gap as corruption, not a torn tail" {
     // directly, the way independent corruption (not a local bug in this
     // writer) would produce it.
     var header_buf: [header_len]u8 = undefined;
-    const skip: RecordHeader = .{ .payload_len = 4, .commit_sequence = 3, .crc32 = Crc32.hash("skip"), .salt = writer.salt.? };
+    const skip = (RecordHeader{ .payload_len = 4, .commit_sequence = 3, .crc32 = 0, .salt = writer.salt.? }).sealed("skip");
     skip.encode(&header_buf);
     try region.file.writePositionalAll(io, &header_buf, writer.tail);
     try region.file.writePositionalAll(io, "skip", writer.tail + header_len);
@@ -1562,7 +1676,7 @@ test "replay rejects an unsupported format version as corrupt, not benign" {
     try writer.sync();
 
     var header_buf: [header_len]u8 = undefined;
-    var bad: RecordHeader = .{ .payload_len = 2, .commit_sequence = 2, .crc32 = Crc32.hash("hi"), .salt = writer.salt.? };
+    var bad = (RecordHeader{ .payload_len = 2, .commit_sequence = 2, .crc32 = 0, .salt = writer.salt.? }).sealed("hi");
     bad.format_version = format_version + 1;
     bad.encode(&header_buf);
     try region.file.writePositionalAll(io, &header_buf, writer.tail);
