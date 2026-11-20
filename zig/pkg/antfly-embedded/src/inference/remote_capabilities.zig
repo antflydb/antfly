@@ -42,10 +42,17 @@ pub const discovery_shape_header = "X-Antfly-Inference-Discovery-Shape";
 pub const DiscoveryShape = struct {
     items: usize,
     media: bool = false,
+    modalities: work.Modalities = .{},
     output_tokens: ?usize = null,
 
     pub fn formatHeader(self: DiscoveryShape, buf: *[64]u8) ![]const u8 {
         if (self.items == 0) return error.InvalidInferenceDiscoveryShape;
+        const mask: u8 = @bitCast(self.modalities);
+        if (mask != 0) {
+            if (self.output_tokens) |tokens|
+                return std.fmt.bufPrint(buf, "2:{d}:{d}:{d}", .{ self.items, mask, tokens });
+            return std.fmt.bufPrint(buf, "2:{d}:{d}:-", .{ self.items, mask });
+        }
         if (self.output_tokens) |tokens| {
             return std.fmt.bufPrint(buf, "1:{d}:{d}:{d}", .{ self.items, @intFromBool(self.media), tokens });
         }
@@ -65,6 +72,23 @@ pub const DiscoveryHeaders = struct {
         return self.entries[0 .. base.len + 1];
     }
 };
+
+pub fn generationModalities(messages: anytype) work.Modalities {
+    var mask: u8 = 0;
+    for (messages) |message| {
+        const content = message.content orelse continue;
+        if (content != .parts) continue;
+        for (content.parts) |part| {
+            const modalities: work.Modalities = switch (part) {
+                .text => .{},
+                .image_url => .{ .image = true },
+                .media => |media| work.modalityForMimeType(media.mime_type) orelse .{},
+            };
+            mask |= @bitCast(modalities);
+        }
+    }
+    return @bitCast(mask);
+}
 
 pub fn generationHasMedia(messages: anytype) bool {
     for (messages) |message| {

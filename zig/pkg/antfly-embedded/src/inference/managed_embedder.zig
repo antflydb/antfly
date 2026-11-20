@@ -2417,7 +2417,7 @@ pub const ManagedEmbedder = struct {
             var storage: [4][2][]const u8 = undefined;
             const headers = remoteEmbeddingHeaders(entry, auth_header, &storage);
             var placement: remote_capabilities.DiscoveryHeaders = .{};
-            const discovery_headers = if (media_items) |count| try embeddingPlacementHeaders(&placement, headers, count, true) else headers;
+            const discovery_headers = if (media_items) |count| try placement.withShape(headers, .{ .items = count, .modalities = .{ .image = true }, .output_tokens = 0 }) else headers;
             var lease = discoverRemoteEmbeddingLease(entry, http, discovery_headers) catch |err| switch (err) {
                 error.QueryEmbeddingOverloaded => return error.QueueFull,
                 error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilitySelectorAbsent, error.InferenceCapabilitiesStale => return error.InferenceCapacityUnavailable,
@@ -6479,6 +6479,24 @@ fn hasEmbeddingMedia(parts: []const template_mod.ContentPart) bool {
     return false;
 }
 
+fn embeddingPartsDiscoveryShape(parts: []const template_mod.ContentPart, items: usize) remote_capabilities.DiscoveryShape {
+    var modalities: inference_work.Modalities = .{};
+    for (parts) |part| switch (part) {
+        .text => modalities.text = true,
+        .media_url => modalities.image = true,
+        .binary => |media| if (inference_work.modalityForMimeType(media.mime_type)) |required| {
+            mergeModalities(&modalities, required);
+        },
+    };
+    const media = hasEmbeddingMedia(parts);
+    return .{
+        .items = @max(items, 1),
+        .media = media,
+        .modalities = if (media) modalities else .{},
+        .output_tokens = 0,
+    };
+}
+
 fn textEmbeddingInvocationShape(texts: []const []const u8) !inference_work.InvocationShape {
     var shape = inference_work.InvocationShape{
         .item_count = texts.len,
@@ -6747,7 +6765,7 @@ fn invalidateRemoteEmbeddingLease(
         try cache.invalidateLease(entry.base_url, entry.model, .embed, base, rejected);
         if (lease.media_placement_items) |count| {
             var placement: remote_capabilities.DiscoveryHeaders = .{};
-            const planned_headers = try embeddingPlacementHeaders(&placement, base, count, true);
+            const planned_headers = try placement.withShape(base, .{ .items = count, .modalities = .{ .image = true }, .output_tokens = 0 });
             try cache.invalidateLease(entry.base_url, entry.model, .embed, planned_headers, rejected);
         }
     }
@@ -6769,11 +6787,7 @@ fn embedWithEntryPartsForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]f32 {
-    return withQueryEmbeddingRetry([]f32, alloc, entry, embedWithEntryPartsForTaskOnce, .{ parts, dims, task_type }, task_type, .{
-        .items = 1,
-        .media = hasEmbeddingMedia(parts),
-        .output_tokens = 0,
-    });
+    return withQueryEmbeddingRetry([]f32, alloc, entry, embedWithEntryPartsForTaskOnce, .{ parts, dims, task_type }, task_type, embeddingPartsDiscoveryShape(parts, 1));
 }
 
 fn embedWithEntryPartsForTaskOnce(
@@ -6864,7 +6878,7 @@ fn embedWithEntryPartsForTaskOnce(
         var capability_header_storage: [4][2][]const u8 = undefined;
         const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
         var placement: remote_capabilities.DiscoveryHeaders = .{};
-        const placement_headers = try embeddingPlacementHeaders(&placement, capability_headers, 1, hasEmbeddingMedia(parts));
+        const placement_headers = try placement.withShape(capability_headers, embeddingPartsDiscoveryShape(parts, 1));
         const lease = try bindRemoteEmbeddingPartsLease(
             alloc,
             entry,
@@ -7358,7 +7372,7 @@ fn embedPartItemsWithEntry(
     var capability_header_storage: [4][2][]const u8 = undefined;
     const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
     var placement: remote_capabilities.DiscoveryHeaders = .{};
-    const placement_headers = try embeddingPlacementHeaders(&placement, capability_headers, items.len, hasEmbeddingMedia(items));
+    const placement_headers = try placement.withShape(capability_headers, embeddingPartsDiscoveryShape(items, items.len));
     const planned_capabilities = planned_lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
     const execution_lease = if (planned_lease.scope_digest != null) lease: {
         const lease = try resolvePlannedRemoteEmbeddingLease(alloc, entry, http, capability_headers, placement_headers, planned_lease, if (hasEmbeddingMedia(items)) items.len else null);
@@ -7873,7 +7887,7 @@ fn prepareRemoteQueryEmbedding(alloc: std.mem.Allocator, entry: *const ManagedEm
     const headers = remoteEmbeddingHeaders(entry, auth, &storage);
     var placement: remote_capabilities.DiscoveryHeaders = .{};
     const discovery_headers = if (shape) |value|
-        try embeddingPlacementHeaders(&placement, headers, value.items, value.media)
+        try placement.withShape(headers, value)
     else
         headers;
     const started = monotonicNowNs();
@@ -8845,7 +8859,7 @@ test "managed embedder owned numeric lease executes without cache residency and 
     }};
     var managed = ManagedEmbedder{ .alloc = alloc, .entries = &entries };
     var placement: remote_capabilities.DiscoveryHeaders = .{};
-    const shaped_headers = try embeddingPlacementHeaders(&placement, &.{.{ "X-Antfly-Inference-Workload-Type", "write-heavy" }}, 1, true);
+    const shaped_headers = try placement.withShape(&.{.{ "X-Antfly-Inference-Workload-Type", "write-heavy" }}, .{ .items = 1, .modalities = .{ .image = true }, .output_tokens = 0 });
     const lease = inference_work.CapabilityLease{
         .capabilities = .{
             .task = .embed,

@@ -2142,7 +2142,7 @@ test "decision functions scoped generated image validation and execution share a
         fn catalog(req: httpx.testing_mod.RequestInfo) !void {
             const table = req.header("X-Antfly-Source-Table") orelse return error.MissingScope;
             try std.testing.expectEqualStrings("model=vision&task=generate&operation=generate", req.query);
-            try std.testing.expectEqualStrings("1:1:1:256", req.header(remote_capabilities.discovery_shape_header) orelse return error.MissingDiscoveryShape);
+            try std.testing.expectEqualStrings("2:1:2:256", req.header(remote_capabilities.discovery_shape_header) orelse return error.MissingDiscoveryShape);
             routes[0].respond.body = if (std.mem.eql(u8, table, "photos")) vision_catalog else text_catalog;
         }
         fn generate(req: httpx.testing_mod.RequestInfo) !void {

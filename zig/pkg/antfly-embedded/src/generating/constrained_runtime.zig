@@ -70,7 +70,7 @@ pub const Runtime = struct {
 
     pub fn capabilitiesForMedia(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig, media: bool) !constrained.Capabilities {
         self.required_media = media;
-        return self.planCapabilities(a, cfg, .{ .items = 1, .media = media, .output_tokens = std.math.cast(usize, cfg.max_tokens) });
+        return self.planCapabilities(a, cfg, .{ .items = 1, .media = media, .modalities = .{ .image = media }, .output_tokens = std.math.cast(usize, cfg.max_tokens) });
     }
 
     fn planCapabilities(self: *Runtime, a: Allocator, cfg: *generating.GeneratorConfig, shape: ?remote.DiscoveryShape) !constrained.Capabilities {
@@ -231,9 +231,12 @@ pub const Runtime = struct {
             const schema_text = try std.json.Stringify.valueAlloc(a, request.schema, .{});
             const system = try std.fmt.allocPrint(a, "Return one structured result per input item. Preserve the item IDs exactly. The JSON schema is: {s}", .{schema_text});
             const messages = try constrained.evidenceMessages(a, request, system, cfg.provider == .openai);
+            var modalities = remote.generationModalities(messages);
+            modalities.image = modalities.image or self.runtime.required_media;
             const shape: remote.DiscoveryShape = .{
                 .items = 1,
                 .media = self.runtime.required_media or remote.generationHasMedia(messages),
+                .modalities = modalities,
                 .output_tokens = std.math.cast(usize, cfg.max_tokens),
             };
             try self.runtime.bindExecutionLease(a, &cfg, shape);

@@ -30493,7 +30493,7 @@ fn appendResolvedInferenceCapabilities(
     try buf.appendSlice(allocator, ",\"generation_token_logprobs_v1\":");
     try buf.appendSlice(allocator, if (executor_kind == .native_generation) "true" else "false");
     try buf.appendSlice(allocator, ",\"model_aware_chunking_v1\":");
-    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed")) "true" else "false");
+    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed") or std.mem.eql(u8, resolved_task, "chunk")) "true" else "false");
     try buf.appendSlice(allocator, ",\"numeric_responses_v1\":");
     try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed") or std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
     // `/rerank` accepts `documents` (strings or content parts). Older servers

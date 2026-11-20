@@ -1134,11 +1134,9 @@ pub const Runtime = struct {
                 }
                 if (document_checkpoints) break :blk .borrowed_binary;
                 if (!remote) break :blk extractorAttachmentTransport(parsed);
-                const caps = self.extractorCapabilitiesForRequests(alloc, &parsed, requests) catch |err| switch (err) {
-                    error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryUnsupported, error.RemoteCapabilitySelectorAbsent => null,
-                    else => return err,
-                };
-                break :blk remoteAttachmentTransport(caps, .base64_payload);
+                // A later window can select a base64-only replica. Reserve
+                // the larger representation before any extraction dispatch.
+                break :blk .base64_payload;
             },
             .transcriber => blk: {
                 var parsed = try std.json.parseFromSlice(transcribing.Config, alloc, requests[0].config_json, .{
@@ -3627,6 +3625,7 @@ pub const Runtime = struct {
         const discovery_shape: remote_capabilities.DiscoveryShape = .{
             .items = 1,
             .media = remote_capabilities.generationHasMedia(&messages),
+            .modalities = remote_capabilities.generationModalities(&messages),
             .output_tokens = discoveryOutputTokens(cfg.max_tokens),
         };
         if (cfg.provider == .antfly and cfg.url.len > 0) {
@@ -3905,7 +3904,7 @@ pub const Runtime = struct {
         }
         capability_auth_count = try self.execution.routing.appendHeaders(&capability_auth_storage, capability_auth_count);
         var placement: remote_capabilities.DiscoveryHeaders = .{};
-        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .output_tokens = discoveryOutputTokens(request.max_tokens orelse execution_cfg.max_tokens) });
+        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .modalities = .{ .image = request.images.len != 0 }, .output_tokens = discoveryOutputTokens(request.max_tokens orelse execution_cfg.max_tokens) });
         const discovered_capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
             const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
@@ -4045,7 +4044,7 @@ pub const Runtime = struct {
             capability_auth_count,
         );
         var placement: remote_capabilities.DiscoveryHeaders = .{};
-        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .output_tokens = discoveryOutputTokens(request.max_tokens orelse execution_cfg.max_tokens) });
+        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .modalities = .{ .image = request.images.len != 0 }, .output_tokens = discoveryOutputTokens(request.max_tokens orelse execution_cfg.max_tokens) });
         const capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
             const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
@@ -4352,7 +4351,7 @@ pub const Runtime = struct {
         }
         capability_auth_count = try self.execution.routing.appendHeaders(&capability_auth_storage, capability_auth_count);
         var placement: remote_capabilities.DiscoveryHeaders = .{};
-        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = 1, .media = true, .output_tokens = 0 });
+        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = 1, .media = true, .modalities = .{ .audio = true }, .output_tokens = 0 });
         if (cfg_parsed.value.provider == .antfly) {
             const endpoint = cfg_parsed.value.resolvedUrl() orelse return error.InvalidTranscribingConfig;
             const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
@@ -4973,23 +4972,29 @@ fn inlineImagePixelsAlloc(
 
 fn producerDiscoveryShape(alloc: Allocator, requests: []const asset_producer.Request) !remote_capabilities.DiscoveryShape {
     var shape: remote_capabilities.DiscoveryShape = .{ .items = @max(1, requests.len), .output_tokens = 0 };
-    const Part = struct { type: ?[]const u8 = null };
+    const Part = struct { type: ?[]const u8 = null, mime_type: ?[]const u8 = null };
     for (requests) |request| {
-        if (request.media.len != 0) {
+        for (request.media) |media| {
             shape.media = true;
-            break;
+            if (inference_work.modalityForMimeType(media.mime_type)) |modalities|
+                mergeInferenceModalities(&shape.modalities, modalities);
         }
         if (request.source_parts_json) |raw| {
             const parts_json = std.mem.trimStart(u8, raw, " \t\r\n");
             if (parts_json.len == 0 or parts_json[0] != '[') continue;
-            // Skip content fields, including potentially large inline media.
             var parts = try std.json.parseFromSlice([]const Part, alloc, parts_json, .{ .ignore_unknown_fields = true });
             defer parts.deinit();
             for (parts.value) |part| {
                 const kind = part.type orelse continue;
-                if (std.mem.eql(u8, kind, "image_url") or std.mem.eql(u8, kind, "media")) {
+                if (std.mem.eql(u8, kind, "image_url")) {
                     shape.media = true;
-                    return shape;
+                    shape.modalities.image = true;
+                } else if (std.mem.eql(u8, kind, "media")) {
+                    shape.media = true;
+                    if (part.mime_type) |mime_type| {
+                        if (inference_work.modalityForMimeType(mime_type)) |modalities|
+                            mergeInferenceModalities(&shape.modalities, modalities);
+                    }
                 }
             }
         }
@@ -5610,8 +5615,9 @@ test "asset producer runtime remote planning uses resolved framed transport" {
             try std.testing.expectEqual(framed, caps.framed_attachments);
             const plan = try runtime.producer().invocationMemoryForRequests(alloc, &.{request});
             const fallback: inference_work.AttachmentTransport = if (kind == .reader) .data_uri else .base64_payload;
-            try std.testing.expectEqual(if (framed) inference_work.AttachmentTransport.segmented_framed_binary else fallback, plan.attachment_transport);
-            if (framed) {
+            const planned_framed = framed and kind != .extractor;
+            try std.testing.expectEqual(if (planned_framed) inference_work.AttachmentTransport.segmented_framed_binary else fallback, plan.attachment_transport);
+            if (planned_framed) {
                 try std.testing.expectEqual(png.len, try plan.attachment_transport.peakResidentSize(png.len, "image/png".len));
                 try std.testing.expectEqual(png.len, try plan.attachment_transport.wireSize(png.len, "image/png".len));
             }
@@ -7953,7 +7959,7 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
             try std.testing.expectEqualStrings("Bearer reader-bearer", request.header("Authorization") orelse return error.MissingHeader);
             if (request.method == .GET) {
                 if (request.header(remote_capabilities.discovery_shape_header)) |shape|
-                    try std.testing.expectEqualStrings("1:2:1:-", shape);
+                    try std.testing.expectEqualStrings("2:2:2:-", shape);
             }
             if (framed and request.method == .POST) {
                 try std.testing.expectEqualStrings(httpx.attachment_envelope.content_type, request.header("Content-Type") orelse return error.MissingHeader);

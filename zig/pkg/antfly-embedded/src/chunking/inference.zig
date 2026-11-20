@@ -286,7 +286,11 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         value.value = try value.value.includingEmbedding(value.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
     };
     const boundary = if (resolved_outputs) |value| try value.value.boundary() else null;
-    const chunk_model = if (cfg.model.len > 0) cfg.model else "fixed";
+    const configured_chunk_model = std.mem.trim(u8, cfg.model, " \t\r\n");
+    const chunk_model = if (configured_chunk_model.len == 0 or
+        std.mem.eql(u8, configured_chunk_model, "fixed_bert") or
+        std.mem.eql(u8, configured_chunk_model, "fixed_bpe") or
+        std.mem.eql(u8, configured_chunk_model, "fixed-bert-tokenizer")) "fixed" else configured_chunk_model;
     const boundary_model = if (boundary) |value| value.model else if (cfg.embedding) |target| target.model else null;
     const boundary_task: inference_work.Operation = if (boundary != null and boundary.?.kind == .transcribe) .transcribe else .embed;
     // The node default credential accompanies only the node default endpoint
@@ -303,15 +307,17 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, routing_header_count);
     const routing_headers = routing_header_storage[0..routing_header_count];
     var placement: remote_capabilities.DiscoveryHeaders = .{};
-    const discovery_headers = try placement.withShape(routing_headers, .{ .items = 1, .media = input != .text, .output_tokens = 0 });
+    var boundary_value: ?[]u8 = null;
+    defer if (boundary_value) |value| alloc.free(value);
+    var discovery_base: [3][2][]const u8 = undefined;
+    @memcpy(discovery_base[0..routing_header_count], routing_headers);
+    var discovery_count = routing_header_count;
     if (boundary_model) |model| {
-        const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
-        defer if (accounting) |hook| hook.finish(hook.ptr, started);
-        const lease = try capability_cache.?.getOrDiscoverLeaseWithContext(http, endpoint, model, boundary_task, routing_headers, execution.waitContext());
-        if (lease.capabilities) |caps| {
-            if (cfg.isModelAware() and !caps.model_aware_chunking_v1) return error.ModelAwareChunkProviderRequired;
-        }
+        boundary_value = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ boundary_task.wireName(), model });
+        discovery_base[discovery_count] = .{ "X-Antfly-Inference-Chunk-Boundary", boundary_value.? };
+        discovery_count += 1;
     }
+    const discovery_headers = try placement.withShape(discovery_base[0..discovery_count], .{ .items = 1, .media = input != .text, .output_tokens = 0 });
     var capability_lease = dispatch: {
         const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
         defer if (accounting) |hook| hook.finish(hook.ptr, started);
@@ -325,6 +331,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     };
     var attachment_transport: inference_work.AttachmentTransport = .base64_payload;
     if (capability_lease.capabilities) |capabilities| {
+        if (boundary_model != null and !capabilities.model_aware_chunking_v1) return error.ModelAwareChunkProviderRequired;
         if (capabilities.framed_attachments and input == .binary)
             attachment_transport = .segmented_framed_binary;
         const shape: inference_work.InvocationShape = switch (input) {
