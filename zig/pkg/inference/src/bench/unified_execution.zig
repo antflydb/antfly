@@ -151,6 +151,16 @@ pub fn main(init: std.process.Init) !void {
     if (options.generate_video != null and (options.generate_image != null or options.generate_audio != null)) return error.InvalidGenerationGeometry;
     if (options.transcribe_audio.len == 0 and (options.transcribe_timestamps or options.transcribe_require_eos or options.transcribe_output_format != .json or options.transcribe_mode != .performance or options.transcribe_max_output_tokens != 0)) return error.InvalidTranscriptionGeometry;
     if (options.transcribe_audio.len != 0 and (options.incremental_source or (options.backend != .native and options.backend != .metal and options.backend != .cuda and options.backend != .xla) or options.batch != 1 or options.resident or options.primitive != null or options.embedding_pool != null or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0 or options.source_proof != .off or options.source_trace_constructor or options.source_pipelined_steps != 0 or options.decoder_model_dir.len != 0)) return error.InvalidTranscriptionGeometry;
+    const pjrt_task: inference.pjrt_options.Options.Task = if (options.transcribe_audio.len != 0)
+        .transcription
+    else if (options.generate_text != null)
+        .generation
+    else if (options.extraction_request != null)
+        .extraction
+    else
+        .legacy_extraction;
+    try options.pjrt.validateTask(pjrt_task);
+    try options.pjrt.validateTaskPlacement(options.backend == .xla);
     if (options.source_metadata_proof and (!options.incremental_source or options.backend != .metal or options.source_policy != .qualified or !options.diagnostics or options.source_proof != .off or options.source_trace_constructor)) return error.InvalidMetadataProof;
     if (options.incremental_source and ((options.backend != .cuda and options.backend != .metal and options.backend != .native) or options.batch != 1 or options.source_attempts == 0 or options.resident or options.primitive != null or options.embedding_pool != null or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0)) return error.InvalidGeometry;
     if (options.source_trace_constructor and (!options.incremental_source or options.backend != .cuda or options.source_proof == .off or !options.diagnostics)) return error.ConstructorTraceRequiresCudaProof;

@@ -316,7 +316,7 @@ test "model program capture rejects host observations and refunds every failed a
     var x = try tensor.Tensor.initFloat32(a, "x", &.{ 2, 3 }, &.{ 1, 2, 3, 4, 5, 6 });
     defer x.deinit();
     try std.testing.expectError(error.HostReadbackDuringCapture, trace(a, .{ .context = &marker, .fingerprint = 1, .run = TestForward.readback }, &.{.{ .tensor = x }}, .{ .resolve = TestForward.noWeight }));
-    try std.testing.checkAllAllocationFailures(a, TestForward.failureCase, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, TestForward.failureCase, .{});
 }
 
 test "model program precision participates in specialization identity" {

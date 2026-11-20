@@ -117,13 +117,45 @@ partitioned generation uses for its seed. Automatic native placement retains
 its existing order, and CUDA policy still requires explicit feasible device and
 capacity bounds.
 
-Explicit placement does not grant serving qualification. In particular, the
-GLiNER-DECIDE marker encoder/readout stages execute through PJRT, but the public
-span decision route still rejects PJRT until its artifact/backend qualification
-and managed admission contract are established. The CLI reports that rejection
-instead of silently substituting native execution. Managed GLiNER fixtures must
-declare their classifier contract; a raw upstream acquisition receipt is not an
-executable model manifest.
+Direct task placement is independent for each stage: an explicitly placed
+Whisper decoder receives its own manager policy, including split encoder/decoder
+artifacts. Provider policy is fixed before creating a serving node. Task controls
+are forwarded to execution or rejected when the selected task/provider cannot
+honor them; parser acceptance alone is not support. Transcription currently has
+no PJRT request-resident decoder and rejects explicit cache enablement.
+
+`pipelines/pjrt_generation_request.zig` owns one stable execution request shared
+by HTTP generation and direct text/media reading. Its compute provider, graph
+cache and generation pipeline retire in that order's reverse, under the provider
+guard. Callers retain the model handle, generation slot and prepaid media lease
+through destruction. The loaded session owns compiled specializations and model
+parameters; the task supplies messages and stopping/publication policy. Direct
+reading cannot substitute a native compute backend for a PJRT session.
+
+GLiNER-DECIDE's F32 schema classifier uses the same marker encoder/readout stage
+as typed decisions. Its exact dense 1B artifact and actual CPU or GB10 PJRT
+provider metadata and the default GEMM policy select separate bounded profiles:
+one request, at most 64
+prepared sequences, each at most 1024 tokens. The current classifier executes
+one physical row at a time and rejects an explicit larger extraction batch.
+BF16, other devices, quantized
+artifacts and span-head extraction receive no qualification from this route.
+The compiled executor does not acquire the eager model mutex or construct a
+native backend; each session call owns its provider admission and execution lane.
+Independent pinned-logit and direct/HTTP tests qualify the actual serving path. Captured symmetric-window bias uses shared integer position
+algebra in `graph/attention_bias.zig`; it does not embed a dense per-head mask
+for every layer. Only the linear position vector and scalar values are
+constants. Independent 512- and 2048-token upstream captures check this definition
+without widening the serving envelope or PJRT's program-size guard.
+
+CUDA marker classification has a separate artifact-bound full-context policy:
+the exact dense Ettin 1B identity may use its 7999-token configuration. An
+8192-token physical budget retains up to eight short rows, or one full-context
+row. Unknown and quantized artifacts keep the conservative limit. This
+does not widen span extraction's independently qualified 1024-token processor
+window. Managed qualification fixtures use the real registry publication gate
+and hardlink shared immutable weights, rather than inventing capability metadata
+or modifying the default model directory.
 
 ## Kernel ownership and validation
 
@@ -202,7 +234,13 @@ preparation API do not by themselves complete these remaining requirements:
   when opening that source, retaining early device/artifact preflight. Prefetch
   guards are installed only after the final session owner is in place.
   `models/load_plan.zig` derives checked artifact/tokenizer preparation peaks,
-  retained weights and run-admission geometry. `models/session_loader.zig` owns
+  retained weights and run-admission geometry. PJRT host load estimates credit
+  only aligned F32 tensors proved to alias an actual safetensors mapping, and
+  only when captured architecture/adapter policy preserves those views. BF16,
+  unaligned tensors and rewriting preparations keep their independent host
+  representation charge. CPU provider operands and the bounded CUDA arena
+  remain charged; aliases never enlarge an operator's memory envelope.
+  `models/session_loader.zig` owns
   primary/component backend attempts, artifact selection, construction guards,
   preparation order and failure rollback. Serving supplies health, admission
   limits/leases, eviction and close protection through synchronous borrowed

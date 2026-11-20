@@ -54,6 +54,7 @@ const Options = struct {
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
+    try opts.pjrt.validateTask(.transcription);
     try ensureRequestedBackendAvailable(opts.backend);
     const audio_data = try c_file.readFile(allocator, opts.audio_path);
     defer allocator.free(audio_data);
@@ -64,8 +65,19 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     session_manager.native_call_policy = .in_process;
     session_manager.process_termination_available = false;
     configureBackendPreference(&session_manager, opts.backend);
+    if (opts.backend != .auto) @import("native_backend_choice.zig").configureDirectSession(&session_manager, @import("native_backend_choice.zig").parse(@tagName(opts.backend)).?);
     try opts.pjrt.applyPolicy(&session_manager);
     if (opts.backend == .xla) try opts.pjrt.configure(&session_manager);
+    var decoder_manager_snapshot = session_manager;
+    if (opts.decoder_backend != .auto) {
+        try ensureRequestedBackendAvailable(opts.decoder_backend);
+        const choice = @import("native_backend_choice.zig").parse(@tagName(opts.decoder_backend)).?;
+        @import("native_backend_choice.zig").configureDirectSession(&decoder_manager_snapshot, choice);
+    }
+
+    // Transcription task controls describe the decoder, independently of
+    // encoder placement. A native decoder must not ignore a PJRT cache flag.
+    try opts.pjrt.validateTaskPlacement(decoder_manager_snapshot.required_backend == .pjrt);
 
     if (enc_dec_mod.findEncoderDecoderPaths(allocator, opts.model_dir)) |paths| {
         defer allocator.free(paths.encoder);
@@ -74,7 +86,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         var encoder_session = try session_manager.loadModel(paths.encoder);
         defer encoder_session.close();
 
-        var decoder_session = try session_manager.loadModel(paths.decoder);
+        var decoder_session = try decoder_manager_snapshot.loadModel(paths.decoder);
         defer decoder_session.close();
 
         const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{opts.model_dir});
@@ -115,6 +127,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
+    var decoder_manager = model_manager_mod.ModelManager.init(allocator, decoder_manager_snapshot);
+    defer decoder_manager.deinit();
 
     const model = try model_manager.loadFromDir(opts.model_dir);
     const whisper_cfg = session_factory.getWhisperConfig(model.session) orelse return error.InvalidModelForTranscription;
@@ -129,7 +143,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             .auto => unreachable,
         };
         if (model.session.backend() == desired) break :blk model.session;
-        const decoder_model = try model_manager.loadFromDirWithPreferredBackends(opts.model_dir, &.{desired}, false);
+        const decoder_model = try decoder_manager.loadFromDirWithPreferredBackends(opts.model_dir, &.{desired}, false);
+        if (decoder_model.session.backend() != desired) return error.RequiredBackendUnavailable;
         break :blk decoder_model.session;
     };
     const prompt_cache = if (model.whisper_prompt_cache) |*cache|

@@ -60,6 +60,7 @@ pub fn main(a: std.mem.Allocator, io: std.Io, args: []const []const u8, extract:
         return error.InvalidArguments;
     }
     try backend_choice.validate(backend);
+    try pjrt.validateTask(.extraction);
     const requests = try a.alloc([]u8, paths.items.len);
     var loaded: usize = 0;
     defer {
@@ -70,15 +71,25 @@ pub fn main(a: std.mem.Allocator, io: std.Io, args: []const []const u8, extract:
         request.* = try file.readFileMax(a, path, 16 * 1024 * 1024);
         loaded += 1;
     }
-    var node = try Node.init(a, .{ .models_dir = args[0], .allow_unknown_models = true, .process_termination_available = true });
+    const provider_options = try pjrt.sessionOptions();
+    var node = try Node.init(a, .{
+        .models_dir = args[0],
+        .allow_unknown_models = true,
+        .process_termination_available = true,
+        .pjrt_memory_policy = provider_options.memory_policy,
+        .pjrt_precision = provider_options.precision,
+        .pjrt_gemm = provider_options.gemm,
+        .pjrt_extraction_batch_size = pjrt.extraction_batch_size,
+    });
     defer node.deinit();
     try node.attachIo(io);
-    backend_choice.configureSessionPreference(&node.session_manager, backend);
-    backend_choice.configureSessionPreference(&node.model_manager.session_manager, backend);
+    backend_choice.configureDirectSession(&node.session_manager, backend);
+    backend_choice.configureDirectSession(&node.model_manager.session_manager, backend);
     if (backend == .xla) {
         try pjrt.configure(&node.session_manager);
         try pjrt.configure(&node.model_manager.session_manager);
     }
+    try pjrt.validateTaskPlacement(node.session_manager.required_backend == .pjrt);
     var buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buffer);
     const timings = try a.alloc(u64, requests.len * repeat);

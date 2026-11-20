@@ -153,6 +153,7 @@ pub const TensorStore = struct {
     pub const Float32Footprint = struct {
         bytes: usize = 0,
         largest_tensor_bytes: usize = 0,
+        mapped_f32_alias_bytes: usize = 0,
 
         fn addShape(self: *@This(), shape: anytype, encoded: usize) !void {
             var count: usize = 1;
@@ -162,6 +163,7 @@ pub const TensorStore = struct {
             self.largest_tensor_bytes = @max(self.largest_tensor_bytes, bytes);
         }
         fn merge(self: *@This(), other: @This()) !void {
+            self.mapped_f32_alias_bytes = std.math.add(usize, self.mapped_f32_alias_bytes, other.mapped_f32_alias_bytes) catch return error.ResourceLimitExceeded;
             self.bytes = std.math.add(usize, self.bytes, other.bytes) catch return error.ResourceLimitExceeded;
             self.largest_tensor_bytes = @max(self.largest_tensor_bytes, other.largest_tensor_bytes);
         }
@@ -198,6 +200,15 @@ pub const TensorStore = struct {
             var range = (try self.describeTensorRange(allocator, name)) orelse return error.UnsupportedTensorStore;
             defer range.deinit(allocator);
             try result.addShape(range.shape, range.byte_len);
+            const aliased = if (self.vtable == &SafetensorsStore.vtable) alias: {
+                const owner: *SafetensorsStore = @ptrCast(@alignCast(self.ptr));
+                break :alias try owner.source.reader.mappedF32Bytes(name);
+            } else if (self.vtable == &ShardedSafetensorsStore.vtable) alias: {
+                const owner: *ShardedSafetensorsStore = @ptrCast(@alignCast(self.ptr));
+                const resolved = try owner.source.findTensorMeta(name);
+                break :alias try resolved.reader.mappedF32Bytes(name);
+            } else 0;
+            result.mapped_f32_alias_bytes = std.math.add(usize, result.mapped_f32_alias_bytes, aliased) catch return error.ResourceLimitExceeded;
         }
         return result;
     }
@@ -2115,7 +2126,38 @@ test "PJRT admission measures expanded operands from safetensors metadata" {
     const footprint = try store.float32Footprint(a);
     try std.testing.expectEqual(@as(usize, 16), footprint.bytes);
     try std.testing.expectEqual(@as(usize, 16), footprint.largest_tensor_bytes);
+    try std.testing.expectEqual(@as(usize, 0), footprint.mapped_f32_alias_bytes);
     var invalid = TensorStore.Float32Footprint{};
     try std.testing.expectError(error.ResourceLimitExceeded, invalid.addShape(&[_]i64{-1}, 0));
     try std.testing.expectError(error.ResourceLimitExceeded, invalid.addShape(&[_]usize{std.math.maxInt(usize)}, 0));
+}
+
+test "PJRT admission inventories actual aligned F32 mapping aliases" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const json = "{\"w\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+    const padding = (8 - json.len % 8) % 8;
+    const header = std.fmt.comptimePrint("{s}{s}", .{ json, "        "[0..padding] });
+    const length = std.mem.nativeToLittle(u64, header.len);
+    const values = [_]f32{ 1.25, -2.5 };
+    var file = try temporary.dir.createFile(io, "weights.safetensors", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, std.mem.asBytes(&length));
+    try file.writeStreamingAll(io, header);
+    try file.writeStreamingAll(io, std.mem.asBytes(&values));
+    const path = try temporary.dir.realPathFileAlloc(io, "weights.safetensors", a);
+    defer a.free(path);
+    const owner = try SafetensorsStore.initAbsolute(a, path);
+    const store = owner.tensorStore();
+    defer store.deinit();
+    const footprint = try store.float32Footprint(a);
+    try std.testing.expectEqual(@as(usize, 8), footprint.bytes);
+    try std.testing.expectEqual(@as(usize, 8), footprint.mapped_f32_alias_bytes);
+    var tensor = try owner.source.reader.readTensor("w");
+    defer tensor.deinit();
+    try std.testing.expect(!tensor.owns_data);
+    try std.testing.expectEqualSlices(f32, &values, tensor.asFloat32());
+    try std.testing.expectEqual(@intFromPtr(owner.source.reader.file_bytes.ptr) + owner.source.reader.data_offset, @intFromPtr(tensor.data.ptr));
 }

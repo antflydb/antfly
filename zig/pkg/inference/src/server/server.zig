@@ -4237,9 +4237,34 @@ fn requireLegacyClassification(manifest: manifest_mod.ModelManifest) !void {
 fn spanV2BackendSupported(config: span_v2_executor.EncoderConfig, backend: backends_mod.BackendType, qualified_variant: ?gliner_decide_qualification.QualifiedVariant) bool {
     return switch (backend) {
         .native, .metal => true,
+        .pjrt => qualified_variant == .decide_1b,
         .cuda => config == .modern_bert or qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8,
         else => false,
     };
+}
+
+fn spanPjrtQualifiedBackend(actual: session_factory.PjrtExecutionProfile, batch_items: usize) !gliner_decide_qualification.Backend {
+    if (batch_items != 1 or actual.precision != .f32 or actual.gemm != .provider_default) return error.UnsupportedGlinerDecisionBackend;
+    if (actual.platform == .cpu) return .pjrt_cpu_f32;
+    if (actual.platform == .cuda and std.mem.eql(u8, actual.device_kind, "NVIDIA GB10")) return .pjrt_cuda_f32;
+    return error.UnsupportedGlinerDecisionBackend;
+}
+
+test "GLiNER span backend selection binds compiled precision device and batching" {
+    const cpu = session_factory.PjrtExecutionProfile{ .device_kind = "cpu", .platform = .cpu, .precision = .f32, .gemm = .provider_default };
+    try std.testing.expectEqual(gliner_decide_qualification.Backend.pjrt_cpu_f32, try spanPjrtQualifiedBackend(cpu, 1));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, spanPjrtQualifiedBackend(cpu, 2));
+    var changed = cpu;
+    changed.precision = .bf16;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, spanPjrtQualifiedBackend(changed, 1));
+    changed = cpu;
+    changed.gemm = .vendor;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, spanPjrtQualifiedBackend(changed, 1));
+    changed = cpu;
+    changed.platform = .cuda;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, spanPjrtQualifiedBackend(changed, 1));
+    changed.device_kind = "NVIDIA GB10";
+    try std.testing.expectEqual(gliner_decide_qualification.Backend.pjrt_cuda_f32, try spanPjrtQualifiedBackend(changed, 1));
 }
 
 test "GLiNER span backend selection requires exact DeBERTa CUDA qualification" {
@@ -6538,6 +6563,46 @@ pub const Node = struct {
             return if (err == error.OutOfMemory) preparation.admission_error orelse err else err))
         {
             return .{ .text = try allocator.dupe(u8, ""), .prompt_tokens = 0, .completion_tokens = 0, .truncated = false, .silent_audio = true };
+        }
+        if (model.session.backend() == .pjrt) {
+            if (a4b_request != null or prompt_cache_key != null) return error.UnsupportedGeneratorProvider;
+            const slot = try model.generation_admission.acquire(execution_control, true, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, null));
+            defer slot.release();
+            var estimate: ?NativePromptEstimate = null;
+            defer if (estimate) |*value| value.deinit();
+            const prompt_tokens = try self.estimateNativePromptTokens(preparation_allocator, model_path, model, gpt_config, messages, max_tokens, 0, false, false, &estimate);
+            if (executor_contract.batch.max_input_tokens_per_item) |limit| if (prompt_tokens > limit) return error.InferenceInputTokensExceeded;
+            const media = try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, .native, estimate.?.media_admission);
+            var media_lease = try model.session.withAdmissionControl(execution_control).admitRetainedMedia(media.host_scratch_bytes, media.backend_scratch_bytes);
+            defer media_lease.deinit();
+            const execution = try @import("../pipelines/pjrt_generation_request.zig").Request.create(allocator, io, model, model_path, .{
+                .media_host_bytes = media.host_scratch_bytes,
+                .media_bucket_rows = self.config.pjrt_media_bucket_rows,
+                .decoder_cache = self.config.pjrt_decoder_cache,
+            }, execution_control);
+            defer execution.destroy();
+            if (stream) |sink| {
+                execution.pipeline.continue_ctx = sink.ctx;
+                execution.pipeline.continue_fn = sink.continue_fn;
+            }
+            const setup_at_ns = embedTimingNowNs();
+            var result = if (stream) |sink|
+                try execution.pipeline.generateStreaming(messages, .{ .max_tokens = max_tokens, .temperature = 0, .enable_thinking = false }, sink.ctx, sink.on_token)
+            else
+                try execution.pipeline.generate(messages, .{ .max_tokens = max_tokens, .temperature = 0, .enable_thinking = false });
+            defer result.deinit();
+            try execution_control.check();
+            const generated_at_ns = embedTimingNowNs();
+            if (timing) |report| report.* = .{
+                .resolve_ms = elapsedMs(started_at_ns, resolved_at_ns),
+                .load_ms = elapsedMs(resolved_at_ns, loaded_at_ns),
+                .setup_ms = elapsedMs(loaded_at_ns, setup_at_ns),
+                .generate_ms = elapsedMs(setup_at_ns, generated_at_ns),
+                .total_ms = elapsedMs(started_at_ns, generated_at_ns),
+            };
+            const text = try caller_allocator.dupe(u8, result.text);
+            if (pin_after_success) model_handle.pin();
+            return .{ .text = text, .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used, .truncated = std.mem.eql(u8, result.finish_reason, "length"), .naturally_completed = std.mem.eql(u8, result.finish_reason, "stop") };
         }
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
             .native => .native,
@@ -13405,7 +13470,7 @@ pub const Node = struct {
         defer handle.release();
         const loaded = handle.get();
         const backend = loaded.session.backend();
-        if (backend != .native and backend != .metal and backend != .cuda) return error.UnsupportedExtractionBackend;
+        if (backend != .native and backend != .metal and backend != .cuda and backend != .pjrt) return error.UnsupportedExtractionBackend;
         // Listing metadata chooses a route, while the held session and parsed
         // tokenizer authenticate every executable byte before learned work.
         if (loaded.manifest.gliner_specialty_profile != specialty_candidate) return error.UnsupportedGlinerSpecialtyArtifact;
@@ -13425,7 +13490,7 @@ pub const Node = struct {
             null;
         const qualified_variant: ?gliner_decide_qualification.QualifiedVariant = if (qualified_identity) |identity| try gliner_decide_qualification.require(identity) else null;
         if (qualified_identity) |identity| {
-            options.modern_span_extraction = gliner_decide_qualification.supportsSpanExtraction(identity);
+            options.modern_span_extraction = backend != .pjrt and gliner_decide_qualification.supportsSpanExtraction(identity);
             try span_v2_executor.preflight(request, options);
         }
         if (qualified_identity == null and specialty_candidate == null) {
@@ -13439,6 +13504,10 @@ pub const Node = struct {
             .native => .native,
             .metal => .metal,
             .cuda => .cuda,
+            .pjrt => profile: {
+                const actual = session_factory.getPjrtExecutionProfile(loaded.session) orelse return error.UnsupportedGlinerDecisionBackend;
+                break :profile try spanPjrtQualifiedBackend(actual, self.config.pjrt_extraction_batch_size);
+            },
             else => .other,
         };
         // Reject an unmeasured backend or request cardinality before parsing
@@ -13570,6 +13639,15 @@ pub const Node = struct {
             device_lease = try self.model_manager.acquireRunResourceAmounts(if (gpu) .gpu else .cpu, device_limits, .{ .backend_scratch_bytes = device_bytes, .host_scratch_bytes = additional_host_bytes });
         }
 
+        if (backend == .pjrt) {
+            options.compiled_session = loaded.session;
+            // Session.run owns provider admission and its execution lane. Do not
+            // wrap it in the eager compute mutex or construct a native backend.
+            const json = try span_v2_executor.executePlanned(null, scratch, config, request, &request_plan, options);
+            errdefer scratch.free(json);
+            if (control) |active| try active.check();
+            return json;
+        }
         const effective = control orelse InferenceExecutionControl{};
         const execution_mutex = loaded.targetInferenceExecutionMutex();
         if (execution_mutex) |mutex| try effective.lock(mutex);
@@ -18748,7 +18826,7 @@ pub const Node = struct {
     /// model's PJRT session; no native KV pool or request-private client exists.
     fn generatePjrt(self: *Node, ctx: *httpx.Context, body: anytype, model_path: []const u8, model: *model_manager_mod.LoadedModel, messages: []const generation.Message, config: generation.GenerationConfig, parser: ?*tool_parser_mod.Parser, stream: bool, include_usage: bool, control: InferenceExecutionControl, input_limit: ?usize, completion: *?DeferredGenerationCompletion) !httpx.Response {
         if (model.session.backend() != .pjrt) return modelLoadFailureResponse(ctx, error.GenerationBackendSelectionMismatch);
-        const client = session_factory.getPjrtClientPtr(model.session) orelse
+        _ = session_factory.getPjrtClientPtr(model.session) orelse
             return modelLoadFailureResponse(ctx, error.GenerationBackendSelectionMismatch);
         const gpt_config = session_factory.getGptConfig(model.session) orelse
             return modelLoadFailureResponse(ctx, error.MissingDecoderConfig);
@@ -18769,42 +18847,14 @@ pub const Node = struct {
         var preparation = model.session.withAdmissionControl(control).admitRetainedMedia(media.host_scratch_bytes, media.backend_scratch_bytes) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer preparation.deinit();
-        var compute = @import("../backends/compute_provider.zig").acquireWithControl(model.session, ctx.allocator, control) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        defer compute.deinit();
-        // The outer guard protects the entire pipeline, including host/device
-        // cleanup. Nested session calls keep soft cancellation but do not arm
-        // the same worker monitor a second time.
-        var borrowed = control;
-        borrowed.hard_cancellation = null;
-        borrowed.native_call_policy = .in_process;
-        compute.backend.execution_control = borrowed;
-        var cache = graph_mod.cache.GraphCache.init(ctx.allocator);
-        defer cache.deinitWithBackend(&compute.backend);
-        var pipeline = generation.NativeGenerationPipeline{
-            .allocator = ctx.allocator,
-            .io = ctx.io,
-            .cb = compute.backend,
-            .execution_control = borrowed,
-            .gpt_config = gpt_config,
-            .session = model.session,
-            .tokenizer = model.getTokenizer(),
-            .add_bos_token = model.manifest.add_bos_token,
-            .bos_token = model.manifest.bos_token,
-            .chat_template = model.chat_tmpl,
-            .model_dir = model_path,
-            .gguf_projector_path = model.manifest.gguf_projector_path,
-            .graph_cache = &cache,
-            .compiled_partition_backend = .pjrt,
-            .compiled_attachment_target = .whole_model,
-            .pjrt_client = client,
-            .generation_admission = &model.generation_admission,
-            .media_prepaid = .{ .process_bytes = media.host_scratch_bytes },
-            .pjrt_media_bucket_rows = self.config.pjrt_media_bucket_rows,
-            .pjrt_decoder_cache = self.config.pjrt_decoder_cache,
-        };
-        defer pipeline.deinit();
-        if (stream) return self.streamGenerate(ctx, body.model, &pipeline, null, messages, config, parser, include_usage, null, completion);
+        const execution = @import("../pipelines/pjrt_generation_request.zig").Request.create(ctx.allocator, ctx.io, model, model_path, .{
+            .media_host_bytes = media.host_scratch_bytes,
+            .media_bucket_rows = self.config.pjrt_media_bucket_rows,
+            .decoder_cache = self.config.pjrt_decoder_cache,
+        }, control) catch |err| return inferenceFailureResponse(ctx, err);
+        defer execution.destroy();
+        const pipeline = &execution.pipeline;
+        if (stream) return self.streamGenerate(ctx, body.model, pipeline, null, messages, config, parser, include_usage, null, completion);
         var result = pipeline.generate(messages, config) catch |err| return generationErrorResponse(ctx, err);
         defer result.deinit();
         return self.finishGenerate(ctx, body, result, config, parser, null, null);
@@ -38710,6 +38760,11 @@ test "whole-model PJRT generation serves real HTTP responses and refunds request
             const content = choices[0].object.get("message").?.object.get("content").?.string;
             try std.testing.expect(content.len != 0);
             if (previous) |expected| try std.testing.expectEqualStrings(expected, content) else previous = try a.dupe(u8, content);
+            const messages = [_]generation.Message{.{ .role = "user", .content = "Say hello." }};
+            const preflight = try Node.directGeneratePreflightForMessages(&messages);
+            const direct = try node.generateMessagesDirectPrepared(request_allocator, path, &messages, 2, preflight, 0, &.{.pjrt}, false, null, false, null, null, null, .{ .io = std.testing.io, .native_call_policy = .in_process });
+            defer request_allocator.free(direct.text);
+            try std.testing.expectEqualStrings(content, direct.text);
             const amounts = domain.admission.snapshot();
             try std.testing.expectEqual(@as(usize, 0), amounts.host_scratch_bytes);
             try std.testing.expectEqual(@as(usize, 0), amounts.backend_scratch_bytes);

@@ -1554,6 +1554,28 @@ pub fn defaultResidentExpertsPerLayer(arch_config: ArchConfig) usize {
     };
 }
 
+/// Match the preparation transformations below. Mapped views survive simple
+/// role/name normalization; Conv1D transposition, adapters and Q8 rewriting
+/// require independent host representations. Unknown adapter selection is kept
+/// conservative until its captured metadata is available.
+pub fn preservesMappedF32(arch: ArchConfig, mf: manifest_mod.ModelManifest) bool {
+    if (!mf.jina_adapter_selection_captured or usesJinaRetrievalAdapter(mf, .native)) return false;
+    return switch (arch) {
+        .gpt => |config| config.family != .gpt2 and !config.usesMoe(),
+        .modern_bert, .gliner_modern_bert => |config| config.laya == null,
+        .bert, .nomic_bert, .embedding_gemma2, .deberta, .t5, .whisper, .florence, .clip, .clap, .gliner, .gliner_boundary, .layoutlmv3 => true,
+    };
+}
+
+test "PJRT admission mapped F32 preservation excludes rewriting architectures" {
+    var mf = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    try std.testing.expect(!preservesMappedF32(.{ .modern_bert = .{} }, mf));
+    mf.jina_adapter_selection_captured = true;
+    try std.testing.expect(preservesMappedF32(.{ .modern_bert = .{} }, mf));
+    try std.testing.expect(preservesMappedF32(.{ .bert = .{} }, mf));
+    try std.testing.expect(!preservesMappedF32(.{ .gpt = .{ .family = .gpt2 } }, mf));
+}
+
 pub fn shouldRetainTensorStore(store_kind: tensor_store_mod.StoreKind, lazy_weight_count: usize) bool {
     // Safetensors stores mmap weights and resident tensors may borrow those
     // buffers directly, so the store must live for the entire session.

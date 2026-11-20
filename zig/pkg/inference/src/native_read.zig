@@ -86,6 +86,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (try usesGenerativeReadExecutor(allocator, opts.model_dir))
         return runGenerativeReader(allocator, io, opts, image_data, load_start_ns);
 
+    try opts.pjrt.validateTask(.legacy_extraction);
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
     session_manager.native_call_policy = .in_process;
     session_manager.process_termination_available = false;
@@ -174,14 +175,21 @@ fn usesGenerativeReadExecutor(allocator: std.mem.Allocator, model_dir: []const u
 }
 
 fn runGenerativeReader(allocator: std.mem.Allocator, io: std.Io, opts: Options, image_data: []const u8, load_start_ns: u64) !void {
+    try opts.pjrt.validateTask(.generation);
     // /read uses its selected model's cache policy. Do not silently accept an
     // encoder-decoder-only cache override which this executor cannot honor.
     if (opts.cache_dtype != null) return error.UnsupportedReaderCacheDtype;
     const server = @import("server/server.zig");
     const model_dir = try std.Io.Dir.cwd().realPathFileAlloc(io, opts.model_dir, allocator);
     defer allocator.free(model_dir);
+    const provider_options = try opts.pjrt.sessionOptions();
     var node = try server.Node.init(allocator, .{
         .models_dir = std.fs.path.dirname(model_dir) orelse ".",
+        .pjrt_memory_policy = provider_options.memory_policy,
+        .pjrt_precision = provider_options.precision,
+        .pjrt_gemm = provider_options.gemm,
+        .pjrt_media_bucket_rows = opts.pjrt.media_bucket_rows,
+        .pjrt_decoder_cache = opts.pjrt.decoder_cache,
         .native_call_policy = .in_process,
         .process_termination_available = false,
     });
@@ -191,6 +199,12 @@ fn runGenerativeReader(allocator: std.mem.Allocator, io: std.Io, opts: Options, 
         try opts.pjrt.configure(&node.session_manager);
         try opts.pjrt.configure(&node.model_manager.session_manager);
     }
+    if (opts.backend != .auto) {
+        const choice = @import("native_backend_choice.zig").parse(@tagName(opts.backend)).?;
+        @import("native_backend_choice.zig").configureDirectSession(&node.session_manager, choice);
+        @import("native_backend_choice.zig").configureDirectSession(&node.model_manager.session_manager, choice);
+    }
+    try opts.pjrt.validateTaskPlacement(node.session_manager.required_backend == .pjrt);
     const backend: ?backends.BackendType = switch (opts.backend) {
         .auto => null,
         .native => .native,

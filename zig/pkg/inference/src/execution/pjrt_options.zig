@@ -18,17 +18,36 @@ pub const Options = struct {
     media_bucket_rows: usize = 0,
     decoder_cache: ?bool = null,
     gemm: @FieldType(factory.PjrtSessionOptions, "gemm") = .provider_default,
+    task_controls: packed struct { batch: bool = false, media: bool = false, cache: bool = false } = .{},
+
+    pub const Task = enum { generation, extraction, transcription, legacy_extraction };
+
+    /// Provider policy is independent of task policy. Reject a control when the
+    /// selected task cannot honor it instead of silently benchmarking a default.
+    pub fn validateTask(self: Options, task: Task) !void {
+        if (self.task_controls.batch and task != .extraction) return error.UnsupportedPjrtTaskOption;
+        if (self.task_controls.media and task != .generation) return error.UnsupportedPjrtTaskOption;
+        if (self.task_controls.cache and task != .generation and
+            !(task == .transcription and self.decoder_cache == false)) return error.UnsupportedPjrtTaskOption;
+    }
+
+    pub fn validateTaskPlacement(self: Options, pjrt_selected: bool) !void {
+        if (!pjrt_selected and (self.task_controls.batch or self.task_controls.media or self.task_controls.cache)) return error.UnsupportedPjrtTaskOption;
+    }
 
     pub fn parse(self: *Options, arg: []const u8, value: []const u8) !bool {
         if (std.mem.eql(u8, arg, "--pjrt-device")) {
             self.device = std.meta.stringToEnum(@FieldType(Options, "device"), value) orelse return error.InvalidPjrtDevice;
         } else if (std.mem.eql(u8, arg, "--pjrt-extraction-batch-size")) {
+            self.task_controls.batch = true;
             self.extraction_batch_size = try std.fmt.parseInt(usize, value, 10);
             if (self.extraction_batch_size == 0 or self.extraction_batch_size > 8) return error.InvalidPjrtBatch;
         } else if (std.mem.eql(u8, arg, "--pjrt-media-bucket-rows")) {
+            self.task_controls.media = true;
             self.media_bucket_rows = try std.fmt.parseInt(usize, value, 10);
             if (self.media_bucket_rows > 256) return error.InvalidPjrtBucket;
         } else if (std.mem.eql(u8, arg, "--pjrt-decoder-cache")) {
+            self.task_controls.cache = true;
             self.decoder_cache = if (std.mem.eql(u8, value, "auto")) null else if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidPjrtDecoderCache;
         } else if (std.mem.eql(u8, arg, "--pjrt-gemm")) {
             self.gemm = std.meta.stringToEnum(@TypeOf(self.gemm), value) orelse return error.InvalidPjrtGemm;
@@ -113,4 +132,24 @@ test "task PJRT policy is independent of placement and explicit selection cannot
     try std.testing.expectEqual(@as(?@import("../backends/backends.zig").BackendType, .pjrt), manager.required_backend);
     options.capacity_bytes = 8192;
     try std.testing.expectError(error.InvalidPjrtMemoryPolicy, options.applyPolicy(&manager));
+}
+
+test "task PJRT controls are honored or explicitly rejected" {
+    var options = Options{};
+    try std.testing.expect(try options.parse("--pjrt-decoder-cache", "true"));
+    try options.validateTask(.generation);
+    try std.testing.expectError(error.UnsupportedPjrtTaskOption, options.validateTask(.transcription));
+    try std.testing.expectError(error.UnsupportedPjrtTaskOption, options.validateTask(.extraction));
+    try std.testing.expect(try options.parse("--pjrt-decoder-cache", "false"));
+    try options.validateTask(.transcription);
+    options = .{};
+    try std.testing.expect(try options.parse("--pjrt-media-bucket-rows", "0"));
+    try options.validateTask(.generation);
+    try std.testing.expectError(error.UnsupportedPjrtTaskOption, options.validateTask(.legacy_extraction));
+    options = .{};
+    try std.testing.expect(try options.parse("--pjrt-extraction-batch-size", "4"));
+    try options.validateTask(.extraction);
+    try options.validateTaskPlacement(true);
+    try std.testing.expectError(error.UnsupportedPjrtTaskOption, options.validateTaskPlacement(false));
+    try std.testing.expectError(error.UnsupportedPjrtTaskOption, options.validateTask(.generation));
 }

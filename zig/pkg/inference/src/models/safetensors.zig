@@ -257,9 +257,7 @@ pub const MMapReader = struct {
         };
     }
 
-    pub fn readTensor(self: *const MMapReader, name: []const u8) !Tensor {
-        const meta = self.header.tensors.get(name) orelse return error.TensorNotFound;
-
+    fn validatedTensorBytes(self: *const MMapReader, meta: TensorMeta) ![]const u8 {
         if (meta.data_start > meta.data_end) return error.InvalidOffset;
         const abs_start = std.math.add(u64, self.data_offset, meta.data_start) catch return error.DataOutOfBounds;
         const abs_end = std.math.add(u64, self.data_offset, meta.data_end) catch return error.DataOutOfBounds;
@@ -271,8 +269,21 @@ pub const MMapReader = struct {
         }
         const expected_bytes = std.math.mul(usize, elements, meta.dtype.byteSize()) catch return error.InvalidShape;
         if (meta.data_end - meta.data_start != expected_bytes) return error.InvalidTensorSize;
+        return self.file_bytes[@intCast(abs_start)..@intCast(abs_end)];
+    }
 
-        const raw = self.file_bytes[@intCast(abs_start)..@intCast(abs_end)];
+    /// A proven alias of this actual mapped source, without reading/copying its
+    /// payload. Borrowed synthetic buffers and unaligned tensors earn no credit.
+    pub fn mappedF32Bytes(self: *const MMapReader, name: []const u8) !usize {
+        const meta = self.header.tensors.get(name) orelse return error.TensorNotFound;
+        if (meta.dtype != .f32 or self.mmap_region == null) return 0;
+        const raw = try self.validatedTensorBytes(meta);
+        return if (@intFromPtr(raw.ptr) % @alignOf(f32) == 0) raw.len else 0;
+    }
+
+    pub fn readTensor(self: *const MMapReader, name: []const u8) !Tensor {
+        const meta = self.header.tensors.get(name) orelse return error.TensorNotFound;
+        const raw = try self.validatedTensorBytes(meta);
 
         if ((self.mmap_region != null or self.borrow_tensor_data) and @intFromPtr(raw.ptr) % meta.dtype.byteSize() == 0) {
             // Data is mmap'd — return borrowed view (no copy).
@@ -705,6 +716,7 @@ fn exerciseBorrowedSnapshot(a: std.mem.Allocator) !void {
     var tensor = try reader.readTensor("weights");
     defer tensor.deinit();
     try std.testing.expect(!tensor.owns_data and !tensor.owns_shape);
+    try std.testing.expectEqual(@as(usize, 0), try reader.mappedF32Bytes("weights"));
     try std.testing.expectEqual(@intFromPtr(&bytes) + 8 + header_size, @intFromPtr(tensor.data.ptr));
     try std.testing.expectEqualSlices(f32, &.{ 1, -2 }, tensor.asFloat32());
     try std.testing.expectError(error.HeaderTooLarge, MMapReader.fromBorrowedBytesLimited(a, &bytes, 1));
@@ -739,6 +751,7 @@ test "safetensors unaligned mapped payload becomes an aligned owned tensor" {
     var reader = try MMapReader.openFileAbsoluteLimited(a, absolute, 1024, 1024);
     defer reader.deinit();
     try std.testing.expect(@intFromPtr(reader.file_bytes[reader.data_offset..].ptr) % 4 != 0);
+    try std.testing.expectEqual(@as(usize, 0), try reader.mappedF32Bytes("weights"));
     var tensor = try reader.readTensor("weights");
     defer tensor.deinit();
     try std.testing.expect(tensor.owns_data and tensor.owns_shape);

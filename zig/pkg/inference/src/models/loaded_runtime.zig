@@ -1653,7 +1653,10 @@ pub const Runtime = struct {
                 .max_length = if (self.manifest.gliner_architecture == .span and
                     self.manifest.gliner_span_encoder_family == .modern_bert and
                     self.session.backend() == .cuda)
-                    @min(self.manifest.max_position_embeddings, 512)
+                    if (session_factory.getGlinerDecisionIdentity(self.session)) |identity|
+                        @min(self.manifest.max_position_embeddings, @import("gliner_decide_qualification.zig").decisionSequenceLimit(identity, .cuda) orelse 512)
+                    else |_|
+                        @min(self.manifest.max_position_embeddings, 512)
                 else
                     self.manifest.max_position_embeddings,
                 .threshold = self.manifest.gliner_threshold,

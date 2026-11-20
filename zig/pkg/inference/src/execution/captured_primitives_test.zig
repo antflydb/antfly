@@ -5,7 +5,7 @@ const ops = @import("../ops/ops.zig");
 const capture = @import("capture.zig");
 const prepared = @import("captured_forward.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
-const Kind = enum { axis_rotary, numeric_select, conv1d, conv2d, grid_grouped, grid_depthwise, sdpa_token, sdpa_heads, sdpa_bias, causal, cross, relative, gqa, gqa_or, gqa_or_window, marker_head, interleaved_pairs, segment_grouped, spatial_rotary };
+const Kind = enum { axis_rotary, numeric_select, conv1d, conv2d, grid_grouped, grid_depthwise, sdpa_token, sdpa_heads, sdpa_bias, sdpa_window, causal, cross, relative, gqa, gqa_or, gqa_or_window, marker_head, interleaved_pairs, segment_grouped, spatial_rotary };
 const Fixture = struct {
     kind: Kind,
     bf16_probability: bool = false,
@@ -100,7 +100,11 @@ const Fixture = struct {
                 }
                 const mask = inputs[3].tensor.asInt64();
                 if (self.kind == .cross) break :attention try cb.crossAttention(x, key, value, mask, 2, 2, 3, 2, 2);
-                const bias = if (self.kind == .sdpa_bias) try tensor(cb, inputs[4].tensor) else null;
+                const bias = if (self.kind == .sdpa_bias) try tensor(cb, inputs[4].tensor) else if (self.kind == .sdpa_window) window: {
+                    if (cb.kind() == .graph) break :window try @import("../graph/attention_bias.zig").symmetricWindow(cb, allocator, 3, 2, 1);
+                    const n = -std.math.inf(f32);
+                    break :window try cb.fromFloat32Shape(&.{ 0, 0, n, 0, 0, 0, n, 0, 0, 0, 0, n, 0, 0, 0, n, 0, 0 }, &.{ 2, 3, 3 });
+                } else null;
                 defer if (bias) |ct| cb.free(ct);
                 break :attention try cb.scaledDotProductAttention(x, key, value, mask, bias, 2, 3, 2, 2);
             },
@@ -211,7 +215,7 @@ fn qualifyProfile(kind: Kind, precision: @import("precision.zig").Policy, bf16_p
     defer reference_cache.deinit(a);
     const frontend = capture.Forward{ .context = &source, .fingerprint = @backingInt(kind), .precision = precision, .output_names = &.{"result"}, .run = Fixture.forward };
     const dynamic_mask = switch (kind) {
-        .relative, .sdpa_heads, .sdpa_token, .sdpa_bias, .cross => true,
+        .relative, .sdpa_heads, .sdpa_token, .sdpa_bias, .sdpa_window, .cross => true,
         else => false,
     };
     for (0..if (kind == .marker_head or kind == .spatial_rotary or kind == .axis_rotary or dynamic_mask) @as(usize, 3) else 1) |iteration| {
@@ -317,4 +321,8 @@ test "captured primitive PJRT numeric select broadcasts scalar fallback" {
 
 test "captured primitive PJRT partial axis rotary preserves head tails and dynamic values" {
     try qualify(.axis_rotary);
+}
+
+test "captured primitive PJRT symmetric window attention preserves dynamic padding" {
+    try qualify(.sdpa_window);
 }

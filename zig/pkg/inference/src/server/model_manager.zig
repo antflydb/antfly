@@ -6027,10 +6027,14 @@ test "GLiNER CUDA managed Ettin full context retains admission and recovers afte
     manager.session_manager.test_allow_unqualified_gliner_cuda_precision = true;
     manager.configureServingPolicy(.{ .allow_unknown = true });
     defer manager.deinit();
-    var handle = try manager.acquireFromDirWithGlinerCudaPrecision(directory, precision);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const serving_directory = try @import("../models/gliner_decide_qualification_fixture.zig").prepare(a, &temporary, directory);
+    defer a.free(serving_directory);
+    var handle = try manager.acquireFromDirWithGlinerCudaPrecision(serving_directory, precision);
     defer handle.release();
     const loaded = handle.get();
-    try qualifyGlinerEttinForTest(&manager, loaded, directory, precision);
+    try qualifyGlinerEttinForTest(&manager, loaded, serving_directory, precision);
 }
 
 /// Reused by the socket qualification test after its cold preload. Keeping

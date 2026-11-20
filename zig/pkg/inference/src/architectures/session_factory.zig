@@ -48,6 +48,7 @@ pub const PjrtSessionOptions = implementation.PjrtSessionOptions;
 pub const createPjrtSessionFromManifestWithOptions = implementation.createPjrtSessionFromManifestWithOptions;
 pub const getPjrtClientPtr = implementation.getPjrtClientPtr;
 pub const getPjrtSpecializationCount = implementation.getPjrtSpecializationCount;
+pub const PjrtExecutionProfile = implementation.PjrtExecutionProfile;
 pub const getPjrtExecutionProfile = implementation.getPjrtExecutionProfile;
 pub const getPjrtPrecision = implementation.getPjrtPrecision;
 pub const getPjrtParameterStore = implementation.getPjrtParameterStore;

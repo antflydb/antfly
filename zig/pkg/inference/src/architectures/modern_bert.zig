@@ -1524,7 +1524,8 @@ fn buildSlidingWindowBias(
     num_heads: usize,
     window_half: usize,
 ) !CT {
-    const n = num_heads * seq_len * seq_len;
+    if (cb.kind() == .graph) return @import("../graph/attention_bias.zig").symmetricWindow(cb, allocator, seq_len, num_heads, window_half);
+    const n = try std.math.mul(usize, num_heads, try std.math.mul(usize, seq_len, seq_len));
     const data = try allocator.alloc(f32, n);
     defer allocator.free(data);
 

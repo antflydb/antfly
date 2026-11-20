@@ -47,6 +47,7 @@ const Options = struct {
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var opts = try parseArgs(allocator, args);
     defer opts.deinit(allocator);
+    try opts.pjrt.validateTask(.legacy_extraction);
     try backend_choice.validate(backend_choice.parse(@tagName(opts.backend)).?);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, opts.schema_json, .{});

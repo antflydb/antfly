@@ -10,6 +10,36 @@ const Tensor = @import("../../backends/tensor.zig").Tensor;
 const Encoder = @import("../../models/gliner_encoder.zig").Config;
 const Parsed = struct { ids: Tensor, mask: Tensor, positions: Tensor, valid: Tensor };
 
+/// Owned host ABI shared by typed decision and schema classification tasks.
+/// Admission belongs to the caller and precedes these copies.
+pub const Inputs = struct {
+    values: [4]Tensor,
+    pub fn init(a: std.mem.Allocator, batch: usize, sequence: usize, labels: usize, ids: []const i64, attention: []const i64, positions: []const i64, mask: []const i64) !Inputs {
+        const tokens = try std.math.mul(usize, batch, sequence);
+        const markers = try std.math.mul(usize, batch, labels);
+        if (batch == 0 or sequence == 0 or labels == 0 or ids.len != tokens or attention.len != tokens or positions.len != markers or mask.len != markers) return error.InvalidInputShape;
+        const shape = [_]i64{ @intCast(batch), @intCast(sequence) };
+        const marker_shape = [_]i64{ @intCast(batch), @intCast(labels) };
+        var self: Inputs = undefined;
+        var initialized: usize = 0;
+        errdefer for (self.values[0..initialized]) |*value| value.deinit();
+        inline for (.{ "input_ids", "attention_mask", "decision_marker_positions", "decision_marker_mask" }, 0..) |name, i| {
+            self.values[i] = try Tensor.initInt64(a, name, if (i < 2) &shape else &marker_shape, switch (i) {
+                0 => ids,
+                1 => attention,
+                2 => positions,
+                3 => mask,
+                else => unreachable,
+            });
+            initialized += 1;
+        }
+        return self;
+    }
+    pub fn deinit(self: *Inputs) void {
+        for (&self.values) |*value| value.deinit();
+    }
+};
+
 pub fn validate(config: Encoder, inputs: []const capture.Input) !Parsed {
     const geometry = config.geometry();
     if (geometry.hidden_size == 0 or geometry.num_attention_heads == 0 or geometry.hidden_size % geometry.num_attention_heads != 0) return error.InvalidModelConfig;
@@ -140,4 +170,15 @@ test "model program marker classifier executes both encoder and readout with dyn
         if (iteration == 0) try std.testing.expectEqual(@as(f32, -1.0e4), actual[0].asFloat32()[1]);
     }
     try std.testing.expectEqual(@as(usize, 1), cache.entries.entries.items.len);
+}
+
+test "task marker ABI refunds every failed input allocation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: std.mem.Allocator) !void {
+            var inputs = try Inputs.init(a, 1, 2, 1, &.{ 1, 2 }, &.{ 1, 1 }, &.{1}, &.{1});
+            defer inputs.deinit();
+            try std.testing.expectEqualStrings("decision_marker_positions", inputs.values[2].name);
+            try std.testing.expectEqual(@as(i64, 1), inputs.values[2].asInt64()[0]);
+        }
+    }.run, .{});
 }

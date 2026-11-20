@@ -368,7 +368,12 @@ pub fn onnxModelLoadAdmission(
 /// reserves the whole bounded provider arena, including its internal workspace;
 /// host conversion needs at most one additional largest operand at a time.
 pub fn pjrtModelLoadAdmission(encoded: usize, represented: usize, largest: usize, policy: ?session_factory.PjrtSessionOptions.MemoryPolicy) !ModelLoadAdmissionPlan {
-    const source = std.math.add(usize, encoded, represented) catch return error.ResourceLimitExceeded;
+    return pjrtModelLoadAdmissionWithAliases(encoded, represented, largest, 0, policy);
+}
+
+pub fn pjrtModelLoadAdmissionWithAliases(encoded: usize, represented: usize, largest: usize, mapped_aliases: usize, policy: ?session_factory.PjrtSessionOptions.MemoryPolicy) !ModelLoadAdmissionPlan {
+    const independent_host = std.math.sub(usize, represented, mapped_aliases) catch return error.ResourceLimitExceeded;
+    const source = std.math.add(usize, encoded, independent_host) catch return error.ResourceLimitExceeded;
     var host = source;
     var backend: usize = 0;
     if (policy != null and policy.? == .cuda) {
@@ -400,7 +405,12 @@ fn pjrtArtifactLoadAdmission(man: manifest_mod.ModelManifest, policy: ?session_f
     };
     var encoded = Encoded{};
     if (!try store.visitStorageSpans(.{ .ptr = &encoded, .visit_fn = Encoded.visit })) return error.UnsupportedTensorStore;
-    return pjrtModelLoadAdmission(encoded.bytes, footprint.bytes, footprint.largest_tensor_bytes, policy);
+    var aliases: usize = 0;
+    if (man.source_root) |root| {
+        const arch = try @import("../architectures/model_definition.zig").detectArchitectureWithGgufFile(man.allocator, root, man, store.ggufFile());
+        if (@import("host_weights.zig").preservesMappedF32(arch, man)) aliases = footprint.mapped_f32_alias_bytes;
+    }
+    return pjrtModelLoadAdmissionWithAliases(encoded.bytes, footprint.bytes, footprint.largest_tensor_bytes, aliases, policy);
 }
 
 test "PJRT admission charges shared operands once and the bounded CUDA arena" {
@@ -413,6 +423,20 @@ test "PJRT admission charges shared operands once and the bounded CUDA arena" {
     try std.testing.expectEqual(@as(usize, 1024), gpu.resident.backend_weight_bytes);
     try std.testing.expectError(error.MemoryBudgetExceeded, pjrtModelLoadAdmission(100, 1025, 160, .{ .cuda = .{ .capacity_bytes = 1024, .device_bytes = 4096 } }));
     try std.testing.expectError(error.ResourceLimitExceeded, pjrtModelLoadAdmission(std.math.maxInt(usize), 1, 1, .cpu));
+}
+
+test "PJRT admission credits only proven mapped F32 host aliases" {
+    const cpu = try pjrtModelLoadAdmissionWithAliases(400, 400, 160, 400, .cpu);
+    try std.testing.expectEqual(@as(usize, 800), cpu.resident.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 960), cpu.peak.host_weight_bytes);
+    const gpu = try pjrtModelLoadAdmissionWithAliases(400, 400, 160, 400, .{ .cuda = .{ .capacity_bytes = 1024, .device_bytes = 4096 } });
+    try std.testing.expectEqual(@as(usize, 400), gpu.resident.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 560), gpu.peak.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), gpu.resident.backend_weight_bytes);
+    const mixed = try pjrtModelLoadAdmissionWithAliases(400, 600, 160, 400, .cpu);
+    try std.testing.expectEqual(@as(usize, 1200), mixed.resident.host_weight_bytes);
+    try std.testing.expectError(error.ResourceLimitExceeded, pjrtModelLoadAdmissionWithAliases(400, 400, 160, 401, .cpu));
+    try std.testing.expectError(error.MemoryBudgetExceeded, pjrtModelLoadAdmissionWithAliases(400, 400, 160, 400, .{ .cuda = .{ .capacity_bytes = 399, .device_bytes = 4096 } }));
 }
 
 pub fn nativeModelLoadAdmission(

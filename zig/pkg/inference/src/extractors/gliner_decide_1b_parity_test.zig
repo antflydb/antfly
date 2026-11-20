@@ -290,11 +290,11 @@ test "Decide frozen public probabilities require the complete current presenter 
     try verifyCaptureBytes(bytes);
 }
 
-const ParityBackend = enum { native, metal, cuda };
+const ParityBackend = enum { native, metal, cuda, pjrt };
 
 fn parity(comptime backend: ParityBackend) !void {
     const metal = backend == .metal;
-    const directory = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse return if (backend == .cuda) error.MissingRequiredGlinerArtifact else error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse return if (backend == .cuda or backend == .pjrt) error.MissingRequiredGlinerArtifact else error.SkipZigTest;
     if (metal and !@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const capture_bytes = try referenceBytes(a);
@@ -371,12 +371,14 @@ fn parity(comptime backend: ParityBackend) !void {
         // This diagnostic owner executes the real managed encoder/head without
         // authorizing registry publication or the CUDA HTTP request gate.
         .cuda => try factory.createGlinerCudaSessionWithPrecision(a, directory, .fp32),
+        .pjrt => try factory.createPjrtSessionWithOptions(a, directory, try pjrtOptions()),
     };
     defer session.close();
     const expected_backend: @TypeOf(session.backend()) = switch (backend) {
         .native => .native,
         .metal => .metal,
         .cuda => .cuda,
+        .pjrt => .pjrt,
     };
     try std.testing.expectEqual(expected_backend, session.backend());
     const config = try factory.getGlinerSpanConfig(session);
@@ -421,7 +423,7 @@ fn parity(comptime backend: ParityBackend) !void {
         const counts = try a.alloc(usize, compiled.schema.classifications.len);
         defer a.free(counts);
         for (compiled.schema.classifications, counts) |classification, *count| count.* = classification.task.labels.len;
-        const rows = rows: {
+        const rows = if (comptime backend == .pjrt) try executor.classificationSessionLogits(session, a, prepared.samples[0], counts, control) else rows: {
             var managed = try factory.getManagedComputeBackend(session, a, null, control);
             defer managed.deinit();
             break :rows try executor.classificationLogits(&managed.backend, a, .{ .modern_bert = config.modern_bert }, prepared.samples[0], counts);
@@ -486,8 +488,6 @@ fn parity(comptime backend: ParityBackend) !void {
             .hard_cancellation = if (watchdog) |owner| owner.boundary() else null,
             .deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s,
         };
-        var managed = try factory.getManagedComputeBackend(session, a, null, control);
-        defer managed.deinit();
         var request_arena = std.heap.ArenaAllocator.init(a);
         defer request_arena.deinit();
         const request_allocator = request_arena.allocator();
@@ -510,7 +510,11 @@ fn parity(comptime backend: ParityBackend) !void {
         const counts = try a.alloc(usize, compiled.schema.classifications.len);
         defer a.free(counts);
         for (compiled.schema.classifications, counts) |classification, *count| count.* = classification.task.labels.len;
-        const rows = try executor.classificationLogits(&managed.backend, a, .{ .modern_bert = config.modern_bert }, prepared.samples[0], counts);
+        const rows = if (comptime backend == .pjrt) try executor.classificationSessionLogits(session, a, prepared.samples[0], counts, control) else rows: {
+            var managed = try factory.getManagedComputeBackend(session, a, null, control);
+            defer managed.deinit();
+            break :rows try executor.classificationLogits(&managed.backend, a, .{ .modern_bert = config.modern_bert }, prepared.samples[0], counts);
+        };
         defer {
             for (rows) |row| a.free(row);
             a.free(rows);
@@ -558,7 +562,81 @@ fn parity(comptime backend: ParityBackend) !void {
         };
         try cudaWindowParity(a, session, tok.tokenizer(), .{ .modern_bert = config.modern_bert }, control);
     }
+    if (comptime backend == .pjrt) {
+        try pjrtCapacityParity(a, session);
+        try std.testing.expect((factory.getPjrtSpecializationCount(session) orelse 0) > 0);
+    }
     std.debug.print("GLiNER2.5-Decide-1B {s}: {d} regular + {d} public cases, max raw-logit error {e}\n", .{ @tagName(backend), ref.requests.len, ref.public_decide_requests.len, max_error });
+}
+
+/// Independent upstream inputs/probabilities cross the local attention window.
+/// The 2048-token diagnostic does not widen the separate serving envelope.
+fn pjrtCapacityParity(a: std.mem.Allocator, session: @import("../backends/session.zig").Session) !void {
+    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(a, "family/decide_1b/capacity_oracle_fp32.jsonl");
+    defer a.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    if (bytes.len != 448083 or !std.mem.eql(u8, &hex, "4ff5e60e47745f7e3328a25cceb2e0801843bae5e773982d3feb65177cba9dfb")) return error.InvalidFamilyReference;
+    const Case = struct {
+        request_id: []const u8 = "",
+        encoder_calls: []const struct { input_ids: []const []const i64, attention_mask: []const []const i64 } = &.{},
+        outputs: []const struct { intent: struct { label: []const u8, confidence: f64 } } = &.{},
+    };
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var checked: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(Case, a, line, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const case = parsed.value;
+        const expected_tokens: usize = if (std.mem.eql(u8, case.request_id, "tokens_512_batch_1")) 512 else if (std.mem.eql(u8, case.request_id, "tokens_2048_batch_1")) 2048 else continue;
+        if (case.encoder_calls.len != 1 or case.outputs.len != 1) return error.InvalidFamilyReference;
+        const call = case.encoder_calls[0];
+        if (call.input_ids.len != 1 or call.attention_mask.len != 1 or call.input_ids[0].len != expected_tokens or call.attention_mask[0].len != expected_tokens) return error.InvalidFamilyReference;
+        var positions: [3]i64 = undefined;
+        var labels: usize = 0;
+        for (call.input_ids[0], 0..) |id, i| {
+            if (id != 50374) continue;
+            if (labels == positions.len) return error.InvalidFamilyReference;
+            positions[labels] = @intCast(i);
+            labels += 1;
+        }
+        if (labels != positions.len) return error.InvalidFamilyReference;
+        var inputs = try @import("../architectures/frontends/marker_classifier.zig").Inputs.init(a, 1, expected_tokens, 3, call.input_ids[0], call.attention_mask[0], &positions, &.{ 1, 1, 1 });
+        defer inputs.deinit();
+        const outputs = try session.runWithControl(&inputs.values, a, null);
+        defer a.free(outputs);
+        defer for (outputs) |*output| output.deinit();
+        if (outputs.len != 1 or outputs[0].dtype != .f32 or !std.mem.eql(i64, outputs[0].shape, &.{ 1, 3 })) return error.InvalidExtractionOutput;
+        const logits = outputs[0].asFloat32();
+        for (logits) |value| if (!std.math.isFinite(value)) return error.InvalidExtractionOutput;
+        const selected = std.mem.indexOfMax(f32, logits);
+        const names = [_][]const u8{ "refund", "support", "cancel" };
+        try std.testing.expectEqualStrings(case.outputs[0].intent.label, names[selected]);
+        var denominator: f64 = 0;
+        for (logits) |value| denominator += @exp(@as(f64, value) - logits[selected]);
+        const confidence = 1 / denominator;
+        try std.testing.expectApproxEqAbs(case.outputs[0].intent.confidence, confidence, 5e-4);
+        checked += 1;
+        std.debug.print("Decide-1B PJRT upstream {d}-token confidence {d:.9} reference {d:.9}\n", .{ expected_tokens, confidence, case.outputs[0].intent.confidence });
+    }
+    try std.testing.expectEqual(@as(usize, 2), checked);
+}
+
+pub fn pjrtOptions() !factory.PjrtSessionOptions {
+    var options = @import("../execution/pjrt_options.zig").Options{};
+    if (platform.env.getenv("ANTFLY_PJRT_TEST_DEVICE")) |device| _ = try options.parse("--pjrt-device", device);
+    if (platform.env.getenv("ANTFLY_PJRT_TEST_CAPACITY_BYTES")) |value| _ = try options.parse("--pjrt-capacity-bytes", value);
+    if (platform.env.getenv("ANTFLY_PJRT_TEST_DEVICE_BYTES")) |value| _ = try options.parse("--pjrt-device-bytes", value);
+    if (platform.env.getenv("ANTFLY_PJRT_TEST_UNIFIED_MEMORY")) |value| _ = try options.parse("--pjrt-unified-memory", value);
+    return options.sessionOptions();
+}
+
+test "GLiNER2.5 Decide 1B pinned full session PJRT F32 classifier qualification" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    if (!platform.env.getenvBool("ANTFLY_GLINER25_DECIDE_1B_PJRT_PARITY")) return error.SkipZigTest;
+    try parity(.pjrt);
 }
 
 test "GLiNER2.5 Decide 1B pinned full session native classifier parity" {

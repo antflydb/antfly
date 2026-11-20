@@ -734,8 +734,10 @@ fn explicitV1ClassificationRegression(
     defer a.free(two_http_json);
     var two_http = try dispatchExtraction(a, node, two_http_json);
     defer two_http.deinit();
-    try std.testing.expectEqual(@as(u16, 400), two_http.status.code);
-    try std.testing.expect(std.mem.indexOf(u8, two_http.body orelse return error.MissingResponseBody, "UnsupportedGlinerDecisionGeometry") != null);
+    try std.testing.expectEqual(@as(u16, 413), two_http.status.code);
+    const two_body = two_http.body orelse return error.MissingResponseBody;
+    try std.testing.expect(std.mem.indexOf(u8, two_body, "EXTRACTION_LIMIT_EXCEEDED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, two_body, "qualified item, sequence or token limit") != null);
 
     var long_text = std.ArrayListUnmanaged(u8).empty;
     defer long_text.deinit(a);
@@ -1223,8 +1225,17 @@ fn serviceParity(comptime backend: BackendType) !void {
     const publication = try registry.synthesizePulledModelManifestJson(a, directory, null, null);
     defer a.free(publication);
     try expectSpanPublication(a, publication);
+    var provider_options = if (backend == .pjrt) try decide_parity.pjrtOptions() else factory.PjrtSessionOptions{};
+    // Fit the existing service envelope without granting additional memory.
+    // Independent raw-oracle qualification uses its separate provider budget.
+    if (provider_options.memory_policy) |*policy| {
+        if (policy.* == .cuda) policy.cuda.capacity_bytes = @min(policy.cuda.capacity_bytes, 6 * 1024 * 1024 * 1024);
+    }
     var node = try Node.init(a, .{
         .models_dir = models_dir,
+        .pjrt_memory_policy = provider_options.memory_policy,
+        .pjrt_precision = provider_options.precision,
+        .pjrt_gemm = provider_options.gemm,
         .max_loaded_models = 1,
         .max_concurrent_requests = 1,
         .keep_alive_ms = 30 * 60 * 1000,
@@ -1355,11 +1366,17 @@ fn serviceParity(comptime backend: BackendType) !void {
     // timing scope. These compatibility regressions run only in qualification.
     if (!run_perf) {
         try explicitV1ClassificationRegression(a, &node, directory, capture.value);
-        try expandedKnowledgeGraphParity(a, &node);
+        if (backend != .pjrt) try expandedKnowledgeGraphParity(a, &node);
         try std.testing.expectEqual(cached.?, try expectCached(&node, directory, backend));
         try expectSameModelWeights(resident_model.?, try modelOwned(&node));
     }
     try shared.verifyFiles(a, directory, pins);
+}
+
+test "GLiNER2.5 Decide-1B exact PJRT F32 direct and HTTP classification parity" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    if (!platform.env.getenvBool("ANTFLY_GLINER25_DECIDE_1B_PJRT_PARITY")) return error.SkipZigTest;
+    try serviceParity(.pjrt);
 }
 
 test "GLiNER2.5 Decide-1B exact native direct and HTTP service parity" {
