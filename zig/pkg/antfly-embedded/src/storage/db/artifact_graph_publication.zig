@@ -258,6 +258,14 @@ test "ordered artifact inventory graph publication validates guards generations 
             try std.testing.expectEqual(@as(u64, 1), (try dag.Storage.load(&read, request.domain)).revision);
             try std.testing.expectEqualSlices(u8, edge, try read.get(edge_key));
         }
+        {
+            // Replaying the same relationship afterimage has no topology effect.
+            var writer = try store.beginWriteTxn();
+            errdefer writer.abort();
+            try result.stageLocalDag(alloc, &writer, command);
+            try std.testing.expectEqual(@as(u64, 1), (try dag.Storage.load(&writer, request.domain)).revision);
+            try writer.commit();
+        }
         const reverse = try keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "owner", "g", "links", "entity", "target");
         defer alloc.free(reverse);
         {

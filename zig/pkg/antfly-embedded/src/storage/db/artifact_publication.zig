@@ -1205,27 +1205,23 @@ pub const PreparedEffects = struct {
     /// The writer already owns the publication source and contender guards.
     pub fn stageLocalDag(self: *@This(), alloc: std.mem.Allocator, txn: anytype, command: Command) !void {
         if (command.mode != .publish or command.producer_kind != .graph) return;
-        const parsed = (try LocalDagBinding.read(alloc, txn, command)) orelse return;
-        defer parsed.deinit();
-        const binding = parsed.value;
-        try binding.validate();
+        if (!try LocalDagBinding.hasBindings(txn)) return;
+        const prepared_digest = self.graph_publication_digest orelse return error.InvalidBatchRequest;
+        if (!std.mem.eql(u8, &prepared_digest, &command.publication_digest) or
+            !std.mem.eql(u8, &prepared_digest, &command.digest())) return error.InvalidBatchRequest;
 
-        const dag = @import("../../graph/dag_authority.zig");
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
         const validation = @import("../../graph/dag_validation.zig");
+        const effects = @import("dag_graph_effects.zig");
         const Clock = struct {
             fn now(_: *anyopaque) u64 {
                 return 0;
             }
         };
-        const transaction = command.publication_digest[0..16].*;
         var budget: validation.Budget = .{ .clock = .{ .context = self, .now = Clock.now } };
-        var witness: validation.Witness = .{};
-        for (binding.edge_types) |edge_type| {
-            const id = try dag.domain(binding.table_identity, command.producer_generation, command.producer_name, edge_type);
-            const state = try dag.Storage.requireActive(txn, id);
-            const vote = (try self.dagPrepare(command, binding.table_identity, edge_type, state.owner_epoch, state.revision, transaction)) orelse continue;
-            _ = try vote.stagePublication(alloc, txn, &budget, &witness);
-        }
+        const changes = try effects.collectPublicationChanges(scratch.allocator(), txn, command.mutations, &budget);
+        try effects.stageLocalArtifactChanges(scratch.allocator(), txn, command.namespace, changes, &budget);
     }
 
     pub fn deinit(self: *@This()) void {

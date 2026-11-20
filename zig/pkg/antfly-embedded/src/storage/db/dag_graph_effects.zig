@@ -178,6 +178,26 @@ pub fn artifactGeneration(value: ?[]const u8) !?u64 {
     return generation;
 }
 
+/// Preview exact graph row transitions while the source guards are held.
+pub fn collectPublicationChanges(alloc: A, txn: anytype, mutations: []const @import("artifact_publication.zig").Mutation, budget: *validation.Budget) ![]ArtifactChange {
+    var changes: std.ArrayList(ArtifactChange) = .empty;
+    for (mutations) |mutation| {
+        if (!keys.isGraphEdgeArtifactKey(mutation.key)) continue;
+        try budget.consume(.requests, 1);
+        try budget.consume(.bytes, mutation.key.len);
+        const raw: ?[]const u8 = txn.get(mutation.key) catch |err| blk: {
+            if (err != error.NotFound) return err;
+            break :blk null;
+        };
+        try changes.append(alloc, .{
+            .key = mutation.key,
+            .before = try artifactGeneration(raw),
+            .after = try artifactGeneration(mutation.value),
+        });
+    }
+    return changes.toOwnedSlice(alloc);
+}
+
 pub const BoundReplacement = struct {
     domain: authority.Digest,
     replacement: Replacement,
