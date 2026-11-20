@@ -5392,6 +5392,7 @@ test "DAG activation fence drains prepared writers and rejects new votes" {
     {
         var writer = try store.beginWriteTxn();
         errdefer writer.abort();
+        try dag.Storage.create(&writer, domain, 1);
         try dag.Storage.activateNewIncarnation(&writer, domain, 1);
         try binding.stage(alloc, &writer, .{
             .producer_kind = .graph,
