@@ -28379,6 +28379,7 @@ fn hasIndexAliasLifecycleStateTxn(txn: *docstore.DocStore.Txn, group_id: u64) !b
 
 fn admitIndexAliasTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !bool {
     const pin = try @import("antfly_local_sources").api_table_index_config.hasModelRevisionPin(self.alloc, table.indexes_json, true);
+    if (pin and table.storage.engine != .local) return false;
     const required = if (pin) metadata_table_manager.pinned_embedding_store_protocol else try @import("antfly_local_sources").api_index_metadata.aliases.requiredStoreProtocol(self.alloc, table.indexes_json);
     if (required == 0) return true;
     var buf: [160]u8 = undefined;

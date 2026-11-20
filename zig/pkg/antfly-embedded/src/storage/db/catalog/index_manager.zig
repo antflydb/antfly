@@ -36108,8 +36108,12 @@ fn validatePinnedDenseLayout(dense: DenseConfig, generator: ?GeneratorConfig) !v
         return error.InvalidIndexConfig;
 }
 
+fn mayContainDenseModelRevision(raw: []const u8) bool {
+    return std.mem.indexOf(u8, raw, "model_revision") != null or std.mem.indexOf(u8, raw, "\\u") != null;
+}
+
 pub fn denseConfigModelRevision(alloc: Allocator, cfg: types.IndexConfig) !?[32]u8 {
-    if (cfg.kind != .dense_vector) return null;
+    if (cfg.kind != .dense_vector or !mayContainDenseModelRevision(cfg.config_json)) return null;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cfg.config_json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidIndexConfig;
@@ -36119,6 +36123,7 @@ pub fn denseConfigModelRevision(alloc: Allocator, cfg: types.IndexConfig) !?[32]
 fn denseModelRevisionFromConfig(alloc: Allocator, root: std.json.ObjectMap) !?[32]u8 {
     const producer = root.get("semantic_producer") orelse return null;
     if (producer != .string) return error.InvalidIndexConfig;
+    if (!mayContainDenseModelRevision(producer.string)) return null;
     var identity = try std.json.parseFromSlice(std.json.Value, alloc, producer.string, .{});
     defer identity.deinit();
     if (identity.value != .object) return error.InvalidIndexConfig;

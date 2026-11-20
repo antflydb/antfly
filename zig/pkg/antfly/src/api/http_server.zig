@@ -18265,7 +18265,7 @@ pub const ApiHttpServer = struct {
         };
         defer alloc.free(expanded_index_json);
         const model_pin = table_index_config.hasModelRevisionPin(alloc, expanded_index_json, false) catch return error.InvalidIndexRequest;
-        if (model_pin and (self.cfg.deployment_mode != .distributed or external_table)) return error.InvalidIndexRequest;
+        if (model_pin and (self.cfg.deployment_mode != .distributed or external_table or table_before.storage.engine != .local)) return error.InvalidIndexRequest;
         const normalized_index_json = table_index_config.normalizeManagedEmbeddingIndexDimensionForCatalogJsonWithOptions(
             alloc,
             index_name,
@@ -23461,7 +23461,8 @@ pub const ApiHttpServer = struct {
             var pinned_schema = schema_mod.parseValidatedTableSchema(self.alloc, bound_schema) catch
                 return try contextual_operations.textAlloc(self.alloc, 400, "invalid table schema");
             defer pinned_schema.deinit(self.alloc);
-            if (self.cfg.deployment_mode != .distributed or pinned_schema.external_base_source != null)
+            if (self.cfg.deployment_mode != .distributed or pinned_schema.external_base_source != null or
+                (request.storage != null and request.storage.?.engine != .local))
                 return try contextual_operations.textAlloc(self.alloc, 400, "model revision pinning requires distributed ordered vector publication");
         }
         const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(

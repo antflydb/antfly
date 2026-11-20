@@ -3698,6 +3698,18 @@ test "index alias decoder floor composes with table features and preserves CAS h
     try std.testing.expect(!metadata_table_manager.indexAliasLifecycleProtocolSupported(7, 3));
     try std.testing.expect(metadata_table_manager.indexAliasesProtocolSupported(7, 4));
     try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(7, metadata_table_manager.artifact_sources_protocol_version + 1));
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator, command: metadata_storage.TransitionCommand, expected: u16) !void {
+            try std.testing.expectEqual(expected, try transitionRequiredCoordinatedDecoderVersion(allocator, command));
+        }
+    };
+    const escaped: metadata_table_manager.TableRecord = .{ .table_id = 2, .name = "plain", .indexes_json = "{\"text\":{\"type\":\"full_text\",\"description\":\"line\\nnext\"}}" };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .upsert_table = escaped }, @as(u16, 0) });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .apply_system_catalog = envelope }, floor });
+}
+
+test "index alias and pinned embedding metadata changes enforce their own decoder floors" {
+    const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
     var pinned = plain;
     pinned.indexes_json =
         \\{"semantic":{"type":"embeddings","embedder":{"provider":"antfly","model":"embed","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
@@ -3708,14 +3720,6 @@ test "index alias decoder floor composes with table features and preserves CAS h
     const pin_envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = pinned } } }, .{});
     defer std.testing.allocator.free(pin_envelope);
     try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = pin_envelope }));
-    const Check = struct {
-        fn run(allocator: std.mem.Allocator, command: metadata_storage.TransitionCommand, expected: u16) !void {
-            try std.testing.expectEqual(expected, try transitionRequiredCoordinatedDecoderVersion(allocator, command));
-        }
-    };
-    const escaped: metadata_table_manager.TableRecord = .{ .table_id = 2, .name = "plain", .indexes_json = "{\"text\":{\"type\":\"full_text\",\"description\":\"line\\nnext\"}}" };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .upsert_table = escaped }, @as(u16, 0) });
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .apply_system_catalog = envelope }, floor });
 }
 
 fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.TransitionCommand) std.mem.Allocator.Error!u16 {
