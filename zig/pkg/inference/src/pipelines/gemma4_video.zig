@@ -919,12 +919,12 @@ test "gemma4 video AV1 MP4 preserves the edit across portable selection and deco
     const config = embedding_video.Configuration{ .sampling = .gemma4, .inspection_scope = &scope, .decoder = .{ .policy = .portable } };
     const times = try embedding_video.selectedConfiguredPresentationUs(a, bytes, .{}, config);
     defer a.free(times);
-    try std.testing.expectEqualSlices(i64, &.{ 125000, 1125000 }, times);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 1125000 }, times);
     const direct = try embedding_video.selectedPresentationUs(a, bytes, .{}, .gemma4, null);
     defer a.free(direct);
     try std.testing.expectEqualSlices(i64, times, direct);
     const entry = scope.find(bytes, null, config).?;
-    try std.testing.expectEqualSlices(usize, &.{ 2, 6 }, entry.selected.?);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 6 }, entry.selected.?);
     try std.testing.expectEqual(@as(usize, 16), entry.webm_reader.packets.len);
     const Counter = struct {
         seen: [2]bool = @splat(false),

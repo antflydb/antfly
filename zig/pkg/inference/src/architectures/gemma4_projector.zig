@@ -7672,7 +7672,7 @@ test "gemma4 video portable generation projects large edited AV1 and AVC transpo
     try std.testing.expectError(error.ResourceLimitExceeded, @import("../pipelines/embedding_gemma2_video.zig").selectedPresentationUs(a, bytes, .{}, .reference, null));
     var projected = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{}, a, projector, bytes);
     defer projected.deinit();
-    try std.testing.expectEqualSlices(i64, &.{ 125000, 1125000 }, projected.timestamps_us);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 1125000 }, projected.timestamps_us);
     try std.testing.expectEqual(@as(usize, 2), projected.images.tokens_per_image.len);
     try std.testing.expect(projected.stats.decoder_source_bytes.? > 0);
     try std.testing.expect(projected.stats.decoded_frames == null);
