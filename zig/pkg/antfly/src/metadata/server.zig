@@ -932,7 +932,7 @@ fn metadataRestoreJobGet(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const
     if (svc.localMetadataLeadershipTerm() == null) return error.NotLeader;
     try svc.ensureLinearizableRead();
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    return try store.getRestoreJobValue(alloc, svc.metadata_group_id, key);
+    return try store.getRestoreJobRecord(alloc, svc.metadata_group_id, key);
 }
 
 fn metadataRestoreJobLoad(ptr: *anyopaque, alloc: std.mem.Allocator) ![]restore_jobs.ReplicatedPersistence.OwnedRow {
@@ -963,7 +963,7 @@ fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8, le
         leadership_term,
     );
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    const committed = (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) orelse
+    const committed = (try store.getRestoreJobRecord(svc.alloc, svc.metadata_group_id, key)) orelse
         return error.RestoreJobCommitNotApplied;
     defer svc.alloc.free(committed);
     if (!std.mem.eql(u8, committed, value)) return error.RestoreJobCommitNotApplied;
@@ -971,7 +971,9 @@ fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8, le
 
 fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, leadership_term: u64) ![]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").restore_job_admission_version);
+    const protocol = @import("topology_protocol.zig");
+    const required_version = if (try restore_jobs.requiresPinnedRestoreWorker(alloc, value)) protocol.pinned_restore_job_version else protocol.restore_job_admission_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
@@ -982,18 +984,22 @@ fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []co
         leadership_term,
     );
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    return (try store.getRestoreJobValue(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+    return (try store.getRestoreJobRecord(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
 }
 
 fn metadataRestoreJobCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, leadership_term: u64) ![]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").coordinated_lifecycle_version);
+    const protocol = @import("topology_protocol.zig");
+    const guard = try @import("restore_staging.zig").PlanGuard.read(alloc, plan_json);
+    const required_version = if (guard.expected_incarnation != null) protocol.guarded_generation_admission_version else if (try restore_jobs.requiresPinnedRestoreWorker(alloc, value)) protocol.pinned_restore_job_version else protocol.coordinated_lifecycle_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
-    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } }, leadership_term);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    return (try store.getRestoreJobValue(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+    try store.requireMetadataIncarnation(svc.metadata_group_id, guard.expected_incarnation);
+    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } }, leadership_term);
+    return (try store.getRestoreJobRecord(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
 }
 
 fn metadataRestoreJobDeleteMatching(ptr: *anyopaque, key: []const u8, value_hash: []const u8, leadership_term: u64) !bool {

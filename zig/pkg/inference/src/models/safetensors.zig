@@ -24,6 +24,7 @@
 //   { "tensor_name": { "dtype": "F32", "shape": [768, 512], "data_offsets": [0, 1572864] } }
 
 const std = @import("std");
+const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const DType = @import("../backends/tensor.zig").DType;
 
@@ -401,6 +402,11 @@ fn tensorIntervalLessThan(_: void, lhs: TensorInterval, rhs: TensorInterval) boo
 /// materializing tensor payloads. The file is mmap'd, so only the bounded JSON
 /// header and filesystem pages needed by the kernel are touched.
 pub fn validateReader(allocator: std.mem.Allocator, reader: *const MMapReader) !void {
+    return validateReaderWithControl(allocator, reader, .{});
+}
+
+fn validateReaderWithControl(allocator: std.mem.Allocator, reader: *const MMapReader, control: ExecutionControl) !void {
+    try control.check();
     if (reader.header.tensors.count() == 0) return error.EmptyTensorSet;
     const data_bytes: u64 = @intCast(reader.file_bytes.len - @as(usize, @intCast(reader.data_offset)));
     const intervals = try allocator.alloc(TensorInterval, reader.header.tensors.count());
@@ -409,6 +415,7 @@ pub fn validateReader(allocator: std.mem.Allocator, reader: *const MMapReader) !
     var interval_index: usize = 0;
     var tensor_it = reader.header.tensors.iterator();
     while (tensor_it.next()) |entry| : (interval_index += 1) {
+        try control.check();
         const tensor = entry.value_ptr.*;
         if (tensor.data_start > tensor.data_end or tensor.data_end > data_bytes)
             return error.DataOutOfBounds;
@@ -428,19 +435,22 @@ pub fn validateReader(allocator: std.mem.Allocator, reader: *const MMapReader) !
         intervals[interval_index] = .{ .start = tensor.data_start, .end = tensor.data_end };
     }
 
+    try control.check();
     std.mem.sort(TensorInterval, intervals, {}, tensorIntervalLessThan);
     var covered_end: u64 = 0;
     for (intervals) |interval| {
+        try control.check();
         if (interval.start != covered_end) return error.InvalidTensorLayout;
         covered_end = interval.end;
     }
     if (covered_end != data_bytes) return error.InvalidTensorLayout;
 }
 
-fn validateFile(allocator: std.mem.Allocator, path: []const u8) !void {
+fn validateFileWithControl(allocator: std.mem.Allocator, path: []const u8, control: ExecutionControl) !void {
+    try control.check();
     var reader = try MMapReader.openFileAbsolute(allocator, path);
     defer reader.deinit();
-    return validateReader(allocator, &reader);
+    return validateReaderWithControl(allocator, &reader, control);
 }
 
 fn validateShardPath(path: []const u8) !void {
@@ -536,9 +546,14 @@ pub fn validateArtifactSet(
     single_path: ?[]const u8,
     index_path: ?[]const u8,
 ) !void {
-    if (single_path) |path| return validateFile(allocator, path);
+    return validateArtifactSetWithControl(allocator, single_path, index_path, .{});
+}
+
+pub fn validateArtifactSetWithControl(allocator: std.mem.Allocator, single_path: ?[]const u8, index_path: ?[]const u8, control: ExecutionControl) !void {
+    try control.check();
+    if (single_path) |path| return validateFileWithControl(allocator, path, control);
     const path = index_path orelse return error.NoSafetensorsArtifact;
-    const index_bytes = try c_file.readFileMax(allocator, path, max_header_size);
+    const index_bytes = try c_file.readFileWithControl(allocator, control.io orelse std.Options.debug_io, path, control);
     defer allocator.free(index_bytes);
     var index = try ShardedIndex.load(allocator, index_bytes);
     defer index.deinit();
@@ -561,6 +576,7 @@ pub fn validateArtifactSet(
     const model_dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
     var index_it = index.weight_map.iterator();
     while (index_it.next()) |entry| {
+        try control.check();
         const shard_name = entry.value_ptr.*;
         try validateShardPath(shard_name);
         if (plans.getPtr(shard_name)) |plan| {
@@ -578,10 +594,12 @@ pub fn validateArtifactSet(
 
     var plan_it = plans.valueIterator();
     while (plan_it.next()) |plan| {
+        try control.check();
         var reader = try MMapReader.openFileAbsolute(allocator, plan.path);
         defer reader.deinit();
-        try validateReader(allocator, &reader);
+        try validateReaderWithControl(allocator, &reader, control);
         for (plan.tensor_names.items) |tensor_name| {
+            try control.check();
             if (!reader.header.tensors.contains(tensor_name))
                 return error.IndexTensorMissingFromShard;
         }

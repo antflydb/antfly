@@ -283,6 +283,10 @@ fn pendingReceipt(alloc: std.mem.Allocator, target: domain.Target, source_id: u6
 }
 
 pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.CatalogDdl) !catalog.DdlOutcome {
+    return executeBound(server, identity, context, database, namespace, alloc, ddl, null);
+}
+
+pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.CatalogDdl, expected: ?[]const @import("sql_ddl_binding.zig").Guard.Table) !catalog.DdlOutcome {
     try context.ensureActive();
     if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
     if (ddl.truncate_tables.len == 0 or ddl.truncate_tables.len > 128) return error.InvalidSqlSyntax;
@@ -294,15 +298,20 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     defer arena.deinit();
     const a = arena.allocator();
     const targets = try a.alloc(domain.Target, ddl.truncate_tables.len);
-    for (ddl.truncate_tables, targets) |name, *target| {
-        target.* = .{ .database = name.database orelse database, .namespace = name.namespace orelse namespace, .table = name.table };
+    if (expected) |entries| if (entries.len != targets.len) return error.CatalogGenerationChanged;
+    for (ddl.truncate_tables, targets, 0..) |name, *target, index| {
+        target.* = .{ .database = name.database orelse database, .namespace = if (expected) |entries| entries[index].namespace else name.namespace orelse namespace, .table = name.table };
         try target.validate();
         const resource = try target.resourceNameAlloc(a);
         if (!try server_mod.tablePermissionCurrentlyAllowed(identity, resource, .admin)) return error.Forbidden;
         if (try server_mod.resolveEffectiveRowFilterJson(a, identity, resource) != null) return error.Forbidden;
     }
-    const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets } }), .{});
+    const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets, .include_source_epoch = context.bound_catalog_incarnation != null } }), .{});
+    try context.checkCatalogIncarnation(resolved.source_epoch);
     if (resolved.tables.len != targets.len) return error.InvalidSqlBackendResponse;
+    if (expected) |guard| for (resolved.tables, 0..) |table, i| {
+        if (guard[i].id != (if (table) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
+    };
     const logical_state = try std.json.parseFromSliceLeaky(domain.State, a, try server.source.systemCatalog(a, context, .snapshot), .{});
     var logical_index = try domain.StateIndex.init(a, logical_state);
     defer logical_index.deinit(a);
@@ -316,6 +325,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     for (resolved.tables, requested) |table, *name| name.* = (table orelse return error.TableNotFound).name;
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
+    try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
     for (resolved.tables) |resolved_table| {
         const bound = resolved_table.?;
         for (snapshot.tables) |table| {
@@ -398,7 +408,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     var digest: [32]u8 = undefined;
     const cohort_manifest = try std.json.Stringify.valueAlloc(a, .{ .targets = planned, .external_fk_parents = external_parents }, .{});
     std.crypto.hash.Blake3.hash(cohort_manifest, &digest, .{});
-    const plan: stages.Plan = .{ .id = id, .cohort_digest = digest, .targets = planned, .external_fk_parents = external_parents };
+    const plan: stages.Plan = .{ .id = id, .expected_incarnation = context.expectedMetadataIncarnation(), .cohort_digest = digest, .targets = planned, .external_fk_parents = external_parents };
     try plan.validate(a);
     const primary_target = for (planned) |target| {
         if (target.source_table_id == resolved.tables[0].?.table_id) break target.table;
@@ -419,7 +429,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         return err;
     };
     var submitted = false;
-    const accepted = server.restore_job_store.startRecoverableObserved(a, .{ .scope = .cluster, .source_kind = .empty_generation, .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = generation_plan }, true, &submitted) catch |err| {
+    const accepted = server.restore_job_store.startRecoverableObserved(a, .{ .scope = .cluster, .source_kind = .empty_generation, .expected_incarnation = context.expectedMetadataIncarnation(), .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = generation_plan }, true, &submitted) catch |err| {
         if (!submitted) try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, completion_owner);
         try @import("sql_completion.zig").rejectMetadataWithContext(context, completion_owner, err);
         return err;

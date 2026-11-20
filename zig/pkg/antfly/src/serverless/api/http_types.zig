@@ -45,9 +45,12 @@ pub const HttpRequest = struct {
     cancellation: cancellation_mod.CancellationToken = .none,
 
     deadline_ns: ?u64 = null,
+    request_id: []const u8 = "",
+    query_started_ns: ?u64 = null,
+    principal: ?@import("antfly_local_sources").api_operation.Principal = null,
     deadline_io: @FieldType(@import("antfly_local_sources").api_operation.RequestContext, "deadline_io") = null,
     pub fn context(self: HttpRequest) @import("antfly_local_sources").api_operation.RequestContext {
-        return .{ .cancellation = self.cancellation, .deadline_ns = self.deadline_ns, .deadline_io = self.deadline_io };
+        return .{ .cancellation = self.cancellation, .deadline_ns = self.deadline_ns, .deadline_io = self.deadline_io, .request_id = self.request_id, .query_started_ns = self.query_started_ns, .principal = self.principal };
     }
     pub fn ensureActive(self: HttpRequest) !void {
         return self.context().ensureActive();

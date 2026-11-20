@@ -9530,7 +9530,7 @@ export interface components {
              */
             limit?: number;
             /**
-             * @description When true, the server immediately attempts the first bounded repair pass before returning the job.
+             * @description When true, the server starts the job and continues bounded passes automatically, including after restart. When false, each pass requires an explicit advance request.
              * @default true
              */
             advance?: boolean;
@@ -12162,6 +12162,8 @@ export interface components {
                 /** @description Opaque identifier accepted by restore for this backup. */
                 selector: string;
             }[];
+            /** @description True when the listing returned only backup metadata because table details exceeded the page size. */
+            table_details_omitted?: boolean;
             /**
              * @description Storage location of the backup
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15

@@ -99,7 +99,6 @@ pub const OpenedBackend = union(enum) {
 pub const NativeBackend = struct {
     read_only: bool = false,
     storage: lsm_backend.Storage,
-    storage_lease: ?lsm_backend.NativeStorageLease,
     storage_owner: ?*lsm_backend.NativeStorage,
     root_dir: []u8,
 
@@ -109,11 +108,11 @@ pub const NativeBackend = struct {
         var storage_owner: ?*lsm_backend.NativeStorage = null;
         errdefer if (storage_owner) |owner| {
             owner.deinit();
-            alloc.destroy(owner);
+            std.heap.page_allocator.destroy(owner);
         };
         const storage = options.storage orelse blk: {
-            const owner = try alloc.create(lsm_backend.NativeStorage);
-            errdefer alloc.destroy(owner);
+            const owner = try std.heap.page_allocator.create(lsm_backend.NativeStorage);
+            errdefer std.heap.page_allocator.destroy(owner);
             owner.* = try lsm_backend.NativeStorage.initWithPool(
                 alloc,
                 options.backend_options.io_runtime,
@@ -128,7 +127,7 @@ pub const NativeBackend = struct {
             error.FileNotFound => {
                 if (storage_owner) |owner| {
                     owner.deinit();
-                    alloc.destroy(owner);
+                    std.heap.page_allocator.destroy(owner);
                     storage_owner = null;
                 }
                 alloc.free(owned_root);
@@ -143,7 +142,6 @@ pub const NativeBackend = struct {
         native.* = .{
             .read_only = options.backend_options.backend.read_only,
             .storage = storage,
-            .storage_lease = null,
             .storage_owner = storage_owner,
             .root_dir = owned_root,
         };
@@ -155,26 +153,20 @@ pub const NativeBackend = struct {
         const backend = handle.backend;
         const root = try alloc.dupe(u8, backend.root_dir orelse return error.MissingStorageRoot);
         errdefer alloc.free(root);
-        var lease = try backend.acquireNativeStorageLease();
-        errdefer if (lease) |*owned| owned.deinit();
-        const storage = if (lease) |*owned| owned.storage() else backend.storage orelse return error.MissingStorageBackend;
+        const storage = backend.storage orelse return error.MissingStorageBackend;
         const native = try alloc.create(NativeBackend);
-        errdefer alloc.destroy(native);
         native.* = .{
             .storage = storage,
-            .storage_lease = lease,
-            .storage_owner = null,
+            .storage_owner = backend.transferNativeStorageOwnership(),
             .root_dir = root,
         };
-        lease = null;
         return native;
     }
 
     pub fn close(self: *NativeBackend, alloc: Allocator) void {
-        if (self.storage_lease) |*lease| lease.deinit();
         if (self.storage_owner) |owner| {
             owner.deinit();
-            alloc.destroy(owner);
+            std.heap.page_allocator.destroy(owner);
         }
         alloc.free(self.root_dir);
         alloc.destroy(self);
@@ -197,6 +189,8 @@ pub const LsmOptions = struct {
     /// Required when `config.storage_backend == .native_catalog` (Lite
     /// only). See `storage/native_catalog_backend.zig:Sink`.
     native_catalog_sink: ?NativeCatalogSink = null,
+    /// Catalog startup activates posting reads before publishing the index.
+    retain_native_posting_startup_snapshot: bool = false,
 };
 
 pub fn openBackendWithLsmOptions(alloc: Allocator, path: [*:0]const u8, config: anytype, lsm_options: LsmOptions) !OpenedBackend {

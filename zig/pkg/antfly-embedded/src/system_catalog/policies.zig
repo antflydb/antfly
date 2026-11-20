@@ -181,10 +181,28 @@ pub const Record = struct {
 
 /// Internal-only Raft payload. Public policy DDL is deliberately unavailable
 /// until all data owners can enforce the new generation.
+pub const max_definitions = 1024;
+// Older leaders checked the existing catalog size, allowing one final create
+// at the limit. These rows must remain readable and removable after upgrade.
+pub const max_stored_definitions = max_definitions + 1;
+pub const capacity_checked_version: u16 = 2;
+
 pub const Command = struct {
     version: u16 = 1,
     expected_revision: u64,
+    expected_incarnation: ?[16]u8 = null,
+    expected_schema_version: ?u32 = null,
+
     change: union(enum) { put: Record, drop: struct { id: u64, generation: u64, table_id: u64 } },
+
+    pub fn createsDefinition(self: Command) bool {
+        return self.change == .put and self.change.put.generation == 1;
+    }
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        if (comptime std.mem.eql(u8, field, "expected_incarnation") or std.mem.eql(u8, field, "expected_schema_version")) return @field(self, field) == null;
+        return false;
+    }
 };
 
 pub const Snapshot = struct {
@@ -513,6 +531,18 @@ test "row-policy publication requires canonical owner and acknowledgement order"
     try std.testing.expectError(error.InvalidRowPolicyPublication, publication.validateShape());
 }
 
+// Preserve the bytes of unguarded commands for legacy decoders and receipts.
+fn writePublicationFields(value: anytype, jw: anytype) !void {
+    try jw.beginObject();
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
+        if (!value.nativeJsonSkipField(name)) {
+            try jw.objectField(name);
+            try jw.write(@field(value, name));
+        }
+    }
+    try jw.endObject();
+}
+
 pub const PublicationCommand = struct {
     version: u16 = 1,
     expected_revision: u64,
@@ -521,6 +551,15 @@ pub const PublicationCommand = struct {
         acknowledge: struct { table_id: u64, generation: u64, receipt: Publication.OwnerAck },
         promote: struct { table_id: u64, generation: u64, phase: Publication.Phase },
     },
+    expected_incarnation: ?[16]u8 = null,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "expected_incarnation") and self.expected_incarnation == null;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try writePublicationFields(self, jw);
+    }
 };
 
 pub const PublicationWork = struct {
@@ -534,6 +573,15 @@ pub const BeginRequest = struct {
     table_id: u64,
     enable: bool,
     expected_revision: u64,
+    expected_incarnation: ?[16]u8 = null,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "expected_incarnation") and self.expected_incarnation == null;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try writePublicationFields(self, jw);
+    }
 };
 
 /// The owner returns a snapshot from one authenticated, linearizable catalog

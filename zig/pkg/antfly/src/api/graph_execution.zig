@@ -54,7 +54,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     var compiled = try cypher.compiler.compile(scratch, request.query, .{}, diagnostic);
     defer compiled.deinit();
     const writes = cypher.runtime.queryHasWrites(compiled.query);
-    const role_revision = if (identity.*) |principal| if (principal.live_user_manager) |manager| @as(?u64, manager.rowPolicyRoleRevision()) else null else null;
+    const role_revision = if (identity.*) |principal| if (principal.live_user_manager) |manager| @as(?u64, try manager.validateRoleRevision(principal.username, principal.roles, null)) else null else null;
     if (identity.*) |principal| {
         if (!server_mod.permissionsAllow(principal.permissions, .graph, name, .read) or (writes and !compiled.query.explain and !server_mod.permissionsAllow(principal.permissions, .graph, name, .write))) return error.Forbidden;
     }
@@ -221,7 +221,7 @@ pub const AuthorityChannel = struct {
         if (self.role_revision) |revision| {
             const principal = self.identity.* orelse return error.Forbidden;
             const manager = principal.live_user_manager orelse return error.Forbidden;
-            if (manager.rowPolicyRoleRevision() != revision) return error.Forbidden;
+            self.role_revision = try manager.validateRoleRevision(principal.username, principal.roles, revision);
         }
         if (!force or self.guarded_operation) if (self.last_authority_check) |last| if (now -| last < 10 * std.time.ns_per_ms) return;
         var arena = std.heap.ArenaAllocator.init(self.server.alloc);

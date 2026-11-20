@@ -122,7 +122,32 @@ const std = @import("std");
 /// Version 88 admits bounded inline map navigation in reader protocol 101.
 /// Version 90 admits table-scoped index aliases and durable retry receipts.
 /// Version 91 admits lifecycle-scoped alias deletion validators.
-pub const current_version: u16 = 91;
+/// Version 92 admits durable restore jobs with backup bindings.
+/// Version 93 separates immutable restore inputs from mutable checkpoints.
+/// Version 94 retains distributed restore admission ownership on ranges.
+pub const pinned_restore_job_version: u16 = 94;
+/// Catalog apply checks the physical identity captured by pgwire Bind.
+pub const bound_ddl_version: u16 = 95;
+/// Bound catalog and policy commands carry guards verified by every applying replica.
+pub const bound_catalog_incarnation_version: u16 = 96;
+/// Version 97 versions FK witness-schema reconstruction and fences policy publication begin.
+pub const guarded_publication_version: u16 = 97;
+/// Generation plans can bind a catalog incarnation and policy creates can enforce capacity at apply.
+pub const guarded_generation_admission_version: u16 = 98;
+/// Catalog CREATE can require the destination namespace or database observed at Bind.
+pub const bound_create_parent_version: u16 = 99;
+/// Every prospective metadata session owner can recover incarnation-bound staged work.
+pub const bound_session_version: u16 = 100;
+pub const current_version: u16 = bound_session_version;
+
+pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
+    const empty: [32]u8 = @splat(0);
+    for (ranges) |range| {
+        if (!std.mem.eql(u8, &range.restore_admission_fingerprint, &empty)) return pinned_restore_job_version;
+    }
+    return fallback;
+}
+
 pub const index_aliases_version: u16 = 90;
 pub const index_alias_lifecycle_version: u16 = 91;
 pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelope: bool) std.mem.Allocator.Error!u16 {

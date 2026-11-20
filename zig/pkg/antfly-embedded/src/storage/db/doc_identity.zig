@@ -717,7 +717,7 @@ pub fn lookupOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?Do
     return std.mem.readInt(u32, raw[0..4], .big);
 }
 
-fn lookupLiveOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
+pub fn lookupLiveOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
     const key = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, doc_id);
     defer alloc.free(key);
     const value = txn.get(key) catch |err| switch (err) {
@@ -944,7 +944,8 @@ pub fn resolvedDocSetForIdsAtGenerationWithPolicyTxn(
     var missing_ordinal_coverage = false;
 
     for (doc_ids) |doc_id| {
-        if (try lookupOrdinalTxn(alloc, mutable_txn, doc_id)) |ordinal| {
+        const mapped = try lookupOrdinalTxn(alloc, mutable_txn, doc_id) orelse try lookupLiveOrdinalTxn(alloc, mutable_txn, doc_id);
+        if (mapped) |ordinal| {
             const state = try lookupStateTxn(mutable_txn, ordinal);
             if (state) |ordinal_state| {
                 const visible = if (generation) |at| ordinal_state.isVisibleAt(at) else ordinal_state.isLive();
@@ -3100,7 +3101,7 @@ fn encodeOrdinalState(state: OrdinalState) [25]u8 {
     return out;
 }
 
-fn decodeOrdinalState(raw: []const u8) !OrdinalState {
+pub fn decodeOrdinalState(raw: []const u8) !OrdinalState {
     if (raw.len != 25) return error.InvalidDocIdentity;
     const state = OrdinalState{
         .canonical_doc_id = std.mem.readInt(u64, raw[0..8], .big),

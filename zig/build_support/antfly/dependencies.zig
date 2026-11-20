@@ -1219,6 +1219,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     inference_query_embedding_cache_mod.addImport("antfly_cache_budget", cache_budget_mod);
     inference_query_embedding_cache_mod.addImport("antfly_platform", platform_mod);
+    inference_query_embedding_cache_mod.addImport("antfly_cancellation", cancellation_mod);
     const inference_host_mod = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/host/host.zig"),
         .target = target,

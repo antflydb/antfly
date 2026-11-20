@@ -37,7 +37,7 @@ pub const Owned = struct {
     }
 };
 
-fn sameOwner(a: metadata.CatalogRouteFence, b: metadata.CatalogRouteFence) bool {
+pub fn sameOwner(a: metadata.CatalogRouteFence, b: metadata.CatalogRouteFence) bool {
     return a.protocol == b.protocol and a.metadata_group_id == b.metadata_group_id and
         std.meta.eql(a.metadata_incarnation, b.metadata_incarnation) and
         a.table_id == b.table_id and a.topology_epoch == b.topology_epoch and std.meta.eql(a.route, b.route);

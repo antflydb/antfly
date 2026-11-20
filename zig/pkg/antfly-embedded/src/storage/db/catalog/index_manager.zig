@@ -232,6 +232,31 @@ var text_doc_scratch_retained_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_segment_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_projection_source_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var sparse_replay_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
+const index_open_descriptor_errors = [_]anyerror{
+    error.StorageDescriptorPressure,
+    error.ProcessFdQuotaExceeded,
+    error.SystemFdQuotaExceeded,
+    error.PersistentDescriptorAdmissionExhausted,
+};
+
+fn isPostingStartupOperationalError(err: anyerror) bool {
+    if (@import("../derived/catch_up_policy.zig").isRecoverableAdmissionError(err)) return true;
+    return switch (err) {
+        error.Canceled,
+        error.OutOfMemory,
+        error.InputOutput,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.ReadOnlyFileSystem,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.DurableFileSyncUnsupported,
+        error.DurableDirectorySyncUnsupported,
+        => true,
+        else => false,
+    };
+}
+
 const default_merge_policy = merger_mod.MergePolicy{
     .max_segments_per_tier = 10,
     .max_segment_size = 5 * 1024 * 1024 * 1024,
@@ -2385,6 +2410,10 @@ pub const IndexManager = struct {
         /// True only when every indexed member has a durable document-unit
         /// identity. Source and parent grouping remain available independently.
         supports_unit_grouping: bool = false,
+        /// Page-image producers persist a vector per physical PDF page. The
+        /// page key itself has no stored document or chunk row.
+        has_pdf_page_members: bool = false,
+
         /// Cached physical catalog identity. Set only after a validated v2
         /// pointer or during atomic adoption of a certified native candidate;
         /// maintenance/status checks therefore never reread control files.
@@ -2410,6 +2439,10 @@ pub const IndexManager = struct {
                 verified.generation == checkpoint.generation and
                 verified.config_hash == checkpoint.config_hash and
                 verified.published_count == certified_count;
+        }
+
+        pub fn memberBacked(self: *const DenseIndex) bool {
+            return self.chunk_name != null or self.has_pdf_page_members;
         }
 
         /// Only an open or publication boundary may establish this proof.
@@ -4403,21 +4436,27 @@ pub const IndexManager = struct {
         if (self.acquireVectorBlockGeneration()) |current| {
             defer current.release();
             if (!vectorBlockGenerationExactAtSequence(current, snapshot_sequence)) return false;
-            var writer = try vector_block_store_mod.Store.open(self.alloc, storage, root);
-            defer writer.deinit();
-            if (writer.covered_source_sequence != snapshot_sequence) return false;
-            const changed = try writer.declareArtifactScopes(scope_hashes);
-            if (changed) {
-                var opened = try vector_block_store_mod.Store.openWithBlocksReusing(
-                    self.alloc,
-                    storage,
-                    root,
-                    &current.opened,
-                );
-                var opened_owned = true;
-                errdefer if (opened_owned) opened.deinit();
+            var opened = try vector_block_store_mod.Store.openWithBlocksReusing(
+                self.alloc,
+                storage,
+                root,
+                &current.opened,
+            );
+            var opened_owned = true;
+            defer if (opened_owned) opened.deinit();
+            if (!openedVectorBlockGenerationExactAtSequence(&opened, snapshot_sequence)) return false;
+            const needs_declaration = !opened.store.hasArtifactScopes(scope_hashes);
+            if (needs_declaration or !opened.store.artifactScopesMatch(&current.opened.store)) {
+                // A failed control publication can leave the new scopes
+                // visible on disk while the old generation still serves.
+                if (!needs_declaration) try opened.store.fenceCurrent();
+
+                // Prepare the serving view before changing CURRENT. A scope
+                // declaration preserves the blocks and fenced WAL it owns.
                 const generation = try self.createVectorBlockGeneration(opened);
                 opened_owned = false;
+                errdefer generation.release();
+                if (needs_declaration) _ = try generation.opened.store.declareArtifactScopes(scope_hashes);
                 self.installVectorBlockGeneration(generation);
             }
             self.vector_block_projection_dirty.store(false, .release);
@@ -6254,6 +6293,14 @@ pub const IndexManager = struct {
     /// Fully-owned extraction inputs for one immutable catalog generation.
     /// Foreground preparation never borrows live index entries after this is
     /// built, so catalog publication is independent of batch size.
+    const PdfPageOutputs = std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8));
+
+    fn deinitPdfPageOutputs(outputs: *PdfPageOutputs, alloc: Allocator) void {
+        var lists = outputs.valueIterator();
+        while (lists.next()) |list| list.deinit(alloc);
+        outputs.deinit(alloc);
+    }
+
     pub const WritePlanSnapshot = struct {
         alloc: Allocator,
         generation: u64,
@@ -6276,6 +6323,8 @@ pub const IndexManager = struct {
         /// Per-row planning only substitutes the document identity and removes
         /// consumers already satisfied by explicit/direct vectors.
         generated_templates: []enrichment_types.GeneratedEnrichmentRequest,
+        // Keys and output names borrow the immutable producer templates.
+        pdf_page_outputs: PdfPageOutputs = .empty,
         /// Constant-time publication membership, compiled once per catalog.
         generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
         /// Catalog-wide completion requirements include projections and
@@ -6297,6 +6346,7 @@ pub const IndexManager = struct {
             if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
+            deinitPdfPageOutputs(&self.pdf_page_outputs, self.alloc);
             self.generated_definitions.deinit(self.alloc);
             for (self.text_fields) |field| self.alloc.free(field);
             if (self.text_fields.len != 0) self.alloc.free(self.text_fields);
@@ -6915,7 +6965,24 @@ pub const IndexManager = struct {
         }
         var generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
         errdefer generated_definitions.deinit(alloc);
-        for (generated_templates) |template| try generated_definitions.put(alloc, @import("../artifact_producer_input.zig").definitionDigest(template), {});
+        var pdf_page_outputs: PdfPageOutputs = .empty;
+        errdefer deinitPdfPageOutputs(&pdf_page_outputs, alloc);
+        for (generated_templates) |template| {
+            try generated_definitions.put(alloc, @import("../artifact_producer_input.zig").definitionDigest(template), {});
+            if (template.kind != .dense_embedding or template.embedding_input != .pdf_page_images) continue;
+            const names = try pdf_page_outputs.getOrPut(alloc, enrichment_types.requestArtifactName(template));
+            if (!names.found_existing) names.value_ptr.* = .empty;
+            const name = enrichment_types.requestEmbeddingName(template);
+            for (names.value_ptr.items) |known| {
+                if (std.mem.eql(u8, known, name)) break;
+            } else try names.value_ptr.append(alloc, name);
+        }
+        var page_outputs = pdf_page_outputs.valueIterator();
+        while (page_outputs.next()) |names| std.mem.sort([]const u8, names.items, {}, struct {
+            fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return std.mem.lessThan(u8, lhs, rhs);
+            }
+        }.less);
         var result: WritePlanSnapshot = .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
@@ -6933,6 +7000,7 @@ pub const IndexManager = struct {
             .graph_fields = graph_fields,
             .generated_templates = generated_templates,
             .generated_definitions = generated_definitions,
+            .pdf_page_outputs = pdf_page_outputs,
             .group_sources = group_sources,
             .completion_plan = completion_plan,
             .chunk_dependents = chunk_dependents,
@@ -7792,8 +7860,9 @@ pub const IndexManager = struct {
         {
             return .rebuild_from_artifacts;
         }
-        if (std.mem.eql(u8, err_name, "TableReadChurn")) {
-            return .retry_open;
+        if (std.mem.eql(u8, err_name, "TableReadChurn")) return .retry_open;
+        inline for (index_open_descriptor_errors) |err| {
+            if (std.mem.eql(u8, err_name, @errorName(err))) return .retry_open;
         }
         return .manual_intervention;
     }
@@ -8670,9 +8739,12 @@ pub const IndexManager = struct {
     /// quarantining everything — the writer cannot race its own (not yet
     /// started) reclaim, so FileNotFound there is persistent damage, and
     /// the writer's self-heal worker covers the unlikely transient case.
-    /// Only meaningful now that the LSM run-table loader classifies
-    /// FileNotFound separately from UnsupportedVersion.
+    /// Descriptor pressure follows the same read-open retry contract.
+    /// Writable opens put it on the retry queue and keep other indexes usable.
     fn indexOpenErrorIsTransientRead(err: anyerror) bool {
+        for (index_open_descriptor_errors) |descriptor_err| {
+            if (err == descriptor_err) return true;
+        }
         return switch (err) {
             error.FileNotFound, error.EndOfStream, error.TableReadChurn => true,
             else => false,
@@ -10414,6 +10486,7 @@ pub const IndexManager = struct {
         stats.fd_persistent_descriptors = @max(stats.fd_persistent_descriptors, entry.fd_persistent_descriptors);
         stats.fd_admission_capacity = @max(stats.fd_admission_capacity, entry.fd_admission_capacity);
         stats.fd_persistent_reserve = @max(stats.fd_persistent_reserve, entry.fd_persistent_reserve);
+        stats.fd_mapping_reserve = @max(stats.fd_mapping_reserve, entry.fd_mapping_reserve);
         stats.fd_admission_waiters = @max(stats.fd_admission_waiters, entry.fd_admission_waiters);
         stats.fd_admission_waits = @max(stats.fd_admission_waits, entry.fd_admission_waits);
         stats.fd_persistent_admission_failures = @max(stats.fd_persistent_admission_failures, entry.fd_persistent_admission_failures);
@@ -13627,6 +13700,12 @@ pub const IndexManager = struct {
         for (self.enrichments.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, internal.name)) continue;
             if (entry.graph_inline_managed != true and try internalEnrichmentConfigsEqual(self.alloc, entry.*, internal)) return .unchanged;
+
+            // Changing the cardinality of a live consumer requires rebuilding its
+            // persisted member mappings, replay state and publication coverage.
+            if (entry.kind == .embedding and internal.kind == .embedding and
+                (entry.embedding_input == .pdf_page_images) != (internal.embedding_input == .pdf_page_images) and
+                try self.embeddingHasIndexConsumer(internal.name)) return error.EnrichmentInUse;
 
             var replacement = try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal);
             var previous = entry.*;
@@ -18359,7 +18438,21 @@ pub const IndexManager = struct {
         if (dense.external or dense.embedding_names.len > 1) return true;
         const generator = try parseDenseGeneratorConfig(self.alloc, cfg.config_json);
         defer if (generator) |value| value.deinit(self.alloc);
-        return self.denseChunkSourceName(dense, generator) != null;
+        return self.denseChunkSourceName(dense, generator) != null or self.denseHasPdfPageMembers(dense, generator);
+    }
+
+    fn denseHasPdfPageMembers(self: *const IndexManager, dense: DenseConfig, generator: ?GeneratorConfig) bool {
+        if (generator) |value| return value.embedding_input == .pdf_page_images;
+        if (dense.external) return false;
+        if (dense.embedding_name) |name| {
+            if (self.getEnrichment(.embedding, name)) |embedding| return embedding.embedding_input == .pdf_page_images;
+        }
+        for (dense.embedding_names) |name| {
+            if (self.getEnrichment(.embedding, name)) |embedding| {
+                if (embedding.embedding_input == .pdf_page_images) return true;
+            }
+        }
+        return false;
     }
 
     // Keep resident construction, quarantine accounting and artifact references
@@ -18931,8 +19024,8 @@ pub const IndexManager = struct {
     }
 
     fn embeddingSourceSupportsUnitGrouping(self: *const IndexManager, embedding_cfg: *const enrichment_catalog.EnrichmentConfig) bool {
-        return embedding_cfg.source_artifact_name.len > 0 and
-            self.artifactSourceSupportsUnitGrouping(embedding_cfg.source_artifact_name);
+        return embedding_cfg.embedding_input == .pdf_page_images or (embedding_cfg.source_artifact_name.len > 0 and
+            self.artifactSourceSupportsUnitGrouping(embedding_cfg.source_artifact_name));
     }
 
     fn textSourcesSupportUnitGrouping(
@@ -24529,6 +24622,7 @@ pub const IndexManager = struct {
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
                     .native_catalog_sink = self.dense_main_native_catalog_sink,
+                    .retain_native_posting_startup_snapshot = dense_cfg.leann == null,
                 });
                 index_open = true;
                 index.setIo(self.io);
@@ -24624,6 +24718,7 @@ pub const IndexManager = struct {
                         // Any source journal tail above this sequence is replayed
                         // normally after the index has opened.
                         posting_sequence = index.activateExperimentalPostingReadsAtOrAfter(0) catch |err| {
+                            if (isPostingStartupOperationalError(err)) return err;
                             std.log.err("dense posting WAL startup validation failed index={s} err={s}", .{
                                 cfg.name,
                                 @errorName(err),
@@ -24657,6 +24752,7 @@ pub const IndexManager = struct {
                                 };
                             },
                             else => {
+                                if (isPostingStartupOperationalError(err)) return err;
                                 std.log.warn("dense posting sidecar startup validation failed index={s} err={s}", .{ cfg.name, @errorName(err) });
                                 if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
                                     std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
@@ -24706,6 +24802,7 @@ pub const IndexManager = struct {
                     .metric = dense_cfg.metric,
                     .external = dense_cfg.external,
                     .managed_direct_field = !dense_cfg.external and dense_generator == null and referenced_embedding == null and dense_cfg.embedding_names.len == 0,
+                    .has_pdf_page_members = self.denseHasPdfPageMembers(dense_cfg, dense_generator),
                     .leann_transient = leann_transient,
                     .leann_text_only = leann_storage == .auto,
                     .leann_media_int8 = leann_transient and if (dense_cfg.leann) |leann_opts| leann_opts.media_int8 else false,
@@ -24719,6 +24816,8 @@ pub const IndexManager = struct {
                     .embedding_names = try cloneOwnedStrings(self.alloc, dense_cfg.embedding_names),
                     .supports_unit_grouping = if (dense_cfg.embedding_names.len > 0)
                         multi_source_supports_unit_grouping
+                    else if (dense_generator) |generator|
+                        generator.embedding_input == .pdf_page_images
                     else if (referenced_embedding) |embedding_cfg|
                         self.embeddingSourceSupportsUnitGrouping(embedding_cfg)
                     else
@@ -26460,6 +26559,21 @@ pub const IndexManager = struct {
         }
     }
 
+    fn embeddingHasIndexConsumer(self: *IndexManager, name: []const u8) !bool {
+        for (self.dense_indexes.items) |entry| {
+            if (entry.embedding_name) |single| if (std.mem.eql(u8, single, name)) return true;
+            if (containsOwnedString(entry.embedding_names, name)) return true;
+        }
+        for (self.status_only_index_configs) |cfg| {
+            if (cfg.kind != .dense_vector) continue;
+            var refs = try self.artifactRefsFromConfig(cfg);
+            defer refs.deinit(self.alloc);
+            if (refs.embedding_name) |single| if (std.mem.eql(u8, single, name)) return true;
+            if (containsOwnedString(refs.embedding_names, name)) return true;
+        }
+        return false;
+    }
+
     fn enrichmentInUse(self: *const IndexManager, kind: enrichment_catalog.EnrichmentType, name: []const u8) bool {
         switch (kind) {
             .chunk => {
@@ -27346,6 +27460,10 @@ pub const IndexManager = struct {
         // estimate is cached across snapshots; the task allocator still caps
         // real live bytes, including publication and oversized values.
         bytes = try std.math.add(u64, bytes, try seg.typedMergeWorkingSetBytes());
+        // An inverse ordinal directory sorts one pair per live output row.
+        if (layout.doc_ordinals_bytes != 0) {
+            bytes = try std.math.add(u64, bytes, @as(u64, seg.reader.doc_count) * @sizeOf(u64));
+        }
         bytes = try std.math.add(u64, bytes, if (native_scratch) @as(u64, 16 * 1024) else try std.math.mul(u64, layout.doc_ordinals_bytes, 2));
         return bytes;
     }
@@ -29011,6 +29129,7 @@ pub const IndexManager = struct {
                 var projection_doc_limit: usize = 0;
                 var projected_build_bytes: u64 = 0;
                 var projected_segment_bytes: u64 = 0;
+                var projected_witness_bytes: u64 = 0;
                 while (source_end < source_docs_with_ordinals.len) {
                     const projection_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
                     const previous_projection_docs = builder.text_docs.items.len;
@@ -29031,7 +29150,8 @@ pub const IndexManager = struct {
                     const doc_build_bytes = try introducer_mod.estimateTextDocumentBuildMemoryBytes(projection_alloc, projected_doc);
                     const doc_segment_bytes = introducer_mod.estimateTextDocumentSegmentBytes(projected_doc);
                     const next_build_bytes = projected_build_bytes +| doc_build_bytes;
-                    const next_segment_bytes = projected_segment_bytes +| doc_segment_bytes;
+                    const next_witness_bytes = @max(projected_witness_bytes, projected_doc.numericWitnessSegmentBytes());
+                    const next_segment_bytes = projected_segment_bytes +| doc_segment_bytes +| (next_witness_bytes - projected_witness_bytes);
                     if (previous_projection_docs > 0 and (next_build_bytes > target_build_memory_bytes or next_segment_bytes > target_segment_bytes)) {
                         projection_doc_limit = previous_projection_docs;
                         next_source_start = source_end - 1;
@@ -29040,6 +29160,7 @@ pub const IndexManager = struct {
 
                     projected_build_bytes = next_build_bytes;
                     projected_segment_bytes = next_segment_bytes;
+                    projected_witness_bytes = next_witness_bytes;
                     projection_doc_limit = builder.text_docs.items.len;
                     next_source_start = source_end;
                     if (projection_doc_limit >= max_text_projection_docs_per_segment_build) break;
@@ -29546,7 +29667,7 @@ pub const IndexManager = struct {
             defer read_txn.abort();
             for (keys) |key| {
                 const vector_id = (try self.resolveDenseVectorIdForDeleteTxn(&read_txn, entry.config.name, key)) orelse continue;
-                const ordinal = if (entry.chunk_name == null and entry.embedding_names.len == 0)
+                const ordinal = if (!entry.memberBacked() and entry.embedding_names.len == 0)
                     (try doc_identity.lookupOrdinalTxn(self.alloc, &read_txn, key)) orelse
                         try self.lookupDenseVectorOrdinalTxn(&read_txn, entry.config.name, vector_id)
                 else
@@ -29803,168 +29924,266 @@ pub const IndexManager = struct {
         index_name: []const u8,
         ordinals: []const doc_identity.DocOrdinal,
     ) ![]const u32 {
-        const bench_profile = getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
-        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        const runtime_store_ns: u64 = 0;
-        var primary_txn_ns: u64 = 0;
-        var sparse_txn_ns: u64 = 0;
-        var doc_id_ns: u64 = 0;
-        var doc_num_ns: u64 = 0;
-        const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
+        const set = @import("../doc_set.zig").ResolvedDocSet{ .ordinals = ordinals };
+        return try self.lookupSparseDocNumsForOrdinalSetAlloc(alloc, store, index_name, &set, .{});
+    }
 
-        const sparse_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+    pub fn lookupSparseDocNumsForOrdinalSetAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        set: *const @import("../doc_set.zig").ResolvedDocSet,
+        control: @import("../../../search/query.zig").ExecutionControl,
+    ) ![]const u32 {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedQueryRequest;
+        const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
+        try control.check();
         var sparse_txn = try entry.index.beginReadTxn();
         defer sparse_txn.abort();
-        if (bench_profile) sparse_txn_ns = platform_time.monotonicNs() - sparse_txn_start_ns;
+        const direct = entry.chunk_name == null and entry.embedding_names.len == 0;
+        var primary_txn = try store.beginReadTxn();
+        defer primary_txn.abort();
 
-        if (entry.chunk_name == null and entry.embedding_names.len == 0) {
-            var fast_lookup = try entry.index.docNumsForOrdinalDocNumsAlloc(alloc, &sparse_txn, ordinals);
-            defer fast_lookup.deinit(alloc);
-            if (fast_lookup.missing_ordinals.len == 0) {
-                const out = try alloc.dupe(u32, fast_lookup.doc_nums);
-                if (bench_profile) {
-                    std.log.info(
-                        "antfly_bench_sparse_ordinal_projection total_us={d} runtime_store_us={d} primary_txn_us={d} sparse_txn_us={d} doc_id_us={d} doc_num_us={d} ordinals={d} doc_nums={d}",
-                        .{
-                            (platform_time.monotonicNs() - total_start_ns) / 1000,
-                            runtime_store_ns / 1000,
-                            primary_txn_ns / 1000,
-                            sparse_txn_ns / 1000,
-                            doc_id_ns / 1000,
-                            doc_num_ns / 1000,
-                            ordinals.len,
-                            out.len,
-                        },
-                    );
-                }
-                return out;
-            }
-
-            const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            var txn = try store.beginProbeTxn();
-            defer txn.abort();
-            if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
-            const doc_id_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const parent_doc_ids = try lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc, &txn, fast_lookup.missing_ordinals);
-            defer alloc.free(parent_doc_ids);
-            if (bench_profile) doc_id_ns = platform_time.monotonicNs() - doc_id_start_ns;
-            const doc_num_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const fallback_doc_nums = try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, parent_doc_ids);
-            defer alloc.free(fallback_doc_nums);
-            var out = std.ArrayListUnmanaged(u32).empty;
-            errdefer out.deinit(alloc);
-            try out.appendSlice(alloc, fast_lookup.doc_nums);
-            try out.appendSlice(alloc, fallback_doc_nums);
-            const out_slice = try out.toOwnedSlice(alloc);
-            if (bench_profile) {
-                doc_num_ns = platform_time.monotonicNs() - doc_num_start_ns;
-                std.log.info(
-                    "antfly_bench_sparse_ordinal_projection total_us={d} runtime_store_us={d} primary_txn_us={d} sparse_txn_us={d} doc_id_us={d} doc_num_us={d} ordinals={d} doc_nums={d}",
-                    .{
-                        (platform_time.monotonicNs() - total_start_ns) / 1000,
-                        runtime_store_ns / 1000,
-                        primary_txn_ns / 1000,
-                        sparse_txn_ns / 1000,
-                        doc_id_ns / 1000,
-                        doc_num_ns / 1000,
-                        ordinals.len,
-                        out_slice.len,
-                    },
-                );
-            }
-            return out_slice;
+        var out: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer out.deinit(alloc);
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen.deinit(alloc);
+        var miss_budget: ?resource_manager_mod.BudgetedAllocator = if (resource_manager_mod.BudgetedAllocator.fromAllocator(alloc) == null)
+            if (self.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .lsm_read_working_set, alloc, 1) else null
+        else
+            null;
+        defer if (miss_budget) |*budget| budget.deinit();
+        const miss_alloc = if (miss_budget) |*budget| budget.allocator() else alloc;
+        var misses: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var keys = misses.keyIterator();
+            while (keys.next()) |key| miss_alloc.free(key.*);
+            misses.deinit(miss_alloc);
         }
+        const locator_complete = try sparse_mod.SparseIndex.projectionHasCompleteLocatorMap(&sparse_txn);
+        var alignment_samples: usize = 0;
+        var alignment_hits: usize = 0;
+        var ordinal_iter = if (set.* == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
+        var offset: usize = 0;
+        while (true) {
+            try control.check();
+            var ordinals: [256]doc_identity.DocOrdinal = undefined;
+            var len: usize = 0;
+            if (ordinal_iter) |*it| {
+                while (len < ordinals.len) : (len += 1) ordinals[len] = it.next() orelse break;
+            } else {
+                switch (set.*) {
+                    .ordinals => |entries| {
+                        len = @min(entries.len - offset, ordinals.len);
+                        @memcpy(ordinals[0..len], entries[offset..][0..len]);
+                        offset += len;
+                        ordinal_core.sort(doc_identity.DocOrdinal, ordinals[0..len]);
+                    },
+                    .none => {},
+                    else => return error.InvalidArgument,
+                }
+            }
+            if (len == 0) break;
 
-        const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var txn = try store.beginReadTxn();
-        defer txn.abort();
-        if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
+            const OrdinalKey = @TypeOf(internal_keys.identityOrdinalToDocKey(0));
+            var storage: [ordinals.len]OrdinalKey = undefined;
+            var keys: [ordinals.len][]const u8 = undefined;
+            var values: [ordinals.len]?[]u8 = @splat(null);
+            var key_count: usize = 0;
+            var unique_ordinals: [ordinals.len]u32 = undefined;
+            for (ordinals[0..len], 0..) |ordinal, i| {
+                if (i != 0 and ordinals[i - 1] == ordinal) continue;
+                unique_ordinals[key_count] = ordinal;
+                storage[key_count] = internal_keys.identityOrdinalToDocKey(ordinal);
+                keys[key_count] = &storage[key_count];
+                key_count += 1;
+            }
+            var key_arena = std.heap.ArenaAllocator.init(alloc);
+            defer key_arena.deinit();
+            try primary_txn.getManySortedOwnedScoped(key_arena.allocator(), keys[0..key_count], values[0..key_count]);
+            if (direct) {
+                var proven: [ordinals.len]bool = @splat(false);
+                if (locator_complete and (alignment_samples < 64 or alignment_hits *| 4 >= alignment_samples)) {
+                    try sparse_mod.SparseIndex.proveProjectionDocNums(
+                        key_arena.allocator(),
+                        &sparse_txn,
+                        unique_ordinals[0..key_count],
+                        values[0..key_count],
+                        proven[0..key_count],
+                        control,
+                    );
+                    for (values[0..key_count], proven[0..key_count]) |key, hit| {
+                        if (key != null) alignment_samples += 1;
+                        if (hit) alignment_hits += 1;
+                    }
+                }
+                var present: usize = 0;
+                for (values[0..key_count], unique_ordinals[0..key_count], proven[0..key_count]) |value, ordinal, aligned| {
+                    if (aligned) {
+                        if (!(try seen.getOrPut(alloc, ordinal)).found_existing) try out.append(alloc, ordinal);
+                    } else if (value) |key| {
+                        keys[present] = key;
+                        present += 1;
+                    }
+                }
+                const physical = try entry.index.docNumsForDocIdsDeferredAlloc(alloc, &sparse_txn, keys[0..present], .{ .keys = &misses, .allocator = miss_alloc }, control);
+                defer alloc.free(physical);
+                for (physical) |doc_num| {
+                    const entry_num = try seen.getOrPut(alloc, doc_num);
+                    if (!entry_num.found_existing) try out.append(alloc, doc_num);
+                }
+            } else {
+                for (values[0..key_count]) |maybe_key| {
+                    try control.check();
+                    if (maybe_key) |key| try appendSparseParentProjectionDocNums(alloc, entry, &primary_txn, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
+                }
+            }
+        }
+        try entry.index.appendUnmappedDocNums(alloc, &sparse_txn, &misses, miss_alloc, &seen, &out, control);
+        return try out.toOwnedSlice(alloc);
+    }
 
+    pub fn lookupSparseDocNumsForParentKeysAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        keys: []const []const u8,
+    ) ![]const u32 {
+        return try self.lookupSparseDocNumsForParentKeysControlledAlloc(alloc, store, index_name, keys, .{});
+    }
+
+    pub fn lookupSparseDocNumsForParentKeysControlledAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        keys: []const []const u8,
+        control: @import("../../../search/query.zig").ExecutionControl,
+    ) ![]const u32 {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedQueryRequest;
+        const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
+        var sparse_txn = try entry.index.beginReadTxn();
+        defer sparse_txn.abort();
+        if (entry.chunk_name == null and entry.embedding_names.len == 0)
+            return try entry.index.docNumsForDocIdsDeferredAlloc(alloc, &sparse_txn, keys, null, control);
+
+        var primary_txn = try store.beginReadTxn();
+        defer primary_txn.abort();
         var out = std.ArrayListUnmanaged(u32).empty;
         errdefer out.deinit(alloc);
         var seen = std.AutoHashMapUnmanaged(u32, void).empty;
         defer seen.deinit(alloc);
-        for (ordinals) |ordinal| {
-            const parent_doc_id = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
-            defer self.alloc.free(parent_doc_id);
-            if (entry.embedding_names.len == 0) {
-                var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &txn, parent_doc_id, entry.chunk_name.?);
-                defer chunks.close();
-                while (try chunks.next()) |row| {
-                    if (!internal_keys.matchesChunkArtifactName(row.key, entry.chunk_name.?)) continue;
-                    try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, row.key, &seen, &out);
-                }
-                continue;
-            }
-            const prefix = try internal_keys.documentExactPrefixAlloc(self.alloc, parent_doc_id);
-            defer self.alloc.free(prefix);
-            var cursor = try txn.openPhysicalCursorAdapter();
-            defer cursor.close();
-            var item = try cursor.seekAtOrAfter(prefix);
-            while (item) |row| : (item = try cursor.next()) {
-                if (!std.mem.startsWith(u8, row.key, prefix)) break;
-                var matches_source = false;
-                for (entry.embedding_names) |embedding_name| {
-                    if ((internal_keys.isEmbeddingArtifactKey(row.key) and internal_keys.matchesEmbeddingArtifactName(row.key, embedding_name)) or
-                        (internal_keys.isDerivedEmbeddingArtifactKey(row.key) and internal_keys.matchesDerivedEmbeddingArtifactName(row.key, embedding_name)))
-                    {
-                        matches_source = true;
+        var miss_budget: ?resource_manager_mod.BudgetedAllocator = if (resource_manager_mod.BudgetedAllocator.fromAllocator(alloc) == null)
+            if (self.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .lsm_read_working_set, alloc, 1) else null
+        else
+            null;
+        defer if (miss_budget) |*budget| budget.deinit();
+        const miss_alloc = if (miss_budget) |*budget| budget.allocator() else alloc;
+        var misses: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var remaining = misses.keyIterator();
+            while (remaining.next()) |key| miss_alloc.free(key.*);
+            misses.deinit(miss_alloc);
+        }
+        const locator_complete = try sparse_mod.SparseIndex.projectionHasCompleteLocatorMap(&sparse_txn);
+        for (keys) |key| {
+            try control.check();
+            if (internal_keys.isChunkArtifactRecordKey(key)) {
+                if (entry.chunk_name) |name| {
+                    if (!internal_keys.matchesChunkArtifactName(key, name)) continue;
+                    const parent = (try internal_keys.decodeDocumentComponentAlloc(alloc, key)) orelse continue;
+                    defer alloc.free(parent);
+                    var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &primary_txn, parent, name);
+                    defer chunks.close();
+                    while (try chunks.nextControlled(control)) |row| {
+                        const order = std.mem.order(u8, row.key, key);
+                        if (order == .lt) continue;
+                        if (order == .eq) try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
                         break;
                     }
                 }
-                if (!matches_source) continue;
-                try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, row.key, &seen, &out);
+                continue;
             }
+            if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+                if (sparseEmbeddingSourceMatches(entry, key) and try primary_txn.contains(key))
+                    try appendSparseProjectionDocNum(alloc, entry, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
+                continue;
+            }
+            try appendSparseParentProjectionDocNums(alloc, entry, &primary_txn, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);
         }
+        try entry.index.appendUnmappedDocNums(alloc, &sparse_txn, &misses, miss_alloc, &seen, &out, control);
         return try out.toOwnedSlice(alloc);
     }
 
-    fn appendSparseProjectionDocNum(alloc: Allocator, entry: *SparseIndex, txn: anytype, key: []const u8, seen: *std.AutoHashMapUnmanaged(u32, void), out: *std.ArrayListUnmanaged(u32)) !void {
-        // Reuse the query's sparse snapshot, rather than opening one per member
-        // and potentially mixing mappings from different index generations.
-        const doc_num = (entry.index.docNumForDocIdTxn(txn, key) catch |err| switch (err) {
-            error.DocNumOverflow => return,
-            else => return err,
-        }) orelse return;
-        const gop = try seen.getOrPut(alloc, doc_num);
-        if (!gop.found_existing) try out.append(alloc, doc_num);
+    fn appendSparseParentProjectionDocNums(
+        alloc: Allocator,
+        entry: *SparseIndex,
+        primary_txn: *docstore_mod.DocStore.Txn,
+        sparse_txn: anytype,
+        parent_doc_id: []const u8,
+        seen: *std.AutoHashMapUnmanaged(u32, void),
+        out: *std.ArrayListUnmanaged(u32),
+        misses: *std.StringHashMapUnmanaged(void),
+        miss_alloc: Allocator,
+        locator_complete: bool,
+        control: @import("../../../search/query.zig").ExecutionControl,
+    ) !void {
+        if (entry.embedding_names.len == 0) {
+            var chunks = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, primary_txn, parent_doc_id, entry.chunk_name.?);
+            defer chunks.close();
+            while (try chunks.nextControlled(control)) |row| {
+                if (!internal_keys.matchesChunkArtifactName(row.key, entry.chunk_name.?)) continue;
+                try appendSparseProjectionDocNum(alloc, entry, sparse_txn, row.key, seen, out, misses, miss_alloc, locator_complete, control);
+            }
+            return;
+        }
+        const prefix = try internal_keys.documentExactPrefixAlloc(alloc, parent_doc_id);
+        defer alloc.free(prefix);
+        var cursor = try primary_txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        var item = try cursor.seekAtOrAfter(prefix);
+        while (item) |row| : (item = try cursor.next()) {
+            try control.check();
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            if (!sparseEmbeddingSourceMatches(entry, row.key)) continue;
+            try appendSparseProjectionDocNum(alloc, entry, sparse_txn, row.key, seen, out, misses, miss_alloc, locator_complete, control);
+        }
     }
 
-    fn lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc: Allocator, txn: anytype, ordinals: []const doc_identity.DocOrdinal) ![]const []const u8 {
-        if (ordinals.len == 0) return try alloc.alloc([]const u8, 0);
-
-        const sorted_ordinals = try alloc.dupe(doc_identity.DocOrdinal, ordinals);
-        defer alloc.free(sorted_ordinals);
-        ordinal_core.sort(doc_identity.DocOrdinal, sorted_ordinals);
-
-        const IdentityOrdinalKey = @TypeOf(internal_keys.identityOrdinalToDocKey(0));
-        var key_storage = try alloc.alloc(IdentityOrdinalKey, sorted_ordinals.len);
-        defer alloc.free(key_storage);
-        var keys = try alloc.alloc([]const u8, sorted_ordinals.len);
-        defer alloc.free(keys);
-        var values = try alloc.alloc(?[]const u8, sorted_ordinals.len);
-        defer alloc.free(values);
-
-        var key_count: usize = 0;
-        var previous: ?doc_identity.DocOrdinal = null;
-        for (sorted_ordinals) |ordinal| {
-            if (previous != null and previous.? == ordinal) continue;
-            key_storage[key_count] = internal_keys.identityOrdinalToDocKey(ordinal);
-            keys[key_count] = key_storage[key_count][0..];
-            values[key_count] = null;
-            key_count += 1;
-            previous = ordinal;
+    fn sparseEmbeddingSourceMatches(entry: *const SparseIndex, key: []const u8) bool {
+        for (entry.embedding_names) |name| {
+            if ((internal_keys.isEmbeddingArtifactKey(key) and internal_keys.matchesEmbeddingArtifactName(key, name)) or
+                (internal_keys.isDerivedEmbeddingArtifactKey(key) and internal_keys.matchesDerivedEmbeddingArtifactName(key, name))) return true;
         }
+        return false;
+    }
 
-        try txn.getManySorted(keys[0..key_count], values[0..key_count]);
-
-        var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer doc_ids.deinit(alloc);
-        try doc_ids.ensureTotalCapacity(alloc, key_count);
-        for (values[0..key_count]) |maybe_raw| {
-            if (maybe_raw) |raw| doc_ids.appendAssumeCapacity(raw);
+    fn appendSparseProjectionDocNum(
+        alloc: Allocator,
+        entry: *SparseIndex,
+        txn: anytype,
+        key: []const u8,
+        seen: *std.AutoHashMapUnmanaged(u32, void),
+        out: *std.ArrayListUnmanaged(u32),
+        misses: *std.StringHashMapUnmanaged(void),
+        miss_alloc: Allocator,
+        locator_complete: bool,
+        control: @import("../../../search/query.zig").ExecutionControl,
+    ) !void {
+        try control.check();
+        switch (entry.index.lookupProjectionDocNum(alloc, txn, key, locator_complete) catch |err| switch (err) {
+            error.DocNumOverflow => return,
+            else => return err,
+        }) {
+            .absent => {},
+            .needs_scan => try sparse_mod.SparseIndex.deferProjectionKey(miss_alloc, misses, key),
+            .found => |doc_num| {
+                const slot = try seen.getOrPut(alloc, doc_num);
+                if (!slot.found_existing) try out.append(alloc, doc_num);
+            },
         }
-        return try doc_ids.toOwnedSlice(alloc);
     }
 
     fn deleteGraphDocsEntry(_: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
@@ -31385,7 +31604,10 @@ pub const IndexManager = struct {
         index_name: []const u8,
         pending: []const PendingDenseVectorMapping,
     ) !void {
-        const cache_updates = try self.collectDenseOrdinalVectorCacheUpdatesTxn(self.alloc, txn, pending);
+        const cache_updates = if (!entry.memberBacked() and entry.embedding_names.len == 0)
+            try self.collectDenseOrdinalVectorCacheUpdatesTxn(self.alloc, txn, pending)
+        else
+            &.{};
         defer self.alloc.free(cache_updates);
         self.commitDenseVectorMappingsTxn(txn, index_name, pending) catch |err| {
             self.rollbackPendingDenseVectors(entry, pending);
@@ -31444,7 +31666,6 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         updates: []const DenseOrdinalVectorCacheUpdate,
     ) !void {
-        if (entry.chunk_name != null or entry.embedding_names.len > 0) return;
         for (updates) |update| {
             try entry.ordinal_vector_ids.put(self.alloc, update.ordinal, update.vector_id);
             try entry.vector_ordinals.put(self.alloc, update.vector_id, update.ordinal);
@@ -31465,7 +31686,7 @@ pub const IndexManager = struct {
         pending: []const PendingDenseVectorMapping,
     ) !void {
         _ = index_name;
-        if (entry.chunk_name != null or entry.embedding_names.len > 0 or pending.len == 0) return;
+        if (entry.memberBacked() or entry.embedding_names.len > 0 or pending.len == 0) return;
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginRead();
@@ -35112,7 +35333,7 @@ pub const IndexManager = struct {
         errdefer batch.abort();
         const txn = batch.asTxn();
         const ordinal = if (self.denseIndex(index_name)) |entry|
-            if (entry.chunk_name == null and entry.embedding_names.len == 0) try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key) else null
+            if (!entry.memberBacked() and entry.embedding_names.len == 0) try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key) else null
         else
             null;
         try self.clearDenseVectorMappingTxn(txn, index_name, doc_key, vector_id);
@@ -35225,6 +35446,71 @@ pub const IndexManager = struct {
         return try self.alloc.dupe(u8, raw);
     }
 
+    pub fn lookupDenseVectorIdsForParentKeysAlloc(self: *IndexManager, alloc: Allocator, store: *docstore_mod.DocStore, name: []const u8, keys: []const []const u8) ![]u64 {
+        return self.lookupDenseVectorIdsForParentKeysControlledAlloc(alloc, store, name, keys, .{});
+    }
+
+    pub fn lookupDenseVectorIdsForParentKeysControlledAlloc(self: *IndexManager, alloc: Allocator, store: *docstore_mod.DocStore, name: []const u8, keys: []const []const u8, control: @import("../../../search/query.zig").ExecutionControl) ![]u64 {
+        try control.check();
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        var runtime = try initRuntimeStore(self.alloc, store);
+        defer runtime.deinit();
+        var mappings = try runtime.store.beginRead();
+        defer mappings.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer ids.deinit(alloc);
+        for (keys) |key| {
+            try control.check();
+            var matched_member = false;
+            if (!internal_keys.isInternalUserKey(key)) {
+                if (entry.embedding_names.len != 0) {
+                    const prefix = try internal_keys.documentExactPrefixAlloc(alloc, key);
+                    defer alloc.free(prefix);
+                    var cursor = try read.openPhysicalCursorAdapter();
+                    defer cursor.close();
+                    var item = try cursor.seekAtOrAfter(prefix);
+                    while (item) |row| : (item = try cursor.next()) {
+                        try control.check();
+                        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                        for (entry.embedding_names) |embedding| {
+                            if (!((internal_keys.isEmbeddingArtifactKey(row.key) and internal_keys.matchesEmbeddingArtifactName(row.key, embedding)) or
+                                (internal_keys.isDerivedEmbeddingArtifactKey(row.key) and internal_keys.matchesDerivedEmbeddingArtifactName(row.key, embedding)))) continue;
+                            if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, row.key)) |id| {
+                                try ids.put(alloc, id, {});
+                                matched_member = true;
+                            }
+                            break;
+                        }
+                    }
+                } else if (entry.chunk_name) |chunk| {
+                    var cursor = try @import("../artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &read, key, chunk);
+                    defer cursor.close();
+                    while (try cursor.nextControlled(control)) |row| {
+                        if (!internal_keys.matchesChunkArtifactName(row.key, chunk)) continue;
+                        if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, row.key)) |id| {
+                            try ids.put(alloc, id, {});
+                            matched_member = true;
+                        }
+                    }
+                }
+            }
+            if (!matched_member) if (try self.lookupDenseVectorIdForDocKeyTxn(&mappings, name, key)) |id| try ids.put(alloc, id, {});
+        }
+        try control.check();
+        const result = try alloc.alloc(u64, ids.count());
+        errdefer alloc.free(result);
+        var iter = ids.keyIterator();
+        for (result, 0..) |*id, i| {
+            if (i % 256 == 0) try control.check();
+            id.* = iter.next().?.*;
+        }
+        std.mem.sort(u64, result, {}, std.sort.asc(u64));
+        try control.check();
+        return result;
+    }
+
     pub fn lookupDenseVectorIdsForOrdinalsAlloc(
         self: *IndexManager,
         alloc: Allocator,
@@ -35232,7 +35518,7 @@ pub const IndexManager = struct {
         index_name: []const u8,
         ordinals: []const doc_identity.DocOrdinal,
     ) ![]u64 {
-        const prefer_primary_mapping = if (self.denseIndex(index_name)) |entry| entry.chunk_name == null and entry.embedding_names.len == 0 else false;
+        const prefer_primary_mapping = if (self.denseIndex(index_name)) |entry| !entry.memberBacked() and entry.embedding_names.len == 0 else false;
         if (prefer_primary_mapping) {
             const entry = self.denseIndex(index_name) orelse return try alloc.alloc(u64, 0);
             if (try self.lookupPrimaryDenseCachedVectorIdsForOrdinalsAlloc(alloc, entry, ordinals)) |cached| {
@@ -35246,24 +35532,24 @@ pub const IndexManager = struct {
         var txn = try runtime_store.store.beginRead();
         defer txn.abort();
 
-        var out = std.ArrayListUnmanaged(u64).empty;
-        errdefer out.deinit(alloc);
         if (prefer_primary_mapping) {
             const entry = self.denseIndex(index_name) orelse return try alloc.alloc(u64, 0);
             return try self.lookupPrimaryDenseVectorIdsForOrdinalsAlloc(alloc, &txn, entry, index_name, ordinals);
         }
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var ids: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+        defer ids.deinit(alloc);
         for (ordinals) |ordinal| {
-            const before_len = out.items.len;
-            try self.appendDenseVectorIdsForOrdinalAlloc(alloc, &out, &runtime_store.store, index_name, ordinal);
-            if (out.items.len != before_len) continue;
+            if (try self.collectDenseOrdinalMembers(alloc, &cursor, &ids, index_name, ordinal)) continue;
             const vector_id = (try self.lookupDenseVectorIdByOrdinalTxn(&txn, index_name, ordinal)) orelse fallback: {
                 const doc_key = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
                 defer self.alloc.free(doc_key);
                 break :fallback (try self.lookupDenseVectorIdForDocKeyTxn(&txn, index_name, doc_key)) orelse continue;
             };
-            if (!containsU64(out.items, vector_id)) try out.append(alloc, vector_id);
+            try ids.put(alloc, vector_id, {});
         }
-        return try out.toOwnedSlice(alloc);
+        return try alloc.dupe(u64, ids.keys());
     }
 
     pub fn lookupDenseOrdinalsForVectorIdsAlloc(
@@ -35301,7 +35587,7 @@ pub const IndexManager = struct {
         for (missing.items) |item| {
             const ordinal = (try self.lookupDenseVectorOrdinalTxn(&txn, index_name, item.vector_id)) orelse continue;
             out[item.source_index] = ordinal;
-            if (entry.chunk_name == null and entry.embedding_names.len == 0) {
+            if (!entry.memberBacked() and entry.embedding_names.len == 0) {
                 try entry.vector_ordinals.put(self.alloc, item.vector_id, ordinal);
                 try entry.ordinal_vector_ids.put(self.alloc, ordinal, item.vector_id);
             }
@@ -35443,37 +35729,27 @@ pub const IndexManager = struct {
         return try out.toOwnedSlice(alloc);
     }
 
-    fn appendDenseVectorIdsForOrdinalAlloc(
+    fn collectDenseOrdinalMembers(
         self: *IndexManager,
         alloc: Allocator,
-        out: *std.ArrayListUnmanaged(u64),
-        store: anytype,
+        cursor: anytype,
+        ids: *std.AutoArrayHashMapUnmanaged(u64, void),
         index_name: []const u8,
         ordinal: doc_identity.DocOrdinal,
-    ) !void {
-        const prefix = try denseOrdinalMemberPrefix(self.alloc, index_name, ordinal);
-        defer self.alloc.free(prefix);
-        var scan_txn = try store.beginCurrentScan();
-        defer scan_txn.abort();
-        var cursor = try scan_txn.openCursor();
-        defer cursor.close();
-        var maybe_entry = try cursor.seekAtOrAfter(prefix);
-        while (maybe_entry) |row| : (maybe_entry = try cursor.next()) {
-            if (!std.mem.startsWith(u8, row.key, prefix)) break;
-            if (row.value.len != 8) return error.InvalidDenseVectorMetadata;
-            const vector_id = std.mem.readInt(u64, row.value[0..8], .little);
-            if (!containsU64(out.items, vector_id)) try out.append(alloc, vector_id);
+    ) !bool {
+        var found = false;
+        inline for (.{ denseOrdinalMemberPrefix, legacyDenseOrdinalMemberPrefix }) |prefixFn| {
+            const prefix = try prefixFn(self.alloc, index_name, ordinal);
+            defer self.alloc.free(prefix);
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |row| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                if (row.value.len != 8) return error.InvalidDenseVectorMetadata;
+                try ids.put(alloc, std.mem.readInt(u64, row.value[0..8], .little), {});
+                found = true;
+            }
         }
-
-        const legacy_prefix = try legacyDenseOrdinalMemberPrefix(self.alloc, index_name, ordinal);
-        defer self.alloc.free(legacy_prefix);
-        maybe_entry = try cursor.seekAtOrAfter(legacy_prefix);
-        while (maybe_entry) |row| : (maybe_entry = try cursor.next()) {
-            if (!std.mem.startsWith(u8, row.key, legacy_prefix)) break;
-            if (row.value.len != 8) return error.InvalidDenseVectorMetadata;
-            const vector_id = std.mem.readInt(u64, row.value[0..8], .little);
-            if (!containsU64(out.items, vector_id)) try out.append(alloc, vector_id);
-        }
+        return found;
     }
 
     fn lookupDenseVectorIdByOrdinalTxn(self: *IndexManager, txn: anytype, index_name: []const u8, ordinal: doc_identity.DocOrdinal) !?u64 {
@@ -39699,6 +39975,96 @@ test "fresh dense admission reclaims a certified generation orphaned before cata
     );
 }
 
+test "native posting startup retries descriptor pressure across catalog opens" {
+    const Fault = struct {
+        var original_read: @FieldType(lsm_backend_mod.Storage.VTable, "read_file_alloc") = undefined;
+        var pressured: std.atomic.Value(bool) = .init(false);
+
+        fn read(ptr: *anyopaque, alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+            if (pressured.load(.acquire) and std.mem.endsWith(u8, path, "/posting-segments/CURRENT")) {
+                return error.ProcessFdQuotaExceeded;
+            }
+            return original_read(ptr, alloc, path, max_bytes);
+        }
+
+        fn publicationFence(_: *anyopaque) void {}
+    };
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "posting-fd-open-retry");
+    defer cleanupIndexManagerDir(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    const names = [_][]const u8{ "first_dense", "second_dense" };
+    {
+        var initial = try IndexManager.init(alloc, std.mem.span(path));
+        defer initial.deinit();
+        initial.updateRange(.{ .start = "", .end = "" });
+        for (names) |name| try initial.addManaged(&store, .{
+            .name = name,
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        }, null);
+        for (names) |name| try std.testing.expect(initial.denseIndex(name).?.index.experimentalPostingWalAuthoritative());
+    }
+
+    var native = try lsm_backend_mod.NativeStorage.init(alloc, .threaded);
+    defer native.deinit();
+    var storage = native.storage();
+    var vtable = storage.vtable.*;
+    Fault.original_read = vtable.read_file_alloc;
+    vtable.read_file_alloc = Fault.read;
+    storage.vtable = &vtable;
+    Fault.pressured.store(true, .release);
+    defer Fault.pressured.store(false, .release);
+
+    // Cover serial and parallel read catalog loading, including cleanup.
+    for ([_]usize{ 1, 2 }) |parallelism| {
+        var reader = try IndexManager.init(alloc, std.mem.span(path));
+        defer reader.deinit();
+        reader.setDenseLsmStorage(storage);
+        reader.load_parallelism = parallelism;
+        reader.io = std.testing.io;
+        try std.testing.expectError(error.ProcessFdQuotaExceeded, reader.loadNoBackfill(&store));
+        try std.testing.expect(!reader.hasLoadFailures());
+    }
+
+    var writer = try IndexManager.init(alloc, std.mem.span(path));
+    defer writer.deinit();
+    writer.updateRange(.{ .start = "", .end = "" });
+    writer.setDenseLsmStorage(storage);
+    try writer.load(&store);
+    try std.testing.expectEqual(names.len, writer.failedIndexLoadSummary().retry_open);
+    try std.testing.expectEqual(@as(usize, 0), writer.failedIndexLoadSummary().manual_intervention);
+
+    Fault.pressured.store(false, .release);
+    var fence_context: u8 = 0;
+    const retry = try writer.retryFailedIndexLoads(&store, nowNs(), true, null, names.len, .{
+        .ptr = &fence_context,
+        .lock_fn = Fault.publicationFence,
+        .unlock_fn = Fault.publicationFence,
+    });
+    try std.testing.expectEqual(names.len, retry.recovered);
+    try std.testing.expect(!writer.hasLoadFailures());
+    for (names) |name| try std.testing.expect(writer.denseIndex(name) != null);
+}
+
+test "posting startup preserves operational errors without classifying corruption as retryable" {
+    for ([_]anyerror{
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.PersistentDescriptorAdmissionExhausted,
+        error.StorageDescriptorPressure,
+        error.InputOutput,
+        error.OutOfMemory,
+        error.Canceled,
+    }) |err| try std.testing.expect(isPostingStartupOperationalError(err));
+    try std.testing.expect(!isPostingStartupOperationalError(error.PostingSegmentChecksumMismatch));
+    try std.testing.expect(!isPostingStartupOperationalError(error.PostingWalShorterThanCheckpoint));
+}
+
 test "fresh native dense backfill certifies one pinned source snapshot" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -39804,6 +40170,37 @@ test "fresh native dense backfill extends a shared vector generation without a s
     const second_scope = IndexManager.denseVectorArtifactScopeHashAt(manager.denseIndex(second.name).?, 0);
     try std.testing.expectEqual(@as(u64, 0), generation.opened.baseOnlyCoverage(first_scope).?.vector_count);
     try std.testing.expectEqual(@as(u64, 1), generation.opened.baseOnlyCoverage(second_scope).?.vector_count);
+
+    const entry = manager.denseIndex(second.name).?;
+    const sequence = generation.opened.store.covered_source_sequence;
+    try std.testing.expect(try manager.tryPrepareFreshDenseVectorCaptureBase(entry, sequence));
+    {
+        const unchanged = manager.acquireVectorBlockGeneration().?;
+        defer unchanged.release();
+        try std.testing.expectEqual(generation, unchanged);
+    }
+
+    // Simulate a scope publication whose CURRENT rename became visible
+    // before the caller received a durable acknowledgement.
+    const control = @import("../../generation_publication.zig");
+    const extra_scope = std.math.maxInt(u64);
+    const root = try manager.vectorBlockRootAlloc();
+    defer alloc.free(root);
+    {
+        var writer = try vector_block_store_mod.Store.open(alloc, manager.vector_block_storage.?, root);
+        defer writer.deinit();
+        @import("antfly_test_error_logs").expectErrorLogs(1);
+        control.injectPostPublishFailuresForTest(2);
+        defer control.injectPostPublishFailuresForTest(0);
+        try std.testing.expectError(error.GenerationPublicationDurabilityUncertain, writer.declareArtifactScopes(&.{extra_scope}));
+    }
+
+    try std.testing.expect(!generation.opened.store.hasArtifactScopes(&.{extra_scope}));
+    try std.testing.expect(try manager.tryPrepareFreshDenseVectorCaptureBase(entry, sequence));
+    const recovered = manager.acquireVectorBlockGeneration().?;
+    defer recovered.release();
+    try std.testing.expect(recovered.opened.store.hasArtifactScopes(&.{extra_scope}));
+    try std.testing.expect(!generation.opened.store.hasArtifactScopes(&.{extra_scope}));
 }
 
 test "standalone dense native migration still requires an explicit physical generation" {
@@ -40173,6 +40570,16 @@ test "dense metadata lookups read legacy textual rows" {
     defer alloc.free(ordinal_map_key);
     const ordinal_member_key = try legacyDenseOrdinalMemberKey(alloc, index_name, ordinal, vector_id);
     defer alloc.free(ordinal_member_key);
+    const legacy_only = try legacyDenseOrdinalMemberKey(alloc, index_name, ordinal, vector_id + 2);
+    defer alloc.free(legacy_only);
+    var legacy_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &legacy_buf, vector_id + 2, .little);
+    const current_member = try denseOrdinalMemberKey(alloc, index_name, ordinal, vector_id);
+    defer alloc.free(current_member);
+    const second_member = try denseOrdinalMemberKey(alloc, index_name, ordinal, vector_id + 1);
+    defer alloc.free(second_member);
+    var second_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &second_buf, vector_id + 1, .little);
     const vector_ordinal_key = try legacyDenseVectorOrdinalMappingKey(alloc, index_name, vector_id);
     defer alloc.free(vector_ordinal_key);
     const next_id_key = try legacyDenseNextIdKey(alloc, index_name);
@@ -40189,6 +40596,9 @@ test "dense metadata lookups read legacy textual rows" {
         .{ .key = vector_map_key, .value = doc_key },
         .{ .key = ordinal_map_key, .value = &vector_buf },
         .{ .key = ordinal_member_key, .value = &vector_buf },
+        .{ .key = current_member, .value = &vector_buf },
+        .{ .key = legacy_only, .value = &legacy_buf },
+        .{ .key = second_member, .value = &second_buf },
         .{ .key = vector_ordinal_key, .value = &ordinal_buf },
         .{ .key = next_id_key, .value = &next_buf },
     }, &.{});
@@ -40207,13 +40617,9 @@ test "dense metadata lookups read legacy textual rows" {
     try std.testing.expectEqual(@as(?u64, vector_id), try manager.lookupDenseVectorIdByOrdinalTxn(&read_txn, index_name, ordinal));
     try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, ordinal), try manager.lookupDenseVectorOrdinalTxn(&read_txn, index_name, vector_id));
 
-    var vector_ids = std.ArrayListUnmanaged(u64).empty;
-    defer vector_ids.deinit(alloc);
-    var runtime_store = try initRuntimeStore(alloc, &store);
-    defer runtime_store.deinit();
-    try manager.appendDenseVectorIdsForOrdinalAlloc(alloc, &vector_ids, &runtime_store.store, index_name, ordinal);
-    try std.testing.expectEqual(@as(usize, 1), vector_ids.items.len);
-    try std.testing.expectEqual(vector_id, vector_ids.items[0]);
+    const vector_ids = try manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, &store, index_name, &.{ ordinal, ordinal });
+    defer alloc.free(vector_ids);
+    try std.testing.expectEqualSlices(u64, &.{ vector_id, vector_id + 1, vector_id + 2 }, vector_ids);
 
     var batch = try store.beginWriteBatch();
     errdefer batch.abort();
@@ -42158,6 +42564,42 @@ test "dense index unions multiple embedding artifact sources without overwriting
     // Exercise the generic dispatch path used by enrichment batching. It must
     // preserve artifact identity exactly like the named maintenance API.
     try manager.applyDenseEmbeddingWrites(&store, &writes);
+
+    const CancelProjection = struct {
+        checks: usize = 0,
+        cancel_at: usize = 3,
+
+        fn check(raw: *const anyopaque) bool {
+            const state: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            state.checks += 1;
+            return state.checks == state.cancel_at;
+        }
+    };
+    var cancellation: CancelProjection = .{};
+    try std.testing.expectError(error.Canceled, manager.lookupDenseVectorIdsForParentKeysControlledAlloc(
+        alloc,
+        &store,
+        "document_vectors",
+        &.{doc_key},
+        .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = CancelProjection.check } },
+    ));
+    cancellation = .{ .cancel_at = std.math.maxInt(usize) };
+    const control: @import("../../../search/query.zig").ExecutionControl = .{
+        .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = CancelProjection.check },
+    };
+    const parent_vectors = try manager.lookupDenseVectorIdsForParentKeysControlledAlloc(alloc, &store, "document_vectors", &.{doc_key}, control);
+    defer alloc.free(parent_vectors);
+    cancellation = .{ .cancel_at = cancellation.checks };
+    try std.testing.expectError(error.Canceled, manager.lookupDenseVectorIdsForParentKeysControlledAlloc(
+        alloc,
+        &store,
+        "document_vectors",
+        &.{doc_key},
+        control,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), parent_vectors.len);
+    try std.testing.expect(containsU64(parent_vectors, deterministicDenseVectorId(title_artifact)));
+    try std.testing.expect(containsU64(parent_vectors, deterministicDenseVectorId(body_artifact)));
 
     try std.testing.expect(!entry.supports_unit_grouping);
     try std.testing.expectEqual(@as(u64, 2), entry.index.stats().active_count);
