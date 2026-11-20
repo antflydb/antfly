@@ -140,6 +140,15 @@ pub const MatchingCursor = struct {
         self.* = undefined;
     }
 
+    /// Stops traversal before any record past `sequence`, ahead of hint
+    /// filtering, so a bounded probe never reads the unrelated suffix.
+    pub fn setUpperSequence(self: *MatchingCursor, sequence: u64) void {
+        switch (self.state) {
+            .journal => |*cursor| cursor.upper_sequence = sequence,
+            .primary_store => |*cursor| cursor.upper_sequence = sequence,
+        }
+    }
+
     pub fn forEachNext(
         self: *MatchingCursor,
         max_matched_entries: usize,
@@ -240,6 +249,7 @@ pub const Source = struct {
     pub fn noMatchingRecordThrough(self: Source, alloc: Allocator, from_sequence: u64, hint: TargetHint, through: u64) !bool {
         var cursor = try self.openMatchingCursor(alloc, from_sequence, hint);
         defer cursor.deinit(alloc);
+        cursor.setUpperSequence(through);
         const Probe = struct {
             through: u64,
             pending: bool = false,
@@ -352,6 +362,8 @@ const JournalMatchingCursor = struct {
     journal: *change_journal_mod.Journal,
     next_sequence: u64,
     hint: TargetHint,
+    /// See `MatchingCursor.setUpperSequence`.
+    upper_sequence: u64 = std.math.maxInt(u64),
 };
 
 const PrimaryStoreMatchingCursor = struct {
@@ -365,6 +377,8 @@ const PrimaryStoreMatchingCursor = struct {
     entry: ?backend_erased.Entry = null,
     fallback_all: bool = false,
     hint_exhausted: bool = false,
+    /// See `MatchingCursor.setUpperSequence`.
+    upper_sequence: u64 = std.math.maxInt(u64),
 
     pub fn deinit(self: *@This()) void {
         if (self.cursor) |*cursor| cursor.close();
@@ -413,6 +427,7 @@ fn journalMatchingCursorForEachNext(
         stats: MatchingRecordStats = .{ .scan_batches = 1 },
 
         fn visit(self: *@This(), entry: log_mod.EntryView) !log_mod.ScanAction {
+            if (entry.sequence > self.cursor.upper_sequence) return .stop;
             if (!try change_journal_mod.encodedRecordHasHint(entry.payload, self.cursor.hint)) {
                 self.stats.scanned_entries += 1;
                 self.stats.hint_filter_skips += 1;
@@ -458,6 +473,8 @@ fn primaryStoreMatchingCursorForEachNext(
             cursor.entry = null;
             break;
         };
+        // Past the bound: keep this entry current for a later, wider call.
+        if (sequence > cursor.upper_sequence) return stats;
         if (cursor.fallback_all and !try change_journal_mod.encodedRecordHasHint(entry.value, cursor.hint)) {
             stats.scanned_entries += 1;
             stats.hint_filter_skips += 1;

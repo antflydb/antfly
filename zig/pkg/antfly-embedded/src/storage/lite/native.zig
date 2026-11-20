@@ -8149,6 +8149,20 @@ pub const NativeFile = struct {
             {
                 return error.NativeRedoLogCorrupt;
             }
+            // An unbounded scan saw no watermark and no writer before it
+            // began. A writer admitted since may have appended records it
+            // has not made durable; retry with the bound the region now
+            // gives.
+            if (replay_ceiling == null) if (scan_region) |r| {
+                const own_pid: u32 = antfly_platform.process.currentId() orelse 0;
+                const now = r.readLogStateChecked();
+                const published_now = if (now) |state| state.durable_sequence != 0 or state.checkpoint_sequence != 0 else true;
+                if (published_now or r.foreignWriterHeld(own_pid)) {
+                    cold_attempts += 1;
+                    if (cold_attempts < 3) continue :cold_scan;
+                    return error.FileBusy;
+                }
+            };
             if (promised_durable) |want| {
                 const covered = @max(checkpoint.commit_sequence, folded_through);
                 if (@max(meta_outcome.last_sequence orelse 0, covered) < want) {
@@ -8197,7 +8211,7 @@ pub const NativeFile = struct {
             compact: ?CompactCheckpoint = null,
             outcome: ?redo_log.ReplayOutcome = null,
         };
-        var pctx = PopulateCtx{ .file = self, .io = io, .start_after_sequence = folded_through, .durable_ceiling_offset = durable_ceiling_offset, .max_sequence = replay_ceiling, .skip = skip_scan };
+        var pctx = PopulateCtx{ .file = self, .io = io, .start_after_sequence = folded_through, .durable_ceiling_offset = durable_ceiling_offset, .max_sequence = replay_ceiling orelse (meta_outcome.last_sequence orelse folded_through), .skip = skip_scan };
         const shared = try inode_lock.ensureRedoOverlay(entry, io, &pctx, struct {
             fn populate(ctx: *PopulateCtx, overlay: *redo_overlay.SharedRedoOverlay, pop_allocator: Allocator) anyerror!void {
                 const RecordCtx = struct {
@@ -8342,7 +8356,7 @@ pub const NativeFile = struct {
                     if (ctx.outcome.stop_reason == .corrupt_record and (ctx.ceiling == null or ctx.outcome.valid_bytes < ctx.ceiling.?)) return error.NativeRedoLogCorrupt;
                 }
             };
-            var catch_up: Catch = .{ .file = self, .io = io, .floor = folded_through, .ceiling = durable_ceiling_offset, .max_sequence = replay_ceiling };
+            var catch_up: Catch = .{ .file = self, .io = io, .floor = folded_through, .ceiling = durable_ceiling_offset, .max_sequence = replay_ceiling orelse (meta_outcome.last_sequence orelse folded_through) };
             try inode_lock.withRedoOverlayLock(entry, io, &catch_up, Catch.run);
             if (catch_up.outcome.valid_count != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
             shared.noteApplied(catch_up.outcome.last_sequence orelse 0);
@@ -8488,8 +8502,10 @@ pub const NativeFile = struct {
     fn publishedReplayCeiling(region: *const shared_lock_region.Region, state: ?shared_lock_region.Region.LogState) ?u64 {
         const published = state orelse region.readLogStateRaw();
         if (published.durable_sequence != 0 or published.checkpoint_sequence != 0) return @max(published.durable_sequence, published.checkpoint_sequence);
+        // Nothing published: any appends a writer holds (or a dead one left)
+        // are not durable yet.
         const own_pid: u32 = antfly_platform.process.currentId() orelse 0;
-        return if (region.foreignLiveWriter(own_pid)) 0 else null;
+        return if (region.foreignWriterHeld(own_pid)) 0 else null;
     }
 
     fn publishedDurableCeiling(region: *const shared_lock_region.Region, state: shared_lock_region.Region.LogState) ?u64 {
@@ -9193,6 +9209,17 @@ pub const NativeFile = struct {
         defer self.maintenance_publication = previous_maintenance;
         var next = before;
         next.commit_sequence += 1;
+        // Runs only after the fold: every logged record is in the tree, so
+        // this slot covers every sequence through its own, as a fold's does.
+        // Left at the old boundary, a reset log's first record (two past it)
+        // reads as a continuity gap on the next cold open.
+        if (self.redo) |*redo| {
+            if (redoOverlayHasUnfoldedWork(redo, self.runtimeIo())) {
+                self.abortTransaction();
+                return;
+            }
+            next.redo_folded_through = next.commit_sequence;
+        }
         next.free_map_root_page = try pages.allocate();
         try self.persistAllocator(&pages, &next);
         try self.syncIfRequired(null);
@@ -9754,6 +9781,19 @@ pub const NativeFile = struct {
     /// writer left past it; an unknown one (a skipped scan, a torn
     /// watermark) is rebuilt from the fold boundary. Records found are
     /// applied, made durable, and published.
+    /// The most payload bytes a writer resync copies to install after its
+    /// barrier without rereading the log.
+    const redo_resync_stage_limit: usize = 8 * 1024 * 1024;
+
+    /// Whether the shared overlay still holds content the tree lacks.
+    fn redoOverlayHasUnfoldedWork(redo: *RedoCommitState, io: std.Io) bool {
+        if (!redo.shared.pagesEmpty(io)) return true;
+        for (0..3) |root_idx| {
+            if (redo.shared.count(io, @intCast(root_idx)) != 0) return true;
+        }
+        return false;
+    }
+
     /// Zeroes the first `len` bytes of the redo log and syncs. A fixed zero
     /// block, written as many times as the used log needs: no allocation
     /// (which could fail after the checkpoint advanced) and no transient
@@ -9823,16 +9863,29 @@ pub const NativeFile = struct {
         // this writer's own tail only once it is durable. The one scan keeps
         // copies of the records the shared overlay does not hold yet, so
         // the install after the barrier never rereads the log.
+        // Staging is bounded: past `redo_resync_stage_limit` bytes, or on an
+        // allocation failure, it stops copying and the install rereads the
+        // suffix after the barrier instead.
         const Stage = struct {
             allocator: Allocator,
             applied: u64,
+            bytes: usize = 0,
+            overflowed: bool = false,
             records: std.ArrayListUnmanaged(struct { sequence: u64, payload: []u8 }) = .empty,
             fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
                 const stage: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
-                if (record.commit_sequence <= stage.applied) return;
-                try stage.records.ensureUnusedCapacity(stage.allocator, 1);
-                const copy = try stage.allocator.dupe(u8, record.payload);
+                if (record.commit_sequence <= stage.applied or stage.overflowed) return;
+                if (stage.bytes + record.payload.len > redo_resync_stage_limit) return stage.overflow();
+                stage.records.ensureUnusedCapacity(stage.allocator, 1) catch return stage.overflow();
+                const copy = stage.allocator.dupe(u8, record.payload) catch return stage.overflow();
                 stage.records.appendAssumeCapacity(.{ .sequence = record.commit_sequence, .payload = copy });
+                stage.bytes += copy.len;
+            }
+            fn overflow(stage: *@This()) void {
+                for (stage.records.items) |record| stage.allocator.free(record.payload);
+                stage.records.clearAndFree(stage.allocator);
+                stage.bytes = 0;
+                stage.overflowed = true;
             }
             fn deinit(stage: *@This()) void {
                 for (stage.records.items) |record| stage.allocator.free(record.payload);
@@ -9862,7 +9915,23 @@ pub const NativeFile = struct {
             try self.file.sync(io);
         }
 
-        if (stage.records.items.len != 0) {
+        if (stage.overflowed) {
+            const Reread = struct {
+                file: *NativeFile,
+                io: std.Io,
+                start_offset: u64,
+                floor: u64,
+                ceiling: u64,
+                outcome: redo_log.ReplayOutcome = undefined,
+                fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
+                    ctx.outcome = try replayIntoSharedOverlayFrom(ctx.file, ctx.io, overlay, ctx.start_offset, ctx.floor, ctx.ceiling);
+                }
+            };
+            var reread: Reread = .{ .file = self, .io = io, .start_offset = start_offset, .floor = floor, .ceiling = scan.last_sequence.? };
+            try inode_lock.withRedoOverlayLock(entry, io, &reread, Reread.run);
+            // Nothing else writes the log under writer authority.
+            if (reread.outcome.last_sequence != scan.last_sequence or reread.outcome.valid_bytes != scan.valid_bytes) return error.NativeRedoLogCorrupt;
+        } else if (stage.records.items.len != 0) {
             const Install = struct {
                 stage: *Stage,
                 fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
@@ -12399,6 +12468,19 @@ pub const NativeFile = struct {
         defer self.maintenance_publication = previous_maintenance;
         var next = before;
         next.commit_sequence += 1;
+        // A redo file reaches this ledger-only body only with nothing left
+        // unfolded (see above), so the slot covers every sequence through its
+        // own, as a fold's does. Left at the old boundary, the next logged
+        // record (two past it on a reset log) reads as a continuity gap on
+        // the next cold open. `beginTransaction` can catch up a peer's
+        // records after that check, so confirm it again here.
+        if (self.redo) |*redo| {
+            if (redoOverlayHasUnfoldedWork(redo, self.runtimeIo())) {
+                self.abortTransaction();
+                return 0;
+            }
+            next.redo_folded_through = next.commit_sequence;
+        }
         next.free_map_root_page = try pages.allocate();
         try self.persistAllocator(&pages, &next);
         // Never the group-commit path: this reclaim commit holds whatever
@@ -12428,6 +12510,7 @@ pub const NativeFile = struct {
         // commit that is otherwise perfectly fine.
         if (self.redo) |*redo| {
             const new_sequence = self.activeCheckpoint().commit_sequence;
+            redo.checkpoint_sequence = new_sequence;
             redo.durable_sequence = new_sequence;
             redo.writer.last_sequence = new_sequence;
         }
@@ -38364,4 +38447,75 @@ test "lite redo log a cold reader refuses a log shorter than the published durab
         try writer.file.writePositionalAll(io, &zeros, second_record_offset);
     }
     try std.testing.expectError(error.NativeRedoLogCorrupt, NativeFile.openWithIo(a, io, path, .{ .read_only = true }));
+}
+
+// A ledger-only reclaim after a fold that reset the log publishes F+1 to the
+// slot without logging it, so the next logged write is F+2. The slot must
+// cover F+1 as its fold boundary, or a cold open reads that first record as
+// a continuity gap and refuses a healthy log.
+test "lite redo log reopens after a ledger-only reclaim follows a log reset" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-ledger-only-gap.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer writer.close();
+        var round: usize = 0;
+        while (round < 8) : (round += 1) {
+            var value_buf: [32]u8 = undefined;
+            const value = try std.fmt.bufPrint(&value_buf, "value-{d}", .{round});
+            try writer.beginTransaction();
+            try writer.putDocument("alpha", value);
+            try writer.commitTransaction();
+        }
+        try writer.checkpointRedoLog();
+        try std.testing.expectEqual(@as(u64, 0), writer.redo.?.writer.tail);
+        const before = writer.activeCheckpoint().commit_sequence;
+        _ = try writer.reclaimPages(4096);
+        const after = writer.activeCheckpoint();
+        try std.testing.expect(after.commit_sequence > before);
+        try std.testing.expectEqual(after.commit_sequence, after.redo_folded_through);
+        try writer.beginTransaction();
+        try writer.putDocument("beta", "two");
+        try writer.commitTransaction();
+    }
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reopened.close();
+    try expectRedoDocument(&reopened, "alpha", "value-7");
+    try expectRedoDocument(&reopened, "beta", "two");
+}
+
+// With nothing published, a writer holding the lease (or one that died
+// holding it) may have appended records it never made durable. A cold
+// reader bounds its replay to the checkpoint instead of scanning unbounded.
+test "lite redo log a cold reader does not replay unpublished appends while a writer holds the lease" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-unpublished-lease.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer writer.close();
+        try writer.beginTransaction();
+        try writer.putDocument("alpha", "one");
+        try writer.commitTransaction();
+    }
+    var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
+    defer region.close();
+    region.resetLogStateForTest();
+    region.markDeadWriterForTest(std.math.maxInt(u32) - 7);
+    {
+        var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+        defer reader.close();
+        try expectRedoDocument(&reader, "alpha", null);
+    }
+    region.clearWriterForTest();
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reader.close();
+    try expectRedoDocument(&reader, "alpha", "one");
 }

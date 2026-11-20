@@ -842,6 +842,11 @@ pub const Region = struct {
         self.header().writer_holder.store(packHolderGen(pid, self.own_liveness_slot, self.own_liveness_generation +% 1), .release);
     }
 
+    /// Test support: clears the writer word, as dead-writer recovery does.
+    pub fn clearWriterForTest(self: *Region) void {
+        self.header().writer_holder.store(0, .release);
+    }
+
     fn header(self: *const Region) *Header {
         return @ptrCast(@alignCast(self.mapping.ptr));
     }
@@ -1943,6 +1948,13 @@ pub const Region = struct {
     /// `fcntl` on every iteration).
     /// True when a live process other than `own_pid` holds the writer
     /// lease, so it may have an append in flight right now.
+    /// Whether another process holds the writer word, live or not: a dead
+    /// holder may still have left an unsynced append behind.
+    pub fn foreignWriterHeld(self: *const Region, own_pid: u32) bool {
+        const word = self.header().writer_holder.load(.acquire);
+        return word != 0 and holderPid(word) != own_pid;
+    }
+
     pub fn foreignLiveWriter(self: *const Region, own_pid: u32) bool {
         const word = self.header().writer_holder.load(.acquire);
         if (word == 0 or holderPid(word) == own_pid) return false;
