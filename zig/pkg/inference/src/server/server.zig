@@ -3576,6 +3576,7 @@ const PublicationLease = @import("../registry/publication_lease.zig").Lease;
 const PinnedRequestSelection = struct {
     node: *Node,
     proof: *model_manager_mod.PreparedPinnedEmbedding,
+    control: InferenceExecutionControl,
 
     fn verify(self: *PinnedRequestSelection, io: std.Io, path: []const u8, selector: ?[]const u8, inventory_publication: ?[32]u8) ![32]u8 {
         const a = self.node.allocator;
@@ -3584,7 +3585,7 @@ const PinnedRequestSelection = struct {
         const canonical = try realPathExistingAlloc(a, io, path);
         defer a.free(canonical);
         if (!pathHasComponentPrefix(canonical, root)) return error.ModelOutsideModelsDir;
-        return self.proof.capture(io, canonical, selector, inventory_publication);
+        return self.proof.capture(io, canonical, selector, inventory_publication, self.control);
     }
 
     fn prepare(raw: *anyopaque, io: std.Io, path: []const u8, selector: []const u8, inventory_publication: ?[32]u8) ![32]u8 {
@@ -3604,7 +3605,8 @@ const ScopedCatalogPublication = struct {
     lease: PublicationLease,
     artifacts: PublishedArtifacts,
 
-    fn open(a: std.mem.Allocator, io: std.Io, path: []const u8) !?ScopedCatalogPublication {
+    fn open(a: std.mem.Allocator, io: std.Io, path: []const u8, control: InferenceExecutionControl) !?ScopedCatalogPublication {
+        try control.check();
         // Direct ONNX paths are not parsed by the directory/GGUF listing path.
         if (std.mem.endsWith(u8, path, ".onnx")) return null;
         const publication = (try @import("../registry/managed_receipt.zig").publicationGeneration(a, io, path)) orelse return null;
@@ -3612,7 +3614,7 @@ const ScopedCatalogPublication = struct {
         errdefer a.free(owned_path);
         var lease = try PublicationLease.shared(a, io, owned_path);
         errdefer lease.deinit(io);
-        const artifacts = try PublishedArtifacts.init(a, io, owned_path, .{ .publication = publication });
+        const artifacts = try PublishedArtifacts.initWithControl(a, io, owned_path, .{ .publication = publication }, control);
         return .{ .path = owned_path, .lease = lease, .artifacts = artifacts };
     }
 
@@ -14122,7 +14124,7 @@ pub const Node = struct {
     }
 
     fn residentSelection(self: *Node, options: ModelSelectionOptions) ?selection_mod.Cache.ResidentPublication {
-        if (options.pinned) |pinned| return .{ .context = pinned, .prepare = PinnedRequestSelection.prepare };
+        if (options.pinned) |pinned| return .{ .context = pinned, .prepare = PinnedRequestSelection.prepare, .control = pinned.control };
         if (!options.reuse_resident) return null;
         return .{ .context = self, .matches = residentSelectionMatches };
     }
@@ -14138,6 +14140,13 @@ pub const Node = struct {
         if (self.selector_cache) |cache| {
             const selected = (try cache.resolveSelectionWithResident(self.allocator, io, self.config.models_dir, request_name, task_type, self.residentSelection(options))) orelse return null;
             if (options.reuse_resident or options.pinned != null) validated.* = selected;
+            return @constCast(selected.path);
+        }
+        if (options.pinned != null) {
+            var temporary = selection_mod.Cache.init(self.allocator);
+            defer temporary.deinit();
+            const selected = (try temporary.resolveSelectionWithResident(self.allocator, io, self.config.models_dir, request_name, task_type, self.residentSelection(options))) orelse return null;
+            validated.* = selected;
             return @constCast(selected.path);
         }
         return registry_mod.resolveInstalledModelSelector(self.allocator, io, self.config.models_dir, request_name, task_type);
@@ -14736,7 +14745,7 @@ pub const Node = struct {
         const model_name: ?[]const u8 = if (request.model.len > 0) request.model else null;
         var prepared_pin = model_manager_mod.PreparedPinnedEmbedding{ .manager = &self.model_manager };
         defer prepared_pin.deinit();
-        var pinned_selection = PinnedRequestSelection{ .node = self, .proof = &prepared_pin };
+        var pinned_selection = PinnedRequestSelection{ .node = self, .proof = &prepared_pin, .control = execution_control };
         const model_path_selection = self.resolveRequestModelSelectionWithOptions(ctx.allocator, ctx.io, model_name, "embedders", .{
             .reuse_resident = true,
             .pinned = if (request.model_revision != null) &pinned_selection else null,
@@ -26290,7 +26299,10 @@ pub const Node = struct {
             const actual = loaded.embedding_identity orelse return error.EmbeddingIdentityMismatch;
             if (!std.mem.eql(u8, expected, &actual)) return error.EmbeddingIdentityMismatch;
         }
-        try loaded.verifyEmbeddingIdentityWithControl(control);
+        loaded.verifyEmbeddingIdentityWithControl(control) catch |err| {
+            if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
+            return err;
+        };
         const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
         const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, .{
             .max_audio_decode_working_bytes = admission.audio_working_bytes,
@@ -26726,7 +26738,12 @@ pub const Node = struct {
 
         var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
-        const model_path = if (request.task == .reader)
+        var prepared_pin = model_manager_mod.PreparedPinnedEmbedding{ .manager = &self.model_manager };
+        defer prepared_pin.deinit();
+        var pinned_selection = PinnedRequestSelection{ .node = self, .proof = &prepared_pin, .control = execution_control };
+        const model_path = if (expected_revision != null)
+            self.resolveRequestModelSelectionWithOptions(ctx.allocator, ctx.io, request.model, runtimeTaskDir(request.task), .{ .pinned = &pinned_selection })
+        else if (request.task == .reader)
             self.resolveReadRequestModelSelection(ctx.allocator, ctx.io, request.model)
         else
             self.resolveRequestModelSelection(ctx.allocator, ctx.io, request.model, runtimeTaskDir(request.task));
@@ -26738,7 +26755,11 @@ pub const Node = struct {
         defer ctx.allocator.free(resolved_path);
         execution_control = selected.bind(execution_control);
 
-        var manifest = self.loadBoundManifest(ctx.allocator, resolved_path, false, execution_control) catch |err| {
+        const admission_manifest = if (expected_revision) |revision|
+            prepared_pin.admissionManifest(ctx.allocator, resolved_path, revision, execution_control)
+        else
+            self.loadBoundManifest(ctx.allocator, resolved_path, false, execution_control);
+        var manifest = admission_manifest catch |err| {
             if (try pinnedEmbeddingPreflightFailure(ctx, expected_revision, err)) |response| return response;
             return modelLoadFailureResponse(ctx, err);
         };
@@ -26790,7 +26811,7 @@ pub const Node = struct {
             }
         } else {
             var handle = if (expected_revision) |required|
-                self.model_manager.acquirePinnedEmbedding(resolved_path, required, execution_control) catch |err| {
+                self.model_manager.acquirePreparedPinnedEmbedding(resolved_path, required, execution_control, &prepared_pin) catch |err| {
                     if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
                     if (try pinnedEmbeddingPreflightFailure(ctx, expected_revision, err)) |response| return response;
                     return modelLoadFailureResponse(ctx, err);
@@ -27166,7 +27187,7 @@ pub const Node = struct {
             const candidate_result: manifest_mod.ListingCandidate = candidate: {
                 if (scoped_publication != null and listing_scope != null and std.mem.eql(u8, listing_scope.?.category, "embedders")) {
                     const scope = scoped_publication.?;
-                    scope.* = ScopedCatalogPublication.open(a, io, entry.path) catch |err| {
+                    scope.* = ScopedCatalogPublication.open(a, io, entry.path, control) catch |err| {
                         if (manifest_mod.isListingCandidateRejection(err)) break :candidate .{ .rejected = err };
                         return err;
                     };
@@ -41537,6 +41558,7 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
 /// Grouped execution uses the same admission failure identities as flat
 /// execution, before interpreting failures as invalid grouped input.
 fn groupedEmbeddingFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
     if (err == error.QueueFull) return transientCapacityFailureResponse(ctx, "SERVICE_UNAVAILABLE", "server at capacity for expanded request workload, try again later", "inference_admission");
     if (err == error.ImageTooLarge or err == error.ImageBatchTooLarge) return readImageErrorResponse(ctx, err);
@@ -51273,11 +51295,26 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     var managed_activation = try httpx.Request.init(a, .POST, managed_activation_path);
     defer managed_activation.deinit();
     managed_activation.body = "{\"model\":\"acme/other\",\"task\":\"embedder\"}";
-    var managed_activation_context = httpx.Context.init(a, io, &managed_activation);
+    const ReceiptReads = struct {
+        var count: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (std.mem.endsWith(u8, path, @import("../registry/managed_receipt.zig").complete_filename)) count += 1;
+            return original(raw, dir, path, options);
+        }
+    };
+    var activation_io_table = io.vtable.*;
+    ReceiptReads.count = 0;
+    ReceiptReads.original = activation_io_table.dirOpenFile;
+    activation_io_table.dirOpenFile = ReceiptReads.open;
+    const activation_io = std.Io{ .userdata = io.userdata, .vtable = &activation_io_table };
+    var managed_activation_context = httpx.Context.init(a, activation_io, &managed_activation);
     defer managed_activation_context.deinit();
     var managed_refused = try node.loadModelInstance(&managed_activation_context);
     defer managed_refused.deinit();
     try std.testing.expect(managed_refused.status.code >= 400);
+    try std.testing.expectEqual(@as(usize, 1), ReceiptReads.count);
     try std.testing.expect(managed_refused.headers.get(embedding_revision.response_header) == null);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
 
@@ -52812,6 +52849,14 @@ test "standalone embedding HTTP revision parser and acknowledgements" {
         try std.testing.expectEqual(@as(u16, 409), response.status.code);
         try std.testing.expectEqualStrings("true", response.headers.get("X-Antfly-Capability-Stale").?);
         try std.testing.expect(response.headers.get(embedding_revision.response_header) == null);
+    }
+    {
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try groupedEmbeddingFailureResponse(&ctx, error.ModelArtifactsChanging);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(response.headers.get("X-Antfly-Capability-Stale") == null);
     }
     for ([_][]const u8{ "\"bad\"", "7", "null" }) |value| {
         const invalid_body = try std.fmt.allocPrint(a, "{{\"model\":\"alias\",\"input\":\"text\",\"model_revision\":{s}}}", .{value});

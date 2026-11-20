@@ -4767,7 +4767,8 @@ pub const PreparedPinnedEmbedding = struct {
         return owned;
     }
 
-    pub fn capture(self: *PreparedPinnedEmbedding, io: std.Io, path: []const u8, selector: ?[]const u8, inventory_publication: ?[32]u8) ![32]u8 {
+    pub fn capture(self: *PreparedPinnedEmbedding, io: std.Io, path: []const u8, selector: ?[]const u8, inventory_publication: ?[32]u8, control: InferenceExecutionControl) ![32]u8 {
+        try control.check();
         if (selector == null or inventory_publication != null) {
             if (try self.manager.residentInstallation(io, path, inventory_publication)) |installed| {
                 self.deinit();
@@ -4781,7 +4782,7 @@ pub const PreparedPinnedEmbedding = struct {
         defer lease.deinit(io);
         const owned_path = try a.dupe(u8, path);
         errdefer a.free(owned_path);
-        var artifacts = try PublishedArtifacts.init(a, io, owned_path, null);
+        var artifacts = try PublishedArtifacts.initWithControl(a, io, owned_path, null, control);
         errdefer artifacts.deinit();
         const installed = artifacts.installation orelse return error.InferenceCapabilitiesStale;
         if (selector) |requested| {
@@ -4813,18 +4814,18 @@ pub const PreparedPinnedEmbedding = struct {
         }
         var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.manager.allocator, io, path);
         defer lease.deinit(io);
-        const construction = try self.prepareConstruction(io, path, installed);
+        const construction = try self.prepareConstruction(io, path, installed, control);
         try managed_receipt.requireInstallation(self.manager.allocator, io, path, installed);
         const manifest = try construction.loadManifest();
         return manifest.clone(alloc);
     }
 
-    fn prepareConstruction(self: *PreparedPinnedEmbedding, io: std.Io, path: []const u8, installed: managed_receipt.Installation) !*PinnedEmbeddingConstruction {
+    fn prepareConstruction(self: *PreparedPinnedEmbedding, io: std.Io, path: []const u8, installed: managed_receipt.Installation, control: InferenceExecutionControl) !*PinnedEmbeddingConstruction {
         if (self.construction == null) {
             const a = self.manager.allocator;
             const owned_path = try a.dupe(u8, path);
             errdefer a.free(owned_path);
-            var artifacts = try PublishedArtifacts.init(a, io, owned_path, .{ .publication = installed.publication });
+            var artifacts = try PublishedArtifacts.initWithControl(a, io, owned_path, .{ .publication = installed.publication }, control);
             errdefer artifacts.deinit();
             if (!std.meta.eql(artifacts.installation, @as(?managed_receipt.Installation, installed))) return error.ModelArtifactsChanging;
             self.construction = .{ .path = owned_path, .artifacts = artifacts };
@@ -10572,7 +10573,7 @@ pub const ModelManager = struct {
 
         var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
         defer lease.deinit(io);
-        const construction = try prepared.prepareConstruction(io, model_dir, installation);
+        const construction = try prepared.prepareConstruction(io, model_dir, installation, control);
         try managed_receipt.requireInstallation(self.allocator, io, model_dir, installation);
         const manifest = try construction.loadManifest();
         const declared = try self.embeddingRevisionCandidatesFromArtifacts(model_dir, manifest.*, control, true, &construction.artifacts);
@@ -10680,7 +10681,7 @@ pub const ModelManager = struct {
             try managed_receipt.requireInstallation(self.allocator, publication_io, model_dir, installed);
             break :publication installed.publication;
         } else try self.publicationForRequest(model_dir, control);
-        var owned_artifacts = if (prepared == null) try PublishedArtifacts.init(self.allocator, publication_io, model_dir, .{ .publication = managed_publication }) else null;
+        var owned_artifacts = if (prepared == null) try PublishedArtifacts.initWithControl(self.allocator, publication_io, model_dir, .{ .publication = managed_publication }, control orelse .{}) else null;
         defer if (owned_artifacts) |*artifacts| artifacts.deinit();
         const tokenizer_artifacts = if (prepared) |construction| &construction.artifacts else &owned_artifacts.?;
         // Manifest parsing and verified construction use the same catalog.
@@ -17844,7 +17845,7 @@ test "durable embedding revision transfers request preparation and verifies cold
     defer manager.deinit();
     var prepared = PreparedPinnedEmbedding{ .manager = &manager };
     defer prepared.deinit();
-    _ = try prepared.capture(io, path, null, null);
+    _ = try prepared.capture(io, path, null, null, .{});
     const manifest = try prepared.construction.?.loadManifest();
     const revisions = try manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, .{ .io = io }, &prepared.construction.?.artifacts);
     try std.testing.expectEqual(@as(usize, 1), revisions.len);

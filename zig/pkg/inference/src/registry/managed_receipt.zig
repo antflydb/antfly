@@ -320,7 +320,9 @@ fn loadValidatedSource(
     io: std.Io,
     dest_dir: []const u8,
     source: ReceiptSource,
+    control: ExecutionControl,
 ) !?ValidatedReceipt {
+    try control.check();
     const cwd = std.Io.Dir.cwd();
     const in_progress_path = try managedPath(allocator, dest_dir, in_progress_filename);
     defer allocator.free(in_progress_path);
@@ -358,6 +360,7 @@ fn loadValidatedSource(
         else => return err,
     };
     defer allocator.free(receipt_json);
+    try control.check();
 
     var parsed = std.json.parseFromSlice(
         DownloadReceipt,
@@ -374,6 +377,7 @@ fn loadValidatedSource(
         else => return error.InvalidManagedDownload,
     };
     errdefer parsed.deinit();
+    try control.check();
     if ((parsed.value.version != 1 and parsed.value.version != 2) or
         parsed.value.artifacts.len == 0 or
         parsed.value.artifacts.len > max_artifact_count)
@@ -403,6 +407,7 @@ fn loadValidatedSource(
     var has_supported_payload = false;
     var all_checksums_declared = true;
     for (parsed.value.artifacts, 0..) |artifact, index| {
+        try control.check();
         all_checksums_declared = all_checksums_declared and artifact.sha256 != null;
         const entry = path_index.getOrPutAssumeCapacity(artifact.path);
         if (entry.found_existing) return error.InvalidManagedDownload;
@@ -446,7 +451,8 @@ fn loadValidatedSource(
     }
     if (!has_supported_payload) return error.InvalidManagedDownload;
     // A linear second pass also covers aliases encountered before a digest.
-    for (artifacts) |*artifact| {
+    for (artifacts, 0..) |*artifact, i| {
+        if (i % 256 == 0) try control.check();
         artifact.sha256 = artifacts[canonical_groups.get(artifact.canonical_path).?].sha256;
     }
     switch (source) {
@@ -462,6 +468,7 @@ fn loadValidatedSource(
 
     var publication_generation: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(receipt_json, &publication_generation, .{});
+    try control.check();
     return .{
         .publication_generation = publication_generation,
         .all_checksums_declared = all_checksums_declared,
@@ -477,7 +484,16 @@ pub fn loadValidated(
     io: std.Io,
     dest_dir: []const u8,
 ) !?ValidatedReceipt {
-    return loadValidatedSource(allocator, io, dest_dir, .completion);
+    return loadValidatedWithControl(allocator, io, dest_dir, .{});
+}
+
+pub fn loadValidatedWithControl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    control: ExecutionControl,
+) !?ValidatedReceipt {
+    return loadValidatedSource(allocator, io, dest_dir, .completion, control);
 }
 
 /// Load the validated artifact plan of a private staging transaction. This is
@@ -488,8 +504,34 @@ pub fn loadValidatedPlan(
     io: std.Io,
     dest_dir: []const u8,
 ) !ValidatedReceipt {
-    return (try loadValidatedSource(allocator, io, dest_dir, .plan)) orelse
+    return (try loadValidatedSource(allocator, io, dest_dir, .plan, .{})) orelse
         error.IncompleteManagedDownload;
+}
+
+test "managed receipt validation observes cancellation during the artifact walk" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "payload" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = complete_filename,
+        // The second artifact is missing. Cancellation must take precedence.
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7},{\"path\":\"missing.gguf\",\"size\":1}]}",
+    });
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    try std.testing.expectError(error.InvalidManagedDownload, loadValidated(allocator, io, root));
+
+    const Stop = struct {
+        fn check(raw: ?*anyopaque) !void {
+            const checks: *usize = @ptrCast(@alignCast(raw));
+            checks.* += 1;
+            if (checks.* == 5) return error.Cancelled;
+        }
+    };
+    var checks: usize = 0;
+    try std.testing.expectError(error.Cancelled, loadValidatedWithControl(allocator, io, root, .{ .ptr = &checks, .check_fn = Stop.check }));
 }
 
 test "validated artifact checksum rehashes the opened file" {

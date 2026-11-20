@@ -359,7 +359,11 @@ pub fn managedModelSelectorsAlloc(allocator: std.mem.Allocator, io: Io, model_di
     return (try managedModelSelectionAlloc(allocator, io, model_dir)).names;
 }
 pub fn managedModelSelectionAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) !ManagedSelection {
-    var receipt = (managed_receipt.loadValidated(allocator, io, model_dir) catch |err| {
+    return managedModelSelectionWithControl(allocator, io, model_dir, .{});
+}
+
+pub fn managedModelSelectionWithControl(allocator: std.mem.Allocator, io: Io, model_dir: []const u8, control: ExecutionControl) !ManagedSelection {
+    var receipt = (managed_receipt.loadValidatedWithControl(allocator, io, model_dir, control) catch |err| {
         // Candidate-local publication failures must not hide healthy models.
         // Allocation and operational I/O failures remain actionable.
         if (manifest_mod.isListingCandidateRejection(err)) return .{ .rejected = true };
@@ -499,7 +503,7 @@ pub const ModelRegistry = struct {
             const entry_path = try std.fs.path.join(self.allocator, &.{ self.models_dir, entry.name });
             defer self.allocator.free(entry_path);
 
-            if (isModelDir(io, entry_path)) {
+            if (try isModelDirWithControl(io, entry_path, control)) {
                 try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name, kind_mode, null);
                 continue;
             }
@@ -521,7 +525,7 @@ pub const ModelRegistry = struct {
                 if (model_entry_kind != .directory and model_entry_kind != .sym_link) continue;
                 const model_path = try std.fs.path.join(self.allocator, &.{ entry_path, model_entry.name });
                 defer self.allocator.free(model_path);
-                if (!isModelDir(io, model_path)) continue;
+                if (!try isModelDirWithControl(io, model_path, control)) continue;
                 const model_name = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ entry.name, model_entry.name });
                 defer self.allocator.free(model_name);
                 try self.appendDiscoveredModel(io, entries, seen, model_path, model_name, kind_mode, null);
@@ -571,7 +575,7 @@ pub const ModelRegistry = struct {
                 if (entry_kind == .directory or entry_kind == .sym_link) {
                     const entry_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
                     defer self.allocator.free(entry_path);
-                    if (isModelDir(io, entry_path)) {
+                    if (try isModelDirWithControl(io, entry_path, control)) {
                         try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name, kind_mode, subdir.kind);
                     } else {
                         var owner_dir = Dir.cwd().openDir(io, entry_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -591,7 +595,7 @@ pub const ModelRegistry = struct {
                             if (model_entry_kind == .directory or model_entry_kind == .sym_link) {
                                 const model_path = try std.fs.path.join(self.allocator, &.{ path, entry.name, model_entry.name });
                                 defer self.allocator.free(model_path);
-                                if (!isModelDir(io, model_path)) {
+                                if (!try isModelDirWithControl(io, model_path, control)) {
                                     continue;
                                 }
                                 const model_name = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ entry.name, model_entry.name });
@@ -2236,8 +2240,15 @@ fn synthesizePulledModelManifestJsonInternal(
 /// Check if a directory is a model directory (leaf) rather than an owner directory.
 /// A model dir contains config.json, tokenizer.json, genai_config.json, a GGUF file, or an onnx/ subdir.
 fn isModelDir(io: Io, path: []const u8) bool {
+    return isModelDirWithControl(io, path, .{}) catch false;
+}
+
+fn isModelDirWithControl(io: Io, path: []const u8, control: ExecutionControl) !bool {
     const allocator = if (build_options.link_libc) std.heap.c_allocator else std.heap.smp_allocator;
-    var receipt = managed_receipt.loadValidated(allocator, io, path) catch return false;
+    var receipt = managed_receipt.loadValidatedWithControl(allocator, io, path, control) catch |err| switch (err) {
+        error.Cancelled, error.Timeout => return err,
+        else => return false,
+    };
     if (receipt) |*validated| {
         validated.deinit();
         // Receipt validation already requires at least one supported model
@@ -2262,6 +2273,7 @@ fn isModelDir(io: Io, path: []const u8) bool {
     defer dir.close(io);
     var iter = dir.iterate();
     while (iter.next(io) catch null) |entry| {
+        try control.check();
         const entry_kind = resolvedEntryKind(dir, io, entry) catch continue;
         if (entry_kind == .file and std.mem.endsWith(u8, entry.name, ".gguf"))
             return publicationStable(allocator, io, path);

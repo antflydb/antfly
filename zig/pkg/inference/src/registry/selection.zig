@@ -141,7 +141,7 @@ pub const Inventory = struct {
             try control.check();
             var candidate = std.heap.ArenaAllocator.init(allocator);
             defer candidate.deinit();
-            const proof = try registry.managedModelSelectionAlloc(candidate.allocator(), io, entry.path);
+            const proof = try registry.managedModelSelectionWithControl(candidate.allocator(), io, entry.path, control);
             const managed = proof.names;
             publication.* = if (proof.rejected) null else proof.publication;
             selectors.* = try a.alloc([]const u8, if (managed.len > 0) managed.len else if (std.mem.indexOfAny(u8, entry.name, ":@") == null) @as(usize, 1) else 0);
@@ -432,14 +432,16 @@ pub const Cache = struct {
         context: *anyopaque,
         matches: ?*const fn (*anyopaque, std.Io, []const u8, [32]u8) anyerror!bool = null,
         prepare: ?*const fn (*anyopaque, std.Io, []const u8, []const u8, ?[32]u8) anyerror![32]u8 = null,
+        control: ExecutionControl = .{},
     };
 
     pub fn resolveSelectionWithResident(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8, requested: []const u8, task: ?[]const u8, resident: ?ResidentPublication) !?ResolvedModel {
         // Full catalogs and misses get a bounded backstop for raw filesystem
         // imports. Existing coordinated pinned hits never scan other models.
+        const control: ExecutionControl = if (resident) |candidate| candidate.control else .{};
         var retried_catalog = false;
         const lookup = blk: while (true) {
-            const lease = try self.acquire(io, root, retried_catalog, .{});
+            const lease = try self.acquire(io, root, retried_catalog, control);
             defer lease.release();
             const inventory = lease.inventory();
             const index = if (task) |scope| try inventory.lookupIndex(requested, scope) else null;

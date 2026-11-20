@@ -162,6 +162,11 @@ pub const PublishedArtifacts = struct {
     const ExternalDataReader = @import("onnx_graph").tensor.ExternalDataReader;
 
     pub fn init(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected) !PublishedArtifacts {
+        return initWithControl(a, io, root, expected, .{});
+    }
+
+    pub fn initWithControl(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected, control: ExecutionControl) !PublishedArtifacts {
+        try control.check();
         const direct = managed.isDirectModelPath(root);
         const publication_root = try managed.publicationRootAlloc(a, io, root);
         defer a.free(publication_root);
@@ -191,7 +196,7 @@ pub const PublishedArtifacts = struct {
             };
             break :stamp managed.ArtifactStamp.fromStat(stat);
         } else null;
-        var receipt = if (standalone) null else try managed.loadValidated(a, io, physical_root);
+        var receipt = if (standalone) null else try managed.loadValidatedWithControl(a, io, physical_root, control);
         errdefer if (receipt) |*value| value.deinit();
         const publication = if (receipt) |value| value.publication_generation else null;
         if (expected) |value| if (!std.meta.eql(value.publication, publication)) return error.ModelArtifactsChanging;
@@ -200,7 +205,13 @@ pub const PublishedArtifacts = struct {
         if (!std.meta.eql(before, after)) return error.ModelArtifactsChanging;
         var index = std.StringHashMapUnmanaged(usize).empty;
         errdefer index.deinit(a);
-        if (receipt) |value| for (value.artifacts, 0..) |artifact, i| try index.put(a, artifact.canonical_path, i);
+        if (receipt) |value| {
+            try index.ensureTotalCapacity(a, @intCast(value.artifacts.len));
+            for (value.artifacts, 0..) |artifact, i| {
+                if (i % 256 == 0) try control.check();
+                index.putAssumeCapacity(artifact.canonical_path, i);
+            }
+        }
         const direct_index: ?usize = if (direct and receipt != null) blk: {
             const requested = try managed.resolveRequestedFilePath(a, io, root);
             defer a.free(requested);
@@ -213,6 +224,7 @@ pub const PublishedArtifacts = struct {
             if (!std.mem.eql(u8, canonical, receipt.?.artifacts[member].canonical_path)) return error.ModelArtifactNotPublished;
             break :blk member;
         } else null;
+        try control.check();
         const verified = try a.alloc(?managed.ArtifactStamp, if (receipt) |value| value.artifacts.len else 0);
         @memset(verified, null);
         return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .physical_root = physical_root, .physical_root_inode = root_stat.inode, .physical_direct = physical_direct, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .installation = installation, .canonical_index = index, .verified_stamps = verified };
