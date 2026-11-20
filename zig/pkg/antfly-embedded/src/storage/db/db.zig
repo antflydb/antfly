@@ -49412,6 +49412,15 @@ pub const DB = struct {
             if (before) |key| if (std.mem.order(u8, key, owner_range.start) != .gt) return true;
             const upper = if (end.len == 0) null else try internal_keys.documentRangeLowerAlloc(self.alloc, end);
             defer if (upper) |bound| self.alloc.free(bound);
+            var recovery_budget: ?resource_manager_mod.BudgetedAllocator = if (resource_manager_mod.BudgetedAllocator.fromAllocator(self.alloc) == null)
+                if (self.db.core.index_manager.resource_manager) |manager|
+                    resource_manager_mod.BudgetedAllocator.init(manager, .lsm_read_working_set, self.alloc, 1)
+                else
+                    null
+            else
+                null;
+            defer if (recovery_budget) |*budget| budget.deinit();
+            const recovery_alloc = if (recovery_budget) |*budget| budget.allocator() else self.alloc;
             var source_batch = Scan{
                 .owner = self,
                 .arena = std.heap.ArenaAllocator.init(self.alloc),
@@ -49419,7 +49428,7 @@ pub const DB = struct {
                 .now = currentTimeNs(),
                 .prefix = prefix,
                 .options = options,
-                .recovery = .{ .arena = std.heap.ArenaAllocator.init(self.alloc) },
+                .recovery = .{ .arena = std.heap.ArenaAllocator.init(recovery_alloc) },
                 .batch_size = @min(@max(options.scan_batch_size orelse 256, 1), 256),
             };
             defer source_batch.arena.deinit();
@@ -49448,6 +49457,7 @@ pub const DB = struct {
             initialized: bool = false,
             exhausted: bool = false,
             incomplete: ?bool = null,
+            explicit_keys: ?std.StringHashMapUnmanaged(void) = null,
         };
 
         /// Resolve the finite ordinal scope once for all failed keys in a
@@ -49467,8 +49477,9 @@ pub const DB = struct {
             } else unreachable;
             const constraints = options.constraints orelse return original_error;
             if (!constraints.positive_filter) return original_error;
-            const set = if (constraints.primary_include_compact) constraints.primary_include else doc_set.ResolvedDocSet{ .ordinals = constraints.filter_doc_nums };
-            if (set == .all) return original_error;
+            const ordinal_set: doc_set.ResolvedDocSet = .{ .ordinals = constraints.filter_doc_nums };
+            const set = if (constraints.primary_include_compact) &constraints.primary_include else &ordinal_set;
+            if (set.* == .all) return original_error;
 
             var pending: std.StringHashMapUnmanaged(usize) = .empty;
             defer pending.deinit(alloc);
@@ -49479,13 +49490,16 @@ pub const DB = struct {
             }
 
             if (!recovery.initialized) {
-                recovery.bitmap = if (set == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
+                // The iterator borrows the request-owned bitmap across batches.
+                recovery.bitmap = if (set.* == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
                 recovery.initialized = true;
             }
-            const numbers = if (set == .ordinals) set.ordinals else &.{};
-            var read = try self.db.core.store.beginReadTxn();
+            const numbers = if (set.* == .ordinals) set.ordinals else &.{};
+            var read = try self.db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer read.abort();
             try self.recoverKnownSourceKeys(&read, recovery, &pending, ordinals, visible);
+            // Keep the original identity error if optional recovery memory
+            // cannot be admitted. An incomplete cache cannot prove absence.
             const cache_alloc = recovery.arena.allocator();
             while (pending.count() != 0 and !recovery.exhausted) {
                 try db_query_search.checkSearchRequestDeadline(self.req);
@@ -49517,34 +49531,34 @@ pub const DB = struct {
                     try db_query_search.checkSearchRequestDeadline(self.req);
                     if (key) |id| {
                         if (recovery.reverse.contains(id)) continue;
-                        try recovery.reverse.put(cache_alloc, try cache_alloc.dupe(u8, id), .{ .ordinal = ordinal });
+                        const retained = cache_alloc.dupe(u8, id) catch return original_error;
+                        recovery.reverse.put(cache_alloc, retained, .{ .ordinal = ordinal }) catch return original_error;
                     } else {
-                        try recovery.missing.append(cache_alloc, ordinal);
+                        recovery.missing.append(cache_alloc, ordinal) catch return original_error;
                     }
                 }
                 try self.recoverKnownSourceKeys(&read, recovery, &pending, ordinals, visible);
             }
             if (pending.count() == 0) return;
             if (recovery.incomplete == null) recovery.incomplete = try self.hasLiveMissingSourceIdentity(&read, recovery.missing.items);
-            var unresolved_error: ?anyerror = null;
-            if (recovery.incomplete.?) {
-                var unresolved = pending.valueIterator();
-                while (unresolved.next()) |slot| {
-                    const failure = failures[slot.*].?;
-                    if (failure == error.StorageReadTemporarilyUnavailable) return failure;
-                    unresolved_error = failure;
-                }
-            } else if (pending.count() != 0) {
-                for ([_]doc_set.ResolvedDocSet{ set, constraints.legacy_filter }) |key_set| {
-                    if (key_set != .doc_keys) continue;
+            if (!recovery.incomplete.? and recovery.explicit_keys == null) {
+                var explicit: std.StringHashMapUnmanaged(void) = .empty;
+                for ([_]*const doc_set.ResolvedDocSet{ set, &constraints.legacy_filter }) |key_set| {
+                    if (key_set.* != .doc_keys) continue;
                     for (key_set.doc_keys) |key| {
                         try db_query_search.checkSearchRequestDeadline(self.req);
-                        const slot = pending.get(key) orelse continue;
-                        const failure = failures[slot].?;
-                        if (failure == error.StorageReadTemporarilyUnavailable) return failure;
-                        unresolved_error = failure;
+                        explicit.put(cache_alloc, key, {}) catch return original_error;
                     }
                 }
+                recovery.explicit_keys = explicit;
+            }
+            var unresolved_error: ?anyerror = null;
+            var unresolved = pending.iterator();
+            while (unresolved.next()) |entry| {
+                if (!recovery.incomplete.? and !recovery.explicit_keys.?.contains(entry.key_ptr.*)) continue;
+                const failure = failures[entry.value_ptr.*].?;
+                if (failure == error.StorageReadTemporarilyUnavailable) return failure;
+                unresolved_error = failure;
             }
             if (unresolved_error) |err| return err;
         }
@@ -158166,6 +158180,52 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
         try std.testing.expect(visible[0]);
         try std.testing.expectEqual(@as(?doc_set.DocOrdinal, endpoints[1]), resolved[0]);
         try std.testing.expectEqual(loaded_ordinals, recovery.offset);
+
+        // Stop inside the first bitmap page, then resume across later pages.
+        var bitmap_scope = @import("../../encoding/roaring.zig").RoaringBitmap.init(a);
+        defer bitmap_scope.deinit();
+        try bitmap_scope.add(endpoints[0]);
+        try bitmap_scope.addRange(1024, 1536);
+        const bitmap_options: db_query_search.MatchAllCandidateCollectOptions = .{
+            .constraints = &.{
+                .positive_filter = true,
+                .primary_include_compact = true,
+                .primary_include = .{ .ordinal_bitmap = bitmap_scope },
+                .legacy_filter = .{ .doc_keys = &.{writes[3].key} },
+            },
+        };
+        var bitmap_recovery: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(a) };
+        defer bitmap_recovery.arena.deinit();
+        try scan.recoverScopedSourceBatch(bitmap_options, &bitmap_recovery, a, &.{writes[1].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+        try std.testing.expect(visible[0] and !bitmap_recovery.exhausted);
+        try std.testing.expect(bitmap_recovery.bitmap.?.bitmap == &bitmap_options.constraints.?.primary_include.ordinal_bitmap);
+        try scan.recoverScopedSourceBatch(bitmap_options, &bitmap_recovery, a, &.{writes[2].key}, &.{error.InvalidDocIdentity}, visible[0..1], resolved[0..1]);
+        try std.testing.expect(!visible[0] and bitmap_recovery.exhausted);
+        const explicit_keys = bitmap_recovery.explicit_keys.?.count();
+        try std.testing.expectEqual(@as(usize, 1), explicit_keys);
+        try std.testing.expectError(error.InvalidDocIdentity, scan.recoverScopedSourceBatch(
+            bitmap_options,
+            &bitmap_recovery,
+            a,
+            &.{writes[3].key},
+            &.{error.InvalidDocIdentity},
+            visible[0..1],
+            resolved[0..1],
+        ));
+        try std.testing.expectEqual(explicit_keys, bitmap_recovery.explicit_keys.?.count());
+
+        var denied_allocator: std.testing.FailingAllocator = .init(a, .{ .fail_index = 0 });
+        var denied: DB.PrimaryMatchAllIdentityScan.SourceRecovery = .{ .arena = std.heap.ArenaAllocator.init(denied_allocator.allocator()) };
+        defer denied.arena.deinit();
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, scan.recoverScopedSourceBatch(
+            options,
+            &denied,
+            a,
+            &.{writes[2].key},
+            &.{error.StorageReadTemporarilyUnavailable},
+            visible[0..1],
+            resolved[0..1],
+        ));
 
         const missing_key = internal_keys.identityOrdinalToDocKey(endpoints[0]);
         {

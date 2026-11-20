@@ -11207,14 +11207,20 @@ const IndexedPredicateEvaluator = struct {
         return self.collectRangeEvidence(query, &physical, true);
     }
 
+    fn discardRangeFrontier(self: IndexedPredicateEvaluator) void {
+        if (self.probe_input) |memo| {
+            memo.deinit(self.alloc);
+            memo.* = .{ .range_projection_disabled = true };
+        }
+    }
+
     fn rangeEvidence(self: IndexedPredicateEvaluator, query: search_mod.SearchQuery, scope: *const roaring.RoaringBitmap) !RangeEvidence {
         if (self.key_domain != null) {
             const memo = self.probe_input orelse return RangeEvidence.init(self.alloc);
             if (memo.range_projection_disabled) return RangeEvidence.init(self.alloc);
             return self.collectKeyRangeEvidence(query, scope) catch |err| switch (err) {
                 error.OutOfMemory => {
-                    memo.deinit(self.alloc);
-                    memo.* = .{ .range_projection_disabled = true };
+                    self.discardRangeFrontier();
                     return RangeEvidence.init(self.alloc);
                 },
                 else => return err,
@@ -11314,16 +11320,38 @@ const IndexedPredicateEvaluator = struct {
         if (self.key_domain != null and (scope.cardinality() <= 128 or scope.cardinality() *| 32 <= self.snapshot.filterPhysicalDocCount())) {
             return self.executeStoredRange(stored, scope);
         }
-        var evidence = self.rangeEvidence(query, scope) catch |err| switch (err) {
+        const evidence = self.rangeEvidence(query, scope) catch |err| switch (err) {
             error.StorageReadTemporarilyUnavailable => return self.executeStoredRange(stored, scope),
+            error.OutOfMemory => {
+                self.discardRangeFrontier();
+                return self.executeStoredRange(stored, scope);
+            },
             else => return err,
+        };
+        return self.finishMixedRange(stored, scope, evidence);
+    }
+
+    fn finishMixedRange(self: IndexedPredicateEvaluator, stored: std.json.Value, scope: *const roaring.RoaringBitmap, owned: RangeEvidence) !roaring.RoaringBitmap {
+        var evidence = owned;
+        evidence.covered.andWith(scope);
+        evidence.matches.andWith(scope);
+        if (evidence.covered.cardinality() == scope.cardinality()) {
+            evidence.covered.deinit();
+            return evidence.matches;
+        }
+        if (evidence.covered.cardinality() == 0) {
+            evidence.covered.deinit();
+            evidence.matches.deinit();
+            return self.executeStoredRange(stored, scope);
+        }
+        var missing = scope.cloneExact(self.alloc) catch {
+            evidence.covered.deinit();
+            evidence.matches.deinit();
+            self.discardRangeFrontier();
+            return self.executeStoredRange(stored, scope);
         };
         defer evidence.covered.deinit();
         errdefer evidence.matches.deinit();
-        evidence.covered.andWith(scope);
-        evidence.matches.andWith(scope);
-        if (evidence.covered.cardinality() == scope.cardinality()) return evidence.matches;
-        var missing = try scope.cloneExact(self.alloc);
         defer missing.deinit();
         missing.andNotWith(&evidence.covered);
         var residual = try self.executeStoredRange(stored, &missing);
@@ -12434,6 +12462,38 @@ test "optional numeric range releases a published frontier when evidence allocat
     try std.testing.expectEqual(@as(usize, 0), evidence.covered.cardinality());
     try std.testing.expectEqual(@as(usize, 0), memo.batches.items.len);
     try std.testing.expect(memo.range_projection_disabled);
+}
+
+test "optional numeric range discards partial evidence when uncovered scope allocation fails" {
+    const backing = std.testing.allocator;
+    var failing: std.testing.FailingAllocator = .init(backing, .{});
+    const alloc = failing.allocator();
+    var memo: IndexedPredicateEvaluator.FrontierProbeInput = .{ .covered = roaring.RoaringBitmap.init(alloc) };
+    defer memo.deinit(alloc);
+    try memo.covered.?.add(1);
+    var scope = roaring.RoaringBitmap.init(backing);
+    defer scope.deinit();
+    try scope.addRange(1, 3);
+    var evidence = IndexedPredicateEvaluator.RangeEvidence.init(backing);
+    try evidence.covered.add(1);
+    try evidence.matches.add(1);
+    const evaluator: IndexedPredicateEvaluator = .{
+        .snapshot = undefined,
+        .analysis = .{},
+        .schema = null,
+        .executor = .{ .ctx = null, .text_index_entry = undefined },
+        .control = .{},
+        .alloc = alloc,
+        .scratch = alloc,
+        .cache_prefix = "",
+        .probe_input = &memo,
+    };
+    failing.fail_index = failing.alloc_index;
+    // The sentinel error confirms that the stored evaluator was called after
+    // the clone failed. The testing allocator checks evidence ownership.
+    try std.testing.expectError(error.UnsupportedQueryRequest, evaluator.finishMixedRange(.null, &scope, evidence));
+    try std.testing.expect(memo.range_projection_disabled);
+    try std.testing.expect(memo.covered == null);
 }
 
 const ResidualIdentityContext = struct {
