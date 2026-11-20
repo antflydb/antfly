@@ -51,6 +51,7 @@ pub const ValidatedArtifact = struct {
 
 pub const ValidatedReceipt = struct {
     publication_generation: [32]u8 = @splat(0),
+    all_checksums_declared: bool = false,
     allocator: std.mem.Allocator,
     parsed: std.json.Parsed(DownloadReceipt),
     artifacts: []ValidatedArtifact,
@@ -407,7 +408,9 @@ fn loadValidatedSource(
     try canonical_groups.ensureTotalCapacity(allocator, @intCast(parsed.value.artifacts.len));
 
     var has_supported_payload = false;
+    var all_checksums_declared = true;
     for (parsed.value.artifacts, 0..) |artifact, index| {
+        all_checksums_declared = all_checksums_declared and artifact.sha256 != null;
         const entry = path_index.getOrPutAssumeCapacity(artifact.path);
         if (entry.found_existing) return error.InvalidManagedDownload;
         entry.value_ptr.* = index;
@@ -468,6 +471,7 @@ fn loadValidatedSource(
     std.crypto.hash.sha2.Sha256.hash(receipt_json, &publication_generation, .{});
     return .{
         .publication_generation = publication_generation,
+        .all_checksums_declared = all_checksums_declared,
         .allocator = allocator,
         .parsed = parsed,
         .artifacts = artifacts,

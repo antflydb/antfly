@@ -2986,11 +2986,35 @@ fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []con
 
 fn hasCompleteChecksums(artifacts: *const PublishedArtifacts) bool {
     const receipt = artifacts.receipt orelse return false;
+    if (receipt.all_checksums_declared) return true;
     for (receipt.artifacts) |artifact| {
         if (artifact.sha256 == null) return false;
     }
     return true;
 }
+
+// Explicit checksums make the digest a function of the raw receipt. If a
+// legacy entry inherits a checksum through a symlink, its effective digest
+// also depends on this installation's validated alias bindings.
+const DeclaredReceiptRevision = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    entry: ?struct { publication: [32]u8, revision: [32]u8 } = null,
+
+    fn get(self: *DeclaredReceiptRevision, a: std.mem.Allocator, io: std.Io, receipt: *const managed_receipt.ValidatedReceipt, control: InferenceExecutionControl) ![32]u8 {
+        if (!receipt.all_checksums_declared) return receiptedModelRevision(a, io, receipt, null, control, false);
+        spinLock(&self.lock);
+        const cached = self.entry;
+        self.lock.unlock();
+        if (cached) |entry| {
+            if (std.mem.eql(u8, &entry.publication, &receipt.publication_generation)) return entry.revision;
+        }
+        const revision = try receiptedModelRevision(a, io, receipt, null, control, false);
+        spinLock(&self.lock);
+        defer self.lock.unlock();
+        self.entry = .{ .publication = receipt.publication_generation, .revision = revision };
+        return revision;
+    }
+};
 
 fn receiptedModelRevision(
     a: std.mem.Allocator,
@@ -5117,7 +5141,7 @@ pub const ModelHandle = struct {
     /// without penalizing unrelated models that use the same backend.
     pub fn quarantine(self: *ModelHandle) void {
         const model = self.model orelse return;
-        markModelBackendUnhealthy(self.manager, model.model_dir, model.session.backend());
+        markModelBackendUnhealthy(self.manager, model.model_dir, model.managed_publication, model.session.backend());
         self.manager.retireLoadedModel(model);
         self.release();
     }
@@ -5896,6 +5920,7 @@ pub const ModelManager = struct {
     merged_decoder_membership: MergedDecoderMembershipCache = .{},
     verified_artifacts: @import("../registry/published_artifacts.zig").VerificationCache = .{},
     unhealthy_backend_lock: std.atomic.Mutex = .unlocked,
+    declared_receipt_revisions: [64]DeclaredReceiptRevision = @splat(.{}),
     unhealthy_model_backends: std.AutoHashMapUnmanaged(ModelBackendHealthKey, u64) = .empty,
     tokenizer_cache_config_mutex: std.atomic.Mutex = .unlocked,
     resource_domain: ?*ResourceDomain = null,
@@ -9645,7 +9670,6 @@ pub const ModelManager = struct {
     ) !?*LoadedModel {
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
-            if (modelBackendIsUnhealthy(self, model_dir, backend)) continue;
             const variant_key = try backendVariantCacheKeyWithPrecision(
                 self.allocator,
                 model_dir,
@@ -9654,16 +9678,18 @@ pub const ModelManager = struct {
                 policy.gliner_cuda_precision,
             );
             defer self.allocator.free(variant_key);
-            if (self.loaded.get(variant_key)) |model| return model;
-            if (self.loaded_aliases.get(variant_key)) |model| return model;
+            if (self.loaded.get(variant_key)) |model|
+                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_publication, backend)) return model;
+            if (self.loaded_aliases.get(variant_key)) |model|
+                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_publication, backend)) return model;
         }
         if (policy.accept_default_alias) {
             if (self.loaded.get(model_dir)) |model|
-                if (!modelBackendIsUnhealthy(self, model_dir, model.session.backend()) and
+                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_publication, model.session.backend()) and
                     (!policy.require_default_alias_backend_match or
                         loadedModelUsesPreferredBackend(model, preferred_backends))) return model;
             if (self.loaded_aliases.get(model_dir)) |model|
-                if (!modelBackendIsUnhealthy(self, model_dir, model.session.backend()) and
+                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_publication, model.session.backend()) and
                     (!policy.require_default_alias_backend_match or
                         loadedModelUsesPreferredBackend(model, preferred_backends))) return model;
         }
@@ -10258,18 +10284,43 @@ pub const ModelManager = struct {
         control: InferenceExecutionControl,
         include_unavailable: bool,
     ) !EmbeddingRevisions {
-        var result: EmbeddingRevisions = .{};
         try control.check();
-        if (manifest.managed_publication == null) return result;
+        if (manifest.managed_publication == null) return .{};
         const io = control.io orelse try self.componentPlanIo();
         var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
         defer lease.deinit(io);
         var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = manifest.managed_publication });
         defer artifacts.deinit();
-        if (!hasCompleteChecksums(&artifacts)) return result;
+        return self.embeddingRevisionCandidatesFromArtifacts(model_dir, manifest, control, include_unavailable, &artifacts);
+    }
+
+    pub fn declaredEmbeddingRevisionsFromArtifacts(
+        self: *ModelManager,
+        model_dir: []const u8,
+        manifest: manifest_mod.ModelManifest,
+        control: InferenceExecutionControl,
+        artifacts: *const PublishedArtifacts,
+    ) !EmbeddingRevisions {
+        return self.embeddingRevisionCandidatesFromArtifacts(model_dir, manifest, control, false, artifacts);
+    }
+
+    fn embeddingRevisionCandidatesFromArtifacts(
+        self: *ModelManager,
+        model_dir: []const u8,
+        manifest: manifest_mod.ModelManifest,
+        control: InferenceExecutionControl,
+        include_unavailable: bool,
+        artifacts: *const PublishedArtifacts,
+    ) !EmbeddingRevisions {
+        var result: EmbeddingRevisions = .{};
+        try control.check();
+        if (!std.meta.eql(manifest.managed_publication, artifacts.publication)) return error.ModelArtifactsChanging;
+        if (!hasCompleteChecksums(artifacts)) return result;
         if (try artifacts.hasRejectedChecksum(&self.verified_artifacts)) return error.ChecksumMismatch;
-        const declared = try receiptedModelRevision(self.allocator, io, &artifacts.receipt.?, null, control, false);
-        const artifact_revision = try embeddingArtifactRevision(manifest, imagePreprocessingRevision(manifest, declared), &artifacts);
+        const receipt = &artifacts.receipt.?;
+        const slot = &self.declared_receipt_revisions[receipt.publication_generation[0] % self.declared_receipt_revisions.len];
+        const declared = try slot.get(self.allocator, artifacts.io, receipt, control);
+        const artifact_revision = try embeddingArtifactRevision(manifest, imagePreprocessingRevision(manifest, declared), artifacts);
         const manager = &self.session_manager;
         if (manager.required_backend_invalid) return result;
         var required: [1]backends.BackendType = undefined;
@@ -10290,7 +10341,7 @@ pub const ModelManager = struct {
             if (!backend.available() or !backend.supportsDirectSessionLoad()) continue;
             if (modelBackendPolicyError(manifest, backend, load_policy.cache_policy.a4b_request) != null) continue;
             if (!modelBackendMeetsJitPolicy(manager, manifest, backend)) continue;
-            if (!include_unavailable and self.pinnedBackendIsUnavailable(model_dir, backend)) continue;
+            if (!include_unavailable and self.pinnedBackendIsUnavailable(model_dir, manifest.managed_publication, backend)) continue;
             if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) continue;
             if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
             if (manifest.embedding_style == .embedding_gemma2 and backend != .native and backend != .metal and backend != .cuda) continue;
@@ -10343,7 +10394,7 @@ pub const ModelManager = struct {
         for (declared.values(), declared.backends[0..declared.len]) |revision, backend| {
             if (!std.mem.eql(u8, &revision, &expected)) continue;
             known_recipe = true;
-            if (self.pinnedBackendIsUnavailable(model_dir, backend)) continue;
+            if (self.pinnedBackendIsUnavailable(model_dir, publication, backend)) continue;
             if (backend == .cuda and !try backends.probeCudaDeviceWithControl(control)) continue;
             compatible[count] = backend;
             count += 1;
@@ -10355,7 +10406,7 @@ pub const ModelManager = struct {
         else
             self.acquireFromDirWithPreferredBackendsAndControl(model_dir, compatible[0..count], false, control);
         var handle = acquired catch |err| {
-            if (count == 1 and isPinnedBackendLoadFailure(err)) markModelBackendUnhealthy(self, model_dir, compatible[0]);
+            if (count == 1 and isPinnedBackendLoadFailure(err)) markModelBackendUnhealthy(self, model_dir, publication, compatible[0]);
             return err;
         };
         errdefer handle.releaseObservation();
@@ -10363,9 +10414,9 @@ pub const ModelManager = struct {
         return handle;
     }
 
-    fn pinnedBackendIsUnavailable(self: *ModelManager, model_dir: []const u8, backend: backends.BackendType) bool {
+    fn pinnedBackendIsUnavailable(self: *ModelManager, model_dir: []const u8, publication: ?[32]u8, backend: backends.BackendType) bool {
         if (backend == .cuda and backends.knownCudaDeviceAvailability() == false) return true;
-        return modelBackendIsUnhealthy(self, model_dir, backend);
+        return modelBackendIsUnhealthy(self, model_dir, publication, backend);
     }
 
     fn acquireResidentPinnedEmbedding(
@@ -10381,7 +10432,7 @@ pub const ModelManager = struct {
         defer self.unlockLoadedModels();
         for (candidates) |backend| {
             const model = (try self.lookupLoadedModelLocked(model_dir, &.{backend}, false, defaults.cache_policy)) orelse continue;
-            if (self.pinnedBackendIsUnavailable(model_dir, model.session.backend()) or
+            if (self.pinnedBackendIsUnavailable(model_dir, publication, model.session.backend()) or
                 !std.meta.eql(model.managed_publication, @as(?[32]u8, publication)) or
                 !std.meta.eql(model.durable_embedding_revision, @as(?[32]u8, expected))) continue;
             model.active_handles += 1;
@@ -10998,10 +11049,11 @@ fn a4bRequestCacheIdentity(
 const model_backend_quarantine_ns: u64 = 30 * std.time.ns_per_s;
 const ModelBackendHealthKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
-fn modelBackendHealthKey(model_dir: []const u8, backend: backends.BackendType) ModelBackendHealthKey {
+fn modelBackendHealthKey(model_dir: []const u8, publication: ?[32]u8, backend: backends.BackendType) ModelBackendHealthKey {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(model_dir);
-    hasher.update(&[_]u8{@backingInt(backend)});
+    hasher.update(&.{ @backingInt(backend), @intFromBool(publication != null) });
+    if (publication) |published| hasher.update(&published);
     var digest: ModelBackendHealthKey = undefined;
     hasher.final(&digest);
     return digest;
@@ -11010,13 +11062,24 @@ fn modelBackendHealthKey(model_dir: []const u8, backend: backends.BackendType) M
 fn markModelBackendUnhealthy(
     self: *ModelManager,
     model_dir: []const u8,
+    publication: ?[32]u8,
     backend: backends.BackendType,
 ) void {
     const retry_after_ns = platform.time.monotonicNs() +| model_backend_quarantine_ns;
     spinLock(&self.unhealthy_backend_lock);
+    const key = modelBackendHealthKey(model_dir, publication, backend);
+    // Retired publications may never be looked up again.
+    if (self.unhealthy_model_backends.count() >= 1024 and !self.unhealthy_model_backends.contains(key)) {
+        var entries = self.unhealthy_model_backends.iterator();
+        var earliest = entries.next().?;
+        while (entries.next()) |entry| {
+            if (entry.value_ptr.* < earliest.value_ptr.*) earliest = entry;
+        }
+        _ = self.unhealthy_model_backends.remove(earliest.key_ptr.*);
+    }
     self.unhealthy_model_backends.put(
         self.allocator,
-        modelBackendHealthKey(model_dir, backend),
+        key,
         retry_after_ns,
     ) catch {
         self.unhealthy_backend_lock.unlock();
@@ -11033,9 +11096,10 @@ fn markModelBackendUnhealthy(
 fn modelBackendIsUnhealthy(
     self: *ModelManager,
     model_dir: []const u8,
+    publication: ?[32]u8,
     backend: backends.BackendType,
 ) bool {
-    const key = modelBackendHealthKey(model_dir, backend);
+    const key = modelBackendHealthKey(model_dir, publication, backend);
     const now_ns = platform.time.monotonicNs();
     spinLock(&self.unhealthy_backend_lock);
     defer self.unhealthy_backend_lock.unlock();
@@ -13022,7 +13086,7 @@ fn loadSessionForPreferredBackendsWithArtifactsImpl(
         if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
         if (backend == .metal and laya_candidate and !laya_packed and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
         if (control) |active| try active.check();
-        if (modelBackendIsUnhealthy(manager, model_dir, backend)) {
+        if (modelBackendIsUnhealthy(manager, model_dir, man.managed_publication, backend)) {
             rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);
             continue;
         }
@@ -17514,6 +17578,46 @@ test "embeddinggemma2 preflight shares host capacity before model load and prese
     try std.testing.expectEqual(@as(usize, 0), manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
 }
 
+test "durable embedding revision keeps inherited receipt digests installation-specific" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const left = "first";
+    const right = "other";
+    var left_digest: [32]u8 = undefined;
+    var right_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(left, &left_digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(right, &right_digest, .{});
+    const left_hex = std.fmt.bytesToHex(left_digest, .lower);
+    const right_hex = std.fmt.bytesToHex(right_digest, .lower);
+    const receipt_json = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .artifacts = &.{
+        .{ .path = "model.safetensors", .size = left.len, .sha256 = &left_hex },
+        .{ .path = "other.safetensors", .size = right.len, .sha256 = &right_hex },
+        .{ .path = "selected.safetensors", .size = left.len },
+    } }, .{});
+    defer a.free(receipt_json);
+    var slot: DeclaredReceiptRevision = .{};
+    var revisions: [2][32]u8 = undefined;
+    for ([_][]const u8{ "first", "second" }, [_][]const u8{ "model.safetensors", "other.safetensors" }, &revisions) |name, target, *revision| {
+        try tmp.dir.createDirPath(io, name);
+        var dir = try tmp.dir.openDir(io, name, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = left });
+        try dir.writeFile(io, .{ .sub_path = "other.safetensors", .data = right });
+        try dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt_json });
+        try dir.symLink(io, target, "selected.safetensors", .{});
+        const path = try dir.realPathFileAlloc(io, ".", a);
+        defer a.free(path);
+        var validated = (try managed_receipt.loadValidated(a, io, path)).?;
+        defer validated.deinit();
+        try std.testing.expect(!validated.all_checksums_declared);
+        try std.testing.expect(validated.find("selected.safetensors").?.sha256 != null);
+        revision.* = try slot.get(a, io, &validated, .{ .io = io });
+    }
+    try std.testing.expect(!std.mem.eql(u8, &revisions[0], &revisions[1]));
+}
+
 test "capi resolver model identity uses receipt digests before load and survives copying" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -17554,7 +17658,13 @@ test "capi resolver model identity uses receipt digests before load and survives
         bound_manifest.managed_publication = try managed_receipt.publicationGeneration(a, io, first_path);
         const initial = try manager.declaredEmbeddingRevisions(first_path, bound_manifest, .{ .io = io });
         try std.testing.expectEqual(@as(usize, 1), initial.len);
-        markModelBackendUnhealthy(&manager, first_path, .native);
+        markModelBackendUnhealthy(&manager, first_path, bound_manifest.managed_publication, .native);
+        const other_publication: [32]u8 = @splat(0xff);
+        try std.testing.expect(!modelBackendIsUnhealthy(&manager, first_path, other_publication, .native));
+        markModelBackendUnhealthy(&manager, first_path, other_publication, .native);
+        try std.testing.expect(modelBackendIsUnhealthy(&manager, first_path, bound_manifest.managed_publication, .native));
+        try std.testing.expect(modelBackendIsUnhealthy(&manager, first_path, other_publication, .native));
+        try std.testing.expect(!modelBackendIsUnhealthy(&manager, first_path, null, .native));
         const unhealthy = try manager.declaredEmbeddingRevisions(first_path, bound_manifest, .{ .io = io });
         try std.testing.expectEqual(@as(usize, 0), unhealthy.len);
         const other = try manager.declaredEmbeddingRevisions(second_path, bound_manifest, .{ .io = io });

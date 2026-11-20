@@ -1395,6 +1395,35 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     return loadFromCatalog(allocator, &catalog);
 }
 
+/// Borrow a validated publication under the caller's shared publication lease.
+pub fn loadFromPublishedArtifacts(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    artifacts: *const @import("../registry/published_artifacts.zig").PublishedArtifacts,
+    comptime listing: bool,
+) !ModelManifest {
+    std.debug.assert(artifacts.publication != null);
+    const catalog = ArtifactCatalog{
+        .allocator = allocator,
+        .model_dir_path = if (artifacts.physical_direct != null) artifacts.storage_root else model_path,
+        .physical_root = artifacts.physical_root,
+        .root_inode = artifacts.physical_root_inode,
+        .receipt = artifacts.receipt,
+    };
+    if (artifacts.physical_direct) |path| {
+        var manifest = ModelManifest{ .allocator = allocator, .managed_publication = artifacts.publication };
+        errdefer manifest.deinit();
+        manifest.gguf_path = try allocator.dupe(u8, path);
+        if (!listing) {
+            try ignoreNonResourceMetadataError(applyGgufTokenizerMetadata(&manifest, allocator, &catalog, catalog.model_dir_path, path));
+            try applyImplicitModelTypeHints(&manifest, model_path);
+            try finalizeEmbeddingProfile(&manifest);
+        }
+        return manifest;
+    }
+    return if (listing) loadListingFromCatalog(allocator, &catalog) else loadFromCatalog(allocator, &catalog);
+}
+
 /// Discover a directory source with physical IO and logical task hints kept
 /// separate. The requested alias is checked before publishing the snapshot,
 /// but is never reopened for metadata or weight discovery.
@@ -1777,10 +1806,9 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
 /// still records enough artifact paths to hide obviously unloadable bundles and
 /// to expose text/image/audio listing metadata.
 pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !ModelManifest {
-    var manifest = ModelManifest{ .allocator = allocator };
-    errdefer manifest.deinit();
-
     if (std.mem.endsWith(u8, model_dir_path, ".gguf")) {
+        var manifest = ModelManifest{ .allocator = allocator };
+        errdefer manifest.deinit();
         var direct = try DirectGgufArtifact.init(allocator, model_dir_path);
         defer direct.deinit();
         manifest.gguf_path = direct.takePath();
@@ -1790,6 +1818,13 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
 
     var catalog = try ArtifactCatalog.initPublished(allocator, model_dir_path);
     defer catalog.deinit();
+    return loadListingFromCatalog(allocator, &catalog);
+}
+
+fn loadListingFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !ModelManifest {
+    const model_dir_path = catalog.model_dir_path;
+    var manifest = ModelManifest{ .allocator = allocator };
+    errdefer manifest.deinit();
     manifest.managed_publication = if (catalog.receipt) |value| value.publication_generation else null;
     manifest.source_root = try allocator.dupe(u8, catalog.storageRoot());
     manifest.source_root_inode = catalog.root_inode;
@@ -1802,16 +1837,16 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
 
     if (try catalog.readOptional("config.json")) |config_bytes| {
         defer allocator.free(config_bytes);
-        if (!try parseBoundaryConfigFromCatalog(&manifest, allocator, &catalog, config_bytes)) {
+        if (!try parseBoundaryConfigFromCatalog(&manifest, allocator, catalog, config_bytes)) {
             try ignoreNonResourceMetadataError(parseListingConfigJson(&manifest, allocator, config_bytes));
             // Route raw span checkpoints from their executable architecture
             // contract even when Antfly has not synthesized model_manifest.json.
             // This reads only the small nested config; exact weight, tokenizer,
             // backend, and request qualification remains a live-session gate.
-            try parseSpanEncoderConfigFromCatalog(&manifest, allocator, &catalog, config_bytes);
+            try parseSpanEncoderConfigFromCatalog(&manifest, allocator, catalog, config_bytes);
         }
     }
-    try detectGlideFromCatalog(&manifest, allocator, &catalog);
+    try detectGlideFromCatalog(&manifest, allocator, catalog);
     if (manifest.native_arch_hint == .none and manifest.config_model_arch.len == 0) {
         if (try catalog.readOptional("clip_config.json")) |config_bytes| {
             defer allocator.free(config_bytes);
@@ -1833,9 +1868,9 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
 
     if (try catalog.readOptional("antfly_inference_bundle.json")) |bundle_bytes| {
         defer allocator.free(bundle_bytes);
-        try parseInferenceBundleJsonWithCatalog(&manifest, allocator, &catalog, bundle_bytes);
+        try parseInferenceBundleJsonWithCatalog(&manifest, allocator, catalog, bundle_bytes);
     }
-    try parseOptionalInferenceVariantsFile(&manifest, allocator, &catalog);
+    try parseOptionalInferenceVariantsFile(&manifest, allocator, catalog);
 
     if (try catalog.readOptional("gliner_config.json")) |gliner_bytes| {
         defer allocator.free(gliner_bytes);
@@ -1874,36 +1909,36 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
             try parseTokenizerJsonSpecialTokens(&manifest, allocator, tokenizer_bytes);
         }
     }
-    try applyListingGlinerHint(&manifest, allocator, &catalog);
+    try applyListingGlinerHint(&manifest, allocator, catalog);
 
     if (!manifest.isClipclapGgufBundle()) {
-        if (manifest.onnx_path == null) try findPrimaryOnnx(&manifest, &catalog);
-        if (manifest.visual_model_path == null) manifest.visual_model_path = try findFileInSubdirs(allocator, &catalog, &visual_model_candidates, &onnx_subdirs);
-        if (manifest.audio_model_path == null) manifest.audio_model_path = try findFileInSubdirs(allocator, &catalog, &audio_model_candidates, &onnx_subdirs);
-        if (manifest.text_projection_path == null) manifest.text_projection_path = try findFileInSubdirs(allocator, &catalog, &text_projection_candidates, &onnx_subdirs);
-        if (manifest.visual_projection_path == null) manifest.visual_projection_path = try findFileInSubdirs(allocator, &catalog, &visual_projection_candidates, &onnx_subdirs);
-        if (manifest.audio_projection_path == null) manifest.audio_projection_path = try findFileInSubdirs(allocator, &catalog, &audio_projection_candidates, &onnx_subdirs);
+        if (manifest.onnx_path == null) try findPrimaryOnnx(&manifest, catalog);
+        if (manifest.visual_model_path == null) manifest.visual_model_path = try findFileInSubdirs(allocator, catalog, &visual_model_candidates, &onnx_subdirs);
+        if (manifest.audio_model_path == null) manifest.audio_model_path = try findFileInSubdirs(allocator, catalog, &audio_model_candidates, &onnx_subdirs);
+        if (manifest.text_projection_path == null) manifest.text_projection_path = try findFileInSubdirs(allocator, catalog, &text_projection_candidates, &onnx_subdirs);
+        if (manifest.visual_projection_path == null) manifest.visual_projection_path = try findFileInSubdirs(allocator, catalog, &visual_projection_candidates, &onnx_subdirs);
+        if (manifest.audio_projection_path == null) manifest.audio_projection_path = try findFileInSubdirs(allocator, catalog, &audio_projection_candidates, &onnx_subdirs);
     }
 
-    if (manifest.safetensors_path == null) manifest.safetensors_path = try findFileInSubdirs(allocator, &catalog, &safetensors_candidates, &.{""});
-    if (manifest.safetensors_index_path == null) manifest.safetensors_index_path = try findFileInSubdirs(allocator, &catalog, &safetensors_index_candidates, &.{""});
-    if (manifest.gliner_head_gguf_path == null) manifest.gliner_head_gguf_path = try findFileInSubdirs(allocator, &catalog, &.{"gliner_head.gguf"}, &.{""});
-    if (manifest.gliner_head_safetensors_path == null) manifest.gliner_head_safetensors_path = try findFileInSubdirs(allocator, &catalog, &.{"gliner_head.safetensors"}, &.{""});
-    try discoverJinaRetrievalAdapter(&manifest, &catalog);
-    if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, &catalog, &.{"config.json"}, &.{""});
-    if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, &catalog, &.{"model_manifest.json"}, &.{""});
-    if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, &catalog, &.{"tokenizer.json"}, &.{""});
-    if (manifest.vocab_txt_path == null) manifest.vocab_txt_path = try findFileInSubdirs(allocator, &catalog, &.{"vocab.txt"}, &.{""});
-    if (manifest.tokenizer_config_path == null) manifest.tokenizer_config_path = try findFileInSubdirs(allocator, &catalog, &.{"tokenizer_config.json"}, &.{""});
-    if (manifest.preprocessor_config_path == null) manifest.preprocessor_config_path = try findFileInSubdirs(allocator, &catalog, &.{"preprocessor_config.json"}, &.{""});
-    if (manifest.processor_config_path == null) manifest.processor_config_path = try findFileInSubdirs(allocator, &catalog, &.{"processor_config.json"}, &.{""});
-    try fillAutoDetectedGgufPaths(&manifest, allocator, &catalog);
+    if (manifest.safetensors_path == null) manifest.safetensors_path = try findFileInSubdirs(allocator, catalog, &safetensors_candidates, &.{""});
+    if (manifest.safetensors_index_path == null) manifest.safetensors_index_path = try findFileInSubdirs(allocator, catalog, &safetensors_index_candidates, &.{""});
+    if (manifest.gliner_head_gguf_path == null) manifest.gliner_head_gguf_path = try findFileInSubdirs(allocator, catalog, &.{"gliner_head.gguf"}, &.{""});
+    if (manifest.gliner_head_safetensors_path == null) manifest.gliner_head_safetensors_path = try findFileInSubdirs(allocator, catalog, &.{"gliner_head.safetensors"}, &.{""});
+    try discoverJinaRetrievalAdapter(&manifest, catalog);
+    if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, catalog, &.{"config.json"}, &.{""});
+    if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, catalog, &.{"model_manifest.json"}, &.{""});
+    if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, catalog, &.{"tokenizer.json"}, &.{""});
+    if (manifest.vocab_txt_path == null) manifest.vocab_txt_path = try findFileInSubdirs(allocator, catalog, &.{"vocab.txt"}, &.{""});
+    if (manifest.tokenizer_config_path == null) manifest.tokenizer_config_path = try findFileInSubdirs(allocator, catalog, &.{"tokenizer_config.json"}, &.{""});
+    if (manifest.preprocessor_config_path == null) manifest.preprocessor_config_path = try findFileInSubdirs(allocator, catalog, &.{"preprocessor_config.json"}, &.{""});
+    if (manifest.processor_config_path == null) manifest.processor_config_path = try findFileInSubdirs(allocator, catalog, &.{"processor_config.json"}, &.{""});
+    try fillAutoDetectedGgufPaths(&manifest, allocator, catalog);
     if (manifest.gguf_path != null and manifest.gguf_projector_path != null and manifest.config_model_arch.len == 0) {
         manifest.gguf_generator_gemma4 = ggufMetadataIsGemma4(manifest.gguf_path.?);
     }
 
-    try applyImplicitSparseOutputLayout(&manifest, &catalog);
-    try applySentenceTransformersTaskSidecars(&manifest, allocator, &catalog);
+    try applyImplicitSparseOutputLayout(&manifest, catalog);
+    try applySentenceTransformersTaskSidecars(&manifest, allocator, catalog);
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
     try finalizeEmbeddingProfile(&manifest);
     try manifest.verifySourceRoot(model_dir_path);

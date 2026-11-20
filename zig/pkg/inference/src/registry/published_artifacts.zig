@@ -565,7 +565,7 @@ pub const PublishedArtifacts = struct {
         defer self.allocator.free(current);
         if (!std.mem.eql(u8, current, expected)) return error.ModelArtifactsChanging;
     }
-    pub fn verify(self: *const PublishedArtifacts) !void {
+    pub fn verifyPublication(self: *const PublishedArtifacts) !void {
         try self.verifyBinding(self.storage_root, self.physical_root);
         const root_stat = try std.Io.Dir.cwd().statFile(self.io, self.physical_root, .{ .follow_symlinks = false });
         if (root_stat.inode != self.physical_root_inode) return error.ModelArtifactsChanging;
@@ -576,6 +576,10 @@ pub const PublishedArtifacts = struct {
         }
         if (self.direct_path) |path| try self.verifyBinding(path, self.physical_direct.?);
         if (!std.meta.eql(self.publication, try managed.publicationGeneration(self.allocator, self.io, self.root))) return error.ModelArtifactsChanging;
+    }
+
+    pub fn verify(self: *const PublishedArtifacts) !void {
+        try self.verifyPublication();
         var opened = self.opened_files.valueIterator();
         while (opened.next()) |value| {
             const stamp = managed.ArtifactStamp.fromStat(try value.file.stat(self.io));

@@ -365,6 +365,11 @@ pub fn managedModelSelectionAlloc(allocator: std.mem.Allocator, io: Io, model_di
         return err;
     }) orelse return .{};
     defer receipt.deinit();
+    return managedModelSelectionFromReceipt(allocator, &receipt);
+}
+
+/// The caller owns a current, validated receipt for the selected installation.
+pub fn managedModelSelectionFromReceipt(allocator: std.mem.Allocator, receipt: *const managed_receipt.ValidatedReceipt) !ManagedSelection {
     const publication = receipt.publication_generation;
     if (receipt.parsed.value.version != 2) return .{ .publication = publication };
     const source = receipt.parsed.value.source orelse return .{ .publication = publication };
