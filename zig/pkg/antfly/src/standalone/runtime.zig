@@ -16363,7 +16363,11 @@ test "system catalog standalone relation coordinator publishes changed schemas a
         // must not certify it merely because publication itself succeeded.
         var snapshot = try LocalStandaloneMetadata.catalogAdminSnapshot(&metadata);
         defer LocalStandaloneMetadata.catalogFreeAdminSnapshot(&metadata, &snapshot);
-        try std.testing.expectEqualStrings(if (iteration == 0) old_schema else new_schema, metadata.findTableByNameLocked("physical").?.schema_json);
+        // Schema mutation adds durable column lineage to the submitted JSON.
+        // The recovered projection must contain the exact committed bytes.
+        const durable = (try store.getTable(alloc, group, table.table_id)).?;
+        defer antfly.metadata.table_manager.freeTable(alloc, durable);
+        try std.testing.expectEqualStrings(durable.schema_json, metadata.findTableByNameLocked("physical").?.schema_json);
         const resolved = try store.resolveSystemCatalogIdentities(alloc, group, .{ .relations = &targets });
         defer resolved.deinit(alloc);
         try std.testing.expect(resolved.relations[iteration] != null);
