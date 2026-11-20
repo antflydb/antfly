@@ -4761,6 +4761,12 @@ const RedoCommitState = struct {
     /// Published (`Region.LogState.fold_start_offset`) so a cold reader
     /// skips the superseded prefix.
     fold_start_offset: u64 = 0,
+    /// The log's physical reset generation (`Region.LogState.
+    /// reset_generation`) as this handle last knew or made it, and the one
+    /// `writer.tail` was verified in: an incremental catch-up may resume at
+    /// `writer.tail` only while it is still current.
+    log_reset_generation: u32 = 0,
+    tail_reset_generation: ?u32 = null,
     /// The first sequence this handle committed without a durability barrier
     /// (a non-durable reclaim), or null when everything through
     /// `durable_sequence` is durable. The next barrier clears it. Caps the
@@ -8017,7 +8023,13 @@ pub const NativeFile = struct {
             {
                 return error.NativeRedoLogCorrupt;
             }
-            const region = scan.region orelse return;
+            const region = scan.region orelse {
+                // No region to publish a bound: a sidecar writer that
+                // appeared during the scan may have appended records it
+                // has not synced.
+                if (scan.unbounded and !scan.holds_authority and scan.native.foreignSidecarWriterHeld(scan.io)) return error.ColdScanRetry;
+                return;
+            };
             // An unbounded scan saw no watermark and no writer before it
             // began. A writer admitted since may have appended records it has
             // not made durable; retry with the bound the region now gives.
@@ -8217,8 +8229,11 @@ pub const NativeFile = struct {
         };
         var pctx: PopulateCtx = undefined;
         var published_fold_start: u64 = 0;
+        var published_reset_generation: u32 = 0;
         // Where this open's scans began: past any superseded prefix.
         var catch_up_start: u64 = 0;
+        // The metadata scan also caught the shared overlay up (bounded case).
+        var overlay_caught_up = false;
         var meta_ctx: MetaCtx = .{};
         var meta_outcome: redo_log.ReplayOutcome = undefined;
         var skip_scan = false;
@@ -8240,6 +8255,7 @@ pub const NativeFile = struct {
                 promised_durable = if (checked) |state| state.durable_sequence else null;
                 observed_checkpoint = published.checkpoint_sequence;
                 published_fold_start = if (checked) |state| state.fold_start_offset else 0;
+                published_reset_generation = published.reset_generation;
                 replay_ceiling = publishedReplayCeiling(r, checked);
                 published_offset = published.durable_offset;
                 durable_ceiling_offset = publishedDurableCeiling(r, published);
@@ -8263,7 +8279,10 @@ pub const NativeFile = struct {
             // unbounded. A writer that holds just the sidecar lock leaves the
             // region's writer word empty, so check the sidecar too; that
             // writer publishes once its own open has recovered the log.
-            if (replay_ceiling == null and scan_region != null and !holds_authority) {
+            // Without a usable region there is no publication to bound by at
+            // all: the same sidecar fence applies, and the reader waits for
+            // that writer to finish instead.
+            if (replay_ceiling == null and !holds_authority) {
                 if (self.foreignSidecarWriterHeld(io)) {
                     publish_waits += 1;
                     if (publish_waits >= cold_publish_wait_polls) return error.FileBusy;
@@ -8319,9 +8338,53 @@ pub const NativeFile = struct {
                 break :cold_scan;
             }
             // Skip the superseded prefix a deferred fold kept, as the
-            // population scan does.
-            meta_outcome = try redo_log.replayBounded(allocator, self.file, io, self.header.redo_log_offset + fold_start, self.header.redo_log_capacity - fold_start, folded_through, replay_ceiling, scan_check.covered, MetaCtx.onRecord, &meta_ctx);
-            meta_outcome.valid_bytes += fold_start;
+            // population scan does. Bounded by a published watermark, this
+            // one pass also catches the shared overlay up: it decodes the
+            // records the overlay lacks while collecting the tip, instead of
+            // a second replay after it. (Unbounded, the post-scan writer
+            // check must pass before anything is installed.)
+            if (replay_ceiling) |ceiling| {
+                const Combined = struct {
+                    const Self = @This();
+                    file: *NativeFile,
+                    io: std.Io,
+                    start_offset: u64,
+                    floor: u64,
+                    ceiling: u64,
+                    covered: u64,
+                    meta: *MetaCtx,
+                    decoded: u64 = 0,
+                    outcome: redo_log.ReplayOutcome = undefined,
+                    fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
+                        const have_through = @max(overlay.appliedThrough(), overlay.decodedThrough());
+                        var visit: Visit = .{ .ctx = ctx, .overlay = overlay, .have_through = have_through };
+                        ctx.outcome = try redo_log.replayBounded(ctx.file.allocator, ctx.file.file, ctx.io, ctx.file.header.redo_log_offset + ctx.start_offset, ctx.file.header.redo_log_capacity - ctx.start_offset, ctx.floor, ctx.ceiling, ctx.covered, Visit.onRecord, &visit);
+                        ctx.outcome.valid_bytes += ctx.start_offset;
+                        if (ctx.decoded != 0) _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
+                    }
+                    const Visit = struct {
+                        ctx: *Self,
+                        overlay: *redo_overlay.SharedRedoOverlay,
+                        have_through: u64,
+                        fn onRecord(ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
+                            const visit: *@This() = @ptrCast(@alignCast(ptr.?));
+                            try MetaCtx.onRecord(visit.ctx.meta, record);
+                            if (record.commit_sequence <= visit.have_through) return;
+                            try applyRedoRecordToOverlay(visit.overlay, record.commit_sequence, record.payload);
+                            visit.overlay.noteDecoded(record.commit_sequence);
+                            visit.ctx.decoded += 1;
+                        }
+                    };
+                };
+                var combined: Combined = .{ .file = self, .io = io, .start_offset = fold_start, .floor = folded_through, .ceiling = ceiling, .covered = scan_check.covered, .meta = &meta_ctx };
+                try inode_lock.withRedoOverlayLock(entry, io, &combined, Combined.run);
+                meta_outcome = combined.outcome;
+                overlay_caught_up = true;
+                if (combined.decoded != 0) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
+            } else {
+                meta_outcome = try redo_log.replayBounded(allocator, self.file, io, self.header.redo_log_offset + fold_start, self.header.redo_log_capacity - fold_start, folded_through, replay_ceiling, scan_check.covered, MetaCtx.onRecord, &meta_ctx);
+                meta_outcome.valid_bytes += fold_start;
+            }
             scan_check.verify(meta_outcome) catch |err| switch (err) {
                 error.ColdScanRetry => {
                     cold_attempts += 1;
@@ -8451,11 +8514,14 @@ pub const NativeFile = struct {
             .checkpoint_sequence = folded_through,
             .tail_source = if (skip_scan) .unknown else if (replay_ceiling != null) .published else .own,
             .tail_fold_boundary = if (skip_scan) null else folded_through,
+            .log_reset_generation = published_reset_generation,
+            .tail_reset_generation = if (skip_scan) null else published_reset_generation,
         };
         // A second opener in this process skips the populate above, but
         // another process may have appended records since. Its reads must
         // see what its sequence (from the scan) covers.
-        if (pctx.outcome == null and (outcome.last_sequence orelse 0) > @max(shared.appliedThrough(), folded_through)) {
+        if (overlay_caught_up) shared.noteApplied(outcome.last_sequence orelse 0);
+        if (pctx.outcome == null and !overlay_caught_up and (outcome.last_sequence orelse 0) > @max(shared.appliedThrough(), folded_through)) {
             const Catch = struct {
                 file: *NativeFile,
                 io: std.Io,
@@ -9188,6 +9254,7 @@ pub const NativeFile = struct {
             redo.pending_log_reset = .{ .old_tail = old_tail, .fold_sequence = new_checkpoint_sequence };
             try self.eraseRedoLogPrefix(io, old_tail);
             redo.fold_start_offset = 0;
+            self.noteRedoLogReset(redo);
             // The log is erased: appends start over at its beginning, even
             // if the capacity shrink below fails.
             redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, 0, redo.writer.last_sequence);
@@ -9351,9 +9418,16 @@ pub const NativeFile = struct {
                     if (pinned < redo.checkpoint_sequence) return;
                 }
             }
+            // An empty overlay proves only that the tree in memory has the
+            // log's content: a non-durable fold empties it while its
+            // checkpoint is still unpublished. Make that checkpoint durable
+            // before ending the log it replaces.
+            if (self.durable_header != null or self.checkpoint_publication_uncertain) try self.sync();
+            if (self.durable_header != null) return;
             redo.pending_log_reset = .{ .old_tail = old_tail, .fold_sequence = @max(redo.checkpoint_sequence, redo.durable_sequence) };
             try self.eraseRedoLogPrefix(io, old_tail);
             redo.fold_start_offset = 0;
+            self.noteRedoLogReset(redo);
             redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, 0, redo.writer.last_sequence);
             redo.pending_log_reset = null;
             self.publishRedoLogState();
@@ -9526,6 +9600,7 @@ pub const NativeFile = struct {
                 redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, published.durable_offset, redo.durable_sequence);
                 redo.tail_source = .unknown;
                 redo.tail_fold_boundary = null;
+                redo.tail_reset_generation = null;
             } else if (published.durable_sequence > @min(redo.durable_sequence, redo.shared.appliedThrough())) {
                 const ReplayCtx = struct {
                     file: *NativeFile,
@@ -9561,6 +9636,7 @@ pub const NativeFile = struct {
                 // on each catch-up.
                 const incremental = redo.tail_source != .unknown and
                     redo.tail_fold_boundary == redo.checkpoint_sequence and
+                    redo.tail_reset_generation == published.reset_generation and
                     redo.writer.tail <= self.header.redo_log_capacity;
                 const resume_sequence = redo.writer.last_sequence orelse redo.checkpoint_sequence;
                 var rctx: ReplayCtx = .{
@@ -9602,6 +9678,8 @@ pub const NativeFile = struct {
                 const last_sequence = outcome.last_sequence orelse if (incremental) redo.writer.last_sequence else null;
                 redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, last_sequence);
                 redo.tail_fold_boundary = redo.checkpoint_sequence;
+                redo.tail_reset_generation = published.reset_generation;
+                redo.log_reset_generation = @max(redo.log_reset_generation, published.reset_generation);
                 // Bounded by the watermark: a dead writer may have left a
                 // surviving suffix past it.
                 redo.tail_source = .published;
@@ -9979,6 +10057,26 @@ pub const NativeFile = struct {
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.namespace_directory_cache = .empty;
         self.header = header;
+        self.rebindRedoWriterToHeader();
+    }
+
+    /// The redo writer appends inside the log region the header names. A
+    /// header adopted from another handle may have moved or shrunk it (a
+    /// capacity shrink, a vacuum's fresh reservation): appends must never
+    /// cross the persisted end, where recovery stops scanning and the
+    /// allocator may already have handed the pages out. A tail no longer
+    /// inside the region is unknown until writer authority rebuilds it.
+    fn rebindRedoWriterToHeader(self: *NativeFile) void {
+        const redo = if (self.redo) |*r| r else return;
+        if (redo.writer.base_offset == self.header.redo_log_offset and redo.writer.capacity == self.header.redo_log_capacity) return;
+        const moved = redo.writer.base_offset != self.header.redo_log_offset;
+        redo.writer.base_offset = self.header.redo_log_offset;
+        redo.writer.capacity = self.header.redo_log_capacity;
+        if (moved or redo.writer.tail > redo.writer.capacity) {
+            redo.writer.tail = @min(redo.writer.tail, redo.writer.capacity);
+            redo.tail_source = .unknown;
+            redo.tail_fold_boundary = null;
+        }
     }
 
     /// Settles the redo append position before a writer appends or folds.
@@ -9996,6 +10094,19 @@ pub const NativeFile = struct {
     /// writer authority: nothing else appends to this file meanwhile.
     fn holdsWriterAuthority(self: *const NativeFile) bool {
         return self.writer_lock_file != null or (self.externally_locked and !self.read_only);
+    }
+
+    /// A physical reset (records restart at offset zero) gets the next
+    /// generation past any this handle or the region has seen, so no
+    /// reader's cached offset from before it still looks current.
+    fn noteRedoLogReset(self: *NativeFile, redo: *RedoCommitState) void {
+        var seen = redo.log_reset_generation;
+        if (self.regionForInode() catch null) |region| {
+            const published = region.readLogStateChecked() orelse region.readLogStateRaw();
+            seen = @max(seen, published.reset_generation);
+        }
+        redo.log_reset_generation = seen +% 1;
+        redo.tail_reset_generation = redo.log_reset_generation;
     }
 
     /// Records this handle's sidecar writer lock in `own_sidecar_locks`.
@@ -10076,6 +10187,7 @@ pub const NativeFile = struct {
             }
             try self.eraseRedoLogPrefix(io, pending.old_tail);
             redo.fold_start_offset = 0;
+            self.noteRedoLogReset(redo);
             redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, 0, redo.writer.last_sequence);
             redo.pending_log_reset = null;
             redo.tail_source = .own;
@@ -10164,6 +10276,8 @@ pub const NativeFile = struct {
         }
         redo.tail_source = .own;
         redo.tail_fold_boundary = redo.checkpoint_sequence;
+        redo.log_reset_generation = @max(redo.log_reset_generation, (published orelse region.readLogStateRaw()).reset_generation);
+        redo.tail_reset_generation = redo.log_reset_generation;
         if (found or torn) self.publishRedoLogState();
     }
 
@@ -11112,6 +11226,7 @@ pub const NativeFile = struct {
             .durable_sequence = redo.syncedSequence(),
             .durable_offset = redo.writer.tail,
             .fold_start_offset = redo.fold_start_offset,
+            .reset_generation = redo.log_reset_generation,
         });
     }
 
@@ -39020,4 +39135,77 @@ test "lite redo log a cold reader skips the superseded prefix a deferred fold ke
     defer reader.close();
     try expectRedoDocument(&reader, "alpha", "one");
     try expectRedoDocument(&reader, "beta", "two");
+}
+
+// Another handle on the same inode shrinks the log reservation. A cached
+// writer adopting that header must take the smaller append limit too, or it
+// can acknowledge a record past the end recovery scans to.
+test "lite redo log a refreshed writer adopts another handle's smaller log capacity" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-capacity-rebind.aflite");
+    defer a.free(path);
+    var first = try NativeFile.createWithRedoLog(a, io, path, .{}, 256 * 1024);
+    defer first.close();
+    var second = try NativeFile.openWithIo(a, io, path, .{ .externally_locked = true });
+    defer second.close();
+    try second.beginTransaction();
+    try second.putDocument("alpha", "one");
+    try second.commitTransaction();
+    try first.beginTransaction();
+    try first.putDocument("beta", "two");
+    try first.commitTransaction();
+    try first.checkpointRedoLog();
+    // `first` shrinks the reservation (the header step of a shrink).
+    const smaller = first.header.redo_log_capacity / 2;
+    first.redo.?.writer.capacity = smaller;
+    var next_header = first.header;
+    next_header.redo_log_capacity = smaller;
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, next_header);
+    try first.file.writePositionalAll(io, &encoded, 0);
+    try first.file.sync(io);
+    first.header.redo_log_capacity = smaller;
+    first.last_synced_header = first.header;
+    try first.beginTransaction();
+    try first.putDocument("gamma", "three");
+    try first.commitTransaction();
+
+    try second.beginTransaction();
+    try std.testing.expectEqual(smaller, second.header.redo_log_capacity);
+    try std.testing.expectEqual(smaller, second.redo.?.writer.capacity);
+    try second.putDocument("delta", "four");
+    try second.commitTransaction();
+    try expectRedoDocument(&second, "gamma", "three");
+}
+
+// A non-durable fold empties the overlay but leaves its checkpoint
+// unpublished, keeping the old log for recovery. Reclaiming the oversized
+// reservation on that empty overlay must make the checkpoint durable before
+// it ends the log, or a crash finds the old checkpoint and an empty log.
+test "lite redo log an empty-overlay reservation reclaim publishes the deferred checkpoint first" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-deferred-shrink.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 256 * 1024);
+        defer writer.close();
+        try writer.beginTransaction();
+        try writer.putDocument("alpha", "one");
+        try writer.commitTransaction();
+        try writer.checkpointRedoLogWithDurability(false);
+        try std.testing.expect(writer.redo.?.writer.tail > 0);
+        writer.redo_log_budget_bytes = 64 * 1024;
+        try writer.checkpointRedoLog();
+        try std.testing.expect(writer.durable_header == null);
+        try std.testing.expectEqual(@as(u64, 0), writer.redo.?.writer.tail);
+    }
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reopened.close();
+    try expectRedoDocument(&reopened, "alpha", "one");
 }

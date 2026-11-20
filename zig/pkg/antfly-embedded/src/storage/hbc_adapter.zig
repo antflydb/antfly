@@ -19872,16 +19872,32 @@ pub const HBCIndex = struct {
     /// inline-publication install step, `installInlineProjectionCheckpoint
     /// Publication`, which calls the same `applyExternallyCommittedMutations`
     /// for exactly this reason.
+    ///
+    /// The host commit is already durable, so a failed mirror update must
+    /// still finish the publication and release `published_snapshot_mu`:
+    /// returning first would leave every later search or write on this
+    /// index blocked on it. The mirror is invalidated instead
+    /// (`native_catalog_backend.Backend.invalidateMirror`), so this index
+    /// fails closed until reopened from the committed catalog.
     pub fn installStagedWrite(self: *HBCIndex, staged: *vectorindex_hbc_index.StagedWrite) !void {
-        if (self.env_owner == .native_catalog and staged.mutations.len != 0) {
-            const converted = try self.alloc.alloc(native_catalog_backend.Mutation, staged.mutations.len);
+        var mirror_err: ?anyerror = null;
+        if (self.env_owner == .native_catalog and staged.mutations.len != 0) mirror: {
+            const backend = self.env_owner.native_catalog;
+            const converted = self.alloc.alloc(native_catalog_backend.Mutation, staged.mutations.len) catch |err| {
+                backend.invalidateMirror();
+                mirror_err = err;
+                break :mirror;
+            };
             defer self.alloc.free(converted);
             for (staged.mutations, converted) |pending, *out| {
                 out.* = .{ .namespace = pending.namespace, .key = pending.key, .value = pending.value, .is_delete = pending.is_delete };
             }
-            try self.env_owner.native_catalog.applyExternallyCommittedMutations(converted);
+            backend.applyExternallyCommittedMutations(converted) catch |err| {
+                mirror_err = err;
+            };
         }
         try vectorindex_hbc_index.installStagedWrite(self, staged);
+        if (mirror_err) |err| return err;
     }
 
     /// `staged.mutations` were never committed durably. Restores this
