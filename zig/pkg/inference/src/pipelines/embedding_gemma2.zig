@@ -665,7 +665,7 @@ pub const LiveDecoder = struct {
         errdefer window.deinit();
         self.reader = window.reader;
         errdefer self.reset();
-        if (self.reader.track.inband_parameter_sets) {
+        if (self.reader.track.requiresAvcRegistry()) {
             if (self.registry) |registry| {
                 if (self.reader.packets.len > self.packets) try registry.append(&self.reader);
             } else {
@@ -5895,6 +5895,9 @@ test "embeddinggemma2 live retry windows never retain storage in a caller output
 }
 
 test "embeddinggemma2 live decoder retains immutable references across growing windows and resets on eviction" {
+    inline for (.{ "closed.mp4", "h264-two-pps.mp4" }) |fixture| try checkLiveDecoderReuse(@embedFile("../testdata/video/" ++ fixture));
+}
+fn checkLiveDecoderReuse(bytes: []const u8) !void {
     const a = std.testing.allocator;
     const media = @import("antfly_media");
     const video = @import("antfly_video");
@@ -5903,7 +5906,7 @@ test "embeddinggemma2 live decoder retains immutable references across growing w
     defer controller.deinit();
     var marker: u8 = 0;
     const session = Session{ .ptr = &marker, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 512 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
-    const snapshot = try media.stream.Snapshot.copy(a, "live-decoder", &.{@embedFile("../testdata/video/closed.mp4")}, .{});
+    const snapshot = try media.stream.Snapshot.copy(a, "live-decoder", &.{bytes}, .{});
     var segment = media.live_mp4.Segment{ .backing = snapshot, .reader = try media.mp4.Reader.init(a, &snapshot.input, .{}), .ordinal = 0, .epoch = 0, .identity = try a.dupe(u8, "live-decoder"), .identity_reservation = .{} };
     var segment_live = true;
     defer if (segment_live) segment.deinit();
@@ -5923,8 +5926,8 @@ test "embeddinggemma2 live decoder retains immutable references across growing w
         return err;
     };
     prepared.window.reader.packets = packets;
-    first.decoder = try video.h264.Incremental.init(owner.allocation.allocator(), &owner.reader, .{});
-    const decoder = first.decoder.?;
+    const registry = first.parameter_sets;
+    try std.testing.expectEqual(owner.reader.track.requiresAvcRegistry(), registry != null);
     const Capture = struct {
         digest: [32]u8 = undefined,
         fn accept(raw: *anyopaque, _: usize, frame: *const video.h264.Frame) !void {
@@ -5933,16 +5936,18 @@ test "embeddinggemma2 live decoder retains immutable references across growing w
         }
     };
     var capture = Capture{};
-    const initial = try decoder.decodeSelected(&owner.reader, &.{0}, &capture, Capture.accept);
+    try std.testing.expect(try first.decodeControlled(&.{0}, 0, &capture, Capture.accept, .{}));
+    const initial = first.decoded_packets;
     const second = try owner.bind(&prepared);
-    try std.testing.expectEqual(decoder, second.decoder.?);
+    try std.testing.expectEqual(registry, second.parameter_sets);
     const last: usize = 1;
-    const continued = try decoder.decodeSelected(&owner.reader, &.{last}, &capture, Capture.accept);
+    try std.testing.expect(try second.decodeControlled(&.{last}, 0, &capture, Capture.accept, .{}));
     var expected = Capture{};
     const replay = try video.h264.decodeSelected(a, &prepared.window.reader, &.{last}, .{}, &expected, Capture.accept);
     try std.testing.expectEqualSlices(u8, &expected.digest, &capture.digest);
-    try std.testing.expect(continued.decoded_packets < replay.decoded_packets);
-    try std.testing.expect(initial.decoded_packets + continued.decoded_packets <= packets.len);
+    try std.testing.expectEqual(@as(usize, 1), second.reused_windows);
+    try std.testing.expect(second.decoded_packets - initial <= replay.decoded_packets);
+    try std.testing.expect(second.decoded_packets <= packets.len);
     prepared.packet_base = 1;
     _ = try owner.bind(&prepared);
     try std.testing.expect(owner.continuation.decoder == null);

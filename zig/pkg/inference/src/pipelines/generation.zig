@@ -167,7 +167,7 @@ pub fn messagesHaveAudio(messages: []const Message) bool {
 /// Audio expansion is measured after projection because its token count varies
 /// with the clip and projector metadata.
 pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
-    var allowance: usize = if (config.mm_tokens_per_image == 0) 0 else nativeGenerationImageCount(messages) *| (@as(usize, config.mm_tokens_per_image) + 1);
+    var allowance = nativeGenerationImageTokenAllowance(messages, config);
     for (messages) |message| if (message.video_bytes != null) {
         allowance +|= gemma4_video.token_allowance;
     };
@@ -179,6 +179,13 @@ test "video prompt allowance is independent of the image token setting" {
     try std.testing.expectEqual(@as(usize, 2848), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma }));
     try std.testing.expectEqual(@as(usize, 2848), nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma, .mm_tokens_per_image = 280 }));
     try std.testing.expectEqual(@as(usize, 1120), try nativeGenerationPromptTokenLimit(.{ .family = .gemma, .max_position_embeddings = 4096 }, null, 128, 0, nativeGenerationMediaTokenAllowance(&messages, .{ .family = .gemma })));
+    const short = [_]Message{.{ .role = "user", .content = "describe", .video_bytes = @embedFile("../testdata/video/h264-two-pps.mp4") }};
+    const config = gpt_mod.Config{ .family = .gemma, .max_position_embeddings = 4096 };
+    const actual = try nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &short, config, .generic);
+    try std.testing.expectEqual(@as(usize, 79), actual.token_allowance);
+    const limit = try nativeGenerationPromptTokenLimit(config, null, 128, 0, nativeGenerationPreliminaryMediaTokenAllowance(&short, config));
+    try std.testing.expectEqual(@as(usize, 1579), try actual.promptTokens(1500, limit));
+    try std.testing.expectEqual(limit, try actual.promptTokens(limit - 1, limit));
     const rendered = try formatMessages(std.testing.allocator, &messages);
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "<|video|> describe") != null);
@@ -186,8 +193,16 @@ test "video prompt allowance is independent of the image token setting" {
 
 pub const NativeGenerationMediaAdmission = struct {
     token_allowance: usize = 0,
+    deferred_video: bool = false,
     host_scratch_bytes: usize = 0,
     backend_scratch_bytes: usize = 0,
+
+    /// Reserve at most the usable context. Projection validates the exact
+    /// expanded prompt before prefill and cannot consume a longer sequence.
+    pub fn promptTokens(self: NativeGenerationMediaAdmission, text: usize, limit: usize) !usize {
+        const bound = std.math.add(usize, text, self.token_allowance) catch return error.PromptTooLong;
+        return if (self.deferred_video) @min(bound, limit) else bound;
+    }
 };
 
 /// One source of truth for multimodal scheduler and process-wide admission.
@@ -258,10 +273,18 @@ pub fn nativeGenerationMediaAdmissionForBackend(
         defer allocator.free(images);
         return .{ .token_allowance = image_count *| (max_image_tokens +| 1), .host_scratch_bytes = try qwen2vl_mm.imageWorkingBytes(images, prep_config) };
     }
-    var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
+    var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationImageTokenAllowance(messages, config) };
     // CUDA decodes on the device. Portable decoding runs in host memory, and
     // CUDA's fallback to it admits that memory only when the fallback happens.
-    if (backend != .cuda) for (messages) |message| if (message.video_bytes) |bytes| {
+    for (messages) |message| if (message.video_bytes) |bytes| {
+        admission.deferred_video = true;
+        // Malformed inputs retain the decoder's detailed diagnostic. The
+        // scheduling estimate is permitted to be conservative in that case.
+        admission.token_allowance +|= gemma4_video.promptAllowance(allocator, bytes) catch |err| switch (err) {
+            error.OutOfMemory, error.VideoInputTooLarge => return err,
+            else => gemma4_video.token_allowance,
+        };
+        if (backend == .cuda) continue;
         const reserved = gemma4_video.reservation(allocator, bytes);
         admission.host_scratch_bytes = reserved.host_bytes;
         admission.backend_scratch_bytes = reserved.surface_bytes;
@@ -285,7 +308,11 @@ pub fn nativeGenerationAdmissionMediaTokenAllowance(
 /// dynamic image preprocessing determines the exact expanded prompt length.
 pub fn nativeGenerationPreliminaryMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
     if (config.family == .qwen3_5 or config.family == .qwen3_vl) return 0;
-    return nativeGenerationMediaTokenAllowance(messages, config);
+    return nativeGenerationImageTokenAllowance(messages, config);
+}
+
+fn nativeGenerationImageTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
+    return if (config.mm_tokens_per_image == 0) 0 else nativeGenerationImageCount(messages) *| (@as(usize, config.mm_tokens_per_image) + 1);
 }
 
 fn nativeGenerationImageCount(messages: []const Message) usize {

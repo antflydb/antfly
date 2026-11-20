@@ -230,6 +230,12 @@ pub const Reader = struct {
 /// sample tables are not expanded and media payloads are never inspected.
 /// The returned track borrows `bytes`. Full Reader validation still owns errors.
 pub fn probeTrack(bytes: []const u8, limits: Limits, control: source.Control) !Track {
+    const result = try probeMovie(bytes, limits, control);
+    return result.tables.track orelse error.UnsupportedVideoCodec;
+}
+
+const MovieProbe = struct { tables: Tables, movie_scale: u32 };
+fn probeMovie(bytes: []const u8, limits: Limits, control: source.Control) !MovieProbe {
     try control.check();
     var parser = Parser{ .limits = limits, .control = control };
     var cursor: usize = 0;
@@ -244,7 +250,36 @@ pub fn probeTrack(bytes: []const u8, limits: Limits, control: source.Control) !T
         cursor = box.end;
     }
     const tables = try parser.movie(movie orelse return error.MissingMovieMetadata);
-    return tables.track orelse error.UnsupportedVideoCodec;
+    return .{ .tables = tables, .movie_scale = parser.movie_scale };
+}
+
+/// Inspect the presentation clock without building a packet/offset index. A
+/// fragment's timing lives outside moov and requires its fragment reader.
+pub fn probeSampleClock(bytes: []const u8, limits: Limits, control: source.Control) !?timeline.SampleClock {
+    const movie = try probeMovie(bytes, limits, control);
+    const t = movie.tables;
+    if (t.defaults != null) return null;
+    const track = t.track orelse return error.UnsupportedVideoCodec;
+    if (t.sizes.len < 12) return error.MalformedMedia;
+    const samples = u32be(t.sizes[8..12]);
+    if (samples > limits.max_samples) return limits.track_limit_error;
+    const edit = try parseEdit(t.elst, movie.movie_scale, track.timescale);
+    var result = timeline.SampleClock{ .scale = track.timescale, .edit = edit };
+    var durations = Run{ .bytes = try entries(t.stts, 8) };
+    var composition = try compositionRun(t.ctts);
+    var dts: i64 = 0;
+    for (0..samples) |i| {
+        if (i % 256 == 0) try control.check();
+        const duration = try durations.next();
+        if (duration <= 0) return error.UnsupportedTimeline;
+        const offset = if (t.ctts.len == 0) 0 else try composition.next();
+        const pts = try edit.present(try std.math.add(i64, dts, offset));
+        dts = try std.math.add(i64, dts, duration);
+        result.include(pts);
+    }
+    try durations.finish();
+    try composition.finish();
+    return result;
 }
 
 /// Validate a moov payload for fragmented video before any media arrives.
@@ -737,6 +772,12 @@ const Run = struct {
         if (self.remaining != 0 or self.cursor != self.bytes.len) return error.MalformedMedia;
     }
 };
+fn compositionRun(bytes: []const u8) !Run {
+    if (bytes.len == 0) return .{ .bytes = &.{} };
+    if (bytes.len < 8 or bytes[0] > 1 or @as(u64, u32be(bytes[4..8])) * 8 != bytes.len - 8) return error.MalformedMedia;
+    return .{ .bytes = bytes[8..], .signed = bytes[0] == 1 };
+}
+
 fn buildPackets(allocator: std.mem.Allocator, t: Tables, track: Track, spans: []const Span, limits: Limits, control: source.Control) ![]Packet {
     if (t.sizes.len < 12) return error.MalformedMedia;
     if (t.sizes[0] != 0) return error.MalformedMedia;
@@ -762,13 +803,7 @@ fn buildPackets(allocator: std.mem.Allocator, t: Tables, track: Track, spans: []
         previous = first;
     }
     var durations = Run{ .bytes = try entries(t.stts, 8) };
-    var composition = Run{ .bytes = &.{} };
-    if (t.ctts.len != 0) {
-        if (t.ctts.len < 8 or t.ctts[0] > 1) return error.MalformedMedia;
-        const count = u32be(t.ctts[4..8]);
-        if (@as(u64, count) * 8 != t.ctts.len - 8) return error.MalformedMedia;
-        composition = .{ .bytes = t.ctts[8..], .signed = t.ctts[0] == 1 };
-    }
+    var composition = try compositionRun(t.ctts);
     const sync = if (t.stss.len != 0) try entries(t.stss, 4) else &.{};
     previous = 0;
     for (0..sync.len / 4) |i| {
@@ -1008,6 +1043,27 @@ test "MP4 metadata probe agrees with indexed track and enforces cancellation and
         var reader = try Reader.init(a, &input, .{});
         defer reader.deinit();
         const track = try probeTrack(bytes, .{}, .{});
+        const clock = try probeSampleClock(bytes, .{}, .{});
+        if (std.mem.eql(u8, name, "fragmented.mp4")) {
+            try std.testing.expect(clock == null);
+        } else {
+            const edit = reader.track.edit;
+            var count: usize = 0;
+            var first: i64 = std.math.maxInt(i64);
+            var last: i64 = std.math.minInt(i64);
+            for (reader.packets) |packet| {
+                if (edit.source_duration) |span| {
+                    const relative = @as(i128, packet.pts) - edit.source_start;
+                    if (relative < 0 or relative >= span) continue;
+                }
+                count += 1;
+                first = @min(first, packet.pts);
+                last = @max(last, packet.pts);
+            }
+            try std.testing.expectEqual(count, clock.?.count);
+            try std.testing.expectEqual(first, clock.?.first);
+            try std.testing.expectEqual(last, clock.?.last);
+        }
         try std.testing.expectEqualDeep(reader.track.codec, track.codec);
         try std.testing.expectEqual(reader.track.width, track.width);
         try std.testing.expectEqual(reader.track.height, track.height);

@@ -234,7 +234,20 @@ pub fn encodeProjectedImagesResident(
 pub const ProjectedVideo = struct {
     images: ResidentProjectedImages,
     timestamps_us: []i64,
-    stats: @import("../ops/cuda/video.zig").Stats,
+    stats: DecodeStats,
+
+    pub const DecodeStats = struct {
+        selected_frames: usize,
+        /// Display callbacks and payload bytes submitted to the hardware parser.
+        decoded_frames: ?usize = null,
+        compressed_bytes: ?usize = null,
+        /// Portable replay counts source reads, including dependency probes.
+        decoder_source_bytes: ?u64 = null,
+
+        fn fromNvdec(stats: @import("../ops/cuda/video.zig").Stats) DecodeStats {
+            return .{ .selected_frames = stats.selected_frames, .decoded_frames = stats.decoded_frames, .compressed_bytes = stats.compressed_bytes };
+        }
+    };
     pub fn deinit(self: *ProjectedVideo) void {
         self.images.allocator.free(self.timestamps_us);
         self.images.deinit();
@@ -336,7 +349,7 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
     const counts = try allocator.dupe(usize, state.tokens[0..state.count]);
     errdefer allocator.free(counts);
     const timestamps = try allocator.dupe(i64, state.timestamps[0..state.count]);
-    return .{ .images = .{ .allocator = allocator, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = cfg.text_hidden, .batches_executed = state.count, .max_batch_executed = 1 }, .timestamps_us = timestamps, .stats = stats };
+    return .{ .images = .{ .allocator = allocator, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = cfg.text_hidden, .batches_executed = state.count, .max_batch_executed = 1 }, .timestamps_us = timestamps, .stats = ProjectedVideo.DecodeStats.fromNvdec(stats) };
 }
 
 /// Frames decoded by the portable or Apple routes. Decoders call `prepare` from
@@ -373,7 +386,7 @@ pub const PortableVideoFrames = struct {
     }
     /// Consumes `timestamps_us`. A repeated selection is delivered once, so its
     /// later slots stay empty and leave the prompt rather than repeat a frame.
-    pub fn project(self: *PortableVideoFrames, timestamps_us: []i64) !ProjectedVideo {
+    pub fn project(self: *PortableVideoFrames, timestamps_us: []i64, decoder_source_bytes: u64) !ProjectedVideo {
         self.resize.deinit();
         const a = self.allocator;
         const cb = self.weights.cb;
@@ -390,7 +403,7 @@ pub const PortableVideoFrames = struct {
         const timestamps = try a.dupe(i64, timestamps_us[0..kept]);
         errdefer a.free(timestamps);
         const images = try projectPreparedSequence(cb, a, &self.weights, self.cfg, frames.items, .{});
-        return .{ .images = images, .timestamps_us = timestamps, .stats = .{ .decoded_frames = kept, .selected_frames = kept } };
+        return .{ .images = images, .timestamps_us = timestamps, .stats = .{ .decoder_source_bytes = decoder_source_bytes, .selected_frames = kept } };
     }
 };
 fn portableFrameGeometry(cfg: Config, frame: image.ImageU8, presentation_width: u32, presentation_height: u32) Geometry {
@@ -550,7 +563,7 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
     const counts = try allocator.dupe(usize, state.tokens[0..state.count]);
     errdefer allocator.free(counts);
     const timestamps = try allocator.dupe(i64, state.timestamps[0..state.count]);
-    return .{ .images = .{ .allocator = allocator, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = cfg.text_hidden, .batches_executed = state.batches, .max_batch_executed = state.maximum_batch }, .timestamps_us = timestamps, .stats = stats };
+    return .{ .images = .{ .allocator = allocator, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = cfg.text_hidden, .batches_executed = state.batches, .max_batch_executed = state.maximum_batch }, .timestamps_us = timestamps, .stats = ProjectedVideo.DecodeStats.fromNvdec(stats) };
 }
 
 fn encodeResidentPatches(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, patches: CT, g: Geometry) !ResidentImage {
@@ -7604,7 +7617,7 @@ fn writeVideoTestProjector(a: std.mem.Allocator, path: []const u8, unified: bool
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = bytes.items });
 }
 
-test "gemma4 video portable generation projects edited AV1 above the embedding input limit" {
+test "gemma4 video portable generation projects large edited AV1 and AVC transport streams" {
     const a = std.testing.allocator;
     const native = @import("../ops/native_compute.zig");
     const compat = @import("../io/compat.zig");
@@ -7639,6 +7652,37 @@ test "gemma4 video portable generation projects edited AV1 above the embedding i
     defer projected.deinit();
     try std.testing.expectEqualSlices(i64, &.{ 125000, 1125000 }, projected.timestamps_us);
     try std.testing.expectEqual(@as(usize, 2), projected.images.tokens_per_image.len);
+    try std.testing.expect(projected.stats.decoder_source_bytes.? > 0);
+    try std.testing.expect(projected.stats.decoded_frames == null);
+
+    // Append a valid AVC filler NAL to the last unbounded video PES. Every TS
+    // continuation carries elementary stream bytes, including the final RBSP stop.
+    const ts = @embedFile("../testdata/video/closed.ts");
+    const extra_packets = 12 * 1024 * 1024 / 184;
+    const large_ts = try a.alloc(u8, ts.len + extra_packets * 188);
+    defer a.free(large_ts);
+    @memcpy(large_ts[0..ts.len], ts);
+    const last_header = ts[ts.len - 188 ..][0..4];
+    for (0..extra_packets) |i| {
+        const packet = large_ts[ts.len + i * 188 ..][0..188];
+        @memcpy(packet[0..3], last_header[0..3]);
+        packet[1] &= 0x1f;
+        packet[3] = 0x10 | @as(u8, @intCast((@as(usize, last_header[3]) + i + 1) % 16));
+        @memset(packet[4..], 0xff);
+        if (i == 0) packet[4..8].* = .{ 0, 0, 1, 12 };
+    }
+    large_ts[large_ts.len - 1] = 0x80;
+    var plain = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{}, a, projector, ts);
+    defer plain.deinit();
+    var large = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{}, a, projector, large_ts);
+    defer large.deinit();
+    try std.testing.expectEqualSlices(i64, plain.timestamps_us, large.timestamps_us);
+    try std.testing.expectEqualSlices(usize, plain.images.tokens_per_image, large.images.tokens_per_image);
+    const expected = try cb.toFloat32(plain.images.embeddings, a);
+    defer a.free(expected);
+    const actual = try cb.toFloat32(large.images.embeddings, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, expected, actual);
 }
 
 test "gemma4 video CUDA and portable preparation share the video resize policy" {
@@ -7720,7 +7764,7 @@ test "gemma4 video CUDA projects resident frames and matches native patch projec
         defer video.deinit();
         try std.testing.expectEqual(before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
         try std.testing.expect(video.stats.selected_frames > 0);
-        try std.testing.expect(video.stats.decoded_frames > video.stats.selected_frames);
+        try std.testing.expect(video.stats.decoded_frames.? > video.stats.selected_frames);
         try std.testing.expectEqual(video.stats.selected_frames, video.timestamps_us.len);
         if (!unified) {
             const pipeline = @import("../pipelines/gemma4_video.zig");

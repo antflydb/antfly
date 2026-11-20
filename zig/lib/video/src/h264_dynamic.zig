@@ -114,6 +114,7 @@ pub const Session = struct {
     reservation: media.admission.Token = .{},
     sequence: [32]?[]u8 = @splat(null),
     picture: [256]?PPS = @splat(null),
+    resolved_pps: [256]?usize = @splat(null),
     entries: std.ArrayList(Entry) = .empty,
     epochs: std.ArrayList(Epoch) = .empty,
     progressive_idrs: std.ArrayList(usize) = .empty,
@@ -179,6 +180,11 @@ pub const Session = struct {
             const owned = try allocator.dupe(u8, nal);
             errdefer allocator.free(owned);
             try self.history.append(allocator, .{ .at = at, .kind = 7, .id = id, .bytes = owned, .original = at == null });
+            if (self.sequence[id] == null or !std.mem.eql(u8, self.sequence[id].?, owned)) {
+                for (self.picture, &self.resolved_pps) |pps, *resolved| {
+                    if (pps != null and pps.?.sps == id) resolved.* = null;
+                }
+            }
             self.sequence[id] = owned;
         } else if (nal[0] & 31 == 8) {
             const id = try bits.ue();
@@ -187,6 +193,7 @@ pub const Session = struct {
             const owned = try allocator.dupe(u8, nal);
             errdefer allocator.free(owned);
             try self.history.append(allocator, .{ .at = at, .kind = 8, .id = id, .bytes = owned, .original = at == null });
+            if (self.picture[id] == null or !std.mem.eql(u8, self.picture[id].?.bytes, owned)) self.resolved_pps[id] = null;
             self.picture[id] = .{ .bytes = owned, .sps = sps };
         } else return error.MalformedVideoConfig;
     }
@@ -203,6 +210,7 @@ pub const Session = struct {
     }
     fn entry(self: *Session, id: usize) !usize {
         if (id >= self.picture.len) return error.MalformedVideoConfig;
+        if (self.resolved_pps[id]) |resolved| return resolved;
         const pps = self.picture[id] orelse return error.MissingVideoParameterSet;
         const sps = self.sequence[pps.sps] orelse return error.MissingVideoParameterSet;
         const allocator = self.budget.allocator();
@@ -217,6 +225,7 @@ pub const Session = struct {
         @memcpy(bytes[11 + sps.len ..], pps.bytes);
         for (self.entries.items, 0..) |candidate, i| if (std.mem.eql(u8, candidate.avcc, bytes)) {
             allocator.free(bytes);
+            self.resolved_pps[id] = i;
             return i;
         };
         if (self.entries.items.len >= self.options.max_configurations) return error.ResourceLimitExceeded;
@@ -227,7 +236,8 @@ pub const Session = struct {
         // Precise growth keeps the registry allocator/admission limit honest.
         try self.entries.ensureTotalCapacityPrecise(allocator, self.entries.items.len + 1);
         self.entries.appendAssumeCapacity(.{ .avcc = bytes, .config = config, .sps_hash = hash });
-        return self.entries.items.len - 1;
+        self.resolved_pps[id] = self.entries.items.len - 1;
+        return self.resolved_pps[id].?;
     }
     fn scan(self: *Session) !void {
         try self.initial();
@@ -435,6 +445,7 @@ pub const Session = struct {
         }
         std.debug.assert(retained == retained_entries);
         self.entries.items.len = retained;
+        self.resolved_pps = @splat(null); // Compaction assigns new entry IDs.
         for (selectors) |*id| if (id.* != std.math.maxInt(usize)) {
             id.* = remap[id.*];
         };
@@ -695,6 +706,14 @@ fn configurationChurn(a: std.mem.Allocator, rounds: usize) !void {
         view.packets = @as(*[1]media.mp4.Packet, @ptrCast(&descriptor));
         try owner.append(&view);
         try std.testing.expect(owner.entries.items.len <= 2);
+        {
+            // Repeated slices must resolve without rebuilding avcC or touching
+            // an allocator. After rebase the next append exercises remapping.
+            const backing = owner.budget.backing;
+            owner.budget.backing = std.testing.failing_allocator;
+            defer owner.budget.backing = backing;
+            try std.testing.expectEqual(owner.active.?, try owner.entry(i % 256));
+        }
         const live = owner.budget.live;
         try owner.rebase(1);
         try std.testing.expectEqual(@as(usize, 1), owner.entries.items.len);

@@ -158,6 +158,10 @@ fn accessUnits(a: std.mem.Allocator, demux: media.transport_stream.Demux, option
     return .{ .allocator = a, .packets = packets, .reservation = reservation };
 }
 pub fn fromDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transport_stream.Demux, options: Options) !Reader {
+    return normalizeDemux(a, identity, demux, options, null);
+}
+
+fn normalizeDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transport_stream.Demux, options: Options, description: ?[]const u8) !Reader {
     if (demux.packets.len == 0 or demux.packets.len > options.transport.max_packets) return error.ResourceLimitExceeded;
     try options.stream.control.check();
     if (options.configuration) |bytes| if (bytes.len > options.stream.max_bytes) return error.ResourceLimitExceeded;
@@ -169,8 +173,9 @@ pub fn fromDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transp
     defer config_reservation.deinit();
     var units = try accessUnits(a, demux, options);
     defer units.deinit();
-    const avcc = try configuration(a, demux, options);
-    defer a.free(avcc);
+    const extracted = if (description == null) try configuration(a, demux, options) else null;
+    defer if (extracted) |value| a.free(value);
+    const avcc = description orelse extracted.?;
     const config = try h264.configParse(a, avcc);
     defer config.groups.deinit(a);
     if (config.width > options.index.max_dimension or config.height > options.index.max_dimension) return error.ResourceLimitExceeded;
@@ -229,6 +234,9 @@ pub fn fromDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transp
 }
 
 pub const StreamOptions = struct {
+    /// A single clip has one sample description. Subsequent in-band SPS/PPS
+    /// remain in the normalized payload and the decoder resolves activation.
+    retain_initial_description: bool = false,
     video: Options = .{},
     epoch: usize = 0,
     first_ordinal: usize = 0,
@@ -434,7 +442,7 @@ pub const Stream = struct {
         options.configuration = self.configuration;
         options.single_access_unit_duration_ticks = duration;
         options.last_duration_ticks = duration;
-        var source = try fromDemux(self.allocator, identity, demux, options);
+        var source = try normalizeDemux(self.allocator, identity, demux, options, if (self.options.retain_initial_description) self.configuration else null);
         errdefer if (owners_live) source.deinit();
         if (self.configuration) |config| if (!std.mem.eql(u8, config, source.reader.track.avcc)) return error.SourceVersionChanged;
         var cfg: ?[]u8 = null;
@@ -483,6 +491,33 @@ pub const Stream = struct {
         try self.publish(self.bytes.items.len, duration, true);
     }
 };
+
+/// Build an immutable random-access view while keeping only one PES and AU
+/// in flight. Each completed AU transfers its payload to the segmented index.
+pub fn indexClip(a: std.mem.Allocator, identity: []const u8, bytes: []const u8, options: Options) !*@import("live_windows.zig").Builder {
+    const windows = @import("live_windows.zig");
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        options: windows.Options,
+        owner: ?*windows.Builder = null,
+        fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const segment = delivery.segment.?;
+            if (self.owner == null) self.owner = try windows.Builder.init(self.allocator, segment, &.{}, self.options);
+            try self.owner.?.append(segment, self.options);
+        }
+    };
+    var collector = Collector{ .allocator = a, .options = .{ .stream = options.stream, .max_packets = options.transport.max_packets, .max_units = options.transport.max_packets } };
+    errdefer if (collector.owner) |owner| owner.deinit();
+    var units = try Stream.init(a, identity, .{ .video = options, .retain_initial_description = true }, &collector, Collector.accept);
+    defer if (!units.ended) units.deinit();
+    var demux = try media.transport_stream.Stream.init(a, .{}, options.transport, options.stream.control, options.stream.admission_pool, units.consumer());
+    defer if (!demux.ended) demux.deinit();
+    try demux.push(bytes);
+    _ = try demux.finish();
+    try units.finish(options.last_duration_ticks);
+    return collector.owner orelse error.EmptyVideo;
+}
 
 /// Request-local state for HLS TS video. Media controls the transport and AES;
 /// this adapter supplies codec configuration and the existing packet-reader ABI.

@@ -6267,8 +6267,7 @@ pub const Node = struct {
         while (prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[prompt_tokens] != 0) : (prompt_tokens += 1) {}
         if (prompt_tokens == 0) return error.EmptyPrompt;
         return .{
-            .token_count = std.math.add(usize, prompt_tokens, media_admission.token_allowance) catch
-                return error.PromptTooLong,
+            .token_count = try media_admission.promptTokens(prompt_tokens, prompt_token_limit),
             .media_admission = media_admission,
         };
     }
@@ -14420,7 +14419,7 @@ pub const Node = struct {
         defer if (encoded_owned) encoded.deinit();
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
-        const total = std.math.add(usize, count, media_admission.token_allowance) catch return error.PromptTooLong;
+        const total = try media_admission.promptTokens(count, prompt_token_limit);
         if (out_estimate) |out| {
             out.* = .{
                 .allocator = allocator,

@@ -30,6 +30,30 @@ pub const Edit = struct {
         return std.math.cast(i64, value) orelse error.TimestampOverflow;
     }
 };
+/// Count timed samples in the presentation edit. PTS values are already in
+/// presentation coordinates and may arrive in decode order.
+pub const SampleClock = struct {
+    scale: u32,
+    edit: Edit = .{},
+    count: usize = 0,
+    first: i64 = std.math.maxInt(i64),
+    last: i64 = std.math.minInt(i64),
+
+    pub fn include(self: *SampleClock, pts: i64) void {
+        if (self.edit.source_duration) |duration| {
+            const relative = @as(i128, pts) - self.edit.source_start;
+            if (relative < 0 or relative >= duration) return;
+        }
+        self.count += 1;
+        self.first = @min(self.first, pts);
+        self.last = @max(self.last, pts);
+    }
+
+    pub fn origin(self: SampleClock) i64 {
+        return if (self.edit.source_duration != null) self.edit.source_start else self.first;
+    }
+};
+
 test "timeline signed rational scaling preserves negative ticks and overflow" {
     try std.testing.expectEqual(@as(i64, -334), try rescale(-1, 3, 1000));
     try std.testing.expectError(error.InvalidTimebase, rescale(1, 0, 1));

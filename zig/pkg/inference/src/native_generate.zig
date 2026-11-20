@@ -514,7 +514,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         gpt_config,
         if (model.session.backend() == .cuda) .cuda else .generic,
     );
-    const prompt_media_allowance = prompt_media_admission.token_allowance;
     const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(&messages, gpt_config);
     const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
         gpt_config,
@@ -533,11 +532,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     );
     const encoded_prompt_at = std.Io.Timestamp.now(io, .awake);
     defer prompt_encoded.deinit();
-    const prompt_tokens = std.math.add(
-        usize,
-        countPromptTokens(prompt_encoded.attention_mask),
-        prompt_media_allowance,
-    ) catch return error.PromptTooLong;
+    const prompt_tokens = try prompt_media_admission.promptTokens(countPromptTokens(prompt_encoded.attention_mask), prompt_token_limit);
 
     if (opts.print_chat_template_status) {
         print("chat_template={}\n", .{apply_chat_template});

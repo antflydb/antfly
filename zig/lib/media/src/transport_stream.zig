@@ -17,6 +17,7 @@
 const std = @import("std");
 const source = @import("source.zig");
 const admission = @import("admission.zig");
+const timeline = @import("timeline.zig");
 pub const Limits = struct {
     max_bytes: usize = 32 * 1024 * 1024,
     max_packets: usize = 8192,
@@ -145,6 +146,29 @@ const Table = struct {
 /// Continuation PES records retain has_timestamp=false; no clocks are invented.
 pub const Pes = struct { bytes: []const u8, packet: Packet, ordinal: usize };
 pub const Consumer = struct { context: *anyopaque, accept: *const fn (*anyopaque, Pes) anyerror!void };
+
+/// Keep only the fields through DTS. Validate PES stuffing as it arrives so a
+/// timing probe can discard elementary stream bytes immediately.
+const ClockProbe = struct {
+    clock: timeline.SampleClock = .{ .scale = 90_000 },
+    header: [19]u8 = undefined,
+    size: usize = 0,
+
+    fn push(self: *ClockProbe, bytes: []const u8) !void {
+        const keep = @min(bytes.len, self.header.len -| self.size);
+        if (keep != 0) @memcpy(self.header[self.size..][0..keep], bytes[0..keep]);
+        if (self.size + bytes.len >= 6) {
+            const declared = std.mem.readInt(u16, self.header[4..6], .big);
+            if (declared != 0) {
+                const end = 6 + @as(usize, declared);
+                const stuffing = @min(bytes.len, end -| self.size);
+                for (bytes[stuffing..]) |byte| if (byte != 0xff) return error.MalformedTransportPes;
+            }
+        }
+        self.size += bytes.len;
+    }
+};
+
 const Parser = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
@@ -159,6 +183,7 @@ const Parser = struct {
     output: std.ArrayList(u8) = .empty,
     packets: std.ArrayList(Packet) = .empty,
     consumer: ?Consumer = null,
+    probe: ?*ClockProbe = null,
     published_packets: usize = 0,
     published_bytes: usize = 0,
     fn section(self: *Parser, bytes: []const u8, pat: bool) !void {
@@ -228,13 +253,16 @@ const Parser = struct {
     fn finishPes(self: *Parser) !void {
         if (!self.pes_started) return;
         try self.control.check();
-        const bytes = self.pes.items;
+        const length = self.pesSize();
+        const bytes = if (self.probe) |probe| probe.header[0..@min(length, probe.header.len)] else self.pes.items;
         if (bytes.len < 9 or !std.mem.eql(u8, bytes[0..3], &.{ 0, 0, 1 }) or bytes[3] < 0xe0 or bytes[3] > 0xef or bytes[6] & 0xc0 != 0x80) return error.MalformedTransportPes;
         if (bytes[6] & 0x30 != 0) return error.UnsupportedEncryptedMedia;
         const declared = std.mem.readInt(u16, bytes[4..6], .big);
-        const end: usize = if (declared == 0) bytes.len else 6 + @as(usize, declared);
-        if (end > bytes.len) return error.TruncatedTransportPes;
-        for (bytes[end..]) |byte| if (byte != 0xff) return error.MalformedTransportPes;
+        const end: usize = if (declared == 0) length else 6 + @as(usize, declared);
+        if (end > length) return error.TruncatedTransportPes;
+        if (self.probe == null) {
+            for (bytes[end..]) |byte| if (byte != 0xff) return error.MalformedTransportPes;
+        }
         const header = @as(usize, bytes[8]) + 9;
         if (header > end) return error.TruncatedTransportPes;
         const flags = bytes[7] >> 6;
@@ -251,21 +279,41 @@ const Parser = struct {
             pts = std.math.add(i64, dts, delta(pts_raw, dts_raw)) catch return error.ResourceLimitExceeded;
         }
         if (header == end) return error.MalformedTransportPes;
-        const count = if (self.consumer != null) self.published_packets else self.packets.items.len;
-        const offset = if (self.consumer != null) self.published_bytes else self.output.items.len;
+        const count = self.published_packets;
+        const offset = self.published_bytes;
         if (count >= self.limits.max_packets or end - header > self.limits.max_bytes -| offset) return error.ResourceLimitExceeded;
         const packet_info = Packet{ .offset = offset, .size = end - header, .dts = dts, .pts = pts, .has_timestamp = timed };
-        if (self.consumer) |consumer| {
+        if (self.probe) |probe| {
+            if (timed) probe.clock.include(pts);
+            probe.size = 0;
+        } else if (self.consumer) |consumer| {
             try consumer.accept(consumer.context, .{ .bytes = bytes[header..end], .packet = packet_info, .ordinal = count });
-            self.published_packets += 1;
-            self.published_bytes += end - header;
         } else {
             try self.packets.append(self.allocator, packet_info);
             try self.output.appendSlice(self.allocator, bytes[header..end]);
         }
+        self.published_packets += 1;
+        self.published_bytes += end - header;
         if (timed) self.state.last_dts = dts;
         self.pes.clearRetainingCapacity();
         self.pes_started = false;
+    }
+    fn finishStream(self: *Parser) !void {
+        if (self.pat.length != 0 or self.pmt.length != 0) return error.TruncatedTransportSection;
+        try self.finishPes();
+        if (!self.pat_table.complete() or !self.pmt_table.complete()) return error.MissingTransportTables;
+        if (self.state.video_pid == null) return error.UnsupportedVideoCodec;
+        if (self.published_packets == 0) return error.EmptyVideo;
+    }
+
+    fn parseClip(self: *Parser, bytes: []const u8) !void {
+        var offset: usize = 0;
+        while (offset < bytes.len) : (offset += 188) try self.packet(bytes[offset..][0..188]);
+        try self.finishStream();
+    }
+
+    fn pesSize(self: *const Parser) usize {
+        return if (self.probe) |probe| probe.size else self.pes.items.len;
     }
     fn packet(self: *Parser, bytes: *const [188]u8) !void {
         try self.control.check();
@@ -306,7 +354,8 @@ const Parser = struct {
             self.pes_started = true;
         }
         if (!self.pes_started) return error.TruncatedTransportPes;
-        if (payload.len > self.limits.max_pes_bytes -| self.pes.items.len) return error.ResourceLimitExceeded;
+        if (payload.len > self.limits.max_pes_bytes -| self.pesSize()) return error.ResourceLimitExceeded;
+        if (self.probe) |probe| return probe.push(payload);
         try self.pes.appendSlice(self.allocator, payload);
     }
 };
@@ -399,11 +448,7 @@ pub const Stream = struct {
     fn finishEntered(self: *Stream) !State {
         try self.parser.control.check();
         if (self.input_bytes == 0 or self.carry_len != 0) return error.MalformedTransportStream;
-        if (self.parser.pat.length != 0 or self.parser.pmt.length != 0) return error.TruncatedTransportSection;
-        try self.parser.finishPes();
-        if (!self.parser.pat_table.complete() or !self.parser.pmt_table.complete()) return error.MissingTransportTables;
-        if (self.parser.state.video_pid == null) return error.UnsupportedVideoCodec;
-        if (self.parser.published_packets == 0) return error.EmptyVideo;
+        try self.parser.finishStream();
         try self.parser.control.check();
         return self.parser.state;
     }
@@ -423,6 +468,18 @@ fn unwrap(value: u64, previous: ?i64) !i64 {
     const last = previous orelse return @intCast(value);
     return std.math.add(i64, last, delta(value, @intCast(@mod(last, @as(i64, 1 << 33))))) catch error.ResourceLimitExceeded;
 }
+/// Inspect the selected AVC program's unwrapped presentation clock without
+/// materializing PES payloads or allocating a packet index.
+pub fn probeSampleClock(a: std.mem.Allocator, bytes: []const u8, limits: Limits, control: source.Control) !timeline.SampleClock {
+    try control.check();
+    if (bytes.len > limits.max_bytes) return error.ResourceLimitExceeded;
+    if (!isTransportStream(bytes)) return error.MalformedTransportStream;
+    var probe = ClockProbe{};
+    var parser = Parser{ .allocator = a, .limits = limits, .state = .{}, .control = control, .probe = &probe };
+    try parser.parseClip(bytes);
+    return probe.clock;
+}
+
 pub fn demux(a: std.mem.Allocator, bytes: []const u8, state: State, limits: Limits, control: source.Control, pool: ?*admission.Pool) !Demux {
     try control.check();
     if (bytes.len > limits.max_bytes) return error.ResourceLimitExceeded;
@@ -437,13 +494,7 @@ pub fn demux(a: std.mem.Allocator, bytes: []const u8, state: State, limits: Limi
     defer parser.pes.deinit(a);
     defer parser.output.deinit(a);
     defer parser.packets.deinit(a);
-    var offset: usize = 0;
-    while (offset < bytes.len) : (offset += 188) try parser.packet(bytes[offset..][0..188]);
-    if (parser.pat.length != 0 or parser.pmt.length != 0) return error.TruncatedTransportSection;
-    try parser.finishPes();
-    if (!parser.pat_table.complete() or !parser.pmt_table.complete()) return error.MissingTransportTables;
-    if (parser.state.video_pid == null) return error.UnsupportedVideoCodec;
-    if (parser.packets.items.len == 0) return error.EmptyVideo;
+    try parser.parseClip(bytes);
     const output = try parser.output.toOwnedSlice(a);
     errdefer a.free(output);
     const packets = try parser.packets.toOwnedSlice(a);
@@ -466,6 +517,16 @@ test "transport AVC PES payload clocks and order match independent FFprobe" {
         defer result.deinit();
         const oracle = try std.json.parseFromSlice(Oracle, std.testing.allocator, @embedFile("../testdata/transport/" ++ name ++ ".json"), .{});
         defer oracle.deinit();
+        const clock = try probeSampleClock(std.testing.failing_allocator, @embedFile("../testdata/transport/" ++ name ++ ".ts"), .{}, .{});
+        try std.testing.expectEqual(oracle.value.packets.len, clock.count);
+        var first: i64 = std.math.maxInt(i64);
+        var last: i64 = std.math.minInt(i64);
+        for (oracle.value.packets) |packet| {
+            first = @min(first, packet.pts);
+            last = @max(last, packet.pts);
+        }
+        try std.testing.expectEqual(first, clock.first);
+        try std.testing.expectEqual(last, clock.last);
         try std.testing.expectEqual(oracle.value.packets.len, result.packets.len);
         try std.testing.expectEqualSlices(u8, @embedFile("../testdata/transport/" ++ name ++ "-pes.bin"), result.bytes);
         for (result.packets, oracle.value.packets) |packet, expected| {
@@ -476,6 +537,15 @@ test "transport AVC PES payload clocks and order match independent FFprobe" {
         }
     }
 }
+test "transport timing probe handles split PES headers and validates discarded stuffing" {
+    var probe = ClockProbe{};
+    try probe.push(&.{ 0, 0, 1, 0xe0, 0 });
+    try probe.push(&.{ 4, 0x80, 0, 0, 0x42, 0xff });
+    try probe.push(&.{ 0xff, 0xff });
+    try std.testing.expectEqual(@as(usize, 13), probe.size);
+    try std.testing.expectError(error.MalformedTransportPes, probe.push(&.{0}));
+}
+
 fn allocationRun(backing: std.mem.Allocator, pool: *admission.Pool) !void {
     // ArrayList resize success depends on heap placement. Force its allocation
     // fallback so the outer failure campaign has deterministic allocation counts.

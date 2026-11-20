@@ -19,40 +19,13 @@ const std = @import("std");
 const media = @import("antfly_media");
 const display = @import("display.zig");
 
-/// True when the clip's first decodable track belongs on the WebM lane. A clip
-/// the MP4 reader can't open isn't claimed; its own route reports the failure.
+pub const limits: media.mp4.Limits = .{ .codecs = std.EnumSet(media.mp4.Codec).initMany(&.{ .avc, .mjpeg, .hevc, .av1 }) };
+
+/// Classify borrowed metadata without constructing a packet index.
 pub fn usesWebmLane(_: std.mem.Allocator, bytes: []const u8) bool {
-    // Most clips aren't AV1. Neither this fast check nor the metadata probe
-    // allocates an index; the chosen route owns full validation under admission.
-    if (!moovMentionsAv1(bytes)) return false;
     const track = media.mp4.probeTrack(bytes, limits, .{}) catch return false;
     return track.codec == .av1;
 }
-
-/// Walks top-level boxes only. A false positive just costs the full parse below.
-fn moovMentionsAv1(bytes: []const u8) bool {
-    var cursor: usize = 0;
-    while (bytes.len - cursor >= 8) {
-        var size: u64 = std.mem.readInt(u32, bytes[cursor..][0..4], .big);
-        var header: usize = 8;
-        if (size == 1) {
-            if (bytes.len - cursor < 16) return false;
-            size = std.mem.readInt(u64, bytes[cursor + 8 ..][0..8], .big);
-            header = 16;
-        } else if (size == 0) {
-            size = bytes.len - cursor;
-        }
-        if (size < header or size > bytes.len - cursor) return false;
-        const box: usize = @intCast(size);
-        if (std.mem.eql(u8, bytes[cursor + 4 ..][0..4], "moov")) {
-            return std.mem.indexOf(u8, bytes[cursor + header .. cursor + box], "av01") != null;
-        }
-        cursor += box;
-    }
-    return false;
-}
-
-pub const limits: media.mp4.Limits = .{ .codecs = std.EnumSet(media.mp4.Codec).initMany(&.{ .avc, .mjpeg, .hevc, .av1 }) };
 
 /// The returned reader owns MP4 metadata and exact WebM-index admission.
 /// Conversion admits the overlap while both packet indexes are live.
@@ -65,7 +38,7 @@ pub fn openWebm(a: std.mem.Allocator, source: *media.source.Source) !media.webm.
 const adapted_sample_bytes = @sizeOf(media.webm.Packet) + @sizeOf(media.webm.SourceTimeline.Sample);
 
 /// Consumes the MP4 owner on success; errors preserve it for caller cleanup.
-fn intoWebm(a: std.mem.Allocator, reader: *media.mp4.Reader) !media.webm.Reader {
+pub fn intoWebm(a: std.mem.Allocator, reader: *media.mp4.Reader) !media.webm.Reader {
     try reader.input.control.check();
     if (reader.track.codec != .av1) return error.UnsupportedVideoCodec;
     if (reader.track.timescale == 0) return error.InvalidTimebase;
@@ -178,13 +151,10 @@ fn colour(bytes: []const u8) !media.webm.Colour {
 test "AV1 MP4 keeps its packets and display metadata on the WebM lane" {
     const a = std.testing.allocator;
     const bytes = @embedFile("../testdata/av1-mp4.mp4");
-    try std.testing.expect(usesWebmLane(a, bytes));
-    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    try std.testing.expect(usesWebmLane(denied.allocator(), bytes));
-    try std.testing.expectEqual(@as(usize, 0), denied.allocated_bytes);
+    try std.testing.expect(usesWebmLane(std.testing.failing_allocator, bytes));
     try std.testing.expect(!usesWebmLane(a, @embedFile("../testdata/mjpeg.mov")));
-    try std.testing.expect(!moovMentionsAv1(@embedFile("../testdata/hevc-mp4.mp4")));
-    try std.testing.expect(!moovMentionsAv1("not an mp4 at all"));
+    try std.testing.expect(!usesWebmLane(a, "not an MP4"));
+
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "av1" };
     var original = try media.mp4.Reader.init(a, &source, limits);
     defer original.deinit();

@@ -190,10 +190,13 @@ Local Gemma 4 generators with a projector accept one video per request, alongsid
 text but not image or audio parts anywhere in that request. Earlier turns can contain
 text. `context_management` rejects video, because it only plans text. Generators
 target one frame per second and uniformly cap the selection at 32 across the clip.
-Both decoding routes accept up to 256 MiB of compressed input. Portable generation
-can use timestamps beyond one minute when the codec and request budgets allow.
-NVDEC takes compatible progressive H.264, HEVC, and AV1 MP4 up to 60 seconds,
-18,000 samples and 4096 pixels per coded axis. CPU and Metal take the
+Admission estimates video tokens from the clip’s presentation timestamps. Generation
+checks the text, timestamp labels and projected frame tokens together against the
+context limit before prefill. Both decoding routes accept up to 256 MiB of
+compressed input. Portable generation can use timestamps beyond one minute when
+the codec and request budgets allow. NVDEC accepts compatible progressive H.264,
+HEVC and AV1 MP4 with up to 60 seconds of elapsed video, 18,000 samples and 4096
+pixels per coded axis. CPU and Metal take the
 [portable codecs](../../zig/lib/video/VIDEO.md).
 When NVDEC is unavailable or declines the clip, CUDA tries a portable decoder
 under a separate host scratch reservation. Portable decoding charges the invocation's host, combined, and scratch

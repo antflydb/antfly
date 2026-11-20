@@ -30,6 +30,7 @@ pub const FrameCache = @import("embedding_gemma2_video_cache.zig").Cache;
 const CacheKey = @import("embedding_gemma2_video_cache.zig").Key;
 const CacheTicket = @import("embedding_gemma2_video_cache.zig").Ticket;
 pub const Encoded = struct {
+    decoder_source_bytes: u64 = 0,
     embeddings: []f32 = &.{},
     tensor: ?CT = null,
     backend: ?*const ComputeBackend = null,
@@ -210,9 +211,10 @@ pub const Inspection = struct {
             self.source.limits = source.limits;
         } else try validateInputSize(bytes.len, configuration.sampling);
         self.validated_bytes = if (borrowed) |reader| try sampledPacketBytes(reader, configuration.sampling) else bytes;
-        self.webm = configuration.webm != null or (borrowed == null and usesWebmLane(a, bytes));
+        const opened = if (configuration.webm == null and borrowed == null) try ContainerInput.open(a, &self.source, bytes, configuration.sampling) else null;
+        self.webm = configuration.webm != null or (opened != null and opened.? == .webm);
         if (self.webm) {
-            self.webm_reader = if (configuration.webm) |input| input.reader.* else try openWebmLane(a, &self.source, bytes);
+            self.webm_reader = if (configuration.webm) |input| input.reader.* else opened.?.webm;
             self.owns_webm_reader = configuration.webm == null;
             self.webm_reader.input = &self.source;
             self.webm_index = if (configuration.webm) |input| input.index.* else try video.webm_pictures.index(a, &self.webm_reader, webmDecodeOptions(self.source.control, &self.pool));
@@ -227,7 +229,7 @@ pub const Inspection = struct {
                 self.reader.input = &self.source;
                 self.borrowed_hevc_config = try normalizeHevc(a, &self.reader);
             } else {
-                self.packet_input = try PacketInput.initSampled(a, &self.source, bytes, configuration.sampling);
+                self.packet_input = opened.?.packets;
                 self.reader = self.packet_input.?.reader;
             }
             self.configurations = try parameterSession(a, &self.reader, configuration.sampling == .gemma4 and configuration.selection == null);
@@ -347,7 +349,7 @@ pub const DecoderContinuation = struct {
     fn decode(self: *@This(), selected: []const usize, packet_base: usize, context: *anyopaque, callback: video.h264.SelectionCallback) !bool {
         return self.decodeControlled(selected, packet_base, context, callback, self.reader.input.control);
     }
-    fn decodeControlled(self: *@This(), selected: []const usize, packet_base: usize, context: *anyopaque, callback: video.h264.SelectionCallback, control: media.source.Control) !bool {
+    pub fn decodeControlled(self: *@This(), selected: []const usize, packet_base: usize, context: *anyopaque, callback: video.h264.SelectionCallback, control: media.source.Control) !bool {
         const Controls = struct {
             original: media.source.Control,
             current: media.source.Control,
@@ -768,13 +770,43 @@ fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader, cache_heade
 fn isWebm(bytes: []const u8) bool {
     return bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "\x1a\x45\xdf\xa3");
 }
-/// AV1 in MP4 shares WebM's reconstruction, display policy and Apple route.
-fn usesWebmLane(a: std.mem.Allocator, bytes: []const u8) bool {
-    return isWebm(bytes) or video.mp4_coded.usesWebmLane(a, bytes);
+// Open and validate the container once. Adapt AV1 only after the bounded MP4
+// reader has selected the track, transferring its metadata to the WebM owner.
+const ContainerInput = union(enum) {
+    packets: PacketInput,
+    webm: media.webm.Reader,
+
+    fn open(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8, sampling: Sampling) !ContainerInput {
+        if (isWebm(bytes)) return .{ .webm = try media.webm.Reader.init(a, source, .{}) };
+        var packet = try PacketInput.initSampled(a, source, bytes, sampling);
+        errdefer packet.deinit();
+        if (packet.reader.track.codec == .av1) return .{ .webm = try video.mp4_coded.intoWebm(a, &packet.reader) };
+        return .{ .packets = packet };
+    }
+
+    fn deinit(self: *ContainerInput) void {
+        switch (self.*) {
+            inline else => |*owner| owner.deinit(),
+        }
+    }
+};
+test "gemma4 video container routing checks cancellation while scanning top-level boxes" {
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            if (self.calls == 8) return error.Cancelled;
+        }
+    };
+    const headers: [256][8]u8 = @splat("\x00\x00\x00\x08free".*);
+    const boxes = std.mem.asBytes(&headers);
+    var cancel = Cancel{};
+    var source = media.source.Source{ .allocator = std.testing.allocator, .identity = "cancel-route", .storage = .{ .borrowed = boxes }, .control = .{ .context = &cancel, .check_fn = Cancel.check } };
+    try std.testing.expectError(error.Cancelled, ContainerInput.open(std.testing.allocator, &source, boxes, .gemma4));
+    try std.testing.expect(source.reads < 8);
 }
-fn openWebmLane(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8) !media.webm.Reader {
-    return if (isWebm(bytes)) media.webm.Reader.init(a, source, .{}) else video.mp4_coded.openWebm(a, source);
-}
+
 fn normalizeHevc(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
     return video.hevc_config.normalizeReader(a, reader) catch |err| switch (err) {
         // This parser and both output routes share the 4:2:0 Main/Main10
@@ -1214,15 +1246,15 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
     try validateInputSize(bytes.len, sampling);
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-preflight", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
-    if (usesWebmLane(a, bytes)) {
-        var reader = try openWebmLane(a, &source, bytes);
-        defer reader.deinit();
-        var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(source.control, pool));
+    var opened = try ContainerInput.open(a, &source, bytes, sampling);
+    defer opened.deinit();
+    if (opened == .webm) {
+        const reader = &opened.webm;
+        var index = try video.webm_pictures.index(a, reader, webmDecodeOptions(source.control, pool));
         defer index.deinit();
-        return inspectWebmPlan(a, &reader, index, sampling, metal, null);
+        return inspectWebmPlan(a, reader, index, sampling, metal, null);
     }
-    var input = try PacketInput.initSampled(a, &source, bytes, sampling);
-    defer input.deinit();
+    const input = &opened.packets;
     return inspectPacketPlan(a, &input.reader, control, sampling, metal, null);
 }
 fn inspectPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, control: Control, sampling: Sampling, metal: bool, selection: ?*const ReaderSelection) !Plan {
@@ -1267,10 +1299,15 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
 /// Presentation time of each selected picture, in microseconds from the first
 /// picture. Slots match the slots delivered to a FrameObserver for this sampling.
 pub fn selectedConfiguredPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: Control, configuration: Configuration) ![]i64 {
-    const scope = configuration.inspection_scope orelse return selectedPresentationUs(a, bytes, control, configuration.sampling, configuration.pool);
+    if (configuration.inspection_scope == null) return selectedPresentationUs(a, bytes, control, configuration.sampling, configuration.pool);
+    return inspectedPresentationUs(a, bytes, null, control, configuration);
+}
+
+pub fn inspectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration) ![]i64 {
+    const scope = configuration.inspection_scope orelse return error.InvalidVideoCacheReservation;
     try control.check();
-    _ = try scope.inspect(bytes, null, control, configuration, false);
-    const entry = scope.find(bytes, null, configuration).?;
+    _ = try scope.inspect(bytes, reader, control, configuration, false);
+    const entry = scope.find(bytes, reader, configuration).?;
     if (entry.gemma4_plan) |*plan| return a.dupe(i64, plan.timestamps());
     const selected = entry.selected.?;
     const output = try a.alloc(i64, selected.len);
@@ -1298,10 +1335,11 @@ pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: 
     try validateInputSize(bytes.len, sampling);
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-timestamps", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
-    if (usesWebmLane(a, bytes)) {
-        var reader = try openWebmLane(a, &source, bytes);
-        defer reader.deinit();
-        var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(source.control, pool));
+    var opened = try ContainerInput.open(a, &source, bytes, sampling);
+    defer opened.deinit();
+    if (opened == .webm) {
+        const reader = &opened.webm;
+        var index = try video.webm_pictures.index(a, reader, webmDecodeOptions(source.control, pool));
         defer index.deinit();
         if (try adaptedPlan(index, sampling, source.control)) |plan| return a.dupe(i64, plan.timestamps());
         const selected = try selectWebm(a, index, sampling, source.control, null);
@@ -1312,8 +1350,7 @@ pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: 
         for (selected, output) |id, *value| value.* = @divFloor(index.pictures[id].pts - first, 1000);
         return output;
     }
-    var input = try PacketInput.initSampled(a, &source, bytes, sampling);
-    defer input.deinit();
+    const input = &opened.packets;
     if (sampling == .gemma4) {
         const plan = try video.packet_sampling.gemma4PortablePlan(a, &input.reader, null);
         return a.dupe(i64, plan.timestamps());
@@ -1525,10 +1562,11 @@ pub const Prefetch = struct {
             source.identity = input.reader.input.identity;
             source.limits = input.reader.input.limits;
         }
-        const webm = if (inspection) |owner| owner.webm else self.webm_input != null or (self.packet_reader == null and usesWebmLane(a, bytes));
+        var opened = if (inspection == null and self.webm_input == null and self.packet_reader == null) try ContainerInput.open(a, &source, bytes, sampling) else null;
+        defer if (opened) |*owner| owner.deinit();
+        const webm = if (inspection) |owner| owner.webm else self.webm_input != null or (opened != null and opened.? == .webm);
         var webm_reader: media.webm.Reader = undefined;
         var reader: media.mp4.Reader = undefined;
-        var packet_input: ?PacketInput = null;
         if (inspection) |owner| {
             const original = if (webm) owner.webm_reader.input else owner.reader.input;
             source.storage = original.storage;
@@ -1542,7 +1580,7 @@ pub const Prefetch = struct {
                 reader.input = &source;
             }
         } else if (webm) {
-            webm_reader = if (self.webm_input) |input| input.reader.* else try openWebmLane(a, &source, bytes);
+            webm_reader = if (self.webm_input) |input| input.reader.* else opened.?.webm;
             webm_reader.input = &source;
         } else if (self.packet_reader) |borrowed| {
             source.storage = borrowed.input.storage;
@@ -1551,10 +1589,8 @@ pub const Prefetch = struct {
             reader = borrowed.*;
             reader.input = &source;
         } else {
-            packet_input = try PacketInput.initSampled(a, &source, bytes, sampling);
-            reader = packet_input.?.reader;
+            reader = opened.?.packets.reader;
         }
-        defer if (inspection == null and webm and self.webm_input == null) webm_reader.deinit() else if (packet_input) |*input| input.deinit();
         const normalized_hevc = if (webm) null else try normalizeHevc(a, &reader);
         defer if (normalized_hevc) |bytes_owned| a.free(bytes_owned);
         var webm_index: ?video.webm_pictures.Index = if (inspection) |owner| owner.webm_index else if (self.webm_input) |input| input.index.* else if (webm) try video.webm_pictures.index(a, &webm_reader, webmDecodeOptions(source.control, pool)) else null;
@@ -1982,6 +2018,11 @@ pub fn encodeReaderCachedWithSelection(a: std.mem.Allocator, cb: *const ComputeB
 /// Decoder-only consumers use the same selection and colour policy as the
 /// embedding tower, without acquiring model weights or projecting a frame.
 pub fn observeConfigured(a: std.mem.Allocator, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, supplied: Configuration) !void {
+    _ = try observeConfiguredSourceBytes(a, bytes, reader, control, supplied);
+}
+
+/// Bytes fetched from the coded source during replay, including seek probes.
+pub fn observeConfiguredSourceBytes(a: std.mem.Allocator, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, supplied: Configuration) !u64 {
     const native = @import("../ops/native_compute.zig");
     var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
     defer store.deinitOwned();
@@ -1996,6 +2037,7 @@ pub fn observeConfigured(a: std.mem.Allocator, bytes: []const u8, reader: ?*cons
     config.stage = null;
     var result = try encodeConfigured(a, &cb, bytes, reader, control, config);
     defer result.deinit(a);
+    return result.decoder_source_bytes;
 }
 
 pub fn encodeConfigured(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration) !Encoded {
@@ -2027,10 +2069,11 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         source.identity = input.reader.input.identity;
         source.limits = input.reader.input.limits;
     }
-    const webm = if (inspection) |owner| owner.webm else webm_input != null or (borrowed == null and usesWebmLane(a, bytes));
+    var opened = if (inspection == null and webm_input == null and borrowed == null) try ContainerInput.open(a, &source, bytes, sampling) else null;
+    defer if (opened) |*owner| owner.deinit();
+    const webm = if (inspection) |owner| owner.webm else webm_input != null or (opened != null and opened.? == .webm);
     var webm_reader: media.webm.Reader = undefined;
     var reader: media.mp4.Reader = undefined;
-    var packet_input: ?PacketInput = null;
     if (inspection) |owner| {
         const original = if (webm) owner.webm_reader.input else owner.reader.input;
         source.storage = original.storage;
@@ -2044,7 +2087,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
             reader.input = &source;
         }
     } else if (webm) {
-        webm_reader = if (webm_input) |input| input.reader.* else try openWebmLane(a, &source, bytes);
+        webm_reader = if (webm_input) |input| input.reader.* else opened.?.webm;
         webm_reader.input = &source;
     } else if (borrowed) |input| {
         source.storage = input.input.storage;
@@ -2053,10 +2096,8 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         reader = input.*;
         reader.input = &source;
     } else {
-        packet_input = try PacketInput.initSampled(a, &source, bytes, sampling);
-        reader = packet_input.?.reader;
+        reader = opened.?.packets.reader;
     }
-    defer if (inspection == null and webm and webm_input == null) webm_reader.deinit() else if (packet_input) |*input| input.deinit();
     const normalized_hevc = if (webm) null else try normalizeHevc(a, &reader);
     defer if (normalized_hevc) |bytes_owned| a.free(bytes_owned);
     var webm_index: ?video.webm_pictures.Index = if (inspection) |owner| owner.webm_index else if (webm_input) |input| input.index.* else if (webm) try video.webm_pictures.index(a, &webm_reader, webmDecodeOptions(source.control, pool)) else null;
@@ -2161,6 +2202,8 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     capture.metal = if (preparer) |*value| value else null;
     if (missing != 0) if (preparer) |*value| try configureOutputSlab(value, pool, try selectionOutputBytes(a, misses[0..missing], if (webm) null else &reader, configurations, if (webm) &webm_reader else null, webm_index));
     capture.decode_slots = miss_slots[0..missing];
+    const replay_source = if (webm) webm_reader.input else reader.input;
+    const reads_before_decode = replay_source.total_bytes;
     const decoded = if (prepared_frames) |frames| reuse: {
         if (frames.len != selected.len) return error.InvalidInputShape;
         for (frames, 0..) |frame, slot| {
@@ -2185,7 +2228,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     if (decode_error) |err| return err;
     if (observe_only) {
         a.free(frame_tokens);
-        return .{};
+        return .{ .decoder_source_bytes = replay_source.total_bytes - reads_before_decode };
     }
     try capture.flushNativePending();
     try capture.finishDuplicates();

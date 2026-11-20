@@ -480,7 +480,9 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     state.sar = try displayAspect(allocator, track);
     _ = try (Frame{ .device = 0, .pitch = 0, .width = track.width, .height = track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = state.rotation, .sar = state.sar }).displaySize();
     if (reader.packets.len == 0) return error.EmptyVideo;
-    state.sampler.end_us = try validateTimeline(track, reader.packets);
+    if (sampling == .gemma4) {
+        try validateDecodeSpan(track, reader.packets);
+    } else state.sampler.end_us = try validateTimeline(track, reader.packets);
     // NVDEC resolves active SPS/PPS itself and rejects unsupported sequences
     // before allocating surfaces. Sample the progressive access-unit timeline.
     // Validate the one-picture-per-sample contract against the display callbacks.
@@ -554,6 +556,21 @@ fn embeddingContentDurationUs(track: media.mp4.Track, presentation_end_us: i64) 
     return presentation_end_us;
 }
 
+// NVDEC's work envelope bounds elapsed coded time, including preroll. The
+// Gemma sampler sends packet identities to NVDEC, so its clock origin is free.
+fn validateDecodeSpan(track: media.mp4.Track, packets: []const media.mp4.Packet) !void {
+    if (track.timescale == 0) return error.InvalidVideoTimestamp;
+    if (packets.len == 0) return error.EmptyVideo;
+    var start: i128 = packets[0].pts;
+    var end = start;
+    for (packets) |packet| {
+        start = @min(start, packet.pts);
+        end = @max(end, @as(i128, packet.pts) + packet.duration);
+    }
+    const duration = @max(end - start, @as(i128, track.edit.source_duration orelse 0));
+    if (duration * std.time.us_per_s > @as(i128, max_duration_us) * track.timescale) return error.VideoDurationExceeded;
+}
+
 fn validateTimeline(track: media.mp4.Track, packets: []const media.mp4.Packet) !i64 {
     if (track.timescale == 0) return error.InvalidVideoTimestamp;
     const max_ticks = @as(i128, max_duration_us) * track.timescale;
@@ -572,9 +589,33 @@ fn validateTimeline(track: media.mp4.Track, packets: []const media.mp4.Packet) !
     return end_us;
 }
 
+test "gemma4 video NVDEC samples a short HEVC fragment at a nonzero decode time" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try @import("cuda_compute.zig").CudaCompute.init(a);
+    defer compute.deinit();
+    const Capture = struct {
+        count: usize = 0,
+        fn accept(raw: *anyopaque, frame: Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(i64, @intCast(self.count)) * std.time.us_per_s, frame.timestamp_us);
+            self.count += 1;
+        }
+    };
+    var capture = Capture{};
+    const stats = try decodeMp4Sampled(a, &compute.ctx, @embedFile("../../testdata/video/hevc-fragmented.mp4"), .{ .context = &capture, .consume = Capture.accept }, .gemma4);
+    try std.testing.expectEqual(@as(usize, 4), stats.selected_frames);
+    try std.testing.expectEqual(@as(usize, 16), stats.decoded_frames);
+}
+
 test "video timeline rejects overflow and samples only the declared edit interval" {
     const track = media.mp4.Track{ .id = 1, .timescale = 1000, .width = 160, .height = 96, .avcc = &.{}, .nal_length_bytes = 4, .display_matrix = @splat(0), .edit = .{ .source_duration = 1500 } };
     const packets = [_]media.mp4.Packet{.{ .offset = 0, .size = 1, .dts = 0, .media_pts = 0, .pts = 0, .duration = 6000, .sync = true }};
+    var shifted = packets;
+    shifted[0].pts = 120_000;
+    try validateDecodeSpan(track, &shifted);
+    shifted[0].duration = 60_001;
+    try std.testing.expectError(error.VideoDurationExceeded, validateDecodeSpan(track, &shifted));
     var sampler = Sampler{ .end_us = try validateTimeline(track, &packets) };
     try std.testing.expect(try sampler.select(0));
     try std.testing.expect(try sampler.select(1_000_000));

@@ -32,6 +32,43 @@ const max_minutes = std.math.maxInt(i64) / (60 * std.time.us_per_s);
 const timestamp_bytes = std.fmt.comptimePrint("{d}:59", .{max_minutes}).len;
 pub const token_allowance = video.packet_sampling.gemma4_max_frames * (projector_mod.video_tokens_per_frame + timestamp_bytes + 4);
 
+// Every selected timestamp comes from a coded packet (or a timed PES).
+// One selection per one-second bucket also bounds the number of visible
+// pictures when one packet contains several codec outputs or only preroll.
+fn clockAllowance(clock: media.timeline.SampleClock) !usize {
+    if (clock.scale == 0 or clock.count == 0) return error.EmptyVideo;
+    const seconds: u64 = @intCast(@divFloor(@as(i128, clock.last) - clock.origin(), clock.scale));
+    const frames = @min(clock.count, seconds +| 1, video.packet_sampling.gemma4_max_frames);
+    const minutes_width = @max(2, std.fmt.count("{d}", .{seconds / 60}));
+    return frames * (projector_mod.video_tokens_per_frame + minutes_width + 3 + 4);
+}
+
+/// Size the reservation from container clocks without acquiring a decoder or
+/// projector. Final context validation tokenizes the actual projected spans.
+pub fn promptAllowance(a: std.mem.Allocator, bytes: []const u8) !usize {
+    if (bytes.len > video.packet_sampling.gemma4_max_input_bytes) return error.VideoInputTooLarge;
+    if (media.transport_stream.isTransportStream(bytes)) {
+        return clockAllowance(try media.transport_stream.probeSampleClock(a, bytes, .{ .max_bytes = video.packet_sampling.gemma4_max_input_bytes }, .{}));
+    }
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = inspection_bytes } };
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-prompt-clock", .admission_pool = &pool, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
+    if (std.mem.startsWith(u8, bytes, "\x1a\x45\xdf\xa3")) {
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        var clock = media.timeline.SampleClock{ .scale = std.time.ns_per_s };
+        for (reader.packets) |packet| clock.include(packet.pts);
+        return clockAllowance(clock);
+    }
+    if (try media.mp4.probeSampleClock(bytes, video.mp4_coded.limits, source.control)) |table| {
+        return clockAllowance(table);
+    }
+    var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
+    defer reader.deinit();
+    var clock = media.timeline.SampleClock{ .scale = reader.track.timescale, .edit = reader.track.edit };
+    for (reader.packets) |packet| clock.include(packet.pts);
+    return clockAllowance(clock);
+}
+
 const sampling: embedding_video.Sampling = .gemma4;
 
 /// Decoder and indexing memory, shared through one pool per request.
@@ -318,27 +355,34 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
     // VideoToolbox surfaces are a separate budget from decoder heap memory.
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes - inspection_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
     var inspection = embedding_video.InspectionScope{ .allocator = a, .limit = inspection_bytes };
-    defer inspection.deinit();
     const configuration = embedding_video.Configuration{ .sampling = sampling, .pool = &pool, .inspection_scope = &inspection };
-    const timestamps = embedding_video.selectedConfiguredPresentationUs(a, bytes, control, configuration) catch |err| return inputError(err);
+    const adapter = control.imageWorkControl();
+    const source_control: media.source.Control = .{ .context = adapter.context, .check_fn = adapter.check_fn };
+    const transport = if (media.transport_stream.isTransportStream(bytes)) video.transport_avc.indexClip(a, "generation-video", bytes, .{
+        .transport = .{ .max_bytes = video.packet_sampling.gemma4_max_input_bytes },
+        .stream = .{ .max_bytes = video.packet_sampling.gemma4_max_input_bytes, .control = source_control, .admission_pool = &pool, .source_limits = .{ .max_total_bytes = 512 * 1024 * 1024 } },
+    }) catch |err| return inputError(err) else null;
+    defer if (transport) |owner| owner.deinit();
+    defer inspection.deinit();
+    const reader = if (transport) |owner| &owner.reader else null;
+    const timestamps = embedding_video.inspectedPresentationUs(a, bytes, reader, control, configuration) catch |err| return inputError(err);
     defer a.free(timestamps);
-    const inspected = inspection.find(bytes, null, configuration).?;
+    const inspected = inspection.find(bytes, reader, configuration).?;
     if (!inspected.webm and inspected.reader.track.codec == .hevc) {
-        const adapter = control.imageWorkControl();
-        const required = try video.apple_hevc.surfaceBytesControlled(inspected.reader.track, .{ .context = adapter.context, .check_fn = adapter.check_fn });
+        const required = try video.apple_hevc.surfaceBytesControlled(inspected.reader.track, source_control);
         if (required > video.apple_hevc.max_surface_bytes) return error.SharedAdmissionExceeded;
         try permit.ensureSurfaces(admission, std.math.cast(usize, required) orelse return error.SharedAdmissionExceeded);
     }
     var frames = try projector_mod.PortableVideoFrames.init(cb, a, projector, timestamps.len);
     defer frames.deinit();
     var observer: Observer = .{ .a = a, .cb = cb, .frames = &frames };
-    embedding_video.observeConfigured(a, bytes, null, control, .{
+    const replay_bytes = embedding_video.observeConfiguredSourceBytes(a, bytes, reader, control, .{
         .observer = .{ .context = &observer, .accept = Observer.accept },
         .sampling = sampling,
         .pool = &pool,
         .inspection_scope = &inspection,
     }) catch |err| return inputError(err);
-    return frames.project(timestamps);
+    return frames.project(timestamps, replay_bytes);
 }
 
 /// Client media failures become one input error. Cancellation, deadlines and
