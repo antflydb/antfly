@@ -48941,7 +48941,7 @@ pub const DB = struct {
                 return;
             }
             if (options.require_complete_primary_population) {
-                try self.scanSourcePopulation();
+                try self.scanSourcePopulation(options);
                 return;
             }
             // Explicit historical reads still need identities deleted since
@@ -49019,7 +49019,7 @@ pub const DB = struct {
             if (!self.stopped) _ = try self.drainExceptionalBefore(null);
         }
 
-        fn scanSourcePopulation(self: *@This()) !void {
+        fn scanSourcePopulation(self: *@This(), options: db_query_search.MatchAllCandidateCollectOptions) !void {
             const Scan = struct {
                 owner: *PrimaryMatchAllIdentityScan,
                 arena: std.heap.ArenaAllocator,
@@ -49071,15 +49071,25 @@ pub const DB = struct {
                 }
             };
             const owner_range = self.db.core.byteRange();
-            const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, owner_range.start);
+            const after = options.primary_key_start_after;
+            const start = if (after != null and owner_range.contains(after.?)) after.? else owner_range.start;
+            if (after) |key| if (owner_range.end.len != 0 and std.mem.order(u8, key, owner_range.end) != .lt) return;
+            const lower = if (after != null and std.mem.eql(u8, start, after.?)) exact: {
+                const prefix = try internal_keys.documentExactPrefixAlloc(self.alloc, start);
+                prefix[prefix.len - 1] = 1;
+                break :exact prefix;
+            } else try internal_keys.documentRangeLowerAlloc(self.alloc, start);
             defer self.alloc.free(lower);
-            const upper = if (owner_range.end.len == 0) null else try internal_keys.documentRangeLowerAlloc(self.alloc, owner_range.end);
+            const before = options.primary_key_stop_before;
+            const end = if (before) |key| if (owner_range.end.len == 0 or std.mem.order(u8, key, owner_range.end) == .lt) key else owner_range.end else owner_range.end;
+            if (before) |key| if (std.mem.order(u8, key, owner_range.start) != .gt) return;
+            const upper = if (end.len == 0) null else try internal_keys.documentRangeLowerAlloc(self.alloc, end);
             defer if (upper) |bound| self.alloc.free(bound);
             var source_batch = Scan{ .owner = self, .arena = std.heap.ArenaAllocator.init(self.alloc) };
             defer source_batch.arena.deinit();
             var txn = try self.db.core.store.beginCurrentScanTxn();
             defer txn.abort();
-            try self.db.core.store.scanStoredDocumentRowsReadTxnWithContext(&txn, lower, upper orelse &.{}, &source_batch, Scan.checkpoint, Scan.visit);
+            try self.db.core.store.scanStoredDocumentRowsReadTxnWithContext(&txn, lower, upper orelse &.{}, options.primary_key_reverse, &source_batch, Scan.checkpoint, Scan.visit);
             if (!self.stopped) _ = try source_batch.flush();
         }
 
@@ -157629,6 +157639,33 @@ test "optional numeric range keeps mixed primary matches for native field sortin
             }, db.matchAllExecutor());
             defer broad.deinit();
             try std.testing.expectEqual(@as(u32, if (with_cursor) 1 else 2), broad.total_hits);
+        }
+        var finite_count = try db_query_search.searchMatchAll(a, .{
+            .index_name = "ft",
+            .limit = 0,
+            .include_stored = false,
+            .resolved_doc_filter = &mixed_scope,
+            .search_after = mixed_page.hits[0].sort_values,
+            .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+        }, db.matchAllExecutor());
+        defer finite_count.deinit();
+        try std.testing.expectEqual(@as(u32, 1), finite_count.total_hits);
+
+        for ([_]bool{ false, true }) |reverse| {
+            const cursor: []const std.json.Value = &.{.{ .string = if (reverse) "mapped" else "legacy" }};
+            for ([_]u32{ 1, 0 }) |limit| {
+                var id_result = try db_query_search.searchMatchAll(a, .{
+                    .limit = limit,
+                    .include_stored = false,
+                    .search_after = if (reverse) &.{} else cursor,
+                    .search_before = if (reverse) cursor else &.{},
+                    .order_by = &.{.{ .field = "_id" }},
+                }, db.matchAllExecutor());
+                defer id_result.deinit();
+                try std.testing.expectEqual(@as(u32, 1), id_result.total_hits);
+                try std.testing.expectEqual(@as(usize, limit), id_result.hits.len);
+                if (limit != 0) try std.testing.expectEqualStrings(if (reverse) "legacy" else "mapped", id_result.hits[0].id);
+            }
         }
         {
             const c = struct {

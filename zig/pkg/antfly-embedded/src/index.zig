@@ -2762,6 +2762,70 @@ pub const IndexSnapshot = struct {
         return out;
     }
 
+    /// Request-local fallback for cursor counts. Seek modern sidecars and
+    /// read each legacy ordinal sidecar at most once across all batches.
+    pub const SortOrdinalBatchProjection = struct {
+        fallback: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+        scanned: std.DynamicBitSetUnmanaged = .{},
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            self.fallback.deinit(alloc);
+            self.scanned.deinit(alloc);
+        }
+
+        pub fn project(
+            self: *@This(),
+            alloc: Allocator,
+            snapshot: *const IndexSnapshot,
+            ordinals: []const u32,
+            control: query_mod.ExecutionControl,
+        ) !GraphFrontierDocs {
+            var out = GraphFrontierDocs.init(alloc);
+            errdefer out.deinit();
+            if (ordinals.len == 0) return out;
+            if (self.scanned.capacity() == 0) self.scanned = try .initEmpty(alloc, snapshot.segments.len);
+            var frontier: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer frontier.deinit(alloc);
+            for (ordinals) |ordinal| try frontier.put(alloc, ordinal, {});
+            var offset: u32 = 0;
+            for (snapshot.segments, 0..) |segment, i| {
+                try control.check();
+                defer offset += segment.reader.doc_count;
+                if (segment.liveDocCount() == 0 or self.scanned.isSet(i)) continue;
+                var lease = try snapshot.leaseSegment(i);
+                defer lease.deinit();
+                var found = GraphFrontierDocs.init(alloc);
+                defer found.deinit();
+                const seek = seekGraphSegmentFrontier(lease.entry, frontier, control, offset, &found) catch |err| switch (err) {
+                    error.InvalidSegment, error.CrcMismatch => false,
+                    else => return err,
+                };
+                if (seek) {
+                    var matches = found.ordinals.iterator();
+                    while (matches.next()) |match| try out.add(match.key_ptr.*, match.value_ptr.*);
+                    continue;
+                }
+                try lease.entry.shared.lockDeletionSharedWithControl(control);
+                defer lease.entry.shared.unlockDeletionShared();
+                var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+                for (0..segment.reader.doc_count) |doc| {
+                    if (doc % 256 == 0) try control.check();
+                    const local: u32 = @intCast(doc);
+                    if (lease.entry.shared.deleted) |deleted| if (deleted.contains(local)) continue;
+                    const ordinal = (try cursor.get(local)) orelse continue;
+                    const slot = try self.fallback.getOrPut(alloc, ordinal);
+                    const global = offset + local;
+                    if (!slot.found_existing or slot.value_ptr.* < global) slot.value_ptr.* = global;
+                }
+                self.scanned.set(i);
+            }
+            for (ordinals) |ordinal| {
+                if (self.fallback.get(ordinal)) |doc| try out.add(doc, ordinal);
+            }
+            return out;
+        }
+    };
+
     pub fn extendGraphFrontierDocNumsAlloc(
         self: *IndexSnapshot,
         alloc: Allocator,
