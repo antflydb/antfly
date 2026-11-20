@@ -628,6 +628,16 @@ pub fn measureReaderWire(alloc: Allocator, cfg: Config, request: anytype) !Reade
             try envelope.addAttachment(image.mime_type.len, image.bytes.len);
             result.mime_bytes = @max(result.mime_bytes, image.mime_type.len);
         } else {
+            if ((data_uri.parse(image) catch null)) |parsed| {
+                if (parsed.encoding == .base64) {
+                    // A valid base64 payload cannot require JSON escaping.
+                    // The serializer still checks its size hint on execution.
+                    url.* = .{ .url = "" };
+                    const header = image[0 .. image.len - parsed.payload.len];
+                    inline_json_bytes +|= (try readerJsonSize(header)) - 2 +| parsed.payload.len;
+                    continue;
+                }
+            }
             url.* = .{ .url = image };
         }
     }

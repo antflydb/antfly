@@ -3419,12 +3419,13 @@ pub const Runtime = struct {
         // one prompt, but produce one response for the prompt as a whole, so
         // flattening requests across those providers loses the request/result
         // boundary. Let the generic batch path execute them sequentially.
-        const capabilities = (try self.readerCapabilities(alloc, cfg_parsed.value)) orelse
-            return error.BatchIncompatible;
         const routed_reader = self.routedReaderConfig(cfg_parsed.value);
         const local_reader = isLocalReaderProvider(routed_reader.provider, routed_reader.resolvedUrl());
-        if ((local_reader and capabilities.batch.mode == .none) or capabilities.result_cardinality != .one_per_item or
-            !capabilities.supports(.{ .image = true })) return error.BatchIncompatible;
+        if (!local_reader and routed_reader.provider != .antfly) return error.BatchIncompatible;
+        const capabilities = if (local_reader) (try self.readerCapabilities(alloc, cfg_parsed.value)) orelse return error.BatchIncompatible else null;
+        if (capabilities) |caps| {
+            if (caps.batch.mode == .none or caps.result_cardinality != .one_per_item or !caps.supports(.{ .image = true })) return error.BatchIncompatible;
+        }
         const sources = try alloc.alloc(ReaderSource, requests.len);
         var sources_filled: usize = 0;
         defer {
@@ -3492,7 +3493,7 @@ pub const Runtime = struct {
         };
         var image_offset: usize = 0;
         var reader_chunk_max_images = if (local_reader)
-            @min(localReaderBatchMaxImages(), capabilities.batch.max_items)
+            @min(localReaderBatchMaxImages(), capabilities.?.batch.max_items)
         else
             total_images;
         var remaining_response_bytes = self.responseLimitForTask(.reader, total_images);
@@ -3507,7 +3508,7 @@ pub const Runtime = struct {
                 try encodedReaderBatchEnd(
                     flat_encoded.items,
                     image_offset,
-                    capabilities.batch,
+                    capabilities.?.batch,
                     .borrowed_binary,
                 )
             else if (local_reader)
@@ -4081,28 +4082,33 @@ pub const Runtime = struct {
     // Colony validates JPEG placement from at most this upload prefix. The
     // native reader may still execute images with larger metadata sections.
     fn readerGeometryVerifiable(bytes: []const u8) bool {
-        if (!std.mem.startsWith(u8, bytes, "\xff\xd8")) return true;
+        return !std.mem.startsWith(u8, bytes, "\xff\xd8") or readerJpegPrefixPixels(bytes) != null;
+    }
+
+    fn readerJpegPrefixPixels(bytes: []const u8) ?u64 {
+        if (!std.mem.startsWith(u8, bytes, "\xff\xd8")) return null;
         const header = bytes[0..@min(bytes.len, 64 << 10)];
         var cursor: usize = 2;
         while (cursor < header.len) {
-            if (header[cursor] != 0xff) return false;
+            if (header[cursor] != 0xff) return null;
             while (cursor < header.len and header[cursor] == 0xff) cursor += 1;
-            if (cursor == header.len) return false;
+            if (cursor == header.len) return null;
             const marker = header[cursor];
             cursor += 1;
-            if (marker == 0 or marker == 0xd9 or marker == 0xda) return false;
+            if (marker == 0 or marker == 0xd9 or marker == 0xda) return null;
             if (marker == 1 or (marker >= 0xd0 and marker <= 0xd7)) continue;
-            if (header.len - cursor < 2) return false;
+            if (header.len - cursor < 2) return null;
             const len = std.mem.readInt(u16, header[cursor..][0..2], .big);
-            if (len < 2) return false;
+            if (len < 2) return null;
             if (marker >= 0xc0 and marker <= 0xcf and marker != 0xc4 and marker != 0xc8 and marker != 0xcc) {
-                if (len < 8 or header.len - cursor < 8) return false;
-                return std.mem.readInt(u16, header[cursor + 3 ..][0..2], .big) != 0 and
-                    std.mem.readInt(u16, header[cursor + 5 ..][0..2], .big) != 0;
+                if (len < 8 or header.len - cursor < 8) return null;
+                const pixels = @as(u64, std.mem.readInt(u16, header[cursor + 3 ..][0..2], .big)) *
+                    std.mem.readInt(u16, header[cursor + 5 ..][0..2], .big);
+                return if (pixels != 0) pixels else null;
             }
             cursor += len;
         }
-        return false;
+        return null;
     }
 
     const ReaderMimeShape = struct {
@@ -4122,6 +4128,15 @@ pub const Runtime = struct {
         }
     };
 
+    fn readerPrefixPixels(mime: []const u8, prefix: []const u8) !u64 {
+        if (std.mem.startsWith(u8, prefix, "\xff\xd8")) {
+            const essence = mime[0 .. std.mem.indexOfScalar(u8, mime, ';') orelse mime.len];
+            if (std.ascii.eqlIgnoreCase(essence, "image/jpeg") or std.ascii.eqlIgnoreCase(essence, "image/jpg"))
+                return readerJpegPrefixPixels(prefix) orelse error.InvalidInferenceMedia;
+        }
+        return inference_work.encodedImagePrefixPixels(mime, prefix);
+    }
+
     fn readerInlinePixels(uri: []const u8, complete: *bool) u64 {
         var buffer: [65538]u8 = undefined;
         const prefix = (inference_work.inlineImageDiscoveryPrefix(uri, &buffer) catch null) orelse {
@@ -4132,7 +4147,7 @@ pub const Runtime = struct {
             complete.* = false;
             return 0;
         }
-        const pixels = inference_work.encodedImagePrefixPixels(prefix.mime_type, prefix.bytes) catch {
+        const pixels = readerPrefixPixels(prefix.mime_type, prefix.bytes) catch {
             complete.* = false;
             return 0;
         };
@@ -4150,7 +4165,7 @@ pub const Runtime = struct {
                 };
                 mime_shape.add(prefix.mime_type, index);
                 const pixels = if (readerGeometryVerifiable(prefix.bytes))
-                    inference_work.encodedImagePrefixPixels(prefix.mime_type, prefix.bytes) catch readerInlinePixels(image, complete)
+                    readerPrefixPixels(prefix.mime_type, prefix.bytes) catch readerInlinePixels(image, complete)
                 else
                     readerInlinePixels(image, complete);
                 break :blk .{ .encoded = image.len, .framed = image.len, .pixels = pixels };
@@ -4236,6 +4251,11 @@ pub const Runtime = struct {
                 },
                 else => return err,
             };
+            if (request.images.len > 1) {
+                if (lease.capabilities) |caps| {
+                    if (caps.result_cardinality != .one_per_item) return error.InferenceDiscoveryTooManyItems;
+                }
+            }
             if (!json_only) {
                 if (lease.capabilities) |caps| {
                     if (caps.framed_attachments and !framedReaderWireFits(caps, batch_wire, request.images.len)) {
