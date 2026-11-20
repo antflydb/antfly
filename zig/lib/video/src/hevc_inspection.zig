@@ -34,7 +34,7 @@ const Picture = struct {
 };
 const PictureResult = anyerror!Picture;
 const PpsResult = anyerror!u4;
-const Selection = struct { sps: u4, picture: Picture };
+const Selection = struct { sps: u4, picture: Picture, irap: bool = false };
 
 fn picture(bits: *Bits) !Picture {
     const sps = try params.parseSps(bits);
@@ -187,6 +187,7 @@ fn inspectPacket(a: std.mem.Allocator, reader: *media.mp4.Reader, packet: media.
                 if (!slice.first) return error.IncompleteVideoPicture;
                 selected_pps = slice.pps;
                 selected = try state.select(slice.pps);
+                selected.?.irap = kind >= 16 and kind <= 23;
                 if (expected) |policy| if (!std.meta.eql(policy, selected.?.picture)) return error.UnsupportedDynamicVideoConfig;
             }
         }
@@ -196,6 +197,11 @@ fn inspectPacket(a: std.mem.Allocator, reader: *media.mp4.Reader, packet: media.
 }
 
 pub fn resolveReader(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
+    return resolve(a, reader, false);
+}
+
+/// Only an unpublished, exclusively owned packet index may replace sync hints.
+pub fn resolve(a: std.mem.Allocator, reader: *media.mp4.Reader, exclusive: bool) !?[]u8 {
     if (reader.track.codec != .hevc or reader.track.hevc_policy_validated or reader.packets.len == 0) return null;
     try reader.input.control.check();
     var owned: ?[]u8 = null;
@@ -216,7 +222,12 @@ pub fn resolveReader(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
     };
     // All later probes skip VCL payloads. Repeated parameter sets are bounded by
     // identity and hash, and no packet lease or decoded frame survives a probe.
-    for (reader.packets[1..]) |packet| _ = try inspectPacket(a, reader, packet, &state, first.picture, null);
+    if (exclusive) reader.packets[0].sync = first.irap;
+    for (reader.packets[1..]) |*packet| {
+        const selected = try inspectPacket(a, reader, packet.*, &state, first.picture, null);
+        if (exclusive) packet.sync = selected.irap;
+    }
+    reader.track.hevc_sync_validated = exclusive;
     if (owned) |bytes| reader.track.codec_config = bytes;
     reader.track.hevc_policy_validated = true;
     return owned;

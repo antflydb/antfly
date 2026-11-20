@@ -78,6 +78,7 @@ const Dependencies = struct {
 /// Pure immutable planning metadata. No source, decoder, admission token or
 /// mutable seek cache survives a request. The cache's arena owns every slice.
 pub const Snapshot = struct {
+    hevc_predecessors: []usize,
     timed: []video.sampling.TimedPicture,
     timeline: video.sampling.Timeline,
     logical: ?video.h264_pictures.Index,
@@ -86,7 +87,7 @@ pub const Snapshot = struct {
     duration_ns: i64,
     pub fn copy(a: std.mem.Allocator, owner: *const Owner) !Snapshot {
         if (owner.registry != null) return error.UnsupportedVideoProfile;
-        var result: Snapshot = .{ .timed = try a.dupe(video.sampling.TimedPicture, owner.timed), .timeline = owner.timeline, .logical = owner.logical, .dependencies = owner.dependencies, .origin = owner.origin, .duration_ns = try owner.durationNs() };
+        var result: Snapshot = .{ .hevc_predecessors = try a.dupe(usize, owner.hevc_predecessors), .timed = try a.dupe(video.sampling.TimedPicture, owner.timed), .timeline = owner.timeline, .logical = owner.logical, .dependencies = owner.dependencies, .origin = owner.origin, .duration_ns = try owner.durationNs() };
         result.timeline.entries = try a.dupe(@typeInfo(@TypeOf(owner.timeline.entries)).pointer.child, owner.timeline.entries);
         result.timeline.maxima = try a.dupe(i128, owner.timeline.maxima);
         result.timeline.allocator = a;
@@ -107,6 +108,7 @@ pub const Snapshot = struct {
 };
 
 pub const Owner = struct {
+    hevc_predecessors: []usize = &.{},
     borrowed_planning: bool = false,
     duration_ns: ?i64 = null,
     continuation: model_video.DecoderContinuation,
@@ -137,7 +139,7 @@ pub const Owner = struct {
             logical = try video.h264_pictures.planning(a, reader, planning, registry);
         const count = if (logical) |index| index.pictures.len else reader.packets.len;
         var metadata_bytes = try std.math.add(usize, try video.sampling.Timeline.storageBytes(count), try std.math.mul(usize, count, @sizeOf(video.sampling.TimedPicture)));
-        if (reader.track.codec == .avc) metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, reader.packets.len, @sizeOf(usize)));
+        if (reader.track.codec == .avc or reader.track.codec == .hevc) metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, reader.packets.len, @sizeOf(usize)));
         if (logical != null) {
             const base = try std.math.ceilPowerOfTwo(usize, @max(@as(usize, 1), count));
             metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, try std.math.add(usize, count, try std.math.mul(usize, base, 2)), @sizeOf(usize)));
@@ -160,6 +162,9 @@ pub const Owner = struct {
         }
         var timeline = try video.sampling.Timeline.init(a, timed, reader.input.control);
         errdefer timeline.deinit();
+        const hevc_predecessors = try a.alloc(usize, if (reader.track.codec == .hevc) reader.packets.len else 0);
+        errdefer a.free(hevc_predecessors);
+        if (hevc_predecessors.len != 0) try video.hevc_restart.fillPredecessors(reader, hevc_predecessors);
         var seek_cache: ?video.decode_plan.SeekCache = if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null;
         errdefer if (seek_cache) |*cache| cache.deinit();
         if (registry) |owner| {
@@ -167,7 +172,7 @@ pub const Owner = struct {
         }
         var dependencies: ?Dependencies = if (logical) |index| try Dependencies.init(a, index) else null;
         errdefer if (dependencies) |*index| index.deinit();
-        return .{ .metadata_reservation = metadata_reservation, .dependencies = dependencies, .timeline = timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool, .limits = limits };
+        return .{ .hevc_predecessors = hevc_predecessors, .metadata_reservation = metadata_reservation, .dependencies = dependencies, .timeline = timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool, .limits = limits };
     }
     pub fn fromSnapshot(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits, snapshot: *const Snapshot) !Owner {
         try reader.input.control.check();
@@ -175,7 +180,7 @@ pub const Owner = struct {
         if (logical) |*index| index.allocator = a;
         var reservation = try pool.acquire(.{ .host_bytes = if (reader.track.codec == .avc) try std.math.mul(usize, reader.packets.len, @sizeOf(usize)) else 0 });
         errdefer reservation.deinit();
-        return .{ .borrowed_planning = true, .duration_ns = snapshot.duration_ns, .metadata_reservation = reservation, .dependencies = snapshot.dependencies, .timeline = snapshot.timeline, .seek_cache = if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = snapshot.timed, .logical = logical, .registry = null, .origin = snapshot.origin, .pool = pool, .limits = limits };
+        return .{ .hevc_predecessors = snapshot.hevc_predecessors, .borrowed_planning = true, .duration_ns = snapshot.duration_ns, .metadata_reservation = reservation, .dependencies = snapshot.dependencies, .timeline = snapshot.timeline, .seek_cache = if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = snapshot.timed, .logical = logical, .registry = null, .origin = snapshot.origin, .pool = pool, .limits = limits };
     }
     pub fn deinit(self: *Owner) void {
         self.continuation.deinit();
@@ -185,6 +190,7 @@ pub const Owner = struct {
         if (!self.borrowed_planning) {
             if (self.dependencies) |*index| index.deinit();
             if (self.logical) |*index| index.deinit();
+            self.allocator.free(self.hevc_predecessors);
             self.allocator.free(self.timed);
         }
         self.metadata_reservation.deinit();
@@ -205,7 +211,11 @@ pub const Owner = struct {
         var stop: usize = 0;
         for (selected, packets) |id, *packet| {
             packet.* = if (self.logical) |index| index.pictures[id].first_packet else id;
-            first = @min(first, packet.*);
+            const dependency = if (self.reader.track.codec == .hevc)
+                try video.hevc_restart.startFor(self.reader.packets, self.hevc_predecessors, packet.*)
+            else
+                packet.*;
+            first = @min(first, dependency);
             const last = if (self.logical) |index| index.pictures[id].last_packet orelse return error.IncompleteVideoPicture else id;
             stop = @max(stop, last + 1);
         }

@@ -901,43 +901,32 @@ pub const Runner = struct {
         return self.webmWindowsCached(reader, null);
     }
     fn webmWindowsCached(self: *Runner, reader: *media.webm.Reader, identity: ?[32]u8) !void {
-        var end: i128 = std.math.minInt(i128);
-        var origin: i64 = std.math.maxInt(i64);
         var indexed = try video.webm_pictures.index(self.allocator, reader, .{ .max_packets = self.request.limits.max_index_packets, .max_pictures = self.request.limits.max_index_packets, .decoder = .{ .av1_all_layers = false, .control = reader.input.control } });
         defer indexed.deinit();
-        var last_pts: i64 = std.math.minInt(i64);
-        var last_duration: ?u64 = null;
-        for (indexed.pictures) |picture| {
-            if (picture.pts >= last_pts) {
-                last_pts = picture.pts;
-                last_duration = picture.duration;
-            }
-            origin = @min(origin, picture.pts);
-            end = @max(end, @as(i128, picture.pts) + (picture.duration orelse 0));
-        }
-        if (origin == std.math.maxInt(i64)) return error.EmptyVideo;
-        if (reader.duration_seconds) |duration| {
-            end = @max(end, @as(i128, origin) + @as(i128, @intFromFloat(duration * std.time.ns_per_s)));
-        } else if (last_duration == null or last_duration.? <= 0) return error.UnknownVideoDuration;
-        if (end <= origin) return error.UnknownVideoDuration;
         const timeline_bytes = try std.math.add(usize, try video.sampling.Timeline.storageBytes(indexed.pictures.len), try std.math.mul(usize, indexed.pictures.len, @sizeOf(video.sampling.TimedPicture)));
         var timeline_reservation = try self.pool.acquire(.{ .host_bytes = timeline_bytes });
         defer timeline_reservation.deinit();
-        const timed = try self.allocator.alloc(video.sampling.TimedPicture, indexed.pictures.len);
-        defer self.allocator.free(timed);
-        const source_timeline = reader.source_timeline;
-        for (timed, indexed.pictures, 0..) |*dest, picture, i| {
-            if (i % 256 == 0) try reader.input.control.check();
-            if (source_timeline) |source| {
-                const id = picture.packet_index orelse return error.InvalidVideoIndex;
-                if (id >= source.samples.len) return error.InvalidVideoIndex;
-                const sample = source.samples[id];
-                dest.* = .{ .pts = sample.pts, .duration = sample.duration };
-            } else dest.* = .{ .pts = picture.pts, .duration = picture.duration };
-        }
-        var timeline = try video.sampling.Timeline.initEdited(self.allocator, timed, reader.input.control, if (source_timeline) |source| source.edit else .{});
+        var timeline = try indexed.presentationTimeline(self.allocator, reader.input.control);
         defer timeline.deinit();
-        const duration = if (source_timeline) |source| @divFloor((timeline.last - timeline.first) * std.time.ns_per_s + source.timescale - 1, source.timescale) else end - origin;
+        const scale = indexed.timescale();
+        var duration = @divFloor((timeline.last - timeline.first) * std.time.ns_per_s + scale - 1, scale);
+        if (reader.source_timeline == null) {
+            if (reader.duration_seconds) |seconds| {
+                duration = @max(duration, @as(i128, @intFromFloat(seconds * std.time.ns_per_s)));
+            } else {
+                var last_pts: i64 = std.math.minInt(i64);
+                var last_duration: ?u64 = null;
+                for (indexed.pictures, 0..) |picture, i| {
+                    if (i % 256 == 0) try self.control.check();
+                    if (picture.pts >= last_pts) {
+                        last_pts = picture.pts;
+                        last_duration = picture.duration;
+                    }
+                }
+                if (last_duration == null or last_duration.? == 0) return error.UnknownVideoDuration;
+            }
+        }
+        if (duration <= 0) return error.UnknownVideoDuration;
         const snapshot = @import("media_index_cache.zig").Cache.WebmSnapshot{ .index = indexed, .source_bound = indexed.reader != null, .timeline = timeline, .origin = timeline.first, .duration = duration };
         if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.rememberPlanned(std.heap.smp_allocator, key, .{ .webm = reader.* }, admission, .{ .webm = snapshot });
         try self.webmWindowsSnapshot(reader, &snapshot);
@@ -952,7 +941,7 @@ pub const Runner = struct {
         defer continuation.deinit();
         var apple_continuation = @import("embedding_gemma2_video.zig").WebmDecoderContinuation{ .allocator = self.allocator, .reader = reader };
         defer apple_continuation.deinit();
-        try self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, if (reader.source_timeline) |source| source.timescale else std.time.ns_per_s, null, .{ .reader = reader, .index = &indexed, .timeline = &timeline, .continuation = &continuation, .apple_continuation = &apple_continuation });
+        try self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, indexed.timescale(), null, .{ .reader = reader, .index = &indexed, .timeline = &timeline, .continuation = &continuation, .apple_continuation = &apple_continuation });
     }
     const VideoSource = struct { bytes: []const u8, reader: ?*const media.mp4.Reader, origin: i64, timescale: u32, owner: ?*@import("media_chunking_video.zig").Owner, webm: ?@import("embedding_gemma2_video.zig").WebmInput };
     const VideoSlot = struct {
@@ -1356,6 +1345,30 @@ test "model aware media inline AV1 MP4 uses the visible picture timeline and hon
     request.limits.max_index_packets = 1;
     runner = try Runner.init(std.testing.allocator, request, executor, .{}, .{ .context = &result, .accept = Qualification.accept });
     try std.testing.expectError(error.ResourceLimitExceeded, runner.run());
+}
+test "model aware media HEVC inter windows retain a verified random access prefix" {
+    const bytes = @embedFile("../testdata/video/codecs/hevc-hvc1.mp4");
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 64 * 1024 * 1024 } };
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "hevc", .admission_pool = &pool };
+    var packet = try @import("embedding_gemma2_video.zig").PacketInput.init(a, &source, bytes);
+    defer packet.deinit();
+    try std.testing.expect(packet.reader.track.hevc_sync_validated);
+    const reads = source.reads;
+    var owner = try @import("media_chunking_video.zig").Owner.init(a, &packet.reader, &pool, .{});
+    defer owner.deinit();
+    try std.testing.expectEqual(reads, source.reads);
+    for (packet.reader.packets, 0..) |target, i| {
+        const start = try video.hevc_restart.startFor(packet.reader.packets, owner.hevc_predecessors, i);
+        if (start == i) continue;
+        const ns: i64 = @intCast(@divFloor((@as(i128, target.pts) - owner.origin) * std.time.ns_per_s, packet.reader.track.timescale));
+        var window = try owner.prepare(.{ .start_ns = ns, .end_ns = ns + std.time.ns_per_ms, .max_frames = 1, .hold = false });
+        defer window.deinit();
+        try std.testing.expectEqual(start, window.packet_base);
+        try std.testing.expect(window.coded.reader.packets.len > i - start);
+        return;
+    }
+    return error.MissingInterFrameFixture;
 }
 test "model aware media consumer failure and cancellation do not acknowledge output" {
     const Fail = struct {
@@ -1896,7 +1909,7 @@ test "model aware media cached planning owns indexes and rebinds sources across 
         }
     };
     const a = std.testing.allocator;
-    inline for (.{ "mjpeg-vfr.mov", "h264-frameonly.mp4", "vp8.webm", "codecs/av1.mp4" }) |name| {
+    inline for (.{ "mjpeg-vfr.mov", "h264-frameonly.mp4", "vp8.webm", "codecs/av1.mp4", "codecs/hevc-hvc1.mp4" }) |name| {
         const webm = std.mem.endsWith(u8, name, ".webm");
         var cache: Cache = .{};
         defer cache.deinit();

@@ -40,6 +40,8 @@ pub const Track = struct {
     multiple_avc_parameter_sets: bool = false,
     /// Header inspection resolved HEVC activation and validated one static policy.
     hevc_policy_validated: bool = false,
+    /// Owned packet sync flags were resolved from the first coded HEVC slice.
+    hevc_sync_validated: bool = false,
     id: u32,
     timescale: u32,
     width: u16,

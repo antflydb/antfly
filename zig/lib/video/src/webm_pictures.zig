@@ -57,6 +57,32 @@ pub const Index = struct {
         self.reservation.deinit();
         self.* = undefined;
     }
+    pub fn sourceTimeline(self: Index) ?media.webm.SourceTimeline {
+        return if (self.reader) |reader| reader.source_timeline else null;
+    }
+
+    pub fn timescale(self: Index) u32 {
+        return if (self.sourceTimeline()) |source| source.timescale else std.time.ns_per_s;
+    }
+
+    /// Picture IDs refer to the visible decoder outputs. Adapted MP4 output
+    /// times come from the corresponding source sample in its original ticks.
+    pub fn presentationTimeline(self: Index, a: std.mem.Allocator, control: media.source.Control) !sampling.Timeline {
+        const timed = try a.alloc(sampling.TimedPicture, self.pictures.len);
+        defer a.free(timed);
+        const original = self.sourceTimeline();
+        for (timed, self.pictures, 0..) |*dest, picture, i| {
+            if (i % 256 == 0) try control.check();
+            if (original) |source| {
+                const id = picture.packet_index orelse return error.InvalidVideoIndex;
+                if (id >= source.samples.len) return error.InvalidVideoIndex;
+                const sample = source.samples[id];
+                dest.* = .{ .pts = sample.pts, .duration = sample.duration };
+            } else dest.* = .{ .pts = picture.pts, .duration = picture.duration };
+        }
+        return sampling.Timeline.initEdited(a, timed, control, if (original) |source| source.edit else .{});
+    }
+
     pub fn select(self: Index) ![]usize {
         if (self.pictures.len == 0) return error.EmptyVideo;
         const order = try self.allocator.alloc(usize, self.pictures.len);

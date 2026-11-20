@@ -38,33 +38,58 @@ pub fn isIrap(packet: []const u8, length_bytes: u3) !bool {
     return false;
 }
 
+const PacketProbe = struct {
+    reader: *media.mp4.Reader,
+    fn irap(self: @This(), index: usize) !bool {
+        try self.reader.input.control.check();
+        const packet = self.reader.packets[index];
+        if (self.reader.track.hevc_sync_validated) return packet.sync;
+        const length = self.reader.track.nal_length_bytes;
+        if (length == 0 or length > 4) return error.InvalidVideoPacket;
+        var cursor: usize = 0;
+        while (cursor < packet.size) {
+            if (packet.size - cursor < length + @as(usize, 2)) return error.InvalidVideoPacket;
+            var prefix = try self.reader.input.read(packet.offset + cursor, length + @as(usize, 2));
+            defer prefix.deinit();
+            var size: usize = 0;
+            for (prefix.bytes[0..length]) |byte| size = (size << 8) | byte;
+            cursor += length;
+            if (size < 2 or size > packet.size - cursor) return error.InvalidVideoPacket;
+            const kind = (prefix.bytes[length] >> 1) & 0x3f;
+            if (kind < 32) return kind >= 16 and kind <= 23;
+            cursor += size;
+        }
+        return false;
+    }
+};
+
+/// Index actual random-access pictures once for repeated window planning.
+pub fn fillPredecessors(reader: *media.mp4.Reader, predecessors: []usize) !void {
+    if (reader.packets.len != predecessors.len) return error.InvalidPacketIndex;
+    const probe = PacketProbe{ .reader = reader };
+    var last: usize = std.math.maxInt(usize);
+    for (predecessors, 0..) |*entry, index| {
+        if (try probe.irap(index)) last = index;
+        entry.* = last;
+    }
+}
+
+pub fn startFor(packets: []const media.mp4.Packet, predecessors: []const usize, target: usize) !usize {
+    if (predecessors.len != packets.len or target >= packets.len) return error.InvalidPacketIndex;
+    const latest = predecessors[target];
+    if (latest == std.math.maxInt(usize)) return error.NoRandomAccessPoint;
+    var candidate = latest;
+    while (packets[candidate].pts > packets[target].pts) {
+        if (candidate == 0 or predecessors[candidate - 1] == std.math.maxInt(usize)) return latest;
+        candidate = predecessors[candidate - 1];
+    }
+    return candidate;
+}
+
 /// Runs in decode order covering every selected packet. `selected` must be sorted
 /// and unique; a selection sharing a run decodes its references once.
 pub fn plan(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const usize) ![]Run {
-    const Probe = struct {
-        reader: *media.mp4.Reader,
-        fn irap(self: @This(), index: usize) !bool {
-            try self.reader.input.control.check();
-            const packet = self.reader.packets[index];
-            const length = self.reader.track.nal_length_bytes;
-            if (length == 0 or length > 4) return error.InvalidVideoPacket;
-            var cursor: usize = 0;
-            while (cursor < packet.size) {
-                if (packet.size - cursor < length + @as(usize, 2)) return error.InvalidVideoPacket;
-                var prefix = try self.reader.input.read(packet.offset + cursor, length + @as(usize, 2));
-                defer prefix.deinit();
-                var size: usize = 0;
-                for (prefix.bytes[0..length]) |byte| size = (size << 8) | byte;
-                cursor += length;
-                if (size < 2 or size > packet.size - cursor) return error.InvalidVideoPacket;
-                const kind = (prefix.bytes[length] >> 1) & 0x3f;
-                if (kind < 32) return kind >= 16 and kind <= 23;
-                cursor += size;
-            }
-            return false;
-        }
-    };
-    return planPackets(a, reader.packets, selected, Probe{ .reader = reader });
+    return planPackets(a, reader.packets, selected, PacketProbe{ .reader = reader });
 }
 
 /// A picture's start is the latest IRAP at or before it whose presentation doesn't

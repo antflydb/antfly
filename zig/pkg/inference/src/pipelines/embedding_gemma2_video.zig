@@ -812,12 +812,16 @@ test "gemma4 video container routing checks cancellation while scanning top-leve
 }
 
 fn normalizeHevc(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
-    return video.hevc_config.normalizeReader(a, reader) catch |err| switch (err) {
+    return video.hevc_config.normalizeReader(a, reader) catch |err| return hevcInputError(err);
+}
+
+fn hevcInputError(err: anyerror) anyerror {
+    return switch (err) {
         // This parser and both output routes share the 4:2:0 Main/Main10
         // envelope. Preserve the codec-unavailable identity for unsupported
         // HEVC profiles, including CPU-only hosts and CUDA fallback.
-        error.UnsupportedVideoProfile => return error.HevcDecoderUnavailable,
-        else => return err,
+        error.UnsupportedVideoProfile => error.HevcDecoderUnavailable,
+        else => err,
     };
 }
 // Own normalized TS storage alongside the packet reader. Returning this owner
@@ -842,7 +846,7 @@ pub const PacketInput = struct {
         }
         var input = PacketInput{ .reader = try media.mp4.Reader.init(a, source, limits), .allocator = a };
         errdefer input.deinit();
-        input.inband_config = try normalizeHevc(a, &input.reader);
+        input.inband_config = video.hevc_config.normalizeOwnedReader(a, &input.reader) catch |err| return hevcInputError(err);
         return input;
     }
     pub fn deinit(self: *PacketInput) void {
@@ -1379,11 +1383,13 @@ fn adaptedPlan(index: video.webm_pictures.Index, sampling: Sampling, control: me
 fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control, timeline: ?*const video.sampling.Timeline) ![]usize {
     if (try adaptedPlan(index, sampling, control)) |plan| return a.dupe(usize, plan.ids());
     if (sampling == .reference) return index.select();
-    const scale = if (index.reader) |r| if (r.source_timeline) |source| source.timescale else std.time.ns_per_s else std.time.ns_per_s;
-    if (timeline) |cached| return switch (sampling) {
-        .gemma4 => cached.select(a, scale, .{}, control, true),
-        .timestamps => |p| cached.select(a, scale, p, control, true),
-        .source_timestamps => |p| cached.select(a, scale, p, control, false),
+    var owned: ?video.sampling.Timeline = if (timeline == null and index.sourceTimeline() != null) try index.presentationTimeline(a, control) else null;
+    defer if (owned) |*value| value.deinit();
+    const effective = timeline orelse if (owned) |*value| value else null;
+    if (effective) |cached| return switch (sampling) {
+        .gemma4 => cached.select(a, index.timescale(), .{}, control, true),
+        .timestamps => |p| cached.select(a, index.timescale(), p, control, true),
+        .source_timestamps => |p| cached.select(a, index.timescale(), p, control, false),
         .reference => unreachable,
     };
     const metadata = try a.alloc(video.sampling.TimedPicture, index.pictures.len);

@@ -391,6 +391,7 @@ pub const Cache = struct {
             .mp4 => |original| {
                 var track = original.track;
                 track.avcc = try a.dupe(u8, track.avcc);
+                track.codec_config = try a.dupe(u8, track.codec_config);
                 track.color_info = try a.dupe(u8, track.color_info);
                 entry.data = .{ .mp4 = .{ .track = track, .packets = try a.dupe(media.mp4.Packet, original.packets), .limits = original.limits } };
             },
@@ -449,7 +450,7 @@ test "model aware media immutable container cache owns metadata and fences sourc
     const identity = Cache.key(&source, false, 100, 1024).?;
     var private = [_]u8{ 1, 2, 3 };
     var packets = [_]media.mp4.Packet{.{ .offset = 20, .size = 4, .dts = 0, .media_pts = 0, .pts = 0, .duration = 1, .sync = true }};
-    const reader = media.mp4.Reader{ .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .id = 1, .timescale = 1, .width = 1, .height = 1, .avcc = &private, .nal_length_bytes = 4, .display_matrix = @splat(0) }, .packets = &packets, .limits = .{} };
+    const reader = media.mp4.Reader{ .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .id = 1, .timescale = 1, .width = 1, .height = 1, .avcc = &private, .codec_config = &private, .nal_length_bytes = 4, .display_matrix = @splat(0) }, .packets = &packets, .limits = .{} };
     var cache: Cache = .{};
     defer cache.deinit();
     cache.remember(a, identity, .{ .mp4 = reader }, .{ .context = &provider, .acquire = Provider.acquire });
@@ -459,6 +460,7 @@ test "model aware media immutable container cache owns metadata and fences sourc
         const hit = cache.get(identity).?;
         defer cache.release(hit);
         try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, hit.data.mp4.track.avcc);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, hit.data.mp4.track.codec_config);
         try std.testing.expectEqual(@as(u64, 20), hit.data.mp4.packets[0].offset);
         source.storage.range.immutable_binding = @splat(2);
         try std.testing.expect(cache.get(Cache.key(&source, false, 100, 1024).?) == null);
