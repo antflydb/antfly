@@ -3542,6 +3542,11 @@ fn appendUniqueOpenAiModelEntry(
 const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
 const PublicationLease = @import("../registry/publication_lease.zig").Lease;
 
+const ModelSelectionOptions = struct {
+    scoped: ?*const ScopedCatalogPublication = null,
+    reuse_resident: bool = false,
+};
+
 const ScopedCatalogPublication = struct {
     path: []const u8,
     lease: PublicationLease,
@@ -13760,20 +13765,20 @@ pub const Node = struct {
         name: ?[]const u8,
         task_type: ?[]const u8,
     ) !ResolvedModel {
-        return self.resolveRequestModelSelectionWithPublication(allocator, io, name, task_type, null);
+        return self.resolveRequestModelSelectionWithOptions(allocator, io, name, task_type, .{});
     }
 
-    fn resolveRequestModelSelectionWithPublication(
+    fn resolveRequestModelSelectionWithOptions(
         self: *Node,
         allocator: std.mem.Allocator,
         io: std.Io,
         name: ?[]const u8,
         task_type: ?[]const u8,
-        scoped: ?*const ScopedCatalogPublication,
+        options: ModelSelectionOptions,
     ) !ResolvedModel {
         if (comptime builtin.is_test) request_work_test_counters.model_resolution_attempts += 1;
         if (name) |raw| try validateRequestModelIdentifier(raw);
-        const resolved = try self.resolveModelSelectionWithPublication(io, name, task_type, scoped);
+        const resolved = try self.resolveModelSelectionWithOptions(io, name, task_type, options);
         defer self.allocator.free(resolved.path);
 
         const root = try realPathExistingAlloc(allocator, io, self.config.models_dir);
@@ -13885,13 +13890,13 @@ pub const Node = struct {
     /// When task_type is provided (e.g. "embedders"), also searches models_dir/task_type/.
     /// Always returns memory owned by `self.allocator`; the caller must free it.
     pub fn resolveModelSelection(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8) !ResolvedModel {
-        return self.resolveModelSelectionWithPublication(io, name, task_type, null);
+        return self.resolveModelSelectionWithOptions(io, name, task_type, .{});
     }
 
-    fn resolveModelSelectionWithPublication(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8, scoped: ?*const ScopedCatalogPublication) !ResolvedModel {
+    fn resolveModelSelectionWithOptions(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8, options: ModelSelectionOptions) !ResolvedModel {
         if (task_type) |task| if (selection_mod.firstScopeWins(task)) {
             for (selection_mod.scopes(task)) |physical| {
-                if (self.resolveModelSelectionWithPublication(io, name, physical, null)) |selected| return selected else |err| switch (requestModelResolutionErrorKind(err)) {
+                if (self.resolveModelSelectionWithOptions(io, name, physical, options)) |selected| return selected else |err| switch (requestModelResolutionErrorKind(err)) {
                     .missing => continue,
                     else => return err,
                 }
@@ -13904,10 +13909,10 @@ pub const Node = struct {
             if (registry_mod.ModelRef.parse(normalized)) |ref| {
                 const requested = try registry_mod.download.parseVariantRevision(ref.variant);
                 if (requested.revision != null or !std.mem.eql(u8, requested.variant, "auto")) {
-                    if (scoped) |captured| {
+                    if (options.scoped) |captured| {
                         if (try captured.resolveSelector(self.allocator, normalized)) |selected| return selected;
                     }
-                    if (self.selector_cache) |cache| return (try cache.resolveSelection(self.allocator, io, self.config.models_dir, normalized, task_type)) orelse error.ModelNotFound;
+                    if (self.selector_cache) |cache| return (try cache.resolveSelectionWithResident(self.allocator, io, self.config.models_dir, normalized, task_type, self.residentSelection(options))) orelse error.ModelNotFound;
                     var temporary = selection_mod.Cache.init(self.allocator);
                     defer temporary.deinit();
                     return (try temporary.resolveSelection(self.allocator, io, self.config.models_dir, normalized, task_type)) orelse error.ModelNotFound;
@@ -13916,15 +13921,23 @@ pub const Node = struct {
                 if (std.mem.indexOfAny(u8, normalized, ":@") != null) return error.InvalidModelIdentifier;
             }
         }
-        const path = try self.resolveModelDirectory(io, name, task_type, scoped);
+        var validated: ?ResolvedModel = null;
+        const path = try self.resolveModelDirectory(io, name, task_type, options, &validated);
         errdefer self.allocator.free(path);
-        if (scoped) |captured| {
+        if (validated) |selected| return selected;
+        if (options.scoped) |captured| {
             if (std.mem.eql(u8, captured.path, path)) return .{ .path = path, .publication = captured.artifacts.publication };
+        }
+        if (options.reuse_resident) {
+            const canonical = try realPathExistingAlloc(self.allocator, io, path);
+            defer self.allocator.free(canonical);
+            if (try self.model_manager.residentManagedPublication(io, canonical, null)) |publication|
+                return .{ .path = path, .publication = publication };
         }
         return @import("../registry/model_selection.zig").fromDirectory(self.allocator, io, path);
     }
 
-    fn resolveModelDirectory(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8, scoped: ?*const ScopedCatalogPublication) ![]const u8 {
+    fn resolveModelDirectory(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8, options: ModelSelectionOptions, validated: *?ResolvedModel) ![]const u8 {
         if (name) |raw| {
             // Resolve qualified production aliases before deriving the stable
             // variant install path, then strip the optional Hub prefix.
@@ -13936,7 +13949,7 @@ pub const Node = struct {
             if (registry_mod.ModelRef.parse(n)) |ref| {
                 const selection = try @import("../registry/download.zig").parseVariantRevision(ref.variant);
                 if (selection.revision != null or !std.mem.eql(u8, selection.variant, "auto")) {
-                    if (try self.resolveDiscoveredRequestName(io, n, task_type)) |path| return path;
+                    if (try self.resolveDiscoveredRequestName(io, n, task_type, options, validated)) |path| return path;
                     return error.ModelNotFound;
                 }
             } else |_| {
@@ -13973,10 +13986,10 @@ pub const Node = struct {
             // those paths do not depend on receipt metadata and must not become
             // O(models x artifacts) or fail because an unrelated receipt is
             // unreadable/ambiguous.
-            if (scoped) |captured| {
+            if (options.scoped) |captured| {
                 if (try captured.resolveSelector(self.allocator, n)) |selected| return selected.path;
             }
-            if (try self.resolveDiscoveredRequestName(io, n, task_type)) |managed_path|
+            if (try self.resolveDiscoveredRequestName(io, n, task_type, options, validated)) |managed_path|
                 return managed_path;
 
             if (task_type) |tt| {
@@ -14037,8 +14050,24 @@ pub const Node = struct {
         return registry_mod.modelInTaskScope(self.config.models_dir, path, task_type);
     }
 
-    fn resolveDiscoveredRequestName(self: *Node, io: std.Io, request_name: []const u8, task_type: ?[]const u8) !?[]u8 {
-        if (self.selector_cache) |cache| return cache.resolve(self.allocator, io, self.config.models_dir, request_name, task_type);
+    fn residentSelection(self: *Node, options: ModelSelectionOptions) ?selection_mod.Cache.ResidentPublication {
+        if (!options.reuse_resident) return null;
+        return .{ .context = self, .matches = residentSelectionMatches };
+    }
+
+    fn residentSelectionMatches(context: *anyopaque, io: std.Io, path: []const u8, expected: [32]u8) !bool {
+        const self: *Node = @ptrCast(@alignCast(context));
+        const canonical = try realPathExistingAlloc(self.allocator, io, path);
+        defer self.allocator.free(canonical);
+        return try self.model_manager.residentManagedPublication(io, canonical, expected) != null;
+    }
+
+    fn resolveDiscoveredRequestName(self: *Node, io: std.Io, request_name: []const u8, task_type: ?[]const u8, options: ModelSelectionOptions, validated: *?ResolvedModel) !?[]u8 {
+        if (self.selector_cache) |cache| {
+            const selected = (try cache.resolveSelectionWithResident(self.allocator, io, self.config.models_dir, request_name, task_type, self.residentSelection(options))) orelse return null;
+            if (options.reuse_resident) validated.* = selected;
+            return @constCast(selected.path);
+        }
         return registry_mod.resolveInstalledModelSelector(self.allocator, io, self.config.models_dir, request_name, task_type);
     }
 
@@ -14633,7 +14662,7 @@ pub const Node = struct {
         // Read only the lightweight manifest first so media can be admitted
         // before loading tokenizer, weights, or accelerator sessions.
         const model_name: ?[]const u8 = if (request.model.len > 0) request.model else null;
-        const model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "embedders") catch |err| {
+        const model_path_selection = self.resolveRequestModelSelectionWithOptions(ctx.allocator, ctx.io, model_name, "embedders", .{ .reuse_resident = true }) catch |err| {
             if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
             return requestModelResolutionError(ctx, err);
         };
@@ -14644,7 +14673,12 @@ pub const Node = struct {
         // Copy the warm publication's small metadata while briefly pinning it.
         // Request validation never scans its GGUF tokenizer arrays, and the
         // failed runtime can be reclaimed before a recovery replacement loads.
-        const cached_manifest = if (metal_runtime.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
+        const cached_manifest = if (request.model_revision) |revision|
+            self.model_manager.copyPinnedEmbeddingManifest(ctx.allocator, model_path, revision, execution_control) catch |err| {
+                if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
+                return modelLoadFailureResponse(ctx, err);
+            }
+        else if (metal_runtime.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
             self.model_manager.copyCachedQwenEmbeddingManifestWithControl(ctx.allocator, model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err| {
                 if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
                 return modelLoadFailureResponse(ctx, err);
@@ -26852,7 +26886,7 @@ pub const Node = struct {
                 const requested_revision = ctx.query("model_revision");
                 const replica_probe = embedding and (include_revisions or requested_revision != null);
                 const prepared = if (scoped_publication) |*scope| scope else null;
-                const path_selection = self.resolveRequestModelSelectionWithPublication(ctx.allocator, ctx.io, name, category, prepared) catch |err| {
+                const path_selection = self.resolveRequestModelSelectionWithOptions(ctx.allocator, ctx.io, name, category, .{ .scoped = prepared }) catch |err| {
                     if (replica_probe and (err == error.InvalidManagedDownload or err == error.ChecksumMismatch)) return embeddingArtifactFailureResponse(ctx);
                     return requestModelResolutionError(ctx, err);
                 };
@@ -50856,6 +50890,53 @@ test "model catalog publishes dense geometry without weights and only for embedd
     try buf.appendSlice(std.testing.allocator, "{}");
     try appendModelMetadata(&buf, std.testing.allocator, &manifest, "chunkers");
     try std.testing.expectEqualStrings("{}", buf.items);
+}
+
+test "model selection reuses the verified resident installation for embedding requests" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const managed = @import("../registry/managed_receipt.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_path = "embedders/test/model";
+    try tmp.dir.createDirPath(io, model_path);
+    const model_dir = try tmp.dir.openDir(io, model_path, .{});
+    defer model_dir.close(io);
+    try model_dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "compiled weights" });
+    const receipt = try std.json.Stringify.valueAlloc(a, managed.DownloadReceipt{
+        .version = 2,
+        .source = .{ .owner = "test", .name = "model", .variant = "safetensors", .selected_format = "safetensors" },
+        .artifacts = &.{.{ .path = "model.safetensors", .size = "compiled weights".len }},
+    }, .{});
+    defer a.free(receipt);
+    try model_dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = receipt });
+    const models = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(models);
+    var node = try Node.init(a, .{ .models_dir = models });
+    defer node.deinit();
+    try node.attachIo(io);
+    const selector = "test/model:safetensors";
+    const selected = try node.resolveRequestModelSelection(a, io, selector, "embedders");
+    defer a.free(selected.path);
+    const installation = try managed.installationForPublication(a, io, selected.path, selected.publication.?);
+    var resident: model_manager_mod.LoadedModel = undefined;
+    resident.managed_installation = installation;
+    try node.model_manager.loaded.put(a, selected.path, &resident);
+    defer _ = node.model_manager.loaded.remove(selected.path);
+
+    // Existing loaded bytes remain usable. A fresh receipt walk would reject
+    // the changed weight size, which will be checked before the next load.
+    try model_dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "changed" });
+    const warm = try node.resolveRequestModelSelectionWithOptions(a, io, selector, "embedders", .{ .reuse_resident = true });
+    defer a.free(warm.path);
+    try std.testing.expectEqual(selected.publication, warm.publication);
+    try std.testing.expectEqualStrings(selected.path, warm.path);
+
+    // A byte-identical receipt installed anew changes the local binding. The
+    // stale resident proof can no longer be used to skip validation.
+    try model_dir.rename(managed.complete_filename, model_dir, ".old-receipt", io);
+    try model_dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = receipt });
+    try std.testing.expectEqual(@as(?[32]u8, null), try node.model_manager.residentManagedPublication(io, selected.path, selected.publication));
 }
 
 test "scoped model discovery resolves dense geometry without loading weights" {

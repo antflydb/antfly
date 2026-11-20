@@ -3326,6 +3326,7 @@ pub const ChunkPlanningAssets = struct {
 
 pub const LoadedModel = struct {
     managed_publication: ?[32]u8 = null,
+    managed_installation: ?managed_receipt.Installation = null,
     runtime_id: RuntimeId = 0,
     residency_mode: RuntimeResidencyMode = .backend_managed,
     chunk_planning: ?ChunkPlanningSnapshot = null,
@@ -5141,7 +5142,7 @@ pub const ModelHandle = struct {
     /// without penalizing unrelated models that use the same backend.
     pub fn quarantine(self: *ModelHandle) void {
         const model = self.model orelse return;
-        markModelBackendUnhealthy(self.manager, model.model_dir, model.managed_publication, model.session.backend());
+        markModelBackendUnhealthy(self.manager, model.model_dir, model.managed_installation, model.session.backend());
         self.manager.retireLoadedModel(model);
         self.release();
     }
@@ -8151,6 +8152,23 @@ pub const ModelManager = struct {
         return modelCacheHasPublicationCapacity(self.loaded.count(), self.max_loaded_models);
     }
 
+    /// A resident managed runtime already authenticated its source. Verify
+    /// that its actual installation is still selected before reusing the proof.
+    pub fn residentManagedPublication(self: *ModelManager, io: std.Io, canonical_path: []const u8, expected: ?[32]u8) !?[32]u8 {
+        const defaults = self.defaultModelLoadPolicy(canonical_path);
+        const captured = blk: {
+            self.lockLoadedModels();
+            defer self.unlockLoadedModels();
+            const model = self.loaded.get(canonical_path) orelse self.loaded_aliases.get(canonical_path) orelse
+                (try self.lookupLoadedModelLocked(canonical_path, defaults.preferred_backends, false, defaults.cache_policy)) orelse return null;
+            break :blk model.managed_installation orelse return null;
+        };
+        if (expected) |publication| if (!std.mem.eql(u8, &publication, &captured.publication)) return null;
+        const publication = (try managed_receipt.publicationGeneration(self.allocator, io, canonical_path)) orelse return null;
+        const current = try managed_receipt.installationForPublication(self.allocator, io, canonical_path, publication);
+        return if (std.meta.eql(captured, current)) publication else null;
+    }
+
     pub fn publicationForRequest(self: *ModelManager, model_dir: []const u8, control: ?InferenceExecutionControl) !?[32]u8 {
         if (control) |active| try active.check();
         const current = try managed_receipt.publicationGeneration(self.allocator, if (control) |active| active.io orelse self.session_manager.io orelse std.Options.debug_io else self.session_manager.io orelse std.Options.debug_io, model_dir);
@@ -9679,17 +9697,17 @@ pub const ModelManager = struct {
             );
             defer self.allocator.free(variant_key);
             if (self.loaded.get(variant_key)) |model|
-                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_publication, backend)) return model;
+                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_installation, backend)) return model;
             if (self.loaded_aliases.get(variant_key)) |model|
-                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_publication, backend)) return model;
+                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_installation, backend)) return model;
         }
         if (policy.accept_default_alias) {
             if (self.loaded.get(model_dir)) |model|
-                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_publication, model.session.backend()) and
+                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_installation, model.session.backend()) and
                     (!policy.require_default_alias_backend_match or
                         loadedModelUsesPreferredBackend(model, preferred_backends))) return model;
             if (self.loaded_aliases.get(model_dir)) |model|
-                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_publication, model.session.backend()) and
+                if (!modelBackendIsUnhealthy(self, model_dir, model.managed_installation, model.session.backend()) and
                     (!policy.require_default_alias_backend_match or
                         loadedModelUsesPreferredBackend(model, preferred_backends))) return model;
         }
@@ -10341,7 +10359,7 @@ pub const ModelManager = struct {
             if (!backend.available() or !backend.supportsDirectSessionLoad()) continue;
             if (modelBackendPolicyError(manifest, backend, load_policy.cache_policy.a4b_request) != null) continue;
             if (!modelBackendMeetsJitPolicy(manager, manifest, backend)) continue;
-            if (!include_unavailable and self.pinnedBackendIsUnavailable(model_dir, manifest.managed_publication, backend)) continue;
+            if (!include_unavailable and self.pinnedBackendIsUnavailable(model_dir, artifacts.installation, backend)) continue;
             if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) continue;
             if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
             if (manifest.embedding_style == .embedding_gemma2 and backend != .native and backend != .metal and backend != .cuda) continue;
@@ -10383,46 +10401,85 @@ pub const ModelManager = struct {
         control: InferenceExecutionControl,
     ) !ModelHandle {
         const publication = (try self.publicationForRequest(model_dir, control)) orelse return error.InferenceCapabilitiesStale;
-        if (try self.acquireResidentPinnedEmbedding(model_dir, publication, expected)) |handle| return handle;
         const io = control.io orelse try self.componentPlanIo();
-        var manifest = try manifest_mod.loadBoundFromDir(self.allocator, io, model_dir, publication, false);
+        const installation = try managed_receipt.installationForPublication(self.allocator, io, model_dir, publication);
+        if (try self.acquireResidentPinnedEmbedding(model_dir, installation, expected)) |handle| return handle;
+
+        var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer lease.deinit(io);
+        var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = publication });
+        defer artifacts.deinit();
+        if (!std.meta.eql(artifacts.installation, @as(?managed_receipt.Installation, installation))) return error.ModelArtifactsChanging;
+        var manifest = if (std.mem.endsWith(u8, model_dir, ".onnx"))
+            try manifest_mod.loadBoundFromDir(self.allocator, io, model_dir, publication, false)
+        else
+            try manifest_mod.loadFromPublishedArtifacts(self.allocator, model_dir, &artifacts, false);
         defer manifest.deinit();
-        const declared = try self.embeddingRevisionCandidates(model_dir, manifest, control, true);
+        const declared = try self.embeddingRevisionCandidatesFromArtifacts(model_dir, manifest, control, true, &artifacts);
         var compatible: [EmbeddingRevisions.max_backends]backends.BackendType = undefined;
         var count: usize = 0;
         var known_recipe = false;
         for (declared.values(), declared.backends[0..declared.len]) |revision, backend| {
             if (!std.mem.eql(u8, &revision, &expected)) continue;
             known_recipe = true;
-            if (self.pinnedBackendIsUnavailable(model_dir, publication, backend)) continue;
+            if (self.pinnedBackendIsUnavailable(model_dir, installation, backend)) continue;
             if (backend == .cuda and !try backends.probeCudaDeviceWithControl(control)) continue;
             compatible[count] = backend;
             count += 1;
         }
         if (count == 0) return if (known_recipe) error.PinnedEmbeddingBackendUnavailable else error.InferenceCapabilitiesStale;
+        try artifacts.verifyPublication();
+        try self.retirePinnedEmbeddingReplacements(model_dir, installation, compatible[0..count]);
         const default_backends = self.defaultModelBackends(model_dir);
         const acquired = if (std.mem.eql(backends.BackendType, compatible[0..count], default_backends))
             self.acquireFromDirWithControl(model_dir, control)
         else
             self.acquireFromDirWithPreferredBackendsAndControl(model_dir, compatible[0..count], false, control);
         var handle = acquired catch |err| {
-            if (count == 1 and isPinnedBackendLoadFailure(err)) markModelBackendUnhealthy(self, model_dir, publication, compatible[0]);
+            if (count == 1 and isPinnedBackendLoadFailure(err)) markModelBackendUnhealthy(self, model_dir, installation, compatible[0]);
             return err;
         };
         errdefer handle.releaseObservation();
+        if (!std.meta.eql(handle.get().managed_installation, @as(?managed_receipt.Installation, installation))) return error.ModelArtifactsChanging;
         if (!std.meta.eql(handle.get().durable_embedding_revision, @as(?[32]u8, expected))) return error.InferenceCapabilitiesStale;
         return handle;
     }
 
-    fn pinnedBackendIsUnavailable(self: *ModelManager, model_dir: []const u8, publication: ?[32]u8, backend: backends.BackendType) bool {
+    // Called under the replacement's publication lease. Old already-admitted
+    // requests keep their handle, while new loads can publish the new runtime.
+    fn retirePinnedEmbeddingReplacements(self: *ModelManager, model_dir: []const u8, installation: managed_receipt.Installation, compatible: []const backends.BackendType) !void {
+        const defaults = self.defaultModelLoadPolicy(model_dir);
+        for (compatible) |backend| {
+            var stale = stale: {
+                self.lockLoadedModels();
+                defer self.unlockLoadedModels();
+                const model = (try self.lookupLoadedModelLocked(model_dir, &.{backend}, false, defaults.cache_policy)) orelse continue;
+                if (std.meta.eql(model.managed_installation, @as(?managed_receipt.Installation, installation))) continue;
+                model.active_handles += 1;
+                break :stale ModelHandle{ .manager = self, .model = model };
+            };
+            stale.retire();
+        }
+    }
+
+    fn pinnedBackendIsUnavailable(self: *ModelManager, model_dir: []const u8, installation: ?managed_receipt.Installation, backend: backends.BackendType) bool {
         if (backend == .cuda and backends.knownCudaDeviceAvailability() == false) return true;
-        return modelBackendIsUnhealthy(self, model_dir, publication, backend);
+        return modelBackendIsUnhealthy(self, model_dir, installation, backend);
+    }
+
+    pub fn copyPinnedEmbeddingManifest(self: *ModelManager, alloc: std.mem.Allocator, model_dir: []const u8, expected: [32]u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        const publication = (try self.publicationForRequest(model_dir, control)) orelse return null;
+        const io = control.io orelse try self.componentPlanIo();
+        const installation = try managed_receipt.installationForPublication(self.allocator, io, model_dir, publication);
+        var handle = (try self.acquireResidentPinnedEmbedding(model_dir, installation, expected)) orelse return null;
+        defer handle.releaseObservation();
+        return try handle.get().manifest.clone(alloc);
     }
 
     fn acquireResidentPinnedEmbedding(
         self: *ModelManager,
         model_dir: []const u8,
-        publication: [32]u8,
+        installation: managed_receipt.Installation,
         expected: [32]u8,
     ) !?ModelHandle {
         const defaults = self.defaultModelLoadPolicy(model_dir);
@@ -10432,8 +10489,8 @@ pub const ModelManager = struct {
         defer self.unlockLoadedModels();
         for (candidates) |backend| {
             const model = (try self.lookupLoadedModelLocked(model_dir, &.{backend}, false, defaults.cache_policy)) orelse continue;
-            if (self.pinnedBackendIsUnavailable(model_dir, publication, model.session.backend()) or
-                !std.meta.eql(model.managed_publication, @as(?[32]u8, publication)) or
+            if (self.pinnedBackendIsUnavailable(model_dir, installation, model.session.backend()) or
+                !std.meta.eql(model.managed_installation, @as(?managed_receipt.Installation, installation)) or
                 !std.meta.eql(model.durable_embedding_revision, @as(?[32]u8, expected))) continue;
             model.active_handles += 1;
             return .{ .manager = self, .model = model };
@@ -10456,8 +10513,13 @@ pub const ModelManager = struct {
         defer publication_lease.deinit(publication_io);
 
         const managed_publication = try self.publicationForRequest(model_dir, control);
-        // Load manifest
-        var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
+        var tokenizer_artifacts = try PublishedArtifacts.init(self.allocator, publication_io, model_dir, .{ .publication = managed_publication });
+        defer tokenizer_artifacts.deinit();
+        // Manifest parsing and verified construction use the same catalog.
+        var man = if (managed_publication != null and !std.mem.endsWith(u8, model_dir, ".onnx"))
+            try manifest_mod.loadFromPublishedArtifacts(self.allocator, model_dir, &tokenizer_artifacts, false)
+        else
+            try manifest_mod.loadFromDir(self.allocator, model_dir);
         var man_owned = true;
         errdefer if (man_owned) man.deinit();
         if (managed_publication != null and !std.meta.eql(managed_publication, man.managed_publication)) return error.ModelArtifactsChanging;
@@ -10503,8 +10565,6 @@ pub const ModelManager = struct {
             defer files.deinit();
             break :native_generation native_kv_identity.fileGeneration(std.Io.Dir.cwd(), sm.io orelse std.Options.debug_io, &files.entries) catch null;
         };
-        var tokenizer_artifacts = try PublishedArtifacts.init(self.allocator, publication_io, model_dir, .{ .publication = man.managed_publication });
-        defer tokenizer_artifacts.deinit();
         tokenizer_artifacts.verification_cache = &self.verified_artifacts;
         if (control) |*active| tokenizer_artifacts.verification_control = artifactVerificationControl(active);
         const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man, control orelse .{});
@@ -10749,6 +10809,7 @@ pub const ModelManager = struct {
         if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man, control orelse .{}))) return error.ModelArtifactsChanging;
         model.* = .{
             .managed_publication = managed_publication,
+            .managed_installation = tokenizer_artifacts.installation,
             .chunk_planning = chunk_planning,
             .resolution_revision = resolution_revision,
             .durable_embedding_revision = if (hasCompleteChecksums(&tokenizer_artifacts))
@@ -11049,11 +11110,11 @@ fn a4bRequestCacheIdentity(
 const model_backend_quarantine_ns: u64 = 30 * std.time.ns_per_s;
 const ModelBackendHealthKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
-fn modelBackendHealthKey(model_dir: []const u8, publication: ?[32]u8, backend: backends.BackendType) ModelBackendHealthKey {
+fn modelBackendHealthKey(model_dir: []const u8, installation: ?managed_receipt.Installation, backend: backends.BackendType) ModelBackendHealthKey {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(model_dir);
-    hasher.update(&.{ @backingInt(backend), @intFromBool(publication != null) });
-    if (publication) |published| hasher.update(&published);
+    hasher.update(&.{ @backingInt(backend), @intFromBool(installation != null) });
+    if (installation) |installed| installed.updateHash(&hasher);
     var digest: ModelBackendHealthKey = undefined;
     hasher.final(&digest);
     return digest;
@@ -11062,12 +11123,12 @@ fn modelBackendHealthKey(model_dir: []const u8, publication: ?[32]u8, backend: b
 fn markModelBackendUnhealthy(
     self: *ModelManager,
     model_dir: []const u8,
-    publication: ?[32]u8,
+    installation: ?managed_receipt.Installation,
     backend: backends.BackendType,
 ) void {
     const retry_after_ns = platform.time.monotonicNs() +| model_backend_quarantine_ns;
     spinLock(&self.unhealthy_backend_lock);
-    const key = modelBackendHealthKey(model_dir, publication, backend);
+    const key = modelBackendHealthKey(model_dir, installation, backend);
     // Retired publications may never be looked up again.
     if (self.unhealthy_model_backends.count() >= 1024 and !self.unhealthy_model_backends.contains(key)) {
         var entries = self.unhealthy_model_backends.iterator();
@@ -11096,10 +11157,10 @@ fn markModelBackendUnhealthy(
 fn modelBackendIsUnhealthy(
     self: *ModelManager,
     model_dir: []const u8,
-    publication: ?[32]u8,
+    installation: ?managed_receipt.Installation,
     backend: backends.BackendType,
 ) bool {
-    const key = modelBackendHealthKey(model_dir, publication, backend);
+    const key = modelBackendHealthKey(model_dir, installation, backend);
     const now_ns = platform.time.monotonicNs();
     spinLock(&self.unhealthy_backend_lock);
     defer self.unhealthy_backend_lock.unlock();
@@ -13086,7 +13147,7 @@ fn loadSessionForPreferredBackendsWithArtifactsImpl(
         if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
         if (backend == .metal and laya_candidate and !laya_packed and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
         if (control) |active| try active.check();
-        if (modelBackendIsUnhealthy(manager, model_dir, man.managed_publication, backend)) {
+        if (modelBackendIsUnhealthy(manager, model_dir, proof.artifacts().installation, backend)) {
             rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);
             continue;
         }
@@ -17578,6 +17639,47 @@ test "embeddinggemma2 preflight shares host capacity before model load and prese
     try std.testing.expectEqual(@as(usize, 0), manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
 }
 
+test "durable embedding revision keeps backend quarantine local to byte-identical installations" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const weights = "weights";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(weights, &digest, .{});
+    const weight_hex = std.fmt.bytesToHex(digest, .lower);
+    const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .artifacts = &.{
+        .{ .path = "model.safetensors", .size = weights.len, .sha256 = &weight_hex },
+    } }, .{});
+    defer a.free(receipt);
+    for ([_][]const u8{ "active", "replacement" }) |name| {
+        try tmp.dir.createDirPath(io, name);
+        const dir = try tmp.dir.openDir(io, name, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = weights });
+        try dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    }
+    const path = try tmp.dir.realPathFileAlloc(io, "active", a);
+    defer a.free(path);
+    const publication = (try managed_receipt.publicationGeneration(a, io, path)).?;
+    const old_installation = try managed_receipt.installationForPublication(a, io, path, publication);
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    markModelBackendUnhealthy(&manager, path, old_installation, .native);
+    try tmp.dir.rename("active", tmp.dir, "retired", io);
+    try tmp.dir.rename("replacement", tmp.dir, "active", io);
+    try std.testing.expectEqual(publication, (try managed_receipt.publicationGeneration(a, io, path)).?);
+    var current = try PublishedArtifacts.init(a, io, path, .{ .publication = publication });
+    defer current.deinit();
+    try current.verifyPublication();
+    try std.testing.expectEqual(try managed_receipt.installationForPublication(a, io, path, publication), current.installation.?);
+    try std.testing.expect(!modelBackendIsUnhealthy(&manager, path, current.installation, .native));
+    // A late failure of the old runtime cannot make the replacement ineligible.
+    markModelBackendUnhealthy(&manager, path, old_installation, .native);
+    try std.testing.expect(modelBackendIsUnhealthy(&manager, path, old_installation, .native));
+    try std.testing.expect(!modelBackendIsUnhealthy(&manager, path, current.installation, .native));
+}
+
 test "durable embedding revision keeps inherited receipt digests installation-specific" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -17658,12 +17760,13 @@ test "capi resolver model identity uses receipt digests before load and survives
         bound_manifest.managed_publication = try managed_receipt.publicationGeneration(a, io, first_path);
         const initial = try manager.declaredEmbeddingRevisions(first_path, bound_manifest, .{ .io = io });
         try std.testing.expectEqual(@as(usize, 1), initial.len);
-        markModelBackendUnhealthy(&manager, first_path, bound_manifest.managed_publication, .native);
-        const other_publication: [32]u8 = @splat(0xff);
-        try std.testing.expect(!modelBackendIsUnhealthy(&manager, first_path, other_publication, .native));
-        markModelBackendUnhealthy(&manager, first_path, other_publication, .native);
-        try std.testing.expect(modelBackendIsUnhealthy(&manager, first_path, bound_manifest.managed_publication, .native));
-        try std.testing.expect(modelBackendIsUnhealthy(&manager, first_path, other_publication, .native));
+        const installed = try managed_receipt.installationForPublication(a, io, first_path, bound_manifest.managed_publication.?);
+        markModelBackendUnhealthy(&manager, first_path, installed, .native);
+        const copied_installation = try managed_receipt.installationForPublication(a, io, second_path, bound_manifest.managed_publication.?);
+        try std.testing.expect(!modelBackendIsUnhealthy(&manager, first_path, copied_installation, .native));
+        markModelBackendUnhealthy(&manager, first_path, copied_installation, .native);
+        try std.testing.expect(modelBackendIsUnhealthy(&manager, first_path, installed, .native));
+        try std.testing.expect(modelBackendIsUnhealthy(&manager, first_path, copied_installation, .native));
         try std.testing.expect(!modelBackendIsUnhealthy(&manager, first_path, null, .native));
         const unhealthy = try manager.declaredEmbeddingRevisions(first_path, bound_manifest, .{ .io = io });
         try std.testing.expectEqual(@as(usize, 0), unhealthy.len);

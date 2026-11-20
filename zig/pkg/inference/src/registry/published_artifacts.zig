@@ -146,6 +146,7 @@ pub const PublishedArtifacts = struct {
     verification_control: managed.VerificationControl = .{},
     receipt: ?managed.ValidatedReceipt,
     publication: ?[32]u8,
+    installation: ?managed.Installation = null,
     verified_stamps: []?managed.ArtifactStamp = &.{},
     canonical_index: std.StringHashMapUnmanaged(usize) = .empty,
     opened_files: std.AutoHashMapUnmanaged(usize, OpenedArtifact) = .empty,
@@ -181,6 +182,7 @@ pub const PublishedArtifacts = struct {
         errdefer if (receipt) |*value| value.deinit();
         const publication = if (receipt) |value| value.publication_generation else null;
         if (expected) |value| if (!std.meta.eql(value.publication, publication)) return error.ModelArtifactsChanging;
+        const installation = if (publication) |generation| try managed.installationAtRoot(a, io, physical_root, root_stat, physical_direct, generation) else null;
         var index = std.StringHashMapUnmanaged(usize).empty;
         errdefer index.deinit(a);
         if (receipt) |value| for (value.artifacts, 0..) |artifact, i| try index.put(a, artifact.canonical_path, i);
@@ -198,7 +200,7 @@ pub const PublishedArtifacts = struct {
         } else null;
         const verified = try a.alloc(?managed.ArtifactStamp, if (receipt) |value| value.artifacts.len else 0);
         @memset(verified, null);
-        return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .physical_root = physical_root, .physical_root_inode = root_stat.inode, .physical_direct = physical_direct, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
+        return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .physical_root = physical_root, .physical_root_inode = root_stat.inode, .physical_direct = physical_direct, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .installation = installation, .canonical_index = index, .verified_stamps = verified };
     }
     pub fn deinit(self: *PublishedArtifacts) void {
         var opened = self.opened_files.valueIterator();
@@ -576,6 +578,10 @@ pub const PublishedArtifacts = struct {
         }
         if (self.direct_path) |path| try self.verifyBinding(path, self.physical_direct.?);
         if (!std.meta.eql(self.publication, try managed.publicationGeneration(self.allocator, self.io, self.root))) return error.ModelArtifactsChanging;
+        if (self.installation) |expected| {
+            const current = try managed.installationAtRoot(self.allocator, self.io, self.physical_root, root_stat, self.physical_direct, expected.publication);
+            if (!std.meta.eql(current, expected)) return error.ModelArtifactsChanging;
+        }
     }
 
     pub fn verify(self: *const PublishedArtifacts) !void {

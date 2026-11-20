@@ -69,6 +69,7 @@ pub const Inventory = struct {
     models_dir: []const u8,
     discovered: []const registry.ModelEntry,
     names: []const []const []const u8,
+    publications: []const ?[32]u8 = &.{},
     owners: [tasks.len]std.StringHashMapUnmanaged(Owner) = @splat(.empty),
     watches: []const Watch = &.{},
     generation: catalog_publication.Generation = .{},
@@ -126,10 +127,13 @@ pub const Inventory = struct {
 
         const entries = try a.alloc(registry.ModelEntry, found.len);
         const names = try a.alloc([]const []const u8, found.len);
-        for (found, entries, names) |entry, *out, *selectors| {
+        const publications = try a.alloc(?[32]u8, found.len);
+        for (found, entries, names, publications) |entry, *out, *selectors, *publication| {
             var candidate = std.heap.ArenaAllocator.init(allocator);
             defer candidate.deinit();
-            const managed = try registry.managedModelSelectorsAlloc(candidate.allocator(), io, entry.path);
+            const proof = try registry.managedModelSelectionAlloc(candidate.allocator(), io, entry.path);
+            const managed = proof.names;
+            publication.* = if (proof.rejected) null else proof.publication;
             selectors.* = try a.alloc([]const u8, if (managed.len > 0) managed.len else if (std.mem.indexOfAny(u8, entry.name, ":@") == null) @as(usize, 1) else 0);
             if (managed.len > 0) {
                 for (managed, @constCast(selectors.*)) |name, *owned| owned.* = try a.dupe(u8, name);
@@ -142,6 +146,7 @@ pub const Inventory = struct {
         }
         result.discovered = entries;
         result.names = names;
+        result.publications = publications;
         try result.buildOwners();
         const watches = try a.alloc(Watch, paths.count());
         var iterator = paths.iterator();
@@ -248,6 +253,7 @@ pub const Inventory = struct {
         }
         copy.discovered = entries;
         copy.names = names;
+        copy.publications = try a.dupe(?[32]u8, self.publications);
         // Full catalogs retain legacy watch evidence until serialization ends.
         const watches = try a.alloc(Watch, self.watches.len);
         for (self.watches, watches) |watch, *owned| owned.* = .{ .path = try a.dupe(u8, watch.path), .stamp = watch.stamp };
@@ -383,13 +389,25 @@ pub const Cache = struct {
         return if (try self.resolveSelection(allocator, io, root, requested, task)) |selected| @constCast(selected.path) else null;
     }
     pub fn resolveSelection(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8, requested: []const u8, task: ?[]const u8) !?ResolvedModel {
+        return self.resolveSelectionWithResident(allocator, io, root, requested, task, null);
+    }
+
+    pub const ResidentPublication = struct {
+        context: *anyopaque,
+        matches: *const fn (*anyopaque, std.Io, []const u8, [32]u8) anyerror!bool,
+    };
+
+    pub fn resolveSelectionWithResident(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8, requested: []const u8, task: ?[]const u8, resident: ?ResidentPublication) !?ResolvedModel {
         // Full catalogs and misses get a bounded backstop for raw filesystem
         // imports. Existing coordinated pinned hits never scan other models.
         var retried_catalog = false;
         const lookup = blk: while (true) {
             const lease = try self.acquire(io, root, retried_catalog);
             defer lease.release();
-            const selected = (try lease.slot.inventory.lookup(requested, task)) orelse {
+            const inventory = lease.inventory();
+            const index = if (task) |scope| try inventory.lookupIndex(requested, scope) else null;
+            const path = if (index) |i| inventory.discovered[i].path else if (task == null) try inventory.lookup(requested, null) else null;
+            const selected = path orelse {
                 if (!std.meta.eql(lease.slot.inventory.generation, try catalog_publication.read(allocator, io, root))) return error.ModelArtifactsChanging;
                 const age = std.Io.Timestamp.now(io, .awake).nanoseconds - lease.slot.rebuilt_at.nanoseconds;
                 if (!retried_catalog and age >= 5 * std.time.ns_per_s) {
@@ -398,10 +416,20 @@ pub const Cache = struct {
                 }
                 return null;
             };
-            break :blk .{ .path = try allocator.dupe(u8, selected), .generation = lease.slot.inventory.generation };
+            break :blk .{
+                .path = try allocator.dupe(u8, selected),
+                .generation = inventory.generation,
+                .publication = if (index) |i| inventory.publications[i] else null,
+            };
         };
         const path = lookup.path;
         errdefer allocator.free(path);
+        if (resident) |candidate| if (lookup.publication) |publication| {
+            if (try candidate.matches(candidate.context, io, path, publication)) {
+                try catalog_publication.require(allocator, io, root, lookup.generation);
+                return .{ .path = path, .publication = publication };
+            }
+        };
         var temporary = std.heap.ArenaAllocator.init(allocator);
         defer temporary.deinit();
         const proof = try registry.managedModelSelectionAlloc(temporary.allocator(), io, path);

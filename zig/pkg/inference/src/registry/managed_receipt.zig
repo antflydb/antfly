@@ -677,6 +677,50 @@ pub fn publicationRootAlloc(a: std.mem.Allocator, io: std.Io, model: []const u8)
     return a.dupe(u8, model);
 }
 
+/// Local identity of a validated installation. A byte-identical reinstall
+/// keeps its portable receipt generation and receives a new local identity.
+pub const Installation = struct {
+    publication: [32]u8,
+    root_inode: @FieldType(std.Io.File.Stat, "inode"),
+    receipt_stamp: ArtifactStamp,
+    direct: ?ArtifactStamp,
+
+    fn hashStamp(stamp: ArtifactStamp, hash: *std.crypto.hash.sha2.Sha256) void {
+        hash.update(std.mem.asBytes(&stamp.inode));
+        hash.update(std.mem.asBytes(&stamp.modified.nanoseconds));
+        hash.update(std.mem.asBytes(&stamp.changed.nanoseconds));
+        hash.update(std.mem.asBytes(&stamp.size));
+    }
+
+    pub fn updateHash(self: Installation, hash: *std.crypto.hash.sha2.Sha256) void {
+        hash.update(&self.publication);
+        hash.update(std.mem.asBytes(&self.root_inode));
+        hashStamp(self.receipt_stamp, hash);
+        if (self.direct) |file| hashStamp(file, hash);
+    }
+};
+
+pub fn installationAtRoot(a: std.mem.Allocator, io: std.Io, root: []const u8, root_stat: std.Io.File.Stat, direct: ?[]const u8, publication: [32]u8) !Installation {
+    const path = try managedPath(a, root, complete_filename);
+    defer a.free(path);
+    const receipt = try std.Io.Dir.cwd().statFile(io, path, .{});
+    return .{
+        .publication = publication,
+        .root_inode = root_stat.inode,
+        .receipt_stamp = ArtifactStamp.fromStat(receipt),
+        .direct = if (direct) |member| ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(io, member, .{})) else null,
+    };
+}
+
+/// Read only the installation root, receipt stamp and any directly selected member.
+pub fn installationForPublication(a: std.mem.Allocator, io: std.Io, model: []const u8, publication: [32]u8) !Installation {
+    const direct = isDirectModelPath(model);
+    const root = if (direct) try publicationRootAlloc(a, io, model) else model;
+    defer if (direct) a.free(root);
+    const stat = try std.Io.Dir.cwd().statFile(io, root, .{});
+    return installationAtRoot(a, io, root, stat, if (direct) model else null, publication);
+}
+
 /// Cheap publication identity for resident sessions and load flights. Receipt
 /// validation still owns artifact integrity; this token binds its source and
 /// artifact manifest to the generation actually loaded, without hashing weights.
