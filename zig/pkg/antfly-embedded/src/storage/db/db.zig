@@ -49531,7 +49531,7 @@ pub const DB = struct {
             ordinals: []?doc_set.DocOrdinal,
         ) !void {
             const original_error = for (failures) |failure| {
-                if (failure) |err| break err;
+                if (failure) |err| break if (err == error.NotFound) error.InvalidDocIdentity else err;
             } else unreachable;
             const constraints = options.constraints orelse return original_error;
             if (!constraints.positive_filter) return original_error;
