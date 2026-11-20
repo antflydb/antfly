@@ -87,8 +87,10 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
 /// Each stage owns its own manager snapshot so a primary requirement cannot
 /// override an explicitly placed decoder or other component.
 pub fn configureDirectSession(session_manager: *backends.SessionManager, choice: Choice) void {
-    configureSessionPreference(session_manager, choice);
-    if (choice == .auto) return;
+    if (choice == .auto) {
+        configureSessionPreference(session_manager, choice);
+        return;
+    }
     const selected: backends.BackendType = switch (choice) {
         .native => .native,
         .metal => .metal,
@@ -99,7 +101,13 @@ pub fn configureDirectSession(session_manager: *backends.SessionManager, choice:
     };
     session_manager.required_backend = selected;
     session_manager.required_backend_invalid = false;
-    if (choice == .xla) session_manager.preferred_backends = &.{.pjrt};
+    session_manager.preferred_backends = switch (selected) {
+        .native => &.{.native},
+        .metal => &.{.metal},
+        .cuda => &.{.cuda},
+        .pjrt => &.{.pjrt},
+        .wasm => &.{.wasm},
+    };
 }
 
 pub fn compiledPartitionBackend(choice: Choice) ?ops.BackendKind {

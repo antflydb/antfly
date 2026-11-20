@@ -274,16 +274,14 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
-    session_manager.preferred_backends = switch (choice) {
-        .cuda => &.{backends.BackendType.cuda},
-        .xla => &.{backends.BackendType.pjrt},
-        .auto => if (build_options.enable_metal)
-            &.{ backends.BackendType.metal, backends.BackendType.native }
-        else
-            &.{backends.BackendType.native},
-        .native => &.{backends.BackendType.native},
-        .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-    };
+    if (choice != .auto) {
+        @import("native_backend_choice.zig").configureDirectSession(session_manager, @import("native_backend_choice.zig").parse(@tagName(choice)).?);
+        return;
+    }
+    session_manager.preferred_backends = if (build_options.enable_metal)
+        &.{ backends.BackendType.metal, backends.BackendType.native }
+    else
+        &.{backends.BackendType.native};
 }
 
 fn printUsage() void {
@@ -334,4 +332,15 @@ test "task CLI extraction accepts explicit PJRT placement and retains owned pars
     try std.testing.expectEqual(BackendChoice.xla, options.backend);
     try std.testing.expect((try options.pjrt.sessionOptions()).memory_policy.? == .cpu);
     try std.testing.expectEqual(BackendChoice.cuda, parseBackendChoice("cuda").?);
+}
+
+test "task direct legacy extractor honors explicit placement over inherited policy" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    manager.required_backend = .pjrt;
+    manager.required_backend_invalid = true;
+    configureBackendPreference(&manager, .native);
+    var storage: [1]backends.BackendType = undefined;
+    const order = try manager.requiredBackendCandidates(&.{.pjrt}, &storage);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.native}, order);
+    try std.testing.expect(!manager.required_backend_invalid);
 }

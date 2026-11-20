@@ -65,7 +65,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     session_manager.native_call_policy = .in_process;
     session_manager.process_termination_available = false;
     configureBackendPreference(&session_manager, opts.backend);
-    if (opts.backend != .auto) @import("native_backend_choice.zig").configureDirectSession(&session_manager, @import("native_backend_choice.zig").parse(@tagName(opts.backend)).?);
     try opts.pjrt.applyPolicy(&session_manager);
     if (opts.backend == .xla) try opts.pjrt.configure(&session_manager);
     var decoder_manager_snapshot = session_manager;
@@ -282,18 +281,16 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
-    session_manager.preferred_backends = switch (choice) {
-        .xla => &.{backends.BackendType.pjrt},
-        .auto => if (build_options.enable_metal)
-            &.{ backends.BackendType.metal, backends.BackendType.native }
-        else if (build_options.enable_cuda)
-            &.{ backends.BackendType.cuda, backends.BackendType.native }
-        else
-            &.{backends.BackendType.native},
-        .cuda => &.{backends.BackendType.cuda},
-        .native => &.{backends.BackendType.native},
-        .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-    };
+    if (choice != .auto) {
+        @import("native_backend_choice.zig").configureDirectSession(session_manager, @import("native_backend_choice.zig").parse(@tagName(choice)).?);
+        return;
+    }
+    session_manager.preferred_backends = if (build_options.enable_metal)
+        &.{ backends.BackendType.metal, backends.BackendType.native }
+    else if (build_options.enable_cuda)
+        &.{ backends.BackendType.cuda, backends.BackendType.native }
+    else
+        &.{backends.BackendType.native};
 }
 
 fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {

@@ -124,7 +124,7 @@ are forwarded to execution or rejected when the selected task/provider cannot
 honor them; parser acceptance alone is not support. Transcription currently has
 no PJRT request-resident decoder and rejects explicit cache enablement.
 
-`pipelines/pjrt_generation_request.zig` owns one stable execution request shared
+`execution/pjrt_generation_request.zig` owns one stable execution request shared
 by HTTP generation and direct text/media reading. Its compute provider, graph
 cache and generation pipeline retire in that order's reverse, under the provider
 guard. Callers retain the model handle, generation slot and prepaid media lease
@@ -144,7 +144,7 @@ The compiled executor does not acquire the eager model mutex or construct a
 native backend; each session call owns its provider admission and execution lane.
 Independent pinned-logit and direct/HTTP tests qualify the actual serving path. Captured symmetric-window bias uses shared integer position
 algebra in `graph/attention_bias.zig`; it does not embed a dense per-head mask
-for every layer. Only the linear position vector and scalar values are
+for every layer. Only linear position/bound vectors and scalar values are
 constants. Independent 512- and 2048-token upstream captures check this definition
 without widening the serving envelope or PJRT's program-size guard.
 

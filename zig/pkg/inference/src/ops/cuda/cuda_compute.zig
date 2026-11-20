@@ -17150,28 +17150,11 @@ test "CUDA op-profile pool free-stack, drain no-op, and category mapping" {
     // allocation, the LIFO free-stack that lets nested scopes hold distinct
     // slots, the empty-ring drain fast path (never touches the GPU context), and
     // the category -> stat-field mapping for the newly added prefill buckets.
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
 
-    compute.temp_scan_profile = .{};
     compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    compute.qualified_span_fp32 = false;
-    compute.lighton_fused_vision_qkv_enabled = false;
-    compute.lighton_ragged_recurrent_enabled = false;
-    compute.lighton_ffn_bf16_inputs = false;
 
-    compute.lighton_norm_weight_cache_enabled = false;
-
-    compute.ocr_temp_cache_budget_bytes = null;
-
-    compute.ocr_deferred_free_budget_bytes = null;
-    compute.execution_scope = null;
-    compute.audio_execution_active = false;
-    compute.embedding_gemma2_constant_generation = 0;
     compute.allocator = std.testing.allocator;
-    compute.profile_pool = .{};
-    compute.stats = .{};
 
     try ensureProfilePoolAllocated(&compute);
     defer {
@@ -17733,31 +17716,12 @@ fn allocGreedyTokenDeviceBuffer(self: *CudaCompute, byte_len: usize) !DeviceBuff
 }
 
 test "CUDA greedy graph output borrows only the prepared replay slot" {
-    var self: CudaCompute = undefined;
-    self.ctx.observation.store(null, .release);
-    self.ctx.observation_enable_failed.store(false, .release);
+    var self = metadataOnlyTestCompute();
 
-    self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    self.qualified_span_fp32 = false;
-    self.lighton_fused_vision_qkv_enabled = false;
-    self.lighton_ragged_recurrent_enabled = false;
-    self.lighton_ffn_bf16_inputs = false;
 
-    self.lighton_norm_weight_cache_enabled = false;
-
-    self.ocr_temp_cache_budget_bytes = null;
-
-    self.ocr_deferred_free_budget_bytes = null;
-    self.execution_scope = null;
-    self.audio_execution_active = false;
-    self.embedding_gemma2_constant_generation = 0;
-    self.resident_training_cache = false;
     self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_prepared_slot = 3;
-    self.debug_cuda_graph_active_slot = null;
-    self.debug_cuda_graph_capture_active = false;
-    self.debug_cuda_graph_capture_disabled = false;
     self.debug_cuda_graph_prepared_output_kind = .tensor;
     self.debug_cuda_graph_slots[3].output_storage = .{ .ptr = 0x1234, .len = 64 };
 
@@ -17775,31 +17739,13 @@ test "CUDA greedy graph output borrows only the prepared replay slot" {
 }
 
 test "CUDA greedy graph output lease remains armed for retry and consumes on tensor creation" {
-    var self: CudaCompute = undefined;
-    self.ctx.observation.store(null, .release);
-    self.ctx.observation_enable_failed.store(false, .release);
+    var self = metadataOnlyTestCompute();
 
-    self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    self.qualified_span_fp32 = false;
-    self.lighton_fused_vision_qkv_enabled = false;
-    self.lighton_ragged_recurrent_enabled = false;
-    self.lighton_ffn_bf16_inputs = false;
 
-    self.lighton_norm_weight_cache_enabled = false;
-
-    self.ocr_temp_cache_budget_bytes = null;
-
-    self.ocr_deferred_free_budget_bytes = null;
-    self.execution_scope = null;
-    self.audio_execution_active = false;
-    self.embedding_gemma2_constant_generation = 0;
-    self.resident_training_cache = false;
     self.allocator = std.testing.allocator;
     self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_prepared_slot = 1;
-    self.debug_cuda_graph_active_slot = null;
-    self.debug_cuda_graph_capture_active = false;
     self.debug_cuda_graph_prepared_output_kind = .greedy_token;
     self.debug_cuda_graph_slots[1].output_storage = .{ .ptr = 0x5678, .len = 64 };
 
@@ -18643,28 +18589,11 @@ fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
 fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
     // No driver is needed: acquired handles may free their metadata, but must
     // never attempt to free the resident model's device allocations.
-    var self: CudaCompute = undefined;
-    self.ctx.observation.store(null, .release);
-    self.ctx.observation_enable_failed.store(false, .release);
+    var self = metadataOnlyTestCompute();
 
-    self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    self.qualified_span_fp32 = false;
-    self.lighton_fused_vision_qkv_enabled = false;
-    self.lighton_ragged_recurrent_enabled = false;
-    self.lighton_ffn_bf16_inputs = false;
 
-    self.lighton_norm_weight_cache_enabled = false;
-
-    self.ocr_temp_cache_budget_bytes = null;
-
-    self.ocr_deferred_free_budget_bytes = null;
-    self.execution_scope = null;
-    self.audio_execution_active = false;
-    self.embedding_gemma2_constant_generation = 0;
-    self.resident_training_cache = false;
     self.allocator = allocator;
-    self.a4b_runtime = null;
     self.resident_weights = .empty;
     defer self.resident_weights.deinit(allocator);
     self.lazy_device_epochs = .empty;
@@ -19148,27 +19077,10 @@ fn disarmSplitkOnlineDecodeReplay(self: *CudaCompute) void {
 }
 
 test "split-K replay rejection cannot leave a prepared graph or stale scalars" {
-    var self: CudaCompute = undefined;
-    self.physical_execution_cleanup = null;
-    self.ctx.observation.store(null, .release);
-    self.ctx.observation_enable_failed.store(false, .release);
+    var self = metadataOnlyTestCompute();
 
-    self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    self.qualified_span_fp32 = false;
-    self.lighton_fused_vision_qkv_enabled = false;
-    self.lighton_ragged_recurrent_enabled = false;
-    self.lighton_ffn_bf16_inputs = false;
 
-    self.lighton_norm_weight_cache_enabled = false;
-
-    self.ocr_temp_cache_budget_bytes = null;
-
-    self.ocr_deferred_free_budget_bytes = null;
-    self.execution_scope = null;
-    self.audio_execution_active = false;
-    self.embedding_gemma2_constant_generation = 0;
-    self.resident_training_cache = false;
     self.allocator = std.testing.allocator;
     self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_slots[1].valid = true;
@@ -19221,27 +19133,10 @@ fn preparePersistentCudaBufferReallocationWithCleanup(self: *CudaCompute, curren
 }
 
 test "CUDA persistent buffer reallocation invalidates graph pointers and rejects capture" {
-    var self: CudaCompute = undefined;
-    self.physical_execution_cleanup = null;
-    self.ctx.observation.store(null, .release);
-    self.ctx.observation_enable_failed.store(false, .release);
+    var self = metadataOnlyTestCompute();
 
-    self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    self.qualified_span_fp32 = false;
-    self.lighton_fused_vision_qkv_enabled = false;
-    self.lighton_ragged_recurrent_enabled = false;
-    self.lighton_ffn_bf16_inputs = false;
 
-    self.lighton_norm_weight_cache_enabled = false;
-
-    self.ocr_temp_cache_budget_bytes = null;
-
-    self.ocr_deferred_free_budget_bytes = null;
-    self.execution_scope = null;
-    self.audio_execution_active = false;
-    self.embedding_gemma2_constant_generation = 0;
-    self.resident_training_cache = false;
     self.allocator = std.testing.allocator;
     self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_slots[2].valid = true;
@@ -19270,26 +19165,10 @@ fn clearDebugCudaGraphCaptureState(self: *CudaCompute) void {
 }
 
 test "clearing CUDA graph capture state removes stale disabled latch" {
-    var self: CudaCompute = undefined;
-    self.ctx.observation.store(null, .release);
-    self.ctx.observation_enable_failed.store(false, .release);
+    var self = metadataOnlyTestCompute();
 
-    self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    self.qualified_span_fp32 = false;
-    self.lighton_fused_vision_qkv_enabled = false;
-    self.lighton_ragged_recurrent_enabled = false;
-    self.lighton_ffn_bf16_inputs = false;
 
-    self.lighton_norm_weight_cache_enabled = false;
-
-    self.ocr_temp_cache_budget_bytes = null;
-
-    self.ocr_deferred_free_budget_bytes = null;
-    self.execution_scope = null;
-    self.audio_execution_active = false;
-    self.embedding_gemma2_constant_generation = 0;
-    self.resident_training_cache = false;
     self.debug_cuda_graph_capture_active = true;
     self.debug_cuda_graph_capture_disabled = true;
     self.debug_cuda_graph_active_slot = 3;
@@ -19304,29 +19183,11 @@ test "clearing CUDA graph capture state removes stale disabled latch" {
 }
 
 test "CUDA graph request reset clears stale capture and scalar state" {
-    var self: CudaCompute = undefined;
-    self.physical_execution_cleanup = null;
-    self.ctx.observation.store(null, .release);
-    self.ctx.observation_enable_failed.store(false, .release);
+    var self = metadataOnlyTestCompute();
 
-    self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    self.qualified_span_fp32 = false;
-    self.lighton_fused_vision_qkv_enabled = false;
-    self.lighton_ragged_recurrent_enabled = false;
-    self.lighton_ffn_bf16_inputs = false;
 
-    self.lighton_norm_weight_cache_enabled = false;
-
-    self.ocr_temp_cache_budget_bytes = null;
-
-    self.ocr_deferred_free_budget_bytes = null;
-    self.execution_scope = null;
-    self.audio_execution_active = false;
-    self.embedding_gemma2_constant_generation = 0;
-    self.resident_training_cache = false;
     self.ctx.debug_graph_capture_active = false;
-    self.generated_gqa_score_prework_templates = .empty;
     self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_capture_active = true;
     self.debug_cuda_graph_capture_disabled = true;
@@ -19357,42 +19218,16 @@ test "CUDA graph request reset clears stale capture and scalar state" {
 }
 
 test "CUDA request reset clears pinned temp slot ABI mappings" {
-    var self: CudaCompute = undefined;
-    self.physical_execution_cleanup = null;
-    self.ctx.observation.store(null, .release);
-    self.ctx.observation_enable_failed.store(false, .release);
+    var self = metadataOnlyTestCompute();
 
-    self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    self.qualified_span_fp32 = false;
-    self.lighton_fused_vision_qkv_enabled = false;
-    self.lighton_ragged_recurrent_enabled = false;
-    self.lighton_ffn_bf16_inputs = false;
 
-    self.lighton_norm_weight_cache_enabled = false;
-
-    self.ocr_temp_cache_budget_bytes = null;
-
-    self.ocr_deferred_free_budget_bytes = null;
-    self.execution_scope = null;
-    self.audio_execution_active = false;
-    self.embedding_gemma2_constant_generation = 0;
-    self.resident_training_cache = false;
-    self.temp_slot_config = .{};
-    self.run_budget = null;
-    self.capability_profile = null;
-    self.stats = .{};
     self.allocator = std.testing.allocator;
     self.temp_buffer_mutex = .unlocked;
-    self.temp_buffers = .empty;
     defer self.temp_buffers.deinit(std.testing.allocator);
-    self.temp_pinned_slots = .empty;
     defer self.temp_pinned_slots.deinit(std.testing.allocator);
-    self.temp_arena_planner = .{};
     defer self.temp_arena_planner.deinit(std.testing.allocator);
     self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
-    self.debug_cuda_graph_active_slot = null;
-    self.debug_cuda_graph_prepared_slot = null;
     self.temp_arena_generation = 1;
     try self.temp_pinned_slots.append(std.testing.allocator, .{
         .buffer = .{ .ptr = 0x1000, .len = 64 },
@@ -21070,25 +20905,10 @@ fn gemma4AudioDepthwiseSegmentedOp(ctx: *anyopaque, input: CT, weight: CT, start
 }
 
 test "Gemma 4 audio CUDA hooks decline pre-Ampere before touching tensors" {
-    var self: CudaCompute = undefined;
-    self.ctx.observation.store(null, .release);
-    self.ctx.observation_enable_failed.store(false, .release);
+    var self = metadataOnlyTestCompute();
 
-    self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    self.qualified_span_fp32 = false;
-    self.lighton_fused_vision_qkv_enabled = false;
-    self.lighton_ragged_recurrent_enabled = false;
-    self.lighton_ffn_bf16_inputs = false;
 
-    self.lighton_norm_weight_cache_enabled = false;
-
-    self.ocr_temp_cache_budget_bytes = null;
-
-    self.ocr_deferred_free_budget_bytes = null;
-    self.execution_scope = null;
-    self.audio_execution_active = false;
-    self.embedding_gemma2_constant_generation = 0;
     self.ctx.info.compute_major = 7;
     try std.testing.expect((try gemma4AudioClampScalarOp(&self, undefined, -1, 1)) == null);
     try std.testing.expect((try gemma4AudioGluRowsOp(&self, undefined, 1, 1)) == null);
@@ -24502,32 +24322,13 @@ fn boundaryMixedWeight(self: *CudaCompute, weight: *const CudaTensor) ?CudaTenso
 }
 
 test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
 
-    compute.temp_scan_profile = .{};
     compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    compute.qualified_span_fp32 = false;
-    compute.lighton_fused_vision_qkv_enabled = false;
-    compute.lighton_ragged_recurrent_enabled = false;
-    compute.lighton_ffn_bf16_inputs = false;
 
-    compute.lighton_norm_weight_cache_enabled = false;
-
-    compute.ocr_temp_cache_budget_bytes = null;
-
-    compute.ocr_deferred_free_budget_bytes = null;
-    compute.execution_scope = null;
-    compute.audio_execution_active = false;
-    compute.embedding_gemma2_constant_generation = 0;
     compute.allocator = std.testing.allocator;
-    compute.gliner_boundary_inference = false;
-    compute.gliner_mixed_attention = false;
     compute.gliner_encoder_attention = true;
-    compute.qualified_decide_q8 = false;
     compute.gliner_q8_f16_mirrors = true;
-    compute.gliner_boundary_f16_mirrors = .{};
     defer compute.gliner_boundary_f16_mirrors.deinit(std.testing.allocator);
     const mirror = buffer_mod.DeviceBuffer{ .ptr = 0x2000, .len = 64 };
     try compute.gliner_boundary_f16_mirrors.put(std.testing.allocator, 0x1000, mirror);
@@ -28808,7 +28609,7 @@ test "CUDA RMS Q8 consumed bias invalidates owner and sibling views before launc
         .shape = &bias_shape,
         .elem_count = 2560,
     };
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.kernels = .{};
     try std.testing.expect(borrowRmsQ8Mirror(&consumed_view, 1, 2560) != null);
     try std.testing.expect(borrowRmsQ8Mirror(&sibling_view, 1, 2560) != null);
@@ -29541,31 +29342,15 @@ fn glinerQ8F16AttentionEligible(self: *const CudaCompute, batch: usize, seq: usi
 }
 
 test "GLiNER Decide CUDA Q8 long-context attention requires complete supported mirror profile" {
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
 
-    compute.temp_scan_profile = .{};
     compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    compute.qualified_span_fp32 = false;
-    compute.lighton_fused_vision_qkv_enabled = false;
-    compute.lighton_ragged_recurrent_enabled = false;
-    compute.lighton_ffn_bf16_inputs = false;
 
-    compute.lighton_norm_weight_cache_enabled = false;
-
-    compute.ocr_temp_cache_budget_bytes = null;
-
-    compute.ocr_deferred_free_budget_bytes = null;
-    compute.execution_scope = null;
-    compute.audio_execution_active = false;
-    compute.embedding_gemma2_constant_generation = 0;
     compute.gliner_encoder_attention = true;
     compute.gliner_q8_f16_mirrors = true;
     compute.gliner_q8_f16_attention = true;
     compute.ctx.info.compute_major = 8;
     compute.kernels.gliner_encoder_attention_tc_f16 = @ptrFromInt(1);
-    compute.gliner_boundary_f16_mirrors = .{};
     defer compute.gliner_boundary_f16_mirrors.deinit(std.testing.allocator);
     for (0..111) |index| try compute.gliner_boundary_f16_mirrors.put(std.testing.allocator, index + 1, .{});
     try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 1, 2048, 28, 64));
@@ -36782,10 +36567,7 @@ const scoped_run_budget_vtable = blk: {
 };
 
 test "generation cooperative CUDA handles bind budgets per step and retire without clearing a peer" {
-    var compute: CudaCompute = undefined;
-    compute.owned_by_backend = false;
-    compute.run_budget = null;
-    compute.lazy_device_budget_bytes = 0;
+    var compute = metadataOnlyTestCompute();
     var first = run_memory.RunBudget.init(.{ .backend_limit_bytes = 1000 });
     var second = run_memory.RunBudget.init(.{ .backend_limit_bytes = 2000 });
     var a = compute.computeBackendWithStepRunBudget(&first, 1);
@@ -37330,13 +37112,10 @@ const binaryElementwiseImpl = binaryElementwise;
 const trainingAdamWManyF32Impl = trainingAdamWManyF32Op;
 
 test "attention match repeat scope restores profile on error" {
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.ctx.info.compute_major = 8;
     compute.ctx.info.compute_minor = 9;
     compute.ctx.debug_graph_capture_active = false;
-    compute.debug_cuda_graph_capture_active = false;
     compute.kernels.attention_match_repeat = false;
     compute.kernels.gqa_prefill_profile = .required_fast;
     compute.kernels.gqa_repeat_hd256 = @ptrFromInt(1);
@@ -38796,36 +38575,17 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
             next = 256;
             copies = 0;
             var controller = @import("../../runtime/tier/memory.zig").AdmissionController{};
-            var compute: CudaCompute = undefined;
+            var compute = metadataOnlyTestCompute();
             compute.ctx.prepared_cache_funding = null;
             compute.constant_metadata_mutex = .unlocked;
             compute.cache_retirement_pending = .init(0);
-            compute.ctx.observation.store(null, .release);
-            compute.ctx.observation_enable_failed.store(false, .release);
 
-            compute.temp_scan_profile = .{};
             compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-            compute.qualified_span_fp32 = false;
-            compute.lighton_fused_vision_qkv_enabled = false;
-            compute.lighton_ragged_recurrent_enabled = false;
-            compute.lighton_ffn_bf16_inputs = false;
 
-            compute.lighton_norm_weight_cache_enabled = false;
-
-            compute.ocr_temp_cache_budget_bytes = null;
-
-            compute.ocr_deferred_free_budget_bytes = null;
-            compute.execution_scope = null;
-            compute.audio_execution_active = false;
-            compute.embedding_gemma2_constant_generation = 0;
             compute.allocator = a;
             compute.capability_profile = .embedding_gemma2;
-            compute.embedding_gemma2_constants = .empty;
             compute.embedding_gemma2_constant_bytes = .init(0);
             compute.embedding_gemma2_constant_count = .init(0);
-            compute.embedding_gemma2_constant_hits = 0;
-            compute.embedding_gemma2_audio_constant_hits = 0;
-            compute.embedding_gemma2_constant_misses = 0;
             compute.ctx.ctx = @ptrFromInt(1);
             compute.ctx.stream = @ptrFromInt(2);
             compute.ctx.stats = .{};
@@ -38933,22 +38693,10 @@ test "embeddinggemma2 CUDA constant snapshots preserve bits after mutation evict
 }
 
 test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclamation before GPU access" {
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
 
-    compute.temp_scan_profile = .{};
     compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
-    compute.qualified_span_fp32 = false;
-    compute.lighton_fused_vision_qkv_enabled = false;
-    compute.lighton_ragged_recurrent_enabled = false;
-    compute.lighton_ffn_bf16_inputs = false;
 
-    compute.lighton_norm_weight_cache_enabled = false;
-
-    compute.ocr_temp_cache_budget_bytes = null;
-
-    compute.ocr_deferred_free_budget_bytes = null;
     compute.capability_profile = .embedding_gemma2;
     compute.embedding_gemma2_policy = .{ .audio_graph = true };
     compute.audio_execution_active = true;
@@ -40399,9 +40147,7 @@ fn makeRetainedTensorView(self: *CudaCompute, source: *CudaTensor, buffer: buffe
 test "CUDA retained reshape and row views preserve owning metadata without GPU access" {
     const Case = struct {
         fn run(a: std.mem.Allocator) !void {
-            var compute: CudaCompute = undefined;
-            compute.ctx.observation.store(null, .release);
-            compute.ctx.observation_enable_failed.store(false, .release);
+            var compute = metadataOnlyTestCompute();
             compute.allocator = a;
             const source = try a.create(CudaTensor);
             source.* = .{ .buffer = .{ .ptr = 4096, .len = 64 }, .dtype = .f32, .shape = @constCast(&[_]i64{ 4, 4 }), .elem_count = 16, .owns_buffer = false, .owns_shape = false };
@@ -40597,9 +40343,7 @@ test "CUDA physical completion orders default stream changes and waits only at r
     driver.fns.cuEventRecord = Fake.record;
     driver.fns.cuStreamWaitEvent = Fake.depend;
     driver.fns.cuEventSynchronize = Fake.wait;
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.ctx.driver = driver;
     compute.ctx.ctx = @ptrFromInt(1);
     compute.ctx.stream = null;
@@ -40620,9 +40364,7 @@ test "CUDA physical completion orders default stream changes and waits only at r
 
 test "CUDA immutable retention shares typed payload and metadata without GPU submission" {
     const a = std.testing.allocator;
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.allocator = a;
     const source = try a.create(CudaTensor);
     source.* = .{ .buffer = .{ .ptr = 4096, .len = 16 }, .dtype = .i32, .shape = @constCast(&[_]i64{4}), .elem_count = 4, .owns_buffer = false, .owns_shape = false };
@@ -40636,12 +40378,8 @@ test "CUDA immutable retention shares typed payload and metadata without GPU sub
 }
 
 test "CUDA planned transfers reject host copies during capture before device submission" {
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
-    compute.execution_scope = null;
+    var compute = metadataOnlyTestCompute();
     compute.debug_cuda_graph_capture_active = true;
-    compute.debug_cuda_graph_capture_disabled = false;
     var tensor = CudaTensor{ .buffer = .{ .ptr = 4096, .len = 4 }, .dtype = .f32, .shape = @constCast(&[_]i64{1}), .elem_count = 1, .owns_buffer = false, .owns_shape = false };
     // The device address is never accessed, but write invalidation touches real
     // lease metadata before the capture guard. A sentinel pointer is not a lease.
@@ -40666,15 +40404,9 @@ test "CUDA physical capture scopes reject nesting and retain operand addresses" 
     defer context.deinit(a);
     const lease = (try ops.physical_storage.Lease.create(a, context.computeBackend(), 16)).?;
     defer lease.release();
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.allocator = a;
-    compute.physical_execution_storage = null;
-    compute.physical_execution_cleanup = null;
-    compute.capturing_physical_storage = .{};
     defer compute.capturing_physical_storage.deinit(a);
-    compute.debug_cuda_graph_capture_active = false;
     const leases = [_]?*ops.physical_storage.Lease{lease};
     try physicalExecutionScopeOp(&compute, &leases);
     try std.testing.expectError(error.PhysicalExecutionScopeActive, physicalExecutionScopeOp(&compute, &leases));
@@ -40697,11 +40429,8 @@ test "CUDA physical capture scopes reject nesting and retain operand addresses" 
 }
 
 test "CUDA row snapshots use stable allocation and fail closed before capture device access" {
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.debug_cuda_graph_capture_active = true;
-    compute.debug_cuda_graph_capture_disabled = false;
     var shape = [_]i64{ 2, 2 };
     var input = CudaTensor{ .buffer = .{}, .dtype = .f32, .shape = &shape, .elem_count = 4, .owns_shape = false };
     const backend = ops.ComputeBackend{ .ptr = &compute, .vtable = &vtable };
@@ -40716,12 +40445,9 @@ test "CUDA planned auxiliary representations retain storage through publication 
     defer context.deinit(a);
     const lease = (try ops.physical_storage.Lease.create(a, context.computeBackend(), 16)).?;
     defer lease.release();
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.allocator = a;
     compute.debug_cuda_graph_capture_active = true;
-    compute.capturing_physical_storage = .{};
     var capture_live = true;
     defer if (capture_live) compute.capturing_physical_storage.deinit(a);
     const tensor = try a.create(CudaTensor);
@@ -40780,9 +40506,7 @@ test "CUDA owned output construction preserves caller resources on allocation fa
         fn run(a: std.mem.Allocator) !void {
             // Construction touches host ownership metadata only. Device buffers
             // remain caller-owned on failure and are never submitted here.
-            var compute: CudaCompute = undefined;
-            compute.ctx.observation.store(null, .release);
-            compute.ctx.observation_enable_failed.store(false, .release);
+            var compute = metadataOnlyTestCompute();
             compute.allocator = a;
             const shape = try a.dupe(i64, &.{ 2, 3 });
             defer a.free(shape);
@@ -40992,15 +40716,27 @@ test "CUDA ordinary projection owners release partial results without changing a
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, retained);
 }
 
+/// Metadata fixtures inherit every production lifecycle default, including new
+/// cache/catalog owners. Driver and kernel handles are deliberately unavailable;
+/// these fixtures cannot execute numerical work or use the full SDK destructor.
+fn metadataOnlyTestCompute() CudaCompute {
+    return .{
+        .allocator = std.testing.allocator,
+        .ctx = .{ .driver = undefined, .device = 0, .ctx = null, .stream = null, .info = .{} },
+        .kernels = undefined,
+    };
+}
+
 test "CUDA resident weight cache teardown respects borrowed storage without a driver" {
     const a = std.testing.allocator;
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.allocator = a;
-    compute.stats = .{};
     compute.resident_weights = .empty;
     defer deinitResidentWeights(&compute);
+    // Cache teardown also owns the host catalog, even with borrowed device
+    // storage. Its contents need not be observed before the catalog retires.
+    compute.lighton_norm_catalog = try a.alloc(CudaCompute.LightOnNormRecord, 1);
+    compute.lighton_norm_catalog_valid.store(true, .release);
     for ([_][]const u8{ "alias-a", "alias-b", "alias-c" }) |name| {
         const key = try a.dupe(u8, name);
         errdefer a.free(key);
@@ -41021,19 +40757,17 @@ test "CUDA resident weight cache teardown respects borrowed storage without a dr
     deinitResidentWeights(&compute);
     try std.testing.expectEqual(@as(usize, 0), compute.resident_weights.count());
     try std.testing.expectEqual(@as(usize, 0), compute.stats.device_free_calls);
+    try std.testing.expectEqual(@as(usize, 0), compute.lighton_norm_catalog.len);
+    try std.testing.expect(!compute.lighton_norm_catalog_valid.load(.acquire));
 }
 
 test "CUDA immutable resident eligibility follows metadata identity rather than allocation ownership" {
     const a = std.testing.allocator;
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.resident_weights = .empty;
     defer compute.resident_weights.deinit(a);
     compute.lighton_shared_recurrent_weights_enabled = true;
     compute.capability_profile = .lightonocr3;
-    compute.lazy_host_store = null;
-    compute.resident_training_cache = false;
     var shape = [_]i64{128};
     try compute.resident_weights.put(a, "checkpoint", .{
         .buffer = .{ .ptr = 4096, .len = 512 },
@@ -41121,12 +40855,9 @@ test "CUDA resident weight cache releases owners and preserves borrowed aliases"
 
 test "CUDA resident weight uploads consume keys on rejected types without a driver" {
     const a = std.testing.allocator;
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.allocator = a;
     compute.resident_weights = .empty;
-    compute.strict_f32_weights = false;
     compute.capability_profile = .embedding_gemma2;
     const invalid = tensor_mod.Tensor{ .data = &.{}, .dtype = .i32, .shape = &.{0}, .name = "", .allocator = a, .owns_data = false, .owns_shape = false };
     inline for (.{ CudaCompute.insertWeightFromTensor, CudaCompute.insertBf16WeightFromTensor, CudaCompute.insertF16WeightFromTensor, CudaCompute.insertBf16WeightFromF32Tensor }) |insert| {
@@ -46038,16 +45769,12 @@ test "CUDA dense attention preserves physical layouts against independent F64" {
 test "LightOn CUDA graph capability has no benchmark GPU allowlist and explains declines" {
     // Only policy fields are initialized: no driver or device allocation is
     // touched by eligibility. Actual graph execution is covered on CUDA.
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.lighton_decode_graph_enabled = true;
     compute.capability_profile = .lightonocr3;
     compute.ctx.info.compute_major = 8;
     compute.ctx.info.compute_minor = 0;
     compute.ctx.info.driver_version = 13000;
-    compute.lighton_bf16_decode_outputs = false;
-    compute.lighton_bf16_projection_outputs = false;
     compute.lighton_attention_enabled = true;
     compute.lighton_batched_kv_write_enabled = true;
     compute.lighton_recurrent_batch_enabled = true;
@@ -46089,9 +45816,7 @@ test "LightOn CUDA graph capability has no benchmark GPU allowlist and explains 
 }
 
 test "CUDA Laya portable warp eligibility depends on loaded symbol and shape" {
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.laya_optimizations = true;
     compute.kernels.laya_attention_warp_f32 = @ptrFromInt(1);
     try std.testing.expect(layaWarpEligible(&compute, 2, 512, 64));
@@ -46107,9 +45832,7 @@ test "CUDA Laya portable warp eligibility depends on loaded symbol and shape" {
 }
 
 test "CUDA vision automatic policy consumes resolved settings without a second environment gate" {
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.capability_profile = .lightonocr3;
     compute.lighton_fused_vision_qkv_enabled = true;
     compute.lighton_fused_vision_mlp_enabled = true;
@@ -46135,14 +45858,9 @@ test "CUDA vision automatic policy consumes resolved settings without a second e
 }
 
 test "LightOn BF16 vision capability includes the portable artifact driver contract" {
-    var compute: CudaCompute = undefined;
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
+    var compute = metadataOnlyTestCompute();
     compute.capability_profile = .lightonocr3;
     compute.lighton_precision = .bf16_vision;
-    compute.resident_training_cache = false;
-    compute.lazy_host_store = null;
-    compute.debug_cuda_graph_capture_active = false;
     compute.ctx.debug_graph_capture_active = false;
     compute.ctx.info.compute_major = 8;
     compute.ctx.info.compute_minor = 0;
@@ -47196,7 +46914,7 @@ test "CUDA prepared reduced projection metadata owns exact runtime workspace and
     const a = std.testing.allocator;
     const route = @import("../../execution/kernel_route.zig");
     const Shape = @import("ml").graph.Shape;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     var weight_dims = [_]i64{ 96, 64 };
     var weight = CudaTensor{ .buffer = .{ .ptr = 4096, .len = 96 * 64 * 2, .allocation_bytes = 96 * 64 * 2 }, .dtype = .bf16, .shape = &weight_dims, .elem_count = 96 * 64 };
@@ -47238,7 +46956,7 @@ test "CUDA prepared reduced projection metadata owns exact runtime workspace and
 
 test "CUDA prepared padded output rejects interior views and oversized slot claims without a device" {
     const a = std.testing.allocator;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     const Shape = @import("ml").graph.Shape;
     const route = @import("../../execution/kernel_route.zig");
@@ -47269,7 +46987,7 @@ test "CUDA prepared packed metadata declares Q4 and Q6 Q8_1 scratch and rejects 
     const a = std.testing.allocator;
     const route = @import("../../execution/kernel_route.zig");
     const Shape = @import("ml").graph.Shape;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     compute.tuned_route_gates.linear_q8_1_dp4a = true;
     compute.tuned_route_gates.q8_1_prefill_rows = true;
@@ -47611,9 +47329,9 @@ fn residentTensorOwnedBy(self: *CudaCompute, tensor: *const CudaTensor) bool {
 }
 
 test "CUDA resident execution accepts attached cache handles and rejects foreign or detached storage" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.ctx = .{ .driver = undefined, .device = 0, .ctx = @ptrFromInt(1), .stream = null, .info = .{} };
-    var foreign: CudaCompute = undefined;
+    var foreign = metadataOnlyTestCompute();
     foreign.ctx = compute.ctx; // The same primary context is not model authority.
     var retirement = CudaStorageRetirement{ .allocator = std.testing.allocator, .source_context = &compute.ctx, .provider = compute.ctx };
     var tensor = CudaTensor{ .buffer = .{ .ptr = 1, .len = 4 }, .dtype = .f32, .shape = @constCast(&[_]i64{1}), .elem_count = 1, .storage_retirement = &retirement };
@@ -47684,12 +47402,9 @@ fn retainResidentTensor(tensor: *CudaTensor) void {
 test "CUDA cache root promotion and retained handles unwind every metadata allocation failure" {
     const Case = struct {
         fn run(a: std.mem.Allocator) !void {
-            var compute: CudaCompute = undefined;
+            var compute = metadataOnlyTestCompute();
             compute.allocator = a;
-            compute.storage_retirement = null;
             defer closeStorageRetirement(&compute);
-            compute.stats = .{};
-            compute.a4b_runtime = null;
             compute.resident_weights = .empty;
             defer deinitResidentWeights(&compute);
             compute.lazy_device_epochs = .empty;
@@ -48411,10 +48126,7 @@ test "CUDA prepared host ingress submit event wait and cancellation faults retai
             Mock.submits = 0;
             Mock.frees = 0;
             Mock.stream_waits = 0;
-            var compute: CudaCompute = undefined;
-            compute.execution_scope = null;
-            compute.debug_cuda_graph_capture_active = false;
-            compute.stats = .{};
+            var compute = metadataOnlyTestCompute();
             compute.ctx.ctx = @ptrFromInt(16);
             compute.ctx.stream = @ptrFromInt(32);
             compute.ctx.stats = .{};
@@ -48508,7 +48220,7 @@ test "CUDA failed completion record drains attempted stream instead of accepting
     Mock.fail_drain = true;
     Mock.event_waits = 0;
     Mock.drained_stream = null;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.ctx.ctx = @ptrFromInt(16);
     compute.ctx.stream = @ptrFromInt(32);
     compute.ctx.stats = .{};
@@ -48533,7 +48245,7 @@ test "CUDA failed completion record drains attempted stream instead of accepting
 test "CUDA RMS direct route keeps live auxiliary policy invocation scoped" {
     const ml = @import("ml");
     const route = @import("../../execution/kernel_route.zig");
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     compute.cublaslt = null;
     compute.kernels.rms_norm_f32_bf16 = null;
@@ -48590,16 +48302,9 @@ test "CUDA failed physical bank free preserves device ledger serving quota shape
     for ([_]bool{ false, true }) |driver_failure| {
         Mock.fail_free = false;
         Mock.free_calls = 0;
-        var compute: CudaCompute = undefined;
+        var compute = metadataOnlyTestCompute();
         compute.allocator = a;
-        compute.stats = .{};
         compute.temp_buffer_mutex = .unlocked;
-        compute.temp_trace_seq = 0;
-        compute.resident_training_cache = false;
-        compute.runtime_policy = .{};
-        compute.temp_scan_profile = .{};
-        compute.deferred_device_frees = .empty;
-        compute.debug_cuda_graph_capture_active = false;
         compute.ctx.ctx = @ptrFromInt(16);
         compute.ctx.device_allocations = .{ .limit = 16 };
         compute.ctx.observation = .init(null);
@@ -48838,7 +48543,7 @@ test "CUDA assigned paths decline typed slice before provider access" {
     const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .slice = try ops.kernel_descriptor.Slice.init(&.{4}, &.{2}, &.{1}, &.{3}, &.{1}) }, .output_shape = Shape.init(.i64, &.{2}), .input_shapes = .{ Shape.init(.i64, &.{4}), undefined, undefined }, .input_count = 1, .alignment = 8 };
     // This real, addressable object remains intentionally uninitialized: these
     // metadata denials must never consult a provider or submit numerical work.
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     try std.testing.expect(!materializesOutputOp(&compute, &descriptor));
     try std.testing.expect(!try runAssignedKernelOp(&compute, .{ .descriptor = &descriptor, .inputs = &.{} }));
     try std.testing.expect((try prepareKernelRouteOp(&compute, .{ .allocator = std.testing.allocator, .descriptor = &descriptor, .inputs = &.{}, .output = .{ .node = 1, .allocation = 0, .epoch = 1, .logical = descriptor.output_shape, .writable_bytes = 16 } })) == null);
@@ -51551,7 +51256,7 @@ test "CUDA NCT convolution width validates padding stride and overflow before SD
 test "CUDA NCT convolution reuses direct 2D F32 schedule without copies and matches independent reference" {
     if (comptime !cuda_enabled) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.initInPlace(a) catch |err| switch (err) {
         error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
         else => return err,
@@ -51608,7 +51313,7 @@ test "CUDA NCT convolution reuses direct 2D F32 schedule without copies and matc
 test "CUDA dense seq2seq unmasked BSHD attention preserves F32 reference without reduced casts" {
     if (comptime !cuda_enabled) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.initInPlace(a) catch |err| switch (err) {
         error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
         else => return err,
@@ -52810,7 +52515,7 @@ test "CUDA prepared F32 vendor metadata preserves qualified workspace policy and
     const route = @import("../../execution/kernel_route.zig");
     const Shape = @import("ml").graph.Shape;
     inline for (.{ @as(usize, 3), @as(usize, 128) }) |rows| inline for (.{ false, true }) |with_bias| {
-        var compute: CudaCompute = undefined;
+        var compute = metadataOnlyTestCompute();
         initPreparedCudaMetadataFixture(&compute);
         compute.cublaslt_workspace_scratch = .{};
         var weight_dims = [_]i64{ 96, 64 };
@@ -52888,7 +52593,7 @@ test "CUDA prepared packed row leaf identity rejects symbol and live policy chan
     const a = std.testing.allocator;
     const route = @import("../../execution/kernel_route.zig");
     const Shape = @import("ml").graph.Shape;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     compute.tuned_route_gates.linear_q8_1_dp4a = true;
     compute.tuned_route_gates.q8_1_prefill_rows = true;
@@ -53100,7 +52805,7 @@ test "CUDA prepared packed recipes retain compatibility for unqualified dequant 
     const a = std.testing.allocator;
     const route = @import("../../execution/kernel_route.zig");
     const Shape = @import("ml").graph.Shape;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     compute.tuned_route_gates.q4_0_tc_hmma_prefill = true;
     compute.tuned_route_gates.q4_0_cublas_prefill = true;
@@ -53488,7 +53193,7 @@ test "CUDA stage snapshot metadata OOM preserves real source before SDK allocati
 }
 
 test "CUDA dense seq2seq policy refuses wrong owner before context and leaves default F32" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.capability_profile = .clipclap;
     try std.testing.expectError(error.UnsupportedCudaArchitecture, compute.configureSeq2seqPolicy(.{ .projections = .f16 }));
     const policy = @import("runtime_policy.zig").Policy{};
@@ -54729,7 +54434,7 @@ test "CUDA OCR cold metadata retries zero retention after pressure without SDK o
     // Precisely the former pressure-zero publication. An undefined numerical
     // endpoint proves this cold decision reads only immutable policy and the
     // short actual cache metadata owner; no stream or SDK may be consulted.
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.capability_profile = .lightonocr3;
     compute.runtime_policy = .{ .temp_cache_mb = 1 };
     compute.constant_metadata_mutex = .unlocked;
@@ -55108,7 +54813,7 @@ test "CUDA cold OCR cache target certifies both actual profiles and vetoes copie
     const Target = @import("../../backends/cold_compute_target.zig").Target;
     // This is only immutable target/metadata certification: no SDK endpoint,
     // stream, resident catalog, quota, allocator or mutable weight is touched.
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.ctx.ctx = @ptrFromInt(0x1000);
     compute.ctx.device = 0;
     var target: Target = .{ .cuda = .{ .implementation_context = &compute, .implementation_table = @ptrCast(&vtable), .primary_context = compute.ctx.ctx.?, .device = 0 } };
@@ -56746,8 +56451,8 @@ test "CUDA reserved paged read rejects copied foreign hooks and invalid runtime 
     defer storage.device_write_hook = null; // synthetic hooks never own SDK state
     var shape = [_]i64{ 1, 32 };
     var query = CudaTensor{ .buffer = .{ .ptr = 1, .len = 128 }, .dtype = .f32, .shape = &shape, .elem_count = 32, .owns_buffer = false, .owns_shape = false };
-    var expected: CudaCompute = undefined;
-    var foreign: CudaCompute = undefined;
+    var expected = metadataOnlyTestCompute();
+    var foreign = metadataOnlyTestCompute();
     const attention = ops.AttentionContext{ .mode = .paged_decode, .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1, .kv_storage = &storage, .kv_cache = .{ .sequence_id = 1, .pool_id = 0, .logical_block_count = 1, .tail_tokens = 1, .logical_blocks = &.{0}, .kv_storage = &storage } };
     var paged = kv_storage_runtime.DevicePagedKvLayer{ .runtime = @ptrFromInt(1), .slot = 0, .format = cuda_kv_format_f16, .token_count = 1, .key_row_bytes = 64, .base_key_row_bytes = 64, .v_row_stride = 64, .page_size_tokens = 16, .position_offset = 0 };
     var copied = CudaKvDeviceStorage.hook_vtable;
@@ -57177,10 +56882,9 @@ test "CUDA optional recurrent prefill actual DSO cold geometry funds real retain
 
 test "CUDA image cold recipe shares exact checked producer geometry and follows rotating source index before SDK" {
     const CacheFunding = @import("prepared_cache.zig");
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.capability_profile = .embedding_gemma2;
     compute.ctx.info.compute_major = 8;
-    compute.embedding_gemma2_resize = .{};
     const request: ops.EmbeddingImageCacheRequest = .{ .width = 17, .height = 9, .stride = 64, .source_capacity = 563, .target_width = 48, .target_height = 48 };
     const layout = (try compute.imageCacheLayout(request)).?;
     try std.testing.expectEqual(@as(usize, 563), layout.source_bytes);
@@ -57215,8 +56919,7 @@ test "CUDA image cold recipe shares exact checked producer geometry and follows 
 test "CUDA audio learning cache state uses actual warm no-plan eligibility and only exact host metadata class" {
     const CacheFunding = @import("prepared_cache.zig");
     const plan_mod = @import("audio_execution_plan.zig");
-    var compute: CudaCompute = undefined;
-    compute.audio_plans = .{};
+    var compute = metadataOnlyTestCompute();
     const request: CacheFunding.Request = .{ .audio_learning = .{ .key = 71 } };
     try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
     compute.audio_plans.entries[0] = .{ .key = 71, .stamp = 1 };
@@ -57372,8 +57075,7 @@ test "CUDA warm raw frontend five owners upgrade exact SDK addresses at full cap
 
 test "CUDA chronological cold arena snapshot reserves later hot-shape birth and both actual full partial keys" {
     const CacheFunding = @import("prepared_cache.zig");
-    var compute: CudaCompute = undefined;
-    compute.embedding_gemma2_execution = .{};
+    var compute = metadataOnlyTestCompute();
     var requests: [2]CacheFunding.Request = undefined;
     var builder = CacheFunding.Builder{ .storage = &requests };
     const full: CacheFunding.Request = .{ .arena = .{ .kind = .vision, .batch = 4, .sequence = 16, .grid_x = 4, .grid_y = 4, .sizes = .{ 1024, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
@@ -57438,9 +57140,8 @@ test "CUDA combined video recipe keeps decoder mandatory and exact chronological
 }
 
 test "CUDA vision arena qualification shares actual entry availability without touching unavailable receiver SDK" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.capability_profile = .embedding_gemma2;
-    compute.cublaslt = null;
     try std.testing.expect(!compute.visionExecutionAvailable());
     // The original entry's first profile veto precedes all other state reads.
     compute.capability_profile = .lightonocr3;
@@ -57449,11 +57150,10 @@ test "CUDA vision arena qualification shares actual entry availability without t
 
 test "CUDA audio depthwise cold inventory validates actual floating source layout and exact twelve immutable keys" {
     const Cache = @import("prepared_cache.zig");
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.resident_weights = .empty;
     defer compute.resident_weights.deinit(std.testing.allocator);
     compute.capability_profile = .embedding_gemma2;
-    compute.embedding_gemma2_policy = .{};
     var recipe = std.mem.zeroes(Cache.AudioRecipe);
     recipe.count = 2;
     recipe.frames[0] = 99;
@@ -57520,9 +57220,7 @@ test "CUDA audio depthwise cold inventory validates actual floating source layou
 }
 
 test "cooperative decode batches preserve quantized routing without changing prefill mirrors" {
-    var compute: CudaCompute = undefined;
-    compute.cooperative_decode_rows = 0;
-    compute.cooperative_owner = .{};
+    var compute = metadataOnlyTestCompute();
     compute.cooperative_owner.last_owner = 7;
     compute.bf16_mirror_row_selector = .production;
     var weight: CudaTensor = undefined;
@@ -57541,8 +57239,7 @@ test "cooperative decode batches preserve quantized routing without changing pre
 test "cooperative decode batches require the qualified quantized head and honor weight tying" {
     const a = std.testing.allocator;
     var shape = [_]i64{ 1, 32 };
-    var compute: CudaCompute = undefined;
-    compute.resident_weights = .{};
+    var compute = metadataOnlyTestCompute();
     defer compute.resident_weights.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), compute.cooperativeDecodeBatchRows(true));
     compute.tuned_route_gates = .{};
@@ -57600,7 +57297,7 @@ test "CUDA allocation Model close refuses ordinary failed resident free until ex
     Mock.fail = true;
     Mock.physical_deaths = 0;
     Mock.primary_releases = 0;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.ctx = .{ .driver = undefined, .ctx = @ptrFromInt(0x8899), .stream = null, .device = 0, .info = .{} };
     compute.ctx.driver.fns.cuCtxSetCurrent = Mock.current;
     compute.ctx.driver.fns.cuMemAlloc = Mock.alloc;
@@ -57675,12 +57372,10 @@ test "CUDA physical replay retains actual planned address owners across checked 
     defer backend.deinit(a);
     const lease = (try ops.physical_storage.Lease.create(a, backend.computeBackend(), 16)) orelse return error.MissingActualPhysicalStorage;
     defer lease.release();
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.allocator = a;
     compute.ctx.ctx = @ptrFromInt(1);
     compute.ctx.stream = @ptrFromInt(2);
-    compute.ctx.observation.store(null, .release);
-    compute.ctx.observation_enable_failed.store(false, .release);
     compute.ctx.stats = .{};
     compute.ctx.driver.fns.cuCtxSetCurrent = Mock.current;
     compute.ctx.driver.fns.cuStreamSynchronize = Mock.sync;
@@ -57728,9 +57423,7 @@ test "CUDA physical scope borrows exact live B and clears on end while refusing 
     defer epoch.release();
     const current = CacheCleanup{ .boundary = &epoch };
     const foreign = CacheCleanup{ .boundary = &epoch };
-    var compute: CudaCompute = undefined;
-    compute.physical_execution_storage = null;
-    compute.physical_execution_cleanup = null;
+    var compute = metadataOnlyTestCompute();
     const backend = ops.ComputeBackend{ .ptr = &compute, .vtable = &vtable };
     const storages = [_]?*ops.physical_storage.Lease{};
     var copied = vtable;
@@ -57797,18 +57490,13 @@ test "CUDA allocation debug graph update failures retain old executable and actu
         Mock.fail_sync = false;
         Mock.fail_destroy = false;
         Mock.deaths = 0;
-        var compute: CudaCompute = undefined;
+        var compute = metadataOnlyTestCompute();
         compute.allocator = a;
-        compute.stats = .{};
-        compute.physical_execution_storage = null;
-        compute.physical_execution_cleanup = null;
         compute.debug_cuda_graph_slots = @splat(.{});
         compute.ctx.ctx = @ptrFromInt(1);
         compute.ctx.stream = @ptrFromInt(2);
         compute.ctx.stats = .{};
         compute.ctx.debug_graph_capture_active = false;
-        compute.ctx.observation.store(null, .release);
-        compute.ctx.observation_enable_failed.store(false, .release);
         compute.ctx.driver.fns.cuCtxSetCurrent = Mock.current;
         compute.ctx.driver.fns.cuStreamSynchronize = Mock.sync;
         compute.ctx.driver.fns.cuGraphExecDestroy = Mock.destroy;
@@ -58018,9 +57706,8 @@ test "CUDA KV explicit cleanup retires actual prepared captured lease outside ph
     const bank = (try ops.physical_storage.Lease.createAdmitted(a, endpoint.computeBackend(), 64, null, .activation, prepared.Prepared.forDispatch(plan, cap.identity))).?;
     var bank_live = true;
     defer if (bank_live) bank.releaseWithBoundary(&old);
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.allocator = a;
-    compute.physical_execution_storage = null;
     compute.physical_execution_cleanup = null; // actual Frame scope has ended
     compute.debug_cuda_graph_capture_active = false;
     compute.debug_cuda_graph_slots = @splat(.{});
@@ -58318,7 +58005,7 @@ test "CUDA batched dot owned route legality rejects changed geometry precision t
     const rhs = try builder.parameter("rhs", ml.graph.Shape.init(.f32, &.{ 2, 5, 4 }));
     const product = try builder.matmul3D(lhs, rhs);
     const descriptor = ops.kernel_descriptor.lower(&graph, product) orelse return error.MissingBatchedDotDescriptor;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     compute.kernels.primitive_batched_dot_f32 = @ptrFromInt(16);
     try std.testing.expect(primitiveCudaDotRouteSupported(&compute, &descriptor));
@@ -58352,7 +58039,7 @@ test "CUDA primitive matrix route keeps vendor geometry and live training policy
     const rhs = try builder.parameter("rhs", ml.graph.Shape.init(.f32, &.{ 5, 4 }));
     const product = try builder.matmul2DLayout(lhs, rhs, true, false);
     const descriptor = ops.kernel_descriptor.lower(&graph, product) orelse return error.MissingBatchedDotDescriptor;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     compute.kernels.primitive_batched_dot_f32 = @ptrFromInt(16);
     try std.testing.expect(primitiveCudaDotRouteSupported(&compute, &descriptor));
@@ -58385,7 +58072,7 @@ test "CUDA ordinary matrix transpose recipe validates mutable input geometry pol
             const rhs = try builder.parameter("rhs", ml.graph.Shape.init(.f32, &.{ 64, 96 }));
             const node = try builder.matmul2DLayout(lhs, rhs, false, false);
             const descriptor = ops.kernel_descriptor.lower(&graph, node) orelse return error.MissingOrdinaryMatrixDescriptor;
-            var compute: CudaCompute = undefined;
+            var compute = metadataOnlyTestCompute();
             initPreparedCudaMetadataFixture(&compute);
             compute.strict_f32_weights = false;
             compute.kernels.primitive_transpose_f32 = @ptrFromInt(16);
@@ -58433,7 +58120,7 @@ test "CUDA rounded projection declares reduced output separately and refuses col
     const a = std.testing.allocator;
     const route = @import("../../execution/kernel_route.zig");
     const Shape = @import("ml").graph.Shape;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     compute.lighton_bf16_decode_outputs = true;
     var dimensions = [_]i64{ 96, 64 };
@@ -58522,7 +58209,7 @@ test "CUDA planned mirror alignment is canonical allocator metadata and rejects 
     const Shape = @import("ml").graph.Shape;
     const ownership = @import("../../execution/storage_ownership.zig");
     const route = @import("../../execution/kernel_route.zig");
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     const backend = compute.computeBackend();
     try std.testing.expectEqual(@as(u32, buffer_mod.DeviceBuffer.allocation_alignment), try ops.physical_storage.minimumAlignment(backend));
@@ -58559,7 +58246,7 @@ test "CUDA RMSNorm ownership attests only its exact live Direct family and bound
     const Shape = @import("ml").graph.Shape;
     const route = @import("../../execution/kernel_route.zig");
     const direct = @import("../../execution/assigned_kernel_route.zig");
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     const cb = compute.computeBackend();
     const logical = Shape.init(.f32, &.{ 3, 64 });
@@ -58750,13 +58437,9 @@ test "CUDA ordinary F32 paged batch writes parent spans without child allocation
 }
 
 test "CUDA dense decoder readiness preserves F32 policy and exact attention scratch schedule" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.capability_profile = .transformer_seq2seq;
-    compute.runtime_policy = .{};
-    compute.training_blas = null;
-    compute.resident_training_cache = false;
     compute.dispatch_stats.enabled = false;
-    compute.debug_cuda_graph_capture_active = false;
     compute.ctx.debug_graph_capture_active = false;
     compute.kernels = .{};
     compute.kernels.attention_f32 = @ptrFromInt(16);
@@ -58795,13 +58478,9 @@ test "CUDA dense decoder readiness preserves F32 policy and exact attention scra
 }
 
 test "CUDA cross projection queries reject bad bias and destination aliases before eager writes" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.capability_profile = .transformer_seq2seq;
-    compute.runtime_policy = .{};
-    compute.training_blas = null;
-    compute.resident_training_cache = false;
     compute.dispatch_stats.enabled = false;
-    compute.debug_cuda_graph_capture_active = false;
     compute.ctx.debug_graph_capture_active = false;
     compute.ctx.info.compute_major = 0;
     compute.kernels = .{};
@@ -58889,8 +58568,7 @@ test "CUDA profile failures remain visible after a later successful collection" 
             return driver_mod.CUDA_SUCCESS;
         }
     };
-    var compute: CudaCompute = undefined;
-    compute.stats = .{};
+    var compute = metadataOnlyTestCompute();
     compute.ctx.ctx = null; // First drain fails before any SDK callback.
     compute.ctx.stats = .{};
     compute.ctx.observation = .init(null);
@@ -58957,8 +58635,7 @@ test "CUDA profile failures remain visible after a later successful collection" 
 }
 
 test "CUDA operation profile categories preserve literal decode and prefill mapping" {
-    var compute: CudaCompute = undefined;
-    compute.stats = .{};
+    var compute = metadataOnlyTestCompute();
     noteDecodeProfileUs(&compute, .bf16_projection, 11);
     noteDecodeProfileUs(&compute, .ffn_block, 13);
     noteDecodeProfileUs(&compute, .recurrent_core, 17);
@@ -58994,16 +58671,12 @@ test "CUDA owned Reader profile checks actual funding roots and live epoch witho
     var roots = try CudaCompute.CapturedCacheRoots.init(&.{}, &.{});
     const other_roots = try CudaCompute.CapturedCacheRoots.init(&.{}, &.{});
     var budget = run_memory.RunBudget.init(.{});
-    var compute: CudaCompute = undefined;
-    compute.shared_operation_owner = null;
+    var compute = metadataOnlyTestCompute();
     compute.capability_profile = .lightonocr3;
     compute.run_budget = &budget;
     compute.captured_cache_roots = &roots;
     compute.ctx.prepared_cache_funding = &funding;
-    compute.execution_scope = null;
-    compute.audio_execution_active = false;
     compute.lighton_burst_readback.busy = false;
-    compute.debug_cuda_graph_capture_active = false;
     compute.ctx.debug_graph_capture_active = false;
     const cb = compute.computeBackend();
     try CudaCompute.validateOwnedReaderProfileSnapshot(&cb, &compute, &funding, &roots, &epoch);
@@ -59421,7 +59094,7 @@ test "CUDA declared physical banks reject oversized deferred owners while ordina
 test "CUDA encoder cold arena capacities preserve physical reuse across original logical signatures" {
     // Pure constructor metadata only: no driver, SDK allocation or real device
     // is attested. Every field read by the geometry recipe is initialized.
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.ctx.info = .{ .compute_major = 12, .compute_minor = 1, .multiprocessor_count = 17 };
     compute.embedding_gemma2_policy = .{ .graph_replay = true };
     var config = std.mem.zeroes(embedding_gemma2_model.Config);
@@ -59541,7 +59214,7 @@ test "CUDA packed BF16 pair slices preserve raw signaling NaNs and odd row offse
 test "vision source matmul cold request funds exact disjoint workspace and keeps fallback layout" {
     // Actual pure producer; every field it reads is initialized. No SDK call,
     // opaque backend receiver or numerical dispatch occurs in this control.
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.embedding_gemma2_policy = .{ .matmul_arithmetic = .full_f32 };
     compute.ctx.info.compute_major = 12;
     const old = try compute.visionArenaRequest(1, 30, 30, false);
@@ -59578,7 +59251,7 @@ test "vision source matmul cold request funds exact disjoint workspace and keeps
 }
 
 test "CUDA BF16 storage rounding validates tensor geometry before allocation" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     var shape = [_]i64{ 2, -1 };
     var input: CudaTensor = .{ .buffer = .{ .ptr = 0x1000, .len = 16 }, .dtype = .f32, .shape = &shape, .elem_count = 4 };
     try std.testing.expectError(error.InvalidShape, roundBf16F32Op(&compute, &input));
@@ -59649,7 +59322,7 @@ test "source reduction capacity is cold queried and never fabricated from defaul
 }
 
 test "source BF16 linear validates complete source storage before allocation and SDK receiver" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     const bad: CT = @ptrFromInt(16);
     try std.testing.expectError(error.InvalidShape, sourceLinear(&compute, .{
         .input = bad,
@@ -59728,9 +59401,7 @@ test "source BF16 linear validates complete source storage before allocation and
 test "source linear bank metadata reuses only its audio owner or exact captured lifetime" {
     const Layout = @import("libraries.zig").Bf16GemmProgram.TemporaryLayout;
     const layout = try Layout.resolve(25, 1024, 4096, false, false, 32 * 1024 * 1024);
-    var compute: CudaCompute = undefined;
-    compute.execution_scope = null;
-    compute.debug_cuda_graph_capture_active = false;
+    var compute = metadataOnlyTestCompute();
     compute.ctx.debug_graph_capture_active = false;
     compute.source_linear_scratch = .{ .active = true, .buffer = .{ .ptr = 0x1000, .len = layout.bytes } };
     for (0..2) |_| {
@@ -59767,7 +59438,7 @@ test "source linear bank metadata reuses only its audio owner or exact captured 
 test "source linear arena precondition refuses retained ordinary storage before any opaque CUDA access" {
     const plan_mod = @import("audio_execution_plan.zig");
     var scope = plan_mod.Scope{ .plan = undefined, .base = 0x8000 };
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.execution_scope = &scope;
     compute.source_linear_scratch = .{ .active = true, .buffer = .{ .ptr = 16, .len = 256 } };
     try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, false));
@@ -59844,7 +59515,7 @@ test "public source audio linear recreates input bank through actual learning ca
 }
 
 test "source GEMM row descriptors reject missing physical input before opaque CUDA access" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     var input: CudaTensor = .{ .buffer = .{ .ptr = 16, .len = 16 }, .dtype = .f32, .shape = @constCast(&[_]i64{ 2, 2 }), .elem_count = 4, .owns_buffer = false, .owns_shape = false };
     var weight: CudaTensor = undefined;
     try std.testing.expectError(error.InvalidShape, sourceLinear(&compute, .{ .input = &input, .weight = &weight, .rows = 2, .source_rows = 3, .width = 2, .columns = 2 }));
@@ -59930,9 +59601,8 @@ test "CUDA source image plane preserves real padding and independent valid row p
 }
 
 test "source vision cold geometry preserves legacy phase without actual Lt program" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.capability_profile = .embedding_gemma2;
-    compute.cublaslt = null;
     const cb = compute.computeBackend();
     // Context/SDK fields remain undefined: absence must select legacy before IO.
     try std.testing.expectEqual(ops.SourceVisionGeometry.legacy_dense, try cb.sourceVisionGeometry());
@@ -59959,8 +59629,7 @@ test "source vision cold geometry preserves legacy phase without actual Lt progr
 }
 
 test "source local relative attention validates geometry and library before opaque CUDA ownership" {
-    var compute: CudaCompute = undefined;
-    compute.bf16_blas = null;
+    var compute = metadataOnlyTestCompute();
     var params = ops.Gemma4AudioLocalAttentionParams{ .arithmetic = .independent_f32, .publication = .bf16_values_f32, .rows = 0, .hidden = 6, .heads = 2, .head_dim = 3, .chunk = 4, .context_left = 3, .context = 6, .k_scale = 1, .logit_cap = 50, .invalid_value = -1e9 };
     try std.testing.expectError(error.InvalidShape, sourceLocalRelativeAttention(&compute, undefined, undefined, undefined, undefined, undefined, undefined, params));
     params.rows = 3;
@@ -59969,9 +59638,7 @@ test "source local relative attention validates geometry and library before opaq
 
 test "source local relative temporary follows the actual learned and captured bank lifetime" {
     const layout = try @import("local_relative_source.zig").Plan.resolve(36, 8, 128, 12, 24, 13);
-    var compute: CudaCompute = undefined;
-    compute.execution_scope = null;
-    compute.debug_cuda_graph_capture_active = false;
+    var compute = metadataOnlyTestCompute();
     compute.ctx.debug_graph_capture_active = false;
     compute.source_linear_scratch = .{ .active = true, .buffer = .{ .ptr = 0x1000, .len = layout.bytes } };
     {
@@ -59999,11 +59666,8 @@ test "source local relative temporary follows the actual learned and captured ba
 }
 
 test "actual source capture without a planned arena rejects before allocation or SDK use" {
-    var compute: CudaCompute = undefined;
-    compute.execution_scope = null;
-    compute.debug_cuda_graph_capture_active = false;
+    var compute = metadataOnlyTestCompute();
     compute.ctx.debug_graph_capture_active = false;
-    compute.stats = .{};
     // Driver and allocator deliberately remain undefined: neither may be used.
     try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, true));
     try std.testing.expectEqual(@as(u64, 0), compute.stats.device_alloc_calls);
@@ -60025,15 +59689,12 @@ test "source local relative actual external capture rejects before module or out
         }
     };
     Fake.queries = 0;
-    var compute: CudaCompute = undefined;
-    compute.execution_scope = null;
-    compute.debug_cuda_graph_capture_active = false;
+    var compute = metadataOnlyTestCompute();
     compute.ctx.debug_graph_capture_active = false;
     compute.ctx.ctx = @ptrFromInt(16);
     compute.ctx.stream = null;
     compute.ctx.driver.fns.cuCtxSetCurrent = Fake.current;
     compute.ctx.driver.fns.cuStreamIsCapturing = Fake.capture;
-    compute.stats = .{};
     compute.bf16_blas = @as(@import("libraries.zig").Cublas, undefined);
     compute.bf16_blas.?.library.fns.setWorkspace = Fake.workspace;
     var shape = [_]i64{ 3, 6 };
@@ -60084,11 +59745,9 @@ test "source local relative actual external capture rejects before module or out
 }
 
 test "CUDA source audio cold metadata requires retained convolution without probing SDK" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.bf16_blas = @as(@import("libraries.zig").Cublas, undefined);
     compute.cublaslt = @as(cublaslt_mod.CublasLt, undefined);
-    compute.embedding_gemma2_policy = .{};
-    compute.vendor_convolution = null;
     // A poisoned context makes any SDK/allocator access invalid. Missing
     // optional convolution selects the owned full-F32 route before submission.
     try std.testing.expectEqual(ops.SourceScalarStorage.full_f32, sourceScalarStorageOp(&compute, .audio));
@@ -60101,7 +59760,7 @@ test "CUDA source audio cold metadata requires retained convolution without prob
 }
 
 test "efficient prefix vision capture preflight precedes weights allocation and provider access" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.capability_profile = .embedding_gemma2;
     compute.cublaslt = @as(@import("cublaslt.zig").CublasLt, undefined);
     compute.ctx.info.compute_major = 8;
@@ -60122,11 +59781,10 @@ test "efficient prefix vision capture preflight precedes weights allocation and 
 }
 
 test "efficient prefix source vision funds only the selected arena workspace" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.ctx.info.compute_major = 8;
     compute.ctx.info.compute_minor = 0;
     compute.runtime_policy.workspace_bytes = 32 * 1024 * 1024;
-    compute.embedding_gemma2_policy = .{};
     const vendor = try compute.visionSourceArenaRequest(1, 60, 39, 2520, true);
     try std.testing.expectEqual(@as(usize, 219348992), vendor.arena.sizes[10]);
     compute.embedding_gemma2_policy.prefix_rf_q64_k64 = true;
@@ -60164,12 +59822,11 @@ test "source bias workspace is a bounded borrowed view without owner transfer" {
 }
 
 test "source bias workspace policy isolates audio warm and arena plan identities" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.embedding_gemma2_policy = .{ .audio_graph = true };
     compute.embedding_gemma2_execution.weight_generation = 7;
     compute.embedding_gemma2_constant_generation = 11;
     compute.cublaslt_workspace_scratch.buffer.ptr = 0x100000;
-    compute.audio_plans = .{};
     const shape = [_]i64{ 1, 25, 1024 };
     const inputs = [_]CudaCompute.AudioCacheInput{.{ .shape = &shape, .elements = 25 * 1024 }};
     // Context/driver/allocator remain poisoned: cache metadata has no SDK work.
@@ -60193,10 +59850,9 @@ test "GLiDE CUDA weight upload consumes keys on early allocation failure" {
     var tensor = try tensor_mod.Tensor.initFloat32(a, "norm.weight", &.{2}, &.{ 1, 1 });
     defer tensor.deinit();
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.allocator = failing.allocator();
     compute.resident_weights = .empty;
-    compute.lighton_norm_catalog_published = false;
     compute.glide_cuda = true;
     // Key allocation succeeds; shape allocation fails before any CUDA access.
     const key = try compute.allocator.dupe(u8, "norm.weight");
@@ -60681,8 +60337,7 @@ test "GLiDE CUDA grouped attention matches dense oracle and rejects invalid work
 }
 
 test "admitted BF16 singleton mirrors bypass quantized fused gate-up before submission" {
-    var compute: CudaCompute = undefined;
-    compute.cooperative_decode_rows = 0;
+    var compute = metadataOnlyTestCompute();
     compute.bf16_mirror_row_selector = .{ .diagnostic_min_rows = 1 };
     var input_shape = [_]i64{ 1, 32 };
     var weight_shape = [_]i64{ 32, 32 };
@@ -61039,7 +60694,7 @@ test "CUDA replay retains packed model weights across lookup relocation without 
 }
 
 test "CUDA borrowed quantized metadata preserves logical shape without physical ownership" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     var shape = [_]i64{ 32, 32 };
     var borrowed = CudaTensor{ .buffer = .{ .ptr = 65536, .len = 576, .borrowed = true }, .dtype = .u8, .shape = &shape, .elem_count = 1024, .quant_type = .{ .known = .Q4_0 }, .owns_buffer = false };
@@ -61307,7 +60962,7 @@ test "CUDA replay retains dense pointwise output facts without fabricating unkno
     const a = std.testing.allocator;
     const route = @import("../../execution/kernel_route.zig");
     const Shape = @import("ml").graph.Shape;
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     initPreparedCudaMetadataFixture(&compute);
     const shape = Shape.init(.f32, &.{ 2, 2 });
     const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .binary = .add }, .input_count = 2, .input_shapes = .{ shape, shape, undefined }, .output_shape = shape };
@@ -61328,8 +60983,7 @@ test "CUDA replay retains dense pointwise output facts without fabricating unkno
 test "CUDA replay retains exact GELU fallback before fused gate source access" {
     const placeholder: CT = @ptrFromInt(8);
     try std.testing.expect((try linearNoBiasPairActivationQ4_0(@ptrFromInt(8), placeholder, placeholder, placeholder, 1, 32, 32, .gelu_exact)) == null);
-    var compute: CudaCompute = undefined;
-    compute.stats = .{};
+    var compute = metadataOnlyTestCompute();
     var request: ops.RunGatedFfnResidualRequest = undefined;
     request.activation = .gelu_exact;
     try std.testing.expect((try runGatedFfnResidualOp(&compute, &request)) == null);
@@ -61433,7 +61087,7 @@ test "CUDA replay retains head normalization rotary schedule with current input 
 }
 
 test "CUDA borrowed quantized metadata pair mirrors distinguish the second source and geometry" {
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.bf16_pair_mirror_cache = .empty;
     defer compute.bf16_pair_mirror_cache.deinit(std.testing.allocator);
     const key = Bf16PairMirrorKey{ .gate = 4096, .up = 8192, .rows = 32, .columns = 64 };
@@ -61454,8 +61108,7 @@ test "CUDA replay retains complete gated BF16 down programs with phase reused sc
 }
 
 test "CUDA borrowed quantized metadata native prefill requirement declines before model or SDK work" {
-    var compute: CudaCompute = undefined;
-    compute.gemma4_native_plan = null;
+    var compute = metadataOnlyTestCompute();
     const cb = ops.ComputeBackend{ .ptr = &compute, .vtable = &vtable };
     const config = gpt_model.Config{ .family = .llama, .hidden_size = 4, .num_attention_heads = 1, .num_key_value_heads = 1, .attention_head_dim = 4, .num_hidden_layers = 1, .intermediate_size = 8, .vocab_size = 8, .max_position_embeddings = 16, .norm_type = .rms_norm, .activation = .silu, .position_encoding = .rope };
     const dc = gpt_arch.DecodeContext{ .attention_mode = .paged_prefill, .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2 };
@@ -62484,7 +62137,7 @@ test "CUDA encoder automatic policy funds the same physical cache as its resolve
     const CacheFunding = @import("prepared_cache.zig");
     if (!cuda_artifact.hasBf16WmmaCodeFor(8, 9)) return error.SkipZigTest;
     // Pure metadata: initialize exactly the fields inspected by this recipe.
-    var compute: CudaCompute = undefined;
+    var compute = metadataOnlyTestCompute();
     compute.ctx.info = .{ .compute_major = 8, .compute_minor = 9, .multiprocessor_count = 58, .name_len = 9 };
     @memcpy(compute.ctx.info.name[0..9], "NVIDIA L4");
     compute.cublaslt = @as(cublaslt_mod.CublasLt, undefined);
@@ -62530,7 +62183,7 @@ test "CUDA model constant retirement preserves physical dtype byte accounting" {
         }
     };
     for ([_]tensor_mod.DType{ .f32, .f16, .bf16 }) |dtype| {
-        var compute: CudaCompute = undefined;
+        var compute = metadataOnlyTestCompute();
         compute.ctx = .{ .driver = undefined, .ctx = @ptrFromInt(1), .stream = null, .device = 0, .info = .{} };
         compute.ctx.driver.fns.cuCtxSetCurrent = Mock.current;
         compute.ctx.driver.fns.cuMemAlloc = Mock.alloc;

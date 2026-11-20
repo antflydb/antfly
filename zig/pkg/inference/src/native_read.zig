@@ -681,18 +681,16 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
-    session_manager.preferred_backends = switch (choice) {
-        .xla => &.{backends.BackendType.pjrt},
-        .auto => if (build_options.enable_cuda)
-            &.{ backends.BackendType.cuda, backends.BackendType.native }
-        else if (build_options.enable_metal)
-            &.{ backends.BackendType.metal, backends.BackendType.native }
-        else
-            &.{backends.BackendType.native},
-        .native => &.{backends.BackendType.native},
-        .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-        .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
-    };
+    if (choice != .auto) {
+        @import("native_backend_choice.zig").configureDirectSession(session_manager, @import("native_backend_choice.zig").parse(@tagName(choice)).?);
+        return;
+    }
+    session_manager.preferred_backends = if (build_options.enable_cuda)
+        &.{ backends.BackendType.cuda, backends.BackendType.native }
+    else if (build_options.enable_metal)
+        &.{ backends.BackendType.metal, backends.BackendType.native }
+    else
+        &.{backends.BackendType.native};
 }
 
 fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
@@ -863,4 +861,15 @@ test "task CLI accepts explicit PJRT device precision and memory policy" {
     try std.testing.expect(policy.memory_policy.? == .cuda);
     try std.testing.expectEqual(@as(usize, 1024), policy.memory_policy.?.cuda.capacity_bytes);
     try std.testing.expectEqual(BackendChoice.xla, parseBackendChoice("pjrt").?);
+}
+
+test "task direct legacy reader honors explicit placement over inherited policy" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    manager.required_backend = .pjrt;
+    manager.required_backend_invalid = true;
+    configureBackendPreference(&manager, .native);
+    var storage: [1]backends.BackendType = undefined;
+    const order = try manager.requiredBackendCandidates(&.{.pjrt}, &storage);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.native}, order);
+    try std.testing.expect(!manager.required_backend_invalid);
 }

@@ -10,9 +10,28 @@ const Fixture = struct {
     kind: Kind,
     bf16_probability: bool = false,
     weights: @import("../ops/native_compute.zig").WeightStore,
+    metal_weights: if (@import("build_options").enable_metal) ?@import("../ops/gpu_hosted_store.zig").WeightStore else void = if (@import("build_options").enable_metal) null else {},
     fn create(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!ops.ComputeBackend {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return @import("../backends/compute_factory.zig").createNative(allocator, &self.weights, null, null, .{});
+    }
+    fn createMetal(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!ops.ComputeBackend {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        // This target qualifies weightless attention; learned-weight fixtures
+        // retain their existing native source and independent CPU reference.
+        if (self.weights.resident_weights.count() != 0) return error.UnsupportedOperation;
+        if (self.metal_weights == null) self.metal_weights = .{ .allocator = allocator, .prefix = "", .lazy_weights = .empty };
+        return @import("../backends/compute_factory.zig").createMetal(allocator, &self.metal_weights.?, null, std.testing.io, .{}, .{ .require_f32_linears = true });
+    }
+    fn importMetal(_: *anyopaque, cb: *const ops.ComputeBackend, input: *const Tensor, _: std.mem.Allocator) anyerror!ops.CT {
+        // Floating-point uploads use the ordinary provider API; the optional
+        // constant-byte hook provides exact integer storage without conversion.
+        if (input.dtype == .f32) return tensor(cb, input.*);
+        const dtype: ops.GraphDType = switch (input.dtype) {
+            .i64 => .i64,
+            else => return error.UnsupportedTensorType,
+        };
+        return (try cb.fromConstantBytes(input.data, dtype, input.shape)) orelse error.UnsupportedTensorType;
     }
     fn import(_: *anyopaque, cb: *const ops.ComputeBackend, input: *const Tensor, _: std.mem.Allocator) anyerror!ops.CT {
         const native: *@import("../ops/native_compute.zig").NativeCompute = @ptrCast(@alignCast(cb.ptr));
@@ -141,15 +160,23 @@ fn qualifyWithPrecision(kind: Kind, precision: @import("precision.zig").Policy) 
     return qualifyProfile(kind, precision, false);
 }
 fn qualifyProfile(kind: Kind, precision: @import("precision.zig").Policy, bf16_probability: bool) !void {
-    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    return qualifyTarget(kind, precision, bf16_probability, .pjrt);
+}
+fn qualifyTarget(kind: Kind, precision: @import("precision.zig").Policy, bf16_probability: bool, comptime target: enum { native, pjrt, metal }) !void {
+    if (comptime target == .pjrt and !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    if (comptime target == .metal) {
+        if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+        if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    }
     const a = std.testing.allocator;
-    var client = @import("pjrt").pjrt.Client.initFromEnv(a) catch |err| switch (err) {
+    var client = if (comptime target == .pjrt) @import("pjrt").pjrt.Client.initFromEnv(a) catch |err| switch (err) {
         error.PjrtPluginNotFound => return error.SkipZigTest,
         else => return err,
-    };
-    defer client.deinit();
+    } else {};
+    defer if (comptime target == .pjrt) client.deinit();
     var source = Fixture{ .kind = kind, .bf16_probability = bf16_probability, .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
     defer source.weights.deinitOwned();
+    defer if (comptime target == .metal) if (source.metal_weights) |*weights| @import("../backends/compute_factory.zig").closeMetalWeights(a, weights);
     var inputs: std.ArrayList(capture.Input) = .empty;
     defer inputs.deinit(a);
     defer for (inputs.items) |*input| input.tensor.deinit();
@@ -240,7 +267,21 @@ fn qualifyProfile(kind: Kind, precision: @import("precision.zig").Policy, bf16_p
             break :reference_values try reference.toFloat32(expected[0].value, a);
         };
         defer a.free(values);
-        const actual = try cache.run(a, .{ .context = &source, .create = Fixture.create, .import = Fixture.import, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = @ptrCast(&client), .pjrt_precision = precision } }, frontend, inputs.items, a, null);
+        if (comptime target == .metal) {
+            var held = try cache.runDevice(a, .{ .context = &source, .create = Fixture.createMetal, .import = Fixture.importMetal, .compiled_context = .{ .cb = undefined, .requested_backend = .metal } }, frontend, inputs.items, a, null);
+            defer held.deinit();
+            const actual_backend = held.backend(0);
+            try std.testing.expectEqual(ops.BackendKind.metal, actual_backend.kind());
+            const actual_values = try actual_backend.toFloat32(held.result.outputs[0], a);
+            defer a.free(actual_values);
+            try std.testing.expectEqual(values.len, actual_values.len);
+            for (values, actual_values) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
+            continue;
+        }
+        const actual = if (comptime target == .pjrt)
+            try cache.run(a, .{ .context = &source, .create = Fixture.create, .import = Fixture.import, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = @ptrCast(&client), .pjrt_precision = precision } }, frontend, inputs.items, a, null)
+        else
+            try cache.run(a, .{ .context = &source, .create = Fixture.create, .import = Fixture.import }, frontend, inputs.items, a, null);
         defer a.free(actual);
         defer for (actual) |*output| output.deinit();
         try std.testing.expectEqual(values.len, actual[0].asFloat32().len);
@@ -325,4 +366,12 @@ test "captured primitive PJRT partial axis rotary preserves head tails and dynam
 
 test "captured primitive PJRT symmetric window attention preserves dynamic padding" {
     try qualify(.sdpa_window);
+}
+
+test "captured primitive Native symmetric window attention preserves dynamic padding" {
+    try qualifyTarget(.sdpa_window, .f32, false, .native);
+}
+
+test "captured primitive Metal symmetric window attention stays resident and preserves dynamic padding" {
+    try qualifyTarget(.sdpa_window, .f32, false, .metal);
 }
