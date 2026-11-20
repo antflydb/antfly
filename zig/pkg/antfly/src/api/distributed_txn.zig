@@ -1583,7 +1583,7 @@ fn executeMultiTableCommitOnce(
     if (participants.items.len > 0) {
         const participant = participants.items[0];
         const coordinator_sync_level: db_mod.types.SyncLevel = if (sync_level == .propose) .write else sync_level;
-        worker.resolveGroupWithCancellation(alloc, participant.group_id, participant.table_name, .{
+        const decision: TxnResolveRequest = .{
             .restore_staging_scope = participant.restore_staging_scope,
             .restore_staging_plan_id = participant.restore_staging_plan_id,
             .txn_id = txn_id,
@@ -1600,7 +1600,8 @@ fn executeMultiTableCommitOnce(
             // the caller's requested visibility contract and are recoverable
             // from the durable coordinator decision.
             .sync_level = coordinator_sync_level,
-        }, options.post_commit_cancellation) catch |err| switch (err) {
+        };
+        worker.resolveGroupWithCancellation(alloc, participant.group_id, participant.table_name, decision, options.post_commit_cancellation) catch |err| switch (err) {
             error.DecisionConflict => {
                 if (trace_writer) |tw| {
                     tw.traceEvent(&.{
@@ -1640,11 +1641,8 @@ fn executeMultiTableCommitOnce(
                     alloc,
                     worker,
                     participant,
-                    txn_id,
-                    commit_version,
-                    coordinator_sync_level,
+                    decision,
                     err,
-                    options.post_commit_cancellation,
                 ) catch |status_err| {
                     // The outcome is uncertain. Recovery will consult the
                     // participant record; aborting here could contradict a
@@ -1799,20 +1797,14 @@ fn resolveCoordinatorDecisionAfterFailure(
     alloc: std.mem.Allocator,
     worker: ParticipantWorker,
     participant: ParticipantTxn,
-    txn_id: db_mod.types.TxnId,
-    commit_version: u64,
-    sync_level: db_mod.types.SyncLevel,
+    decision: TxnResolveRequest,
     initial_resolve_error: anyerror,
-    cancellation: db_mod.types.CancellationToken,
 ) !db_mod.types.TxnStatus {
-    _ = cancellation;
     return try resolveCoordinatorDecisionAfterFailureUntil(
         alloc,
         worker,
         participant,
-        txn_id,
-        commit_version,
-        sync_level,
+        decision,
         initial_resolve_error,
         platform_time.monotonicNs() +| coordinator_resolution_timeout_ns,
     );
@@ -1822,9 +1814,7 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
     alloc: std.mem.Allocator,
     worker: ParticipantWorker,
     participant: ParticipantTxn,
-    txn_id: db_mod.types.TxnId,
-    commit_version: u64,
-    sync_level: db_mod.types.SyncLevel,
+    decision: TxnResolveRequest,
     initial_resolve_error: anyerror,
     deadline_ns: u64,
 ) !db_mod.types.TxnStatus {
@@ -1836,7 +1826,7 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
             alloc,
             participant.group_id,
             participant.table_name,
-            participant.statusRequest(txn_id),
+            participant.statusRequest(decision.txn_id),
             deadline_ns,
         ) catch |status_err| status_failure: {
             last_status_error = status_err;
@@ -1861,15 +1851,7 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
         // cancellation cannot prove the first commit was not accepted. This
         // bounded recovery loop has its own deadline and repeats only the
         // exact same idempotent decision.
-        worker.resolveGroupUntil(alloc, participant.group_id, participant.table_name, .{
-            .restore_staging_scope = participant.restore_staging_scope,
-            .restore_staging_plan_id = participant.restore_staging_plan_id,
-            .txn_id = txn_id,
-            .status = .committed,
-            .commit_version = commit_version,
-            .topology_epoch = participant.topology_epoch,
-            .sync_level = sync_level,
-        }, deadline_ns) catch |retry_err| {
+        worker.resolveGroupUntil(alloc, participant.group_id, participant.table_name, decision, deadline_ns) catch |retry_err| {
             last_resolve_error = retry_err;
             const now_ns = platform_time.monotonicNs();
             if (now_ns < deadline_ns) sleepNs(@min(coordinator_resolution_retry_ns, deadline_ns - now_ns));
@@ -5096,6 +5078,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.resolve_calls += 1;
                     try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+                    try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
                     try std.testing.expectEqual(@as(u64, 10_001), req.commit_version);
                     try std.testing.expectEqual(db_mod.types.SyncLevel.write, req.sync_level);
                 }
@@ -5120,13 +5103,8 @@ fn consumerTests() type {
                 std.testing.allocator,
                 recorder.worker(),
                 .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
-                txn_id,
-                10_001,
-                // Every ambiguous coordinator retry must preserve the durable barrier
-                // selected for the original decision submission.
-                .write,
+                .{ .txn_id = txn_id, .commit_version = 10_001, .status = .committed, .topology_epoch = 0, .sync_level = .write },
                 error.InjectedResolveFailure,
-                .none,
             );
             try std.testing.expectEqual(db_mod.types.TxnStatus.committed, status);
             try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
@@ -5177,9 +5155,7 @@ fn consumerTests() type {
                 std.testing.allocator,
                 recorder.worker(),
                 .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
-                txn_id,
-                10_001,
-                .write,
+                .{ .txn_id = txn_id, .commit_version = 10_001, .status = .committed, .topology_epoch = 42, .sync_level = .write },
                 error.InjectedResolveFailure,
                 platform_time.monotonicNs() + 10 * std.time.ns_per_ms,
             ));
@@ -5222,6 +5198,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.resolve_until_calls += 1;
                     try std.testing.expectEqual(self.expected_deadline_ns, deadline_ns);
+                    try std.testing.expectEqual(@as(u64, 42), req.topology_epoch);
                     try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
                 }
             };
@@ -5232,9 +5209,7 @@ fn consumerTests() type {
                 std.testing.allocator,
                 recorder.worker(),
                 .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
-                try parseTxnIdHex("00112233445566778899aabbccddeeff"),
-                10_001,
-                .write,
+                .{ .txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff"), .commit_version = 10_001, .status = .committed, .topology_epoch = 42, .sync_level = .write },
                 error.InjectedResolveFailure,
                 deadline_ns,
             );

@@ -11435,8 +11435,10 @@ pub const ProvisionedTableWriteSource = struct {
     pub const RoutedWriteAdmission = struct {
         source: *ProvisionedTableWriteSource,
         table_name: []const u8,
+        decision_group: ?u64 = null,
 
         pub fn deinit(self: *@This()) void {
+            if (self.decision_group) |group| self.source.endGroupOperation(self.table_name, group);
             self.source.endTableRequest(self.table_name);
             self.* = undefined;
         }
@@ -11450,21 +11452,47 @@ pub const ProvisionedTableWriteSource = struct {
         deadline_ns: u64,
         cancellation: db_mod.types.CancellationToken,
     ) !RoutedWriteAdmission {
+        return self.acquireProposalAdmission(alloc, table_name, fence, deadline_ns, cancellation, false);
+    }
+
+    pub fn acquireProposalAdmission(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        fence: metadata_api.CatalogRouteFence,
+        deadline_ns: u64,
+        cancellation: db_mod.types.CancellationToken,
+        decision: bool,
+    ) !RoutedWriteAdmission {
         try fence.validate();
         const admission_deadline_ns = if (self.catalog.routeFenceDeadline(fence)) |fence_deadline|
             @min(deadline_ns, fence_deadline)
         else
             deadline_ns;
-        while (!self.tryBeginTableRequest(table_name)) {
+        while (true) {
+            if (self.tryBeginTableRequest(table_name)) {
+                if (!decision or self.tryBeginReadCompatibleGroupOperation(table_name, fence.route.group_id)) break;
+                self.endTableRequest(table_name);
+            }
             try cancellation.check();
             try fence.admission_cancellation.check();
             if (self.catalog.budget(null).nowNs() >= admission_deadline_ns) return error.CatalogRoutingSnapshotTimeout;
             try self.catalog.budget(null).sleepNs(std.time.ns_per_ms);
         }
-        errdefer self.endTableRequest(table_name);
+        var admission: RoutedWriteAdmission = .{ .source = self, .table_name = table_name, .decision_group = if (decision) fence.route.group_id else null };
+        errdefer admission.deinit();
         try cancellation.check();
         try fence.admission_cancellation.check();
-        try table_catalog.validateCatalogRouteFenceUntil(
+        if (decision) {
+            // A transition can freeze an owner without changing its range list.
+            // Validate transition state and the route on one cut while holding
+            // the group and table gates through Raft index assignment.
+            const current = (try table_catalog.checkedTransactionRoute(alloc, self.catalog, table_name, fence.topology_epoch, false, fence.route.group_id)) orelse return error.TopologyChanged;
+            if (current.metadata_group_id != fence.metadata_group_id or
+                !std.meta.eql(current.metadata_incarnation, fence.metadata_incarnation) or
+                current.table_id != fence.table_id or !std.meta.eql(current.route, fence.route)) return error.TopologyChanged;
+            if (self.catalog.budget(null).nowNs() >= admission_deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        } else try table_catalog.validateCatalogRouteFenceUntil(
             alloc,
             self.catalog,
             table_name,
@@ -11473,7 +11501,7 @@ pub const ProvisionedTableWriteSource = struct {
         );
         try cancellation.check();
         try fence.admission_cancellation.check();
-        return .{ .source = self, .table_name = table_name };
+        return admission;
     }
 
     fn tryBeginStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
@@ -23729,6 +23757,30 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
+        if (self.raft_batcher) |batcher| {
+            // Resolution is idempotent and may arrive through a stale hosted
+            // route after leadership changes. Use the same leader-aware Raft
+            // dispatcher as begin/prepare; the transaction ID and replicated
+            // decision make retries safe, while the forwarded batch hop remains
+            // cache-only and bounded inside the data runtime.
+            const req: db_mod.types.BatchRequest = .{
+                .sync_level = sync_level,
+                .transaction = .{ .resolve = .{
+                    .txn_id = txn_id,
+                    .status = status,
+                    .commit_version = commit_version,
+                } },
+            };
+            if (topology_epoch != 0) {
+                const fence = (try table_catalog.checkedTransactionRoute(alloc, self.catalog, table_name, topology_epoch, true, group_id)) orelse return error.TopologyChanged;
+                try batcher.batchGroupRoutedWithCancellation(alloc, fence, table_name, req, cancellation);
+            } else {
+                self.beginGroupOperation(table_name, group_id);
+                defer self.endGroupOperation(table_name, group_id);
+                try batcher.batchGroupWithCancellation(alloc, group_id, table_name, req, cancellation);
+            }
+            return {};
+        }
         // Serialize the final epoch validation with split/merge transition
         // admission. If a transition is already waiting, it wins admission;
         // otherwise this resolve remains ahead of the transition until the
@@ -23737,22 +23789,6 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.endGroupOperation(table_name, group_id);
         if (topology_epoch != 0)
             try table_catalog.validateTransactionEpoch(alloc, self.catalog, table_name, topology_epoch, true);
-        if (self.raft_batcher) |batcher| {
-            // Resolution is idempotent and may arrive through a stale hosted
-            // route after leadership changes. Use the same leader-aware Raft
-            // dispatcher as begin/prepare; the transaction ID and replicated
-            // decision make retries safe, while the forwarded batch hop remains
-            // cache-only and bounded inside the data runtime.
-            try batcher.batchGroupWithCancellation(alloc, group_id, table_name, .{
-                .sync_level = sync_level,
-                .transaction = .{ .resolve = .{
-                    .txn_id = txn_id,
-                    .status = status,
-                    .commit_version = commit_version,
-                } },
-            }, cancellation);
-            return {};
-        }
         if (status == .committed) {
             lockAtomic(&self.local_db_mutex);
             self.invalidateReadCache(table_name);
@@ -26951,10 +26987,13 @@ pub const HostedProvisionedTableWriteSource = struct {
         try ensurePreDecisionContextActive(context);
         if (comptime control_only_storage_sources) {
             if (context.route_fence != null or req.range_guards.len != 0) return error.CatalogRouteFenceUnsupported;
-            if (topology_epoch != 0)
-                try table_catalog.validateTransactionEpoch(alloc, self.catalog, table_name, topology_epoch, req.transaction != null and req.transaction.? == .resolve);
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
+            if (req.transaction) |transaction| if (transaction == .resolve and topology_epoch != 0) {
+                const decision = transaction.resolve;
+                return local_source.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, decision.txn_id, decision.status, decision.commit_version, topology_epoch, req.sync_level, context.cancellation);
+            };
+            if (topology_epoch != 0) try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
             return try local_source.batchGroupLocal(alloc, group_id, table_name, req);
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);

@@ -1728,14 +1728,30 @@ pub fn transactionDecisionEpoch(snapshot: *const metadata_api.AdminSnapshot, top
 }
 
 pub fn validateTransactionEpoch(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, expected_epoch: u64, decision: bool) !void {
+    _ = try checkedTransactionRoute(alloc, catalog, table_name, expected_epoch, decision, null);
+}
+
+/// Select the final Raft owner's route from the very snapshot that passed
+/// decision admission. The leader rechecks this fence under its proposal gate.
+pub fn checkedTransactionRoute(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, expected_epoch: u64, decision: bool, group: ?u64) !?metadata_api.CatalogRouteFence {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
-    if (expected_epoch == 0) return;
+    if (expected_epoch == 0) return null;
     const topology_epoch = try topologyEpochFromSnapshot(alloc, &snapshot, table.*);
-    if (expected_epoch == topology_epoch) return; // Requests from existing coordinators.
-    if (!decision or expected_epoch != transactionDecisionEpoch(&snapshot, topology_epoch)) return error.TopologyChanged;
+    if (expected_epoch != topology_epoch and (!decision or expected_epoch != transactionDecisionEpoch(&snapshot, topology_epoch))) return error.TopologyChanged;
+    const group_id = group orelse return null;
+    const range = findRangeForTableGroup(snapshot.ranges, table.table_id, group_id) orelse return error.TopologyChanged;
+    const range_id = metadata_table_manager.rangeDocIdentityRangeId(range);
+    return .{
+        .metadata_group_id = snapshot.status.metadata_group_id,
+        .metadata_incarnation = snapshot.status.metadata_incarnation,
+        .catalog_revision = 0,
+        .table_id = table.table_id,
+        .topology_epoch = topology_epoch,
+        .route = .{ .group_id = group_id, .range_id = range_id, .identity_namespace = .{ .table_id = table.table_id, .shard_id = metadata_table_manager.rangeDocIdentityShardId(range), .range_id = range_id } },
+    };
 }
 
 pub fn validateTopologyEpoch(
@@ -3840,8 +3856,41 @@ fn consumerTests() type {
             const source: CatalogSource = .{ .ptr = &snapshot, .vtable = &.{ .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.free } };
             const epoch = try transactionTopologyEpoch(std.testing.allocator, source, "rows");
             const decision = transactionDecisionEpoch(&snapshot, epoch);
-            try validateTransactionEpoch(std.testing.allocator, source, "rows", decision, true);
-            snapshot.status.metadata_incarnation = @splat(7);
+            const fence = (try checkedTransactionRoute(std.testing.allocator, source, "rows", decision, true, 2)).?;
+            try std.testing.expectEqual(epoch, fence.topology_epoch);
+            try std.testing.expectEqual(@as(u64, 4), fence.route.range_id);
+            try std.testing.expectEqual(@as(u64, 1), fence.metadata_group_id);
+            try std.testing.expectError(error.TopologyChanged, checkedTransactionRoute(std.testing.allocator, source, "rows", decision, true, 7));
+            // Exercise both ends of the routed batch dispatch. Replace the
+            // leader catalog after the caller issues its fence, before proposal.
+            const writes = @import("table_writes.zig");
+            const types = @import("antfly_local_sources").storage_db_types;
+            const Probe = struct {
+                source: *writes.ProvisionedTableWriteSource,
+                catalog: *metadata_api.AdminSnapshot,
+                replace: bool = false,
+                accepted: usize = 0,
+                fn unbound(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: types.BatchRequest) !void {
+                    return error.UnexpectedUnfencedDecision;
+                }
+                fn routed(raw: *anyopaque, a: std.mem.Allocator, route: metadata_api.CatalogRouteFence, table: []const u8, req: types.BatchRequest, cancel: types.CancellationToken) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(@as(u64, 2), route.route.group_id);
+                    try std.testing.expect(req.transaction.? == .resolve);
+                    if (self.replace) self.catalog.status.metadata_incarnation = @splat(7);
+                    var admitted = try self.source.acquireProposalAdmission(a, table, route, std.math.maxInt(u64), cancel, true);
+                    defer admitted.deinit();
+                    self.accepted += 1;
+                }
+            };
+            var owner = writes.ProvisionedTableWriteSource.init("unused", source);
+            defer owner.deinit();
+            var probe: Probe = .{ .source = &owner, .catalog = &snapshot };
+            _ = owner.withRaftBatcher(.{ .ptr = &probe, .vtable = &.{ .batch_group = Probe.unbound, .batch_group_local = Probe.unbound, .batch_group_routed_with_cancellation = Probe.routed } });
+            try std.testing.expect((try owner.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .committed, 1, decision, .write, .none)) != null);
+            probe.replace = true;
+            try std.testing.expectError(error.TopologyChanged, owner.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .committed, 1, decision, .write, .none));
+            try std.testing.expectEqual(@as(usize, 1), probe.accepted);
             try std.testing.expectError(error.TopologyChanged, validateTransactionEpoch(std.testing.allocator, source, "rows", decision, true));
             try validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch);
             snapshot.status.metadata_incarnation = null;

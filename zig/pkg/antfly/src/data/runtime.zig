@@ -13511,12 +13511,13 @@ pub const DataServer = struct {
                     }
                     const admission_deadline_ns = admission_source.catalog.budget(null).nowNs() +|
                         (deadline_ns - admission_now_ns);
-                    routed_write_admission = try admission_source.acquireRoutedWriteAdmission(
+                    routed_write_admission = try admission_source.acquireProposalAdmission(
                         alloc,
                         table_name,
                         fence,
                         admission_deadline_ns,
                         route.visibility_cancellation,
+                        req.transaction != null and req.transaction.? == .resolve,
                     );
                 }
                 // The unpublished child has no public write route. Its

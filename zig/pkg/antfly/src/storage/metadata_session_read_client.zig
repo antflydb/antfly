@@ -72,6 +72,7 @@ const Read = struct {
     };
     fn cursor(a: A, ptr: *anyopaque) !erased.Cursor {
         const self = try a.create(Cursor);
+        _ = cast(ptr).refs.fetchAdd(1, .monotonic);
         self.* = .{ .read = cast(ptr), .arena = std.heap.ArenaAllocator.init(a) };
         return .{ .allocator = a, .ptr = self, .vtable = &.{ .close = Cursor.close, .first = Cursor.first, .last = Cursor.last, .next = Cursor.next, .prev = Cursor.prev, .seek_at_or_after = Cursor.after, .seek_at_or_before = Cursor.before } };
     }
@@ -97,6 +98,7 @@ const Cursor = struct {
     }
     fn close(a: A, ptr: *anyopaque) void {
         const self = cast(ptr);
+        self.read.release();
         self.key.deinit(a);
         self.arena.deinit();
         a.destroy(self);

@@ -80,6 +80,8 @@ const Mock = struct {
     cursor_revoked: bool = false,
     buffered_filter_changed: bool = false,
     revoke_on_buffered_resume: bool = false,
+    deny_describe_at: ?usize = null,
+    deny_stream_validation: bool = false,
     stream_fail_at: ?usize = null,
     failed_transactions: usize = 0,
     canceled: std.atomic.Value(bool) = .init(false),
@@ -179,7 +181,7 @@ const Mock = struct {
         try request.check();
         if (self.expected_cursor_namespace) |expected| if (!std.mem.eql(u8, expected, request.namespace orelse "public")) return error.CatalogGenerationChanged;
         self.stream_validations += 1;
-        if (self.cursor_revoked) return error.Forbidden;
+        if (self.cursor_revoked or self.deny_stream_validation) return error.Forbidden;
     }
     fn nextPage(raw: *anyopaque, alloc: std.mem.Allocator, request: backend.Request, wanted: u32) !backend.StreamPage {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -243,6 +245,7 @@ const Mock = struct {
     fn describe(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Description {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.describes += 1;
+        if (self.deny_describe_at == self.describes) return error.Forbidden;
         try request.check();
         if (self.replace_before_setting_execute and self.describes == 3) self.catalog_revision += 1;
         if (self.probe_change_at != null or self.replace_before_setting_execute) return .{
@@ -260,7 +263,7 @@ const Mock = struct {
         if (self.cursor_revoked) return error.Forbidden;
         if (self.ddl_pending or self.ddl_unknown) return .{ .columns = &.{} };
         if (self.expected_result_tag != null) return .{ .columns = &.{}, .binding_guard = "immutable-catalog-binding" };
-        if (std.ascii.eqlIgnoreCase(request.statement, "ROLLBACK") or std.ascii.eqlIgnoreCase(request.statement, "COMMIT")) return .{ .columns = &.{} };
+        if (std.ascii.startsWithIgnoreCase(request.statement, "ROLLBACK TO ") or std.ascii.eqlIgnoreCase(request.statement, "ROLLBACK") or std.ascii.eqlIgnoreCase(request.statement, "COMMIT")) return .{ .columns = &.{} };
         if (self.json_null_results) return .{ .is_select = true, .columns = &.{.{ .name = "j", .type = .json }} };
         if (self.array_results) return .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .jsonb }} };
         return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.settingEpoch() };
@@ -1677,6 +1680,79 @@ test "extended rollback closes a suspended transaction portal before Sync" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "34000") != null);
 }
 
+test "extended rollback to savepoint closes later portals and preserves earlier bindings" {
+    for ([_]bool{ false, true }) |streaming| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "BEGIN\x00");
+        try parse(&input.writer, "q", "SELECT n FROM t", false);
+        try bind(&input.writer, "before", "q", null);
+        try frame(&input.writer, 'Q', "SAVEPOINT sp\x00");
+        try bind(&input.writer, "after", "q", null);
+        try execute(&input.writer, "after", 1);
+        try parse(&input.writer, "rollback", "ROLLBACK TO sp", false);
+        try bind(&input.writer, "rollback", "rollback", null);
+        try execute(&input.writer, "rollback", 0);
+        try frame(&input.writer, 'D', "Pbefore\x00");
+        try execute(&input.writer, "after", 1);
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .json_null_results = !streaming, .stream_rows = if (streaming) 3 else 0 };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expect(std.mem.endsWith(u8, observed, "12CTEZ"));
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "34000") != null);
+    }
+}
+
+test "Describe Portal checks authorization before returning columns or executing" {
+    for ([_]bool{ false, true }) |suspended| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try parse(&input.writer, "q", "SELECT j FROM t", false);
+        try bind(&input.writer, "p", "q", null);
+        if (suspended) try execute(&input.writer, "p", 1);
+        try frame(&input.writer, 'D', "Pp\x00");
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .json_null_results = true, .revoke_on_buffered_resume = suspended, .deny_describe_at = if (suspended) null else 3 };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "T"));
+        try std.testing.expectEqual(@as(usize, @intFromBool(suspended)), mock.executions);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "42501") != null);
+    }
+}
+
+test "Describe validates native portal authority after suspension and exhaustion" {
+    for ([_]usize{ 1, 2 }) |rows| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try parse(&input.writer, "q", "SELECT n FROM t", false);
+        try bind(&input.writer, "p", "q", null);
+        try execute(&input.writer, "p", 1);
+        try frame(&input.writer, 'D', "Pp\x00");
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = rows, .deny_stream_validation = true };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "T"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observed, "D"));
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_validations);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "42501") != null);
+    }
+}
+
 test "pgwire suspended materialized SELECT rechecks authority before sending more rows" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
@@ -2178,7 +2254,7 @@ test "pgwire extended typed bind describes without execution and resumes once" {
         var mock: Mock = .{ .native_parameters = native };
         var output = try run(&mock, input.written(), .{});
         defer output.deinit();
-        try std.testing.expectEqual(@as(usize, 4), mock.describes);
+        try std.testing.expectEqual(@as(usize, 5), mock.describes);
         try std.testing.expectEqual(@as(usize, 1), mock.executions);
         try std.testing.expect(mock.saw_statement_unchanged);
         try std.testing.expect(mock.saw_binding_guard);

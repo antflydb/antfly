@@ -74,6 +74,7 @@ const Read = struct {
     physical: erased.ReadTxn,
     arena: std.heap.ArenaAllocator,
     prefix: []const u8,
+    refs: std.atomic.Value(usize) = .init(1),
     fn cast(ptr: *anyopaque) *Read {
         return @ptrCast(@alignCast(ptr));
     }
@@ -87,7 +88,9 @@ const Read = struct {
         self.* = .{ .store = store, .physical = try store.host.read(store.host.ptr, a), .arena = arena, .prefix = prefix };
         return self;
     }
-    fn destroy(self: *Read, a: A) void {
+    fn destroy(self: *Read, _: A) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const a = self.arena.child_allocator;
         self.physical.abort();
         self.arena.deinit();
         a.destroy(self);
@@ -97,7 +100,7 @@ const Read = struct {
     }
     fn get(ptr: *anyopaque, key: []const u8) ![]const u8 {
         const self = cast(ptr);
-        if (std.mem.eql(u8, key, record.epoch_key)) return error.NotFound;
+        if (record.internalKey(key)) return error.NotFound;
         return self.physical.get(try record.keyAlloc(self.arena.allocator(), self.store.group, key));
     }
     fn scope(a: A, ptr: *anyopaque) !erased.ReadScope {
@@ -111,7 +114,7 @@ const Read = struct {
         group: u64,
         physical: erased.ReadScope,
         fn physicalKey(self: *@This(), key: []const u8) ![]const u8 {
-            if (std.mem.eql(u8, key, record.epoch_key)) return error.NotFound;
+            if (record.internalKey(key)) return error.NotFound;
             return record.keyAlloc(self.alloc, self.group, key);
         }
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
@@ -122,7 +125,10 @@ const Read = struct {
         pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
             const physical = try self.physicalKey(key);
             defer self.alloc.free(physical);
-            return self.physical.getRange(physical, offset, length);
+            return self.physical.getRange(physical, offset, length) catch |err| switch (err) {
+                error.Unsupported => (try record.cachedRange(&self.physical, self.alloc, self.group, key, offset, length)) orelse error.Unsupported,
+                else => err,
+            };
         }
         pub fn close(self: *@This()) void {
             self.physical.close();
@@ -136,6 +142,7 @@ const Write = struct {
     read: *Read,
     term: u64,
     epoch: u64,
+    refs: std.atomic.Value(usize) = .init(1),
     scanned: bool = false,
     owned_bytes: usize = 0,
     changes: std.ArrayList(record.Change) = .empty,
@@ -144,6 +151,7 @@ const Write = struct {
     }
     fn abort(a: A, ptr: *anyopaque) void {
         const self = cast(ptr);
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         self.read.destroy(a);
         a.destroy(self);
     }
@@ -154,7 +162,7 @@ const Write = struct {
     fn observe(self: *Write, key: []const u8) !*record.Change {
         if (self.find(key)) |change| return change;
         if (self.changes.items.len >= record.max_operations) return error.TransactionTooLarge;
-        if (key.len == 0 or key.len > 512 or std.mem.eql(u8, key, record.epoch_key)) return error.InvalidTransactionSessionRecord;
+        if (key.len == 0 or key.len > 512 or record.internalKey(key)) return error.InvalidTransactionSessionRecord;
         const a = self.read.arena.allocator();
         const actual = Read.get(self.read, key) catch |err| switch (err) {
             error.NotFound => null,
@@ -188,6 +196,7 @@ const Write = struct {
     }
     fn commit(a: A, ptr: *anyopaque) !void {
         const self = cast(ptr);
+        if (self.refs.load(.acquire) != 1) return error.TransactionCursorActive;
         const store = self.read.store;
         if (store.host.term(store.host.ptr) != self.term) return error.NotLeader;
         if (self.changes.items.len != 0) {
@@ -225,11 +234,17 @@ const Cursor = struct {
         const self = try a.create(Cursor);
         errdefer a.destroy(self);
         self.* = .{ .a = a, .read = read, .write = write, .physical = try read.physical.openCursor() };
+        if (write) |w| {
+            _ = w.refs.fetchAdd(1, .monotonic);
+        } else {
+            _ = read.refs.fetchAdd(1, .monotonic);
+        }
         return .{ .allocator = a, .ptr = self, .vtable = &.{ .close = close, .first = first, .last = last, .next = next, .prev = prev, .seek_at_or_after = after, .seek_at_or_before = before } };
     }
     fn close(a: A, ptr: *anyopaque) void {
         const self = cast(ptr);
         self.physical.close();
+        if (self.write) |w| Write.abort(self.read.arena.child_allocator, w) else self.read.destroy(a);
         self.key.deinit(a);
         self.seek.deinit(a);
         a.destroy(self);
@@ -256,7 +271,18 @@ const Cursor = struct {
                 break;
             }
             const key = entry.key[self.read.prefix.len..];
-            if (!std.mem.eql(u8, key, record.epoch_key) and eligible(key, bound, forward, inclusive) and (self.write == null or self.write.?.find(key) == null)) break;
+            if (std.mem.startsWith(u8, key, record.cache_namespace)) {
+                self.seek.clearRetainingCapacity();
+                try self.seek.appendSlice(self.a, self.read.prefix);
+                try self.seek.appendSlice(self.a, record.cache_namespace);
+                // The reserved prefix ends in '/'. Its predecessor/successor
+                // bound skips all derived entries in a single seek.
+                if (forward) self.seek.items[self.seek.items.len - 1] += 1;
+                base = if (forward) try self.physical.seekAtOrAfter(self.seek.items) else try self.physical.seekAtOrBefore(self.seek.items);
+                if (!forward and base != null and std.mem.eql(u8, base.?.key, self.seek.items)) base = try self.physical.prev();
+                continue;
+            }
+            if (!record.internalKey(key) and eligible(key, bound, forward, inclusive) and (self.write == null or self.write.?.find(key) == null)) break;
             base = if (forward) try self.physical.next() else try self.physical.prev();
         }
         var selected: ?erased.Entry = if (base) |entry| .{ .key = entry.key[self.read.prefix.len..], .value = entry.value } else null;
@@ -369,6 +395,27 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         try std.testing.expectError(error.Unavailable, txn.commit());
         txn.abort();
         fixture.lose_ack = false;
+    }
+    {
+        var read = try logical.beginRead();
+        var cursor = read.openCursor() catch |err| {
+            read.abort();
+            return err;
+        };
+        read.abort();
+        defer cursor.close();
+        try std.testing.expectEqualStrings("acknowledgement lost", (try cursor.seekAtOrAfter("receipt")).?.value);
+    }
+    {
+        var txn = try logical.beginWrite();
+        var cursor = txn.openCursor() catch |err| {
+            txn.abort();
+            return err;
+        };
+        defer cursor.close();
+        try std.testing.expectError(error.TransactionCursorActive, txn.commit());
+        txn.abort();
+        try std.testing.expectEqualStrings("receipt", (try cursor.first()).?.key);
     }
     var current = try logical.beginRead();
     defer current.abort();

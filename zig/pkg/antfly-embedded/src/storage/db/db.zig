@@ -51720,13 +51720,15 @@ fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.D
             for (probes[0..received], headers[0..received]) |probe, header| {
                 var item = probe.candidate;
                 if (header) |bytes| candidate: {
+                    if (policy) |active| {
+                        var backing = inference_work.ReclaimingInvocationAllocator.init(output);
+                        var validation = std.heap.ArenaAllocator.init(backing.allocator());
+                        defer validation.deinit();
+                        if (!try @import("privacy_read.zig").permitsVirtualPage(validation.allocator(), active, probe.key, bytes, txn)) break :candidate;
+                    }
                     const meta = try @import("../artifact_payload.zig").Metadata.decode(bytes);
                     if (meta.sourceHash()) |source| {
-                        if (policy) |active| {
-                            var backing = inference_work.ReclaimingInvocationAllocator.init(output);
-                            var validation = std.heap.ArenaAllocator.init(backing.allocator());
-                            defer validation.deinit();
-                            if (!try @import("privacy_read.zig").permitsVirtualPage(validation.allocator(), active, probe.key, bytes, txn)) break :candidate;
+                        if (policy != null) {
                             if (verified) |indices| try indices.put(output, item.index, {});
                         }
                         const fingerprint = try std.fmt.allocPrint(wave.allocator(), "{s}:{x:0>16}", .{ item.outputs[0], source });
@@ -156112,15 +156114,14 @@ test "source semantic media input virtual PDF pages require the physical vector 
     try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
     const policy = (try @import("privacy_read.zig").capture(&db, scratch)).?;
     const name = try std.fmt.allocPrint(scratch, "_privacy_{s}_visual", .{policy.prepared.version});
-    try db.addEnrichment(.{ .name = name, .kind = .embedding, .field = "url", .embedding_input = .pdf_page_images, .expected_dims = 3 });
-    const config = try std.json.Stringify.valueAlloc(scratch, .{ .field = "v", .dims = 3, .embedding_name = name }, .{});
-    try db.addIndex(.{ .name = "images", .kind = .dense_vector, .config_json = config });
-    const unit = unit: {
-        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
-        defer plan.release();
-        var pages = plan.plan().pdf_page_outputs.keyIterator();
-        break :unit try internal_keys.documentUnitArtifactKeyAlloc(scratch, "doc", pages.next().?.*, "page:000001");
-    };
+    const legacy = "0legacy";
+    for ([_][]const u8{ legacy, name }, [_][]const u8{ "orphan", "images" }) |output_name, index_name| {
+        const config = try std.json.Stringify.valueAlloc(scratch, .{ .field = "v", .dims = 3, .generator = .{ .source_field = "url", .input = "pdf_page_images", .artifact_name = "pdf_pages", .embedding_name = output_name } }, .{});
+        try db.addIndex(.{ .name = index_name, .kind = .dense_vector, .config_json = config });
+    }
+    const unit = try internal_keys.documentUnitArtifactKeyAlloc(scratch, "doc", "pdf_pages", "page:000001");
+    const invalid = try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, unit, legacy);
+    try db.core.store.put(invalid, @import("../artifact_payload.zig").magic); // Truncated reference from an ineligible producer.
     const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, unit, name);
     const vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(scratch, 19, &.{ 1, 2, 3 });
     try db.core.store.put(vector_key, vector);

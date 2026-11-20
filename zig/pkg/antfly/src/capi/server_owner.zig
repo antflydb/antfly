@@ -2741,6 +2741,7 @@ const MetadataSessionRead = struct {
     alloc: Allocator,
     txn: antfly.capi_dependencies.storage_docstore.DocStore.Txn,
     prefix: []u8,
+    group: u64,
 };
 pub fn metadataSessionReadOpen(store_ptr: ?*anyopaque, request: *const kernel_owner_abi.MetadataApplyGroupRequest, out_read: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     out_read.* = null;
@@ -2761,7 +2762,7 @@ pub fn metadataSessionReadOpen(store_ptr: ?*anyopaque, request: *const kernel_ow
         owner.alloc.destroy(read);
         return storageOwnerStatusFromError(err);
     };
-    read.* = .{ .alloc = owner.alloc, .txn = txn, .prefix = owned };
+    read.* = .{ .alloc = owner.alloc, .txn = txn, .prefix = owned, .group = request.group_id };
     out_read.* = read;
     return .ok;
 }
@@ -2795,7 +2796,9 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
             if (s.getRange(key, request.offset, request.length)) |bytes| {
                 break :blk bytes;
             } else |err| if (err != error.Unsupported) return storageOwnerStatusFromError(err);
-            const full = read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
+            const cached = @import("../metadata/transaction_session_record.zig").cachedRange(s, read.alloc, read.group, key[read.prefix.len..], request.offset, request.length) catch |err| return storageOwnerStatusFromError(err);
+            if (cached) |bytes| break :blk bytes;
+            const full = s.get(key) catch |err| return storageOwnerStatusFromError(err);
             if (request.offset > full.len or request.length > full.len - request.offset) return .end_of_stream;
             break :blk full[@intCast(request.offset)..][0..request.length];
         } else read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);

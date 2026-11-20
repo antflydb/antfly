@@ -63,6 +63,7 @@ const Prepared = struct {
 };
 
 const Portal = struct {
+    creation_epoch: u64 = 0,
     arena: std.heap.ArenaAllocator,
     statement: []const u8,
     parameters: []const std.json.Value,
@@ -121,6 +122,7 @@ pub const Session = struct {
     sql_cursors: std.StringHashMapUnmanaged(SqlCursor) = .empty,
     cursor_budget: ?*Budget = null,
     cursor_epoch: u64 = 0,
+    rollback_portal_epoch: ?u64 = null,
     statement_timeout: ?u32 = null,
     application_name: commands.ApplicationName = .{},
     lake_visibility: commands.ReadRequirements = .{},
@@ -227,7 +229,17 @@ pub const Session = struct {
             const status_before_frame = self.status;
             // The portal executing COMMIT or ROLLBACK owns its response.
             // Release it and its siblings before reading the next frame.
-            defer if (status_before_frame != .idle and self.status == .idle) self.clearPortals();
+            defer {
+                if (status_before_frame != .idle and self.status == .idle) {
+                    self.clearPortals();
+                } else if (self.rollback_portal_epoch) |epoch| {
+                    var it = self.portals.iterator();
+                    // Removal leaves a tombstone in the current hash slot.
+                    while (it.next()) |entry| if (entry.value_ptr.*.creation_epoch > epoch)
+                        self.removePortal(entry.key_ptr.*);
+                }
+                self.rollback_portal_epoch = null;
+            }
             self.dispatch(tag, payload) catch |err| {
                 const completion_code: []const u8 = if (self.diagnostic.code) |*code| code else sqlstate(err);
                 if (std.mem.eql(u8, completion_code, "40003") and !self.mutation_ack_pending) {
@@ -492,10 +504,9 @@ pub const Session = struct {
         return current;
     }
 
-    fn refreshPortal(self: *Session, portal: *Portal) !void {
-        const alloc = portal.arena.allocator();
+    fn checkedPortalDescription(self: *Session, alloc: std.mem.Allocator, portal: *Portal) !backend.Description {
         const bound = portal.description;
-        if (try self.descriptionCurrent(alloc, portal.statement, bound)) return;
+        if (try self.descriptionCurrent(alloc, portal.statement, bound)) return bound;
         const current = try self.rebindCached(alloc, portal.statement, bound);
         if (bound.binding_guard) |before| {
             if (if (bound.stamp) |s| s.catalog else null) |previous| {
@@ -507,7 +518,7 @@ pub const Session = struct {
             const same = if (self.source.vtable.same_binding_targets) |check| check(before, after) else std.mem.eql(u8, before, after);
             if (!same) return error.CatalogGenerationChanged;
         } else if (current.binding_guard != null) return error.CatalogGenerationChanged;
-        portal.description = current;
+        return current;
     }
 
     fn rebindCached(self: *Session, alloc: std.mem.Allocator, statement: []const u8, original: backend.Description) !backend.Description {
@@ -632,7 +643,9 @@ pub const Session = struct {
                     if (std.mem.eql(u8, name, self.savepoints.items[index].name)) {
                         if (value == .rollback_to) {
                             if (self.catalog_settings) |*state| if (self.savepoints.items[index].catalog) |snapshot| try state.rollbackTo(snapshot);
-                            self.discardCursorsAfter(self.savepoints.items[index].epoch);
+                            const epoch = self.savepoints.items[index].epoch;
+                            self.discardCursorsAfter(epoch);
+                            self.rollback_portal_epoch = @min(self.rollback_portal_epoch orelse epoch, epoch);
                             self.statement_timeout = self.savepoints.items[index].timeout;
                             self.namespace_setting = self.savepoints.items[index].namespace;
                             self.application_name = self.savepoints.items[index].application;
@@ -1064,7 +1077,8 @@ pub const Session = struct {
                 const namespace = try a.dupe(u8, statement.namespace);
                 const portal = try self.alloc.create(Portal);
                 errdefer if (!transferred) self.alloc.destroy(portal);
-                portal.* = .{ .arena = arena, .statement = text, .parameters = parameters, .parameter_cells = native_cells, .parameter_owner = parameter_owner, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path };
+                self.cursor_epoch = try self.nextCursorEpoch();
+                portal.* = .{ .creation_epoch = self.cursor_epoch, .arena = arena, .statement = text, .parameters = parameters, .parameter_cells = native_cells, .parameter_owner = parameter_owner, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path };
                 try self.portals.put(self.alloc, owned_name, portal);
                 transferred = true;
                 try self.message('2', "");
@@ -1088,6 +1102,28 @@ pub const Session = struct {
                     },
                     'P' => {
                         const portal = self.portals.get(name) orelse return error.InvalidPortalName;
+                        if (portal.failed) return error.PortalExecutionFailed;
+                        const previous_namespace = self.request_namespace;
+                        const previous_path = self.request_search_path;
+                        self.request_namespace = portal.namespace;
+                        self.request_search_path = portal.search_path;
+                        defer self.request_namespace = previous_namespace;
+                        defer self.request_search_path = previous_path;
+                        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                        defer scratch.deinit();
+                        _ = try self.checkedPortalDescription(scratch.allocator(), portal);
+                        var req = self.request(portal.statement, portal.parameters, portal.types);
+                        req.binding_guard = portal.description.binding_guard;
+                        req.setting_epoch = portal.description.setting_epoch;
+                        if (portal.stream_opened) req.session_id = portal.session_id;
+                        if (portal.stream) |stream| {
+                            const check = stream.validate orelse return error.UnsupportedSqlExecution;
+                            try check(stream.context, scratch.allocator(), req);
+                        } else if (portal.result) |result| {
+                            if (result.cursor_authority) |authority| {
+                                try authority.validate(authority.ptr, scratch.allocator(), self.identity orelse return error.AuthenticationFailed, req, false);
+                            }
+                        }
                         try self.rowDescription(portal.description.columns, portal.formats);
                     },
                     else => return error.ProtocolViolation,
@@ -1113,8 +1149,9 @@ pub const Session = struct {
                 };
                 if (!portal.stream_opened) {
                     self.read_receipt_budget = .{};
-                    try self.refreshPortal(portal);
+                    portal.description = try self.checkedPortalDescription(portal.arena.allocator(), portal);
                     portal.stream_opened = true;
+                    if (self.session_id) |id| portal.session_id = try portal.arena.allocator().dupe(u8, id);
                     if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
                         self.cancel_requested.store(false, .release);
                         self.executing.store(true, .release);
@@ -1135,9 +1172,6 @@ pub const Session = struct {
                 }
                 const first_delivery = portal.result == null;
                 if (first_delivery) {
-                    if (portal.description.is_select) if (self.session_id) |id| {
-                        portal.session_id = try portal.arena.allocator().dupe(u8, id);
-                    };
                     portal.result = try self.executeCells(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.parameter_descriptors, portal.parameter_cells, portal.parameter_owner, portal.description.binding_guard, portal.description.setting_epoch, if (portal.description.is_select) .require_select else .none);
                     const result = portal.result.?;
                     if (!columnsEqual(portal.description.columns, result.columns)) return error.ResultShapeChanged;
@@ -1342,7 +1376,7 @@ pub const Session = struct {
         defer if (!key_moved) self.alloc.free(key);
         const database = if (self.database) |value| try arena.allocator().dupe(u8, value) else null;
         const namespace = try arena.allocator().dupe(u8, self.request_namespace orelse self.effectiveNamespace());
-        self.cursor_epoch = std.math.add(u64, self.cursor_epoch, 1) catch return error.ProgramLimitExceeded;
+        self.cursor_epoch = try self.nextCursorEpoch();
         try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .authority = buffered_authority, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .search_path = self.effectiveSearchPath(), .creation_epoch = self.cursor_epoch });
         key_moved = true;
         arena_moved = true;
@@ -1550,6 +1584,10 @@ pub const Session = struct {
         self.savepoints.clearRetainingCapacity();
     }
 
+    fn nextCursorEpoch(self: *Session) !u64 {
+        return std.math.add(u64, self.cursor_epoch, 1) catch error.ProgramLimitExceeded;
+    }
+
     fn discardCursorsAfter(self: *Session, epoch: u64) void {
         while (true) {
             var iterator = self.sql_cursors.iterator();
@@ -1634,6 +1672,15 @@ pub const Session = struct {
         req.parameter_descriptors = portal.description.parameter_descriptors;
         req.binding_guard = portal.description.binding_guard;
         req.setting_epoch = portal.description.setting_epoch;
+        const previously_complete = portal.stream_complete;
+        if (portal.stream_opened) req.session_id = portal.session_id;
+        if (previously_complete) if (portal.stream) |stream| {
+            if (stream.validate) |check| {
+                var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                defer scratch.deinit();
+                try check(stream.context, scratch.allocator(), req);
+            }
+        };
         var remaining: usize = if (requested == 0) std.math.maxInt(usize) else @intCast(requested);
         while (!portal.stream_complete and remaining != 0) {
             try req.check();
@@ -1659,8 +1706,16 @@ pub const Session = struct {
             try self.writer.flush();
         }
         if (portal.stream_complete) {
-            if (portal.stream) |stream| stream.close(stream.context);
-            portal.stream = null;
+            if (!previously_complete) if (portal.stream) |stream| {
+                if (!describe_rows and stream.detach != null and stream.validate != null) {
+                    // Release the execution plan and storage cut. Describe and
+                    // repeated Execute still need this portal's reader tenure.
+                    stream.detach.?(stream.context);
+                } else {
+                    stream.close(stream.context);
+                    portal.stream = null;
+                }
+            };
             var tag: [64]u8 = undefined;
             try self.command(try std.fmt.bufPrint(&tag, "SELECT {d}", .{portal.offset}));
         } else try self.message('s', "");

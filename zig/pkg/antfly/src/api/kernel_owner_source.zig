@@ -6211,7 +6211,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.BatchRequest,
     ) !void {
-        return self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, req, .{});
+        return self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, req, .{}, 0);
     }
 
     fn applyTransactionGroupLocalWithContext(
@@ -6221,12 +6221,19 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.BatchRequest,
         context: request_operation.RequestContext,
+        decision_epoch: u64,
     ) !void {
         try context.ensureActive();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
-        var lease = try self.acquireTransactionOwner(alloc, group_id, table_name, req, context);
+        var lease = if (decision_epoch != 0) try self.acquire(group_id, table_name) else try self.acquireTransactionOwner(alloc, group_id, table_name, req, context);
         defer lease.deinit();
+        if (decision_epoch != 0) {
+            const route = (try table_catalog.checkedTransactionRoute(alloc, self.catalog, table_name, decision_epoch, true, group_id)) orelse return error.TopologyChanged;
+            const expected = route.route.identity_namespace;
+            const actual = lease.entry.identity;
+            if (actual.table_id != expected.table_id or actual.shard_id != expected.shard_id or actual.range_id != expected.range_id) return error.TopologyChanged;
+        }
         try context.ensureActive();
         var response = try lease.owner().replicatedBatchJson(table_name, request_json);
         defer response.deinit();
@@ -6330,7 +6337,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .retain_terminal = retain_terminal,
                 .participants = participants,
             } },
-        }, active);
+        }, active, 0);
         return {};
     }
 
@@ -6389,18 +6396,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         txn_id: db_types.TxnId,
         status: db_types.TxnStatus,
         commit_version: u64,
-        _: u64,
+        topology_epoch: u64,
         sync_level: db_types.SyncLevel,
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        try self.applyTransactionGroupLocal(alloc, group_id, table_name, .{
+        try self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, .{
             .sync_level = sync_level,
             .transaction = .{ .resolve = .{
                 .txn_id = txn_id,
                 .status = status,
                 .commit_version = commit_version,
             } },
-        });
+        }, .{}, topology_epoch);
         return {};
     }
 

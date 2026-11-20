@@ -505,10 +505,11 @@ const OwnedRead = struct {
         self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .read_requirements = request.read_requirements, .shared_receipt_wait_budget = request.read_receipt_budget, .lake_visibility = if (request.read_requirements.visibility) |visibility| if (visibility == .accepted) .accepted else .committed else @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
         defer if (transaction_lease) |lease| lease.release();
+        var tenure: ?u64 = null;
         if (self.session_id) |id_hex| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(id_hex) catch return error.SqlTransactionNotActive;
             transaction_lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
-            try server.txn_sessions.requireActiveSqlReader(alloc, id, credential.sessionPrincipal(), server.localSessionNodeId());
+            tenure = try server.txn_sessions.sqlReaderTenure(alloc, id, credential.sessionPrincipal(), server.localSessionNodeId());
             var state = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionNotActive;
             defer state.deinit(server.alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
@@ -536,7 +537,7 @@ const OwnedRead = struct {
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
-        var opening: CursorAdmission = .{ .out = arena, .adapter = adapter, .native = &self.native_adapter, .credential = credential, .admitted = admitted_revision };
+        var opening: CursorAdmission = .{ .out = arena, .adapter = adapter, .native = &self.native_adapter, .credential = credential, .admitted = admitted_revision, .lease_epoch = tenure };
         opening.install(&stream_backend);
         const opened = try Pull.Stream.openOwned(try @import("sql_memory_owner.zig").create(adapter.server.alloc, alloc, adapter.server.shared_resource_manager orelse &adapter.server.local_resource_manager), stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
         if (opened == null) {
@@ -715,6 +716,7 @@ const CursorAdmission = struct {
     native: *execution.Adapter,
     credential: *Credential,
     admitted: ReadRevision,
+    lease_epoch: ?u64,
     previous: @FieldType(catalog.Backend, "execution_binding_validator") = null,
     captured: ?RetainedRead = null,
 
@@ -727,6 +729,7 @@ const CursorAdmission = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.previous) |validator| try validator.validate(validator.ptr, scratch, binding);
         self.captured = try RetainedRead.capture(self.out, self.adapter, self.credential, self.native.identity.* orelse return error.Unauthorized, binding, self.native.context, self.native.revision, self.admitted);
+        self.captured.?.lease_epoch = self.lease_epoch;
         // A later native operator may mint another owner proof. Bind its role
         // set under the same manager lock that signs that proof.
         self.native.identity.*.?.bound_policy_roles = self.captured.?.role_digest;
@@ -739,6 +742,7 @@ const RetainedRead = struct {
     policies: []const OwnedRead.Policy,
     bindings: []const Domain.CursorBinding,
     validated: ReadRevision,
+    lease_epoch: ?u64 = null,
     validated_stamp: ?wire.CatalogStamp = null,
     role_digest: ?[32]u8 = null,
     cut: Cut,
@@ -875,7 +879,8 @@ const RetainedRead = struct {
         if (self.adapter.server.cfg.user_manager != credential.manager) return error.Unauthorized;
         if (request.session_id) |encoded| {
             const id = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
-            try self.adapter.server.txn_sessions.requireActiveSqlReader(a, id, credential.sessionPrincipal(), self.adapter.server.localSessionNodeId());
+            const epoch = try self.adapter.server.txn_sessions.sqlReaderTenure(a, id, credential.sessionPrincipal(), self.adapter.server.localSessionNodeId());
+            if (epoch != self.lease_epoch) return error.SessionLeaseLost;
         }
         const revision = try self.validateAccess(a, credential);
         var context = try requestContext(credential, &request).platformDeadline();
@@ -1278,7 +1283,11 @@ const Job = struct {
         var execution_backend = guarded.backend();
         var opening: CursorAdmission = undefined;
         if (cursor_revision) |revision| {
-            opening = .{ .out = self.alloc, .adapter = self.adapter, .native = &native_adapter, .credential = self.credential, .admitted = revision };
+            const tenure = if (self.request.session_id) |hex|
+                try server.txn_sessions.sqlReaderTenure(self.alloc, try @import("distributed_txn.zig").parseTxnIdHex(hex), self.credential.sessionPrincipal(), server.localSessionNodeId())
+            else
+                null;
+            opening = .{ .lease_epoch = tenure, .out = self.alloc, .adapter = self.adapter, .native = &native_adapter, .credential = self.credential, .admitted = revision };
             opening.install(&execution_backend);
         }
         execution_backend.parameter_descriptor_hints = self.request.parameter_descriptors;

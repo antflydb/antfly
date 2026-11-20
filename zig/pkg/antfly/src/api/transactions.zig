@@ -1264,10 +1264,18 @@ pub const DurableSessionStore = struct {
             error.NotFound => null,
             else => return err,
         };
+        var epoch: u64 = 1;
+        var expires = now_ms +| ttl_ms;
         if (lease_raw) |raw| {
             const parsed = try std.json.parseFromSlice(lease_mod.LeaseRecord, self.alloc, raw, .{ .allocate = .alloc_always });
             defer parsed.deinit();
-            if (require_expired and parsed.value.expires_at_ms > now_ms and !std.mem.eql(u8, parsed.value.owner_id, owner_id)) return false;
+            const live = parsed.value.expires_at_ms > now_ms;
+            const same_owner = std.mem.eql(u8, parsed.value.owner_id, owner_id);
+            if (require_expired and live and !same_owner) return false;
+            if (live and same_owner) {
+                epoch = @max(1, parsed.value.epoch);
+                expires = @max(expires, parsed.value.expires_at_ms);
+            } else epoch = std.math.add(u64, parsed.value.epoch, 1) catch return error.LeaseEpochOverflow;
         }
 
         const session_value = try encodeSessionRecord(self.alloc, session);
@@ -1275,7 +1283,8 @@ pub const DurableSessionStore = struct {
         if (max_record_bytes) |limit| if (session_value.len > limit) return error.SessionRecordTooLarge;
         const lease_value = try std.json.Stringify.valueAlloc(self.alloc, lease_mod.LeaseRecord{
             .owner_id = owner_id,
-            .expires_at_ms = now_ms + ttl_ms,
+            .expires_at_ms = expires,
+            .epoch = epoch,
         }, .{});
         defer self.alloc.free(lease_value);
         var previous_needs_recovery = false;
@@ -2472,6 +2481,10 @@ pub const SessionRegistry = struct {
 
     /// A shared store is authoritative even when this node has a cached session.
     pub fn requireActiveSqlReader(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: []const u8, owner: u64) !void {
+        _ = try self.sqlReaderTenure(alloc, txn_id, principal, owner);
+    }
+
+    pub fn sqlReaderTenure(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: []const u8, owner: u64) !?u64 {
         const stripe = self.sessionLock(txn_id);
         stripe.lock();
         defer stripe.unlock();
@@ -2481,25 +2494,25 @@ pub const SessionRegistry = struct {
                 const checked = checkSqlReader(session, principal, owner);
                 self.mutex.unlock();
                 try checked;
-                return self.validateSqlLease(alloc, txn_id, owner);
+                return self.sqlLeaseTenure(alloc, txn_id, owner);
             }
             self.mutex.unlock();
         }
         const durable = self.durable orelse return error.SqlTransactionNotActive;
         const shared_lease = if (self.lease_store) |lease| std.meta.eql(lease.backend, durable.backend) else false;
-        switch (durable.backend) {
-            .docstore => |store| {
+        const epoch = switch (durable.backend) {
+            .docstore => |store| blk: {
                 var read = try store.beginReadTxn();
                 defer read.abort();
-                try requireDurableReader(alloc, &read, txn_id, principal, owner, shared_lease);
+                break :blk try requireDurableReader(alloc, &read, txn_id, principal, owner, shared_lease);
             },
-            .runtime => |store| {
+            .runtime => |store| blk: {
                 var read = try store.beginRead();
                 defer read.abort();
-                try requireDurableReader(alloc, &read, txn_id, principal, owner, shared_lease);
+                break :blk try requireDurableReader(alloc, &read, txn_id, principal, owner, shared_lease);
             },
-        }
-        if (!shared_lease) try self.validateSqlLease(alloc, txn_id, owner);
+        };
+        return if (shared_lease) epoch else self.sqlLeaseTenure(alloc, txn_id, owner);
     }
 
     pub fn getSqlState(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SqlState {
@@ -2529,10 +2542,15 @@ pub const SessionRegistry = struct {
     /// Read-only SQL statements must not consume an obsolete cached session
     /// after another node adopts its durable owner lease.
     pub fn validateSqlLease(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, owner: u64) !void {
-        const store = self.lease_store orelse return;
+        _ = try self.sqlLeaseTenure(alloc, txn_id, owner);
+    }
+
+    fn sqlLeaseTenure(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, owner: u64) !?u64 {
+        const store = self.lease_store orelse return null;
         var record = (try store.load(alloc, txn_id)) orelse return error.SessionLeaseLost;
         defer lease_mod.deinitRecord(alloc, &record);
         try requireReaderLease(record, owner);
+        return record.epoch;
     }
 
     pub fn setSqlFailed(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, failed: bool) !void {
@@ -5904,6 +5922,10 @@ const reader_field = "\"reader_v1\":\"";
 const reader_payload_len = 41;
 const reader_prefix_len = session_record.bound_session_header.len + reader_field.len + 2 * reader_payload_len + 2;
 
+comptime {
+    std.debug.assert(reader_prefix_len <= session_record.cached_prefix_bytes);
+}
+
 fn readerPayload(session: *const Session) [reader_payload_len]u8 {
     var payload: [reader_payload_len]u8 = undefined;
     payload[0] = @intFromBool(readerActive(session));
@@ -5926,14 +5948,14 @@ fn checkReaderPrefix(bytes: []const u8, principal: []const u8, owner: u64) !bool
     return true;
 }
 
-fn requireDurableReader(alloc: std.mem.Allocator, read: anytype, id: db_mod.types.TxnId, principal: []const u8, owner: u64, check_lease: bool) !void {
+fn requireDurableReader(alloc: std.mem.Allocator, read: anytype, id: db_mod.types.TxnId, principal: []const u8, owner: u64, check_lease: bool) !?u64 {
     const key = try makeSessionKey(alloc, id);
     defer alloc.free(key);
     checkDurableReaderSession(alloc, read, key, id, principal, owner) catch |err| switch (err) {
         error.NotFound => return error.SqlTransactionNotActive,
         else => return err,
     };
-    if (!check_lease) return;
+    if (!check_lease) return null;
     const lease_key = try makeSessionLeaseKey(alloc, id);
     defer alloc.free(lease_key);
     const raw = read.get(lease_key) catch |err| switch (err) {
@@ -5943,6 +5965,7 @@ fn requireDurableReader(alloc: std.mem.Allocator, read: anytype, id: db_mod.type
     const lease = try std.json.parseFromSlice(lease_mod.LeaseRecord, alloc, raw, .{});
     defer lease.deinit();
     try requireReaderLease(lease.value, owner);
+    return lease.value.epoch;
 }
 
 fn checkDurableReaderSession(alloc: std.mem.Allocator, read: anytype, key: []const u8, id: db_mod.types.TxnId, principal: []const u8, owner: u64) !void {
@@ -7313,6 +7336,16 @@ test "SQL session metadata for a retained reader checks the shared session and l
     try registry.requireActiveSqlReader(a, id, "alice", 7);
     try std.testing.expectError(error.SqlTransactionNotActive, registry.requireActiveSqlReader(a, id, "bob", 7));
     try store.put(key, raw);
+    const first = (try registry.sqlReaderTenure(a, id, "alice", 7)).?;
+    const now = nextTxnTimestamp() / std.time.ns_per_ms;
+    try std.testing.expect(try leases.renew(id, 7, now, 60_000));
+    try std.testing.expectEqual(first, (try registry.sqlReaderTenure(a, id, "alice", 7)).?);
+    try std.testing.expect(try leases.renew(id, 7, now + 120_000, 60_000));
+    try std.testing.expectEqual(first + 1, (try registry.sqlReaderTenure(a, id, "alice", 7)).?);
+    try std.testing.expect(try leases.renew(id, 8, now + 240_000, 60_000));
+    try std.testing.expectError(error.SessionLeaseLost, registry.sqlReaderTenure(a, id, "alice", 7));
+    try std.testing.expect(try leases.renew(id, 7, now + 360_000, 60_000));
+    try std.testing.expectEqual(first + 3, (try registry.sqlReaderTenure(a, id, "alice", 7)).?);
     const lease_key = try makeSessionLeaseKey(a, id);
     defer a.free(lease_key);
     try store.put(lease_key, "{\"owner_id\":\"node:7\",\"expires_at_ms\":1}");
