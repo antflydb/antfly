@@ -46497,7 +46497,15 @@ test "embeddinggemma2 pretrained video matches official F32 oracle" {
         const cosine = try @import("antfly_decisions").scoring.cosine(result.vector, &expected, 768);
         std.debug.print("embeddinggemma2 video={s} backend={s} tokens={d} cosine={d:.9} max_abs={d:.9}\n", .{ name, @tagName(backend), result.input_tokens, cosine, max_abs });
         try rows.append(a, .{ .name = name, .tokens = result.input_tokens, .cosine = cosine, .max_abs = max_abs, .norm = @sqrt(norm) });
-        failures += @intFromBool(cosine < @as(f64, if (backend != .native) 0.9999 else 0.99999) or max_abs > @as(f64, if (backend != .native) 1e-3 else 1e-4));
+        // CUDA uses the BF16 backbone. Apply the existing CUDA media
+        // candidate/control gate (profiling/media-acceptance.json). The codec
+        // qualification independently requires byte-exact selected pictures.
+        const abs_limit: f64 = switch (backend) {
+            .cuda => 0.003,
+            .metal => 0.001,
+            else => 0.0001,
+        };
+        failures += @intFromBool(cosine < @as(f64, if (backend != .native) 0.9999 else 0.99999) or max_abs > abs_limit);
         try std.testing.expectApproxEqAbs(@as(f64, 1), @sqrt(norm), 1e-5);
 
         if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VIDEO_PLAN") and std.mem.eql(u8, name, "h264_video")) {

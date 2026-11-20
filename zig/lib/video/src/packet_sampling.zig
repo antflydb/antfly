@@ -41,6 +41,11 @@ pub fn gemma4Pictures(reader: *const media.mp4.Reader, pictures: anytype, contro
 pub fn gemma4Av1Packets(a: std.mem.Allocator, reader: *media.mp4.Reader) !Gemma4Plan {
     const counts = try av1OutputCounts(a, reader);
     defer a.free(counts);
+    return gemma4Av1FromCounts(a, reader, counts);
+}
+
+pub fn gemma4Av1FromCounts(a: std.mem.Allocator, reader: *media.mp4.Reader, counts: []const usize) !Gemma4Plan {
+    if (counts.len != reader.packets.len) return error.InvalidVideoIndex;
     var visible = try std.DynamicBitSetUnmanaged.initEmpty(a, reader.packets.len);
     defer visible.deinit(a);
     for (counts, 0..) |count, i| switch (count) {

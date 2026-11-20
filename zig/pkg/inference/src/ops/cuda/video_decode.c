@@ -42,6 +42,9 @@ typedef struct {
     int display_left, display_top, matrix_override, range_override, transfer_override, primaries_override;
     unsigned sar_h, sar_v;
     int aspect_declared;
+    int single_picture_packet, decoded_in_packet;
+    int64_t packet_tag, surface_tag[32];
+    unsigned tagged_surfaces;
     tcuvidCreateVideoParser *create_parser;
     tcuvidDestroyVideoParser *destroy_parser;
     tcuvidParseVideoData *parse;
@@ -149,6 +152,16 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
 }
 static int decode(void *opaque, CUVIDPICPARAMS *picture) {
     Decoder *d = opaque;
+    // Parser timestamps are presentation clocks. They can be reassigned when
+    // the input numbers are opaque packet IDs and B pictures are reordered.
+    // Associate an access unit with the decoder surface it actually produced.
+    if (d->expected_codec != cudaVideoCodec_AV1) {
+        int slot = picture->CurrPicIdx;
+        if (!d->single_picture_packet || d->decoded_in_packet || slot < 0 || slot >= 32) { d->failed = 2; return 0; }
+        d->decoded_in_packet = 1;
+        d->surface_tag[slot] = d->packet_tag;
+        d->tagged_surfaces |= 1u << slot;
+    }
     if (d->decode(d->decoder, picture)) { d->failed = 3; return 0; }
     return 1;
 }
@@ -156,8 +169,15 @@ static int display(void *opaque, CUVIDPARSERDISPINFO *picture) {
     Decoder *d = opaque;
     if (!picture) return 1;
     if (!picture->progressive_frame) { d->failed = 2; return 0; }
-    // Ask whether this presentation timestamp is wanted before mapping a surface.
-    int wanted = d->frame(d->user, 0, 0, d->width, d->height, picture->timestamp, d->matrix, d->full_range, d->bit_depth, d->transfer);
+    int64_t tag = picture->timestamp;
+    if (d->expected_codec != cudaVideoCodec_AV1) {
+        int slot = picture->picture_index;
+        if (slot < 0 || slot >= 32 || !(d->tagged_surfaces & (1u << slot))) { d->failed = 2; return 0; }
+        tag = d->surface_tag[slot];
+        d->tagged_surfaces &= ~(1u << slot);
+    }
+    // Ask whether the displayed picture is wanted before mapping a surface.
+    int wanted = d->frame(d->user, 0, 0, d->width, d->height, tag, d->matrix, d->full_range, d->bit_depth, d->transfer);
     if (wanted < 0) { d->failed = 4; return 0; }
     if (!wanted) return 1;
     CUVIDPROCPARAMS p = {0};
@@ -170,7 +190,7 @@ static int display(void *opaque, CUVIDPARSERDISPINFO *picture) {
         status.decodeStatus == cuvidDecodeStatus_Error || status.decodeStatus == cuvidDecodeStatus_Error_Concealed) {
         d->unmap(d->decoder, device); d->failed = 3; return 0;
     }
-    int ok = d->frame(d->user, device, pitch, d->width, d->height, picture->timestamp, d->matrix, d->full_range, d->bit_depth, d->transfer);
+    int ok = d->frame(d->user, device, pitch, d->width, d->height, tag, d->matrix, d->full_range, d->bit_depth, d->transfer);
     int unmapped = d->unmap(d->decoder, device);
     if (ok < 0 || unmapped) { d->failed = 4; return 0; }
     return 1;
@@ -207,7 +227,7 @@ int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback call
     if (d->parser) return 3;
     if (codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_HEVC && codec != cudaVideoCodec_AV1) return 2;
     d->stream = stream; d->user = user; d->frame = callback;
-    d->failed = 0; d->sequence_seen = 0;
+    d->failed = 0; d->sequence_seen = 0; d->tagged_surfaces = 0;
     d->expected_width = width; d->expected_height = height; d->matrix_override = matrix; d->range_override = range;
     d->transfer_override = transfer; d->primaries_override = primaries; d->sar_h = sar_h; d->sar_v = sar_v; d->aspect_declared = aspect_declared;
     d->expected_codec = codec;
@@ -222,9 +242,14 @@ void antfly_nvdec_finish(Decoder *d) {
     d->parser = NULL; d->user = NULL; d->frame = NULL;
 }
 
-int antfly_nvdec_packet(Decoder *d, const unsigned char *bytes, unsigned size, int64_t pts, int eos) {
+enum parser_packet_kind { PACKET_CONFIGURATION, PACKET_END_OF_STREAM, PACKET_SAMPLE };
+int antfly_nvdec_packet(Decoder *d, const unsigned char *bytes, unsigned size, int64_t pts, enum parser_packet_kind kind) {
     CUVIDSOURCEDATAPACKET p = {0};
-    p.flags = eos ? CUVID_PKT_ENDOFSTREAM : CUVID_PKT_TIMESTAMP;
+    d->single_picture_packet = kind == PACKET_SAMPLE && d->expected_codec != cudaVideoCodec_AV1;
+    d->packet_tag = pts;
+    d->decoded_in_packet = 0;
+    p.flags = kind == PACKET_END_OF_STREAM ? CUVID_PKT_ENDOFSTREAM : kind == PACKET_SAMPLE ? CUVID_PKT_TIMESTAMP : 0;
+    if (d->single_picture_packet) p.flags |= CUVID_PKT_ENDOFPICTURE;
     p.payload = bytes; p.payload_size = size; p.timestamp = pts;
     int result = d->parse(d->parser, &p);
     return d->failed ? d->failed : (result ? 3 : 0);
