@@ -77,6 +77,40 @@ class StagedFormattingTests(unittest.TestCase):
         staged = self.git("show", ":example.py")
         self.assertTrue(staged.startswith(b"value = 1\n"))
 
+    def test_index_update_os_error_rolls_back_worktree(self):
+        self.base()
+        unformatted = b"value=1\n" + b"# context\n" * 12 + b"other = 0\n"
+        self.write("example.py", unformatted)
+        self.git("add", "--", "example.py")
+
+        def failing_replace(src, dst):
+            raise PermissionError("index is read-only")
+
+        with patch.object(format_staged.os, "replace", failing_replace):
+            with self.assertRaisesRegex(format_staged.HookError, "read-only"):
+                format_staged.format_staged(self.root, self.format)
+        self.assertEqual((self.root / "example.py").read_bytes(), unformatted)
+        self.assertEqual(self.git("show", ":example.py"), unformatted)
+        self.assertFalse((self.root / ".git" / "index.lock").exists())
+
+    def test_rollback_leaves_a_file_an_editor_changed(self):
+        self.base()
+        unformatted = b"value=1\n" + b"# context\n" * 12 + b"other = 0\n"
+        self.write("example.py", unformatted)
+        self.git("add", "--", "example.py")
+        edited = b"value = 1\n" + b"# context\n" * 12 + b"other = 9\n"
+
+        def edit_then_fail(*args):
+            # An editor saves over the formatted hunk before the index update fails.
+            self.write("example.py", edited)
+            raise format_staged.HookError("index update failed")
+
+        with patch.object(format_staged, "update_index_under_lock", edit_then_fail):
+            with self.assertRaisesRegex(format_staged.HookError, "example.py"):
+                format_staged.format_staged(self.root, self.format)
+        self.assertEqual((self.root / "example.py").read_bytes(), edited)
+        self.assertEqual(self.git("show", ":example.py"), unformatted)
+
     def test_index_changed_while_formatting_applies_nothing(self):
         self.base()
         self.write("example.py", b"value=1\n" + b"# context\n" * 12 + b"other = 0\n")
