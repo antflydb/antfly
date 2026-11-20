@@ -269,6 +269,20 @@ pub const BatchResult = struct {
     execution: BatchExecution,
     /// Provider-reported token counts, absent when the adapter has no usage.
     usage: ?inference_api.GenerateUsage = null,
+    /// Decoded HTTP response body bytes, when the adapter uses HTTP.
+    response_body_bytes: ?usize = null,
+
+    pub fn responseBytes(self: BatchResult) usize {
+        var retained_bytes: usize = 0;
+        for (self.items) |item| {
+            retained_bytes +|= item.text.len +| item.item_id.len +|
+                (if (item.document_json) |value| value.len else 0) +|
+                (if (item.fields_json) |value| value.len else 0) +|
+                (if (item.regions_json) |value| value.len else 0) +|
+                (if (item.source_fingerprint) |value| value.len else 0);
+        }
+        return @max(retained_bytes, self.response_body_bytes orelse 0);
+    }
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.items) |*item| deinitResult(alloc, item);
@@ -710,7 +724,10 @@ const AntflyReaderState = struct {
             var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms", .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
             defer response.deinit();
             if (!response.ok()) return readAntflyHttpError(alloc, response.status.code, responseCapabilityStale(response), response.body orelse "");
-            return documentBatchResult(alloc, response.body orelse return error.InvalidReadResultCount);
+            const response_body = response.body orelse return error.InvalidReadResultCount;
+            var batch = try documentBatchResult(alloc, response_body);
+            batch.response_body_bytes = response_body.len;
+            return batch;
         }
         const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
         defer alloc.free(images);
@@ -758,7 +775,10 @@ const AntflyReaderState = struct {
         defer resp.deinit();
         if (!resp.ok()) return readAntflyHttpError(alloc, resp.status.code, responseCapabilityStale(resp), resp.body orelse "");
 
-        return decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
+        const response_body = resp.body orelse return error.EmptyResponse;
+        var batch = try decodeReadBatch(alloc, response_body, req.images.len);
+        batch.response_body_bytes = response_body.len;
+        return batch;
     }
 
     fn readEncodedReported(self: *AntflyReaderState, alloc: Allocator, req: EncodedRequest) !BatchResult {
@@ -825,8 +845,10 @@ const AntflyReaderState = struct {
         defer resp.deinit();
         if (!resp.ok()) return readAntflyHttpError(alloc, resp.status.code, responseCapabilityStale(resp), resp.body orelse "");
 
-        var batch = try decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
+        const response_body = resp.body orelse return error.EmptyResponse;
+        var batch = try decodeReadBatch(alloc, response_body, req.images.len);
         errdefer batch.deinit(alloc);
+        batch.response_body_bytes = response_body.len;
         for (batch.items, req.images) |*item, original| {
             if (item.item_id.len > 0) alloc.free(@constCast(item.item_id));
             item.item_id = "";
@@ -1061,7 +1083,10 @@ fn CloudReaderState(comptime provider: Provider) type {
             });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
-            return hosted.chat(alloc, resp.body orelse return error.EmptyResponse);
+            const response_body = resp.body orelse return error.EmptyResponse;
+            var batch = try hosted.chat(alloc, response_body);
+            batch.response_body_bytes = response_body.len;
+            return batch;
         }
 
         fn readVertex(self: *Self, alloc: Allocator, req: Request) !BatchResult {
@@ -1109,7 +1134,10 @@ fn CloudReaderState(comptime provider: Provider) type {
             });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
-            return hosted.vertex(alloc, resp.body orelse return error.EmptyResponse);
+            const response_body = resp.body orelse return error.EmptyResponse;
+            var batch = try hosted.vertex(alloc, response_body);
+            batch.response_body_bytes = response_body.len;
+            return batch;
         }
     };
 }

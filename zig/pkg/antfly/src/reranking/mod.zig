@@ -522,18 +522,25 @@ pub fn rerankContentWithOptions(
                 fallback_cache = remote_capabilities.Cache.init(alloc, http.io);
                 capability_cache = &fallback_cache.?;
             }
+            var placement: remote_capabilities.DiscoveryHeaders = .{};
+            const discovery_headers = try placement.withShape(headers, .{ .items = 1, .media = has_media, .modalities = .{ .text = true, .image = has_media }, .output_tokens = 0, .candidates = documents.len });
+            var capability_identity: remote_capabilities.LeaseIdentity = .{};
             if (cfg.model.len > 0) {
                 const capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
                     http,
                     endpoint,
                     cfg.model,
                     .rerank,
-                    headers,
+                    discovery_headers,
                     .{
                         .deadline_ns = request_context.deadline_ns,
                         .cancellation = request_context.cancellation orelse .none,
                     },
                 );
+                capability_identity = .{
+                    .routing_token = capability_lease.routing_token,
+                    .descriptor_revision = capability_lease.descriptor_revision,
+                };
                 if (capability_lease.capabilities) |discovered| {
                     discovered.validateInvocation(.rerank, .{
                         .item_count = 1,
@@ -565,7 +572,7 @@ pub fn rerankContentWithOptions(
                 null);
             var result = provider.rerankDocuments(alloc, cfg.model, query, documents, content.parts) catch |err| {
                 if (err == error.InferenceCapabilitiesStale and cfg.model.len > 0)
-                    try capability_cache.?.invalidate(endpoint, cfg.model, .rerank, headers);
+                    try capability_cache.?.invalidateLease(endpoint, cfg.model, .rerank, discovery_headers, capability_identity);
                 return err;
             };
             defer result.deinit();
