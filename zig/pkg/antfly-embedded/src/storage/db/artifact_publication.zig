@@ -1417,7 +1417,7 @@ fn localDagBindingKeyFor(namespace: [24]u8, name: []const u8, generation: u64) [
 }
 
 pub const PreparedBaseVectors = PreparedEffects;
-pub const Coverage = struct { index_name: []const u8, generation: u64, document_key: []const u8, artifact_names: []const []const u8 = &.{}, artifact_keys: []const []const u8 = &.{}, outcome: ?enum { produced, skipped } = null };
+pub const Coverage = struct { index_name: []const u8, generation: u64, document_key: []const u8, artifact_names: []const []const u8 = &.{}, artifact_keys: []const []const u8 = &.{}, outcome: ?enum { produced, skipped, terminal_failed } = null };
 
 pub fn prepareEffects(alloc: std.mem.Allocator, command: Command, catalogs: @import("artifact_inventory.zig").Catalogs) !PreparedEffects {
     return switch (command.producer_kind) {
@@ -1536,7 +1536,11 @@ pub fn stageCoverage(alloc: std.mem.Allocator, txn: anytype, command: Command, c
                 break;
             }
         }
-        const target: ?usize = if (tombstonedSource(command.sources, item.document_key)) null else if (item.outcome) |outcome| (if (outcome == .produced) @as(usize, 0) else 1) else if (produced) 0 else 1;
+        const target: ?usize = if (tombstonedSource(command.sources, item.document_key)) null else if (item.outcome) |outcome| switch (outcome) {
+            .produced => 0,
+            .skipped => 1,
+            .terminal_failed => 2,
+        } else if (produced) 0 else 1;
         const marker = try epoch.marker(alloc, scope, item.index_name, item.generation, item.document_key);
         defer alloc.free(marker);
         const previous_raw = txn.get(marker) catch |err| switch (err) {
@@ -1575,6 +1579,32 @@ pub fn stageCoverage(alloc: std.mem.Allocator, txn: anytype, command: Command, c
         }
         if (target) |index| try txn.put(marker, outcomes[index]) else try txn.delete(marker);
     }
+}
+
+/// A cyclic candidate never changes accepted artifacts. Its output owners
+/// still become incomplete for coordinated publication until a repair succeeds.
+pub fn stageGraphCycleCoverage(alloc: std.mem.Allocator, txn: anytype, command: Command) !void {
+    if (command.mode != .publish or command.producer_kind != .graph) return error.InvalidBatchRequest;
+    const owners = try command.outputSources();
+    const coverage = try alloc.alloc(Coverage, owners.count());
+    defer alloc.free(coverage);
+    var count: usize = 0;
+    for (command.sources, 0..) |source, source_index| {
+        if (!owners.isSet(source_index)) continue;
+        coverage[count] = .{
+            .index_name = command.producer_name,
+            .generation = command.producer_generation,
+            .document_key = source.document_key,
+            .outcome = .terminal_failed,
+        };
+        count += 1;
+    }
+    stageCoverage(alloc, txn, command, coverage) catch |err| switch (err) {
+        // All items share the same counter baseline. An absent baseline
+        // blocks publication on its own and leaves receipts inspectable.
+        error.ArtifactCoverageBaselinePending => {},
+        else => return err,
+    };
 }
 
 fn tombstonedSource(sources: []const Source, document: []const u8) bool {
@@ -1885,6 +1915,17 @@ test "ordered artifact inventory publication coverage is point bounded idempoten
     try std.testing.expectEqualStrings("produced", try txn.get(marker));
     const missing = try epoch.counter(alloc, scope, "shared", 1, "terminal_failed");
     defer alloc.free(missing);
+    var failed_graph = command;
+    failed_graph.producer_kind = .graph;
+    failed_graph.sources = &.{.{ .document_key = "doc", .content_digest = @splat(3), .timestamp = 1, .input_position = null }};
+    try stageGraphCycleCoverage(alloc, &txn, failed_graph);
+    try stageGraphCycleCoverage(alloc, &txn, failed_graph);
+    try std.testing.expectEqualStrings("existing sibling output", try txn.get(second));
+    try std.testing.expectEqualStrings("terminal_failed", try txn.get(marker));
+    try std.testing.expectEqual(@as(u64, 1), try keys.decodeDerivedCoverageOutcomeCount(try txn.get(missing)));
+    try stageCoverage(alloc, &txn, command, &transitions);
+    try std.testing.expectEqualStrings("produced", try txn.get(marker));
+    try std.testing.expectEqual(@as(u64, 0), try keys.decodeDerivedCoverageOutcomeCount(try txn.get(missing)));
     try txn.delete(missing);
     try std.testing.expectError(error.ArtifactCoverageBaselinePending, stageCoverage(alloc, &txn, command, &transitions));
     try txn.put(missing, &@as([8]u8, @splat(0)));

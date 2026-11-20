@@ -28301,7 +28301,9 @@ pub const DB = struct {
         const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
-        try @import("artifact_publication.zig").stageRejection(&txn, command, entry.index, reason);
+        const publication = @import("artifact_publication.zig");
+        try publication.stageRejection(&txn, command, entry.index, reason);
+        if (reason == .graph_cycle) try publication.stageGraphCycleCoverage(self.alloc, &txn, command);
         std.log.debug("artifact publication rejected mode={s} producer={s} index={d} reason={s}", .{ @tagName(command.mode), command.producer_name, entry.index, @tagName(reason) });
         // Retryable outcomes retain the immutable upload for a later apply.
         if (!reason.preservesUpload()) try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
