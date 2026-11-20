@@ -1421,6 +1421,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_part_items_with_context_fn = embedDensePartItemsWithContext,
             .dense_embed_part_items_planned_fn = embedDensePartItemsPlanned,
             .resolve_part_lease_fn = resolveDensePartLease,
+            .resolve_media_part_lease_fn = resolveDenseMediaPartLease,
             .part_batch_limit_fn = densePartBatchLimit,
             .capabilities_with_context_fn = denseCapabilitiesWithContext,
             .dense_embed_raster_items_with_context_fn = embedDenseRasterItemsWithContext,
@@ -2341,6 +2342,21 @@ pub const ManagedEmbedder = struct {
     }
 
     fn resolveDensePartLease(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, context: ?RequestContext) !inference_work.CapabilityLease {
+        return resolveDensePartLeaseForShape(ptr, alloc, name, context, null);
+    }
+
+    fn resolveDenseMediaPartLease(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, context: ?RequestContext, items: usize) !inference_work.CapabilityLease {
+        var count = @max(items, 1);
+        while (true) {
+            return resolveDensePartLeaseForShape(ptr, alloc, name, context, count) catch |err| {
+                if (err != error.InferenceDiscoveryTooManyItems or count == 1) return err;
+                count /= 2;
+                continue;
+            };
+        }
+    }
+
+    fn resolveDensePartLeaseForShape(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, context: ?RequestContext, media_items: ?usize) !inference_work.CapabilityLease {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
         var entry = configured.requestOverlay(alloc);
@@ -2350,7 +2366,10 @@ pub const ManagedEmbedder = struct {
             try value.check();
             applyRequestContext(&entry, value, &cancellation);
         }
-        return densePartLeaseForEntry(&entry, alloc);
+        if (media_items == null) return densePartLeaseForEntry(&entry, alloc);
+        var lease = try discoveredEmbeddingLeaseForShape(&entry, alloc, media_items);
+        if (entry.declared_inputs) |inputs| if (lease.capabilities) |*caps| applyDeclaredInputs(caps, inputs);
+        return lease;
     }
 
     fn densePartLeaseForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.CapabilityLease {
@@ -2361,6 +2380,10 @@ pub const ManagedEmbedder = struct {
     }
 
     fn discoveredEmbeddingLeaseForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.CapabilityLease {
+        return discoveredEmbeddingLeaseForShape(entry, alloc, null);
+    }
+
+    fn discoveredEmbeddingLeaseForShape(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator, media_items: ?usize) !inference_work.CapabilityLease {
         if (entry.antfly_provider) |local| {
             if (entry.discovery_context) |context| {
                 try context.check();
@@ -2393,12 +2416,20 @@ pub const ManagedEmbedder = struct {
                 auth_header = try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref);
             var storage: [4][2][]const u8 = undefined;
             const headers = remoteEmbeddingHeaders(entry, auth_header, &storage);
-            var lease = discoverRemoteEmbeddingLease(entry, http, headers) catch |err| switch (err) {
+            var placement: remote_capabilities.DiscoveryHeaders = .{};
+            const discovery_headers = if (media_items) |count| try embeddingPlacementHeaders(&placement, headers, count, true) else headers;
+            var lease = discoverRemoteEmbeddingLease(entry, http, discovery_headers) catch |err| switch (err) {
                 error.QueryEmbeddingOverloaded => return error.QueueFull,
                 error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilitySelectorAbsent, error.InferenceCapabilitiesStale => return error.InferenceCapacityUnavailable,
                 else => return err,
             };
             if (lease.capabilities != null) {
+                if (media_items) |count| {
+                    lease.media_placement_items = count;
+                    const caps = &lease.capabilities.?;
+                    caps.batch.max_items = @min(caps.batch.max_items, count);
+                    caps.batch.preferred_items = @min(caps.batch.preferred_items, caps.batch.max_items);
+                }
                 lease.scope_digest = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, headers);
                 return lease;
             }
@@ -6575,7 +6606,7 @@ fn bindRemoteEmbeddingLease(
     placement_headers: []const [2][]const u8,
     shape: inference_work.InvocationShape,
 ) !remote_capabilities.CapabilityLease {
-    const lease = try acquireRemoteEmbeddingLease(entry, http, provider, headers, placement_headers);
+    const lease = try acquireRemoteEmbeddingLease(entry, http, provider, headers, placement_headers, null);
     if (lease.capabilities) |capabilities| try capabilities.validateInvocation(.embed, shape);
     return lease;
 }
@@ -6608,6 +6639,7 @@ fn resolvePlannedRemoteEmbeddingLease(
     headers: []const [2][]const u8,
     placement_headers: []const [2][]const u8,
     planned: remote_capabilities.CapabilityLease,
+    media_items: ?usize,
 ) !remote_capabilities.CapabilityLease {
     const scope = planned.scope_digest orelse return planned;
     const shaped_scope = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, placement_headers);
@@ -6615,6 +6647,9 @@ fn resolvePlannedRemoteEmbeddingLease(
     const base_scope = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, headers);
     if (!std.mem.eql(u8, &scope, &base_scope)) return error.InferenceCapabilitiesStale;
     if (planned.routing_token == null) return planned;
+    if (planned.media_placement_items) |limit| {
+        if (media_items) |count| if (count <= limit) return planned;
+    }
 
     const revision = planned.descriptor_revision orelse return error.InferenceCapabilitiesStale;
     var execution = try discoverRemoteEmbeddingLease(entry, http, placement_headers);
@@ -6635,9 +6670,10 @@ fn acquireRemoteEmbeddingLease(
     provider: *antfly_provider_mod.Provider,
     headers: []const [2][]const u8,
     placement_headers: []const [2][]const u8,
+    media_items: ?usize,
 ) !remote_capabilities.CapabilityLease {
     if (entry.planned_embedding_lease) |planned| {
-        var execution = try resolvePlannedRemoteEmbeddingLease(provider.allocator, entry, http, headers, placement_headers, planned);
+        var execution = try resolvePlannedRemoteEmbeddingLease(provider.allocator, entry, http, headers, placement_headers, planned, media_items);
         provider.model_revision = if (execution.capabilities) |caps| caps.model_revision else null;
         if (execution.planning_only) execution.capabilities = null;
         provider.setFramedAttachments(if (execution.capabilities) |caps| caps.framed_attachments else false);
@@ -6675,6 +6711,7 @@ fn bindRemoteEmbeddingPartsLease(
         provider,
         headers,
         placement_headers,
+        if (hasEmbeddingMedia(parts)) (if (independently_addressable) parts.len else 1) else null,
     );
     if (lease.capabilities) |capabilities| {
         const transport: inference_work.AttachmentTransport = if (capabilities.framed_attachments)
@@ -6705,10 +6742,15 @@ fn invalidateRemoteEmbeddingLease(
         .descriptor_revision = lease.descriptor_revision,
     };
     try cache.invalidateLease(entry.base_url, entry.model, .embed, headers, rejected);
-    // A caller-owned plan may have been obtained without invocation details.
-    if (headers.len > 0 and
-        std.ascii.eqlIgnoreCase(headers[headers.len - 1][0], remote_capabilities.discovery_shape_header))
-        try cache.invalidateLease(entry.base_url, entry.model, .embed, headers[0 .. headers.len - 1], rejected);
+    if (headers.len > 0 and std.ascii.eqlIgnoreCase(headers[headers.len - 1][0], remote_capabilities.discovery_shape_header)) {
+        const base = headers[0 .. headers.len - 1];
+        try cache.invalidateLease(entry.base_url, entry.model, .embed, base, rejected);
+        if (lease.media_placement_items) |count| {
+            var placement: remote_capabilities.DiscoveryHeaders = .{};
+            const planned_headers = try embeddingPlacementHeaders(&placement, base, count, true);
+            try cache.invalidateLease(entry.base_url, entry.model, .embed, planned_headers, rejected);
+        }
+    }
 }
 
 fn embedWithEntryParts(
@@ -7319,7 +7361,7 @@ fn embedPartItemsWithEntry(
     const placement_headers = try embeddingPlacementHeaders(&placement, capability_headers, items.len, hasEmbeddingMedia(items));
     const planned_capabilities = planned_lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
     const execution_lease = if (planned_lease.scope_digest != null) lease: {
-        const lease = try resolvePlannedRemoteEmbeddingLease(alloc, entry, http, capability_headers, placement_headers, planned_lease);
+        const lease = try resolvePlannedRemoteEmbeddingLease(alloc, entry, http, capability_headers, placement_headers, planned_lease, if (hasEmbeddingMedia(items)) items.len else null);
         const live = lease.capabilities orelse return error.InferenceCapabilitiesStale;
         try validateDensePartItemInvocation(alloc, live, if (live.framed_attachments) .segmented_framed_binary else .base64_payload, items);
         provider.model_revision = live.model_revision;
@@ -8827,9 +8869,15 @@ test "managed embedder owned numeric lease executes without cache residency and 
     const vectors = try planned.embedDensePartItems(alloc, "visual", &items, 2);
     defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
     try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, vectors[0]);
+    var media_window = lease;
+    media_window.scope_digest = try remote_capabilities.scopeDigest(alloc, url, "clipclap", .embed, &.{.{ "X-Antfly-Inference-Workload-Type", "write-heavy" }});
+    media_window.media_placement_items = 4;
+    const page_vectors = try managed.denseInterface().withPartLease(media_window).embedDensePartItems(alloc, "visual", &items, 2);
+    defer db_embedder.freeDenseEmbeddingBatch(alloc, page_vectors);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, page_vectors[0]);
     entries[0].source_table = @constCast("rotated-scope");
     try std.testing.expectError(error.InferenceCapabilitiesStale, planned.embedDensePartItems(alloc, "visual", &items, 2));
-    try std.testing.expectEqual(@as(usize, 1), app.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), app.calls.load(.acquire));
 }
 
 test "managed embedder media planning is pure and typed results avoid JSON reservations" {

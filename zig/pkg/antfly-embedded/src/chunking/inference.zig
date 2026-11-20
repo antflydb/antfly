@@ -286,8 +286,9 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         value.value = try value.value.includingEmbedding(value.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
     };
     const boundary = if (resolved_outputs) |value| try value.value.boundary() else null;
-    const model = if (boundary) |value| value.model else if (cfg.embedding) |target| target.model else if (cfg.model.len > 0) cfg.model else "fixed";
-    const capability_task: inference_work.Operation = if (boundary) |value| if (value.kind == .transcribe) .transcribe else .embed else if (cfg.embedding != null) .embed else .chunk;
+    const chunk_model = if (cfg.model.len > 0) cfg.model else "fixed";
+    const boundary_model = if (boundary) |value| value.model else if (cfg.embedding) |target| target.model else null;
+    const boundary_task: inference_work.Operation = if (boundary != null and boundary.?.kind == .transcribe) .transcribe else .embed;
     // The node default credential accompanies only the node default endpoint
     // (chunkers carry no credential of their own); discovery and the chunk
     // call authenticate identically.
@@ -302,31 +303,30 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, routing_header_count);
     const routing_headers = routing_header_storage[0..routing_header_count];
     var placement: remote_capabilities.DiscoveryHeaders = .{};
-    // Model-aware chunking discovers an upstream boundary contract. The
-    // chunk service owns the boundary invocation and its request shape.
-    const discovery_headers = if (capability_task == .chunk)
-        try placement.withShape(routing_headers, .{ .items = 1, .media = input == .binary, .output_tokens = 0 })
-    else
-        routing_headers;
+    const discovery_headers = try placement.withShape(routing_headers, .{ .items = 1, .media = input != .text, .output_tokens = 0 });
+    if (boundary_model) |model| {
+        const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
+        defer if (accounting) |hook| hook.finish(hook.ptr, started);
+        const lease = try capability_cache.?.getOrDiscoverLeaseWithContext(http, endpoint, model, boundary_task, routing_headers, execution.waitContext());
+        if (lease.capabilities) |caps| {
+            if (cfg.isModelAware() and !caps.model_aware_chunking_v1) return error.ModelAwareChunkProviderRequired;
+        }
+    }
     var capability_lease = dispatch: {
         const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
         defer if (accounting) |hook| hook.finish(hook.ptr, started);
-        break :dispatch try capability_cache.?.getOrDiscoverLeaseWithContext(
-            http,
-            endpoint,
-            model,
-            capability_task,
-            discovery_headers,
-            execution.waitContext(),
-        );
+        break :dispatch capability_cache.?.getOrDiscoverLeaseWithContext(http, endpoint, chunk_model, .chunk, discovery_headers, execution.waitContext()) catch |err| switch (err) {
+            error.RemoteCapabilitySelectorAbsent, error.RemoteCapabilityDiscoveryUnsupported => if (boundary_model != null)
+                remote_capabilities.CapabilityLease{ .capabilities = null }
+            else
+                return err,
+            else => return err,
+        };
     };
     var attachment_transport: inference_work.AttachmentTransport = .base64_payload;
     if (capability_lease.capabilities) |capabilities| {
-        if (cfg.isModelAware() and !capabilities.model_aware_chunking_v1) return error.ModelAwareChunkProviderRequired;
-        if (capabilities.framed_attachments and switch (input) {
-            .binary => true,
-            .text, .source => false,
-        }) attachment_transport = .segmented_framed_binary;
+        if (capabilities.framed_attachments and input == .binary)
+            attachment_transport = .segmented_framed_binary;
         const shape: inference_work.InvocationShape = switch (input) {
             .source => .{ .item_count = 1 },
             .text => |text| .{
@@ -361,16 +361,14 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         header_storage[header_count] = header;
         header_count += 1;
     }
-    // An upstream embedding/transcription lease describes the boundary
-    // service, so only the direct chunk contract can authorize /chunk.
-    if (capability_task == .chunk) if (capability_lease.routing_token) |*token| {
+    if (capability_lease.routing_token) |*token| {
         header_storage[header_count] = .{ remote_capabilities.capability_token_header, token.slice() };
         header_count += 1;
-    };
-    if (capability_task == .chunk) if (capability_lease.descriptor_revision) |*revision| {
+    }
+    if (capability_lease.descriptor_revision) |*revision| {
         header_storage[header_count] = .{ remote_capabilities.capability_revision_header, revision.slice() };
         header_count += 1;
-    };
+    }
     if (attachment_transport == .segmented_framed_binary) {
         header_storage[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
         header_count += 1;
@@ -409,7 +407,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         if (resp.status.code == 409 and stale != null and
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
         {
-            if (capability_task == .chunk) try capability_cache.?.invalidateLease(endpoint, model, capability_task, discovery_headers, .{
+            try capability_cache.?.invalidateLease(endpoint, chunk_model, .chunk, discovery_headers, .{
                 .routing_token = capability_lease.routing_token,
                 .descriptor_revision = capability_lease.descriptor_revision,
             });

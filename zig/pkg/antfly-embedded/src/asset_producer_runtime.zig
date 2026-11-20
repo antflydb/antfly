@@ -1133,7 +1133,12 @@ pub const Runtime = struct {
                         return error.InferenceInvocationMemoryUnavailable;
                 }
                 if (document_checkpoints) break :blk .borrowed_binary;
-                break :blk if (remote) remoteAttachmentTransport(try self.extractorCapabilities(alloc, parsed), extractorAttachmentTransport(parsed)) else extractorAttachmentTransport(parsed);
+                if (!remote) break :blk extractorAttachmentTransport(parsed);
+                const caps = self.extractorCapabilitiesForRequests(alloc, &parsed, requests) catch |err| switch (err) {
+                    error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryUnsupported, error.RemoteCapabilitySelectorAbsent => null,
+                    else => return err,
+                };
+                break :blk remoteAttachmentTransport(caps, .base64_payload);
             },
             .transcriber => blk: {
                 var parsed = try std.json.parseFromSlice(transcribing.Config, alloc, requests[0].config_json, .{
@@ -1596,7 +1601,8 @@ pub const Runtime = struct {
                 }
                 var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
                 defer cfg.deinit(alloc);
-                break :blk try self.extractorCapabilities(alloc, cfg);
+                try self.routeExtractorConfig(alloc, &cfg);
+                break :blk try self.extractorCapabilitiesForRequests(alloc, &cfg, requests);
             },
             else => null,
         };
@@ -1673,9 +1679,7 @@ pub const Runtime = struct {
             .transcriber => .serial_compatibility,
             .extractor => blk: {
                 if (try generated_extractor.isGenerated(alloc, requests[0].config_json)) break :blk .native;
-                if (!try self.canExtractBatch(alloc, requests)) break :blk .none;
-                const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse break :blk .none;
-                break :blk capabilities.batch.mode;
+                break :blk try self.extractorBatchMode(alloc, requests);
             },
         };
     }
@@ -1969,22 +1973,40 @@ pub const Runtime = struct {
         };
     }
 
-    fn canExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
-        if (!requestsShareRoute(requests)) return false;
-        if (try generated_extractor.isGenerated(alloc, requests[0].config_json)) return true;
-        const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse return false;
-        if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
-            capabilities.batch.mode == .none) return false;
-        var cfg = extracting.parseConfigFromSlice(alloc, requests[0].config_json) catch return false;
+    fn extractorBatchMode(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !inference_work.BatchMode {
+        if (!requestsShareRoute(requests)) return .none;
+        if (try privacyRequestsEmpty(alloc, requests)) return .none;
+        var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
-        self.routeExtractorConfig(alloc, &cfg) catch return false;
-        validateExtractorBatchPlan(
-            alloc,
-            capabilities,
-            extractorAttachmentTransport(cfg),
-            requests,
-        ) catch return false;
-        return true;
+        try self.routeExtractorConfig(alloc, &cfg);
+        const caps = (try self.extractorCapabilitiesForRequests(alloc, &cfg, requests)) orelse return .none;
+        validateExtractorBatchPlan(alloc, caps, extractorAttachmentTransport(cfg), requests) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return .none;
+        };
+        return caps.batch.mode;
+    }
+
+    fn extractorCapabilitiesForRequests(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, requests: []const asset_producer.Request) !?inference_work.InferenceCapabilities {
+        if (cfg.provider != .antfly or cfg.resolvedUrl() == null)
+            return self.extractorCapabilities(alloc, cfg.*);
+        var count = requests.len;
+        var shape: remote_capabilities.DiscoveryShape = undefined;
+        var caps = (try self.bindExtractorWindow(alloc, cfg, requests, &count, &shape)) orelse return null;
+        caps.batch.max_items = @min(caps.batch.max_items, count);
+        caps.batch.preferred_items = @min(caps.batch.preferred_items, caps.batch.max_items);
+        return caps;
+    }
+
+    fn bindExtractorWindow(self: *Runtime, alloc: Allocator, cfg: *extracting.Config, requests: []const asset_producer.Request, count: *usize, shape: *remote_capabilities.DiscoveryShape) !?inference_work.InferenceCapabilities {
+        while (true) {
+            shape.* = try producerDiscoveryShape(alloc, requests[0..count.*]);
+            return self.bindExtractorCapabilityLease(alloc, cfg, shape.*) catch |err| {
+                if (err != error.InferenceDiscoveryTooManyItems or count.* <= 1) return err;
+                count.* /= 2;
+                continue;
+            };
+        }
     }
 
     fn extractorCapabilities(
@@ -2701,18 +2723,20 @@ pub const Runtime = struct {
     }
 
     fn tryExtractBatchReported(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !asset_producer.ProducedBatch {
-        if (requests.len > 0 and try generated_extractor.isGenerated(alloc, requests[0].config_json)) return self.extractGenerated(alloc, requests);
+        if (requests.len == 0 or !requestsShareRoute(requests)) return error.BatchIncompatible;
+        if (try generated_extractor.isGenerated(alloc, requests[0].config_json)) return self.extractGenerated(alloc, requests);
         for (requests) |request| {
             if (request.producer_type != .extractor) return error.BatchIncompatible;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
         }
 
-        const capabilities = (try capabilitiesForRequests(self, alloc, requests)) orelse return error.BatchIncompatible;
         var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
         try self.routeExtractorConfig(alloc, &cfg);
         const remote = cfg.provider == .antfly and cfg.resolvedUrl() != null;
-        if (!remote) try validateExtractorBatchCompatibility(alloc, capabilities, extractorAttachmentTransport(cfg), requests);
+        const local_capabilities = if (remote) null else (try self.extractorCapabilities(alloc, cfg)) orelse return error.BatchIncompatible;
+        if (local_capabilities) |caps| try validateExtractorBatchCompatibility(alloc, caps, extractorAttachmentTransport(cfg), requests);
+        var item_limit = if (local_capabilities) |caps| caps.batch.max_items else requests.len;
         const outputs = try alloc.alloc([]u8, requests.len);
         var outputs_owned = true;
         errdefer if (outputs_owned) {
@@ -2721,23 +2745,20 @@ pub const Runtime = struct {
         };
         for (outputs) |*output| output.* = &.{};
         var execution: inference_work.ExecutionReport = .{ .requested_items = requests.len };
-        var discovery_item_limit: usize = std.math.maxInt(usize);
         var start: usize = 0;
         while (start < requests.len) {
-            var active = capabilities;
-            var end = @min(start +| @min(active.batch.max_items, discovery_item_limit), requests.len);
+            var active: inference_work.InferenceCapabilities = undefined;
+            var end = @min(start +| item_limit, requests.len);
             if (end <= start) return error.InvalidInferenceCapabilities;
             var shape: remote_capabilities.DiscoveryShape = .{ .items = end - start };
             while (true) {
                 if (remote) {
-                    shape = try producerDiscoveryShape(alloc, requests[start..end]);
-                    active = (self.bindExtractorCapabilityLease(alloc, &cfg, shape) catch |err| {
-                        if (err != error.InferenceDiscoveryTooManyItems or end - start <= 1) return err;
-                        discovery_item_limit = (end - start) / 2;
-                        end = start + discovery_item_limit;
-                        continue;
-                    }) orelse return error.InvalidInferenceCapabilities;
-                }
+                    var count = end - start;
+                    active = (try self.bindExtractorWindow(alloc, &cfg, requests[start..end], &count, &shape)) orelse return error.InvalidInferenceCapabilities;
+                    if (count < end - start) item_limit = @min(item_limit, count);
+                    end = start + count;
+                    item_limit = @min(item_limit, active.batch.max_items);
+                } else active = local_capabilities.?;
                 if (!remote and active.batch.mode == .none) return error.BatchIncompatible;
                 const transport = extractorAttachmentTransport(cfg);
                 const fitting = try extractorBatchEnd(alloc, active, transport, requests[0..end], start);
@@ -3884,7 +3905,7 @@ pub const Runtime = struct {
         }
         capability_auth_count = try self.execution.routing.appendHeaders(&capability_auth_storage, capability_auth_count);
         var placement: remote_capabilities.DiscoveryHeaders = .{};
-        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .output_tokens = discoveryOutputTokens(request.max_tokens) });
+        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .output_tokens = discoveryOutputTokens(request.max_tokens orelse execution_cfg.max_tokens) });
         const discovered_capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
             const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
@@ -4024,7 +4045,7 @@ pub const Runtime = struct {
             capability_auth_count,
         );
         var placement: remote_capabilities.DiscoveryHeaders = .{};
-        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .output_tokens = discoveryOutputTokens(request.max_tokens) });
+        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = @max(1, request.images.len), .media = request.images.len != 0, .output_tokens = discoveryOutputTokens(request.max_tokens orelse execution_cfg.max_tokens) });
         const capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
             const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
             const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
@@ -4331,7 +4352,7 @@ pub const Runtime = struct {
         }
         capability_auth_count = try self.execution.routing.appendHeaders(&capability_auth_storage, capability_auth_count);
         var placement: remote_capabilities.DiscoveryHeaders = .{};
-        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = 1, .media = true });
+        const capability_auth_headers = try placement.withShape(capability_auth_storage[0..capability_auth_count], .{ .items = 1, .media = true, .output_tokens = 0 });
         if (cfg_parsed.value.provider == .antfly) {
             const endpoint = cfg_parsed.value.resolvedUrl() orelse return error.InvalidTranscribingConfig;
             const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
@@ -5334,7 +5355,7 @@ fn validateExtractorBatchCompatibility(
     // An executor that advertises no batching (the GLiNER boundary contract:
     // mode = .none, max_items = 1 -- see resolvedExecutorBatchImplementation
     // in zig/pkg/inference/src/server/server.zig) is not a malformed
-    // capability, it is simply not batchable. `canExtractBatch` already
+    // capability, it is simply not batchable. `extractorBatchMode` already
     // treats this as "return false, use sequential production" without
     // erroring; this gate must classify it the same way its caller
     // (`produceBatch`'s `error.BatchIncompatible => {}` fallback) expects, so
@@ -9081,7 +9102,7 @@ test "asset producer runtime batches compatible antfly extractor requests" {
 // contract; see zig/pkg/inference/src/server/server.zig's
 // resolvedExecutorBatchImplementation and GLINER25.md's LengthContract) must
 // never see more than one document per extract() invocation, no matter how
-// many compatible requests the caller offers at once. `canExtractBatch`
+// many compatible requests the caller offers at once. `extractorBatchMode`
 // (consulted by `batchMode`/`canProduceBatch`) must refuse batching outright,
 // and `tryExtractBatchReported`'s own `validateExtractorBatchCompatibility`
 // gate must independently refuse it too -- both read the same freshly

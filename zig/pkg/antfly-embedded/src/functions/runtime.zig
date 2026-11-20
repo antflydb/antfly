@@ -272,7 +272,7 @@ pub const Runtime = struct {
                 const kind = question.object.get("type").?.string;
                 if (std.mem.eql(u8, kind, "multi_choice") or std.mem.eql(u8, kind, "score")) return error.UnsupportedConstrainedProbabilities;
             };
-            if (media == null and self.generatorUsesRemoteAntfly(cfg.generator.?)) return caps;
+            if (media != true and self.generatorUsesRemoteAntfly(cfg.generator.?)) return caps;
             var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
             defer arena.deinit();
             const resolved = try self.resolveGenerator(name, if (source_table.len > 0) source_table else self.source_table, media);
@@ -359,6 +359,7 @@ pub const Runtime = struct {
         const caps = resolved.capabilities;
         engine.limits = caps.limits;
         const mode = try caps.select(cfg.output, cfg.probabilities);
+        try @import("antfly_structured").validateProviderSchema(generator, mode, try generated.questionSchema(a, requests[0].questions));
         generator.logprobs = cfg.probabilities == .token_logprobs;
         const inputs = try a.alloc(decisions.Json, requests.len);
         defer a.free(inputs);
@@ -2188,6 +2189,10 @@ test "decision functions scoped generated image validation and execution share a
         \\[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]
     , .{}));
     const request = decisions.Request{ .decider = "judge", .questions = questions, .input = input };
+    var text_request = request;
+    text_request.input = .{ .text = "Compare this text row" };
+    try runtime.provider().withSourceTable("photos").validateRequests(alloc, &.{ text_request, request });
+    try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
     const first = try runtime.provider().withSourceTable("photos").evaluateBatch(alloc, &.{request});
     try std.testing.expectEqualStrings("same", first[0].object.get("answers").?.array.items[0].object.get("choice").?.string);
     try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));

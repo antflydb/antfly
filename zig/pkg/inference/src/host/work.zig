@@ -537,6 +537,9 @@ pub const CapabilityLease = struct {
     descriptor_revision: ?CapabilityRevision = null,
     /// Digest of URL, model, task and authorization/source headers at planning.
     scope_digest: ?[32]u8 = null,
+    /// Capacity placement was resolved for this many media items. The same
+    /// routing lease covers smaller media windows within the descriptor limits.
+    media_placement_items: ?usize = null,
 };
 
 /// Physical representation/ownership selected by the concrete executor, not
