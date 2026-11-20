@@ -6574,6 +6574,7 @@ pub const ApiHttpServer = struct {
             .table_id = physical.table_id,
             .enable = enable,
             .expected_revision = resolved.revision,
+            .expected_incarnation = context.bound_catalog_incarnation,
         } });
         _ = response;
     }
@@ -18589,39 +18590,38 @@ pub const ApiHttpServer = struct {
                 try inherited.put(fk.object.get("name").?.string, fk.object.get("parent_table").?.string);
             };
         }
-        var targets: std.ArrayList(system_catalog.Target) = .empty;
-        var target_slots: std.ArrayList(*std.json.Value) = .empty;
-        var retained: std.ArrayList([]const u8) = .empty;
+        var targets: std.StringArrayHashMapUnmanaged(system_catalog.Target) = .empty;
+        var target_slots: std.ArrayList(struct { slot: *std.json.Value, index: usize }) = .empty;
+        var retained: std.StringArrayHashMapUnmanaged(void) = .empty;
         for (foreign.array.items) |*fk| {
             if (fk.* != .object) return error.InvalidSchemaUpdateRequest;
             const parent = fk.object.getPtr("parent_table") orelse return error.InvalidSchemaUpdateRequest;
             const name = fk.object.get("name") orelse return error.InvalidSchemaUpdateRequest;
             if (parent.* != .string or name != .string) return error.InvalidSchemaUpdateRequest;
             if (inherited.get(name.string)) |bound| if (std.mem.eql(u8, bound, parent.string)) {
-                try retained.append(a, bound);
+                try retained.put(a, bound, {});
                 continue;
             };
             const target: system_catalog.Target = .{ .database = scope.database, .namespace = scope.namespace, .table = parent.string };
-            const logical = try target.resourceNameAlloc(a);
-            if (!try tablePermissionCurrentlyAllowed(identity, logical, .admin)) return error.Forbidden;
             if (std.mem.eql(u8, target.table, scope.table)) {
-                // Initial CREATE has no physical identity until metadata
-                // reserves the hidden owner. Preserve the logical self name
-                // only in the unpublished candidate; the initial-plan
-                // builder replaces it with that exact reserved identity.
-                if (before.len == 0) continue;
-                parent.* = .{ .string = child };
+                if (!try tablePermissionCurrentlyAllowed(identity, try target.resourceNameAlloc(a), .admin)) return error.Forbidden;
+                if (before.len != 0) parent.* = .{ .string = child };
                 continue;
             }
-            try targets.append(a, target);
-            try target_slots.append(a, parent);
+            const entry = try targets.getOrPut(a, target.table);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = target;
+                const logical = try target.resourceNameAlloc(a);
+                if (!try tablePermissionCurrentlyAllowed(identity, logical, .admin)) return error.Forbidden;
+            }
+            try target_slots.append(a, .{ .slot = parent, .index = entry.index });
         }
-        if (targets.items.len != 0 or retained.items.len != 0) {
-            const bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets.items, .storage_names = retained.items } });
+        if (targets.count() != 0 or retained.count() != 0) {
+            const bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets.values(), .storage_names = retained.keys() } });
             const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
-            if (resolved.tables.len != targets.items.len or resolved.logical_names.len != retained.items.len) return error.UnsupportedOperation;
-            for (target_slots.items, resolved.tables) |slot, table| slot.* = .{ .string = (table orelse return error.ForeignKeyParentTableNotFound).name };
-            for (retained.items, resolved.logical_names) |physical, logical| {
+            if (resolved.tables.len != targets.count() or resolved.logical_names.len != retained.count()) return error.UnsupportedOperation;
+            for (target_slots.items) |target| target.slot.* = .{ .string = (resolved.tables[target.index] orelse return error.ForeignKeyParentTableNotFound).name };
+            for (retained.keys(), resolved.logical_names) |physical, logical| {
                 const parent = logical orelse if (std.mem.startsWith(u8, physical, "table:")) return error.ForeignKeyParentTableNotFound else physical;
                 if (!try tablePermissionCurrentlyAllowed(identity, parent, .admin)) return error.Forbidden;
             }

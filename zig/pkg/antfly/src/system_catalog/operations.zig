@@ -256,12 +256,16 @@ pub fn beginPolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: o
 pub fn mutatePolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("antfly_local_sources").system_catalog_policies.PublicationCommand) ![]u8 {
     if (!context.setting_admin or !context.row_policy_install_authority) return error.Forbidden;
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_publication_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (command.expected_incarnation != null) protocol.guarded_publication_version else protocol.sql_row_policy_publication_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    if (command.expected_incarnation) |incarnation| {
+        const guard: operation.RequestContext = .{ .bound_catalog_incarnation = incarnation };
+        try guard.checkMetadataIncarnation(try store.getMetadataIncarnation(svc.metadata_group_id));
+    }
     const current = try store.systemCatalogMeta(alloc, svc.metadata_group_id);
     if (current.revision != command.expected_revision) return error.RowPolicyCatalogChanged;
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
@@ -386,7 +390,9 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     if (!context.fk_generation_publication_authority) return error.Forbidden;
     try command.validateShape();
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.fk_initial_create_version);
+    const versioned_support = if (command.plan) |plan| plan.support_schema_format != .legacy or fk_publication.hasStampedSupport(plan.parents) else false;
+    const version = if (versioned_support) protocol.guarded_publication_version else protocol.fk_initial_create_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, version);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;

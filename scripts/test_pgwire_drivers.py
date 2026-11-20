@@ -152,10 +152,18 @@ def exercise_bound_portals(server, password):
             execute()
 
         parse("update", "UPDATE portal_target SET n = 9 WHERE id = 'a'")
-        for migration in ("alter", "replace", "reuse"):
+        for migration in ("alter", "noop", "replace", "reuse"):
             bind("update")
             if migration == "alter":
                 migrator.execute("ALTER TABLE portal_target ADD COLUMN note TEXT")
+            if migration == "noop":
+                response = requests.patch(
+                    server.api_url + "/tables/portal_target/schema",
+                    auth=("admin", password),
+                    json={},
+                    timeout=10,
+                )
+                response.raise_for_status()
             if migration == "replace":
                 migrator.execute("DROP TABLE portal_target")
                 migrator.execute(create)

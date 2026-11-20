@@ -94,6 +94,42 @@ fn childCatalogB64(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
     return alloc.dupe(u8, observed.catalog);
 }
 
+/// Both transition derivations emit (parent name, constraint name) order.
+pub const ParentGroups = struct {
+    entries: []const publication.DerivedTransition,
+    offset: usize = 0,
+
+    pub fn next(self: *ParentGroups) ?[]const publication.DerivedTransition {
+        const start = self.offset;
+        if (start == self.entries.len) return null;
+        self.offset += 1;
+        while (self.offset < self.entries.len and std.mem.eql(u8, self.entries[start].parent_table_name, self.entries[self.offset].parent_table_name)) self.offset += 1;
+        return self.entries[start..self.offset];
+    }
+
+    pub fn transitions(alloc: std.mem.Allocator, group: []const publication.DerivedTransition) ![]publication.Transition {
+        const out = try alloc.alloc(publication.Transition, group.len);
+        for (out, group) |*dest, entry| dest.* = entry.transition;
+        return out;
+    }
+};
+
+pub fn parentsByName(alloc: std.mem.Allocator, snapshot: []const records.TableRecord, derived: []const publication.DerivedTransition) !std.StringHashMapUnmanaged(?*const records.TableRecord) {
+    var names: std.StringHashMapUnmanaged(?*const records.TableRecord) = .empty;
+    errdefer names.deinit(alloc);
+    for (derived) |item| try names.put(alloc, item.parent_table_name, null);
+    var remaining = names.count();
+    for (snapshot) |*table| {
+        if (remaining == 0) break;
+        const slot = names.getPtr(table.name) orelse continue;
+        if (slot.* == null) {
+            slot.* = table;
+            remaining -= 1;
+        }
+    }
+    return names;
+}
+
 pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, identity: ?server_mod.AuthenticatedIdentity, before: records.TableRecord, proposed_schema_json: []const u8) !publication.Plan {
     try context.ensureActive();
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
@@ -119,51 +155,31 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
     } else false;
     const child_fences = try ownerFences(server, alloc, context, id, current, child_ranges, if (self_parent) .child_generation_dual else .child_generation_source);
     var parents: std.ArrayList(publication.Parent) = .empty;
-    for (derived) |item| {
-        const parent_table = for (snapshot.tables) |table| {
-            if (std.mem.eql(u8, table.name, item.parent_table_name)) break table;
-        } else return error.ForeignKeyParentTableNotFound;
+    var groups: ParentGroups = .{ .entries = derived };
+    var by_name = try parentsByName(alloc, snapshot.tables, derived);
+    defer by_name.deinit(alloc);
+    while (groups.next()) |group| {
+        const name = group[0].parent_table_name;
+        const parent_table = (by_name.get(name).? orelse return error.ForeignKeyParentTableNotFound).*;
         if (parent_table.storage_migration != null or
             parent_table.relational_retirement_json.len != 0 or parent_table.restore_backup_id.len != 0) return error.TableTransitionActive;
-        var found: ?*publication.Parent = null;
-        for (parents.items) |*parent| if (parent.table.table_id == parent_table.table_id) {
-            found = parent;
-            break;
-        };
-        if (found == null) {
-            const names = try server.logicalTableNamesInArena(alloc, context, &.{parent_table.name});
-            if (names.len != 1 or !try server_mod.tablePermissionCurrentlyAllowed(identity, names[0], .admin) or
-                try server_mod.resolveEffectiveRowFilterJson(alloc, identity, names[0]) != null) return error.Forbidden;
-            const dual = parent_table.table_id == current.table_id;
-            const parent_ranges = if (dual) child_ranges else try rangesFor(alloc, snapshot, parent_table.table_id);
-            try parents.append(alloc, .{
-                .table = try ownedTableForPlan(alloc, parent_table),
-                .ranges = parent_ranges,
-                .fences = if (dual) child_fences else try ownerFences(server, alloc, context, id, parent_table, parent_ranges, .child_generation_parent),
-                .transitions = &.{},
-            });
-            found = &parents.items[parents.items.len - 1];
-        }
-        const existing = found.?.transitions;
-        const next = try alloc.alloc(publication.Transition, existing.len + 1);
-        @memcpy(next[0..existing.len], existing);
-        next[existing.len] = item.transition;
-        found.?.transitions = next;
+        const names = try server.logicalTableNamesInArena(alloc, context, &.{parent_table.name});
+        if (names.len != 1 or !try server_mod.tablePermissionCurrentlyAllowed(identity, names[0], .admin) or
+            try server_mod.resolveEffectiveRowFilterJson(alloc, identity, names[0]) != null) return error.Forbidden;
+        const dual = parent_table.table_id == current.table_id;
+        const parent_ranges = if (dual) child_ranges else try rangesFor(alloc, snapshot, parent_table.table_id);
+        try parents.append(alloc, .{
+            .table = try ownedTableForPlan(alloc, parent_table),
+            .ranges = parent_ranges,
+            .fences = if (dual) child_fences else try ownerFences(server, alloc, context, id, parent_table, parent_ranges, .child_generation_parent),
+            .transitions = try ParentGroups.transitions(alloc, group),
+        });
     }
     std.mem.sort(publication.Parent, parents.items, {}, struct {
         fn less(_: void, lhs: publication.Parent, rhs: publication.Parent) bool {
             return lhs.table.table_id < rhs.table.table_id;
         }
     }.less);
-    for (parents.items) |*parent| {
-        const sorted = try alloc.dupe(publication.Transition, parent.transitions);
-        std.mem.sort(publication.Transition, sorted, {}, struct {
-            fn less(_: void, lhs: publication.Transition, rhs: publication.Transition) bool {
-                return std.mem.lessThan(u8, lhs.constraint_name, rhs.constraint_name);
-            }
-        }.less);
-        parent.transitions = sorted;
-    }
     const result: publication.Plan = .{
         .id = id,
         .child_before = try ownedTableForPlan(alloc, current),

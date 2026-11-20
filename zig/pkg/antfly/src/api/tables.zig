@@ -1667,7 +1667,7 @@ pub fn applySchemaUpdateRecord(
     schema_json: []const u8,
 ) !metadata_table_manager.TableRecord {
     try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, table.indexes_json, "");
-    return applySchemaRecord(alloc, table, schema_json, false, false, null);
+    return applySchemaRecord(alloc, table, schema_json, false, false, null, .lineage_v1);
 }
 
 /// Recompute an already prepared schema update without minting a second index
@@ -1679,22 +1679,32 @@ pub fn applySchemaUpdateRecordWithIncarnation(
     schema_json: []const u8,
     incarnation: u64,
 ) !metadata_table_manager.TableRecord {
+    return reconstructSchemaUpdateRecord(alloc, table, schema_json, incarnation, .lineage_v1);
+}
+
+pub fn reconstructSchemaUpdateRecord(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    schema_json: []const u8,
+    incarnation: u64,
+    format: SchemaRecordFormat,
+) !metadata_table_manager.TableRecord {
     try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, table.indexes_json, "");
     if (!@import("antfly_local_sources").storage_coverage_identity.isValid(incarnation)) return error.InvalidIndexConfig;
-    return applySchemaRecord(alloc, table, schema_json, false, false, incarnation);
+    return applySchemaRecord(alloc, table, schema_json, false, false, incarnation, format);
 }
 
 /// Only the fresh-generation rewrite reservation may use this constructor.
 /// It does not publish the schema or permit changing existing stored rows.
 pub fn prepareSchemaRewriteRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
-    return applySchemaRecord(alloc, table, schema_json, true, false, null);
+    return applySchemaRecord(alloc, table, schema_json, true, false, null, .lineage_v1);
 }
 
 /// Construct the immutable candidate for a coordinated FK generation plan.
 /// This does not publish the table: metadata's dedicated fenced state machine
 /// is the only consumer allowed to commit the returned record.
 pub fn prepareForeignKeyPublicationRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
-    return applySchemaRecord(alloc, table, schema_json, false, true, null);
+    return applySchemaRecord(alloc, table, schema_json, false, true, null, .lineage_v1);
 }
 
 /// Recompute the only index-catalog delta a generation publication may carry.
@@ -1729,7 +1739,9 @@ pub fn foreignKeyPublicationIndexesValid(alloc: std.mem.Allocator, table_name: [
     return std.mem.eql(u8, expected, after_indexes_json);
 }
 
-fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64) !metadata_table_manager.TableRecord {
+pub const SchemaRecordFormat = enum { legacy, lineage_v1 };
+
+fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64, format: SchemaRecordFormat) !metadata_table_manager.TableRecord {
     try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
     const schema_changed = !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
@@ -1748,7 +1760,7 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
     var updated = try metadata_table_manager.cloneTable(alloc, table.*);
     errdefer metadata_table_manager.freeTable(alloc, updated);
 
-    const normalized_schema_json = try normalizeSchemaWithPredecessor(alloc, schema_json, next_version, table.schema_json);
+    const normalized_schema_json = try normalizeSchemaRecord(alloc, schema_json, next_version, table.schema_json, format);
     var normalized_schema_json_owned = true;
     errdefer if (normalized_schema_json_owned) alloc.free(normalized_schema_json);
     // schemasSemanticallyEqual derives both runtime schemas, so the candidate
@@ -1769,7 +1781,7 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
 
     if (table.read_schema_json.len == 0) {
         const normalized_read_schema_json = if (table.schema_json.len > 0)
-            try normalizeSchemaVersion(alloc, table.schema_json, current_version)
+            try normalizeSchemaRecord(alloc, table.schema_json, current_version, null, format)
         else
             try normalizeSchemaVersion(alloc, "{}", 0);
         alloc.free(updated.read_schema_json);
@@ -4031,24 +4043,31 @@ fn rowProperties(root: std.json.ObjectMap) ?std.json.ObjectMap {
 }
 
 fn stampColumnLineage(a: std.mem.Allocator, root: *std.json.ObjectMap, old: std.json.ObjectMap, version: u32) !void {
-    const before = rowProperties(old) orelse return;
-    const after = rowProperties(root.*) orelse return;
-    if (!json_helpers.jsonValuesEqual(old.get("default_type").?, root.get("default_type").?)) return;
-    var it = before.iterator();
-    while (it.next()) |entry| {
-        const current = after.get(entry.key_ptr.*) orelse return;
-        if (!json_helpers.jsonValuesEqual(entry.value_ptr.*, current)) return;
-    }
     const prior = old.get("version") orelse std.json.Value{ .integer = 0 };
     const prior_version = switch (prior) {
         .integer => |v| std.math.cast(u32, v) orelse return,
         .number_string => |v| std.fmt.parseInt(u32, v, 10) catch return,
         else => return,
     };
-    if (prior_version >= version) return;
+    if (prior_version > version) return;
+    // Equal versions already passed whole-schema semantic equality in
+    // applySchemaRecord. Optional defaults can have different JSON spellings.
+    if (prior_version < version) {
+        const before = rowProperties(old) orelse return;
+        const after = rowProperties(root.*) orelse return;
+        if (!json_helpers.jsonValuesEqual(old.get("default_type").?, root.get("default_type").?)) return;
+        var it = before.iterator();
+        while (it.next()) |entry| {
+            const current = after.get(entry.key_ptr.*) orelse return;
+            if (!json_helpers.jsonValuesEqual(entry.value_ptr.*, current)) return;
+        }
+    }
+    const start = schema_mod.columnLineage(old, prior_version);
+    // A no-op carries forward only a lineage the predecessor actually had.
+    if (start == version) return;
     var stamp: std.json.ObjectMap = .empty;
     try stamp.put(a, "version", .{ .integer = version });
-    try stamp.put(a, "start", .{ .integer = schema_mod.columnLineage(old, prior_version) });
+    try stamp.put(a, "start", .{ .integer = start });
     try root.put(a, "x-antfly-column-lineage", .{ .object = stamp });
 }
 
@@ -4115,6 +4134,10 @@ test "SQL index DDL birth survives compatible updates and resets after removal o
 }
 
 fn normalizeSchemaWithPredecessor(alloc: std.mem.Allocator, schema_json: []const u8, version: u32, predecessor: ?[]const u8) ![]u8 {
+    return normalizeSchemaRecord(alloc, schema_json, version, predecessor, .lineage_v1);
+}
+
+fn normalizeSchemaRecord(alloc: std.mem.Allocator, schema_json: []const u8, version: u32, predecessor: ?[]const u8, format: SchemaRecordFormat) ![]u8 {
     const source = if (schema_json.len > 0) schema_json else "{}";
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{ .parse_numbers = false });
     defer parsed.deinit();
@@ -4122,9 +4145,11 @@ fn normalizeSchemaWithPredecessor(alloc: std.mem.Allocator, schema_json: []const
 
     if (parsed.value != .object) return error.InvalidSchemaUpdateRequest;
     const root = &parsed.value.object;
-    _ = root.orderedRemove(index_lifetimes_field);
-    _ = root.orderedRemove("x-antfly-column-lineage");
-    if (predecessor) |old| try stampSchemaLifetimes(parsed.arena.allocator(), root, old, version);
+    if (format == .lineage_v1) {
+        _ = root.orderedRemove(index_lifetimes_field);
+        _ = root.orderedRemove("x-antfly-column-lineage");
+        if (predecessor) |old| try stampSchemaLifetimes(parsed.arena.allocator(), root, old, version);
+    }
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);

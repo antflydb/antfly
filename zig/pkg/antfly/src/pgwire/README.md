@@ -126,9 +126,13 @@ proxy's login into an unbounded, cached grant or retry a canceled mutation.
   checks its bound targets again during mutation admission. A bound
   `DROP TABLE IF EXISTS` cannot remove a table created after Bind observed
   its absence. Clustered catalog mutations carrying a bound resource ID
-  require metadata topology protocol 95. Policy DDL pins the policy ID
+  require metadata topology protocol 95. A bound catalog incarnation raises
+  the requirement to 96. Enabling or disabling row security with a bound
+  incarnation requires protocol 97. Policy DDL pins the policy ID
   and generation, and foreign-key and tablespace changes pin their named
-  destination. Column and constraint edits pin the owning schema version.
+  destination. An initial `MATCH PARTIAL` foreign key that installs a parent
+  witness index also requires protocol 97. Column and constraint edits pin the
+  owning schema version.
   A prepared DROP INDEX follows the index across unrelated column changes
   and rejects a dropped and recreated index. The metadata owner assigns
   index birth versions when it commits a schema, including for HTTP edits.

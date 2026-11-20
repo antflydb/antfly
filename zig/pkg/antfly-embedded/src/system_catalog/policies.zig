@@ -521,6 +521,18 @@ test "row-policy publication requires canonical owner and acknowledgement order"
     try std.testing.expectError(error.InvalidRowPolicyPublication, publication.validateShape());
 }
 
+// Preserve the bytes of unguarded commands for legacy decoders and receipts.
+fn writePublicationFields(value: anytype, jw: anytype) !void {
+    try jw.beginObject();
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
+        if (!value.nativeJsonSkipField(name)) {
+            try jw.objectField(name);
+            try jw.write(@field(value, name));
+        }
+    }
+    try jw.endObject();
+}
+
 pub const PublicationCommand = struct {
     version: u16 = 1,
     expected_revision: u64,
@@ -529,6 +541,15 @@ pub const PublicationCommand = struct {
         acknowledge: struct { table_id: u64, generation: u64, receipt: Publication.OwnerAck },
         promote: struct { table_id: u64, generation: u64, phase: Publication.Phase },
     },
+    expected_incarnation: ?[16]u8 = null,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "expected_incarnation") and self.expected_incarnation == null;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try writePublicationFields(self, jw);
+    }
 };
 
 pub const PublicationWork = struct {
@@ -542,6 +563,15 @@ pub const BeginRequest = struct {
     table_id: u64,
     enable: bool,
     expected_revision: u64,
+    expected_incarnation: ?[16]u8 = null,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "expected_incarnation") and self.expected_incarnation == null;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try writePublicationFields(self, jw);
+    }
 };
 
 /// The owner returns a snapshot from one authenticated, linearizable catalog

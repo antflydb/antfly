@@ -34671,19 +34671,36 @@ fn retirePdfPageEmbeddings(publication: PdfPublication, alloc: Allocator, reques
     try publication.finish(request, consumers, .skipped);
 }
 
-// Promotions consume their private keys. Flush promotions before scanning so
-// every remaining key is abandoned. Each delete window carries the same
-// source and ownership fences as publication and completes before coverage.
+// A final page of residue fits in memory. Promotions still queued in this
+// window own their stage keys and will consume them at commit. On overflow
+// commit all pending work before restarting the bounded prefix scan.
 fn drainPdfStages(publication: PdfPublication, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) !void {
-    const runtime = publication.runtime;
-    try publication.flush();
     const root = try internal_keys.pdfPageEmbeddingStageRootPrefixAlloc(alloc, request.doc_key, requestArtifactName(request), requestEmbeddingName(request));
     defer alloc.free(root);
     while (true) {
-        var page = try backend_scan.scanPrefixKeysPage(alloc, &runtime.store, root, generated_pdf_stage_cleanup_page_keys);
+        var page = try backend_scan.scanPrefixKeysPage(alloc, &publication.runtime.store, root, generated_pdf_stage_cleanup_page_keys);
         defer page.deinit(alloc);
-        try publication.deletes(page.keys, false);
-        if (!page.has_more) break;
+        const promotions = publication.window.artifact_promotions.items;
+        if (promotions.len != 0 and page.has_more) {
+            try publication.flush();
+            continue;
+        }
+        if (promotions.len == 0) {
+            try publication.deletes(page.keys, false);
+        } else if (page.keys.len != 0) {
+            // Classify before queuing deletes, which may itself flush the
+            // window and release the borrowed promotion keys.
+            var pending: std.StringHashMapUnmanaged(void) = .empty;
+            defer pending.deinit(alloc);
+            for (promotions) |item| try pending.put(alloc, item.staged_key, {});
+            var obsolete: std.ArrayList([]const u8) = .empty;
+            defer obsolete.deinit(alloc);
+            for (page.keys) |key| if (!pending.contains(key)) {
+                try obsolete.append(alloc, key);
+            };
+            try publication.deletes(obsolete.items, false);
+        }
+        if (!page.has_more) return;
         try publication.flush();
     }
 }
@@ -51655,6 +51672,38 @@ test "PDF page publication fences stale windows and drains abandoned attempts" {
         defer residue.deinit(a);
         try std.testing.expectEqual(@as(usize, 0), residue.keys.len);
     }
+
+    // Each guarded writer submission calls notify, including a guard-only
+    // batch. A clean single-page publication needs exactly one submission.
+    const Counter = struct {
+        calls: usize = 0,
+        fn notify(raw: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var counter: Counter = .{};
+    const original_notify = runtime.notify_fn;
+    const original_ctx = runtime.notify_ctx;
+    runtime.notify_fn = Counter.notify;
+    runtime.notify_ctx = &counter;
+    defer {
+        runtime.notify_fn = original_notify;
+        runtime.notify_ctx = original_ctx;
+    }
+    const page = try internal_keys.documentUnitArtifactKeyAlloc(a, "doc", requestArtifactName(request), "page:000001");
+    defer a.free(page);
+    const output = requestEmbeddingName(request);
+    const final = try embeddingArtifactKeyAlloc(a, page, output);
+    defer a.free(final);
+    const stage = try pdfPageEmbeddingStageKeyAlloc(a, "doc", requestArtifactName(request), output, "current", "page:000001");
+    defer a.free(stage);
+    const vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 1, &.{ 1, 2, 3 });
+    defer a.free(vector);
+    try db.core.store.put(stage, vector);
+    try publishPdfPageEmbeddingBatches(publication, a, &.{page}, &.{.{ .index_name = output, .doc_key = page, .parent_doc_key = "doc", .artifact_key = final, .vector = &.{} }}, &.{"images"}, &.{page}, &.{stage}, output, &.{}, request);
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, stage));
 }
 
 test "sparse cleanup guards fence empty sources epochs definitions and source resurrection" {

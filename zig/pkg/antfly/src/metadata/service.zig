@@ -3668,14 +3668,30 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
             if (parsed.value.mutation.expected_resource_id != null or parsed.value.mutation.expected_tablespace_id != null) required = @max(required, metadata_topology_protocol.bound_ddl_version);
             if (parsed.value.mutation.kind == .graph) required = @max(required, metadata_topology_protocol.graph_definition_version);
         },
-        .apply_sql_policies => |bytes| {
+        .apply_fk_initial_create => |bytes| {
+            const Parent = struct { support_after: ?struct { schema_json: []const u8 } = null };
+            const Header = struct { plan: ?struct {
+                support_schema_format: ?@import("../api/tables.zig").SchemaRecordFormat = null,
+                parents: []const Parent = &.{},
+            } = null };
+            var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return metadata_topology_protocol.current_version,
+            };
+            defer parsed.deinit();
+            if (parsed.value.plan) |plan| if (plan.support_schema_format != null or fk_generation_publication.hasStampedSupport(plan.parents)) {
+                required = @max(required, metadata_topology_protocol.guarded_publication_version);
+            };
+        },
+        .apply_sql_policies, .apply_sql_policy_publication => |bytes| {
             const Header = struct { expected_incarnation: ?[16]u8 = null, expected_schema_version: ?u32 = null };
             var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return metadata_topology_protocol.current_version,
             };
             defer parsed.deinit();
-            if (parsed.value.expected_incarnation != null or parsed.value.expected_schema_version != null) required = @max(required, metadata_topology_protocol.bound_catalog_incarnation_version);
+            if (parsed.value.expected_incarnation != null or parsed.value.expected_schema_version != null)
+                required = @max(required, if (command == .apply_sql_policy_publication) metadata_topology_protocol.guarded_publication_version else metadata_topology_protocol.bound_catalog_incarnation_version);
         },
         .register_store, .upsert_store, .upsert_store_heartbeat => |record| {
             if (record.artifact_sources_protocol_version >= 4) {
@@ -14088,6 +14104,13 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try signing_service.propose(&.{signing_command});
     try std.testing.expectEqual(@as(usize, 1), signing_service.appended);
     const initial_create_command: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{}" };
+    const versioned_plan: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{\"plan\":{\"support_schema_format\":\"lineage_v1\"}}" };
+    var upgrading: Fake = .{ .member_versions = &.{ 97, 96, 97 } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&upgrading, versioned_plan, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, upgrading.propose(&.{versioned_plan}));
+    upgrading.member_versions = &.{ 97, 97, 97 };
+    try ensureCoordinatedDecoderWithContext(&upgrading, versioned_plan, .{});
+    try upgrading.propose(&.{versioned_plan});
     const generation_command: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{}" };
     try std.testing.expectEqual(metadata_topology_protocol.fk_generation_publication_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, generation_command)));
     var mixed_generation: Fake = .{ .member_versions = &.{ 19, 18, 19 } };

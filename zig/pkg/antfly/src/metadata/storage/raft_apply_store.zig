@@ -5490,6 +5490,7 @@ test "initial partial support begin survives restart and cancellation before chi
             .logical_name = "child",
             .namespace_id = system_catalog.default_namespace_id,
             .support_pending = true,
+            .support_schema_format = .lineage_v1,
             .parents = &.{.{
                 .table = parent_before,
                 .ranges = &.{parent_range},
@@ -5500,6 +5501,28 @@ test "initial partial support begin survives restart and cancellation before chi
             }},
         };
         try plan.validate(a);
+        // An old log contains the unstamped parent delta and no format field.
+        // Decode, validate and reserialize it without changing the receipt digest.
+        var legacy = plan;
+        legacy.support_schema_format = .legacy;
+        // A protocol-96 binary could already have published a stamped plan
+        // without the discriminator. Preserve that plan's original digest too.
+        try legacy.validate(a);
+        try std.testing.expect(fk_generation_publication.hasStampedSupport(legacy.parents));
+        var legacy_parent = plan.parents[0];
+        const next_indexes = try std.json.parseFromSliceLeaky(std.json.Value, a, parent_after.indexes_json, .{});
+        const token = @import("antfly_local_sources").api_coverage_policy.incarnation(next_indexes.object.get("full_text_index_v2").?).?;
+        legacy_parent.support_after = try @import("../../api/tables.zig").reconstructSchemaUpdateRecord(a, &parent_before, support_json, token, .legacy);
+        legacy.parents = &.{legacy_parent};
+        const historical = try std.json.Stringify.valueAlloc(a, legacy, .{});
+        try std.testing.expect(std.mem.indexOf(u8, historical, "support_schema_format") == null);
+        try std.testing.expect(std.mem.indexOf(u8, historical, "x-antfly-column-lineage") == null);
+        const replay = try std.json.parseFromSliceLeaky(fk_generation_publication.InitialCreatePlan, a, historical, .{});
+        var old_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(historical, &old_digest, .{});
+        try std.testing.expectEqual(old_digest, try replay.digest(a));
+        legacy.support_schema_format = .lineage_v1;
+        try std.testing.expectError(error.InvalidGenerationPublication, legacy.validate(a));
         var forged = plan;
         var forged_parent = plan.parents[0];
         var forged_after = parent_after;
@@ -12955,6 +12978,7 @@ pub const RaftApplyStore = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const meta = try system_catalog_storage.readMeta(a, &txn, group_id);
+        if (!try boundIncarnationMatches(&txn, group_id, request.expected_incarnation)) return error.CatalogGenerationChanged;
         if (meta.revision != request.expected_revision) return error.RowPolicyCatalogChanged;
         if (try backupCohortLocksTableTxn(&txn, group_id, request.table_id) or
             try restoreStagingLocksTableTxn(&txn, group_id, request.table_id) or
@@ -13024,7 +13048,7 @@ pub const RaftApplyStore = struct {
             .acknowledged_owners = &.{},
         };
         try publication.validateShape();
-        return std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = meta.revision, .change = .{ .begin = publication } }, .{});
+        return std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = meta.revision, .expected_incarnation = request.expected_incarnation, .change = .{ .begin = publication } }, .{});
     }
 
     fn policyTableSchemaTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !struct { version: u32, digest: [32]u8, record_digest: [32]u8, has_indexes: bool, has_schema_search: bool } {
@@ -13098,6 +13122,7 @@ pub const RaftApplyStore = struct {
         var parsed = try std.json.parseFromSlice(sql_policies.PublicationCommand, self.alloc, bytes, .{});
         defer parsed.deinit();
         const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
+        if (!try boundIncarnationMatches(txn, group_id, parsed.value.expected_incarnation)) return;
         // Re-evaluate the exact owner cut inside the metadata apply
         // transaction. A receipt from an owner split or replaced since begin
         // can never promote the old policy generation.
@@ -39857,6 +39882,26 @@ test "row-policy publication persists exact owner ACKs and leader install cut" {
 
         try std.testing.expectError(error.RowPolicyCatalogChanged, store.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = false, .expected_revision = 2 }));
         try std.testing.expectError(error.RowPolicyCatalogChanged, store.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = true, .expected_revision = 1 }));
+        // Keep the logical revision, physical table and owner cut identical
+        // while replacing the metadata identity between resolution and begin.
+        {
+            var identity_txn = try store.store.beginWriteTxn();
+            errdefer identity_txn.abort();
+            try writeMetadataIncarnationRecordTxn(&identity_txn, group, .{ .incarnation = "22222222222222222222222222222222".* });
+            try relation_reconciliation.advanceSource(&identity_txn, group);
+            try identity_txn.commit();
+        }
+        try std.testing.expectError(error.CatalogGenerationChanged, store.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = false, .expected_revision = 2, .expected_incarnation = @splat(0x11) }));
+        const stale_begin = try store.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = true, .expected_revision = 2, .expected_incarnation = @splat(0x22) });
+        defer alloc.free(stale_begin);
+        {
+            var restored = try store.store.beginWriteTxn();
+            errdefer restored.abort();
+            try writeMetadataIncarnationRecordTxn(&restored, group, .{ .incarnation = "33333333333333333333333333333333".* });
+            try restored.commit();
+        }
+        try store.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = stale_begin });
+        try std.testing.expectEqual(@as(u64, 2), (try store.systemCatalogMeta(alloc, group)).revision);
         var forged_publication = publication;
         forged_publication.schema_digest = @splat(9);
         const forged_begin = try std.json.Stringify.valueAlloc(alloc, sql_policies.PublicationCommand{ .expected_revision = 2, .change = .{ .begin = forged_publication } }, .{});

@@ -1354,6 +1354,11 @@ test "SQL catalog binds distinct constraints on a shared foreign key parent in o
         try std.testing.expectEqual(@as(u64, 19), parent.id);
         try std.testing.expectEqual(@as(u32, 3), parent.schema_version);
     }
+    const bound = try server.bindForeignKeySchema(a, .{ .table = "child" }, "physical_child",
+        \\{"foreign_keys":[{"name":"fk_a","parent_table":"parent"},{"name":"fk_b","parent_table":"parent"}]}
+    , "{}", null, .{});
+    defer a.free(bound);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bound, "\"physical_parent\""));
 }
 
 test "SQL catalog ALTER submits native schema CAS without client generations" {
