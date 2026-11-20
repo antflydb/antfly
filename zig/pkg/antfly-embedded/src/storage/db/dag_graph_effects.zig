@@ -115,23 +115,34 @@ pub fn scanAccepted(alloc: A, txn: anytype, request: activation.ScanRequest, sta
         bytes += extent;
         if (next) |previous| alloc.free(previous);
         next = try alloc.dupe(u8, row.key);
-        if (try readAccepted(alloc, request, row.key, row.value)) |replacement|
+        if (try artifactReplacement(alloc, request.index_name, request.edge_type, request.generation, row.key, row.value, true)) |replacement|
             try result.append(alloc, replacement);
     }
     std.mem.sort(Replacement, result.items, {}, lessThan);
     return .{ .next = next, .exhausted = entry == null, .replacements = try result.toOwnedSlice(alloc) };
 }
 
-fn readAccepted(alloc: A, request: activation.ScanRequest, key: []const u8, value: []const u8) !?Replacement {
-    if (!keys.matchesGraphEdgeIndexName(key, request.index_name)) return null;
+/// Translate a canonical physical relationship afterimage or retirement
+/// preimage using the same identity as logical producer writes. The caller
+/// supplies the fenced catalog generation and an allocator for the result.
+pub fn artifactReplacement(
+    alloc: A,
+    index_name: []const u8,
+    edge_type: []const u8,
+    generation: u64,
+    key: []const u8,
+    value: []const u8,
+    present: bool,
+) !?Replacement {
+    if (!keys.matchesGraphEdgeIndexName(key, index_name)) return null;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const parsed = (try keys.parseGraphEdgeArtifactKeyAlloc(scratch.allocator(), key)) orelse return error.InvalidDagAuthority;
-    if (!std.mem.eql(u8, parsed.edge_type, request.edge_type)) return null;
+    if (!std.mem.eql(u8, parsed.edge_type, edge_type)) return null;
     const codec = @import("enrichment/artifact_codec.zig");
     const record = try codec.decodeGraphEdgeBorrowed(value);
     if (record.generation == 0 or codec.isPortableUnboundGraphEdge(value)) return error.GraphConstraintNotReady;
-    if (record.generation != request.generation) return null;
+    if (record.generation != generation) return null;
     const identity: edges.GraphEdgeWrite = .{
         .index_name = parsed.index_name,
         .edge_type = parsed.edge_type,
@@ -141,7 +152,10 @@ fn readAccepted(alloc: A, request: activation.ScanRequest, key: []const u8, valu
         .edge_id = parsed.edge_id,
     };
     const source = try alloc.dupe(u8, identity.source);
+    errdefer alloc.free(source);
+    if (!present) return .{ .owner = owner(identity), .source = source, .targets = &.{} };
     const targets = try alloc.alloc([]const u8, 1);
+    errdefer alloc.free(targets);
     targets[0] = try alloc.dupe(u8, identity.target);
     return .{ .owner = owner(identity), .source = source, .targets = targets };
 }
@@ -191,4 +205,15 @@ test "DAG final graph effects retain relationship identity across publication an
     try std.testing.expectEqualDeep(owner(writes[0]), removed[0].owner);
     try std.testing.expectEqual(@as(usize, 0), removed[0].targets.len);
     try std.testing.expectError(error.InvalidDagMutation, collect(alloc, "g", "R", writes, &.{delete}));
+    const physical = try keys.graphRelationshipArtifactKeyAlloc(alloc, "second", "g", "R", "b", "a", "x");
+    const value = try @import("enrichment/artifact_codec.zig").encodeGraphEdgeAlloc(alloc, null, 7, 1, 0, 0, "{}");
+    const installed = (try artifactReplacement(alloc, "g", "R", 7, physical, value, true)).?;
+    try std.testing.expectEqualDeep(owner(writes[1]), installed.owner);
+    try std.testing.expectEqualStrings(writes[1].source, installed.source);
+    try std.testing.expectEqualStrings(writes[1].target, installed.targets[0]);
+    const retired = (try artifactReplacement(alloc, "g", "R", 7, physical, value, false)).?;
+    try std.testing.expectEqualDeep(installed.owner, retired.owner);
+    try std.testing.expectEqualStrings(installed.source, retired.source);
+    try std.testing.expectEqual(@as(usize, 0), retired.targets.len);
+    try std.testing.expect((try artifactReplacement(alloc, "g", "R", 8, physical, value, true)) == null);
 }
