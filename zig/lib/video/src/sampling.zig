@@ -85,10 +85,12 @@ pub fn referencePictures(a: std.mem.Allocator, pictures: anytype, scale: u32, ed
     const order = try a.alloc(usize, pictures.len);
     defer a.free(order);
     var count: usize = 0;
+    var bounds = Bounds{};
     const preceding = try precedingHold(pictures, edit, control);
     for (pictures, 0..) |picture, id| {
         if (id % 256 == 0) try control.check();
         if (!visibleInEdit(picture.pts, picture.duration, edit, preceding)) continue;
+        bounds.include(picture.pts, picture.duration);
         order[count] = id;
         count += 1;
     }
@@ -101,9 +103,7 @@ pub fn referencePictures(a: std.mem.Allocator, pictures: anytype, scale: u32, ed
         }
     };
     std.mem.sort(usize, order[0..count], pictures, Less.less);
-    const last = pictures[order[count - 1]];
-    const tail: ?u64 = last.duration;
-    const duration: i128 = edit.source_duration orelse (@as(i128, last.pts) + (tail orelse 0) - pictures[order[0]].pts);
+    const duration: i128 = edit.source_duration orelse (bounds.end(null) - bounds.first);
     const ids = try referenceOrdinals(a, count, duration, scale);
     for (ids) |*id| id.* = order[id.*];
     return ids;

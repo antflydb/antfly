@@ -168,6 +168,11 @@ fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, sample
         next = best[i] orelse next;
         best[i] = next;
     }
+    // Clipping makes the opening hold visible at presentation time zero.
+    // A picture starting exactly on the boundary supersedes that hold.
+    if (held) |id| {
+        if (best[0] == null or (try pictureTime(pictures[best[0].?], samples)).pts > origin) best[0] = id;
+    }
     var plan = Gemma4Plan{};
     var previous: ?usize = null;
     for (best[0..count]) |candidate| if (candidate) |id| {
@@ -175,15 +180,10 @@ fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, sample
         previous = id;
         const pic = pictures[id];
         plan.packet_ids[plan.len] = packetId(pic, id);
-        plan.timestamps_us[plan.len] = try presentationUs((try pictureTime(pic, samples)).pts, origin, scale);
+        plan.timestamps_us[plan.len] = try presentationUs(@max(origin, (try pictureTime(pic, samples)).pts), origin, scale);
         plan.len += 1;
     };
-    if (plan.len == 0) {
-        const id = held orelse return error.EmptyVideo;
-        plan.packet_ids[0] = packetId(pictures[id], id);
-        plan.timestamps_us[0] = 0;
-        plan.len = 1;
-    }
+    if (plan.len == 0) return error.EmptyVideo;
     return plan;
 }
 
@@ -313,4 +313,22 @@ test "reference pictures filter a trimmed MP4 edit before applying average FPS" 
     const ids = try sampling_mod.referencePictures(std.testing.allocator, &samples, 10, .{ .source_start = 10, .source_duration = 20 }, .{});
     defer std.testing.allocator.free(ids);
     try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, ids);
+}
+
+test "edited opening hold precedes the next target and yields to an exact boundary" {
+    var times = [_]media.webm.SourceTimeline.Sample{ .{ .pts = 0, .duration = 15 }, .{ .pts = 15, .duration = 10 } };
+    const edit = media.timeline.Edit{ .source_start = 5, .source_duration = 20 };
+    var plan = try planPictures(10, edit, &times, null, null, .{});
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, plan.ids());
+    try std.testing.expectEqualSlices(i64, &.{ 0, 1_000_000 }, plan.timestamps());
+    times[1].pts = 5;
+    plan = try planPictures(10, edit, &times, null, null, .{});
+    try std.testing.expectEqualSlices(usize, &.{1}, plan.ids());
+}
+
+test "reference sampling includes longest presentation even with earlier PTS" {
+    const samples = [_]media.webm.SourceTimeline.Sample{ .{ .pts = 1, .duration = 1 }, .{ .pts = 0, .duration = 4 } };
+    const ids = try sampling_mod.referencePictures(std.testing.allocator, &samples, 1, .{}, .{});
+    defer std.testing.allocator.free(ids);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1, 0, 0 }, ids);
 }

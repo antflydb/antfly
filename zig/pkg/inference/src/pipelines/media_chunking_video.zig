@@ -154,19 +154,21 @@ pub const Owner = struct {
         if (registry) |session| session.releasePlanningHeaders();
         if (transport) |ts| ts.releaseHeaders();
         const count = if (logical) |index| index.pictures.len else reader.packets.len;
-        var metadata_bytes = try video.sampling.Timeline.storageBytes(count);
-        if ((reader.track.codec == .avc and registry == null) or reader.track.codec == .hevc) metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, reader.packets.len, @sizeOf(usize)));
+        var index_bytes: usize = if ((reader.track.codec == .avc and registry == null) or reader.track.codec == .hevc)
+            try std.math.mul(usize, reader.packets.len, @sizeOf(usize))
+        else
+            0;
         if (logical != null) {
             const base = try std.math.ceilPowerOfTwo(usize, @max(@as(usize, 1), count));
-            metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, try std.math.add(usize, count, try std.math.mul(usize, base, 2)), @sizeOf(usize)));
+            const slots = try std.math.add(usize, count, try std.math.mul(usize, base, 2));
+            index_bytes = try std.math.add(usize, index_bytes, try std.math.mul(usize, slots, @sizeOf(usize)));
         }
-        var metadata_reservation = try pool.acquire(.{ .host_bytes = metadata_bytes });
-        errdefer metadata_reservation.deinit();
+        var memory = media.admission.TrackedAllocator{ .backing = a, .limit = std.math.maxInt(usize), .reservation = try pool.acquire(.{}) };
+        errdefer memory.reservation.deinit();
+        const scratch = memory.allocator();
         var timeline = build: {
-            var scratch = try pool.acquire(.{ .host_bytes = try std.math.mul(usize, count, @sizeOf(video.sampling.TimedPicture)) });
-            defer scratch.deinit();
-            const timed = try a.alloc(video.sampling.TimedPicture, count);
-            defer a.free(timed);
+            const timed = scratch.alloc(video.sampling.TimedPicture, count) catch |err| return memory.denied orelse err;
+            defer scratch.free(timed);
             if (logical) |index| {
                 for (timed, index.pictures) |*dest, picture| {
                     dest.* = .{ .pts = picture.pts, .duration = picture.duration };
@@ -176,9 +178,13 @@ pub const Owner = struct {
                     dest.* = .{ .pts = packet.pts, .duration = packet.duration };
                 }
             }
-            break :build try video.sampling.Timeline.initEdited(a, timed, reader.input.control, reader.track.edit);
+            break :build video.sampling.Timeline.initEdited(scratch, timed, reader.input.control, reader.track.edit) catch |err| return if (err == error.OutOfMemory) memory.denied orelse err else err;
         };
+        // Transfer the retained timeline and its charge to the movable owner.
+        // Timed pictures have been freed and edited-out entries were never allocated.
+        timeline.allocator = a;
         errdefer timeline.deinit();
+        try memory.reservation.resize(.{ .host_bytes = try std.math.add(usize, memory.live, index_bytes) });
         const hevc_predecessors = try a.alloc(usize, if (reader.track.codec == .hevc) reader.packets.len else 0);
         errdefer a.free(hevc_predecessors);
         if (hevc_predecessors.len != 0) try video.hevc_restart.fillPredecessors(reader, hevc_predecessors);
@@ -186,7 +192,7 @@ pub const Owner = struct {
         errdefer if (seek_cache) |*cache| cache.deinit();
         var dependencies: ?Dependencies = if (logical) |index| try Dependencies.init(a, index) else null;
         errdefer if (dependencies) |*index| index.deinit();
-        return .{ .hevc_predecessors = hevc_predecessors, .metadata_reservation = metadata_reservation, .dependencies = dependencies, .timeline = timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .logical = logical, .registry = registry, .origin = timeline.first, .pool = pool, .limits = limits };
+        return .{ .hevc_predecessors = hevc_predecessors, .metadata_reservation = memory.reservation, .dependencies = dependencies, .timeline = timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .logical = logical, .registry = registry, .origin = timeline.first, .pool = pool, .limits = limits };
     }
     fn registrySeekCache(a: std.mem.Allocator, reader: *const media.mp4.Reader, registry: *const video.h264_dynamic.Session) video.decode_plan.SeekCache {
         var cache = video.decode_plan.SeekCache.forPage(a, reader, registry.progressive_idrs.items);

@@ -40,7 +40,11 @@ pub const Span = struct {
         const flags = try kinds(initial, reader.track.nal_length_bytes);
         if (!flags.a) return self;
         self.partitioned = true;
-        self.reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(usize) }) else media.admission.Token{};
+        // Header planning supplies a tracked scratch allocator for all members,
+        // storage and RBSP work. Full decode owns its explicit span reservation.
+        if (!headers) {
+            if (reader.input.admission_pool) |pool| self.reservation = try pool.acquire(.{ .host_bytes = @sizeOf(usize) });
+        }
         try self.members.ensureTotalCapacityPrecise(allocator, 1);
         self.members.appendAssumeCapacity(first);
         var coded_bytes: usize = reader.packets[first].size;
@@ -70,8 +74,10 @@ pub const Span = struct {
             const member_count = self.members.items.len + @intFromBool(part.residual);
             const capacity = grownCapacity(self.storage.capacity, length, options.max_packet_bytes);
             const members = grownCapacity(self.members.capacity, member_count, reader.packets.len);
-            const member_bytes = try std.math.mul(usize, members, 2 * @sizeOf(usize));
-            try self.reservation.resize(.{ .host_bytes = try std.math.add(usize, try std.math.mul(usize, capacity, 3), member_bytes) });
+            if (self.reservation.pool != null) {
+                const member_bytes = try std.math.mul(usize, members, 2 * @sizeOf(usize));
+                try self.reservation.resize(.{ .host_bytes = try std.math.add(usize, try std.math.mul(usize, capacity, 3), member_bytes) });
+            }
             try self.storage.ensureTotalCapacityPrecise(allocator, capacity);
             if (self.storage.items.len == 0) self.storage.appendSliceAssumeCapacity(initial);
             self.storage.appendSliceAssumeCapacity(lease.bytes);

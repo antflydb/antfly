@@ -870,7 +870,12 @@ pub const Runner = struct {
         }
         defer self.audio_provider = null;
         const count = self.request.limits.max_index_packets;
-        const identity = @import("media_index_cache.zig").Cache.videoKey(source, if (transport) .transport else if (webm) .webm else .mp4, count, self.request.max_working_bytes);
+        const Cache = @import("media_index_cache.zig").Cache;
+        const container: Cache.Container = if (transport) .transport else if (webm) .webm else .mp4;
+        const identity = if (self.request.native_source == null)
+            Cache.inlineVideoKey(self.summary.identity.source, container, count, self.request.max_working_bytes)
+        else
+            Cache.videoKey(source, container, count, self.request.max_working_bytes);
         var hit = if (identity != null and self.request.index_cache != null) self.request.index_cache.?.get(identity.?) else null;
         var build: ?@import("media_speaker_flights.zig").Registry.Lease = null;
         defer if (build) |lease| lease.deinit();
@@ -900,7 +905,7 @@ pub const Runner = struct {
                     var reader = data.reader(self.allocator, input);
                     var owner = if (entry.mp4_plan) |*plan| try @import("media_chunking_video.zig").Owner.fromSnapshot(self.allocator, &reader, &self.pool, self.request.limits, plan) else try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
                     defer owner.deinit();
-                    try self.videoWindows(bytes, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
+                    try self.videoWindows(if (transport) &.{} else bytes, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
                 },
                 else => unreachable,
             }
@@ -956,10 +961,9 @@ pub const Runner = struct {
     fn webmWindowsCached(self: *Runner, reader: *media.webm.Reader, identity: ?[32]u8, build: *?@import("media_speaker_flights.zig").Registry.Lease) !void {
         var indexed = try video.webm_pictures.index(self.allocator, reader, .{ .max_packets = self.request.limits.max_index_packets, .max_pictures = self.request.limits.max_index_packets, .decoder = .{ .av1_all_layers = false, .admission_pool = &self.pool, .control = reader.input.control } });
         defer indexed.deinit();
-        const timeline_bytes = try std.math.add(usize, try video.sampling.Timeline.storageBytes(indexed.pictures.len), try std.math.mul(usize, indexed.pictures.len, @sizeOf(video.sampling.TimedPicture)));
-        var timeline_reservation = try self.pool.acquire(.{ .host_bytes = timeline_bytes });
-        defer timeline_reservation.deinit();
-        var timeline = try indexed.presentationTimeline(self.allocator, reader.input.control);
+        var memory = media.admission.TrackedAllocator{ .backing = self.allocator, .reservation = try self.pool.acquire(.{}), .limit = self.request.max_working_bytes };
+        defer memory.reservation.deinit();
+        var timeline = indexed.presentationTimeline(memory.allocator(), reader.input.control) catch |err| return if (err == error.OutOfMemory) memory.denied orelse err else err;
         defer timeline.deinit();
         const scale = indexed.timescale();
         const duration = @divFloor((timeline.last - timeline.first) * std.time.ns_per_s + scale - 1, scale);
@@ -2125,6 +2129,22 @@ test "model aware media cached planning owns indexes and rebinds sources across 
         try std.testing.expectEqual(@as(u64, summary.next_ordinal + 1), replay.summary.next_ordinal);
         try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
         try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
+        // Inline pages derive their own content digest and share the immutable
+        // plan while rebinding packet payloads to each request.
+        var inline_request = request;
+        inline_request.native_source = null;
+        inline_request.input.binary.data = provider.bytes;
+        var inline_first = Qualification{};
+        var inline_page = try Runner.init(a, inline_request, inline_first.executor(), .{}, .{ .context = &inline_first, .accept = Qualification.accept });
+        const inline_summary = try inline_page.run();
+        const key = Cache.inlineVideoKey(inline_summary.identity.source, if (transport) .transport else if (webm) .webm else .mp4, request.limits.max_index_packets, request.max_working_bytes);
+        const cached = cache.get(key) orelse return error.MissingInlineIndex;
+        defer cache.release(cached);
+        inline_request.continuation = inline_summary.identity.cursor(inline_summary.next_ordinal, &cursor);
+        var inline_second = Qualification{};
+        var next_page = try Runner.init(a, inline_request, inline_second.executor(), .{}, .{ .context = &inline_second, .accept = Qualification.accept });
+        const next_summary = try next_page.run();
+        try std.testing.expectEqual(inline_summary.next_ordinal + 1, next_summary.next_ordinal);
     }
 }
 

@@ -425,7 +425,12 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Option
     const owned = if (registry == null and reader.track.requiresAvcRegistry()) try dynamic.Session.initPlanning(a, reader, options.decode) else null;
     defer if (owned) |owner| owner.deinit();
     defer if (registry orelse owned) |owner| owner.releasePlanningHeaders();
-    var result = try @import("h264_headers.zig").planning(a, reader, options, registry orelse owned);
+    const session = registry orelse owned;
+    var result = @import("h264_headers.zig").planning(a, reader, options, session) catch |err| retry: {
+        if ((err != error.SharedAdmissionExceeded and err != error.OutOfMemory) or session == null or session.?.header_packets.items.len == 0) return err;
+        session.?.releasePlanningHeaders();
+        break :retry try @import("h264_headers.zig").planning(a, reader, options, session);
+    };
     errdefer result.deinit();
     try result.reservation.resize(.{ .host_bytes = (result.storage orelse result.pictures).len * @sizeOf(h264.Picture) });
     return result;

@@ -178,16 +178,17 @@ fn planHeaders(a: std.mem.Allocator, scratch: std.mem.Allocator, reader: *media.
             if (h.first == 0) row.starts |= bit;
             row.lanes[lane] = h;
             row.picture.last_packet = span.last;
+        }
+        if (packet_row) |id| {
+            const row = if (fields) &rows[id] else &current;
             const members = if (span.partitioned) span.members.items else &.{packet_index};
             for (members) |member| {
                 const part = reader.packets[member];
                 row.picture.pts = @min(row.picture.pts, part.pts);
                 row.end = @max(row.end, try std.math.add(i64, part.pts, part.duration));
             }
+            if (!fields) pictures[id] = try finishRow(current);
         }
-        if (!fields) if (packet_row) |id| {
-            pictures[id] = try finishRow(current);
-        };
         packet_index = span.last;
     }
     if (fields) for (rows[0..count], pictures[0..count]) |row, *picture| {

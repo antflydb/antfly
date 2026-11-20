@@ -458,7 +458,7 @@ fn sumUsize(values: []const usize) usize {
 }
 
 /// Native video uses 140 soft tokens per frame and a single joint encoder input.
-pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, max_tokens: usize, selection: @import("../ops/cuda/video.zig").DisplayPlan) !ProjectedVideo {
+pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, prepared: *const @import("../ops/cuda/video.zig").PreparedEmbedding, max_tokens: usize) !ProjectedVideo {
     if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.UnsupportedVideoBackend;
     if (cb.kind() != .cuda or !cb.supportsCopyRows2D() or cb.vtable.sliceRows2D == null) return error.UnsupportedVideoBackend;
     const video = @import("../ops/cuda/video.zig");
@@ -570,15 +570,15 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
     };
     const staging_event = try compute.ctx.createStreamEvent();
     defer _ = compute.ctx.driver.fns.cuEventDestroy(staging_event);
-    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor, .max_tokens = max_tokens, .planned_frames = selection.pictures.len, .staging_event = staging_event, .capacity = if (compute.embedding_gemma2_policy.image_batch) 4 else 1 };
+    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor, .max_tokens = max_tokens, .planned_frames = prepared.inspection.frames, .staging_event = staging_event, .capacity = if (compute.embedding_gemma2_policy.image_batch) 4 else 1 };
     defer {
         for (state.pending[0..state.pending_count]) |slot| if (slot.hidden) |tensor| cb.free(tensor);
         if (state.output) |out| cb.free(out);
     }
     errdefer compute.ctx.synchronize() catch {};
-    const stats = try video.decodeInspectedEmbedding(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check, .surface_ready = State.ready, .coalesce_repetitions = true }, selection);
+    const stats = try video.decodeInspectedEmbedding(allocator, &compute.ctx, prepared, .{ .context = &state, .consume = State.consume, .check = State.check, .surface_ready = State.ready, .coalesce_repetitions = true });
     try state.flush();
-    if (state.count != selection.pictures.len) return error.VideoDecodeFailed;
+    if (state.count != prepared.inspection.frames) return error.VideoDecodeFailed;
     const embeddings = state.output.?;
     state.output = null;
     errdefer cb.free(embeddings);

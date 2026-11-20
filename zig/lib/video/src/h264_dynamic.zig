@@ -291,6 +291,7 @@ pub const Session = struct {
             self.budget.backing = self.memory.?.allocator();
             self.header_budget.backing = self.memory.?.allocator();
         }
+        if (cache_headers) self.budget.reclaimer = .{ .context = self, .release = reclaimOwnedHeaders };
         self.scan() catch |err| return self.scanError(err);
         return self;
     }
@@ -317,6 +318,12 @@ pub const Session = struct {
         for (&self.picture_versions) |*versions| versions.deinit(allocator);
         allocator.free(self.packet_configs);
         self.releasePlanningHeaders();
+    }
+    fn reclaimOwnedHeaders(raw: *anyopaque) bool {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        if (self.header_packets.capacity == 0) return false;
+        self.releasePlanningHeaders();
+        return true;
     }
     pub fn releasePlanningHeaders(self: *Session) void {
         const a = self.header_budget.allocator();
@@ -405,28 +412,15 @@ pub const Session = struct {
             if (packet.size > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
             const bytes_before = self.reader.input.total_bytes;
             const header_allocator = self.header_budget.allocator();
-            const prefix = if (self.supplied_headers) |headers| headers[i] else @import("h264_prefix.zig").packet(header_allocator, self.reader, i, self.options.max_packet_bytes) catch |err| retry: {
-                // Cache pressure must never narrow the parameter/profile limit
-                // or make a long clip fail. Discard the optional cache, then
-                // continue sparse reads with one bounded packet in flight.
-                if (err != error.OutOfMemory or (!self.header_budget.denied and (self.memory == null or self.memory.?.denied == null)) or self.header_packets.items.len == 0) return err;
-                self.releasePlanningHeaders();
-                self.header_budget.denied = false;
-                if (self.memory) |*memory| memory.denied = null;
-                break :retry try @import("h264_prefix.zig").packet(header_allocator, self.reader, i, self.options.max_packet_bytes);
+            const prefix = if (self.supplied_headers) |headers| headers[i] else prefix: {
+                // Eviction only touches previously completed packets. Disable it
+                // before growing the list which owns those packets.
+                self.header_budget.reclaimer = self.budget.reclaimer;
+                defer self.header_budget.reclaimer = null;
+                break :prefix try @import("h264_prefix.zig").packetReclaiming(header_allocator, self.reader, i, self.options.max_packet_bytes, self.budget.reclaimer);
             };
             var retained = self.supplied_headers != null;
             defer if (!retained) header_allocator.free(prefix);
-            if (self.cache_headers) {
-                if (self.header_packets.append(header_allocator, prefix)) |_| {
-                    retained = true;
-                } else |err| {
-                    if (err != error.OutOfMemory or (!self.header_budget.denied and (self.memory == null or self.memory.?.denied == null))) return err;
-                    self.releasePlanningHeaders();
-                    self.header_budget.denied = false;
-                    if (self.memory) |*memory| memory.denied = null;
-                }
-            }
             const lease = .{ .bytes = prefix };
             self.probe_packets += 1;
             self.probe_bytes += self.reader.input.total_bytes - bytes_before;
@@ -481,6 +475,16 @@ pub const Session = struct {
                     try self.progressive_idrs.append(allocator, i);
             }
             self.packet_configs[i] = selected orelse self.active orelse std.math.maxInt(usize);
+            if (self.cache_headers) {
+                if (self.header_packets.append(header_allocator, prefix)) |_| {
+                    retained = true;
+                } else |err| {
+                    if (err != error.OutOfMemory) return err;
+                    self.releasePlanningHeaders();
+                    self.header_budget.denied = false;
+                    if (self.memory) |*memory| memory.denied = null;
+                }
+            }
         }
         if (self.epochs.items.len == 0) return error.EmptyVideoTrack;
     }

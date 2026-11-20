@@ -144,10 +144,16 @@ pub const Cache = struct {
         return result;
     }
     pub fn inlineAudioKey(content: [32]u8, aac: bool, max_packets: usize, max_bytes_: usize) [32]u8 {
+        return inlineKey("media-inline-audio-seek-v1", content, @intFromBool(aac), max_packets, max_bytes_);
+    }
+    pub fn inlineVideoKey(content: [32]u8, container: Container, max_packets: usize, max_bytes_: usize) [32]u8 {
+        return inlineKey("media-inline-video-seek-v1", content, @backingInt(container), max_packets, max_bytes_);
+    }
+    fn inlineKey(domain: []const u8, content: [32]u8, format: u8, max_packets: usize, max_bytes_: usize) [32]u8 {
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("media-inline-audio-seek-v1");
+        hash.update(domain);
         hash.update(&content);
-        hash.update(&.{@intFromBool(aac)});
+        hash.update(&.{format});
         for ([_]u64{ max_packets, max_bytes_ }) |n| {
             var raw: [8]u8 = undefined;
             std.mem.writeInt(u64, &raw, n, .little);

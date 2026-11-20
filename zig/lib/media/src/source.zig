@@ -93,7 +93,13 @@ pub const Source = struct {
     pub fn read(self: *Source, offset: u64, size: usize) !Lease {
         return self.readControlled(offset, size, .{});
     }
+    pub fn readReclaiming(self: *Source, offset: u64, size: usize, reclaimer: ?admission.Reclaimer) !Lease {
+        return self.readWithControl(offset, size, .{}, reclaimer);
+    }
     pub fn readControlled(self: *Source, offset: u64, size: usize, caller: Control) !Lease {
+        return self.readWithControl(offset, size, caller, null);
+    }
+    fn readWithControl(self: *Source, offset: u64, size: usize, caller: Control, reclaimer: ?admission.Reclaimer) !Lease {
         const owner = self.physical orelse self;
         const io = std.Io.Threaded.global_single_threaded.io();
         owner.mutex.lockUncancelable(io);
@@ -115,7 +121,10 @@ pub const Source = struct {
         errdefer if (owner != self) {
             owner.retained_bytes -= size;
         };
-        var reservation = if (self.admission_pool) |pool| try pool.acquire(.{ .host_bytes = size }) else admission.Token{};
+        var reservation = if (self.admission_pool) |pool| pool.acquire(.{ .host_bytes = size }) catch |err| retry: {
+            if (!admission.Reclaimer.reclaim(reclaimer)) return err;
+            break :retry try pool.acquire(.{ .host_bytes = size });
+        } else admission.Token{};
         errdefer reservation.deinit();
         self.retained_bytes += size;
         errdefer self.retained_bytes -= size;
@@ -135,7 +144,10 @@ pub const Source = struct {
                         return .{ .bytes = bytes, .source = self, .reservation = reservation };
                     }
                 }
-                const owned = try self.allocator.alloc(u8, size);
+                const owned = self.allocator.alloc(u8, size) catch |err| retry: {
+                    if (!admission.Reclaimer.reclaim(reclaimer)) return err;
+                    break :retry try self.allocator.alloc(u8, size);
+                };
                 errdefer self.allocator.free(owned);
                 var done: usize = 0;
                 while (done < size) {

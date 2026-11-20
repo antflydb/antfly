@@ -427,27 +427,16 @@ pub const Index = struct {
     }
 
     pub fn buildForReader(self: *Index, a: std.mem.Allocator, wire: *media.source.Source, options: avc.Options, capture_headers: bool) !void {
-        var retry_without_cache = false;
-        self.buildAttempt(a, wire, options, capture_headers, &retry_without_cache) catch |err| {
-            // A demux or source buffer can encounter shared pressure outside
-            // the index callbacks. Drop the cache before retrying that scan.
-            if (!retry_without_cache or (err != error.SharedAdmissionExceeded and err != error.OutOfMemory)) return err;
-            try self.buildAttempt(a, wire, options, false, &retry_without_cache);
-        };
-    }
-
-    fn buildAttempt(self: *Index, a: std.mem.Allocator, wire: *media.source.Source, options: avc.Options, capture_headers: bool, retry_without_cache: *bool) !void {
         self.* = .{ .capture_headers = capture_headers, .memory = .{ .backing = a, .limit = options.index.max_index_bytes, .reservation = if (wire.admission_pool) |pool| try pool.acquire(.{}) else .{} } };
-        errdefer {
-            retry_without_cache.* = self.capture_headers and (self.headers.capacity != 0 or self.current_header.capacity != 0);
-            self.deinit();
-        }
+        errdefer self.deinit();
         var units = try avc.Stream.initIndex(a, wire.identity, options, .{ .context = self, .track = recordTrack, .nal = recordNal, .packet = recordPacket });
         defer if (!units.ended) units.deinit();
         var consumer = units.consumer();
         consumer.extent = recordRun;
         consumer.extent_context = self;
-        avc.scanSource(a, wire, options, &units, consumer) catch |err|
+        const reclaimer = media.admission.Reclaimer{ .context = self, .release = reclaimForScan };
+        units.workspace.reclaimer = reclaimer;
+        avc.scanSourceReclaiming(a, wire, options, &units, consumer, reclaimer) catch |err|
             return if (err == error.OutOfMemory) self.memory.denied orelse err else err;
         if (self.track == null or self.packet_end != self.length or self.runs.items.len == 0) return error.InvalidVideoIndex;
     }
@@ -455,6 +444,10 @@ pub const Index = struct {
     /// as a unit at any point before a consumer borrows them.
     pub fn planningHeaders(self: *const Index) ?[]const []u8 {
         return if (self.capture_headers and self.headers.items.len == self.packets.items.len) self.headers.items else null;
+    }
+    fn reclaimForScan(raw: *anyopaque) bool {
+        const self: *Index = @ptrCast(@alignCast(raw));
+        return self.reclaim();
     }
     fn reclaim(self: *Index) bool {
         if (!self.capture_headers) return false;
@@ -762,6 +755,35 @@ test "seekable transport evicts optional headers when required mapping growth ne
     try std.testing.expect(cached.planningHeaders() == null);
     try std.testing.expectEqualSlices(Nal, baseline.nals.items, cached.nals.items);
     try std.testing.expectEqualSlices(Run, baseline.runs.items, cached.runs.items);
+}
+
+test "seekable transport builds within one physical scan under the cache-free peak" {
+    const Provider = struct {
+        bytes: []const u8,
+        next: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: media.source.Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset != self.next) return error.RepeatedPhysicalRead;
+            @memcpy(out, self.bytes[self.next..][0..out.len]);
+            self.next += out.len;
+            return out.len;
+        }
+    };
+    const bytes = @embedFile("../testdata/transport/closed.ts");
+    var cap: u64 = std.math.maxInt(u64);
+    for ([_]bool{ false, true }) |capture| {
+        var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        const a = backing.allocator();
+        var provider = Provider{ .bytes = bytes };
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = cap } };
+        var wire = media.source.Source{ .allocator = a, .admission_pool = &pool, .identity = "single-pass", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = bytes.len } }, .limits = .{ .max_total_bytes = bytes.len, .max_read_bytes = 188 * 4 } };
+        var index: Index = undefined;
+        try index.buildForReader(a, &wire, .{ .stream = .{ .admission_pool = &pool } }, capture);
+        defer index.deinit();
+        cap = pool.high_water.host_bytes;
+        try std.testing.expectEqual(bytes.len, provider.next);
+        if (capture) try std.testing.expect(index.planningHeaders() == null);
+    }
 }
 
 test "seekable transport forwards worker cancellation inside a physical read" {

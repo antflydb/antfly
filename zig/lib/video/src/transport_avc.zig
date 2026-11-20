@@ -616,9 +616,14 @@ pub fn indexSource(a: std.mem.Allocator, source: *media.source.Source, options: 
 }
 
 pub fn scanSource(a: std.mem.Allocator, source: *media.source.Source, options: Options, units: *Stream, consumer_: media.transport_stream.Consumer) !void {
+    return scanSourceReclaiming(a, source, options, units, consumer_, null);
+}
+
+pub fn scanSourceReclaiming(a: std.mem.Allocator, source: *media.source.Source, options: Options, units: *Stream, consumer_: media.transport_stream.Consumer, reclaimer: ?media.admission.Reclaimer) !void {
     if (source.length() > options.transport.max_bytes) return error.ResourceLimitExceeded;
     var demux = try media.transport_stream.Stream.init(a, .{}, options.transport, options.stream.control, options.stream.admission_pool, consumer_);
     defer if (!demux.ended) demux.deinit();
+    demux.workspace.reclaimer = reclaimer;
     switch (source.storage) {
         .borrowed => |bytes| try demux.push(bytes),
         .range => {
@@ -626,7 +631,7 @@ pub fn scanSource(a: std.mem.Allocator, source: *media.source.Source, options: O
             if (chunk == 0) return error.ResourceLimitExceeded;
             var offset: u64 = 0;
             while (offset < source.length()) {
-                var lease = try source.read(offset, @intCast(@min(source.length() - offset, chunk)));
+                var lease = try source.readReclaiming(offset, @intCast(@min(source.length() - offset, chunk)), reclaimer);
                 defer lease.deinit();
                 try demux.push(lease.bytes);
                 offset += lease.bytes.len;

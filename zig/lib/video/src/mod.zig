@@ -76,6 +76,7 @@ test {
     _ = apple_webm;
     _ = @import("backends/apple_test.zig");
     _ = sampling;
+    _ = packet_sampling;
     _ = display;
     _ = tone;
     _ = @import("sampling_test.zig");

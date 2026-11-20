@@ -2145,18 +2145,23 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     try effective.check();
     // Bound container metadata before allocating it, without charging the
     // compressed MP4 as device input or opening the decoder before admission.
-    const inspected = inspect: {
-        var host_permit = try session.admitHostPreprocess(try std.math.add(usize, bytes.len, 128 * 1024 * 1024));
-        defer host_permit.deinit();
-        const Check = struct {
-            fn check(raw: ?*const anyopaque) anyerror!void {
-                const c: *const Control = @ptrCast(@alignCast(raw.?));
-                try c.check();
-            }
-        };
-        break :inspect @import("../ops/cuda/video.zig").inspectEmbedding(a, bytes, .{ .context = &effective, .check_fn = Check.check }) catch |err| return videoInputError(err);
+    var host_permit = try session.admitHostPreprocess(try std.math.add(usize, bytes.len, 128 * 1024 * 1024));
+    defer host_permit.deinit();
+    const Check = struct {
+        fn check(raw: ?*const anyopaque) anyerror!void {
+            const c: *const Control = @ptrCast(@alignCast(raw.?));
+            try c.check();
+        }
     };
-    const request = try cudaVideoRequest(inspected, bytes.len, options);
+    var prepared: @import("../ops/cuda/video.zig").PreparedEmbedding = undefined;
+    prepared.init(a, bytes, .{ .context = &effective, .check_fn = Check.check }) catch |err| return videoInputError(err);
+    var prepared_live = true;
+    defer if (prepared_live) prepared.deinit();
+    const inspected = prepared.inspection;
+    const retained = prepared.retainedBytes();
+    try host_permit.retainHostBytes(retained);
+    var request = try cudaVideoRequest(inspected, bytes.len, options);
+    request.pre_admitted_host_bytes = retained;
     var execution_waiter = Scheduler.Waiter{};
     try enterModel(session, lock, effective, &execution_waiter);
     defer leaveModel(lock, &execution_waiter);
@@ -2186,11 +2191,14 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     const before = MediaTransferSnapshot.init(cb);
     defer observeResidentTransfers(cb, before, options);
     const started = mediaNow();
-    var projected = projector.encodeEmbeddingGemma2VideoResident(cb, a, bytes, options.max_tokens, inspected.selection) catch |err| {
+    var projected = projector.encodeEmbeddingGemma2VideoResident(cb, a, &prepared, options.max_tokens) catch |err| {
         std.log.warn("embeddinggemma2 CUDA video failed phase=decode_projection error={s}", .{@errorName(err)});
         return videoInputError(err);
     };
     defer projected.deinit();
+    prepared.deinit();
+    prepared_live = false;
+    try host_permit.retainHostBytes(bytes.len);
     if (options.timings) |t| {
         t.vision_ns += mediaNow() - started;
         t.resident_cohorts += 1;
@@ -2224,7 +2232,7 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     if (options.timings) |t| t.pack_ns += mediaNow() - pack_started;
     const encoder_started = mediaNow();
     if (length != request.sequence) return error.InvalidVideoInput;
-    const encoder_request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = length, .input_bytes = bytes.len, .backend_input_bytes = length * 512 * @sizeOf(f32), .host_preprocess_bytes = length * 32, .workspace_planned = true, .workspace_bytes = try cudaEncoderWorkspace(length, 1), .preprocessing_complete = true, .output_bytes = options.dimensions * @sizeOf(f32) };
+    const encoder_request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = length, .input_bytes = bytes.len, .pre_admitted_host_bytes = bytes.len, .backend_input_bytes = length * 512 * @sizeOf(f32), .host_preprocess_bytes = length * 32, .workspace_planned = true, .workspace_bytes = try cudaEncoderWorkspace(length, 1), .preprocessing_complete = true, .output_bytes = options.dimensions * @sizeOf(f32) };
     permit.retainForRun(encoder_request) catch |err| {
         logCudaVideoAdmission(session, encoder_request, "encoder_retain", err, null);
         return err;

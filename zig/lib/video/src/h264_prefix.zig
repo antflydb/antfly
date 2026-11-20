@@ -70,6 +70,10 @@ pub fn retainedSize(header: u8, size: usize) !usize {
 /// Re-encode only each NAL's needed prefix. Original packet offsets/lengths
 /// remain authoritative; this buffer must never be submitted to a decoder.
 pub fn packet(a: std.mem.Allocator, reader: *media.mp4.Reader, index: usize, maximum: usize) ![]u8 {
+    return packetReclaiming(a, reader, index, maximum, null);
+}
+
+pub fn packetReclaiming(a: std.mem.Allocator, reader: *media.mp4.Reader, index: usize, maximum: usize, reclaimer: ?media.admission.Reclaimer) ![]u8 {
     const entry = reader.packets[index];
     if (entry.size > maximum) return error.ResourceLimitExceeded;
     const n = reader.track.nal_length_bytes;
@@ -84,7 +88,7 @@ pub fn packet(a: std.mem.Allocator, reader: *media.mp4.Reader, index: usize, max
         // One bounded read normally covers length and complete header. Skip
         // the entropy tail using its declared length, without fetching it.
         const offset = try std.math.add(u64, entry.offset, cursor);
-        var lease = try reader.input.read(offset, @min(entry.size - cursor, @as(usize, n) + 128));
+        var lease = try reader.input.readReclaiming(offset, @min(entry.size - cursor, @as(usize, n) + 128), reclaimer);
         defer lease.deinit();
         var size: usize = 0;
         for (lease.bytes[0..n]) |byte| size = (size << 8) | byte;
@@ -103,7 +107,7 @@ pub fn packet(a: std.mem.Allocator, reader: *media.mp4.Reader, index: usize, max
         const available = @min(retained, lease.bytes.len - n);
         out.appendSliceAssumeCapacity(lease.bytes[n..][0..available]);
         if (available < retained) {
-            var tail = try reader.input.read(try std.math.add(u64, offset, n + available), retained - available);
+            var tail = try reader.input.readReclaiming(try std.math.add(u64, offset, n + available), retained - available, reclaimer);
             defer tail.deinit();
             out.appendSliceAssumeCapacity(tail.bytes);
         }
