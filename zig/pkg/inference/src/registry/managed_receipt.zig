@@ -714,6 +714,24 @@ pub fn installationForPublication(a: std.mem.Allocator, io: std.Io, model: []con
     return installationAtRoot(a, io, root, stat, if (direct) model else null, publication);
 }
 
+/// Recheck a previously hashed receipt against the current installation.
+/// Both marker reads are required because publication may start during stat.
+pub fn requireInstallation(a: std.mem.Allocator, io: std.Io, model: []const u8, expected: Installation) !void {
+    const direct = isDirectModelPath(model);
+    const root = if (direct) try publicationRootAlloc(a, io, model) else model;
+    defer if (direct) a.free(root);
+    const progress = try managedPath(a, root, in_progress_filename);
+    defer a.free(progress);
+    const plan = try managedPath(a, root, plan_filename);
+    defer a.free(plan);
+    const cwd = std.Io.Dir.cwd();
+    if (try publicationBlockedPaths(cwd, io, progress, plan)) return error.IncompleteManagedDownload;
+    const stat = try cwd.statFile(io, root, .{});
+    const current = try installationAtRoot(a, io, root, stat, if (direct) model else null, expected.publication);
+    if (try publicationBlockedPaths(cwd, io, progress, plan)) return error.IncompleteManagedDownload;
+    if (!std.meta.eql(expected, current)) return error.ModelArtifactsChanging;
+}
+
 /// Cheap publication identity for resident sessions and load flights. Receipt
 /// validation still owns artifact integrity; this token binds its source and
 /// artifact manifest to the generation actually loaded, without hashing weights.

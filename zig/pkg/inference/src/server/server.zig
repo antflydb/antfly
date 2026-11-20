@@ -2037,6 +2037,7 @@ const LoadedEmbeddingRuntimeAttemptFn = *const fn (
 const LoadedEmbeddingRecoveryOptions = struct {
     trace: ?*embedding_trace.Trace = null,
     pinned_revision: ?[32]u8 = null,
+    prepared_pin: ?*model_manager_mod.PreparedPinnedEmbedding = null,
     preferred_backends: ?[]const backends_mod.BackendType = null,
     cache_default_alias: bool = true,
     pin_on_success: bool = false,
@@ -2108,6 +2109,7 @@ fn acknowledgeEmbeddingRevision(ctx: *httpx.Context, revision: ?[32]u8) !void {
 fn pinnedEmbeddingPreflightFailure(ctx: *httpx.Context, revision: ?[32]u8, err: anyerror) !?httpx.Response {
     if (revision == null) return null;
     return switch (err) {
+        error.ModelNotFound, error.FileNotFound, error.NotDir, error.ModelArtifactsChanging, error.IncompleteManagedDownload, error.ModelInventoryChanged, error.InferenceCapabilitiesStale => try embeddingRevisionFailureResponse(ctx),
         error.ChecksumMismatch, error.InvalidManagedDownload, error.ModelArtifactNotPublished, error.PinnedEmbeddingArtifactUnavailable => try embeddingArtifactFailureResponse(ctx),
         error.PinnedEmbeddingBackendUnavailable => blk: {
             try ctx.setHeader("X-Antfly-Embedding-Backend-Unavailable", "true");
@@ -2160,6 +2162,9 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
                 }
             }
             if (self.options.pinned_revision) |revision| {
+                if (self.options.prepared_pin) |prepared| {
+                    return self.node.model_manager.acquirePreparedPinnedEmbedding(self.model_path, revision, self.options.execution_control orelse .{}, prepared);
+                }
                 return self.node.model_manager.acquirePinnedEmbedding(self.model_path, revision, self.options.execution_control orelse .{});
             }
             return if (self.options.preferred_backends) |preferred_backends|
@@ -3568,7 +3573,28 @@ fn appendUniqueOpenAiModelEntry(
 const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
 const PublicationLease = @import("../registry/publication_lease.zig").Lease;
 
+const PinnedRequestSelection = struct {
+    node: *Node,
+    proof: *model_manager_mod.PreparedPinnedEmbedding,
+
+    fn verify(self: *PinnedRequestSelection, io: std.Io, path: []const u8, selector: ?[]const u8, inventory_publication: ?[32]u8) ![32]u8 {
+        const a = self.node.allocator;
+        const root = try realPathExistingAlloc(a, io, self.node.config.models_dir);
+        defer a.free(root);
+        const canonical = try realPathExistingAlloc(a, io, path);
+        defer a.free(canonical);
+        if (!pathHasComponentPrefix(canonical, root)) return error.ModelOutsideModelsDir;
+        return self.proof.capture(io, canonical, selector, inventory_publication);
+    }
+
+    fn prepare(raw: *anyopaque, io: std.Io, path: []const u8, selector: []const u8, inventory_publication: ?[32]u8) ![32]u8 {
+        const self: *PinnedRequestSelection = @ptrCast(@alignCast(raw));
+        return self.verify(io, path, selector, inventory_publication);
+    }
+};
+
 const ModelSelectionOptions = struct {
+    pinned: ?*PinnedRequestSelection = null,
     scoped: ?*const ScopedCatalogPublication = null,
     reuse_resident: bool = false,
 };
@@ -13957,7 +13983,7 @@ pub const Node = struct {
                     if (self.selector_cache) |cache| return (try cache.resolveSelectionWithResident(self.allocator, io, self.config.models_dir, normalized, task_type, self.residentSelection(options))) orelse error.ModelNotFound;
                     var temporary = selection_mod.Cache.init(self.allocator);
                     defer temporary.deinit();
-                    return (try temporary.resolveSelection(self.allocator, io, self.config.models_dir, normalized, task_type)) orelse error.ModelNotFound;
+                    return (try temporary.resolveSelectionWithResident(self.allocator, io, self.config.models_dir, normalized, task_type, self.residentSelection(options))) orelse error.ModelNotFound;
                 }
             } else |_| {
                 if (std.mem.indexOfAny(u8, normalized, ":@") != null) return error.InvalidModelIdentifier;
@@ -13969,6 +13995,9 @@ pub const Node = struct {
         if (validated) |selected| return selected;
         if (options.scoped) |captured| {
             if (std.mem.eql(u8, captured.path, path)) return .{ .path = path, .publication = captured.artifacts.publication };
+        }
+        if (options.pinned) |pinned| {
+            return .{ .path = path, .publication = try pinned.verify(io, path, null, null) };
         }
         if (options.reuse_resident) {
             const canonical = try realPathExistingAlloc(self.allocator, io, path);
@@ -14093,6 +14122,7 @@ pub const Node = struct {
     }
 
     fn residentSelection(self: *Node, options: ModelSelectionOptions) ?selection_mod.Cache.ResidentPublication {
+        if (options.pinned) |pinned| return .{ .context = pinned, .prepare = PinnedRequestSelection.prepare };
         if (!options.reuse_resident) return null;
         return .{ .context = self, .matches = residentSelectionMatches };
     }
@@ -14107,7 +14137,7 @@ pub const Node = struct {
     fn resolveDiscoveredRequestName(self: *Node, io: std.Io, request_name: []const u8, task_type: ?[]const u8, options: ModelSelectionOptions, validated: *?ResolvedModel) !?[]u8 {
         if (self.selector_cache) |cache| {
             const selected = (try cache.resolveSelectionWithResident(self.allocator, io, self.config.models_dir, request_name, task_type, self.residentSelection(options))) orelse return null;
-            if (options.reuse_resident) validated.* = selected;
+            if (options.reuse_resident or options.pinned != null) validated.* = selected;
             return @constCast(selected.path);
         }
         return registry_mod.resolveInstalledModelSelector(self.allocator, io, self.config.models_dir, request_name, task_type);
@@ -14704,7 +14734,13 @@ pub const Node = struct {
         // Read only the lightweight manifest first so media can be admitted
         // before loading tokenizer, weights, or accelerator sessions.
         const model_name: ?[]const u8 = if (request.model.len > 0) request.model else null;
-        const model_path_selection = self.resolveRequestModelSelectionWithOptions(ctx.allocator, ctx.io, model_name, "embedders", .{ .reuse_resident = true }) catch |err| {
+        var prepared_pin = model_manager_mod.PreparedPinnedEmbedding{ .manager = &self.model_manager };
+        defer prepared_pin.deinit();
+        var pinned_selection = PinnedRequestSelection{ .node = self, .proof = &prepared_pin };
+        const model_path_selection = self.resolveRequestModelSelectionWithOptions(ctx.allocator, ctx.io, model_name, "embedders", .{
+            .reuse_resident = true,
+            .pinned = if (request.model_revision != null) &pinned_selection else null,
+        }) catch |err| {
             if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
             return requestModelResolutionError(ctx, err);
         };
@@ -14716,7 +14752,7 @@ pub const Node = struct {
         // Request validation never scans its GGUF tokenizer arrays, and the
         // failed runtime can be reclaimed before a recovery replacement loads.
         const cached_manifest = if (request.model_revision) |revision|
-            self.model_manager.copyPinnedEmbeddingManifest(ctx.allocator, model_path, revision, execution_control) catch |err| {
+            prepared_pin.admissionManifest(ctx.allocator, model_path, revision, execution_control) catch |err| {
                 if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
                 return modelLoadFailureResponse(ctx, err);
             }
@@ -14750,7 +14786,7 @@ pub const Node = struct {
                 if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
                 reserved_units = required_units;
             }
-            return self.createGroupedEmbedding(ctx, model_path, admission_manifest, executor_contract, request, borrowed_attachments, .{ .media = media_admission, .reserved_units = &reserved_units, .audio_working_bytes = audio_admission.max_decode_working_bytes }, execution_control) catch |err| {
+            return self.createGroupedEmbedding(ctx, model_path, admission_manifest, executor_contract, request, borrowed_attachments, .{ .media = media_admission, .reserved_units = &reserved_units, .audio_working_bytes = audio_admission.max_decode_working_bytes }, execution_control, &prepared_pin) catch |err| {
                 if (err == error.PinnedEmbeddingArtifactUnavailable or err == error.PinnedEmbeddingBackendUnavailable) return (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)).?;
                 return groupedEmbeddingFailureResponse(ctx, err);
             };
@@ -14831,13 +14867,18 @@ pub const Node = struct {
                 .executor_contract = executor_contract,
                 .execution_control = execution_control,
             };
+            var failure_stage: EmbeddingRuntimeFailureStage = .acquire;
             runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
                 .pinned_revision = request.model_revision,
+                .prepared_pin = &prepared_pin,
+                .failure_stage = &failure_stage,
                 .execution_control = execution_control,
             }, &attempt, Attempt.run) catch |err|
                 {
                     if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
-                    if (err == error.PinnedEmbeddingArtifactUnavailable or err == error.PinnedEmbeddingBackendUnavailable) return (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)).?;
+                    if (failure_stage == .acquire or err == error.PinnedEmbeddingArtifactUnavailable or err == error.PinnedEmbeddingBackendUnavailable) {
+                        if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
+                    }
                     if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
                     return inferenceFailureResponse(ctx, err);
                 };
@@ -15071,12 +15112,15 @@ pub const Node = struct {
         const pipeline_start = embedTimingStart();
         runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
             .pinned_revision = request.model_revision,
+            .prepared_pin = &prepared_pin,
             .failure_stage = &failure_stage,
             .trace = attempt.trace,
             .execution_control = execution_control,
         }, &attempt, Attempt.run) catch |err| {
             if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
-            if (err == error.PinnedEmbeddingArtifactUnavailable or err == error.PinnedEmbeddingBackendUnavailable) return (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)).?;
+            if (failure_stage == .acquire or err == error.PinnedEmbeddingArtifactUnavailable or err == error.PinnedEmbeddingBackendUnavailable) {
+                if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
+            }
             if (err == error.EmbeddingIdentityMismatch) return ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = "embedding assets or recipe differ from the pinned index identity" });
             if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
             if (isEmbedRequestOptionError(err)) {
@@ -26156,18 +26200,18 @@ pub const Node = struct {
         return vectors;
     }
 
-    fn createGroupedEmbedding(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, admission: GroupedEmbeddingAdmission, control: InferenceExecutionControl) !httpx.Response {
+    fn createGroupedEmbedding(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, admission: GroupedEmbeddingAdmission, control: InferenceExecutionControl, prepared_pin: ?*model_manager_mod.PreparedPinnedEmbedding) !httpx.Response {
         // The inner call releases frame-cache fences, model handles and arena
         // storage before this scope publishes the completed cleanup outcome.
         var outcome = self.metrics.embedding_groups.begin();
         defer outcome.finish();
-        return self.createGroupedEmbeddingTracked(ctx, path, manifest, contract, request, attachments, admission, control) catch |err| {
+        return self.createGroupedEmbeddingTracked(ctx, path, manifest, contract, request, attachments, admission, control, prepared_pin) catch |err| {
             outcome.failure = err;
             return err;
         };
     }
 
-    fn createGroupedEmbeddingTracked(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, admission: GroupedEmbeddingAdmission, control: InferenceExecutionControl) !httpx.Response {
+    fn createGroupedEmbeddingTracked(self: *Node, ctx: *httpx.Context, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, request: ParsedEmbedRequest, attachments: []const httpx.attachment_envelope.Attachment, admission: GroupedEmbeddingAdmission, control: InferenceExecutionControl, prepared_pin: ?*model_manager_mod.PreparedPinnedEmbedding) !httpx.Response {
         const grouped = @import("../pipelines/embedding_gemma2.zig");
         if (request.instruction != null) return error.InstructionNotSupportedForModel;
         if (request.dimensions) |dim| if (dim <= 0 or !@import("../architectures/embedding_gemma2.zig").validDimension(@intCast(dim))) return error.InvalidEmbeddingDimensions;
@@ -26228,7 +26272,13 @@ pub const Node = struct {
         }
         var input_tokens: usize = 0;
         var handle = if (request.model_revision) |required|
-            try self.model_manager.acquirePinnedEmbedding(path, required, control)
+            (if (prepared_pin) |prepared|
+                self.model_manager.acquirePreparedPinnedEmbedding(path, required, control, prepared)
+            else
+                self.model_manager.acquirePinnedEmbedding(path, required, control)) catch |err| {
+                if (try pinnedEmbeddingPreflightFailure(ctx, request.model_revision, err)) |response| return response;
+                return err;
+            }
         else
             try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
@@ -51048,6 +51098,37 @@ test "model catalog publishes dense geometry without weights and only for embedd
     try std.testing.expectEqualStrings("{}", buf.items);
 }
 
+test "pinned embedding HTTP treats a missing selector or moving publication as a stale proof" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(models);
+    var node = try Node.init(a, .{ .models_dir = models });
+    defer node.deinit();
+    try node.attachIo(io);
+    const pin = "1111111111111111111111111111111111111111111111111111111111111111";
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embeddings");
+    defer request.deinit();
+    request.body = "{\"model\":\"missing\",\"input\":\"query\",\"model_revision\":\"" ++ pin ++ "\"}";
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.createEmbedding(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
+    try std.testing.expectEqualStrings("true", response.headers.get("X-Antfly-Capability-Stale").?);
+    try std.testing.expect(response.headers.get(embedding_revision.response_header) == null);
+    for ([_]anyerror{ error.FileNotFound, error.IncompleteManagedDownload, error.ModelArtifactsChanging }) |err| {
+        var other_ctx = httpx.Context.init(a, io, &request);
+        defer other_ctx.deinit();
+        var refused = (try pinnedEmbeddingPreflightFailure(&other_ctx, @splat(1), err)).?;
+        defer refused.deinit();
+        try std.testing.expectEqual(@as(u16, 409), refused.status.code);
+        try std.testing.expectEqualStrings("true", refused.headers.get("X-Antfly-Capability-Stale").?);
+    }
+}
+
 test "model selection reuses the verified resident installation for embedding requests" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -51716,7 +51797,7 @@ test "grouped embedding request rejects aggregate pixels before model loading in
     var ctx = httpx.Context.init(a, std.testing.io, &request);
     defer ctx.deinit();
     for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
-        try std.testing.expectError(error.InferenceDecodedPixelsExceeded, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, admission, .{}));
+        try std.testing.expectError(error.InferenceDecodedPixelsExceeded, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, admission, .{}, null));
     }
     // Node capacity is independent of a model's advertised pixel ceiling.
     var unbounded_contract = contract;
@@ -51726,7 +51807,7 @@ test "grouped embedding request rejects aggregate pixels before model loading in
     const constrained = GroupedEmbeddingAdmission{ .media = constrained_media, .reserved_units = &reserved_units };
     try std.testing.expectError(error.ImageBatchTooLarge, node.embedGroupsFromPath(a, std.testing.io, "missing-model", &manifest, unbounded_contract, input.value, .{}, .{}, constrained));
     for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
-        try std.testing.expectError(error.ImageBatchTooLarge, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, unbounded_contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, constrained, .{}));
+        try std.testing.expectError(error.ImageBatchTooLarge, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, unbounded_contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, constrained, .{}, null));
     }
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
 }
@@ -52586,7 +52667,7 @@ test "grouped embedding request applies image security before model loading" {
     var ctx = httpx.Context.init(a, std.testing.io, &request);
     defer ctx.deinit();
     for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
-        try std.testing.expectError(error.ImageTooLarge, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = parsed.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, admission, .{}));
+        try std.testing.expectError(error.ImageTooLarge, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = parsed.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, admission, .{}, null));
     }
     var response = try groupedEmbeddingFailureResponse(&ctx, error.ImageTooLarge);
     defer response.deinit();
@@ -52633,7 +52714,7 @@ test "grouped embedding request reports all invalid items without model loading"
     defer request.deinit();
     var ctx = httpx.Context.init(a, std.testing.io, &request);
     defer ctx.deinit();
-    var response = try node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = .per_item }, &.{}, .{ .media = media, .reserved_units = &units }, .{});
+    var response = try node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = input.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = .per_item }, &.{}, .{ .media = media, .reserved_units = &units }, .{}, null);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
     var body = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
@@ -52690,7 +52771,7 @@ test "grouped embedding request charges framed attachments before inline media" 
     var ctx = httpx.Context.init(a, std.testing.io, &request);
     defer ctx.deinit();
     for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
-        try std.testing.expectError(error.RemoteContentTooLarge, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = parsed.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &attachments, .{ .media = media, .reserved_units = &units }, .{}));
+        try std.testing.expectError(error.RemoteContentTooLarge, node.createGroupedEmbeddingTracked(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = parsed.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &attachments, .{ .media = media, .reserved_units = &units }, .{}, null));
     }
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
 }

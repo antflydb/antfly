@@ -430,7 +430,8 @@ pub const Cache = struct {
 
     pub const ResidentPublication = struct {
         context: *anyopaque,
-        matches: *const fn (*anyopaque, std.Io, []const u8, [32]u8) anyerror!bool,
+        matches: ?*const fn (*anyopaque, std.Io, []const u8, [32]u8) anyerror!bool = null,
+        prepare: ?*const fn (*anyopaque, std.Io, []const u8, []const u8, ?[32]u8) anyerror![32]u8 = null,
     };
 
     pub fn resolveSelectionWithResident(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8, requested: []const u8, task: ?[]const u8, resident: ?ResidentPublication) !?ResolvedModel {
@@ -460,12 +461,26 @@ pub const Cache = struct {
         };
         const path = lookup.path;
         errdefer allocator.free(path);
-        if (resident) |candidate| if (lookup.publication) |publication| {
-            if (try candidate.matches(candidate.context, io, path, publication)) {
+        if (resident) |candidate| {
+            if (candidate.prepare) |prepare| {
+                const publication = prepare(candidate.context, io, path, requested, lookup.publication) catch |err| switch (err) {
+                    error.ModelNotFound => {
+                        allocator.free(path);
+                        self.invalidate(io);
+                        return null;
+                    },
+                    else => return err,
+                };
                 try catalog_publication.require(allocator, io, root, lookup.generation);
                 return .{ .path = path, .publication = publication };
             }
-        };
+            if (candidate.matches) |matches| if (lookup.publication) |publication| {
+                if (try matches(candidate.context, io, path, publication)) {
+                    try catalog_publication.require(allocator, io, root, lookup.generation);
+                    return .{ .path = path, .publication = publication };
+                }
+            };
+        }
         var temporary = std.heap.ArenaAllocator.init(allocator);
         defer temporary.deinit();
         const proof = try registry.managedModelSelectionAlloc(temporary.allocator(), io, path);

@@ -182,11 +182,22 @@ pub const PublishedArtifacts = struct {
         const root_stat = try std.Io.Dir.cwd().statFile(io, physical_root, .{ .follow_symlinks = false });
         const physical_direct = if (direct) try managed.resolveRegularFilePath(a, io, root) else null;
         errdefer if (physical_direct) |path| a.free(path);
+        const receipt_path = if (standalone) null else try std.fs.path.join(a, &.{ physical_root, managed.complete_filename });
+        defer if (receipt_path) |path| a.free(path);
+        const before: ?managed.ArtifactStamp = if (receipt_path) |path| stamp: {
+            const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => break :stamp null,
+                else => return err,
+            };
+            break :stamp managed.ArtifactStamp.fromStat(stat);
+        } else null;
         var receipt = if (standalone) null else try managed.loadValidated(a, io, physical_root);
         errdefer if (receipt) |*value| value.deinit();
         const publication = if (receipt) |value| value.publication_generation else null;
         if (expected) |value| if (!std.meta.eql(value.publication, publication)) return error.ModelArtifactsChanging;
         const installation = if (publication) |generation| try managed.installationAtRoot(a, io, physical_root, root_stat, physical_direct, generation) else null;
+        const after = if (installation) |installed| installed.receipt_stamp else null;
+        if (!std.meta.eql(before, after)) return error.ModelArtifactsChanging;
         var index = std.StringHashMapUnmanaged(usize).empty;
         errdefer index.deinit(a);
         if (receipt) |value| for (value.artifacts, 0..) |artifact, i| try index.put(a, artifact.canonical_path, i);
@@ -585,10 +596,10 @@ pub const PublishedArtifacts = struct {
             if (stat.kind != .directory or stat.inode != self.directory_scope_inode.?) return error.ModelArtifactsChanging;
         }
         if (self.direct_path) |path| try self.verifyBinding(path, self.physical_direct.?);
-        if (!std.meta.eql(self.publication, try managed.publicationGeneration(self.allocator, self.io, self.root))) return error.ModelArtifactsChanging;
         if (self.installation) |expected| {
-            const current = try managed.installationAtRoot(self.allocator, self.io, self.physical_root, root_stat, self.physical_direct, expected.publication);
-            if (!std.meta.eql(current, expected)) return error.ModelArtifactsChanging;
+            try managed.requireInstallation(self.allocator, self.io, self.root, expected);
+        } else if ((try managed.publicationGeneration(self.allocator, self.io, self.root)) != null) {
+            return error.ModelArtifactsChanging;
         }
     }
 
