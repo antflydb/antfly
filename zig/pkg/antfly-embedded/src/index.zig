@@ -193,6 +193,23 @@ pub const SegmentData = union(enum) {
 /// later generations, which is what the previous snapshot successor chain
 /// pinned (under a merge storm that grew with churn rate × hold time, and a
 /// leaked snapshot pinned every future generation).
+const StoredKeyDirectory = struct {
+    const Entry = struct {
+        hash: u64,
+        doc: u32,
+    };
+
+    entries: []Entry,
+    reservation: ?resource_manager_mod.Reservation,
+    alloc: Allocator,
+
+    fn deinit(self: *@This()) void {
+        if (self.reservation) |*reservation| reservation.release();
+        self.alloc.free(self.entries);
+        self.alloc.destroy(self);
+    }
+};
+
 pub const SegmentShared = struct {
     const deletion_writer_bit: u32 = 1 << 31;
 
@@ -203,6 +220,8 @@ pub const SegmentShared = struct {
     /// Visibility cells and physical readers may have independent owners.
     allocator: Allocator,
     residency_mutex: std.atomic.Mutex = .unlocked,
+    stored_key_directory_lock: std.atomic.Mutex = .unlocked,
+    stored_key_directories: [2]std.atomic.Value(?*StoredKeyDirectory) = @splat(.init(null)),
     // One process-level accounting owner per physical mapping. The manager
     // outlives all snapshots/forks sharing this segment, including query pins.
     residency_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -641,6 +660,9 @@ pub const SegmentEntry = struct {
     }
 
     fn destroyShared(alloc: Allocator, shared: *SegmentShared) void {
+        for (&shared.stored_key_directories) |*slot| {
+            if (slot.load(.acquire)) |directory| directory.deinit();
+        }
         if (shared.residency_manager) |manager| manager.observeUsageWithHostCharge(.full_text_segment_residency, &shared.residency_accounted, 0, 0);
         if (shared.deleted) |*deleted| deleted.deinit();
         freeTypedDocValuesCoverage(alloc, shared.typed_doc_values_coverage);
@@ -2454,17 +2476,74 @@ pub const IndexSnapshot = struct {
         return try self.collectKeyDocNumsAlloc(alloc, frontier, control, true);
     }
 
-    fn collectKeyDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl, match_parent: bool) !GraphFrontierDocs {
+    fn storedProjectionKey(alloc: Allocator, key: []const u8, match_parent: bool) ![]const u8 {
         const internal_keys = @import("storage/internal_keys.zig");
+        if (match_parent and (internal_keys.isChunkArtifactRecordKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isDocumentUnitArtifactRecordKey(key))) {
+            return (try internal_keys.decodeDocumentComponentAlloc(alloc, key)) orelse error.InvalidSegment;
+        }
+        return key;
+    }
+
+    fn storedKeyDirectory(
+        self: *const IndexSnapshot,
+        segment: *const SegmentEntry,
+        scratch: *segment_mod.SegmentReadScratch,
+        match_parent: bool,
+        control: query_mod.ExecutionControl,
+    ) !?*const StoredKeyDirectory {
+        const shared = segment.shared;
+        const slot = &shared.stored_key_directories[@intFromBool(match_parent)];
+        if (slot.load(.acquire)) |directory| return directory;
+        const room = @as(usize, segment.reader.doc_count) * @sizeOf(StoredKeyDirectory.Entry);
+        if (room > 16 * 1024 * 1024) return null;
+        if (!shared.stored_key_directory_lock.tryLock()) return null;
+        defer shared.stored_key_directory_lock.unlock();
+        if (slot.load(.acquire)) |directory| return directory;
+
+        const manager = self.graph_predicates.manager.load(.acquire);
+        var reservation: ?resource_manager_mod.Reservation = if (manager) |owner|
+            owner.reserveWithoutReclaim(.graph_predicate_cache, room + @sizeOf(StoredKeyDirectory)) catch return null
+        else
+            null;
+        var published = false;
+        defer if (!published) {
+            if (reservation) |*charge| charge.release();
+        };
+        const alloc = shared.allocator;
+        const entries = alloc.alloc(StoredKeyDirectory.Entry, segment.reader.doc_count) catch return null;
+        defer if (!published) alloc.free(entries);
+        var used: usize = 0;
+        for (0..segment.reader.doc_count) |i| {
+            if (i % 256 == 0) try control.check();
+            const doc: u32 = @intCast(i);
+            scratch.reset();
+            const key = (try segment.reader.storedIdScoped(scratch.allocator(), doc)) orelse continue;
+            const projected = try storedProjectionKey(scratch.allocator(), key, match_parent);
+            entries[used] = .{ .hash = std.hash.Wyhash.hash(0, projected), .doc = doc };
+            used += 1;
+        }
+        // Unused slots sort last. Keep the exact allocation extent for release.
+        for (entries[used..]) |*entry| entry.* = .{ .hash = std.math.maxInt(u64), .doc = std.math.maxInt(u32) };
+        const Order = struct {
+            fn less(_: void, left: StoredKeyDirectory.Entry, right: StoredKeyDirectory.Entry) bool {
+                return left.hash < right.hash;
+            }
+        };
+        std.mem.sort(StoredKeyDirectory.Entry, entries[0..used], {}, Order.less);
+        try control.check();
+        const directory = alloc.create(StoredKeyDirectory) catch return null;
+        directory.* = .{ .entries = entries, .reservation = reservation, .alloc = alloc };
+        slot.store(directory, .release);
+        published = true;
+        return directory;
+    }
+
+    fn collectKeyDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, frontier: std.AutoHashMapUnmanaged(u32, []const u8), control: query_mod.ExecutionControl, match_parent: bool) !GraphFrontierDocs {
         var docs = GraphFrontierDocs.init(alloc);
         errdefer docs.deinit();
+        if (frontier.count() == 0) return docs;
         var keys: std.StringHashMapUnmanaged(u32) = .empty;
         defer keys.deinit(alloc);
-        var entries = frontier.iterator();
-        while (entries.next()) |entry| {
-            try control.check();
-            try keys.put(alloc, entry.value_ptr.*, entry.key_ptr.*);
-        }
         var scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
         defer scratch.deinit();
         var offset: u32 = 0;
@@ -2475,19 +2554,84 @@ pub const IndexSnapshot = struct {
             var lease = try self.leaseSegment(index);
             defer lease.deinit();
             const live = LiveGraphFrontier{ .target = &docs, .shared = lease.entry.shared, .offset = offset, .control = control };
+            if (frontier.count() *| 8 < segment.reader.doc_count) {
+                if (try self.storedKeyDirectory(lease.entry, &scratch, match_parent, control)) |directory| {
+                    var wanted = frontier.iterator();
+                    while (wanted.next()) |entry| {
+                        try control.check();
+                        const key = entry.value_ptr.*;
+                        const hash = std.hash.Wyhash.hash(0, key);
+                        var low: usize = 0;
+                        var high = directory.entries.len;
+                        while (low < high) {
+                            const mid = low + (high - low) / 2;
+                            if (directory.entries[mid].hash < hash) low = mid + 1 else high = mid;
+                        }
+                        for (directory.entries[low..]) |candidate| {
+                            if (candidate.hash != hash or candidate.doc == std.math.maxInt(u32)) break;
+                            try control.check();
+                            scratch.reset();
+                            const stored = (try lease.entry.reader.storedIdScoped(scratch.allocator(), candidate.doc)) orelse continue;
+                            const projected = try storedProjectionKey(scratch.allocator(), stored, match_parent);
+                            if (std.mem.eql(u8, key, projected)) try live.add(offset + candidate.doc, entry.key_ptr.*);
+                        }
+                    }
+                    continue;
+                }
+            }
+            if (keys.count() == 0) {
+                var wanted = frontier.iterator();
+                while (wanted.next()) |entry| {
+                    try control.check();
+                    try keys.put(alloc, entry.value_ptr.*, entry.key_ptr.*);
+                }
+            }
             for (0..segment.reader.doc_count) |i| {
                 if (i % 256 == 0) try control.check();
                 const doc: u32 = @intCast(i);
+                {
+                    try lease.entry.shared.lockDeletionSharedWithControl(control);
+                    defer lease.entry.shared.unlockDeletionShared();
+                    if (lease.entry.shared.deleted) |deleted| if (deleted.contains(doc)) continue;
+                }
                 scratch.reset();
                 const key = (try lease.entry.reader.storedIdScoped(scratch.allocator(), doc)) orelse continue;
-                const match_key = if (match_parent and (internal_keys.isChunkArtifactRecordKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isDocumentUnitArtifactRecordKey(key)))
-                    (try internal_keys.decodeDocumentComponentAlloc(scratch.allocator(), key)) orelse continue
-                else
-                    key;
-                if (keys.get(match_key)) |slot| try live.add(offset + doc, slot);
+                const projected = try storedProjectionKey(scratch.allocator(), key, match_parent);
+                if (keys.get(projected)) |slot| try live.add(offset + doc, slot);
             }
         }
         return docs;
+    }
+
+    pub fn collectOrdinalSortFrontierAlloc(self: *const IndexSnapshot, alloc: Allocator, ordinals: []const u32, control: query_mod.ExecutionControl) !GraphFrontierDocs {
+        var out = GraphFrontierDocs.init(alloc);
+        errdefer out.deinit();
+        var frontier: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer frontier.deinit(alloc);
+        for (ordinals) |ordinal| {
+            try control.check();
+            try frontier.put(alloc, ordinal, {});
+        }
+        var offset: u32 = 0;
+        for (self.segments, 0..) |segment, i| {
+            try control.check();
+            defer offset += segment.reader.doc_count;
+            if (segment.liveDocCount() == 0) continue;
+            var lease = try self.leaseSegment(i);
+            defer lease.deinit();
+            if (ordinals.len *| 16 < segment.reader.doc_count) {
+                if (try seekGraphSegmentFrontier(lease.entry, frontier, control, offset, &out)) continue;
+            }
+            const live = LiveGraphFrontier{ .target = &out, .shared = lease.entry.shared, .offset = offset, .control = control };
+            var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+            for (0..segment.reader.doc_count) |doc| {
+                if (doc % 256 == 0) try control.check();
+                const local: u32 = @intCast(doc);
+                const ordinal = (try cursor.get(local)) orelse continue;
+                if (frontier.contains(ordinal)) try live.add(offset + local, ordinal);
+            }
+        }
+        return out;
     }
 
     pub fn extendGraphFrontierDocNumsAlloc(

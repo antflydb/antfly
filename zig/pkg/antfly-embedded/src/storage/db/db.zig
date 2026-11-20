@@ -48956,6 +48956,10 @@ pub const DB = struct {
             if (self.reverse) std.mem.reverse([]const u8, exceptional.items);
             self.exceptional = exceptional.items;
             defer self.exceptional = &.{};
+            if (options.hasCompletePrimaryKeyScope()) {
+                _ = try self.drainExceptionalBefore(null);
+                return;
+            }
             var lower: []const u8 = lower_owned orelse &prefix;
             if (range_lower) |key| if (std.mem.lessThan(u8, lower, key)) {
                 lower = key;
@@ -76500,7 +76504,10 @@ test "db sparse hits resolve doc ordinals through identity not sparse doc nums" 
     const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "doc:a")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(doc_identity.DocOrdinal, 1), ordinal);
 
-    var result = try db.search(alloc, .{
+    var filter = doc_set.ResolvedDocFilter{};
+    defer filter.deinit(alloc);
+    filter.include = try doc_set.fromOrdinalsAlloc(alloc, &.{ordinal});
+    const request = types.SearchRequest{
         .index_name = "sp_v1",
         .query = .{ .sparse_knn = .{
             .indices = &.{1},
@@ -76511,13 +76518,22 @@ test "db sparse hits resolve doc ordinals through identity not sparse doc nums" 
         // Qualification validates persistence/reopen correctness rather than
         // the default approximate-recall operating point.
         .search_effort = 1.0,
-    });
+    };
+    var result = try db.search(alloc, request);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), result.hits[0].doc_ordinal);
+
+    var scoped = request;
+    scoped.resolved_doc_filter = &filter;
+    var filtered = try db.search(alloc, scoped);
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), filtered.hits.len);
+    try std.testing.expectEqualStrings("doc:a", filtered.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), filtered.hits[0].doc_ordinal);
 }
 
 test "db native checkpoint warming transfers snapshot budgets to a different runtime clock" {
@@ -157389,6 +157405,30 @@ test "optional numeric range keeps mixed primary matches for native field sortin
         try std.testing.expectEqual(@as(usize, 2), sorted.hits.len);
         try std.testing.expectEqualStrings("legacy", sorted.hits[0].id);
         try std.testing.expectEqualStrings("mapped", sorted.hits[1].id);
+        if (replace_segment) {
+            var exact = try db_query_search.searchMatchAll(a, .{
+                .index_name = "ft",
+                .limit = 2,
+                .exclude_doc_ids = &.{"legacy"},
+                .include_stored = false,
+                .filter_query_json = "{\"range\":{\"rank\":{\"gte\":1}}}",
+                .order_by = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
+            }, db.matchAllExecutor());
+            defer exact.deinit();
+            try std.testing.expectEqual(@as(usize, 1), exact.hits.len);
+            try std.testing.expectEqualStrings("mapped", exact.hits[0].id);
+
+            var key_only = try db_query_search.searchMatchAll(a, .{
+                .index_name = "ft",
+                .limit = 2,
+                .filter_doc_ids = &.{"legacy"},
+                .include_stored = false,
+                .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+            }, db.matchAllExecutor());
+            defer key_only.deinit();
+            try std.testing.expectEqual(@as(usize, 1), key_only.hits.len);
+            try std.testing.expectEqualStrings("legacy", key_only.hits[0].id);
+        }
     }
 }
 

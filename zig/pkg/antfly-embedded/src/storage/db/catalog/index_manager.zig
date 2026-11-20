@@ -29639,44 +29639,18 @@ pub const IndexManager = struct {
         if (bench_profile) sparse_txn_ns = platform_time.monotonicNs() - sparse_txn_start_ns;
 
         if (entry.chunk_name == null and entry.embedding_names.len == 0) {
-            var fast_lookup = try entry.index.docNumsForOrdinalDocNumsAlloc(alloc, &sparse_txn, ordinals);
-            defer fast_lookup.deinit(alloc);
-            if (fast_lookup.missing_ordinals.len == 0) {
-                const out = try alloc.dupe(u32, fast_lookup.doc_nums);
-                if (bench_profile) {
-                    std.log.info(
-                        "antfly_bench_sparse_ordinal_projection total_us={d} runtime_store_us={d} primary_txn_us={d} sparse_txn_us={d} doc_id_us={d} doc_num_us={d} ordinals={d} doc_nums={d}",
-                        .{
-                            (platform_time.monotonicNs() - total_start_ns) / 1000,
-                            runtime_store_ns / 1000,
-                            primary_txn_ns / 1000,
-                            sparse_txn_ns / 1000,
-                            doc_id_ns / 1000,
-                            doc_num_ns / 1000,
-                            ordinals.len,
-                            out.len,
-                        },
-                    );
-                }
-                return out;
-            }
-
+            // Preferred sparse numbers can collide with existing physical
+            // numbers. Translate through the primary and sparse key maps.
             const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
             var txn = try store.beginProbeTxn();
             defer txn.abort();
             if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
             const doc_id_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const parent_doc_ids = try lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc, &txn, fast_lookup.missing_ordinals);
+            const parent_doc_ids = try lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc, &txn, ordinals);
             defer alloc.free(parent_doc_ids);
             if (bench_profile) doc_id_ns = platform_time.monotonicNs() - doc_id_start_ns;
             const doc_num_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const fallback_doc_nums = try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, parent_doc_ids);
-            defer alloc.free(fallback_doc_nums);
-            var out = std.ArrayListUnmanaged(u32).empty;
-            errdefer out.deinit(alloc);
-            try out.appendSlice(alloc, fast_lookup.doc_nums);
-            try out.appendSlice(alloc, fallback_doc_nums);
-            const out_slice = try out.toOwnedSlice(alloc);
+            const out = try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, parent_doc_ids);
             if (bench_profile) {
                 doc_num_ns = platform_time.monotonicNs() - doc_num_start_ns;
                 std.log.info(
@@ -29689,11 +29663,11 @@ pub const IndexManager = struct {
                         doc_id_ns / 1000,
                         doc_num_ns / 1000,
                         ordinals.len,
-                        out_slice.len,
+                        out.len,
                     },
                 );
             }
-            return out_slice;
+            return out;
         }
 
         const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;

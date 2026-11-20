@@ -1387,12 +1387,13 @@ fn resolvePatternDocIdsAlloc(
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
     parent_aware: bool,
+    control: @import("../../../search/query.zig").ExecutionControl,
 ) !ResolvedPatternDocIds {
     return switch (set.*) {
         .all => .{ .all = true },
         .none => .{ .active = true },
         .doc_keys => |keys| .{ .ids = keys, .active = true },
-        .ordinals, .ordinal_bitmap => try resolvePatternOrdinalHitsAlloc(alloc, set, legacy, hits, generation, executor, parent_aware),
+        .ordinals, .ordinal_bitmap => try resolvePatternOrdinalHitsAlloc(alloc, set, legacy, hits, generation, executor, parent_aware, control),
     };
 }
 
@@ -1404,52 +1405,85 @@ fn resolvePatternOrdinalHitsAlloc(
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
     parent_aware: bool,
+    control: @import("../../../search/query.zig").ExecutionControl,
 ) !ResolvedPatternDocIds {
+    if (allHitsHaveDocOrdinals(hits)) return .{ .borrowed_ordinal_set = set, .active = true };
+
     var matched = std.ArrayListUnmanaged([]const u8).empty;
     defer {
         for (matched.items) |id| alloc.free(id);
         matched.deinit(alloc);
     }
-    var projected: ?[]const []const u8 = null;
-    defer if (projected) |ids| freeResolvedDocIds(alloc, ids);
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const temp = scratch.allocator();
+    var unresolved: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty;
+    var legacy_keys: std.StringHashMapUnmanaged(void) = .empty;
+    if (legacy.* == .doc_keys) {
+        for (legacy.doc_keys) |key| {
+            try control.check();
+            try legacy_keys.put(temp, key, {});
+        }
+    }
     for (hits) |hit| {
+        try control.check();
         if (hit.doc_ordinal != null) continue;
-        const parent = if (parent_aware) executor.resolve_parent_id.?(executor.ctx, alloc, hit) catch |err| switch (err) {
+        const parent = if (parent_aware) executor.resolve_parent_id.?(executor.ctx, temp, hit) catch |err| switch (err) {
             error.InvalidChunkArtifact, error.StoredDocMissing => null,
             else => return err,
         } else null;
-        defer if (parent) |id| alloc.free(id);
         const key = parent orelse hit.id;
-        if (legacy.* == .doc_keys and containsDocId(legacy.doc_keys, key)) continue;
-
-        const matches = blk: {
-            if (executor.resolve_doc_ids_to_doc_set) |resolve| {
-                var hit_set = try resolve(executor.ctx, alloc, &.{key}, generation);
-                defer hit_set.deinit(alloc);
-                switch (hit_set) {
-                    .none => break :blk false,
-                    .ordinals => {
-                        for (hit_set.ordinals) |ordinal| if (set.containsOrdinal(ordinal)) break :blk true;
-                        break :blk false;
-                    },
-                    else => {},
+        if (legacy_keys.contains(key)) continue;
+        if (executor.resolve_doc_ids_to_doc_set) |resolve| {
+            var hit_set = try resolve(executor.ctx, alloc, &.{key}, generation);
+            defer hit_set.deinit(alloc);
+            if (hit_set == .none) continue;
+            if (hit_set == .ordinals) {
+                for (hit_set.ordinals) |ordinal| {
+                    if (!set.containsOrdinal(ordinal)) continue;
+                    try appendPatternMatch(alloc, &matched, hit.id);
+                    break;
                 }
+                continue;
             }
-            // Old rows may have only reverse identity entries. Keep the
-            // compatibility projection for hits that still need that lookup.
-            if (projected == null) {
-                const project = executor.resolve_doc_set_doc_ids orelse return error.UnsupportedQueryRequest;
-                projected = (try project(executor.ctx, alloc, set, generation)) orelse return error.UnsupportedQueryRequest;
-            }
-            break :blk containsDocId(projected.?, key);
-        };
-        if (matches) {
-            const id = try alloc.dupe(u8, hit.id);
-            errdefer alloc.free(id);
-            try matched.append(alloc, id);
+        }
+        const entry = try unresolved.getOrPut(temp, key);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(temp, hit.id);
+    }
+
+    if (unresolved.count() != 0) {
+        const project = executor.resolve_doc_set_doc_ids orelse return error.UnsupportedQueryRequest;
+        var bitmap_it = if (set.* == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
+        var offset: usize = 0;
+        while (unresolved.count() != 0) {
+            try control.check();
+            var batch: [128]doc_set.DocOrdinal = undefined;
+            const ordinals = if (bitmap_it) |*it| blk: {
+                var len: usize = 0;
+                while (len < batch.len) : (len += 1) batch[len] = it.next() orelse break;
+                break :blk batch[0..len];
+            } else blk: {
+                const keys = set.ordinals[offset..][0..@min(batch.len, set.ordinals.len - offset)];
+                offset += keys.len;
+                break :blk keys;
+            };
+            if (ordinals.len == 0) break;
+            const batch_set = doc_set.ResolvedDocSet{ .ordinals = ordinals };
+            const keys = (try project(executor.ctx, alloc, &batch_set, generation)) orelse return error.UnsupportedQueryRequest;
+            defer freeResolvedDocIds(alloc, keys);
+            for (keys) |key| if (unresolved.fetchRemove(key)) |entry| {
+                for (entry.value.items) |id| try appendPatternMatch(alloc, &matched, id);
+            };
         }
     }
     return .{ .borrowed_ordinal_set = set, .ids = try matched.toOwnedSlice(alloc), .active = true, .owned = true };
+}
+
+fn appendPatternMatch(alloc: Allocator, matched: *std.ArrayListUnmanaged([]const u8), key: []const u8) !void {
+    const id = try alloc.dupe(u8, key);
+    errdefer alloc.free(id);
+    try matched.append(alloc, id);
 }
 
 fn resolvePatternDocIdsFromPublicIdsAlloc(
@@ -1586,13 +1620,13 @@ pub fn applyStoredSearchPatternFilters(
     const parent_aware = member_mode and executor.resolve_parent_id != null and executor.load_parent_stored != null;
 
     var resolved_include = if (resolved_filter) |filter|
-        try resolvePatternDocIdsAlloc(alloc, &filter.include, &filter.legacy_include, result.hits, req.identity_read_generation, executor, parent_aware)
+        try resolvePatternDocIdsAlloc(alloc, &filter.include, &filter.legacy_include, result.hits, req.identity_read_generation, executor, parent_aware, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns })
     else
         ResolvedPatternDocIds{};
     defer resolved_include.deinit(alloc);
 
     var resolved_exclude = if (resolved_filter) |filter|
-        try resolvePatternDocIdsAlloc(alloc, &filter.exclude, &filter.legacy_exclude, result.hits, req.identity_read_generation, executor, parent_aware)
+        try resolvePatternDocIdsAlloc(alloc, &filter.exclude, &filter.legacy_exclude, result.hits, req.identity_read_generation, executor, parent_aware, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns })
     else
         ResolvedPatternDocIds{};
     defer resolved_exclude.deinit(alloc);
@@ -2468,7 +2502,7 @@ test "optional numeric range result membership keeps exceptional keys without re
         .load_stored = TestStoredLoader.loadStored,
         .resolve_doc_set_doc_ids = Harness.failReverse,
         .resolve_doc_ids_to_doc_set = Harness.resolve,
-    }, false);
+    }, false, .{});
     defer resolved.deinit(alloc);
     try std.testing.expect(resolvedPatternContainsHit(resolved, hits[1]));
     try std.testing.expect(resolvedPatternContainsHit(resolved, hits[2]));
