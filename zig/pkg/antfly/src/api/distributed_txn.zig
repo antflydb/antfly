@@ -1564,21 +1564,11 @@ fn executeMultiTableCommitOnce(
     // admission and the exact range epoch before the coordinator participant
     // records the irreversible commit decision.
     if (!resume_committed) {
-        for (participants.items, 0..) |participant, i| {
-            var already_checked = false;
-            for (participants.items[0..i]) |prior| {
-                if (std.mem.eql(u8, prior.table_name, participant.table_name)) {
-                    already_checked = true;
-                    break;
-                }
-            }
-            if (already_checked) continue;
-            table_catalog.validateTransactionTopologyEpoch(alloc, catalog, participant.table_name, participant.topology_epoch) catch |err| {
-                abort_on_error = false;
-                try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
-                return err;
-            };
-        }
+        validateParticipantEpochs(alloc, catalog, participants.items) catch |err| {
+            abort_on_error = false;
+            try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
+            return err;
+        };
     }
 
     // Visibility and propagation can both remain pending (for example, when
@@ -2240,12 +2230,50 @@ const TableRoutes = struct {
     }
 };
 
+const RoutesByName = std.StringArrayHashMapUnmanaged(TableRoutes);
+
+fn loadTableRoutes(a: std.mem.Allocator, by_name: *RoutesByName, snapshot: *const @import("../metadata/api.zig").AdminSnapshot) !void {
+    var by_id: std.AutoHashMapUnmanaged(u64, *TableRoutes) = .empty;
+    for (snapshot.tables) |*descriptor| {
+        const routes = by_name.getPtr(descriptor.name) orelse continue;
+        try table_catalog.validateTransactionTopologyStableSnapshot(snapshot, descriptor.*);
+        routes.descriptor = descriptor;
+        try by_id.put(a, descriptor.table_id, routes);
+    }
+    for (snapshot.ranges) |*range| {
+        const routes = by_id.get(range.table_id) orelse continue;
+        try routes.ranges.append(a, range);
+    }
+    for (by_name.values()) |*routes| {
+        if (routes.ranges.items.len == 0) return error.TableNotFound;
+        routes.epoch = table_catalog.sortedTransactionTopologyEpoch(routes.descriptor.?.*, routes.ranges.items);
+    }
+}
+
+fn validateParticipantEpochs(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, participants: []const ParticipantTxn) !void {
+    if (participants.len == 0) return;
+    var workspace = std.heap.ArenaAllocator.init(alloc);
+    defer workspace.deinit();
+    const a = workspace.allocator();
+    var by_name: RoutesByName = .empty;
+    for (participants) |participant| {
+        const slot = try by_name.getOrPut(a, participant.table_name);
+        if (!slot.found_existing) slot.value_ptr.* = .{ .requirements = .{ .table_name = participant.table_name } };
+    }
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    try loadTableRoutes(a, &by_name, &snapshot);
+    for (participants) |participant| {
+        if (participant.topology_epoch != 0 and by_name.getPtr(participant.table_name).?.epoch != participant.topology_epoch) return error.TopologyChanged;
+    }
+}
+
 fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, participants: *std.ArrayListUnmanaged(ParticipantTxn)) !void {
     if (tables.len == 0) return;
     var workspace = std.heap.ArenaAllocator.init(alloc);
     defer workspace.deinit();
     const a = workspace.allocator();
-    var by_name: std.StringArrayHashMapUnmanaged(TableRoutes) = .empty;
+    var by_name: RoutesByName = .empty;
     var bound_incarnation: ?[16]u8 = null;
     for (tables) |table| {
         try TableRoutes.mergeRequirement(&bound_incarnation, table.bound_catalog_incarnation, error.CatalogGenerationChanged);
@@ -2259,21 +2287,7 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
         const actual = snapshot.status.metadata_incarnation orelse return error.CatalogGenerationChanged;
         if (!std.mem.eql(u8, &actual, &std.fmt.bytesToHex(incarnation, .lower))) return error.CatalogGenerationChanged;
     }
-    var by_id: std.AutoHashMapUnmanaged(u64, *TableRoutes) = .empty;
-    for (snapshot.tables) |*descriptor| {
-        const routes = by_name.getPtr(descriptor.name) orelse continue;
-        try table_catalog.validateTransactionTopologyStableSnapshot(&snapshot, descriptor.*);
-        routes.descriptor = descriptor;
-        try by_id.put(a, descriptor.table_id, routes);
-    }
-    for (snapshot.ranges) |*range| {
-        const routes = by_id.get(range.table_id) orelse continue;
-        try routes.ranges.append(a, range);
-    }
-    for (by_name.values()) |*routes| {
-        if (routes.ranges.items.len == 0) return error.TableNotFound;
-        routes.epoch = table_catalog.sortedTransactionTopologyEpoch(routes.descriptor.?.*, routes.ranges.items);
-    }
+    try loadTableRoutes(a, &by_name, &snapshot);
     // Enlist in original request order: the first participant is the coordinator.
     for (tables) |table| {
         const routes = by_name.getPtr(table.table_name).?;
@@ -6009,7 +6023,8 @@ fn consumerTests() type {
                 .{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
             }, .write, null);
             try std.testing.expect(guarded == .committed);
-            try std.testing.expectEqual(snapshots_before + 1, FakeCatalog.snapshots);
+            // Routing and the post-prepare fence each take one fresh catalog snapshot.
+            try std.testing.expectEqual(snapshots_before + 2, FakeCatalog.snapshots);
             try std.testing.expectEqual(@as(usize, 3), guarded.committed.participant_count);
             try std.testing.expectEqual(@as(usize, 3), recorder.bound_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.range_prepares);

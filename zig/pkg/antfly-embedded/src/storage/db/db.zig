@@ -20382,20 +20382,20 @@ pub const DB = struct {
         // Projection borrows the caller's immutable schema and primary snapshot.
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
-        const stored = primary orelse probe.getLeased(store_key) catch |err| switch (err) {
+        const stored_primary = primary orelse probe.getLeased(store_key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
-        if (stored == null and (opts.include_primary_digest or !internal_keys.isDocumentUnitArtifactRecordKey(store_key))) return null;
+        if (stored_primary == null and (opts.include_primary_digest or !internal_keys.isDocumentUnitArtifactRecordKey(store_key))) return null;
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
         const policy = if (opts.privacy_original) null else try privacy.capture(self, privacy_arena.allocator());
         if (!opts.privacy_original) try privacy.requireExpected(privacy_arena.allocator(), opts.privacy_policy_version, policy);
         const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
-        const page = if (stored == null) try virtualPdfPageUnit(self, alloc, probe, store_key, if (protected) policy else null) else null;
+        const page = if (stored_primary == null) try virtualPdfPageUnit(self, alloc, probe, store_key, if (protected) policy else null) else null;
         defer if (page) |bytes| alloc.free(bytes);
-        const raw = stored orelse page orelse return null;
+        const raw = stored_primary orelse page orelse return null;
         if (protected) {
             if (opts.include_primary_digest) return error.PrivacyUnsupportedMutation;
             const special = db_query_projection.buildLookupFieldSelectionPlan(opts).special;
