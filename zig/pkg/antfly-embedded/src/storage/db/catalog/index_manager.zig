@@ -2359,6 +2359,10 @@ pub const IndexManager = struct {
         /// True only when every indexed member has a durable document-unit
         /// identity. Source and parent grouping remain available independently.
         supports_unit_grouping: bool = false,
+        /// Page-image producers persist a vector per physical PDF page. The
+        /// page key itself has no stored document or chunk row.
+        has_pdf_page_members: bool = false,
+
         /// Cached physical catalog identity. Set only after a validated v2
         /// pointer or during atomic adoption of a certified native candidate;
         /// maintenance/status checks therefore never reread control files.
@@ -2384,6 +2388,10 @@ pub const IndexManager = struct {
                 verified.generation == checkpoint.generation and
                 verified.config_hash == checkpoint.config_hash and
                 verified.published_count == certified_count;
+        }
+
+        pub fn memberBacked(self: *const DenseIndex) bool {
+            return self.chunk_name != null or self.has_pdf_page_members;
         }
 
         /// Only an open or publication boundary may establish this proof.
@@ -6215,6 +6223,14 @@ pub const IndexManager = struct {
     /// Fully-owned extraction inputs for one immutable catalog generation.
     /// Foreground preparation never borrows live index entries after this is
     /// built, so catalog publication is independent of batch size.
+    const PdfPageOutputs = std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8));
+
+    fn deinitPdfPageOutputs(outputs: *PdfPageOutputs, alloc: Allocator) void {
+        var lists = outputs.valueIterator();
+        while (lists.next()) |list| list.deinit(alloc);
+        outputs.deinit(alloc);
+    }
+
     pub const WritePlanSnapshot = struct {
         alloc: Allocator,
         generation: u64,
@@ -6237,6 +6253,8 @@ pub const IndexManager = struct {
         /// Per-row planning only substitutes the document identity and removes
         /// consumers already satisfied by explicit/direct vectors.
         generated_templates: []enrichment_types.GeneratedEnrichmentRequest,
+        // Keys and output names borrow the immutable producer templates.
+        pdf_page_outputs: PdfPageOutputs = .empty,
         /// Constant-time publication membership, compiled once per catalog.
         generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
         /// Catalog-wide completion requirements include projections and
@@ -6258,6 +6276,7 @@ pub const IndexManager = struct {
             if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
+            deinitPdfPageOutputs(&self.pdf_page_outputs, self.alloc);
             self.generated_definitions.deinit(self.alloc);
             for (self.text_fields) |field| self.alloc.free(field);
             if (self.text_fields.len != 0) self.alloc.free(self.text_fields);
@@ -6876,7 +6895,24 @@ pub const IndexManager = struct {
         }
         var generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
         errdefer generated_definitions.deinit(alloc);
-        for (generated_templates) |template| try generated_definitions.put(alloc, @import("../artifact_producer_input.zig").definitionDigest(template), {});
+        var pdf_page_outputs: PdfPageOutputs = .empty;
+        errdefer deinitPdfPageOutputs(&pdf_page_outputs, alloc);
+        for (generated_templates) |template| {
+            try generated_definitions.put(alloc, @import("../artifact_producer_input.zig").definitionDigest(template), {});
+            if (template.kind != .dense_embedding or template.embedding_input != .pdf_page_images) continue;
+            const names = try pdf_page_outputs.getOrPut(alloc, enrichment_types.requestArtifactName(template));
+            if (!names.found_existing) names.value_ptr.* = .empty;
+            const name = enrichment_types.requestEmbeddingName(template);
+            for (names.value_ptr.items) |known| {
+                if (std.mem.eql(u8, known, name)) break;
+            } else try names.value_ptr.append(alloc, name);
+        }
+        var page_outputs = pdf_page_outputs.valueIterator();
+        while (page_outputs.next()) |names| std.mem.sort([]const u8, names.items, {}, struct {
+            fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return std.mem.lessThan(u8, lhs, rhs);
+            }
+        }.less);
         var result: WritePlanSnapshot = .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
@@ -6894,6 +6930,7 @@ pub const IndexManager = struct {
             .graph_fields = graph_fields,
             .generated_templates = generated_templates,
             .generated_definitions = generated_definitions,
+            .pdf_page_outputs = pdf_page_outputs,
             .group_sources = group_sources,
             .completion_plan = completion_plan,
             .chunk_dependents = chunk_dependents,
@@ -13579,6 +13616,12 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, entry.name, internal.name)) continue;
             if (entry.graph_inline_managed != true and try internalEnrichmentConfigsEqual(self.alloc, entry.*, internal)) return .unchanged;
 
+            // Changing the cardinality of a live consumer requires rebuilding its
+            // persisted member mappings, replay state and publication coverage.
+            if (entry.kind == .embedding and internal.kind == .embedding and
+                (entry.embedding_input == .pdf_page_images) != (internal.embedding_input == .pdf_page_images) and
+                try self.embeddingHasIndexConsumer(internal.name)) return error.EnrichmentInUse;
+
             var replacement = try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal);
             var previous = entry.*;
             entry.* = replacement;
@@ -18293,7 +18336,21 @@ pub const IndexManager = struct {
         if (dense.external or dense.embedding_names.len > 1) return true;
         const generator = try parseDenseGeneratorConfig(self.alloc, cfg.config_json);
         defer if (generator) |value| value.deinit(self.alloc);
-        return self.denseChunkSourceName(dense, generator) != null;
+        return self.denseChunkSourceName(dense, generator) != null or self.denseHasPdfPageMembers(dense, generator);
+    }
+
+    fn denseHasPdfPageMembers(self: *const IndexManager, dense: DenseConfig, generator: ?GeneratorConfig) bool {
+        if (generator) |value| return value.embedding_input == .pdf_page_images;
+        if (dense.external) return false;
+        if (dense.embedding_name) |name| {
+            if (self.getEnrichment(.embedding, name)) |embedding| return embedding.embedding_input == .pdf_page_images;
+        }
+        for (dense.embedding_names) |name| {
+            if (self.getEnrichment(.embedding, name)) |embedding| {
+                if (embedding.embedding_input == .pdf_page_images) return true;
+            }
+        }
+        return false;
     }
 
     // Keep resident construction, quarantine accounting and artifact references
@@ -18865,8 +18922,8 @@ pub const IndexManager = struct {
     }
 
     fn embeddingSourceSupportsUnitGrouping(self: *const IndexManager, embedding_cfg: *const enrichment_catalog.EnrichmentConfig) bool {
-        return embedding_cfg.source_artifact_name.len > 0 and
-            self.artifactSourceSupportsUnitGrouping(embedding_cfg.source_artifact_name);
+        return embedding_cfg.embedding_input == .pdf_page_images or (embedding_cfg.source_artifact_name.len > 0 and
+            self.artifactSourceSupportsUnitGrouping(embedding_cfg.source_artifact_name));
     }
 
     fn textSourcesSupportUnitGrouping(
@@ -24582,6 +24639,7 @@ pub const IndexManager = struct {
                     .metric = dense_cfg.metric,
                     .external = dense_cfg.external,
                     .managed_direct_field = !dense_cfg.external and dense_generator == null and referenced_embedding == null and dense_cfg.embedding_names.len == 0,
+                    .has_pdf_page_members = self.denseHasPdfPageMembers(dense_cfg, dense_generator),
                     .leann_transient = leann_transient,
                     .leann_text_only = leann_storage == .auto,
                     .leann_media_int8 = leann_transient and if (dense_cfg.leann) |leann_opts| leann_opts.media_int8 else false,
@@ -24595,6 +24653,8 @@ pub const IndexManager = struct {
                     .embedding_names = try cloneOwnedStrings(self.alloc, dense_cfg.embedding_names),
                     .supports_unit_grouping = if (dense_cfg.embedding_names.len > 0)
                         multi_source_supports_unit_grouping
+                    else if (dense_generator) |generator|
+                        generator.embedding_input == .pdf_page_images
                     else if (referenced_embedding) |embedding_cfg|
                         self.embeddingSourceSupportsUnitGrouping(embedding_cfg)
                     else
@@ -26339,6 +26399,21 @@ pub const IndexManager = struct {
                 }
             }
         }
+    }
+
+    fn embeddingHasIndexConsumer(self: *IndexManager, name: []const u8) !bool {
+        for (self.dense_indexes.items) |entry| {
+            if (entry.embedding_name) |single| if (std.mem.eql(u8, single, name)) return true;
+            if (containsOwnedString(entry.embedding_names, name)) return true;
+        }
+        for (self.status_only_index_configs) |cfg| {
+            if (cfg.kind != .dense_vector) continue;
+            var refs = try self.artifactRefsFromConfig(cfg);
+            defer refs.deinit(self.alloc);
+            if (refs.embedding_name) |single| if (std.mem.eql(u8, single, name)) return true;
+            if (containsOwnedString(refs.embedding_names, name)) return true;
+        }
+        return false;
     }
 
     fn enrichmentInUse(self: *const IndexManager, kind: enrichment_catalog.EnrichmentType, name: []const u8) bool {
@@ -29367,7 +29442,7 @@ pub const IndexManager = struct {
             defer read_txn.abort();
             for (keys) |key| {
                 const vector_id = (try self.resolveDenseVectorIdForDeleteTxn(&read_txn, entry.config.name, key)) orelse continue;
-                const ordinal = if (entry.chunk_name == null and entry.embedding_names.len == 0)
+                const ordinal = if (!entry.memberBacked() and entry.embedding_names.len == 0)
                     (try doc_identity.lookupOrdinalTxn(self.alloc, &read_txn, key)) orelse
                         try self.lookupDenseVectorOrdinalTxn(&read_txn, entry.config.name, vector_id)
                 else
@@ -31053,7 +31128,10 @@ pub const IndexManager = struct {
         index_name: []const u8,
         pending: []const PendingDenseVectorMapping,
     ) !void {
-        const cache_updates = try self.collectDenseOrdinalVectorCacheUpdatesTxn(self.alloc, txn, pending);
+        const cache_updates = if (!entry.memberBacked() and entry.embedding_names.len == 0)
+            try self.collectDenseOrdinalVectorCacheUpdatesTxn(self.alloc, txn, pending)
+        else
+            &.{};
         defer self.alloc.free(cache_updates);
         self.commitDenseVectorMappingsTxn(txn, index_name, pending) catch |err| {
             self.rollbackPendingDenseVectors(entry, pending);
@@ -31110,7 +31188,6 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         updates: []const DenseOrdinalVectorCacheUpdate,
     ) !void {
-        if (entry.chunk_name != null or entry.embedding_names.len > 0) return;
         for (updates) |update| {
             try entry.ordinal_vector_ids.put(self.alloc, update.ordinal, update.vector_id);
             try entry.vector_ordinals.put(self.alloc, update.vector_id, update.ordinal);
@@ -31131,7 +31208,7 @@ pub const IndexManager = struct {
         pending: []const PendingDenseVectorMapping,
     ) !void {
         _ = index_name;
-        if (entry.chunk_name != null or entry.embedding_names.len > 0 or pending.len == 0) return;
+        if (entry.memberBacked() or entry.embedding_names.len > 0 or pending.len == 0) return;
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginRead();
@@ -34756,7 +34833,7 @@ pub const IndexManager = struct {
         errdefer batch.abort();
         const txn = batch.asTxn();
         const ordinal = if (self.denseIndex(index_name)) |entry|
-            if (entry.chunk_name == null and entry.embedding_names.len == 0) try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key) else null
+            if (!entry.memberBacked() and entry.embedding_names.len == 0) try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key) else null
         else
             null;
         try self.clearDenseVectorMappingTxn(txn, index_name, doc_key, vector_id);
@@ -34928,7 +35005,7 @@ pub const IndexManager = struct {
         index_name: []const u8,
         ordinals: []const doc_identity.DocOrdinal,
     ) ![]u64 {
-        const prefer_primary_mapping = if (self.denseIndex(index_name)) |entry| entry.chunk_name == null and entry.embedding_names.len == 0 else false;
+        const prefer_primary_mapping = if (self.denseIndex(index_name)) |entry| !entry.memberBacked() and entry.embedding_names.len == 0 else false;
         if (prefer_primary_mapping) {
             const entry = self.denseIndex(index_name) orelse return try alloc.alloc(u64, 0);
             if (try self.lookupPrimaryDenseCachedVectorIdsForOrdinalsAlloc(alloc, entry, ordinals)) |cached| {
@@ -34942,24 +35019,24 @@ pub const IndexManager = struct {
         var txn = try runtime_store.store.beginRead();
         defer txn.abort();
 
-        var out = std.ArrayListUnmanaged(u64).empty;
-        errdefer out.deinit(alloc);
         if (prefer_primary_mapping) {
             const entry = self.denseIndex(index_name) orelse return try alloc.alloc(u64, 0);
             return try self.lookupPrimaryDenseVectorIdsForOrdinalsAlloc(alloc, &txn, entry, index_name, ordinals);
         }
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var ids: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+        defer ids.deinit(alloc);
         for (ordinals) |ordinal| {
-            const before_len = out.items.len;
-            try self.appendDenseVectorIdsForOrdinalAlloc(alloc, &out, &runtime_store.store, index_name, ordinal);
-            if (out.items.len != before_len) continue;
+            if (try self.collectDenseOrdinalMembers(alloc, &cursor, &ids, index_name, ordinal)) continue;
             const vector_id = (try self.lookupDenseVectorIdByOrdinalTxn(&txn, index_name, ordinal)) orelse fallback: {
                 const doc_key = (try doc_identity.lookupDocIdTxn(self.alloc, &txn, ordinal)) orelse continue;
                 defer self.alloc.free(doc_key);
                 break :fallback (try self.lookupDenseVectorIdForDocKeyTxn(&txn, index_name, doc_key)) orelse continue;
             };
-            if (!containsU64(out.items, vector_id)) try out.append(alloc, vector_id);
+            try ids.put(alloc, vector_id, {});
         }
-        return try out.toOwnedSlice(alloc);
+        return try alloc.dupe(u64, ids.keys());
     }
 
     pub fn lookupDenseOrdinalsForVectorIdsAlloc(
@@ -34997,7 +35074,7 @@ pub const IndexManager = struct {
         for (missing.items) |item| {
             const ordinal = (try self.lookupDenseVectorOrdinalTxn(&txn, index_name, item.vector_id)) orelse continue;
             out[item.source_index] = ordinal;
-            if (entry.chunk_name == null and entry.embedding_names.len == 0) {
+            if (!entry.memberBacked() and entry.embedding_names.len == 0) {
                 try entry.vector_ordinals.put(self.alloc, item.vector_id, ordinal);
                 try entry.ordinal_vector_ids.put(self.alloc, ordinal, item.vector_id);
             }
@@ -35139,37 +35216,27 @@ pub const IndexManager = struct {
         return try out.toOwnedSlice(alloc);
     }
 
-    fn appendDenseVectorIdsForOrdinalAlloc(
+    fn collectDenseOrdinalMembers(
         self: *IndexManager,
         alloc: Allocator,
-        out: *std.ArrayListUnmanaged(u64),
-        store: anytype,
+        cursor: anytype,
+        ids: *std.AutoArrayHashMapUnmanaged(u64, void),
         index_name: []const u8,
         ordinal: doc_identity.DocOrdinal,
-    ) !void {
-        const prefix = try denseOrdinalMemberPrefix(self.alloc, index_name, ordinal);
-        defer self.alloc.free(prefix);
-        var scan_txn = try store.beginCurrentScan();
-        defer scan_txn.abort();
-        var cursor = try scan_txn.openCursor();
-        defer cursor.close();
-        var maybe_entry = try cursor.seekAtOrAfter(prefix);
-        while (maybe_entry) |row| : (maybe_entry = try cursor.next()) {
-            if (!std.mem.startsWith(u8, row.key, prefix)) break;
-            if (row.value.len != 8) return error.InvalidDenseVectorMetadata;
-            const vector_id = std.mem.readInt(u64, row.value[0..8], .little);
-            if (!containsU64(out.items, vector_id)) try out.append(alloc, vector_id);
+    ) !bool {
+        var found = false;
+        inline for (.{ denseOrdinalMemberPrefix, legacyDenseOrdinalMemberPrefix }) |prefixFn| {
+            const prefix = try prefixFn(self.alloc, index_name, ordinal);
+            defer self.alloc.free(prefix);
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |row| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                if (row.value.len != 8) return error.InvalidDenseVectorMetadata;
+                try ids.put(alloc, std.mem.readInt(u64, row.value[0..8], .little), {});
+                found = true;
+            }
         }
-
-        const legacy_prefix = try legacyDenseOrdinalMemberPrefix(self.alloc, index_name, ordinal);
-        defer self.alloc.free(legacy_prefix);
-        maybe_entry = try cursor.seekAtOrAfter(legacy_prefix);
-        while (maybe_entry) |row| : (maybe_entry = try cursor.next()) {
-            if (!std.mem.startsWith(u8, row.key, legacy_prefix)) break;
-            if (row.value.len != 8) return error.InvalidDenseVectorMetadata;
-            const vector_id = std.mem.readInt(u64, row.value[0..8], .little);
-            if (!containsU64(out.items, vector_id)) try out.append(alloc, vector_id);
-        }
+        return found;
     }
 
     fn lookupDenseVectorIdByOrdinalTxn(self: *IndexManager, txn: anytype, index_name: []const u8, ordinal: doc_identity.DocOrdinal) !?u64 {
@@ -39990,6 +40057,16 @@ test "dense metadata lookups read legacy textual rows" {
     defer alloc.free(ordinal_map_key);
     const ordinal_member_key = try legacyDenseOrdinalMemberKey(alloc, index_name, ordinal, vector_id);
     defer alloc.free(ordinal_member_key);
+    const legacy_only = try legacyDenseOrdinalMemberKey(alloc, index_name, ordinal, vector_id + 2);
+    defer alloc.free(legacy_only);
+    var legacy_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &legacy_buf, vector_id + 2, .little);
+    const current_member = try denseOrdinalMemberKey(alloc, index_name, ordinal, vector_id);
+    defer alloc.free(current_member);
+    const second_member = try denseOrdinalMemberKey(alloc, index_name, ordinal, vector_id + 1);
+    defer alloc.free(second_member);
+    var second_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &second_buf, vector_id + 1, .little);
     const vector_ordinal_key = try legacyDenseVectorOrdinalMappingKey(alloc, index_name, vector_id);
     defer alloc.free(vector_ordinal_key);
     const next_id_key = try legacyDenseNextIdKey(alloc, index_name);
@@ -40006,6 +40083,9 @@ test "dense metadata lookups read legacy textual rows" {
         .{ .key = vector_map_key, .value = doc_key },
         .{ .key = ordinal_map_key, .value = &vector_buf },
         .{ .key = ordinal_member_key, .value = &vector_buf },
+        .{ .key = current_member, .value = &vector_buf },
+        .{ .key = legacy_only, .value = &legacy_buf },
+        .{ .key = second_member, .value = &second_buf },
         .{ .key = vector_ordinal_key, .value = &ordinal_buf },
         .{ .key = next_id_key, .value = &next_buf },
     }, &.{});
@@ -40024,13 +40104,9 @@ test "dense metadata lookups read legacy textual rows" {
     try std.testing.expectEqual(@as(?u64, vector_id), try manager.lookupDenseVectorIdByOrdinalTxn(&read_txn, index_name, ordinal));
     try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, ordinal), try manager.lookupDenseVectorOrdinalTxn(&read_txn, index_name, vector_id));
 
-    var vector_ids = std.ArrayListUnmanaged(u64).empty;
-    defer vector_ids.deinit(alloc);
-    var runtime_store = try initRuntimeStore(alloc, &store);
-    defer runtime_store.deinit();
-    try manager.appendDenseVectorIdsForOrdinalAlloc(alloc, &vector_ids, &runtime_store.store, index_name, ordinal);
-    try std.testing.expectEqual(@as(usize, 1), vector_ids.items.len);
-    try std.testing.expectEqual(vector_id, vector_ids.items[0]);
+    const vector_ids = try manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, &store, index_name, &.{ ordinal, ordinal });
+    defer alloc.free(vector_ids);
+    try std.testing.expectEqualSlices(u64, &.{ vector_id, vector_id + 1, vector_id + 2 }, vector_ids);
 
     var batch = try store.beginWriteBatch();
     errdefer batch.abort();

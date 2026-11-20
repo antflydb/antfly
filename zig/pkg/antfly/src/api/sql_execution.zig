@@ -172,6 +172,7 @@ pub const Adapter = struct {
     database: []const u8 = "default",
     namespace: []const u8 = "public",
     /// Borrowed from the pinned connection request, never retained by a plan.
+    ddl_guard: ?@import("sql_ddl_binding.zig").Guard = null,
     ddl_search_path: ?*const @import("../pgwire/search_path.zig").Path = null,
     decision_provider: ?@import("antfly_local_sources").functions_decisions.DecisionProvider = null,
     /// Pgwire retains the original durable owner scope independently of its
@@ -180,6 +181,7 @@ pub const Adapter = struct {
     inherit_session_database: bool = false,
     inherit_session_namespace: bool = false,
     revision: ?u64 = null,
+    missing_target_epoch: ?@import("antfly_local_sources").system_catalog_relation_reconciliation.Epoch = null,
     target: ?system_catalog.Target = null,
     outcome_transaction_id: ?[32]u8 = null,
     session_id: ?[]const u8 = null,
@@ -706,7 +708,7 @@ pub const Adapter = struct {
 
     fn ddl(ptr: *anyopaque, allocators: catalog.DdlAllocators, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
-        return @import("sql_catalog.zig").executeWithAllocators(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, input, self.ddl_search_path);
+        return @import("sql_catalog.zig").executeBound(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, input, self.ddl_search_path, self.ddl_guard);
     }
 
     fn checkpoint(ptr: *anyopaque) !void {
@@ -747,6 +749,9 @@ pub const Adapter = struct {
         if (!try http_server.resourcePermissionCurrentlyAllowed(self.identity.*, .graph, definition.name.table, .read)) return error.Forbidden;
         const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .read = .{ .kind = .graph, .name = definition.name.table } });
         const state = try std.json.parseFromSliceLeaky(system_catalog.State, alloc, bytes, .{ .allocate = .alloc_always });
+        // Resolve the label tables at the same logical cut as the mapping.
+        if (self.revision) |revision| if (revision != state.revision) return error.CatalogGenerationChanged;
+        self.revision = state.revision;
         const record = state.find(.graph, 0, definition.name.table) orelse return error.CatalogNotFound;
         const cypher = @import("cypher");
         var graph = try system_catalog.graphForExecution(alloc, record);
@@ -805,11 +810,24 @@ pub const Adapter = struct {
             }
         }
         if (!self.server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
-        const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = targets, .include_query_definitions = true, .expected_revision = self.revision } });
+        const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = targets, .include_query_definitions = true, .include_source_epoch = self.context.bound_catalog_incarnation != null, .expected_revision = self.revision } });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
+        try self.context.checkCatalogIncarnation(snapshot.source_epoch);
+        if (self.revision) |revision| if (revision != snapshot.revision) return error.CatalogGenerationChanged;
+        if (self.missing_target_epoch) |epoch| if (snapshot.source_epoch == null or !epoch.eql(snapshot.source_epoch.?)) return error.CatalogGenerationChanged;
         if (snapshot.tables.len != targets.len) return error.InvalidSqlBackendResponse;
+        // An absent higher-priority search-path candidate is part of this read cut.
+        self.revision = snapshot.revision;
         const bindings = try alloc.alloc(catalog.Table, targets.len);
-        for (targets, snapshot.tables, bindings) |target, resolved, *binding| binding.* = try self.bindResolved(alloc, target, resolved, snapshot.revision, action);
+        for (targets, snapshot.tables, bindings) |target, resolved, *binding| {
+            const table = resolved orelse {
+                // Legacy default.public physical tables can change without
+                // changing the logical namespace revision.
+                self.missing_target_epoch = snapshot.source_epoch;
+                return error.TableNotFound;
+            };
+            binding.* = try self.bindResolved(alloc, target, table, snapshot.revision, action);
+        }
         return bindings;
     }
 
@@ -836,9 +854,8 @@ pub const Adapter = struct {
         return projected;
     }
 
-    fn bindResolved(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, resolved: ?system_catalog.ResolvedTable, revision: u64, action: catalog.Action) !catalog.Table {
+    fn bindResolved(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, table: system_catalog.ResolvedTable, revision: u64, action: catalog.Action) !catalog.Table {
         const logical = try target.resourceNameAlloc(alloc);
-        const table = resolved orelse return error.TableNotFound;
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
@@ -858,7 +875,6 @@ pub const Adapter = struct {
             }),
         };
         binding.scope = .{ .database = try alloc.dupe(u8, target.database), .namespace = try alloc.dupe(u8, target.namespace), .name = try alloc.dupe(u8, target.table), .revision = revision };
-        self.revision = revision;
         self.target = target;
         try self.recordPreparedBinding(alloc, binding);
         if (self.identity.*) |*identity| try http_server.projectCatalogIdentity(self.server.alloc, identity, logical, table.name);
@@ -888,22 +904,19 @@ pub const Adapter = struct {
             // One linearizable revision-fenced batch for every logical binding.
             // The revision fences schemas and policy publications as well as IDs.
             const targets = try a.alloc(system_catalog.Target, binding.dependencies.len);
-            var revision: ?u64 = null;
+            const revision = (table.scope orelse return error.InvalidSqlBackendResponse).revision;
             for (binding.dependencies, targets) |dependency, *target| {
                 const scope = dependency.scope orelse return error.InvalidSqlBackendResponse;
-                if (revision) |expected| {
-                    if (expected != scope.revision) return error.CatalogGenerationChanged;
-                } else revision = scope.revision;
+                if (revision != scope.revision) return error.CatalogGenerationChanged;
                 target.* = .{ .database = scope.database, .namespace = scope.namespace, .table = scope.name };
             }
-            if (revision) |expected| {
-                const bytes = try self.server.source.systemCatalog(a, self.context, .{ .resolve_many = .{ .targets = targets, .expected_revision = expected } });
-                const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
-                if (snapshot.revision != expected or snapshot.tables.len != binding.dependencies.len) return error.CatalogGenerationChanged;
-                for (snapshot.tables, binding.dependencies) |maybe_current, dependency| {
-                    const current = maybe_current orelse return error.CatalogGenerationChanged;
-                    if (current.table_id != dependency.id or !std.mem.eql(u8, current.name, dependency.physical_name)) return error.CatalogGenerationChanged;
-                }
+            const bytes = try self.server.source.systemCatalog(a, self.context, .{ .resolve_many = .{ .targets = targets, .expected_revision = revision, .include_source_epoch = self.context.bound_catalog_incarnation != null } });
+            const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
+            try self.context.checkCatalogIncarnation(snapshot.source_epoch);
+            if (snapshot.revision != revision or snapshot.tables.len != binding.dependencies.len) return error.CatalogGenerationChanged;
+            for (snapshot.tables, binding.dependencies) |maybe_current, dependency| {
+                const current = maybe_current orelse return error.CatalogGenerationChanged;
+                if (current.table_id != dependency.id or !std.mem.eql(u8, current.name, dependency.physical_name)) return error.CatalogGenerationChanged;
             }
             return;
         }
@@ -914,8 +927,9 @@ pub const Adapter = struct {
         // statement. The coordinator still applies its own durable auth fence.
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const target: system_catalog.Target = .{ .database = scope.database, .namespace = scope.namespace, .table = scope.name };
-        const bytes = try self.server.source.systemCatalog(temporary, self.context, .{ .resolve_many = .{ .targets = &.{target}, .expected_revision = scope.revision } });
+        const bytes = try self.server.source.systemCatalog(temporary, self.context, .{ .resolve_many = .{ .targets = &.{target}, .include_source_epoch = self.context.bound_catalog_incarnation != null, .expected_revision = scope.revision } });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, temporary, bytes, .{});
+        try self.context.checkCatalogIncarnation(snapshot.source_epoch);
         if (snapshot.revision != scope.revision or snapshot.tables.len != 1) return error.CatalogGenerationChanged;
         const current = snapshot.tables[0] orelse return error.CatalogGenerationChanged;
         if (current.table_id != table.id or !std.mem.eql(u8, current.name, table.physical_name)) return error.CatalogGenerationChanged;
@@ -2657,7 +2671,7 @@ pub const Adapter = struct {
             defer if (tables[0].conflict_guards) |*owned| owned.deinit();
             if (guards) |value| try tables[0].mergeConflictGuards(alloc, value);
             var bindings = [_]txn.CatalogBinding{.{ .logical = logical, .physical = table.physical_name }};
-            const statement = txn.OwnedTransactionCommitRequest{ .tables = &tables, .catalog_bindings = .{ .items = &bindings, .capacity = 1, .pointer_stability = .{} } };
+            const statement = txn.OwnedTransactionCommitRequest{ .bound_catalog_incarnation = self.context.bound_catalog_incarnation, .tables = &tables, .catalog_bindings = .{ .items = &bindings, .capacity = 1, .pointer_stability = .{} } };
             if (!(try self.server.transactionRequestAuthorized(self.identity.*, statement))) return error.Forbidden;
             _ = (try self.server.txn_sessions.stageValidated(self.server.alloc, id, &statement, .{ .ptr = self, .validate = validateStaged })) orelse return error.SqlTransactionNotActive;
             self.ranges_staged = true;
@@ -2840,6 +2854,32 @@ test "SQL point bound is half-open and excludes all byte-key descendants" {
         const descendant = [_]u8{ 'a', 0xff, @intCast(next) };
         try std.testing.expect(std.mem.order(u8, &descendant, upper) != .lt);
     }
+}
+
+test "SQL pgwire search path retains the catalog revision of a missing candidate" {
+    const Lookup = struct {
+        calls: usize = 0,
+        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const revision = call.resolve_many.expected_revision;
+            if (self.calls == 1) {
+                try std.testing.expect(revision == null);
+                return alloc.dupe(u8, "{\"revision\":7,\"tables\":[null]}");
+            }
+            try std.testing.expectEqual(@as(?u64, 7), revision);
+            return alloc.dupe(u8, "{\"revision\":8,\"tables\":[null]}");
+        }
+    };
+    var lookup: Lookup = .{};
+    var server: http_server.ApiHttpServer = undefined;
+    server.source = .{ .ptr = &lookup, .vtable = &.{ .status = undefined, .system_catalog = Lookup.resolve, .supports_query_definitions = true } };
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.TableNotFound, adapter.resolveMany(arena.allocator(), &.{.{ .database = "default", .namespace = "first", .table = "events" }}, .read));
+    try std.testing.expectError(error.CatalogGenerationChanged, adapter.resolveMany(arena.allocator(), &.{.{ .database = "default", .namespace = "second", .table = "events" }}, .read));
 }
 
 test "SQL require-index equality uses exact native bounds only inside a guarded statement" {
@@ -4638,6 +4678,41 @@ test "SQL receipt readiness shares one deadline across preflight and scan checks
     try std.testing.expectEqual(start, budget.deadline(start, 0));
     try std.testing.expect(budget.deadline_ns == null);
     try std.testing.expectEqual(std.math.maxInt(u64), budget.deadline(std.math.maxInt(u64) - 1, 10));
+}
+
+test "SQL pgwire graph verification checks the bound catalog incarnation for empty and populated graphs" {
+    const Probe = struct {
+        incarnation: [16]u8 = @splat(1),
+        fn call(raw: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return switch (input) {
+                .graph_authority => a.dupe(u8, "{\"present\":true}"),
+                .resolve_many => |request| blk: {
+                    try std.testing.expect(request.include_source_epoch);
+                    try std.testing.expectEqual(@as(?u64, 7), request.expected_revision);
+                    const rows = [_]?system_catalog.ResolvedTable{.{ .table_id = 8, .name = "docs" }};
+                    break :blk std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .source_epoch = .{ .revision = 1, .incarnation = self.incarnation }, .tables = rows[0..request.targets.len] }, .{});
+                },
+                else => error.UnexpectedCatalogCall,
+            };
+        }
+    };
+    const a = std.testing.allocator;
+    var probe: Probe = .{};
+    var server = http_server.ApiHttpServer.init(a, .{}, .{ .ptr = &probe, .vtable = &.{ .status = undefined, .supports_graph_authority_probe = true, .system_catalog = Probe.call } }, null, null);
+    defer server.deinit();
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{ .bound_catalog_incarnation = @splat(1) } };
+    const deps = [_]catalog.Table{.{ .id = 8, .physical_name = "docs", .columns = &.{}, .schema_version = 1, .scope = .{ .database = "default", .namespace = "public", .name = "docs", .revision = 7 } }};
+    var binding: catalog.graph_relation.Binding = .{ .graph = .{ .name = "g", .incarnation = 9, .revision = 1, .labels = &.{}, .relationships = &.{} }, .catalog_json = "", .definition = undefined, .dependencies = &.{} };
+    const table: catalog.Table = .{ .id = 9, .physical_name = "g", .columns = &.{}, .schema_version = 1, .graph = &binding, .scope = .{ .database = "default", .namespace = "public", .name = "g", .revision = 7 } };
+    for (0..2) |count| {
+        binding.dependencies = deps[0..count];
+        probe.incarnation = @splat(1);
+        try adapter.verify(a, table);
+        probe.incarnation = @splat(2);
+        try std.testing.expectError(error.CatalogGenerationChanged, adapter.verify(a, table));
+    }
 }
 
 test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation" {

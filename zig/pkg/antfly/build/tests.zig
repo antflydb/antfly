@@ -575,7 +575,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
-    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
+    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL policy DDL", "SQL pgwire", "SQL rewrite response" } });
     b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
         .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
     const sql_native_cells_tests = b.addTest(.{
@@ -7181,6 +7181,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "model aware media fused reuse rejects a changed provider generation with the same alias",
             "model aware media retained named text permits a changed embedding generation",
             "model aware media vocabulary inference rejects a producing generation change hidden by rollback",
+            "PDF page publication fences stale windows",
+            "source grouping trusts a whole document embedding",
             "shared PDF page embedding checkpoints successful siblings before retry",
             "cached content authority fences legacy writes",
             "backfill skips cached bodies and publishes metadata only",

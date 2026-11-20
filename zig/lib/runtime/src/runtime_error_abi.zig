@@ -1117,6 +1117,7 @@ pub const Detail = enum(c_int) {
     index_alias_precondition_failed,
     storage_kernel_owner_stale_descriptor,
     object_table_definition_conflict,
+    row_policy_limit_exceeded,
 };
 
 pub const Status = extern struct {
@@ -1531,6 +1532,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidTablespacePlacementPolicy => status(.invalid_argument, .invalid_tablespace_placement_policy),
         error.CatalogCommandTooLarge => status(.invalid_argument, .catalog_command_too_large),
         error.InvalidCatalogRecord => status(.corrupt, .invalid_catalog_record),
+        error.RowPolicyLimitExceeded => status(.invalid_argument, .row_policy_limit_exceeded),
         error.RowPolicyCatalogChanged => status(.conflict, .row_policy_catalog_changed),
         error.CatalogIdExhausted => status(.internal, .catalog_id_exhausted),
 
@@ -2570,6 +2572,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_tablespace_placement_policy => "InvalidTablespacePlacementPolicy",
         .catalog_command_too_large => "CatalogCommandTooLarge",
         .invalid_catalog_record => "InvalidCatalogRecord",
+        .row_policy_limit_exceeded => "RowPolicyLimitExceeded",
         .row_policy_catalog_changed => "RowPolicyCatalogChanged",
         .catalog_id_exhausted => "CatalogIdExhausted",
 
@@ -3383,7 +3386,7 @@ test "system catalog errors retain their stable runtime boundary classification"
     const unavailable = statusFromError(error.SettingAuthorityUnavailable);
     try std.testing.expectEqual(@backingInt(Code.unavailable), unavailable.code);
     try std.testing.expectEqual(error.SettingAuthorityUnavailable, errorFromStatus(unavailable));
-    const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
+    const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted, error.RowPolicyLimitExceeded };
     for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
 }
 
