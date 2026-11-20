@@ -258,6 +258,7 @@ test "ordered artifact inventory producer definition identity binds every provid
             .bool => @field(changed, reflected_name) = !@field(request, reflected_name),
             .int => @field(changed, reflected_name) += 1,
             .array => @field(changed, reflected_name)[0] ^= 1,
+            .optional => @field(changed, reflected_name) = @splat(1),
             else => unreachable,
         }
         try std.testing.expect(!sameDefinition(request, changed));
