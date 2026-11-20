@@ -12375,7 +12375,68 @@ pub const DataServer = struct {
     pub const DagActivationRoute = struct {
         namespace: [24]u8,
         fence: antfly.metadata_api.CatalogRouteFence,
+
+        fn validate(self_route: @This()) !void {
+            try self_route.fence.validate();
+            const identity = self_route.fence.route.identity_namespace;
+            if (std.mem.readInt(u64, self_route.namespace[0..8], .big) != identity.table_id or
+                std.mem.readInt(u64, self_route.namespace[8..16], .big) != identity.shard_id or
+                std.mem.readInt(u64, self_route.namespace[16..24], .big) != identity.range_id)
+                return error.GraphConstraintRevisionChanged;
+        }
     };
+
+    /// Acquire the authority and all source cuts for a pinned activation.
+    /// Retrying the same manifest reuses acquired cuts. The durable activation
+    /// caller owns cleanup if it abandons a partially acquired attempt.
+    pub fn acquireDagActivationOnRoutes(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        manifest: DagEffects.ScanManifest,
+        authority_route: DagActivationRoute,
+        source_routes: []const DagActivationRoute,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        if (!std.mem.eql(u8, &manifest.authority_namespace, &authority_route.namespace))
+            return error.GraphConstraintRevisionChanged;
+        try cancellation.check();
+        const SourceRoute = struct { route: DagActivationRoute, selected: bool = false };
+        var routes: std.AutoHashMapUnmanaged([24]u8, SourceRoute) = .empty;
+        defer routes.deinit(alloc);
+        for (source_routes) |route| {
+            try route.validate();
+            if (route.fence.table_id != authority_route.fence.table_id or
+                route.fence.metadata_group_id != authority_route.fence.metadata_group_id or
+                !std.meta.eql(route.fence.metadata_incarnation, authority_route.fence.metadata_incarnation) or
+                route.fence.topology_epoch != authority_route.fence.topology_epoch or
+                route.fence.catalog_revision != authority_route.fence.catalog_revision)
+                return error.TopologyChanged;
+            const slot = try routes.getOrPut(alloc, route.namespace);
+            if (slot.found_existing) return error.InvalidArgument;
+            slot.value_ptr.* = .{ .route = route };
+        }
+        // Resolve the entire ordered scan footprint before changing a root.
+        var ordered: std.ArrayList(DagActivationRoute) = .empty;
+        defer ordered.deinit(alloc);
+        try authority_route.validate();
+        try ordered.append(alloc, authority_route);
+        for (manifest.domains) |domain| {
+            for (domain.roots) |root| {
+                if (std.mem.eql(u8, &root.namespace, &authority_route.namespace)) continue;
+                const source = routes.getPtr(root.namespace) orelse return error.TopologyChanged;
+                if (source.selected) continue;
+                try ordered.append(alloc, source.route);
+                source.selected = true;
+            }
+        }
+        for (ordered.items) |route| {
+            try cancellation.check();
+            try localRaftBatchGroupRoutedWithCancellation(self, alloc, route.fence, table_name, .{
+                .dag_source_fence = .{ .namespace = route.namespace, .action = .acquire, .fence = manifest.fence },
+            }, cancellation);
+        }
+    }
 
     /// Advance an activation whose source fences have already been installed.
     /// The caller supplies the pinned catalog routes and owns publication of
@@ -12401,7 +12462,7 @@ pub const DataServer = struct {
 
             fn read(self_port: @This(), comptime T: type, route: DagActivationRoute, control: anytype) !T {
                 try self_port.cancellation.check();
-                try route.fence.validate();
+                try route.validate();
                 const json = try std.json.Stringify.valueAlloc(self_port.alloc, control, .{ .emit_strings_as_arrays = true });
                 defer self_port.alloc.free(json);
                 var reads = self_port.server.read_source.source();
@@ -42878,6 +42939,14 @@ fn consumerTests() type {
                 .roots = &.{.{ .namespace = @splat(3), .index_name = "g", .edge_type = "R", .generation = 1 }},
             }}, @splat(3), @splat(4));
             var server: DataServer = undefined;
+            try std.testing.expectError(error.GraphConstraintRevisionChanged, server.acquireDagActivationOnRoutes(
+                std.testing.allocator,
+                "docs",
+                manifest,
+                .{ .namespace = @splat(9), .fence = undefined },
+                &.{},
+                .none,
+            ));
             try std.testing.expectError(error.GraphConstraintRevisionChanged, server.advanceDagActivationOnRoutes(
                 std.testing.allocator,
                 "docs",

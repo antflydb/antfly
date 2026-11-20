@@ -83,7 +83,9 @@ authority proposals for initialization, owner takeover, and page commits.
 Hosted readers use the pinned group route for local or authenticated remote
 lookups. Remote activation controls use the authenticated document-read POST
 route with a bound sized for a physical cursor. Distributed activation still
-needs a durable scheduler.
+needs a durable scheduler. The hosted acquisition step validates the pinned
+routing footprint before proposing the authority fence and each distinct source
+fence. A retry of the same attempt can reuse fences already acquired.
 An active source fence allows an ordered catalog change only when activation
 proofs match its pinned snapshot. Raft protocol version 31 gates these commands,
 DAG-bearing transaction prepare, and catalog activation proofs. The source-fence
