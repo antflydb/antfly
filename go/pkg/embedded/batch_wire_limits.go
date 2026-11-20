@@ -29,10 +29,15 @@ type batchWireSizer struct {
 }
 
 func (s *batchWireSizer) addLength(n int) error {
-	if uint64(n) > math.MaxUint32 {
+	if n < 0 || uint64(n) > math.MaxUint32 {
 		return fmt.Errorf("embedded: batch wire field of %d bytes exceeds the format's 4 GiB limit", n)
 	}
-	return s.addBytes(4 + n)
+	// The prefix and the field are added separately: on a 32-bit int,
+	// 4 + n can itself wrap for a length near MaxInt.
+	if err := s.addBytes(4); err != nil {
+		return err
+	}
+	return s.addBytes(n)
 }
 
 func (s *batchWireSizer) addBytes(n int) error {

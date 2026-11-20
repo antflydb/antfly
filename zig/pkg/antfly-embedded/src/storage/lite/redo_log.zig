@@ -309,6 +309,8 @@ fn writePositionalPairAll(file: File, io: Io, first: []const u8, second: []const
 pub const RecordView = struct {
     commit_sequence: u64,
     payload: []const u8,
+    /// The record's offset relative to the replay's `base_offset`.
+    offset: u64 = 0,
 };
 
 pub const StopReason = enum {
@@ -573,7 +575,7 @@ pub fn replayBounded(
 
         if (!superseded) {
             if (on_record) |cb| {
-                try cb(ctx, .{ .commit_sequence = header.commit_sequence, .payload = payload_buf.items });
+                try cb(ctx, .{ .commit_sequence = header.commit_sequence, .payload = payload_buf.items, .offset = pos });
             }
             count += 1;
         }
@@ -581,6 +583,27 @@ pub fn replayBounded(
         pos += header_len + payload_len;
         last_sequence = header.commit_sequence;
     }
+}
+
+/// The sequence of a complete, checksummed record at the very start of the
+/// log that is newer than `floor`, or null: an ended log (zero header), a
+/// torn or garbage first header, or a superseded record. Lets writer
+/// authority tell "another writer reset this log and appended" apart from
+/// "the old log is still here" without scanning it.
+pub fn firstRecordNewerThan(allocator: Allocator, file: File, io: Io, base_offset: u64, capacity: u64, floor: u64) !?u64 {
+    if (capacity < header_len) return null;
+    var header_buf: [header_len]u8 = undefined;
+    if (try file.readPositionalAll(io, &header_buf, base_offset) < header_len) return null;
+    if (isAllZero(&header_buf)) return null;
+    const header = RecordHeader.decode(&header_buf);
+    if (header.magic != magic or header.format_version != format_version or header.header_len != header_len) return null;
+    if (header.commit_sequence <= floor) return null;
+    if (header_len + @as(u64, header.payload_len) > capacity) return null;
+    const payload = try allocator.alloc(u8, header.payload_len);
+    defer allocator.free(payload);
+    if (try file.readPositionalAll(io, payload, base_offset + header_len) < payload.len) return null;
+    if (Crc32.hash(payload) != header.crc32) return null;
+    return header.commit_sequence;
 }
 
 fn isAllZero(bytes: []const u8) bool {

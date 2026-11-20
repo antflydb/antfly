@@ -6094,9 +6094,13 @@ pub const Store = struct {
         if (self.maintenance_running or self.generation_workspace_active or self.multi_commit_sequence_active or self.file.change_capture != null) return error.FileBusy;
         if (self.file.redo == null) return false;
         const before = self.file.header.redo_log_capacity;
-        if (native.NativeFile.redoLogCapacityForBudget(self.file.redo_log_budget_bytes) >= before) return false;
+        const oversized = native.NativeFile.redoLogCapacityForBudget(self.file.redo_log_budget_bytes) < before;
+        // An interrupted shrink can leave the capacity at its target with the
+        // old reservation still held: finishing that release is the reclaim.
+        const owed = try self.file.redoReservationReleasePending();
+        if (!oversized and !owed) return false;
         try self.file.checkpointRedoLog();
-        return self.file.header.redo_log_capacity < before;
+        return self.file.header.redo_log_capacity < before or (owed and !try self.file.redoReservationReleasePending());
     }
 
     /// `checkpointRedoLog` for a caller already inside this store's writer
