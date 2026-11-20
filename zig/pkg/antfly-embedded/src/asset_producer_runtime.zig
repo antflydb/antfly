@@ -3010,6 +3010,8 @@ pub const Runtime = struct {
                     discovery_headers,
                     self.execution.waitContext(),
                 ) catch |err| {
+                    if (err == error.RemoteCapabilitySelectorAbsent or err == error.RemoteCapabilityDiscoveryUnsupported)
+                        return if (start == 0) error.BatchIncompatible else error.InferenceCapabilitiesStale;
                     if (err != error.InferenceDiscoveryTooManyItems or end - start <= 1) return err;
                     discovery_item_limit = (end - start) / 2;
                     end = start + discovery_item_limit;
