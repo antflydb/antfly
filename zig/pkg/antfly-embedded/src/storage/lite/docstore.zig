@@ -6283,7 +6283,7 @@ pub const Store = struct {
     pub fn durableSequence(self: *Store) u64 {
         lockStore(self);
         defer self.mutex.unlock();
-        return self.file.committedSequence();
+        return self.file.durableSequence();
     }
 
     const MutationBatch = struct {

@@ -19,9 +19,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -29,17 +31,36 @@ class HookError(Exception):
     pass
 
 
+# Another git process (an editor, a status poller, a concurrent commit in
+# another worktree's hooks) can hold the real index's lock for a moment.
+# Waiting it out is better than failing the commit.
+INDEX_LOCK_RETRY_SECONDS = 5.0
+INDEX_LOCK_RETRY_INTERVAL = 0.05
+
+
 def run(args, *, cwd, data=None, env=None):
-    try:
-        return subprocess.run(
-            args, cwd=cwd, input=data, stdout=subprocess.PIPE, check=True, env=env
-        ).stdout
-    except FileNotFoundError as error:
-        raise HookError(
-            f"Required formatting tool is unavailable: {args[0]}"
-        ) from error
-    except subprocess.CalledProcessError as error:
-        raise HookError(f"Command failed: {' '.join(args)}") from error
+    deadline = time.monotonic() + INDEX_LOCK_RETRY_SECONDS
+    while True:
+        try:
+            return subprocess.run(
+                args,
+                cwd=cwd,
+                input=data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                env=env,
+            ).stdout
+        except FileNotFoundError as error:
+            raise HookError(
+                f"Required formatting tool is unavailable: {args[0]}"
+            ) from error
+        except subprocess.CalledProcessError as error:
+            if b"index.lock" in (error.stderr or b"") and time.monotonic() < deadline:
+                time.sleep(INDEX_LOCK_RETRY_INTERVAL)
+                continue
+            sys.stderr.buffer.write(error.stderr or b"")
+            raise HookError(f"Command failed: {' '.join(args)}") from error
 
 
 def formatter(root, path):
@@ -117,10 +138,16 @@ def format_staged(root, format_blob=None):
     # Work only against a private index until every formatter has succeeded.
     # Git generates the patch, so renames, quoting, file modes, and new files
     # keep their normal Git semantics. Never restage the working-tree file.
-    before = git("write-tree").strip().decode()
     with tempfile.TemporaryDirectory(prefix="antfly-format-") as temp:
         temporary_index = Path(temp) / "index"
         env = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}
+        # `write-tree` refreshes the index it reads, which takes the real
+        # index's lock; reading a private copy of it never contends.
+        real_index = Path(os.fsdecode(git("rev-parse", "--git-path", "index").strip()))
+        if not real_index.is_absolute():
+            real_index = Path(root) / real_index
+        shutil.copyfile(real_index, temporary_index)
+        before = git("write-tree", env=env).strip().decode()
         git("read-tree", before, env=env)
         for path, (cwd, command) in selected:
             entry = git("ls-files", "--stage", "-z", "--", path).split(b"\0")[0]

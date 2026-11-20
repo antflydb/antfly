@@ -449,16 +449,6 @@ pub fn redoOverlayAppliedThrough(entry: *Entry, io: Io) u64 {
     return if (entry.redo_overlay) |*overlay| overlay.appliedThrough() else 0;
 }
 
-/// This process's verified redo log position for `fold_boundary`, if its
-/// shared overlay exists and has one (`SharedRedoOverlay.verifiedLog`).
-pub fn redoOverlayVerifiedLog(entry: *Entry, io: Io, fold_boundary: u64) ?redo_overlay.SharedRedoOverlay.VerifiedLog {
-    entry.mutex.lockUncancelable(io);
-    defer entry.mutex.unlock(io);
-    const overlay = if (entry.redo_overlay) |*o| o else return null;
-    if (entry.redo_overlay_owner_pid != @as(u32, @bitCast(std.c.getpid()))) return null;
-    return overlay.verifiedLog(io, fold_boundary);
-}
-
 pub fn committedSequence(entry: *Entry) u64 {
     return entry.last_committed_sequence.load(.monotonic);
 }
