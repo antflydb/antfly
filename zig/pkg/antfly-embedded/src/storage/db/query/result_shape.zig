@@ -1379,10 +1379,26 @@ fn freeResolvedDocIds(alloc: Allocator, ids: []const []const u8) void {
     if (ids.len > 0) alloc.free(@constCast(ids));
 }
 
+fn patternLegacyMembershipAlloc(
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+    control: @import("../../../search/query.zig").ExecutionControl,
+) !std.StringHashMapUnmanaged(void) {
+    var membership: std.StringHashMapUnmanaged(void) = .empty;
+    errdefer membership.deinit(alloc);
+    if (set.* == .doc_keys) {
+        for (set.doc_keys) |key| {
+            try control.check();
+            try membership.put(alloc, key, {});
+        }
+    }
+    return membership;
+}
+
 fn resolvePatternDocIdsAlloc(
     alloc: Allocator,
     set: *const doc_set.ResolvedDocSet,
-    legacy: *const doc_set.ResolvedDocSet,
+    legacy: *const std.StringHashMapUnmanaged(void),
     hits: []const types.SearchHit,
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
@@ -1400,7 +1416,7 @@ fn resolvePatternDocIdsAlloc(
 fn resolvePatternOrdinalHitsAlloc(
     alloc: Allocator,
     set: *const doc_set.ResolvedDocSet,
-    legacy: *const doc_set.ResolvedDocSet,
+    legacy: *const std.StringHashMapUnmanaged(void),
     hits: []const types.SearchHit,
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
@@ -1418,13 +1434,6 @@ fn resolvePatternOrdinalHitsAlloc(
     defer scratch.deinit();
     const temp = scratch.allocator();
     var unresolved: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty;
-    var legacy_keys: std.StringHashMapUnmanaged(void) = .empty;
-    if (legacy.* == .doc_keys) {
-        for (legacy.doc_keys) |key| {
-            try control.check();
-            try legacy_keys.put(temp, key, {});
-        }
-    }
     for (hits) |hit| {
         try control.check();
         if (hit.doc_ordinal != null) continue;
@@ -1433,7 +1442,7 @@ fn resolvePatternOrdinalHitsAlloc(
             else => return err,
         } else null;
         const key = parent orelse hit.id;
-        if (legacy_keys.contains(key)) continue;
+        if (legacy.contains(key)) continue;
         if (executor.resolve_doc_ids_to_doc_set) |resolve| {
             var hit_set = try resolve(executor.ctx, alloc, &.{key}, generation);
             defer hit_set.deinit(alloc);
@@ -1456,9 +1465,13 @@ fn resolvePatternOrdinalHitsAlloc(
         const project = executor.resolve_doc_set_doc_ids orelse return error.UnsupportedQueryRequest;
         var bitmap_it = if (set.* == .ordinal_bitmap) set.ordinal_bitmap.iterator() else null;
         var offset: usize = 0;
+        // A reverse-only identity has no keyed access path. Bound the
+        // compatibility work independently of the bitmap cardinality.
+        const reverse_probe_limit = 65_536;
+        var probes: usize = 0;
         while (unresolved.count() != 0) {
             try control.check();
-            var batch: [128]doc_set.DocOrdinal = undefined;
+            var batch: [256]doc_set.DocOrdinal = undefined;
             const ordinals = if (bitmap_it) |*it| blk: {
                 var len: usize = 0;
                 while (len < batch.len) : (len += 1) batch[len] = it.next() orelse break;
@@ -1469,6 +1482,8 @@ fn resolvePatternOrdinalHitsAlloc(
                 break :blk keys;
             };
             if (ordinals.len == 0) break;
+            probes += ordinals.len;
+            if (probes > reverse_probe_limit) return error.QueryCandidateBudgetExceeded;
             const batch_set = doc_set.ResolvedDocSet{ .ordinals = ordinals };
             const keys = (try project(executor.ctx, alloc, &batch_set, generation)) orelse return error.UnsupportedQueryRequest;
             defer freeResolvedDocIds(alloc, keys);
@@ -1492,6 +1507,7 @@ fn resolvePatternDocIdsFromPublicIdsAlloc(
     hits: []const types.SearchHit,
     generation: ?u64,
     executor: StoredPatternFilterExecutor,
+    control: @import("../../../search/query.zig").ExecutionControl,
 ) !ResolvedPatternDocIds {
     if (ids.len == 0) return .{ .active = true };
     const resolve = executor.resolve_doc_ids_to_doc_set orelse return .{ .ids = ids, .active = true };
@@ -1510,17 +1526,11 @@ fn resolvePatternDocIdsFromPublicIdsAlloc(
             return .{ .ids = keys, .active = true, .ordinal_set = resolved };
         },
         .ordinals, .ordinal_bitmap => {
-            if (allHitsHaveDocOrdinals(hits)) return .{ .ordinal_set = resolved, .active = true };
-            const project = executor.resolve_doc_set_doc_ids orelse {
-                resolved.deinit(alloc);
-                return error.UnsupportedQueryRequest;
-            };
-            const projected = (try project(executor.ctx, alloc, &resolved, generation)) orelse {
-                resolved.deinit(alloc);
-                return error.UnsupportedQueryRequest;
-            };
-            resolved.deinit(alloc);
-            return .{ .ids = projected, .active = true, .owned = true };
+            const no_legacy: std.StringHashMapUnmanaged(void) = .empty;
+            var matched = try resolvePatternOrdinalHitsAlloc(alloc, &resolved, &no_legacy, hits, generation, executor, false, control);
+            matched.borrowed_ordinal_set = null;
+            matched.ordinal_set = resolved;
+            return matched;
         },
     }
 }
@@ -1548,6 +1558,13 @@ fn resolvedPatternContainsHit(resolved: ResolvedPatternDocIds, hit: types.Search
         };
     }
     return containsDocId(resolved.ids, hit.id);
+}
+
+fn resolvedPatternContainsSharedHit(resolved: ResolvedPatternDocIds, hit: types.SearchHit, match_id: []const u8) bool {
+    if (resolved.borrowed_ordinal_set == null and resolved.ordinal_set == null) {
+        return containsDocId(resolved.ids, match_id) or containsDocId(resolved.ids, hit.id);
+    }
+    return resolvedPatternContainsHit(resolved, hit);
 }
 
 fn resolvedDocFilterFromRequest(req: types.SearchRequest) ?*const doc_set.ResolvedDocFilter {
@@ -1619,26 +1636,36 @@ pub fn applyStoredSearchPatternFilters(
     const member_mode = req.return_mode == .member or req.return_mode == .chunk;
     const parent_aware = member_mode and executor.resolve_parent_id != null and executor.load_parent_stored != null;
 
+    const control = @import("../../../search/query.zig").ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+    var include_keys: std.StringHashMapUnmanaged(void) = .empty;
+    defer include_keys.deinit(alloc);
+    var exclude_keys: std.StringHashMapUnmanaged(void) = .empty;
+    defer exclude_keys.deinit(alloc);
+    if (resolved_filter) |filter| {
+        include_keys = try patternLegacyMembershipAlloc(alloc, &filter.legacy_include, control);
+        exclude_keys = try patternLegacyMembershipAlloc(alloc, &filter.legacy_exclude, control);
+    }
+
     var resolved_include = if (resolved_filter) |filter|
-        try resolvePatternDocIdsAlloc(alloc, &filter.include, &filter.legacy_include, result.hits, req.identity_read_generation, executor, parent_aware, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns })
+        try resolvePatternDocIdsAlloc(alloc, &filter.include, &include_keys, result.hits, req.identity_read_generation, executor, parent_aware, control)
     else
         ResolvedPatternDocIds{};
     defer resolved_include.deinit(alloc);
 
     var resolved_exclude = if (resolved_filter) |filter|
-        try resolvePatternDocIdsAlloc(alloc, &filter.exclude, &filter.legacy_exclude, result.hits, req.identity_read_generation, executor, parent_aware, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns })
+        try resolvePatternDocIdsAlloc(alloc, &filter.exclude, &exclude_keys, result.hits, req.identity_read_generation, executor, parent_aware, control)
     else
         ResolvedPatternDocIds{};
     defer resolved_exclude.deinit(alloc);
 
     var native_include = if (has_positive_doc_ids)
-        try resolvePatternDocIdsFromPublicIdsAlloc(alloc, req.filter_doc_ids, result.hits, req.identity_read_generation, executor)
+        try resolvePatternDocIdsFromPublicIdsAlloc(alloc, req.filter_doc_ids, result.hits, req.identity_read_generation, executor, control)
     else
         ResolvedPatternDocIds{};
     defer native_include.deinit(alloc);
 
     var native_exclude = if (req.exclude_doc_ids.len > 0)
-        try resolvePatternDocIdsFromPublicIdsAlloc(alloc, req.exclude_doc_ids, result.hits, req.identity_read_generation, executor)
+        try resolvePatternDocIdsFromPublicIdsAlloc(alloc, req.exclude_doc_ids, result.hits, req.identity_read_generation, executor, control)
     else
         ResolvedPatternDocIds{};
     defer native_exclude.deinit(alloc);
@@ -1802,12 +1829,10 @@ pub fn applyStoredSearchPatternFilters(
         if (has_positive_doc_ids) {
             keep = resolvedPatternContainsHit(native_include, hit);
         }
-        const legacy_include = if (resolved_filter) |filter| filter.legacy_include == .doc_keys and
-            containsDocId(filter.legacy_include.doc_keys, match_id) else false;
-        const legacy_exclude = if (resolved_filter) |filter| filter.legacy_exclude == .doc_keys and
-            containsDocId(filter.legacy_exclude.doc_keys, match_id) else false;
+        const legacy_include = include_keys.contains(match_id);
+        const legacy_exclude = exclude_keys.contains(match_id);
         if (keep and resolved_include.active) {
-            keep = legacy_include or resolvedPatternContainsHit(resolved_include, hit);
+            keep = legacy_include or resolvedPatternContainsSharedHit(resolved_include, hit, match_id);
         }
         if (keep and req.exclude_doc_ids.len > 0) {
             keep = !resolvedPatternContainsHit(native_exclude, hit);
@@ -1816,7 +1841,7 @@ pub fn applyStoredSearchPatternFilters(
             keep = false;
         }
         if (keep and resolved_exclude.active) {
-            keep = !resolvedPatternContainsHit(resolved_exclude, hit);
+            keep = !resolvedPatternContainsSharedHit(resolved_exclude, hit, match_id);
         }
         if (keep and compiled_filter != null) {
             const compiled = compiled_filter.?;
@@ -2497,7 +2522,9 @@ test "optional numeric range result membership keeps exceptional keys without re
         .{ .id = @constCast("recoverable") },
         .{ .id = @constCast("mapped"), .doc_ordinal = 4 },
     };
-    var resolved = try resolvePatternDocIdsAlloc(alloc, &primary, &legacy, hits, null, .{
+    var membership = try patternLegacyMembershipAlloc(alloc, &legacy, .{});
+    defer membership.deinit(alloc);
+    var resolved = try resolvePatternDocIdsAlloc(alloc, &primary, &membership, hits, null, .{
         .ctx = null,
         .load_stored = TestStoredLoader.loadStored,
         .resolve_doc_set_doc_ids = Harness.failReverse,

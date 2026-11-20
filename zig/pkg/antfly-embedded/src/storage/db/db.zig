@@ -47532,7 +47532,7 @@ pub const DB = struct {
             .range_projection_current = rangeProjectionCurrentCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
-            .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
+            .lookup_doc_nums_for_ordinal_set = sparseDocNumsForOrdinalSetCallback,
             .lookup_doc_nums_for_parent_keys = sparseDocNumsForParentKeysCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
@@ -48756,14 +48756,15 @@ pub const DB = struct {
         return try self.core.index_manager.lookupSparseDocNumsForParentKeysAlloc(alloc, self.core.store, index_name, keys);
     }
 
-    fn sparseDocNumsForOrdinalsCallback(
+    fn sparseDocNumsForOrdinalSetCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
         index_name: []const u8,
-        ordinals: []const u32,
+        set: *const doc_set.ResolvedDocSet,
+        control: db_query_search.QueryExecutionControl,
     ) anyerror![]const u32 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.lookupSparseDocNumsForOrdinalsAlloc(alloc, self.core.store, index_name, ordinals);
+        return try self.core.index_manager.lookupSparseDocNumsForOrdinalSetAlloc(alloc, self.core.store, index_name, set, control);
     }
 
     fn loadRequiredProjectedSearchDocumentCallback(
@@ -157428,6 +157429,27 @@ test "optional numeric range keeps mixed primary matches for native field sortin
             defer key_only.deinit();
             try std.testing.expectEqual(@as(usize, 1), key_only.hits.len);
             try std.testing.expectEqualStrings("legacy", key_only.hits[0].id);
+
+            const mapped_deletions = try text.deleteByIdsTracked(&.{"mapped"});
+            defer text.freeDeleteInfos(mapped_deletions);
+            const mapped_without_text_ordinal = (try mapper.buildTextSegmentFromDocuments(a, &.{
+                .{ .key = "mapped", .value = "{\"body\":\"beacon\",\"rank\":2}" },
+            }, .{}, schema)).?;
+            defer a.free(mapped_without_text_ordinal);
+            try text.indexSegment(mapped_without_text_ordinal);
+            for ([_]bool{ false, true }) |descending| {
+                var mapped_only = try db_query_search.searchMatchAll(a, .{
+                    .index_name = "ft",
+                    .limit = 2,
+                    .filter_doc_ids = &.{"mapped"},
+                    .include_stored = false,
+                    .order_by = &.{ .{ .field = "rank", .desc = descending }, .{ .field = "_id" } },
+                }, db.matchAllExecutor());
+                defer mapped_only.deinit();
+                try std.testing.expectEqual(@as(usize, 1), mapped_only.hits.len);
+                try std.testing.expectEqualStrings("mapped", mapped_only.hits[0].id);
+                try std.testing.expect(mapped_only.hits[0].doc_ordinal != null);
+            }
         }
     }
 }

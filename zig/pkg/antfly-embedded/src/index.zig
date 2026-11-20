@@ -202,8 +202,10 @@ const StoredKeyDirectory = struct {
     entries: []Entry,
     reservation: ?resource_manager_mod.Reservation,
     alloc: Allocator,
+    refs: std.atomic.Value(u32) = .init(2),
 
-    fn deinit(self: *@This()) void {
+    fn release(self: *@This()) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         if (self.reservation) |*reservation| reservation.release();
         self.alloc.free(self.entries);
         self.alloc.destroy(self);
@@ -221,7 +223,9 @@ pub const SegmentShared = struct {
     allocator: Allocator,
     residency_mutex: std.atomic.Mutex = .unlocked,
     stored_key_directory_lock: std.atomic.Mutex = .unlocked,
-    stored_key_directories: [2]std.atomic.Value(?*StoredKeyDirectory) = @splat(.init(null)),
+    stored_key_directories: [2]?*StoredKeyDirectory = @splat(null),
+    stored_key_directory_manager: ?*resource_manager_mod.ResourceManager = null,
+    stored_key_directory_reclaimer: u64 = 0,
     // One process-level accounting owner per physical mapping. The manager
     // outlives all snapshots/forks sharing this segment, including query pins.
     residency_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -660,8 +664,9 @@ pub const SegmentEntry = struct {
     }
 
     fn destroyShared(alloc: Allocator, shared: *SegmentShared) void {
-        for (&shared.stored_key_directories) |*slot| {
-            if (slot.load(.acquire)) |directory| directory.deinit();
+        if (shared.stored_key_directory_manager) |manager| manager.unregisterReclaimer(shared.stored_key_directory_reclaimer);
+        for (shared.stored_key_directories) |slot| {
+            if (slot) |directory| directory.release();
         }
         if (shared.residency_manager) |manager| manager.observeUsageWithHostCharge(.full_text_segment_residency, &shared.residency_accounted, 0, 0);
         if (shared.deleted) |*deleted| deleted.deinit();
@@ -2484,23 +2489,46 @@ pub const IndexSnapshot = struct {
         return key;
     }
 
+    fn reclaimStoredKeyDirectories(raw: *anyopaque, target: u64) u64 {
+        const shared: *SegmentShared = @ptrCast(@alignCast(raw));
+        if (!shared.stored_key_directory_lock.tryLock()) return 0;
+        defer shared.stored_key_directory_lock.unlock();
+        var released: u64 = 0;
+        for (&shared.stored_key_directories) |*slot| {
+            if (released >= target) break;
+            const directory = slot.* orelse continue;
+            if (directory.refs.load(.acquire) != 1) continue;
+            slot.* = null;
+            released += directory.entries.len * @sizeOf(StoredKeyDirectory.Entry) + @sizeOf(StoredKeyDirectory);
+            directory.release();
+        }
+        return released;
+    }
+
     fn storedKeyDirectory(
         self: *const IndexSnapshot,
         segment: *const SegmentEntry,
         scratch: *segment_mod.SegmentReadScratch,
         match_parent: bool,
         control: query_mod.ExecutionControl,
-    ) !?*const StoredKeyDirectory {
+    ) !?*StoredKeyDirectory {
         const shared = segment.shared;
         const slot = &shared.stored_key_directories[@intFromBool(match_parent)];
-        if (slot.load(.acquire)) |directory| return directory;
-        const room = @as(usize, segment.reader.doc_count) * @sizeOf(StoredKeyDirectory.Entry);
-        if (room > 16 * 1024 * 1024) return null;
         if (!shared.stored_key_directory_lock.tryLock()) return null;
         defer shared.stored_key_directory_lock.unlock();
-        if (slot.load(.acquire)) |directory| return directory;
+        if (slot.*) |directory| {
+            _ = directory.refs.fetchAdd(1, .monotonic);
+            return directory;
+        }
 
+        const room = @as(usize, segment.reader.doc_count) * @sizeOf(StoredKeyDirectory.Entry);
         const manager = self.graph_predicates.manager.load(.acquire);
+        if (manager) |owner| {
+            if (shared.stored_key_directory_reclaimer == 0) {
+                shared.stored_key_directory_reclaimer = owner.registerReclaimer(.graph_predicate_cache, shared, reclaimStoredKeyDirectories) catch return null;
+                shared.stored_key_directory_manager = owner;
+            }
+        } else if (room > 16 * 1024 * 1024) return null;
         var reservation: ?resource_manager_mod.Reservation = if (manager) |owner|
             owner.reserveWithoutReclaim(.graph_predicate_cache, room + @sizeOf(StoredKeyDirectory)) catch return null
         else
@@ -2533,7 +2561,7 @@ pub const IndexSnapshot = struct {
         try control.check();
         const directory = alloc.create(StoredKeyDirectory) catch return null;
         directory.* = .{ .entries = entries, .reservation = reservation, .alloc = alloc };
-        slot.store(directory, .release);
+        slot.* = directory;
         published = true;
         return directory;
     }
@@ -2556,6 +2584,7 @@ pub const IndexSnapshot = struct {
             const live = LiveGraphFrontier{ .target = &docs, .shared = lease.entry.shared, .offset = offset, .control = control };
             if (frontier.count() *| 8 < segment.reader.doc_count) {
                 if (try self.storedKeyDirectory(lease.entry, &scratch, match_parent, control)) |directory| {
+                    defer directory.release();
                     var wanted = frontier.iterator();
                     while (wanted.next()) |entry| {
                         try control.check();
@@ -2620,7 +2649,17 @@ pub const IndexSnapshot = struct {
             var lease = try self.leaseSegment(i);
             defer lease.deinit();
             if (ordinals.len *| 16 < segment.reader.doc_count) {
-                if (try seekGraphSegmentFrontier(lease.entry, frontier, control, offset, &out)) continue;
+                var segment_docs = GraphFrontierDocs.init(alloc);
+                defer segment_docs.deinit();
+                const used_inverse = seekGraphSegmentFrontier(lease.entry, frontier, control, offset, &segment_docs) catch |err| switch (err) {
+                    error.InvalidSegment, error.CrcMismatch => false,
+                    else => return err,
+                };
+                if (used_inverse) {
+                    var pairs = segment_docs.ordinals.iterator();
+                    while (pairs.next()) |pair| try out.add(pair.key_ptr.*, pair.value_ptr.*);
+                    continue;
+                }
             }
             const live = LiveGraphFrontier{ .target = &out, .shared = lease.entry.shared, .offset = offset, .control = control };
             var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);

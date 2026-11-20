@@ -944,7 +944,8 @@ pub fn resolvedDocSetForIdsAtGenerationWithPolicyTxn(
     var missing_ordinal_coverage = false;
 
     for (doc_ids) |doc_id| {
-        if (try lookupOrdinalTxn(alloc, mutable_txn, doc_id)) |ordinal| {
+        const mapped = try lookupOrdinalTxn(alloc, mutable_txn, doc_id) orelse try lookupLiveOrdinalTxn(alloc, mutable_txn, doc_id);
+        if (mapped) |ordinal| {
             const state = try lookupStateTxn(mutable_txn, ordinal);
             if (state) |ordinal_state| {
                 const visible = if (generation) |at| ordinal_state.isVisibleAt(at) else ordinal_state.isLive();
