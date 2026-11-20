@@ -9144,6 +9144,12 @@ const replay_hints = [_]change_journal_mod.TargetHint{
     .promotion,
 };
 
+const replay_hint_ordinals = blk: {
+    var ordinals: [replay_hints.len]u8 = undefined;
+    for (replay_hints, 0..) |hint, i| ordinals[i] = replayHintOrdinal(hint);
+    break :blk ordinals;
+};
+
 fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {
     return @intCast(@backingInt(hint));
 }
@@ -9287,10 +9293,10 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     // the retirement transactions that eventually charge against it) can
     // tell the layout apart from an old one.
     const journal_state = try replay_journal_format.state(txn);
-    if (journal_state == .legacy) try replay_journal_format.upgrade(txn, try scanReplayJournalLedger(txn));
+    if (journal_state == .legacy) try replay_journal_format.upgrade(txn, try scanReplayJournalLedger(txn), &replay_hint_ordinals, false);
     const already_initialized = journal_state != .absent;
     if (!already_initialized) {
-        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_v2);
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_current);
         try txn.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
     }
 
@@ -9330,6 +9336,18 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
 
     const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
     try txn.put(all_key[0..], payload);
+    // Each hint the record carries keeps its latest-sequence marker, a
+    // small overwrite, so a consumer's "nothing pending through S" check is
+    // one read instead of a filtered scan of the shared lane's backlog.
+    const hint_mask = change_journal_mod.encodedRecordHintMask(payload) catch 0;
+    if (hint_mask != 0) {
+        const latest_raw = encodeReplaySequence(sequence);
+        for (replay_hints) |hint| {
+            if ((hint_mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
+            const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
+            try txn.put(latest_key[0..], latest_raw[0..]);
+        }
+    }
 
     if (txn.store != null) {
         var ledger = reserved_ledger.?;
@@ -19193,10 +19211,47 @@ test "lite native docstore upgrades a base-revision replay journal on its next a
     defer read.abort();
     try std.testing.expectError(error.NotFound, read.get(replay_journal_format.legacy_next_sequence_key[0..]));
     const version = internal_keys.decodeReplayJournalFormatVersion(try read.get(internal_keys.replay_journal_format_version_key[0..]));
-    try std.testing.expectEqual(@as(?u32, internal_keys.replay_journal_format_v2), version);
+    try std.testing.expectEqual(@as(?u32, internal_keys.replay_journal_format_current), version);
     const ledger = internal_keys.JournalCreditLedger.decode(try read.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 3), ledger.records);
     try std.testing.expectEqual(@as(u64, 3 * internal_keys.replay_key_len + 2 * first.len + second.len), ledger.bytes);
+    // Raised to the head by the upgrade, then the new append's own.
+    const full_text_marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.full_text));
+    try std.testing.expectEqual(@as(?u64, 2), decodeTestReplaySequence(try read.get(full_text_marker[0..])));
+    const enrichment_marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.enrichment));
+    try std.testing.expectEqual(@as(?u64, 1), decodeTestReplaySequence(try read.get(enrichment_marker[0..])));
+}
+
+// One small marker per hint the record carries: the shared lane still holds
+// the only copy, and a hint's newest sequence is one read.
+test "lite native docstore keeps a latest-sequence marker per hint" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-replay-markers.aflite");
+    defer allocator.free(path);
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    var runtime = try store.runtimeStore(allocator);
+    defer runtime.deinit();
+    for ([_]change_journal_mod.TargetHint{ .enrichment, .full_text, .full_text }, 1..) |hint, sequence| {
+        const record = try encodeTestReplayRecord(allocator, sequence, hint);
+        defer allocator.free(record);
+        try runtime.appendReplayOpaque(allocator, sequence, record);
+    }
+    var read = try store.beginRead();
+    defer read.abort();
+    const enrichment_marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.enrichment));
+    try std.testing.expectEqual(@as(?u64, 1), decodeTestReplaySequence(try read.get(enrichment_marker[0..])));
+    const full_text_marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.full_text));
+    try std.testing.expectEqual(@as(?u64, 3), decodeTestReplaySequence(try read.get(full_text_marker[0..])));
+    const lane_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 3);
+    try std.testing.expectError(error.NotFound, read.get(lane_key[0..]));
+}
+
+fn decodeTestReplaySequence(raw: []const u8) ?u64 {
+    if (raw.len != 8) return null;
+    return std.mem.readInt(u64, raw[0..8], .little);
 }
 
 test "lite native docstore hint lane stops at a record whose hints cannot be read" {

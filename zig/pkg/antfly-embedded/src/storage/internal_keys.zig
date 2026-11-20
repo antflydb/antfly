@@ -208,6 +208,11 @@ pub const replay_meta_next_sequence_key = globalReplayPrefix(.next_sequence);
 /// and no format-version key. Antfly is unreleased: this build never writes
 /// or reads v1 layouts. `requireCurrentReplayJournalFormat` refuses them.
 pub const replay_journal_format_v2: u32 = 2;
+/// v3: every append updates the latest-sequence marker of each hint its
+/// record carries, so a marker bounds that hint's work exactly. A v2 or
+/// base journal is upgraded with each marker raised to the journal head.
+pub const replay_journal_format_v3: u32 = 3;
+pub const replay_journal_format_current: u32 = replay_journal_format_v3;
 pub const replay_journal_format_version_key = globalReplayPrefix(.journal_format_version);
 pub const journal_credit_ledger_key = globalReplayPrefix(.journal_credit_ledger);
 

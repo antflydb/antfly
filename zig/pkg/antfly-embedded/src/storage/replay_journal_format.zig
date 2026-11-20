@@ -13,11 +13,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Replay-journal format detection and the in-place upgrade from the base
-//! revision's layout. That layout has an initialized journal with no format
-//! marker, keeps `next_sequence` under global replay kind 0x02 (journal
-//! sharing moved it), and has no credit ledger. Its lane entries are kept as
-//! they are; only the metadata is rewritten.
+//! Replay-journal format detection and the in-place upgrade from earlier
+//! layouts. The base revision's layout has an initialized journal with no
+//! format marker, keeps `next_sequence` under global replay kind 0x02
+//! (journal sharing moved it), and has no credit ledger. v2 kept per-hint
+//! latest-sequence markers only for active consumers. Lane entries are kept
+//! as they are; only the metadata is rewritten.
+//!
+//! A store whose readers use per-hint lanes (`keep_base_layout`, every
+//! backend but Lite) stays readable by the base revision: its appends keep
+//! writing every hint lane and `next_sequence` under the base key too, so
+//! the upgrade keeps that key. A base binary that wrote since leaves the base
+//! key ahead; `baseWroteSince` sends the next open through the upgrade
+//! again. Lite files carry a native header the base revision refuses.
 
 const std = @import("std");
 const internal_keys = @import("internal_keys.zig");
@@ -29,7 +37,7 @@ pub const State = enum {
     /// No journal yet: the first append initializes and stamps it.
     absent,
     current,
-    /// Initialized by the base revision: `upgrade` rewrites it.
+    /// Initialized by the base revision or as v2: `upgrade` rewrites it.
     legacy,
 };
 
@@ -43,8 +51,26 @@ pub fn state(txn: anytype) !State {
         else => return err,
     };
     const version = internal_keys.decodeReplayJournalFormatVersion(raw) orelse return error.UnsupportedReplayJournalFormat;
-    if (version != internal_keys.replay_journal_format_v2) return error.UnsupportedReplayJournalFormat;
+    if (version == internal_keys.replay_journal_format_v2) return .legacy;
+    if (version != internal_keys.replay_journal_format_current) return error.UnsupportedReplayJournalFormat;
     return .current;
+}
+
+/// Whether a base binary appended after the upgrade: it advances only the
+/// base `next_sequence` key, leaving it ahead of the current one.
+pub fn baseWroteSince(txn: anytype) !bool {
+    const base = try readSequence(txn, legacy_next_sequence_key[0..]) orelse return false;
+    const current = try readSequence(txn, internal_keys.replay_meta_next_sequence_key[0..]) orelse return true;
+    return base > current;
+}
+
+fn readSequence(txn: anytype, key: []const u8) !?u64 {
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (raw.len != 8) return error.CorruptReplayMetadata;
+    return std.mem.readInt(u64, raw[0..8], .little);
 }
 
 /// The stored `next_sequence` bytes. A journal still in the base layout (a
@@ -69,36 +95,36 @@ pub fn entryCharge(key_len: usize, value_len: usize) u64 {
     return @as(u64, key_len) + value_len;
 }
 
-/// Rewrites a legacy journal's metadata in the caller's write transaction:
-/// moves `next_sequence` to its current key, stores `ledger` (the caller's
-/// scan of every lane entry, charged as `entryCharge`), and stamps the
-/// current format.
-pub fn upgrade(txn: anytype, ledger: internal_keys.JournalCreditLedger) !void {
-    const legacy_next: ?[8]u8 = blk: {
-        const raw = txn.get(legacy_next_sequence_key[0..]) catch |err| switch (err) {
-            error.NotFound => break :blk null,
-            else => return err,
-        };
-        if (raw.len != 8) return error.CorruptReplayMetadata;
-        break :blk raw[0..8].*;
-    };
-    if (legacy_next) |raw| {
-        const current_next: ?u64 = blk: {
-            const current = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
-                error.NotFound => break :blk null,
-                else => return err,
-            };
-            if (current.len != 8) return error.CorruptReplayMetadata;
-            break :blk std.mem.readInt(u64, current[0..8], .little);
-        };
-        const next = @max(std.mem.readInt(u64, &raw, .little), current_next orelse 0);
+/// Rewrites an older journal's metadata in the caller's write transaction:
+/// `next_sequence` under its current key (and, with `keep_base_layout`,
+/// under the base key too), `ledger` (the caller's scan of every lane entry,
+/// charged as `entryCharge`), each of `hint_ordinals`' latest-sequence
+/// markers raised to the journal head (an older layout may have skipped a
+/// hint's appends, so only the head bounds them), and the current format.
+pub fn upgrade(txn: anytype, ledger: internal_keys.JournalCreditLedger, hint_ordinals: []const u8, keep_base_layout: bool) !void {
+    const base_next = try readSequence(txn, legacy_next_sequence_key[0..]);
+    const current_next = try readSequence(txn, internal_keys.replay_meta_next_sequence_key[0..]);
+    const next = @max(base_next orelse 0, current_next orelse 0);
+    if (base_next != null or current_next != null) {
         var next_raw: [8]u8 = undefined;
         std.mem.writeInt(u64, &next_raw, next, .little);
         try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
-        try txn.delete(legacy_next_sequence_key[0..]);
+        if (keep_base_layout) {
+            try txn.put(legacy_next_sequence_key[0..], next_raw[0..]);
+        } else if (base_next != null) {
+            try txn.delete(legacy_next_sequence_key[0..]);
+        }
+    }
+    if (next > 0) {
+        var head_raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &head_raw, next - 1, .little);
+        for (hint_ordinals) |ordinal| {
+            const key = internal_keys.replayLatestSequenceKey(ordinal);
+            if ((try readSequence(txn, key[0..]) orelse 0) < next - 1) try txn.put(key[0..], head_raw[0..]);
+        }
     }
     const ledger_raw = ledger.encode();
     try txn.put(internal_keys.journal_credit_ledger_key[0..], ledger_raw[0..]);
-    const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_v2);
+    const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_current);
     try txn.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
 }
