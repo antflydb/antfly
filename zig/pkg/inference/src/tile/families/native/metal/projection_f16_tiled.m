@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 // Historical ABI exports remain consumed by the Metal runtime pipelines.
 // native-program:entry termite_glide_linear_16_64
         "kernel void termite_glide_linear_16_64(device float *x [[buffer(0)]], device half *w [[buffer(1)]], device float *bias [[buffer(2)]], device float *y [[buffer(3)]], constant termite_glide_linear_params &p [[buffer(4)]], uint2 group [[threadgroup_position_in_grid]]) { termite_glide_linear_body<16, 64, 2>(x, w, bias, y, p, group); }\n"

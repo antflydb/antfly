@@ -407,7 +407,7 @@ SOURCE_MODULES = {
     "structlog": ("zig/lib/structlog/src/root.zig",),
     "usermgr_storage": ("zig/pkg/antfly/src/usermgr/storage_imports.zig",),
     "vopr": ("zig/lib/vopr/src/root.zig",),
-    "xla_proto": ("zig/lib/pjrt/proto/xla_proto_stub.zig",),
+    "xla_proto": ("zig/lib/pjrt/proto/xla_proto.zig",),
 }
 CONFIGURATION_IMPORTS = {
     "apple_native_options",

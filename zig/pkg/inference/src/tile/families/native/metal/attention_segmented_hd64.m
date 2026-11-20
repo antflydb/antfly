@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 // Historical ABI exports remain consumed by the Metal runtime pipelines.
 // native-program:entry termite_glide_row_flash_hd64
         "kernel void termite_glide_row_flash_hd64(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]],\n"

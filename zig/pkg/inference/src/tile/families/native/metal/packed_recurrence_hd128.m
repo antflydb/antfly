@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 // Historical ABI exports remain consumed by the Metal runtime pipelines.
 // native-program:entry termite_glide_core_conv
            "kernel void termite_glide_core_conv(device const float *mixed [[buffer(0)]], device const float *weight [[buffer(1)]], device const uint *pos [[buffer(2)]], device float *conv [[buffer(3)]], constant termite_glide_core_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
