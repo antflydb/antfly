@@ -3523,6 +3523,7 @@ pub const Runtime = struct {
             var chunk_batch = (if (uses_encoded_media)
                 self.readReaderWindow(alloc, cfg_parsed.value, readers.EncodedRequest{
                     .images = flat_encoded.items[image_offset..image_end],
+                    .require_batch_contract = true,
                     .prompt = shared_prompt,
                     .max_tokens = cfg_parsed.value.max_tokens,
                     .source_fingerprint = chunk_source_fingerprint,
@@ -3531,6 +3532,7 @@ pub const Runtime = struct {
             else
                 self.readReaderWindow(alloc, cfg_parsed.value, readers.Request{
                     .images = flat_images.items[image_offset..image_end],
+                    .require_batch_contract = true,
                     .prompt = shared_prompt,
                     .max_tokens = cfg_parsed.value.max_tokens,
                     .inline_content_trust = if (requests[0].inline_media_trusted) .trusted_internal else .untrusted,
@@ -4252,6 +4254,7 @@ pub const Runtime = struct {
                 else => return err,
             };
             if (request.images.len > 1) {
+                if (request.require_batch_contract and lease.capabilities == null) return error.InferenceDiscoveryTooManyItems;
                 if (lease.capabilities) |caps| {
                     if (caps.result_cardinality != .one_per_item) return error.InferenceDiscoveryTooManyItems;
                 }

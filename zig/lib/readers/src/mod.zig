@@ -115,6 +115,8 @@ pub const DocumentSource = struct {
     include_hidden: bool = false,
 };
 pub const Request = struct {
+    /// Combining independent work requires a discovered per-item contract.
+    require_batch_contract: bool = false,
     /// Base64 or data URI audio (including audio tracks in video containers).
     audio: ?[]const u8 = null,
     audio_options: ?inference_api.AudioReadOptions = null,
@@ -146,6 +148,8 @@ pub const EncodedImage = struct {
 };
 
 pub const EncodedRequest = struct {
+    /// Combining independent work requires a discovered per-item contract.
+    require_batch_contract: bool = false,
     /// Composition may inspect incomplete output; ordinary callers keep strict behavior.
     allow_incomplete: bool = false,
     images: []const EncodedImage,
