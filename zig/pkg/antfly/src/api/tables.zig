@@ -1748,7 +1748,7 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
     var updated = try metadata_table_manager.cloneTable(alloc, table.*);
     errdefer metadata_table_manager.freeTable(alloc, updated);
 
-    const normalized_schema_json = try normalizeSchemaVersion(alloc, schema_json, next_version);
+    const normalized_schema_json = try normalizeSchemaWithPredecessor(alloc, schema_json, next_version, table.schema_json);
     var normalized_schema_json_owned = true;
     errdefer if (normalized_schema_json_owned) alloc.free(normalized_schema_json);
     // schemasSemanticallyEqual derives both runtime schemas, so the candidate
@@ -3984,15 +3984,108 @@ fn appendCanonicalSchemaJson(
 }
 
 pub fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
+    return normalizeSchemaWithPredecessor(alloc, schema_json, version, null);
+}
+
+// Birth versions are metadata-owned. Legacy writers can copy unknown schema
+// fields, so accept the map only at the exact version at which it was stamped.
+const IndexLifetimes = struct {
+    version: u32,
+    births: std.json.ArrayHashMap(u32),
+};
+const index_lifetimes_field = "x-antfly-index-lifetimes";
+const IndexLifetimesProjection = struct {
+    version: u32 = 0,
+    @"x-antfly-index-lifetimes": ?IndexLifetimes = null,
+    fn birth(self: @This(), name: []const u8) u32 {
+        if (self.@"x-antfly-index-lifetimes") |stamp| {
+            if (stamp.version == self.version) if (stamp.births.map.get(name)) |v| {
+                if (v <= self.version) return v;
+            };
+        }
+        return self.version;
+    }
+};
+
+pub fn indexBirthVersion(alloc: std.mem.Allocator, schema: []const u8, name: []const u8) !u32 {
+    var projection = std.json.parseFromSlice(IndexLifetimesProjection, alloc, schema, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return schemaVersion(schema),
+    };
+    defer projection.deinit();
+    return projection.value.birth(name);
+}
+
+fn stampIndexLifetimes(a: std.mem.Allocator, root: *std.json.ObjectMap, previous: []const u8, version: u32) !void {
+    const indexes = root.get("relational_indexes") orelse return;
+    if (indexes != .array or indexes.array.items.len == 0) return;
+    const source = if (previous.len == 0) "{}" else previous;
+    const old = std.json.parseFromSliceLeaky(std.json.Value, a, source, .{ .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    if (old != .object) return;
+    const projection = std.json.parseFromSliceLeaky(IndexLifetimesProjection, a, source, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    var definitions: std.StringHashMapUnmanaged(std.json.Value) = .empty;
+    if (old.object.get("relational_indexes")) |prior| if (prior == .array) {
+        for (prior.array.items) |item| {
+            if (item != .object) continue;
+            const name = item.object.get("name") orelse continue;
+            if (name == .string) try definitions.put(a, name.string, item);
+        }
+    };
+    var births: std.json.ObjectMap = .empty;
+    for (indexes.array.items) |item| {
+        if (item != .object) return error.InvalidSchemaUpdateRequest;
+        const key = item.object.get("name") orelse return error.InvalidSchemaUpdateRequest;
+        if (key != .string) return error.InvalidSchemaUpdateRequest;
+        const name = key.string;
+        const prior = definitions.get(name) orelse continue;
+        if (json_helpers.jsonValuesEqual(prior, item)) {
+            try births.put(a, name, .{ .integer = projection.birth(name) });
+        }
+    }
+    if (births.count() == 0) return;
+    var stamp: std.json.ObjectMap = .empty;
+    try stamp.put(a, "version", .{ .integer = version });
+    try stamp.put(a, "births", .{ .object = births });
+    try root.put(a, index_lifetimes_field, .{ .object = stamp });
+}
+
+test "SQL index DDL birth survives compatible updates and resets after removal or replacement" {
+    const a = std.testing.allocator;
+    const legacy =
+        \\{"version":4,"relational_indexes":[{"name":"ix","keys":[{"column":"x"}]}]}
+    ;
+    const forged =
+        \\{"relational_indexes":[{"keys":[{"column":"x"}],"name":"ix"}],"x-antfly-index-lifetimes":{"version":5,"births":{"ix":1}}}
+    ;
+    const compatible = try normalizeSchemaWithPredecessor(a, forged, 5, legacy);
+    defer a.free(compatible);
+    try std.testing.expectEqual(@as(u32, 4), try indexBirthVersion(a, compatible, "ix"));
+    const replaced = try normalizeSchemaWithPredecessor(a,
+        \\{"relational_indexes":[{"name":"ix","keys":[{"column":"y"}]}]}
+    , 6, compatible);
+    defer a.free(replaced);
+    try std.testing.expectEqual(@as(u32, 6), try indexBirthVersion(a, replaced, "ix"));
+    const recreated = try normalizeSchemaWithPredecessor(a, forged, 7, "{}");
+    defer a.free(recreated);
+    try std.testing.expectEqual(@as(u32, 7), try indexBirthVersion(a, recreated, "ix"));
+}
+
+fn normalizeSchemaWithPredecessor(alloc: std.mem.Allocator, schema_json: []const u8, version: u32, predecessor: ?[]const u8) ![]u8 {
     const source = if (schema_json.len > 0) schema_json else "{}";
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{ .parse_numbers = false });
     defer parsed.deinit();
     try @import("relational_expression_contract.zig").canonicalizeSchemaValue(parsed.arena.allocator(), &parsed.value);
 
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidSchemaUpdateRequest,
-    };
+    if (parsed.value != .object) return error.InvalidSchemaUpdateRequest;
+    const root = &parsed.value.object;
+    _ = root.orderedRemove(index_lifetimes_field);
+    if (predecessor) |old| try stampIndexLifetimes(parsed.arena.allocator(), root, old, version);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);

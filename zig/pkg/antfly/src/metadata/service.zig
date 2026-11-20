@@ -574,6 +574,15 @@ fn requireRelationMutationOwnerWithContext(service: anytype, expected: metadata_
     if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
     try service.ensureLinearizableReadWithContext(context);
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (guard.qualified_table) {
+        const scope: relation_catalog.Target = .{ .database = guard.target.database, .namespace = guard.target.namespace, .table = guard.target.name };
+        const pin_incarnation = !std.mem.allEqual(u8, &guard.incarnation, 0);
+        const cut = try store.resolveSystemCatalogIdentities(service.alloc, service.metadata_group_id, .{ .targets = &.{scope}, .include_source_epoch = pin_incarnation });
+        defer cut.deinit(service.alloc);
+        if (cut.tables.len != 1 or cut.tables[0] == null or cut.tables[0].?.table_id != expected.table_id or !std.mem.eql(u8, cut.tables[0].?.name, expected.name)) return error.CatalogGenerationChanged;
+        if (pin_incarnation and (cut.source_epoch == null or !std.mem.eql(u8, &cut.source_epoch.?.incarnation, &guard.incarnation))) return error.CatalogGenerationChanged;
+        return;
+    }
     const request: relation_catalog.ResolveMany = .{ .relations = &.{guard.target} };
     const resolved = try store.resolveSystemCatalogIdentities(service.alloc, service.metadata_group_id, request);
     defer resolved.deinit(service.alloc);
@@ -3649,13 +3658,13 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
     var required = (try transitionBaseDecoderVersion(a, command));
     switch (command) {
         .apply_system_catalog => |bytes| {
-            const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind, expected_resource_id: ?u64 = null } };
+            const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind, expected_resource_id: ?u64 = null, expected_tablespace_id: ?u64 = null } };
             var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return metadata_topology_protocol.current_version,
             };
             defer parsed.deinit();
-            if (parsed.value.mutation.expected_resource_id != null) required = @max(required, metadata_topology_protocol.bound_ddl_version);
+            if (parsed.value.mutation.expected_resource_id != null or parsed.value.mutation.expected_tablespace_id != null) required = @max(required, metadata_topology_protocol.bound_ddl_version);
             if (parsed.value.mutation.kind == .graph) required = @max(required, metadata_topology_protocol.graph_definition_version);
         },
         .register_store, .upsert_store, .upsert_store_heartbeat => |record| {
@@ -3745,7 +3754,7 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
     if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
     if (command == .apply_resolver_authority or command == .advance_resolver_namespace) return metadata_topology_protocol.resolver_records_version;
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
-        return metadata_topology_protocol.relation_mutation_version;
+        return if (command.compare_and_replace_table.relation_guard.?.qualified_table) metadata_topology_protocol.bound_ddl_version else metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {
         const intent = @import("relation_reconciliation_command.zig").Command.decode(command.apply_relation_reconciliation) catch return metadata_topology_protocol.current_version;
         return intent.requiredDecoderVersion();

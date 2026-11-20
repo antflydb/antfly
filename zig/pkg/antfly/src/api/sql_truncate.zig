@@ -286,7 +286,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     return executeBound(server, identity, context, database, namespace, alloc, ddl, null);
 }
 
-pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.CatalogDdl, expected: ?@import("sql_ddl_binding.zig").Guard) !catalog.DdlOutcome {
+pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.CatalogDdl, expected: ?[]const @import("sql_ddl_binding.zig").Guard.Table) !catalog.DdlOutcome {
     try context.ensureActive();
     if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
     if (ddl.truncate_tables.len == 0 or ddl.truncate_tables.len > 128) return error.InvalidSqlSyntax;
@@ -298,8 +298,9 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
     defer arena.deinit();
     const a = arena.allocator();
     const targets = try a.alloc(domain.Target, ddl.truncate_tables.len);
-    for (ddl.truncate_tables, targets) |name, *target| {
-        target.* = .{ .database = name.database orelse database, .namespace = name.namespace orelse namespace, .table = name.table };
+    if (expected) |entries| if (entries.len != targets.len) return error.CatalogGenerationChanged;
+    for (ddl.truncate_tables, targets, 0..) |name, *target, index| {
+        target.* = .{ .database = name.database orelse database, .namespace = if (expected) |entries| entries[index].namespace else name.namespace orelse namespace, .table = name.table };
         try target.validate();
         const resource = try target.resourceNameAlloc(a);
         if (!try server_mod.tablePermissionCurrentlyAllowed(identity, resource, .admin)) return error.Forbidden;
@@ -308,7 +309,7 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
     const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets } }), .{});
     if (resolved.tables.len != targets.len) return error.InvalidSqlBackendResponse;
     if (expected) |guard| for (resolved.tables, 0..) |table, i| {
-        if (try guard.id(targets.len, i) != (if (table) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
+        if (guard[i].id != (if (table) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
     };
     const logical_state = try std.json.parseFromSliceLeaky(domain.State, a, try server.source.systemCatalog(a, context, .snapshot), .{});
     var logical_index = try domain.StateIndex.init(a, logical_state);

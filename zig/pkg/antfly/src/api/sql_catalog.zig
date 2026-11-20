@@ -37,33 +37,37 @@ const ast = @import("antfly_local_sources").sql_ast;
 const DdlGuard = @import("sql_ddl_binding.zig").Guard;
 const SearchPath = @import("../pgwire/search_path.zig").Path;
 
-fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, allocators: catalog.DdlAllocators, target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, admission: ?RelationAdmission, expected_id: ?u64) !catalog.DdlOutcome {
+fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, allocators: catalog.DdlAllocators, target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, admission: ?RelationAdmission, expected: ?DdlGuard.Objects) !catalog.DdlOutcome {
     const alloc = allocators.result;
     if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
     var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
     const a = arena.allocator();
-    var guarded_admission = admission;
-    if (expected_id) |id| {
-        const relation: domain.RelationTarget = .{ .database = target.database, .namespace = target.namespace, .name = target.table };
-        const lookup: domain.ResolveMany = .{ .relations = &.{relation}, .include_query_definitions = true };
-        const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = lookup });
-        const cut = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{});
-        try cut.validateRelations(lookup);
-        const entry = cut.relations[0] orelse return if (id == 0) error.TableNotFound else error.CatalogGenerationChanged;
-        if (entry.owner.kind != .table or entry.table.table_id != id) return error.CatalogGenerationChanged;
-        guarded_admission = .{ .table = entry.table, .guard = .{ .target = relation, .logical_table = entry.logical_table, .owner = entry.owner, .incarnation = cut.relation_epoch.?.incarnation } };
-    }
-    const table = if (guarded_admission) |captured| captured.table else blk: {
-        const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true } });
-        const snapshot = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{ .allocate = .alloc_always });
+    var incarnation: [16]u8 = @splat(0);
+    const table = if (admission) |captured| captured.table else blk: {
+        const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true, .include_source_epoch = expected != null } });
+        const snapshot = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{});
         if (snapshot.tables.len != 1) return error.InvalidSqlBackendResponse;
+        if (snapshot.source_epoch) |epoch| incarnation = epoch.incarnation;
+        if (expected) |objects| if ((try objects.table(1, 0)).id != (if (snapshot.tables[0]) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
         break :blk snapshot.tables[0] orelse return error.TableNotFound;
     };
     const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
     var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, definition.schema_json);
     defer parsed.deinit(a);
     const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed);
+    if (expected) |objects| if (objects.schema_version) |version| if (version != native.version) return error.CatalogGenerationChanged;
+    const mutation_guard: ?domain.RelationMutationGuard = if (admission) |captured| captured.guard else if (expected != null) blk: {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(definition.schema_json, &digest, .{});
+        break :blk .{
+            .qualified_table = true,
+            .target = .{ .database = target.database, .namespace = target.namespace, .name = target.table },
+            .logical_table = target.table,
+            .incarnation = incarnation,
+            .owner = .{ .kind = .table, .table_id = table.table_id, .schema_version = native.version, .schema_digest = digest },
+        };
+    } else null;
     if (native.storage_mode != .relational) return error.UnsupportedSqlShape;
     if (native.external_base_source != null) {
         const change = ddl.schema_change orelse return error.ExternalLakeReadOnly;
@@ -97,7 +101,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         }
         const publication_id = try alloc.alloc(u8, 32);
         errdefer alloc.free(publication_id);
-        const publication = server.beginFkGenerationPublication(alloc, context, identity, before.*, updated) catch |err| switch (err) {
+        const publication = server.beginBoundFkGenerationPublication(alloc, context, identity, before.*, updated, if (expected) |obj| if (obj.parent_id) |id| .{ .constraint = ddl.schema_change.?.add_foreign_key.name, .id = id } else null else null) catch |err| switch (err) {
             error.MetadataMutationOutcomeUnknown => return error.SqlMutationOutcomeUnknown,
             else => return err,
         };
@@ -147,7 +151,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     var submitted = false;
     var observed_context = context;
     observed_context.sql_completion_submission = &submitted;
-    const version = submitSchema(server, observed_context, alloc, table.name, table.table_id, native.version, updated, retirement, validation, if (guarded_admission) |captured| captured.guard else null) catch |err| {
+    const version = submitSchema(server, observed_context, alloc, table.name, table.table_id, native.version, updated, retirement, validation, mutation_guard) catch |err| {
         if (!submitted) try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, completion_owner);
         try @import("sql_completion.zig").rejectMetadataWithContext(context, completion_owner, err);
         if (err == error.ForeignKeyReferenced) return error.SqlDependentConstraint;
@@ -448,6 +452,15 @@ fn resolveIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
     };
 }
 
+fn indexGuard(a: std.mem.Allocator, result: IndexResolution, creating: bool) !DdlGuard {
+    const admission = result.admission orelse return DdlGuard.index(a, null, null);
+    const birth = if (!creating and admission.guard.owner.kind == .index) blk: {
+        const definition = admission.table.query_definition orelse return error.InvalidSqlBackendResponse;
+        break :blk try tables.indexBirthVersion(a, definition.schema_json, admission.guard.target.name);
+    } else null;
+    return DdlGuard.index(a, admission.guard, birth);
+}
+
 fn executeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: ast.CatalogDdl, path: ?*const SearchPath, expected: ?DdlGuard) !catalog.DdlOutcome {
     var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
@@ -455,7 +468,7 @@ fn executeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
     const creating = ddl.action == .create;
     const result = try resolveIndex(server, identity, context, database, namespace, a, ddl, path, true);
     if (expected) |guard| {
-        const current = try DdlGuard.index(a, if (result.admission) |r| r.guard else null, creating);
+        const current = try indexGuard(a, result, creating);
         if (!std.mem.eql(u8, guard.bytes, current.bytes)) return error.CatalogGenerationChanged;
     }
     const admission = result.admission orelse {
@@ -603,6 +616,70 @@ pub fn bindsExisting(statement: ast.Statement) bool {
     };
 }
 
+fn pinsSchemaVersion(statement: ast.Statement) bool {
+    if (statement != .catalog_ddl) return false;
+    return switch (statement.catalog_ddl.schema_change orelse return false) {
+        .drop_column, .drop_constraint, .validate_constraint, .drop_default, .set_default => true,
+        else => false,
+    };
+}
+
+const TableCut = struct {
+    objects: []DdlGuard.Table,
+    definitions: []?domain.ResolvedTable,
+    revision: u64,
+};
+
+// Resolve only remaining names at each search-path position. All point reads
+// share a revision and authorization is checked before looking in each scope.
+fn resolveTables(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, a: std.mem.Allocator, database: []const u8, namespace: []const u8, names: []const ast.Name, path: ?*const SearchPath, definitions: bool, expected_revision: ?u64) !TableCut {
+    if (names.len == 0 or names.len > 128) return error.InvalidSqlSyntax;
+    const objects = try a.alloc(DdlGuard.Table, names.len);
+    const rows = try a.alloc(?domain.ResolvedTable, names.len);
+    @memset(rows, null);
+    const targets = try a.alloc(domain.Target, names.len);
+    const positions = try a.alloc(usize, names.len);
+    var revision = expected_revision;
+    for (0..if (path) |p| p.len else @as(usize, 1)) |depth| {
+        var count: usize = 0;
+        for (names, 0..) |name, i| {
+            if (rows[i] != null) continue;
+            const on_path = name.database == null and name.namespace == null and path != null;
+            if (depth != 0 and !on_path) continue;
+            const ns = if (on_path) path.?.entries[depth].slice() else name.namespace orelse namespace;
+            if (depth == 0) objects[i] = .{ .namespace = ns, .id = 0 };
+            targets[count] = .{ .database = name.database orelse database, .namespace = ns, .table = name.table };
+            try targets[count].validate();
+            try authorizeTableAdmin(identity, a, targets[count]);
+            positions[count] = i;
+            count += 1;
+        }
+        if (count == 0) break;
+        const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets[0..count], .include_query_definitions = definitions, .expected_revision = revision } });
+        const cut = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{});
+        if (cut.tables.len != count) return error.InvalidSqlBackendResponse;
+        if (revision) |r| if (cut.revision != r) return error.CatalogGenerationChanged;
+        revision = cut.revision;
+        for (cut.tables, positions[0..count], targets[0..count]) |table, i, target| if (table) |t| {
+            objects[i] = .{ .namespace = target.namespace, .id = t.table_id };
+            rows[i] = t;
+        };
+    }
+    return .{ .objects = objects, .definitions = rows, .revision = revision orelse return error.InvalidParameter };
+}
+
+fn tablespaceId(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, a: std.mem.Allocator, ddl: ast.CatalogDdl) !?u64 {
+    if (ddl.action != .set_tablespace) return null;
+    const name = ddl.tablespace orelse return null;
+    if (identity) |user| if (!server_mod.permissionsAllow(user.permissions, .tablespace, name, .read)) return error.Forbidden;
+    const bytes = server.source.systemCatalog(a, context, .{ .read = .{ .kind = .tablespace, .name = name } }) catch |err| switch (err) {
+        error.CatalogNotFound => return 0,
+        else => return err,
+    };
+    const state = try std.json.parseFromSliceLeaky(domain.State, a, bytes, .{});
+    return (state.find(.tablespace, 0, name) orelse return error.InvalidSqlBackendResponse).id;
+}
+
 pub fn describeGuard(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, statement: ast.Statement, path: ?*const SearchPath) !DdlGuard {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -610,8 +687,8 @@ pub fn describeGuard(server: *server_mod.ApiHttpServer, identity: ?server_mod.Au
     if (statement == .catalog_ddl) {
         const ddl = statement.catalog_ddl;
         if (ddl.kind == .index) {
-            const result = try resolveIndex(server, identity, context, database, namespace, a, ddl, path, false);
-            return DdlGuard.index(alloc, if (result.admission) |r| r.guard else null, ddl.action == .create);
+            const result = try resolveIndex(server, identity, context, database, namespace, a, ddl, path, ddl.action == .drop);
+            return indexGuard(alloc, result, ddl.action == .create);
         }
         if (ddl.kind != .table) {
             const kind: domain.Kind = switch (ddl.kind) {
@@ -631,13 +708,13 @@ pub fn describeGuard(server: *server_mod.ApiHttpServer, identity: ?server_mod.Au
             };
             if (identity) |user| if (!server_mod.permissionsAllow(user.permissions, permission, resource, .admin)) return error.Forbidden;
             const bytes = server.source.systemCatalog(a, context, .{ .read = .{ .kind = kind, .database = db, .name = ddl.name.table } }) catch |err| switch (err) {
-                error.CatalogNotFound => return DdlGuard.single(alloc, 0),
+                error.CatalogNotFound => return DdlGuard.encode(alloc, .{ .resource_id = 0, .tablespace_id = try tablespaceId(server, identity, context, a, ddl) }),
                 else => return err,
             };
             const state = try std.json.parseFromSliceLeaky(domain.State, a, bytes, .{});
             const parent = if (kind == .namespace) (state.find(.database, 0, db) orelse return error.InvalidSqlBackendResponse).id else 0;
             const record = state.find(kind, parent, ddl.name.table) orelse return error.InvalidSqlBackendResponse;
-            return DdlGuard.single(alloc, record.id);
+            return DdlGuard.encode(alloc, .{ .resource_id = record.id, .tablespace_id = try tablespaceId(server, identity, context, a, ddl) });
         }
     }
     const names: []const ast.Name = switch (statement) {
@@ -646,32 +723,64 @@ pub fn describeGuard(server: *server_mod.ApiHttpServer, identity: ?server_mod.Au
         .catalog_ddl => |ddl| if (ddl.action == .truncate) ddl.truncate_tables else &.{ddl.name},
         else => unreachable,
     };
-    if (names.len == 0 or names.len > 128) return error.InvalidSqlSyntax;
-    const targets = try a.alloc(domain.Target, names.len);
-    for (targets, names) |*out, name| {
-        out.* = .{ .database = name.database orelse database, .namespace = name.namespace orelse namespace, .table = name.table };
-        try out.validate();
-        try authorizeTableAdmin(identity, a, out.*);
+    const cut = try resolveTables(server, identity, context, a, database, namespace, names, path, pinsSchemaVersion(statement), null);
+    var objects: DdlGuard.Objects = .{ .tables = cut.objects };
+    if (pinsSchemaVersion(statement)) if (cut.definitions[0]) |table| {
+        objects.schema_version = try tables.schemaVersion((table.query_definition orelse return error.InvalidSqlBackendResponse).schema_json);
+    };
+    if (statement == .policy_ddl and (statement.policy_ddl.action == .alter or statement.policy_ddl.action == .drop)) {
+        const state = try @import("sql_policy_ddl.zig").definitionCut(server, a, context, .{ .table_id = cut.objects[0].id, .name = statement.policy_ddl.name });
+        if (state.revision != cut.revision) return error.CatalogGenerationChanged;
+        objects.policy = @import("sql_policy_ddl.zig").policyIdentity(state, cut.objects[0].id, statement.policy_ddl.name);
     }
-    const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets } });
-    const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{});
-    if (resolved.tables.len != targets.len) return error.InvalidSqlBackendResponse;
-    return DdlGuard.tables(alloc, resolved.tables);
+    if (statement == .catalog_ddl) {
+        const ddl = statement.catalog_ddl;
+        objects.tablespace_id = try tablespaceId(server, identity, context, a, ddl);
+        if (ddl.schema_change) |change| if (change == .add_foreign_key) {
+            const parent = try resolveTables(server, identity, context, a, ddl.name.database orelse database, cut.objects[0].namespace, &.{.{ .table = change.add_foreign_key.parent }}, null, false, cut.revision);
+            objects.parent_id = parent.objects[0].id;
+        };
+    }
+    return DdlGuard.encode(alloc, objects);
 }
 
 pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: catalog.Ddl, path: ?*const SearchPath, expected: ?DdlGuard) !catalog.DdlOutcome {
     const alloc = allocators.result;
     try context.ensureActive();
-    if (input == .policy_ddl) return @import("sql_policy_ddl.zig").executeBound(server, identity, context, database, namespace, alloc, input.policy_ddl, if (expected) |g| try g.id(1, 0) else null);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .index)
         return executeIndex(server, identity, context, database, namespace, allocators, input.catalog_ddl, path, expected);
+    var scope_arena = std.heap.ArenaAllocator.init(allocators.scratch);
+    defer scope_arena.deinit();
+    const scope_alloc = scope_arena.allocator();
+    const bound = if (expected) |g| try g.objects(scope_alloc) else null;
+    const is_table = input == .drop_table or input == .policy_ddl or (input == .catalog_ddl and input.catalog_ddl.kind == .table);
+    var effective_namespace = namespace;
+    if (is_table) {
+        const names: []const ast.Name = switch (input) {
+            .drop_table => |d| &.{d.table},
+            .policy_ddl => |d| &.{d.table},
+            .catalog_ddl => |d| if (d.action == .truncate) d.truncate_tables else &.{d.name},
+            else => unreachable,
+        };
+        const scopes = if (bound) |objects| objects.tables else if (path != null and path.?.len > 1)
+            (try resolveTables(server, identity, context, scope_alloc, database, namespace, names, path, false, null)).objects
+        else
+            null;
+        if (scopes) |selected| {
+            if (selected.len != names.len or names.len == 0) return error.CatalogGenerationChanged;
+            effective_namespace = selected[0].namespace;
+        }
+        if (input == .catalog_ddl and input.catalog_ddl.action == .truncate)
+            return @import("sql_truncate.zig").executeBound(server, identity, context, database, namespace, alloc, input.catalog_ddl, scopes);
+        if (input == .policy_ddl) return @import("sql_policy_ddl.zig").executeBound(server, identity, context, database, effective_namespace, alloc, input.policy_ddl, bound);
+    }
     const name = switch (input) {
         .create_table => |v| v.name,
         .drop_table => |v| v.table,
         .catalog_ddl => |v| v.name,
         .policy_ddl => unreachable,
     };
-    const target: domain.Target = .{ .database = name.database orelse database, .namespace = name.namespace orelse namespace, .table = name.table };
+    const target: domain.Target = .{ .database = name.database orelse database, .namespace = name.namespace orelse effective_namespace, .table = name.table };
     try target.validate();
     const kind: domain.Kind = switch (input) {
         .catalog_ddl => |ddl| switch (ddl.kind) {
@@ -692,10 +801,8 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
     };
     if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, resource, .admin)) return error.Forbidden;
     if (input == .catalog_ddl and input.catalog_ddl.action == .alter_schema)
-        return alterSchema(server, identity, context, allocators, target, input.catalog_ddl, null, if (expected) |g| try g.id(1, 0) else null);
-    if (input == .catalog_ddl and input.catalog_ddl.action == .truncate)
-        return @import("sql_truncate.zig").executeBound(server, identity, context, database, namespace, alloc, input.catalog_ddl, expected);
-    var request: domain.Request = .{ .mutation = .{ .expected_resource_id = if (expected) |g| try g.id(1, 0) else null, .action = switch (input) {
+        return alterSchema(server, identity, context, allocators, target, input.catalog_ddl, null, bound);
+    var request: domain.Request = .{ .mutation = .{ .expected_tablespace_id = if (bound) |obj| obj.tablespace_id else null, .expected_resource_id = if (bound) |obj| if (is_table) (try obj.table(1, 0)).id else obj.resource_id else null, .action = switch (input) {
         .create_table => .create,
         .drop_table => .drop,
         .catalog_ddl => |ddl| switch (ddl.action) {

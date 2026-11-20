@@ -327,13 +327,14 @@ pub const Mutation = struct {
     expected_graph_revision: ?u64 = null,
     /// Bound destructive SQL DDL. Zero attests absence for IF EXISTS.
     expected_resource_id: ?u64 = null,
+    expected_tablespace_id: ?u64 = null,
     /// Populated only by native table admission, never accepted from public JSON.
     table_id: u64 = 0,
     storage_name: []const u8 = "",
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "expected_graph_revision") or std.mem.eql(u8, name, "expected_resource_id")) {
+            if (comptime std.mem.eql(u8, name, "expected_graph_revision") or std.mem.eql(u8, name, "expected_resource_id") or std.mem.eql(u8, name, "expected_tablespace_id")) {
                 if (@field(self, name)) |revision| {
                     try jw.objectField(name);
                     try jw.write(revision);
@@ -344,6 +345,20 @@ pub const Mutation = struct {
             }
         }
         try jw.endObject();
+    }
+};
+
+pub const PolicyRead = struct {
+    table_id: u64,
+    name: []const u8,
+    id: ?u64 = null,
+
+    pub fn select(self: @This(), state: State) State {
+        const records = for (state.policies, 0..) |record, i| {
+            if (record.table_id == self.table_id and std.ascii.eqlIgnoreCase(record.name, self.name) and (self.id == null or self.id.? == record.id))
+                break state.policies[i..][0..1];
+        } else state.policies[0..0];
+        return .{ .revision = state.revision, .next_id = state.next_id, .policies = records };
     }
 };
 
@@ -881,6 +896,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
         if (request.action == .create) return error.InvalidCatalogMutation;
         if ((if (found) |resource| resource.id else 0) != expected) return error.CatalogGenerationChanged;
     }
+    if (request.expected_tablespace_id != null and (request.action != .set_tablespace or request.tablespace == null or request.expected_resource_id == null)) return error.InvalidCatalogMutation;
     var upserts = std.ArrayListUnmanaged(Resource).empty;
     defer upserts.deinit(alloc);
     var removes = std.ArrayListUnmanaged(Resource).empty;
@@ -976,7 +992,11 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
             if (request.action == .set_tablespace) {
                 if (existing.kind == .tablespace or request.new_name != null) return error.InvalidCatalogMutation;
                 var updated = existing;
-                updated.tablespace_id = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
+                updated.tablespace_id = if (request.tablespace) |name| blk: {
+                    const destination = try reader.lookup(.tablespace, 0, name);
+                    if (request.expected_tablespace_id) |id| if ((if (destination) |space| space.id else 0) != id) return error.CatalogGenerationChanged;
+                    break :blk (destination orelse return error.TablespaceNotFound).id;
+                } else 0;
                 try upserts.append(alloc, updated);
             } else {
                 if ((existing.kind == .database and existing.id == default_database_id) or (existing.kind == .namespace and existing.id == default_namespace_id)) return error.ProtectedCatalogResource;
@@ -1175,11 +1195,27 @@ pub const RelationMutationGuard = struct {
     owner: @import("relation_names.zig").Owner,
     incarnation: [16]u8,
 
+    /// Check the logical table binding directly; schema-owned index names
+    /// continue to require their published registry claim.
+    qualified_table: bool = false,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (!std.mem.eql(u8, name, "qualified_table") or self.qualified_table) {
+                try jw.objectField(name);
+                try jw.write(@field(self, name));
+            }
+        }
+        try jw.endObject();
+    }
+
     pub fn validate(self: @This()) !void {
         try self.target.validate();
         try (Target{ .database = self.target.database, .namespace = self.target.namespace, .table = self.logical_table }).validate();
         try self.owner.validate();
-        if (self.owner.phase != .active or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidCatalogMutation;
+        if (self.qualified_table and (self.owner.kind != .table or !std.mem.eql(u8, self.target.name, self.logical_table))) return error.InvalidCatalogMutation;
+        if (self.owner.phase != .active or (!self.qualified_table and std.mem.allEqual(u8, &self.incarnation, 0))) return error.InvalidCatalogMutation;
     }
 
     pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
@@ -1198,7 +1234,7 @@ pub const RelationMutationGuard = struct {
         errdefer alloc.free(namespace);
         const name = try alloc.dupe(u8, self.target.name);
         errdefer alloc.free(name);
-        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = try alloc.dupe(u8, self.logical_table), .owner = self.owner, .incarnation = self.incarnation };
+        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = try alloc.dupe(u8, self.logical_table), .owner = self.owner, .incarnation = self.incarnation, .qualified_table = self.qualified_table };
     }
 };
 

@@ -3136,6 +3136,10 @@ const LocalStandaloneMetadata = struct {
                 for (state.settings, definitions) |record, *definition| definition.* = record.effective(scope.principal, scope.database);
                 return std.json.Stringify.valueAlloc(alloc, settings.Snapshot{ .scope = scope, .epoch = @max(1, state.revision), .definitions = definitions }, .{});
             },
+            .policy_definition_read => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                return std.json.Stringify.valueAlloc(alloc, request.select(self.systemCatalogState()), .{});
+            },
             .policy_snapshot => |request| {
                 if (request.table_id == 0 or request.principal.len == 0 or request.database.len == 0) return error.InvalidRowPolicyRecord;
                 if (request.roles.len != 0) return error.RowPolicyAuthenticationRequired;

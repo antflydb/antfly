@@ -239,6 +239,35 @@ pub fn loadPolicyPublications(alloc: std.mem.Allocator, txn: *docstore.DocStore.
     return out;
 }
 
+/// The durable key is the policy ID. Bound Execute can point-read it. For a
+/// first binding, walk only the bounded policy prefix and decode the matching
+/// program once. All fields in the response belong to this transaction.
+pub fn readPolicyDefinition(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: domain.PolicyRead) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const meta = try readMeta(scratch, txn, group);
+    var state: domain.State = .{ .revision = meta.revision, .next_id = meta.next_id };
+    const prefix = try keyAlloc(scratch, group, "policy:");
+    const seek = if (request.id) |id| try policyKeyAlloc(scratch, group, id) else prefix;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(seek);
+    while (entry) |kv| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, prefix) or (request.id != null and !std.mem.eql(u8, kv.key, seek))) break;
+        const Header = struct { name: []const u8, table_id: u64 };
+        var head = try std.json.parseFromSlice(Header, a, kv.value, .{ .ignore_unknown_fields = true });
+        defer head.deinit();
+        if (head.value.table_id != request.table_id or !std.ascii.eqlIgnoreCase(head.value.name, request.name)) continue;
+        const record = try std.json.parseFromSliceLeaky(policies.Record, scratch, kv.value, .{});
+        try record.validateShape();
+        if (!std.mem.eql(u8, kv.key, try policyKeyAlloc(scratch, group, record.id))) return error.InvalidRowPolicyRecord;
+        state.policies = &.{record};
+        return std.json.Stringify.valueAlloc(a, state, .{});
+    }
+    return std.json.Stringify.valueAlloc(a, state, .{});
+}
+
 pub fn loadPolicies(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]const policies.Record {
     const prefix = try keyAlloc(alloc, group_id, "policy:");
     defer alloc.free(prefix);

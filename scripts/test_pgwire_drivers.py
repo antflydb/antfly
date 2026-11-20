@@ -185,6 +185,73 @@ def exercise_bound_portals(server, password):
         execute(b"C40001")
         assert migrator.execute("SELECT n FROM portal_target").fetchone() == (0,)
 
+        parse("policy", "DROP POLICY IF EXISTS portal_policy ON portal_target")
+        bind("policy")
+        policy = "CREATE POLICY portal_policy ON portal_target USING (n >= 0)"
+        migrator.execute(policy)
+        execute(b"C40001")
+        bind("policy")
+        migrator.execute("DROP POLICY portal_policy ON portal_target")
+        migrator.execute(policy)
+        execute(b"C40001")
+        migrator.execute("DROP POLICY portal_policy ON portal_target")
+
+        migrator.execute("ALTER TABLE portal_target ADD COLUMN scratch TEXT")
+        parse("column", "ALTER TABLE portal_target DROP COLUMN scratch")
+        bind("column")
+        migrator.execute("ALTER TABLE portal_target DROP COLUMN scratch")
+        migrator.execute("ALTER TABLE portal_target ADD COLUMN scratch BIGINT")
+        execute(b"C40001")
+        assert migrator.execute("SELECT scratch FROM portal_target").fetchone() == (
+            None,
+        )
+
+        constraint = (
+            "ALTER TABLE portal_target ADD CONSTRAINT nonnegative CHECK (n >= 0)"
+        )
+        drop_constraint = "ALTER TABLE portal_target DROP CONSTRAINT nonnegative"
+        migrator.execute(constraint)
+        parse("constraint", drop_constraint)
+        bind("constraint")
+        migrator.execute(drop_constraint)
+        migrator.execute(constraint)
+        execute(b"C40001")
+        migrator.execute(drop_constraint)
+
+        migrator.execute("CREATE TABLE fk_destination (id TEXT PRIMARY KEY)")
+        parse(
+            "fk",
+            "ALTER TABLE portal_target ADD CONSTRAINT bound_fk FOREIGN KEY (id) REFERENCES fk_destination(id)",
+        )
+        bind("fk")
+        migrator.execute("DROP TABLE fk_destination")
+        migrator.execute("CREATE TABLE fk_destination (id TEXT PRIMARY KEY)")
+        execute(b"C40001")
+
+        migrator.execute("CREATE DATABASE bound_placement")
+        space = "CREATE TABLESPACE portal_space LOCATION 's3://bucket/path'"
+        migrator.execute(space)
+        parse("placement", "ALTER DATABASE bound_placement SET TABLESPACE portal_space")
+        bind("placement")
+        migrator.execute("DROP TABLESPACE portal_space")
+        migrator.execute(space)
+        execute(b"C40001")
+        # Removing it also proves that the replacement never acquired the database.
+        migrator.execute("DROP TABLESPACE portal_space")
+
+        create_index = "CREATE INDEX portal_n ON portal_target (n)"
+        migrator.execute(create_index)
+        parse("index", "DROP INDEX portal_n")
+        bind("index")
+        migrator.execute("ALTER TABLE portal_target ADD COLUMN unrelated TEXT")
+        execute()
+        migrator.execute(create_index)
+        bind("index")
+        migrator.execute("DROP INDEX portal_n")
+        migrator.execute(create_index)
+        execute(b"C40001")
+        migrator.execute("DROP INDEX portal_n")
+
         # A fresh Bind acquires the new identity and unrelated DDL is compatible.
         bind("drop")
         migrator.execute("CREATE TABLE graph_other (id TEXT, n BIGINT)")
@@ -249,6 +316,18 @@ def exercise_cached_search_path(server, password):
             sql.execute("EXECUTE path_plan")
             assert sql.fetchone() == ("a", value)
             assert conn.execute(query, prepare=True).fetchone() == ("a", value)
+
+        sql.execute("CREATE TABLE path_second.only_here (n BIGINT)")
+        sql.execute("SET search_path TO path_first, path_second")
+        conn.execute("ALTER TABLE only_here ADD COLUMN k TEXT", prepare=True)
+        sql.execute("SELECT k FROM path_second.only_here")
+        conn.execute("DROP TABLE IF EXISTS only_here", prepare=True)
+        try:
+            sql.execute("SELECT k FROM path_second.only_here")
+        except psycopg.errors.UndefinedTable:
+            pass
+        else:
+            raise AssertionError("DROP TABLE skipped the second search_path entry")
 
         sql.execute("SET search_path TO path_renamed")
         for execute in (

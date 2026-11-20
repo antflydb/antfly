@@ -2209,6 +2209,7 @@ pub const StatusSource = struct {
 
     pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         switch (input) {
+            .policy_definition_read => if (!context.setting_admin) return error.Forbidden,
             .native_memory_create => |request| {
                 if (context.native_service != .memory or !context.setting_admin or request.mutation.kind != .table or request.mutation.action != .create) return error.Forbidden;
             },
@@ -6392,6 +6393,10 @@ pub const ApiHttpServer = struct {
     /// checks, read-index owner identities, and exact AIC binding happen in
     /// the builder; metadata rechecks the entire cut at Raft apply.
     pub fn beginFkGenerationPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, before: metadata_table_manager.TableRecord, proposed_schema_json: []const u8) !FkGenerationBegin {
+        return self.beginBoundFkGenerationPublication(alloc, context, identity, before, proposed_schema_json, null);
+    }
+
+    pub fn beginBoundFkGenerationPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, before: metadata_table_manager.TableRecord, proposed_schema_json: []const u8, expected_parent: ?struct { constraint: []const u8, id: u64 }) !FkGenerationBegin {
         if (self.cfg.deployment_mode == .standalone and
             (self.hotStandbyMutationPolicy().failover_safe_mutations_only or self.cfg.fk_generation_source == null or self.cfg.fk_generation_parent == null))
             return error.UnsupportedOperation;
@@ -6399,6 +6404,15 @@ pub const ApiHttpServer = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const plan = try @import("fk_generation_plan_builder.zig").build(self, a, context, identity, before, proposed_schema_json);
+        if (expected_parent) |expected| {
+            for (plan.parents) |parent| {
+                if (parent.table.table_id != expected.id) continue;
+                for (parent.transitions) |transition| {
+                    if (std.mem.eql(u8, transition.constraint_name, expected.constraint)) break;
+                } else continue;
+                break;
+            } else return error.CatalogGenerationChanged;
+        }
         const result: FkGenerationBegin = .{
             .plan_id = plan.id,
             .child_table_id = plan.child_before.table_id,

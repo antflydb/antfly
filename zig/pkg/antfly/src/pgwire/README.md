@@ -126,7 +126,12 @@ proxy's login into an unbounded, cached grant or retry a canceled mutation.
   checks its bound targets again during mutation admission. A bound
   `DROP TABLE IF EXISTS` cannot remove a table created after Bind observed
   its absence. Clustered catalog mutations carrying a bound resource ID
-  require metadata topology protocol 95.
+  require metadata topology protocol 95. Policy DDL pins the policy ID
+  and generation, and foreign-key and tablespace changes pin their named
+  destination. Column and constraint edits pin the owning schema version.
+  A prepared DROP INDEX follows the index across unrelated column changes
+  and rejects a dropped and recreated index. The metadata owner assigns
+  index birth versions when it commits a schema, including for HTTP edits.
 - Warm Describe reuses the validated shape while its catalog and authorization
   generations match. Descriptions that consulted no catalog objects, such as
   `SELECT 1`, need only the credential check. Rebinding checks parameter

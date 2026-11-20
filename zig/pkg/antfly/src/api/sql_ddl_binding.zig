@@ -32,34 +32,40 @@ pub const Guard = struct {
         return std.mem.startsWith(u8, bytes, prefix);
     }
 
-    pub fn id(self: Guard, count: usize, position: usize) !u64 {
-        const payload = self.bytes[prefix.len..];
-        if (count > 128 or position >= count or payload.len != count * 8) return error.CatalogGenerationChanged;
-        return std.mem.readInt(u64, payload[position * 8 ..][0..8], .little);
+    pub const Table = struct { namespace: []const u8, id: u64 };
+    pub const Policy = struct { id: u64, generation: u64 };
+    pub const Objects = struct {
+        tables: []const Table = &.{},
+        resource_id: ?u64 = null,
+        schema_version: ?u32 = null,
+        policy: ?Policy = null,
+        parent_id: ?u64 = null,
+        tablespace_id: ?u64 = null,
+
+        pub fn table(self: Objects, count: usize, position: usize) !Table {
+            if (self.tables.len != count or position >= count) return error.CatalogGenerationChanged;
+            return self.tables[position];
+        }
+    };
+
+    pub fn objects(self: Guard, a: std.mem.Allocator) !Objects {
+        return std.json.parseFromSliceLeaky(Objects, a, self.bytes[prefix.len..], .{});
     }
 
-    pub fn single(alloc: std.mem.Allocator, value: u64) !Guard {
-        var bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &bytes, value, .little);
-        return .{ .bytes = try std.mem.concat(alloc, u8, &.{ prefix, &bytes }) };
+    pub fn encode(a: std.mem.Allocator, value: Objects) !Guard {
+        var out: std.Io.Writer.Allocating = .init(a);
+        errdefer out.deinit();
+        try out.writer.writeAll(prefix);
+        try std.json.Stringify.value(value, .{ .emit_null_optional_fields = false }, &out.writer);
+        return .{ .bytes = try out.toOwnedSlice() };
     }
 
-    pub fn tables(alloc: std.mem.Allocator, resolved: []const ?domain.ResolvedTable) !Guard {
-        if (resolved.len == 0 or resolved.len > 128) return error.InvalidSqlBackendResponse;
-        const bytes = try alloc.alloc(u8, prefix.len + resolved.len * 8);
-        @memcpy(bytes[0..prefix.len], prefix);
-        for (resolved, 0..) |table, i| std.mem.writeInt(u64, bytes[prefix.len + i * 8 ..][0..8], if (table) |t| t.table_id else 0, .little);
-        return .{ .bytes = bytes };
-    }
-
-    pub fn index(alloc: std.mem.Allocator, value: ?domain.RelationMutationGuard, creating: bool) !Guard {
-        // DROP INDEX also pins its schema generation: an index can be dropped
-        // and recreated on the same table under the same spelling.
+    pub fn index(alloc: std.mem.Allocator, value: ?domain.RelationMutationGuard, index_birth: ?u32) !Guard {
         var buffer: [256]u8 = undefined;
         var hash: std.Io.Writer.Hashing(std.crypto.hash.Blake3) = .init(&buffer);
         if (value) |relation| {
             std.json.Stringify.value(.{ relation.target, relation.incarnation, relation.owner.table_id }, .{}, &hash.writer) catch unreachable;
-            if (!creating) std.json.Stringify.value(relation.owner, .{}, &hash.writer) catch unreachable;
+            std.json.Stringify.value(.{ relation.owner.kind, index_birth }, .{}, &hash.writer) catch unreachable;
         }
         hash.writer.flush() catch unreachable;
         var digest: [32]u8 = undefined;

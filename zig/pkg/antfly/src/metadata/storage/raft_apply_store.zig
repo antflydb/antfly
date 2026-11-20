@@ -12535,6 +12535,12 @@ pub const RaftApplyStore = struct {
         return .{ .present = id != null and id.? == request.graph_id };
     }
 
+    pub fn policyDefinitionRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: system_catalog.PolicyRead) ![]u8 {
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        return system_catalog_storage.readPolicyDefinition(alloc, &txn, group, request);
+    }
+
     pub fn systemCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Read) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
@@ -23846,21 +23852,37 @@ pub const RaftApplyStore = struct {
     ) !void {
         try guard.validate();
         if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
-        const activation = try self.standbyRelationActivationTxn(txn, group_id);
-        if (activation.version < topology_protocol.relation_mutation_version) return error.TableTopologyProtocolUpgradeRequired;
-        const epoch = try relationSourceEpochTxn(txn, group_id);
-        if (!std.mem.eql(u8, &guard.incarnation, &epoch.incarnation)) return error.CatalogGenerationChanged;
-        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogPublicationProofPending;
-        if (!live.root.epoch.eql(epoch)) return error.CatalogGenerationChanged;
-        const namespace_id = (try resolveSystemCatalogNamespaceTxn(self.alloc, txn, group_id, guard.target.database, guard.target.namespace)) orelse return error.CatalogGenerationChanged;
-        const owner = (try live.getClaim(.{ .namespace_id = namespace_id, .name = guard.target.name })) orelse return error.CatalogGenerationChanged;
-        if (!owner.eql(guard.owner)) return error.CatalogGenerationChanged;
-        var binding = try system_catalog_storage.getById(self.alloc, txn, group_id, .table, owner.table_id);
-        defer if (binding) |*value| value.deinit();
-        if (binding) |value| {
-            if (value.value.parent_id != namespace_id or !std.mem.eql(u8, value.value.name, guard.logical_table) or
-                !std.mem.eql(u8, value.value.storage_name, expected.name)) return error.CatalogGenerationChanged;
-        } else if (namespace_id != system_catalog.default_namespace_id or !std.mem.eql(u8, expected.name, guard.logical_table)) return error.CatalogGenerationChanged;
+        if (guard.qualified_table) {
+            if (!std.mem.allEqual(u8, &guard.incarnation, 0)) {
+                const epoch = try relationSourceEpochTxn(txn, group_id);
+                if (!std.mem.eql(u8, &guard.incarnation, &epoch.incarnation)) return error.CatalogGenerationChanged;
+            }
+            const bound = (try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, self.alloc, txn, group_id, .{
+                .database = guard.target.database,
+                .namespace = guard.target.namespace,
+                .table = guard.target.name,
+            })) orelse return error.CatalogGenerationChanged;
+            defer bound.deinit(self.alloc);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(expected.schema_json, &digest, .{});
+            if (bound.table_id != expected.table_id or !std.mem.eql(u8, bound.name, expected.name) or !std.mem.eql(u8, &digest, &guard.owner.schema_digest)) return error.CatalogGenerationChanged;
+        } else {
+            const activation = try self.standbyRelationActivationTxn(txn, group_id);
+            if (activation.version < topology_protocol.relation_mutation_version) return error.TableTopologyProtocolUpgradeRequired;
+            const epoch = try relationSourceEpochTxn(txn, group_id);
+            if (!std.mem.eql(u8, &guard.incarnation, &epoch.incarnation)) return error.CatalogGenerationChanged;
+            var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogPublicationProofPending;
+            if (!live.root.epoch.eql(epoch)) return error.CatalogGenerationChanged;
+            const namespace_id = (try resolveSystemCatalogNamespaceTxn(self.alloc, txn, group_id, guard.target.database, guard.target.namespace)) orelse return error.CatalogGenerationChanged;
+            const owner = (try live.getClaim(.{ .namespace_id = namespace_id, .name = guard.target.name })) orelse return error.CatalogGenerationChanged;
+            if (!owner.eql(guard.owner)) return error.CatalogGenerationChanged;
+            var binding = try system_catalog_storage.getById(self.alloc, txn, group_id, .table, owner.table_id);
+            defer if (binding) |*value| value.deinit();
+            if (binding) |value| {
+                if (value.value.parent_id != namespace_id or !std.mem.eql(u8, value.value.name, guard.logical_table) or
+                    !std.mem.eql(u8, value.value.storage_name, expected.name)) return error.CatalogGenerationChanged;
+            } else if (namespace_id != system_catalog.default_namespace_id or !std.mem.eql(u8, expected.name, guard.logical_table)) return error.CatalogGenerationChanged;
+        }
         // Extension ownership is independently mutable. Recheck its exact
         // table-local index in this write transaction, not a preflight snapshot.
         var prefix_buf: [catalog_name_key_buffer_bytes]u8 = undefined;

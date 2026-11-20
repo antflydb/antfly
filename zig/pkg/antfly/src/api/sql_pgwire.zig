@@ -159,7 +159,11 @@ pub const Adapter = struct {
         const stamp = description.stamp orelse return false;
         if (stamp.authority != try credential.descriptionRevision()) return false;
         const previous = stamp.catalog orelse return true;
-        const current = try catalogStamp(self.server, alloc, credential, request) orelse return false;
+        var admission = self.server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
+        defer admission.release();
+        var job: Job = .{ .adapter = self, .alloc = alloc, .credential = credential, .request = request, .kind = .probe };
+        try self.dispatch(&job);
+        const current = job.catalog_stamp orelse return false;
         return std.meta.eql(previous, current);
     }
 
@@ -499,6 +503,7 @@ const OwnedRead = struct {
         errdefer if (self.decision_runtime) |*active| active.deinit();
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
+        try self.guarded.indexLargeGuard(arena);
         const parameters = if (request.parameter_cells != null) request.parameters else try normalizeParameters(arena, request.parameters, request.parameter_types);
         self.native_adapter.graph_parameters = parameters;
         self.native_adapter.graph_parameter_cells = request.parameter_cells;
@@ -917,7 +922,8 @@ const Job = struct {
     alloc: std.mem.Allocator,
     credential: *Credential,
     request: wire.Request,
-    kind: enum { describe, execute },
+    kind: enum { describe, execute, probe },
+    catalog_stamp: ?wire.CatalogStamp = null,
     description: ?wire.Description = null,
     result: ?wire.Result = null,
     failure: ?anyerror = null,
@@ -944,6 +950,10 @@ const Job = struct {
 
     fn runInner(self: *Job) !void {
         try validateRequest(self.request);
+        if (self.kind == .probe) {
+            self.catalog_stamp = try catalogStamp(self.adapter.server, self.alloc, self.credential, self.request);
+            return;
+        }
         var preparation = self.adapter.server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
         var lease = self.adapter.server.sqlPlanCache().acquire(self.adapter.server.sqlPlanCacheIo(), .{
@@ -996,6 +1006,9 @@ const Job = struct {
             .revision = &native_adapter.revision,
             .expected_guard = self.request.binding_guard,
         };
+        const scratch = self.request.scratch_allocator orelse self.alloc;
+        try guarded.indexLargeGuard(scratch);
+        defer guarded.indexed_entries.deinit(scratch);
         if (self.kind == .describe) {
             switch (compiled.statement) {
                 .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => {
@@ -1330,6 +1343,27 @@ const GuardedCatalog = struct {
     revision: *const ?u64,
     expected_guard: ?[]const u8,
     probe: ?*DescriptionProbe = null,
+    indexed_entries: BindingEntries = .empty,
+
+    fn indexLargeGuard(self: *GuardedCatalog, a: std.mem.Allocator) !void {
+        const bytes = self.expected_guard orelse return;
+        if (@import("sql_ddl_binding.zig").Guard.isDdl(bytes)) return;
+        var targets = try GuardTargets.init(bytes);
+        if (targets.count <= 8) return;
+        errdefer self.indexed_entries.deinit(a);
+        try self.indexed_entries.ensureTotalCapacity(a, targets.count);
+        while (try targets.next()) |target| {
+            self.indexed_entries.putAssumeCapacity(.{ .name = target.name, .id = target.id, .version = target.version, .graph_revision = target.graph_revision }, {});
+        }
+    }
+
+    fn verify(self: *GuardedCatalog, table: catalog.Table) !void {
+        const bytes = self.expected_guard orelse return;
+        const revision = self.revision.* orelse return error.InvalidSqlBackendResponse;
+        if (self.indexed_entries.count() == 0) return verifyBindingGuard(bytes, revision, table);
+        if (std.mem.readInt(u64, bytes[0..8], .little) != revision or !self.indexed_entries.contains(BindingEntry.of(table))) return error.CatalogGenerationChanged;
+    }
+
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
@@ -1342,9 +1376,9 @@ const GuardedCatalog = struct {
         if (self.probe) |probe| try probe.sample(alloc);
         const resolve_graph = self.native.vtable.resolve_graph orelse return error.UnsupportedSqlExecution;
         const table = try resolve_graph(self.native.ptr, alloc, definition);
-        if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
-        if (self.expected_guard) |guard| for (table.graph.?.dependencies) |dependency| {
-            try verifyBindingGuard(guard, self.revision.*.?, dependency);
+        try self.verify(table);
+        if (self.expected_guard != null) for (table.graph.?.dependencies) |dependency| {
+            try self.verify(dependency);
         };
         try self.checkTableRead(table);
         return table;
@@ -1404,7 +1438,7 @@ const GuardedCatalog = struct {
         try self.authority.credential.validate();
         if (self.probe) |probe| try probe.sample(alloc);
         const table = try resolveOnPath(self.native, alloc, name, action, if (self.authority.request.search_path) |*path| path else null);
-        if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
+        try self.verify(table);
         return table;
     }
     fn scan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
@@ -1664,9 +1698,8 @@ fn catalogStamp(server: *http.ApiHttpServer, alloc: std.mem.Allocator, credentia
         // Preserve executor shutdown, translate client cancellation and timeout
         // to the recoverable pgwire statement error, and allow older peers.
         return switch (requestError(request, err)) {
-            error.QueryCanceled => error.QueryCanceled,
-            error.Canceled => error.Canceled,
-            else => null,
+            error.UnsupportedOperation, error.UnknownField => null,
+            else => |failure| failure,
         };
     };
     defer alloc.free(bytes);
@@ -1679,25 +1712,45 @@ fn catalogStamp(server: *http.ApiHttpServer, alloc: std.mem.Allocator, credentia
 }
 
 fn statementBindingGuard(alloc: std.mem.Allocator, revision: ?u64, binding: describe_sql.BoundStatement) !?[]const u8 {
-    var scans: [64]catalog.StatementScan = undefined;
-    var count: usize = 0;
-    try collectBindingTables(binding, &scans, &count, 0);
-    if (count == 0) return null;
-    return try bindingGuards(alloc, revision orelse return error.InvalidSqlBackendResponse, scans[0..count]);
+    var entries: BindingEntries = .{};
+    defer entries.deinit(alloc);
+    try collectBindingTables(alloc, binding, &entries, 0);
+    if (entries.count() == 0) return null;
+    return try encodeBindingGuard(alloc, revision orelse return error.InvalidSqlBackendResponse, entries.keys());
 }
 
-fn collectBindingTable(table: catalog.Table, scans: *[64]catalog.StatementScan, count: *usize) !void {
-    // Lowered joins, CTEs and set operations bind their output through a
-    // virtual table. Only their underlying physical scans have catalog IDs.
-    if (table.id == 0) return;
-    for (scans[0..count.*]) |scan| {
-        if (graphRevision(scan.table) == graphRevision(table) and scan.table.id == table.id and scan.table.schema_version == table.schema_version and std.mem.eql(u8, scan.table.physical_name, table.physical_name)) return;
+// A statement may bind 64 relations, each graph with up to 64 distinct label
+// tables. Keep only compact identity fields and deduplicate in insertion order.
+const max_binding_entries = 64 * (1 + 64);
+const BindingEntry = struct {
+    id: u64,
+    name: []const u8,
+    version: u32,
+    graph_revision: u64,
+    fn of(table: catalog.Table) BindingEntry {
+        return .{ .id = table.id, .name = table.physical_name, .version = table.schema_version, .graph_revision = graphRevision(table) };
     }
-    if (count.* == scans.len) return error.SqlProgramLimitExceeded;
-    scans[count.*] = .{ .table = table, .request = .{ .fields = &.{}, .limit = 1 } };
-    count.* += 1;
+};
+const BindingEntryContext = struct {
+    pub fn hash(_: @This(), key: BindingEntry) u32 {
+        var h = std.hash.Wyhash.init(key.id);
+        h.update(key.name);
+        std.hash.autoHash(&h, key.version);
+        std.hash.autoHash(&h, key.graph_revision);
+        return @truncate(h.final());
+    }
+    pub fn eql(_: @This(), x: BindingEntry, y: BindingEntry, _: usize) bool {
+        return x.id == y.id and x.version == y.version and x.graph_revision == y.graph_revision and std.mem.eql(u8, x.name, y.name);
+    }
+};
+const BindingEntries = std.ArrayHashMapUnmanaged(BindingEntry, void, BindingEntryContext, true);
+
+fn collectBindingTable(alloc: std.mem.Allocator, table: catalog.Table, entries: *BindingEntries) !void {
+    if (table.id == 0) return;
+    if ((try entries.getOrPut(alloc, BindingEntry.of(table))).found_existing) return;
+    if (entries.count() > max_binding_entries) return error.SqlProgramLimitExceeded;
     if (table.graph) |binding| for (binding.dependencies) |dependency| {
-        try collectBindingTable(dependency, scans, count);
+        try collectBindingTable(alloc, dependency, entries);
     };
 }
 
@@ -1705,42 +1758,42 @@ fn graphRevision(table: catalog.Table) u64 {
     return if (table.graph) |binding| binding.graph.revision else 0;
 }
 
-fn collectBindingTables(binding: describe_sql.BoundStatement, scans: *[64]catalog.StatementScan, count: *usize, depth: usize) anyerror!void {
+fn collectBindingTables(alloc: std.mem.Allocator, binding: describe_sql.BoundStatement, entries: *BindingEntries, depth: usize) anyerror!void {
     if (depth >= 64) return error.SqlProgramLimitExceeded;
-    if (binding.table) |table| try collectBindingTable(table, scans, count);
+    if (binding.table) |table| try collectBindingTable(alloc, table, entries);
     if (binding.relation) |relation| for (relation.scans) |scan| {
-        try collectBindingTable(scan.table, scans, count);
+        try collectBindingTable(alloc, scan.table, entries);
     };
-    if (binding.insert_source) |source| try collectBindingTables(source.*, scans, count, depth + 1);
-    if (binding.joined_mutation) |joined| try collectBindingTables(joined.input.*, scans, count, depth + 1);
+    if (binding.insert_source) |source| try collectBindingTables(alloc, source.*, entries, depth + 1);
+    if (binding.joined_mutation) |joined| try collectBindingTables(alloc, joined.input.*, entries, depth + 1);
     if (binding.merge_mutation) |merge| {
-        try collectBindingTable(merge.target, scans, count);
-        try collectBindingTables(merge.input.*, scans, count, depth + 1);
+        try collectBindingTable(alloc, merge.target, entries);
+        try collectBindingTables(alloc, merge.input.*, entries, depth + 1);
     }
-    if (binding.window) |window| try collectBindingTables(window.input.*, scans, count, depth + 1);
-    if (binding.returning) |returning| try collectBindingTables(returning.*, scans, count, depth + 1);
+    if (binding.window) |window| try collectBindingTables(alloc, window.input.*, entries, depth + 1);
+    if (binding.returning) |returning| try collectBindingTables(alloc, returning.*, entries, depth + 1);
 }
 
 fn bindingGuard(alloc: std.mem.Allocator, revision: u64, table: catalog.Table) ![]const u8 {
-    return bindingGuards(alloc, revision, &.{.{ .table = table, .request = .{ .fields = &.{}, .limit = 1 } }});
+    return encodeBindingGuard(alloc, revision, &.{BindingEntry.of(table)});
 }
 
-fn bindingGuards(alloc: std.mem.Allocator, revision: u64, scans: []const catalog.StatementScan) ![]const u8 {
-    if (scans.len == 0 or scans.len > 64) return error.SqlProgramLimitExceeded;
+fn encodeBindingGuard(alloc: std.mem.Allocator, revision: u64, entries: []const BindingEntry) ![]const u8 {
+    if (entries.len == 0 or entries.len > max_binding_entries) return error.SqlProgramLimitExceeded;
     var length: usize = 10;
-    for (scans) |scan| length = try std.math.add(usize, length, 24 + scan.table.physical_name.len);
+    for (entries) |item| length = try std.math.add(usize, length, 24 + item.name.len);
     const bytes = try alloc.alloc(u8, length);
     std.mem.writeInt(u64, bytes[0..8], revision, .little);
-    std.mem.writeInt(u16, bytes[8..10], @intCast(scans.len), .little);
+    std.mem.writeInt(u16, bytes[8..10], @intCast(entries.len), .little);
     var offset: usize = 10;
-    for (scans) |scan| {
+    for (entries) |item| {
         const entry = bytes[offset..];
-        std.mem.writeInt(u32, entry[0..4], @intCast(scan.table.physical_name.len), .little);
-        std.mem.writeInt(u64, entry[4..12], scan.table.id, .little);
-        std.mem.writeInt(u32, entry[12..16], scan.table.schema_version, .little);
-        std.mem.writeInt(u64, entry[16..24], graphRevision(scan.table), .little);
-        @memcpy(entry[24..][0..scan.table.physical_name.len], scan.table.physical_name);
-        offset += 24 + scan.table.physical_name.len;
+        std.mem.writeInt(u32, entry[0..4], @intCast(item.name.len), .little);
+        std.mem.writeInt(u64, entry[4..12], item.id, .little);
+        std.mem.writeInt(u32, entry[12..16], item.version, .little);
+        std.mem.writeInt(u64, entry[16..24], item.graph_revision, .little);
+        @memcpy(entry[24..][0..item.name.len], item.name);
+        offset += 24 + item.name.len;
     }
     return bytes;
 }
@@ -1753,7 +1806,7 @@ const GuardTargets = struct {
     fn init(guard: []const u8) !GuardTargets {
         if (guard.len < 10) return error.CatalogGenerationChanged;
         const count = std.mem.readInt(u16, guard[8..10], .little);
-        if (count == 0 or count > 64) return error.CatalogGenerationChanged;
+        if (count == 0 or count > max_binding_entries) return error.CatalogGenerationChanged;
         return .{ .rest = guard[10..], .count = count };
     }
     fn next(self: *GuardTargets) !?Target {
@@ -1810,10 +1863,7 @@ test "SQL pgwire prepared identity rejects same shaped table replacement before 
     try std.testing.expectError(error.CatalogGenerationChanged, verifyBindingGuard(guard, 8, table));
     try std.testing.expectError(error.CatalogGenerationChanged, verifyBindingGuard("malformed", 7, table));
     const other: catalog.Table = .{ .id = 55, .physical_name = "other_docs", .schema_version = 3, .columns = &.{} };
-    const many = try bindingGuards(std.testing.allocator, 7, &.{
-        .{ .table = table, .request = .{ .fields = &.{}, .limit = 1 } },
-        .{ .table = other, .request = .{ .fields = &.{}, .limit = 1 } },
-    });
+    const many = try encodeBindingGuard(std.testing.allocator, 7, &.{ BindingEntry.of(table), BindingEntry.of(other) });
     defer std.testing.allocator.free(many);
     const compatible = try bindingGuard(std.testing.allocator, 8, replacement);
     defer std.testing.allocator.free(compatible);
@@ -1857,6 +1907,39 @@ test "SQL pgwire binding manifest includes recursive mutation sources and dedupl
     try std.testing.expectEqualSlices(u8, inserted, updated);
 }
 
+test "SQL pgwire binds the maximum distinct label tables plus graph identity" {
+    var dependencies: [64]catalog.Table = undefined;
+    for (&dependencies, 0..) |*t, i| t.* = .{ .id = i + 1, .physical_name = "label", .schema_version = 3, .columns = &.{} };
+    var graph: catalog.graph_relation.Binding = undefined;
+    graph.graph.revision = 4;
+    graph.dependencies = &dependencies;
+    const table: catalog.Table = .{ .id = 1, .physical_name = "graph", .schema_version = 1, .columns = &.{}, .graph = &graph };
+    const binding: describe_sql.BoundStatement = .{ .table = table, .action = .read, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty };
+    const guard = (try statementBindingGuard(std.testing.allocator, 9, binding)).?;
+    defer std.testing.allocator.free(guard);
+    try std.testing.expectEqual(@as(u16, 65), (try GuardTargets.init(guard)).count);
+    try verifyBindingGuard(guard, 9, table);
+    for (dependencies) |dependency| try verifyBindingGuard(guard, 9, dependency);
+}
+
+test "SQL pgwire warm catalog probes share preparation admission and constants bypass it" {
+    var manager: usermgr.UserManager = undefined;
+    manager.authorization_revision = .init(7);
+    var server = http.ApiHttpServer.init(std.testing.allocator, .{ .sql_max_concurrent_preparations = 1 }, .{ .ptr = &manager, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    server.cfg.user_manager = &manager;
+    var credential: Credential = .{ .manager = &manager, .username = @constCast("alice"), .principal = @constCast("basic:alice"), .verifier_mac = undefined };
+    const identity: wire.Identity = .{ .context = &credential, .release = Credential.release };
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const req: wire.Request = .{ .statement = "SELECT 1", .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } }, .cancel_requested = &cancel };
+    var adapter: Adapter = .{ .server = &server };
+    var held = server.sql_preparation_admission.tryAcquireLease().?;
+    defer held.release();
+    try std.testing.expect(try Adapter.descriptionCurrent(&adapter, std.testing.allocator, identity, req, .{ .stamp = .{ .authority = 7 } }));
+    const catalog_stamp: wire.CatalogStamp = .{ .catalog_revision = 1, .relation_epoch = .{ .incarnation = @splat(1), .revision = 1 } };
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, Adapter.descriptionCurrent(&adapter, std.testing.allocator, identity, req, .{ .stamp = .{ .authority = 7, .catalog = catalog_stamp } }));
+}
+
 test "SQL pgwire warm catalog probe returns recoverable cancellation and preserves shutdown" {
     const Probe = struct {
         cancel: std.atomic.Value(bool) = .init(false),
@@ -1880,6 +1963,10 @@ test "SQL pgwire warm catalog probe returns recoverable cancellation and preserv
     try std.testing.expectError(error.Canceled, catalogStamp(&server, std.testing.allocator, &credential, request));
     probe.failure = error.DeadlineExceeded;
     try std.testing.expectError(error.QueryCanceled, catalogStamp(&server, std.testing.allocator, &credential, request));
+    probe.failure = error.ResourceTemporarilyUnavailable;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, catalogStamp(&server, std.testing.allocator, &credential, request));
+    probe.failure = error.UnsupportedOperation;
+    try std.testing.expect(try catalogStamp(&server, std.testing.allocator, &credential, request) == null);
 }
 
 test "SQL pgwire credential snapshot observes policy revocation and password rotation" {

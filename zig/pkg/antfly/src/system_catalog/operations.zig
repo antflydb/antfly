@@ -97,7 +97,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         });
     }
     const required_version = @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (request.mutation.kind == .graph) protocol.graph_definition_version else if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (request.mutation.expected_resource_id != null) protocol.bound_ddl_version else required_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (request.mutation.expected_resource_id != null or request.mutation.expected_tablespace_id != null) @max(protocol.bound_ddl_version, required_version) else required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
@@ -526,6 +526,12 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk alloc.dupe(u8, "{}");
         },
         .setting_snapshot => |scope| settingSnapshotJson(svc, alloc, context, scope),
+        .policy_definition_read => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.policyDefinitionRead(alloc, svc.metadata_group_id, request);
+        },
         .policy_snapshot => |request| policySnapshotJson(svc, alloc, context, request),
         .policy_install_snapshot => |request| policyInstallSnapshotJson(svc, alloc, context, request),
         .policy_publication_status => |table_id| policyPublicationStatusJson(svc, alloc, context, table_id),
