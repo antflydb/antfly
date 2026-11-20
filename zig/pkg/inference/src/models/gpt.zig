@@ -372,6 +372,12 @@ pub const Config = struct {
         return self.ple_hidden_size > 0;
     }
 
+    /// PLE projects x/sqrt(hidden_size) before RMSNorm. When the multiply is
+    /// folded away, epsilon must be divided by that scale squared as well.
+    pub fn pleProjectionNormEps(self: Config) f32 {
+        return self.norm_eps * @as(f32, @floatFromInt(self.hidden_size));
+    }
+
     pub fn usesGemma4Channels(self: Config) bool {
         return self.gemma4_channel_protocol or (self.family == .gemma and self.hasPle());
     }

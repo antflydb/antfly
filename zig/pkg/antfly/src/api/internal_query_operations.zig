@@ -248,7 +248,7 @@ fn computePreparedQueryVector(compute: *QueryComputeContext, alloc: std.mem.Allo
             error.QueryEmbeddingNotCacheable => return storage.cache.computeUncached(alloc, cache_deadline, compute, QueryComputeContext.run),
             else => return err,
         };
-        return storage.cache.getOrComputeWithRetryHint(storage.budget, alloc, key, cache_deadline, options.cancellation orelse .none, compute, QueryComputeContext.run, options.retry_not_before_ns);
+        return storage.cache.getOrComputeWithRetryHint(storage.budget, alloc, key, cache_deadline, options.cancellation orelse .none, compute, QueryComputeContext.run, options.retry_not_before_ns, if (compute.prepared.cacheHasFixedExpiration()) .fixed else .sliding);
     }
     return storage.cache.computeUncached(alloc, cache_deadline, compute, QueryComputeContext.run);
 }
@@ -293,7 +293,7 @@ pub fn planSemanticQuery(
     defer runtime.deinit();
 
     return .{
-        .model_revision_fence = .{ .expected = runtime.queryModelRevision(index_name) },
+        .model_revision_fence = runtime.queryModelRevision(index_name),
         .vector = try computeManagedQueryVector(&runtime, alloc, index_name, semantic_search, embedding_template, .{
             .storage = if (planning.query_embedding_cache) |cache|
                 if (planning.query_embedding_budget) |budget| .{ .cache = cache, .budget = budget } else null

@@ -40,6 +40,7 @@ pub fn create(context: *const bridge.CreateContext) callconv(.c) c_int {
             error.InvalidArguments => return bridge.Status.invalid_arguments,
             error.UnsupportedEmbeddedLiteIndex => return bridge.Status.unsupported_index,
             error.UnsupportedEmbeddedLiteSchema => return bridge.Status.unsupported_schema,
+            error.UnsupportedBackupMigrationState => return bridge.Status.unsupported_migration,
             else => return bridge.Status.failed,
         },
     };

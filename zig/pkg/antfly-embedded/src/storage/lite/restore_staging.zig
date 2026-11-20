@@ -179,6 +179,7 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                 var manifest = try backups_api.readManifest(allocator, scratch, root.value.backup_id);
                 defer manifest.deinit(allocator);
                 if (manifest.format != .native or !std.mem.eql(u8, manifest.table_name, root.value.table_name)) return error.BackupArtifactFormatMismatch;
+                if (hasActiveMigration(&manifest)) report.restore_blocker = "unsupported_schema_migration";
                 // The table manifest is executable metadata as well as the
                 // per-shard catalogs. Inspect it independently before all shards.
                 var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
@@ -199,11 +200,14 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
         }
         if (!native) {
             report.format = "portable";
-            var companion = try readPortableCompanion(allocator, input_path, initial.size, &digest, &report.catalog_sha256);
+            var catalog_digest: ?preflight.Digest = null;
+            var companion = try readPortableCompanion(allocator, input_path, &catalog_digest);
             defer if (companion) |*manifest| manifest.deinit(allocator);
             report.catalog_source = if (companion != null) "companion" else "archive";
             if (companion) |manifest| {
-                if (manifest.read_schema_json.len != 0)
+                try verifyPortableCompanion(&manifest, initial.size, &digest);
+                report.catalog_sha256 = catalog_digest;
+                if (hasActiveMigration(&manifest))
                     report.restore_blocker = "unsupported_schema_migration";
             }
             const catalogs: InspectionCatalogs = if (companion) |manifest|
@@ -577,6 +581,24 @@ fn stagePortableFile(
     try backups_api.validateBackupId(portable_backup_id);
     const initial_stat = try source.stat(io);
     if (initial_stat.size > max_prepared_bytes) return error.BackupExpansionLimitExceeded;
+    var detached = try readPortableCompanion(allocator, path, null);
+    defer if (detached) |*manifest| manifest.deinit(allocator);
+    if (detached) |*manifest| {
+        if (manifest.shards[0].artifact_size_bytes != initial_stat.size)
+            return error.BackupArtifactIntegrityMismatch;
+        if (hasActiveMigration(manifest)) {
+            // Verify the same pinned descriptor without consuming scratch space
+            // for a backup detached restore cannot accept.
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            try backups_api.hashFileContents(io, source, initial_stat, &hasher);
+            var digest: [32]u8 = undefined;
+            hasher.final(&digest);
+            const hex = std.fmt.bytesToHex(digest, .lower);
+            try verifyPortableCompanion(manifest, initial_stat.size, &hex);
+            return error.UnsupportedBackupMigrationState;
+        }
+    }
+
     // Pin the verified file in private scratch before opening a remote location.
     // Copy + hash is bounded and rejects a replaced or changed input descriptor.
     const scratch = try temporaryPortablePath(allocator, io);
@@ -598,8 +620,10 @@ fn stagePortableFile(
     defer if (integrity_owned) allocator.free(integrity.sha256);
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{portable_backup_id});
     errdefer allocator.free(snapshot_path);
-    var detached = try detachedPortableManifest(allocator, path, table_name, portable_backup_id, snapshot_path, integrity);
-    defer if (detached) |*manifest| manifest.deinit(allocator);
+    if (detached) |*manifest| {
+        try verifyPortableCompanion(manifest, integrity.size_bytes, integrity.sha256);
+        try rebasePortableCompanion(allocator, manifest, table_name, portable_backup_id, snapshot_path);
+    }
     const inspection_options: portable_backup.FileInspectionOptions = .{
         .max_input_bytes = max_input_bytes,
         .max_logical_bytes = max_prepared_bytes,
@@ -640,12 +664,11 @@ fn stagePortableFile(
     };
 }
 
-/// Verify the companion against the exact portable bytes inspected or staged.
+/// Read a companion once. The caller must verify its declared artifact
+/// identity against the exact bytes inspected or staged.
 fn readPortableCompanion(
     allocator: Allocator,
     path: []const u8,
-    size_bytes: u64,
-    sha256: []const u8,
     companion_digest: ?*?preflight.Digest,
 ) !?backups_api.TableBackupManifest {
     const manifest_path = try std.fmt.allocPrint(allocator, "{s}.manifest.json", .{path});
@@ -661,23 +684,27 @@ fn readPortableCompanion(
     var manifest = try backups_api.parseTableBackupManifest(allocator, bytes, header.value.backup_id);
     errdefer manifest.deinit(allocator);
     if (manifest.format != .portable or manifest.shards.len != 1) return error.BackupArtifactFormatMismatch;
-    const shard = manifest.shards[0];
-    if (shard.artifact_size_bytes != size_bytes or !std.mem.eql(u8, shard.artifact_sha256, sha256))
-        return error.BackupArtifactIntegrityMismatch;
     if (companion_digest) |output| output.* = preflight.hash(bytes);
     return manifest;
 }
 
-fn detachedPortableManifest(
+fn verifyPortableCompanion(manifest: *const backups_api.TableBackupManifest, size_bytes: u64, sha256: []const u8) !void {
+    const shard = manifest.shards[0];
+    if (shard.artifact_size_bytes != size_bytes or !std.mem.eql(u8, shard.artifact_sha256, sha256))
+        return error.BackupArtifactIntegrityMismatch;
+}
+
+fn hasActiveMigration(manifest: *const backups_api.TableBackupManifest) bool {
+    return manifest.read_schema_json.len != 0;
+}
+
+fn rebasePortableCompanion(
     allocator: Allocator,
-    path: []const u8,
+    manifest: *backups_api.TableBackupManifest,
     table_name: []const u8,
     backup_id: []const u8,
     snapshot_path: []const u8,
-    integrity: backups_api.ArtifactIntegrity,
-) !?backups_api.TableBackupManifest {
-    var manifest = (try readPortableCompanion(allocator, path, integrity.size_bytes, integrity.sha256, null)) orelse return null;
-    errdefer manifest.deinit(allocator);
+) !void {
     const shard = &@constCast(manifest.shards)[0];
     const owned_table = try allocator.dupe(u8, table_name);
     errdefer allocator.free(owned_table);
@@ -690,7 +717,6 @@ fn detachedPortableManifest(
     manifest.table_name = owned_table;
     manifest.backup_id = owned_id;
     shard.snapshot_path = owned_path;
-    return manifest;
 }
 
 fn stageNativeAfbRestoreBackup(
@@ -711,6 +737,18 @@ fn stageNativeAfbRestoreBackup(
     // The caller holds the shared lock and supplies the stat from before its
     // header/manifest reads. Also reject writers that ignore advisory locks.
     if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
+    {
+        const metadata_path = try std.fmt.allocPrint(allocator, "{s}-metadata.json", .{root_manifest.backup_id});
+        defer allocator.free(metadata_path);
+        const bytes = try backup_bundle_io.readNativeObjectAlloc(allocator, io, source, initial_stat.size, root_manifest, metadata_path, backups_api.max_backup_manifest_bytes);
+        defer allocator.free(bytes);
+        var embedded = try backups_api.parseTableBackupManifest(allocator, bytes, root_manifest.backup_id);
+        defer embedded.deinit(allocator);
+        if (embedded.format != .native or !std.mem.eql(u8, embedded.table_name, root_manifest.table_name))
+            return error.BackupArtifactFormatMismatch;
+        if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
+        if (hasActiveMigration(&embedded)) return error.UnsupportedBackupMigrationState;
+    }
     const staging_root = try temporaryPreparationPath(allocator, io, "antfly-afb2-", "");
     defer allocator.free(staging_root);
     defer std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
@@ -722,6 +760,7 @@ fn stageNativeAfbRestoreBackup(
         return error.BackupArtifactFormatMismatch;
 
     if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
+    if (hasActiveMigration(&source_manifest)) return error.UnsupportedBackupMigrationState;
     var location = try backups_api.openBackupLocation(allocator, location_uri);
     defer location.deinit(allocator);
     // Server manifests name immutable artifact generations independently of
@@ -2481,7 +2520,7 @@ test "backup preflight native multishard scans later shards and table producers"
         .table_name = "docs",
         .description = "",
         .schema_json = "{}",
-        .read_schema_json = "",
+        .read_schema_json = "{}",
         .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"${secret:replication.pg}\",\"postgres_table\":\"public.documents\"}]",
         .indexes_json = "{\"default\":{\"type\":\"embeddings\",\"field\":\"media\",\"dimension\":3,\"embedder\":{\"model\":\"mock\"}},\"enrichments\":[{\"name\":\"pdf\",\"kind\":\"asset\",\"field\":\"media\",\"producer\":{\"type\":\"reader\"}}]}",
         .shards = &shards,
@@ -2507,6 +2546,37 @@ test "backup preflight native multishard scans later shards and table producers"
     try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"replication_source\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "replication.pg") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"document_id\":\"z\"") != null);
+
+    const compatibility = parsed.value.object.get("compatibility").?.object;
+    try std.testing.expectEqualStrings("blocked", compatibility.get("verdict").?.string);
+    try std.testing.expectEqualStrings("unsupported_schema_migration", compatibility.get("restore_blocker").?.string);
+    const target = try std.fs.path.join(a, &.{ root, "migration-blocked" });
+    defer a.free(target);
+    const location = try std.fmt.allocPrint(a, "file://{s}", .{target});
+    defer a.free(location);
+    if (comptime builtin.link_libc and builtin.os.tag != .windows) {
+        const Environment = struct {
+            extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+            extern fn unsetenv(name: [*:0]const u8) c_int;
+        };
+        const env = @import("antfly_platform").env;
+        const saved = if (env.getenv("TMPDIR")) |value| try a.dupeSentinel(u8, value, 0) else null;
+        defer if (saved) |value| a.free(value);
+        defer {
+            if (saved) |value| {
+                _ = Environment.setenv("TMPDIR", value, 1);
+            } else {
+                _ = Environment.unsetenv("TMPDIR");
+            }
+        }
+        // The archive is a regular file, so it cannot hold scratch output.
+        const unavailable = try a.dupeSentinel(u8, bundle_path, 0);
+        defer a.free(unavailable);
+        try std.testing.expectEqual(@as(c_int, 0), Environment.setenv("TMPDIR", unavailable, 1));
+        try std.testing.expectError(error.UnsupportedBackupMigrationState, stageInputRestoreBackup(a, bundle_path, "restored", "", location));
+    }
+    try std.testing.expectError(error.UnsupportedBackupMigrationState, stageInputRestoreBackup(a, bundle_path, "restored", "", location));
+    try std.testing.expect(!fileExists(io, target));
 }
 
 test "backup preflight AFB1 corruption cancellation and missing capabilities cannot certify" {

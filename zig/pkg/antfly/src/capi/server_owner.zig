@@ -2445,6 +2445,20 @@ pub fn metadataApplyStoreProjection(
             defer handle.store.freeRanges(alloc, value.ranges);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .catalog_table_projection => blk: {
+            const value = handle.store.captureCatalogTableProjection(
+                alloc,
+                request.group_id,
+                request.key.slice(),
+                if (request.arg0 == 0) null else request.arg0,
+            ) catch |err| break :blk if (err == error.CatalogRoutingSnapshotTimeout)
+                .timeout
+            else
+                metadataProjectionStatusFromError(err);
+            defer handle.store.freeTables(alloc, value.tables);
+            defer handle.store.freeRanges(alloc, value.ranges);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .resolver_catalog_read => blk: {
             const Read = @import("../metadata/resolver_catalog_read.zig").Request;
             var parsed = std.json.parseFromSlice(Read, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
@@ -2689,7 +2703,10 @@ pub fn metadataApplyStoreProjection(
             break :blk .ok;
         },
         .restore_job_value => blk: {
-            const value = handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice()) catch |err|
+            const value = (if (request.arg0 == 1)
+                handle.store.getRestoreJobRecord(alloc, request.group_id, request.key.slice())
+            else
+                handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice())) catch |err|
                 break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);
             break :blk metadataProjectionJson(alloc, out_json, value);

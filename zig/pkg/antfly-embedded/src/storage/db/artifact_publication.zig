@@ -1152,6 +1152,7 @@ pub fn prepareBaseVectors(alloc: std.mem.Allocator, command: Command, catalogs: 
     } else false;
     if (!authorized) return error.InvalidBatchRequest;
     const dims = if (producer.kind == .dense_vector) try manager.denseConfigDimensions(scratch, producer) else 0;
+    const required_revision = if (producer.kind == .dense_vector) try manager.denseConfigModelRevision(scratch, producer) else null;
     const Consumer = struct { name: []const u8, generation: u64, artifact_names: []const []const u8 };
     var consumers: std.ArrayList(Consumer) = .empty;
     for (configs) |config| {
@@ -1180,6 +1181,9 @@ pub fn prepareBaseVectors(alloc: std.mem.Allocator, command: Command, catalogs: 
             const header = try codec.decodeHeader(value);
             if (producer.kind == .dense_vector) {
                 if (header.kind != .dense_embedding) return error.InvalidBatchRequest;
+                if (!std.meta.eql(try codec.denseEmbeddingModelRevision(value), required_revision) or
+                    (required_revision != null and !std.meta.eql(command.execution_identity, required_revision)))
+                    return error.InvalidBatchRequest;
                 const vector = try codec.decodeDenseEmbeddingAlloc(scratch, value);
                 if (vector.len != dims) return error.InvalidBatchRequest;
                 for (consumers.items) |consumer| try dense.append(scratch, .{ .index_name = consumer.name, .doc_key = identity.doc_key, .artifact_key = artifact_key, .vector = vector });
@@ -1443,10 +1447,13 @@ test "ordered artifact inventory publication projects every shared consumer and 
         .{ .name = "second", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}", .coverage_generation = 9 },
         .{ .name = "other", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"other-model\"}", .coverage_generation = 11 },
         .{ .name = "legacy", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"legacy\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"legacy\"}}", .coverage_generation = 13 },
+        .{ .name = "pinned", .kind = .dense_vector, .config_json =
+        \\{"field":"body","dims":2,"embedding_name":"pinned","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"pinned"},"semantic_producer":"{\"provider\":\"antfly\",\"model\":\"embed\",\"model_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"}
+        , .coverage_generation = 15 },
     };
     var catalog: std.ArrayList(u8) = .empty;
     defer catalog.deinit(alloc);
-    try catalog.appendSlice(alloc, "AIDX\x02\x00\x00\x00\x04\x00\x00\x00");
+    try catalog.appendSlice(alloc, "AIDX\x02\x00\x00\x00\x05\x00\x00\x00");
     for (configs) |config| {
         var length: [4]u8 = undefined;
         std.mem.writeInt(u32, &length, @intCast(config.name.len), .little);
@@ -1497,6 +1504,30 @@ test "ordered artifact inventory publication projects every shared consumer and 
     defer legacy.deinit();
     try std.testing.expectEqual(@as(usize, 1), legacy.batch.dense_embeddings.len);
     try std.testing.expectEqualStrings("legacy", legacy.batch.dense_embeddings[0].index_name);
+
+    const pinned_key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "pinned");
+    defer alloc.free(pinned_key);
+    const codec = @import("enrichment/artifact_codec.zig");
+    const revision: Digest = @splat(0xaa);
+    const pinned_payload = try codec.encodeProducedDenseEmbeddingAtRevisionAlloc(alloc, 3, true, revision, &.{ 1, 2 });
+    defer alloc.free(pinned_payload);
+    command.producer_name = "pinned";
+    command.producer_generation = 15;
+    command.producer_artifact_name = "pinned";
+    command.execution_identity = revision;
+    command.mutations = &.{.{ .family = .base_vector, .key = pinned_key, .value = payload, .source_index = 0 }};
+    command.publication_digest = command.digest();
+    try std.testing.expectError(error.InvalidBatchRequest, prepareBaseVectors(alloc, command, catalogs));
+    command.mutations = &.{.{ .family = .base_vector, .key = pinned_key, .value = pinned_payload, .source_index = 0 }};
+    command.execution_identity = @splat(0xbb);
+    command.publication_digest = command.digest();
+    try std.testing.expectError(error.InvalidBatchRequest, prepareBaseVectors(alloc, command, catalogs));
+    command.execution_identity = revision;
+    command.publication_digest = command.digest();
+    var pinned = try prepareBaseVectors(alloc, command, catalogs);
+    defer pinned.deinit();
+    try std.testing.expectEqualStrings("pinned", pinned.batch.dense_embeddings[0].index_name);
+    try @import("online_vector_artifacts.zig").validate(pinned_key, pinned_payload);
 }
 
 test "ordered artifact inventory final materialization observes activation in its write snapshot" {

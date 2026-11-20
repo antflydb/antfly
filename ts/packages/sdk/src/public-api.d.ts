@@ -12162,6 +12162,8 @@ export interface components {
                 /** @description Opaque identifier accepted by restore for this backup. */
                 selector: string;
             }[];
+            /** @description True when the listing returned only backup metadata because table details exceeded the page size. */
+            table_details_omitted?: boolean;
             /**
              * @description Storage location of the backup
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15

@@ -211,8 +211,16 @@ pub fn definitionDigest(request: requests.GeneratedEnrichmentRequest) publicatio
     hash.update("antfly:producer-definition:v1:");
     inline for (@typeInfo(requests.GeneratedEnrichmentRequest).@"struct".field_names, @typeInfo(requests.GeneratedEnrichmentRequest).@"struct".field_types) |reflected_name, field_type| {
         if (comptime !definitionField(reflected_name)) continue;
-        hashDefinitionBytes(&hash, reflected_name);
         const value = @field(request, reflected_name);
+        // A null pin preserves the existing durable definition identity.
+        if (comptime std.mem.eql(u8, reflected_name, "model_revision")) {
+            if (value) |revision| {
+                hashDefinitionBytes(&hash, reflected_name);
+                hashDefinitionBytes(&hash, &revision);
+            }
+            continue;
+        }
+        hashDefinitionBytes(&hash, reflected_name);
         switch (@typeInfo(field_type)) {
             .pointer => hashDefinitionBytes(&hash, value),
             .array => |array| if (array.child == u8) hashDefinitionBytes(&hash, &value) else @compileError("producer array needs a canonical field encoding"),

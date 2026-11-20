@@ -6553,6 +6553,7 @@ fn samePlainDenseBatchKey(
     rhs: enrichment_types.GeneratedEnrichmentRequest,
 ) bool {
     return lhs.expected_dims == rhs.expected_dims and
+        std.meta.eql(lhs.model_revision, rhs.model_revision) and
         lhs.embedding_input == rhs.embedding_input and
         lhs.input_kind == rhs.input_kind and
         std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs)) and
@@ -30676,6 +30677,9 @@ fn embeddingOutputCarriesForward(a: Allocator, request: enrichment_types.Generat
     const privacy = @import("../../../privacy/document.zig");
     const name = requestEmbeddingName(request);
     if (privacy.isManagedArtifactName(name) or privacy.consumerPolicyVersion(name) != null or std.mem.eql(u8, request.source_field, privacy.source_field)) return false;
+    if (request.model_revision != null and
+        !std.meta.eql(enrichment_artifact_codec.denseEmbeddingModelRevision(encoded) catch return false, request.model_revision))
+        return false;
     const metadata = @import("../../artifact_payload.zig").Metadata.decode(encoded) catch return false;
     if (metadata.reference != null or metadata.header.flags.vector_elided or metadata.sourceHash() != source_hash) return false;
     switch (request.kind) {
@@ -31918,6 +31922,7 @@ fn collectPlainDenseBatchItem(
     errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
     var input = captureProducerInput(runtime, request, doc_store_key, raw) catch |err| return scope.publicationFailure(err);
     errdefer if (input) |*token| token.deinit();
+    if (request.model_revision != null and input == null) return scope.publicationFailure(error.ArtifactPublicationPending);
 
     if (input) |*token| {
         var read = runtime.store.beginProbe() catch |err| return scope.publicationFailure(err);
@@ -32075,7 +32080,7 @@ fn flushPlainDenseItems(
         writes[i] = .{
             .key = item.artifact_key,
             // Plain items embed the rendered source text alone.
-            .value = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(runtime.alloc, item.source_hash, item.text_input, vector),
+            .value = try encodeAcceptedDenseOutput(runtime.alloc, item.request.model_revision, if (item.producer_input) |token| token.execution_identity else null, item.source_hash, item.text_input, vector),
             .source_key = source_key,
             .source_digest = item.source_record_digest,
             .doc_key = item.request.doc_key,
@@ -35386,6 +35391,7 @@ fn processDenseTemplateParts(
         .source_record_digest = source_digest,
         .source_sequence = request.sequence,
         .generation_guard = EmbeddingGenerationGuard.fromRequest(request),
+        .model_revision = request.model_revision,
         .vector = vector,
         .ordered_input = input,
         .text_input = partsAreText(parts) and locally_replayable,
@@ -35446,6 +35452,7 @@ fn processDenseEmbedding(
     errdefer if (runtime.retry_scheduler) |scheduler| scheduler.rememberSource(runtime, requestFailureFingerprint(request), sourceRecordDigest(raw));
     var input = try captureProducerInput(runtime, request, doc_store_key, raw);
     defer if (input) |*token| token.deinit();
+    if (request.model_revision != null and input == null) return error.ArtifactPublicationPending;
 
     if (input) |*token| {
         var read = try runtime.store.beginProbe();
@@ -35508,6 +35515,7 @@ fn processDenseEmbedding(
         .source_record_digest = sourceRecordDigest(raw),
         .source_sequence = request.sequence,
         .generation_guard = EmbeddingGenerationGuard.fromRequest(request),
+        .model_revision = request.model_revision,
         .vector = vector,
         .ordered_input = if (input) |*token| token else null,
         // Prepared as plain text: re-embedding renders the same text.
@@ -36060,11 +36068,20 @@ const EmbeddingArtifactWrite = struct {
     source_record_digest: [32]u8,
     source_sequence: u64,
     generation_guard: EmbeddingGenerationGuard,
+    model_revision: ?[32]u8 = null,
     vector: []const f32,
     ordered_input: ?*const producer_input.Token = null,
     /// See `Flags.text_input`.
     text_input: bool = false,
 };
+
+fn encodeAcceptedDenseOutput(alloc: Allocator, pin: ?[32]u8, execution: ?[32]u8, source_hash: ?u64, text_input: bool, vector: []const f32) ![]u8 {
+    if (pin) |revision| {
+        if (!std.meta.eql(pin, execution)) return error.EnrichmentSourceChanged;
+        return enrichment_artifact_codec.encodeProducedDenseEmbeddingAtRevisionAlloc(alloc, source_hash, text_input, revision, vector);
+    }
+    return enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, source_hash, text_input, vector);
+}
 
 fn writeEmbeddingArtifact(runtime: *EnrichmentRuntime, write: EmbeddingArtifactWrite) !bool {
     _ = write.source_field;
@@ -36074,7 +36091,7 @@ fn writeEmbeddingArtifact(runtime: *EnrichmentRuntime, write: EmbeddingArtifactW
     else
         try internal_keys.embeddingArtifactKeyForDocumentAlloc(runtime.alloc, write.base_key, write.artifact_name);
     defer runtime.alloc.free(key);
-    const payload = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(runtime.alloc, write.source_hash, write.text_input, write.vector);
+    const payload = try encodeAcceptedDenseOutput(runtime.alloc, write.model_revision, if (write.ordered_input) |token| token.execution_identity else null, write.source_hash, write.text_input, write.vector);
     defer runtime.alloc.free(payload);
     if (write.ordered_input) |token| {
         try enqueueProducerArtifact(runtime, token, key, payload);

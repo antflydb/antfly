@@ -2897,6 +2897,8 @@ pub const BackupInfo = struct {
     tables: []const []const u8,
     /// Exact restore selectors paired with display names, in the same order as tables. Use selector in ClusterRestoreRequest.table_names to disambiguate identical display names.
     table_selectors: ?[]const std.json.Value = null,
+    /// True when the listing returned only backup metadata because table details exceeded the page size.
+    table_details_omitted: ?bool = null,
     /// Storage location of the backup
     location: []const u8,
     /// Antfly version that created the backup
@@ -2910,6 +2912,7 @@ pub const BackupInfo = struct {
         .{ "timestamp", "timestamp", false },
         .{ "tables", "tables", false },
         .{ "table_selectors", "table_selectors", true },
+        .{ "table_details_omitted", "table_details_omitted", true },
         .{ "location", "location", false },
         .{ "antfly_version", "antfly_version", true },
         .{ "format", "format", true },
@@ -2933,6 +2936,10 @@ pub const BackupInfo = struct {
         try jw.write(self.tables);
         if (self.table_selectors) |value| {
             try jw.objectField("table_selectors");
+            try jw.write(value);
+        }
+        if (self.table_details_omitted) |value| {
+            try jw.objectField("table_details_omitted");
             try jw.write(value);
         }
         try jw.objectField("location");

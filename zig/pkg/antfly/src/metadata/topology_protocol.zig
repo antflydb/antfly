@@ -122,7 +122,22 @@ const std = @import("std");
 /// Version 88 admits bounded inline map navigation in reader protocol 101.
 /// Version 90 admits table-scoped index aliases and durable retry receipts.
 /// Version 91 admits lifecycle-scoped alias deletion validators.
-pub const current_version: u16 = 91;
+/// Version 92 admits durable restore jobs with backup bindings.
+/// Version 93 separates immutable restore inputs from mutable checkpoints.
+/// Version 94 retains distributed restore admission ownership on ranges.
+pub const pinned_restore_job_version: u16 = 94;
+/// Version 95 maintains durable hosted embedding revision admission.
+pub const pinned_embedding_revision_version: u16 = 95;
+pub const current_version: u16 = pinned_embedding_revision_version;
+
+pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
+    const empty: [32]u8 = @splat(0);
+    for (ranges) |range| {
+        if (!std.mem.eql(u8, &range.restore_admission_fingerprint, &empty)) return pinned_restore_job_version;
+    }
+    return fallback;
+}
+
 pub const index_aliases_version: u16 = 90;
 pub const index_alias_lifecycle_version: u16 = 91;
 pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelope: bool) std.mem.Allocator.Error!u16 {
@@ -130,6 +145,41 @@ pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelop
     const required = if (envelope) try aliases.requiredEnvelopeStoreProtocol(a, bytes) else try aliases.requiredStoreProtocol(a, bytes);
     return if (required >= 4) index_alias_lifecycle_version else if (required >= 3) index_aliases_version else 0;
 }
+pub fn pinnedEmbeddingDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelope: bool) std.mem.Allocator.Error!u16 {
+    const config = @import("antfly_local_sources").api_table_index_config;
+    if (!config.mayContainModelRevision(bytes)) return 0;
+    if (!envelope) return if (try hasPinnedEmbeddingCatalog(a, bytes)) pinned_embedding_revision_version else 0;
+    var parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return pinned_embedding_revision_version,
+    };
+    defer parsed.deinit();
+    return if (try hasPinnedEmbeddingEnvelope(a, parsed.value)) pinned_embedding_revision_version else 0;
+}
+
+fn hasPinnedEmbeddingCatalog(a: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!bool {
+    return @import("antfly_local_sources").api_table_index_config.hasModelRevisionPin(a, bytes, true) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return true,
+    };
+}
+
+fn hasPinnedEmbeddingEnvelope(a: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!bool {
+    switch (value) {
+        .object => |object| {
+            if (object.get("indexes_json")) |catalog| {
+                if (catalog == .string and try hasPinnedEmbeddingCatalog(a, catalog.string)) return true;
+            }
+            for (object.values()) |child| if (try hasPinnedEmbeddingEnvelope(a, child)) return true;
+        },
+        .array => |array| for (array.items) |child| {
+            if (try hasPinnedEmbeddingEnvelope(a, child)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
 pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
     return @import("antfly_local_sources").api_index_metadata.aliases.uses(a, indexes_json);
 }

@@ -1310,7 +1310,7 @@ fn computePleVectorsDirect(
         .slot = pleProjNormSlot(configured_layer_count),
         .input = reshaped,
         .hidden_size = ple_dim,
-        .eps = gpt_config.norm_eps,
+        .eps = gpt_config.pleProjectionNormEps(),
     })) orelse return null;
     defer cb.free(normed_flat);
 
@@ -1405,7 +1405,7 @@ fn computePleVectorsDirectFromTokenTensor(
         .slot = pleProjNormSlot(configured_layer_count),
         .input = reshaped,
         .hidden_size = ple_dim,
-        .eps = gpt_config.norm_eps,
+        .eps = gpt_config.pleProjectionNormEps(),
     })) orelse return null;
     defer cb.free(normed_flat);
 

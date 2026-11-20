@@ -11256,6 +11256,36 @@ pub const DB = struct {
         return outcome == .produced or outcome == .skipped;
     }
 
+    fn artifactRepairConsumerCoverageComplete(self: *DB, alloc: Allocator, coverage_marker_key: ?[]const u8, extraction_key: ?[]const u8) !bool {
+        if (coverage_marker_key) |marker_key| {
+            if (!try self.repairCoverageMarkerComplete(alloc, marker_key)) return false;
+        }
+
+        if (extraction_key) |manifest_key| {
+            const raw = self.core.store.get(alloc, manifest_key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            defer alloc.free(raw);
+            const health = @import("enrichment/document_extraction_completion.zig").publicationState(alloc, raw) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return false,
+            };
+            if (health != .complete) return false;
+        }
+        return true;
+    }
+
+    fn observedArtifactRepairConsumerCoverageComplete(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
+        const coverage_key = try self.enrichmentFailureCoverageMarkerKeyAlloc(alloc, issue);
+        defer if (coverage_key) |key| alloc.free(key);
+        const extraction_key = try self.documentExtractionRepairKeyAlloc(alloc, issue);
+        defer if (extraction_key) |key| alloc.free(key);
+        lockAtomicWithBackoff(&self.async_context.artifact_repair_issue_mutex);
+        defer self.async_context.artifact_repair_issue_mutex.unlock();
+        return self.artifactRepairConsumerCoverageComplete(alloc, coverage_key, extraction_key);
+    }
+
     fn completeArtifactRepairIssueIfCurrent(
         self: *DB,
         alloc: Allocator,
@@ -11299,22 +11329,7 @@ pub const DB = struct {
         // clears debt first (and stale terminal transitions are rejected) or a
         // terminal transition lands first (and debt remains queued). There is
         // no interleaving that can leave terminal coverage without repair debt.
-        if (coverage_marker_key) |marker_key| {
-            if (!try self.repairCoverageMarkerComplete(alloc, marker_key)) return .coverage_incomplete;
-        }
-
-        if (extraction_key) |manifest_key| {
-            const raw = self.core.store.get(alloc, manifest_key) catch |err| switch (err) {
-                error.NotFound => return .coverage_incomplete,
-                else => return err,
-            };
-            defer alloc.free(raw);
-            const health = @import("enrichment/document_extraction_completion.zig").publicationState(alloc, raw) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return .coverage_incomplete,
-            };
-            if (health != .complete) return .coverage_incomplete;
-        }
+        if (!try self.artifactRepairConsumerCoverageComplete(alloc, coverage_marker_key, extraction_key)) return .coverage_incomplete;
         completion.completed_sequence = @max(completion.completed_sequence, revision.sequence);
         completion.pending_issues -|= 1;
 
@@ -17236,6 +17251,7 @@ pub const DB = struct {
         lease_authority: IndexRepairLeaseAuthority,
     ) !types.ArtifactRepairResult {
         try checkArtifactRepairCancelled(options);
+        if (req.observe_index_repair) return self.observeIndexRepair(alloc, req, options);
         if (req.target == .index) return try self.repairIndexIssuesWithRequest(
             alloc,
             req,
@@ -17352,21 +17368,19 @@ pub const DB = struct {
                 const applied = try enrichment_state.loadAppliedSequence(alloc, self.core.store, enrichment_runtime_mod.scope_name);
                 // One job submits a failed source once. Polls wait for that
                 // durable replay; a fresh job can explicitly retry its outcome.
-                if (queued != 0 and (queued >= issue.sequence) and
-                    (applied < queued or (req.repair_job_id != null and completion_snapshot.queued_job_id == req.repair_job_id.?)))
+                const same_job = req.repair_job_id != null and completion_snapshot.queued_job_id == req.repair_job_id.?;
+                if (queued != 0 and
+                    ((queued >= issue.sequence and applied < queued) or
+                        (same_job and (queued >= issue.sequence or artifactRepairPublicationSettled(completion_snapshot)))))
                 {
-                    if (applied < queued) {
+                    if (applied < queued and !artifactRepairPublicationSettled(completion_snapshot)) {
                         result.in_progress += 1;
                     } else {
                         const readable = issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue.*);
                         // A readable asset may be an old payload or a manifest
                         // recording terminal OCR failures. Only a successful
                         // publication's completion fence proves this repair.
-                        const completed = if (!readable)
-                            false
-                        else if (issue.reason == .enrichment_failed)
-                            (try self.completeArtifactRepairIssueIfCurrent(alloc, issue.*, issue_revision, completion_key, completion_snapshot.epoch, true)) == .completed
-                        else
+                        const completed = issue.reason != .enrichment_failed and readable and
                             try self.clearArtifactRepairIssueIfCurrent(alloc, issue.*, issue_revision);
                         if (completed) {
                             result.repaired += 1;
@@ -17374,9 +17388,9 @@ pub const DB = struct {
                         }
                         // Successful providers may have published a later
                         // derived batch that the index has not applied yet.
-                        // An unchanged, older diagnosis is not a failure of
-                        // this queued attempt; wait for its publication fence.
-                        if (issue.sequence < queued and completion_snapshot.failed_sequence < queued)
+                        // Once publication settles, a consumer that still
+                        // lacks coverage is remaining debt for this attempt.
+                        if (issue.sequence < queued and !artifactRepairPublicationSettled(completion_snapshot))
                             result.in_progress += 1
                         else
                             result.failed += 1;
@@ -17478,6 +17492,11 @@ pub const DB = struct {
             if (result.next_cursor) |cursor| alloc.free(cursor);
             result.next_cursor = if (req.cursor) |cursor| try alloc.dupe(u8, cursor) else null;
             result.has_more = true;
+            // This page will be read again. Only a settled page contributes
+            // terminal outcomes to the durable job's cumulative counts.
+            result.failed = 0;
+            result.unsupported = 0;
+            result.missing_source_docs = 0;
             return result;
         }
         if (result.repaired != 0) {
@@ -17488,6 +17507,118 @@ pub const DB = struct {
             try self.runArtifactRepairMetadataMaintenanceUntilIdle();
         }
         return result;
+    }
+
+    /// An observation reports durable state without creating, resuming, or
+    /// dispatching a repair. A worker can retire its intent between polls.
+    fn observeIndexRepair(self: *DB, alloc: Allocator, req: types.ArtifactRepairRunRequest, options: types.ArtifactRepairRunOptions) !types.ArtifactRepairResult {
+        if (req.target != .index or req.control != null or req.repair_id != null) return error.InvalidArgument;
+        const name = req.index_name orelse return error.InvalidArgument;
+        const cfg = self.core.index_manager.get(name) orelse return error.NotFound;
+        const config_hash = types.indexConfigHash(cfg.*);
+        var result: types.ArtifactRepairResult = .{
+            .limit = if (req.limit == 0) 100 else req.limit,
+            .scanned = 1,
+            .observed_only = true,
+        };
+        var state: ?index_repair_state.State = self.loadIndexRepairState(alloc) catch |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => null,
+            else => return err,
+        };
+        defer if (state) |*loaded| loaded.deinit(alloc);
+        var terminal_reason: ?[]const u8 = null;
+        if (state) |*loaded| if (loaded.findIndex(name)) |index| {
+            const intent = loaded.entries.items[index].intent;
+            if (intent.root_generation != self.core.root_generation or intent.group_id != self.localRepairGroupId() or intent.config_hash != config_hash) {
+                result.observation_changed = true;
+                return result;
+            }
+            result.indexes_degraded_before = 1;
+            result.indexes_degraded_after = 1;
+            result.unresolved = 1;
+            result.debt_remaining = true;
+            if (!indexRepairActionRequired(intent)) {
+                result.in_progress = 1;
+                return result;
+            }
+            const fallback = if (intent.automation == .paused) "index_repair_paused" else "index_repair_failed";
+            terminal_reason = intent.last_error orelse fallback;
+        };
+        if (terminal_reason == null and try self.indexGenerationRepairRequired(alloc, name)) {
+            result.observation_changed = true;
+            return result;
+        }
+
+        // Older jobs may have persisted document-only shards in their polling
+        // set. Check their durable replay outcome as well as the generation.
+        if (req.operator_initiated) try self.observeIndexDocumentRepairs(alloc, req, options, &result);
+        errdefer result.deinit(alloc);
+        if (!result.has_more) {
+            if (terminal_reason) |message| {
+                result.failed += 1;
+                result.terminal_error = try alloc.dupe(u8, message);
+            }
+        }
+        return result;
+    }
+
+    fn artifactRepairPublicationSettled(completion: ArtifactRepairCompletionState) bool {
+        return completion.completed_sequence >= completion.queued_sequence or
+            completion.failed_sequence >= completion.queued_sequence;
+    }
+
+    fn observeIndexDocumentRepairs(self: *DB, alloc: Allocator, req: types.ArtifactRepairRunRequest, options: types.ArtifactRepairRunOptions, result: *types.ArtifactRepairResult) !void {
+        var page = try self.listArtifactRepairIssuesPage(alloc, .{
+            .index_name = req.index_name,
+            .limit = result.limit,
+            .cursor = req.cursor,
+        });
+        defer page.deinit(alloc);
+        if (page.issues.len != 0) {
+            const applied = try enrichment_state.loadAppliedSequence(alloc, self.core.store, enrichment_runtime_mod.scope_name);
+            var failed: u64 = 0;
+            for (page.issues) |issue| {
+                try checkArtifactRepairCancelled(options);
+                const key = try self.artifactRepairCompletionKeyForIssueAlloc(alloc, issue);
+                defer alloc.free(key);
+                const completion = try self.artifactRepairCompletionSnapshot(alloc, key);
+                const queued = completion.queued_sequence;
+                if (queued != 0 and applied < queued and !artifactRepairPublicationSettled(completion)) {
+                    result.document_replay_in_progress += 1;
+                    continue;
+                }
+                if (issue.reason == .enrichment_failed and completion.completed_sequence >= issue.sequence and
+                    (issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue)) and
+                    try self.observedArtifactRepairConsumerCoverageComplete(alloc, issue)) continue;
+                if (queued != 0 and issue.sequence < queued and !artifactRepairPublicationSettled(completion)) {
+                    // The source replay applied, but its derived output or
+                    // terminal failure is not visible in the ledger yet.
+                    result.document_replay_in_progress += 1;
+                    continue;
+                }
+                if (queued != 0 and issue.reason != .enrichment_failed and
+                    completion.failed_sequence < queued and try self.artifactNowReadable(alloc, issue)) continue;
+                failed += 1;
+            }
+            result.in_progress += result.document_replay_in_progress;
+            if (result.document_replay_in_progress != 0) {
+                // Keep this page until all pending rows settle. Count failed
+                // rows once when it advances, including those observed above.
+                result.has_more = true;
+                result.debt_remaining = true;
+                result.unresolved += result.document_replay_in_progress;
+                result.next_cursor = if (req.cursor) |cursor| try alloc.dupe(u8, cursor) else null;
+                return;
+            }
+            result.failed += failed;
+            result.unresolved += failed;
+            result.debt_remaining = result.debt_remaining or failed != 0;
+        }
+        if (page.issues.len != 0) result.scanned = page.issues.len;
+        result.has_more = page.has_more;
+        result.debt_remaining = result.debt_remaining or page.has_more;
+        result.next_cursor = page.next_cursor;
+        page.next_cursor = null;
     }
 
     /// Index repair and rebuild also retry the index's permanently failed
@@ -17501,36 +17632,22 @@ pub const DB = struct {
         options: types.ArtifactRepairRunOptions,
         lease_authority: IndexRepairLeaseAuthority,
     ) anyerror!types.ArtifactRepairResult { // explicit: re-enters the artifact repair dispatch
-        if (req.observe_index_repair) {
-            const name = req.index_name orelse return error.InvalidArgument;
-            if (req.force or req.control != null) return error.InvalidArgument;
-            if (try self.indexRepairIdForIndex(alloc, name)) |id| {
-                var entry = self.loadIndexRepairEntryById(alloc, id) catch |err| switch (err) {
-                    error.IndexRepairIntentNotFound => return .{ .observed_only = true, .observation_changed = true },
-                    else => return err,
-                };
-                defer entry.deinit(alloc);
-                const intent = entry.intent;
-                const terminal = intent.phase == .terminal and retryableIndexRepairTerminalPhase(intent.last_error, intent.trigger) == null;
-                const needs_source_dispatch = intent.work_class == .initial_build and
-                    (intent.trigger == .catalog_admission or intent.trigger == .replay_artifact_unavailable) and
-                    initialBuildCanRetireBeforeActivation(intent);
-                if (terminal or !needs_source_dispatch) return .{
-                    .limit = req.limit,
-                    .scanned = 1,
-                    .failed = @intFromBool(terminal),
-                    .unresolved = 1,
-                    .in_progress = @intFromBool(!terminal),
-                    .indexes_degraded_after = 1,
-                    .debt_remaining = true,
-                    .observed_only = true,
-                    .terminal_error = if (terminal) try alloc.dupe(u8, intent.last_error orelse "index_repair_terminal") else null,
-                };
-            } else if (try self.indexGenerationRepairRequired(alloc, name)) {
-                return .{ .observed_only = true, .observation_changed = true };
+        if (req.resume_document_repair and req.operator_initiated and req.control == null) {
+            var observation: types.ArtifactRepairResult = .{
+                .limit = if (req.limit == 0) 100 else req.limit,
+                .scanned = 1,
+                .observed_only = true,
+            };
+            var owns_observation = true;
+            defer if (owns_observation) observation.deinit(alloc);
+            try self.observeIndexDocumentRepairs(alloc, req, options, &observation);
+            if (observation.document_replay_in_progress != 0) {
+                // Only poll the existing replay while this page is parked.
+                // Unsupported rows and missing sources are revisited once the
+                // replay settles, so polls do not mutate their diagnostics.
+                owns_observation = false;
+                return observation;
             }
-            // Once the generation settles, operator repair can still have
-            // source artifacts to dispatch. Use the ordinary bounded pass.
         }
         // Operator continuations carry an artifact-ledger cursor. Generation
         // repair has no local cursor and must retain its own request validation.
@@ -17585,11 +17702,11 @@ pub const DB = struct {
             defer remaining.deinit(alloc);
             if (remaining.issues.len != 0) result.in_progress = 0;
         }
-        try mergeIndexEnrichmentRepairResult(alloc, &result, enrichment);
+        try mergeIndexEnrichmentRepairResult(alloc, &result, enrichment, req.cursor);
         return result;
     }
 
-    fn mergeIndexEnrichmentRepairResult(alloc: Allocator, result: *types.ArtifactRepairResult, enrichment: types.ArtifactRepairResult) !void {
+    fn mergeIndexEnrichmentRepairResult(alloc: Allocator, result: *types.ArtifactRepairResult, enrichment: types.ArtifactRepairResult, cursor: ?[]const u8) !void {
         result.scanned +|= enrichment.scanned;
         result.reprocessed +|= enrichment.reprocessed;
         result.repaired +|= enrichment.repaired;
@@ -17598,10 +17715,12 @@ pub const DB = struct {
         result.unsupported +|= enrichment.unsupported;
         result.unresolved +|= enrichment.unresolved;
         result.in_progress +|= enrichment.in_progress;
-        // Keep scanning after failed documents instead of restarting at the
-        // first page. The table layer wraps this local cursor with its group.
-        result.has_more = enrichment.has_more;
-        if (enrichment.next_cursor) |cursor| result.next_cursor = try alloc.dupe(u8, cursor);
+        result.document_replay_in_progress = enrichment.in_progress;
+        // Document work must settle on its ledger page before later groups or
+        // the generation polling set can complete the job.
+        result.has_more = enrichment.has_more or enrichment.in_progress != 0;
+        const next = if (enrichment.in_progress != 0) cursor else enrichment.next_cursor;
+        if (next) |value| result.next_cursor = try alloc.dupe(u8, value);
         if (enrichment.debt_remaining or enrichment.has_more) result.debt_remaining = true;
     }
 
@@ -17711,25 +17830,17 @@ pub const DB = struct {
             result.scanned = 1;
             result.indexes_degraded_before = @intFromBool(repair_required);
             result.indexes_degraded_after = 1;
-            if (req.force or options.defer_durable_index_repair_execution) {
+            if (req.force) {
                 var current = try self.loadIndexRepairEntryById(alloc, repair_id);
                 defer current.deinit(alloc);
                 if (current.intent.phase == .terminal) {
-                    if (req.force) {
-                        try self.updateIndexRepairIntent(alloc, repair_id, .{
-                            .phase = .detected,
-                            .attempt_count = current.intent.attempt_count +| 1,
-                            .failure_streak = 0,
-                            .next_retry_at_ms = 0,
-                            .replace_last_error = true,
-                        });
-                    } else if (retryableIndexRepairTerminalPhase(current.intent.last_error, current.intent.trigger) == null) {
-                        result.terminal_error = try alloc.dupe(u8, current.intent.last_error orelse "index_repair_terminal");
-                        result.failed = 1;
-                        result.unresolved = 1;
-                        result.debt_remaining = true;
-                        return result;
-                    }
+                    try self.updateIndexRepairIntent(alloc, repair_id, .{
+                        .phase = .detected,
+                        .attempt_count = current.intent.attempt_count +| 1,
+                        .failure_streak = 0,
+                        .next_retry_at_ms = 0,
+                        .replace_last_error = true,
+                    });
                 }
             }
             if (options.defer_durable_index_repair_execution) {
@@ -90171,6 +90282,39 @@ test "db shared repair completion reprocesses consumer with terminal coverage" {
         .outcome = .terminal_failed,
     }});
 
+    try std.testing.expect(try db.artifactNowReadable(alloc, pending[0]));
+    // A successful replay shared with a sibling is no longer pending
+    // even though this consumer still has terminal coverage.
+    const applied_before = try enrichment_state.loadAppliedSequence(alloc, db.core.store, enrichment_runtime_mod.scope_name);
+    const settled_sequence = completion.completed_sequence + 1;
+    var shared_publication = completion;
+    shared_publication.queued_sequence = settled_sequence;
+    shared_publication.queued_job_id = 42;
+    shared_publication.completed_sequence = settled_sequence;
+    encodeArtifactRepairCompletionState(&encoded_completion, shared_publication);
+    try db.core.store.put(completion_key, &encoded_completion);
+    try enrichment_state.saveAppliedSequence(db.core.store, enrichment_runtime_mod.scope_name, settled_sequence);
+    var observed: types.ArtifactRepairResult = .{ .limit = 1, .observed_only = true };
+    defer observed.deinit(alloc);
+    try db.observeIndexDocumentRepairs(alloc, .{ .index_name = "semantic" }, .{}, &observed);
+    try std.testing.expectEqual(@as(u64, 1), observed.failed);
+    try std.testing.expect(observed.debt_remaining);
+    try std.testing.expectEqual(@as(u64, 0), observed.in_progress);
+
+    var settled = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+        .target = .artifact,
+        .index_name = "semantic",
+        .repair_job_id = 42,
+        .operator_initiated = true,
+    }, .{ .defer_durable_index_repair_execution = true });
+    defer settled.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), settled.failed);
+    try std.testing.expectEqual(@as(u64, 0), settled.in_progress);
+    try std.testing.expect(!settled.has_more and settled.debt_remaining);
+    encodeArtifactRepairCompletionState(&encoded_completion, completion);
+    try db.core.store.put(completion_key, &encoded_completion);
+    try enrichment_state.saveAppliedSequence(db.core.store, enrichment_runtime_mod.scope_name, applied_before);
+
     var repair = try db.repairArtifactIssues(alloc, .embedding, 1);
     defer repair.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
@@ -101500,7 +101644,59 @@ test "db managed index repair keeps failed OCR manifests as debt" {
         var encoded: [artifact_repair_completion_state_len]u8 = undefined;
         encodeArtifactRepairCompletionState(&encoded, completion);
         try db.core.store.put(completion_key, &encoded);
+        const observation: types.ArtifactRepairRunRequest = .{
+            .target = .index,
+            .index_name = "consumer",
+            .operator_initiated = true,
+            .repair_job_id = 42,
+            .observe_index_repair = true,
+        };
+        const deferred = types.ArtifactRepairRunOptions{ .defer_durable_index_repair_execution = true };
+        const before = db.core.nextEnrichmentSequence();
+        var pending = try db.repairArtifactIssuesWithRequestOptions(alloc, observation, deferred);
+        defer pending.deinit(alloc);
+        try std.testing.expect(pending.observed_only and pending.has_more);
+        try std.testing.expectEqual(@as(u64, 1), pending.document_replay_in_progress);
+        try std.testing.expectEqual(@as(u64, 0), pending.failed);
+        try std.testing.expectEqual(before, db.core.nextEnrichmentSequence());
+
+        var unsupported = issue;
+        unsupported.doc_key = "doc:unsupported";
+        unsupported.artifact_name = "unsupported_units";
+        unsupported.repairable = false;
+        try db.recordArtifactRepairIssue(alloc, unsupported);
+        var resume_request = observation;
+        resume_request.observe_index_repair = false;
+        resume_request.resume_document_repair = true;
+        for (0..2) |_| {
+            var poll = try db.repairArtifactIssuesWithRequestOptions(alloc, resume_request, deferred);
+            defer poll.deinit(alloc);
+            try std.testing.expect(poll.observed_only and poll.has_more);
+            try std.testing.expectEqual(@as(u64, 1), poll.document_replay_in_progress);
+            try std.testing.expectEqual(@as(u64, 0), poll.unsupported);
+        }
+        const checked = try db.listArtifactRepairIssuesPage(alloc, .{ .index_name = "consumer" });
+        defer types.freeArtifactRepairIssues(alloc, checked.issues);
+        defer if (checked.next_cursor) |cursor| alloc.free(cursor);
+        var found_unsupported = false;
+        for (checked.issues) |row| {
+            if (!std.mem.eql(u8, row.doc_key, unsupported.doc_key)) continue;
+            try std.testing.expectEqual(@as(u64, 0), row.attempts);
+            try std.testing.expect(try db.clearArtifactRepairIssueIfCurrent(alloc, row, DB.ArtifactRepairIssueRevision.capture(row)));
+            found_unsupported = true;
+        }
+        try std.testing.expect(found_unsupported);
+        try std.testing.expectEqual(before, db.core.nextEnrichmentSequence());
+
         try enrichment_state.saveAppliedSequence(db.core.store, enrichment_runtime_mod.scope_name, 5);
+        var observed_failure = try db.repairArtifactIssuesWithRequestOptions(alloc, observation, deferred);
+        defer observed_failure.deinit(alloc);
+        try std.testing.expect(observed_failure.observed_only and observed_failure.debt_remaining);
+        try std.testing.expect(!observed_failure.has_more);
+        try std.testing.expectEqual(@as(u64, 0), observed_failure.in_progress);
+        try std.testing.expectEqual(@as(u64, 1), observed_failure.failed);
+        try std.testing.expectEqual(before, db.core.nextEnrichmentSequence());
+
         var result = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
             .target = .artifact,
             .index_name = "consumer",
@@ -101523,6 +101719,11 @@ test "db managed index repair keeps failed OCR manifests as debt" {
         completion.completed_sequence = issue.sequence;
         encodeArtifactRepairCompletionState(&encoded, completion);
         try db.core.store.put(completion_key, &encoded);
+        var observed_success = try db.repairArtifactIssuesWithRequestOptions(alloc, observation, deferred);
+        defer observed_success.deinit(alloc);
+        try std.testing.expect(!observed_success.debt_remaining);
+        try std.testing.expectEqual(@as(u64, 0), observed_success.failed);
+
         var completed = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
             .target = .artifact,
             .index_name = "consumer",

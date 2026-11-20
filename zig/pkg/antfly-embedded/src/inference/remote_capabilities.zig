@@ -480,7 +480,8 @@ pub const Cache = struct {
                 {
                     // A failed cold flight has no lease to defer. Remember its
                     // cooldown in the same bounded cache as positive entries.
-                    discovery_retry = @max(discovery_retry, now_after_discovery +| capability_refresh_retry_ns);
+                    const cooldown = @max(discovery_retry, now_after_discovery +| capability_refresh_retry_ns);
+                    discovery_retry = cooldown;
                     self.putEntryLocked(key, .{
                         .value = null,
                         .expires_at_ns = 0,

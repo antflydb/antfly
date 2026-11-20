@@ -1241,8 +1241,8 @@ pub fn embeddingProducerModelRevision(object: std.json.ObjectMap) !?[32]u8 {
 
 pub const DenseKnnQuery = struct {
     vector: []const f32,
-    // A managed query must match the planned index even when it was unpinned.
-    model_revision_fence: ?struct { expected: ?[32]u8 } = null,
+    // Pinned indexes require a managed query planned for the same model revision.
+    model_revision_fence: ?[32]u8 = null,
     k: u32 = 10,
 };
 
@@ -4291,6 +4291,7 @@ pub const ArtifactRepairRunRequest = struct {
     /// no model calls.
     operator_initiated: bool = false,
     observe_index_repair: bool = false,
+    resume_document_repair: bool = false,
 };
 
 pub const RepairCancelCheck = struct {
@@ -4383,6 +4384,8 @@ pub const ArtifactRepairRunOptions = struct {
     /// Coordinator-only filter for already-dispatched index repair work.
     observe_index_groups: ?[]const u64 = null,
     expected_repair_groups: ?u64 = null,
+    /// Continue exactly one shard from its parked document-ledger cursor.
+    resume_document_page: bool = false,
     /// Lite's live coordinator may enqueue a bounded source page or retire a
     /// proven canonical initial build. It must never construct/activate a
     /// shadow while holding the short connection publication fence.
@@ -4480,8 +4483,12 @@ pub const ArtifactRepairResult = struct {
     has_more: bool = false,
     debt_remaining: bool = false,
 
+    /// The document-replay subset of in_progress. Document replay stays on
+    /// its ledger cursor while generation work can be observed by shard.
+    document_replay_in_progress: u64 = 0,
     /// Coordinator-owned group IDs that still need index repair observation.
     pending_index_groups: ?[]u64 = null,
+    pending_document_pages: ?[][]u8 = null,
     terminal_error: ?[]u8 = null,
     observed_only: bool = false,
     observation_changed: bool = false,
@@ -4489,6 +4496,10 @@ pub const ArtifactRepairResult = struct {
 
     pub fn deinit(self: *ArtifactRepairResult, alloc: Allocator) void {
         if (self.pending_index_groups) |groups| alloc.free(groups);
+        if (self.pending_document_pages) |pages| {
+            for (pages) |page| alloc.free(page);
+            alloc.free(pages);
+        }
         if (self.terminal_error) |message| alloc.free(message);
         if (self.next_cursor) |value| alloc.free(value);
         self.* = undefined;

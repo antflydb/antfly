@@ -124,7 +124,7 @@ fn denseArtifact(row: docstore.KVPair) !bool {
         return true;
     }
     const header = try codec.decodeHeader(row.value);
-    return header.kind == .dense_embedding;
+    return header.kind == .dense_embedding and header.version == codec.codec_version;
 }
 
 fn sameCurrent(txn: *erased.WriteTxn, row: docstore.KVPair) !bool {

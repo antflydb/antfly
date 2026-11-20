@@ -3588,31 +3588,25 @@ pub fn encodeQueryRequestWithGraphWireMode(
     }
     const knn_revision = if (req.query == .dense_knn) req.query.dense_knn.model_revision_fence else null;
     var revision_count: usize = 0;
-    if (knn_revision) |fence| {
+    if (knn_revision) |revision| {
         if (dense_queries.len != 0) return error.UnsupportedQueryRequest;
         const name = req.index_name orelse return error.UnsupportedQueryRequest;
         try appendJsonFieldName(alloc, &out, &first, "_embedding_model_revisions");
         try out.append(alloc, '{');
         try appendJsonString(alloc, &out, name);
         try out.append(alloc, ':');
-        if (fence.expected) |revision|
-            try appendJsonString(alloc, &out, &std.fmt.bytesToHex(revision, .lower))
-        else
-            try out.appendSlice(alloc, "null");
+        try appendJsonString(alloc, &out, &std.fmt.bytesToHex(revision, .lower));
         revision_count = 1;
     }
     for (dense_queries) |dense| {
-        const fence = dense.query.model_revision_fence orelse continue;
+        const revision = dense.query.model_revision_fence orelse continue;
         if (revision_count == 0) {
             try appendJsonFieldName(alloc, &out, &first, "_embedding_model_revisions");
             try out.append(alloc, '{');
         } else try out.append(alloc, ',');
         try appendJsonString(alloc, &out, dense.index_name);
         try out.append(alloc, ':');
-        if (fence.expected) |revision|
-            try appendJsonString(alloc, &out, &std.fmt.bytesToHex(revision, .lower))
-        else
-            try out.appendSlice(alloc, "null");
+        try appendJsonString(alloc, &out, &std.fmt.bytesToHex(revision, .lower));
         revision_count += 1;
     }
     if (revision_count != 0) try out.append(alloc, '}');

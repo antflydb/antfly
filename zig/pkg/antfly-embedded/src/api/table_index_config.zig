@@ -56,6 +56,10 @@ pub fn parseIndexConfigWithOptions(
     const kind = try parseIndexKind(parsed.value);
     const config_json = try extractIndexConfigJsonWithOptions(alloc, index_name, parsed.value, options);
     errdefer alloc.free(config_json);
+    if (kind == .dense_vector and try indexHasModelRevisionPin(alloc, parsed.value)) index_manager.validatePinnedDenseConfig(alloc, .{ .name = index_name, .kind = kind, .config_json = config_json }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateTableRequest,
+    };
     const configured_incarnation = coverage_policy_mod.incarnation(parsed.value);
     return .{
         .name = try alloc.dupe(u8, index_name),
@@ -118,6 +122,22 @@ pub fn validateManagedEmbeddingRuntimeConfigJsonWithOptions(
     var personal_check = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer personal_check.deinit();
     try rejectPersonalGenerator(personal_check.value);
+    if (mayContainModelRevision(indexes_json) and personal_check.value == .object) {
+        var entries = personal_check.value.object.iterator();
+        while (entries.next()) |entry| {
+            if (entry.value_ptr.* != .object or !try indexHasModelRevisionPin(alloc, entry.value_ptr.*)) continue;
+            const config_json = try extractIndexConfigJsonWithOptions(alloc, entry.key_ptr.*, entry.value_ptr.*, options);
+            defer alloc.free(config_json);
+            index_manager.validatePinnedDenseConfig(alloc, .{
+                .name = entry.key_ptr.*,
+                .kind = .dense_vector,
+                .config_json = config_json,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidCreateTableRequest,
+            };
+        }
+    }
     var managed = managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(
         alloc,
         indexes_json,
@@ -243,7 +263,13 @@ pub fn indexHasModelRevisionPin(alloc: std.mem.Allocator, value: std.json.Value)
     return false;
 }
 
+/// Fast rejection for legacy catalog values, including escaped JSON keys.
+pub fn mayContainModelRevision(raw: []const u8) bool {
+    return std.mem.indexOf(u8, raw, "model_revision") != null or std.mem.indexOf(u8, raw, "\\u") != null;
+}
+
 pub fn hasModelRevisionPin(alloc: std.mem.Allocator, raw: []const u8, catalog: bool) !bool {
+    if (!mayContainModelRevision(raw)) return false;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
     if (!catalog) return try indexHasModelRevisionPin(alloc, parsed.value);
