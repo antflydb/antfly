@@ -208,6 +208,11 @@ def exercise_bound_portals(server, password):
         )
 
         for name, statement in (
+            ("update_rebind", "UPDATE portal_target SET scratch = 42"),
+            (
+                "policy_rebind",
+                "CREATE POLICY scratch_policy ON portal_target USING (scratch >= 0)",
+            ),
             ("index_rebind", "CREATE INDEX scratch_idx ON portal_target (scratch)"),
             (
                 "check_rebind",

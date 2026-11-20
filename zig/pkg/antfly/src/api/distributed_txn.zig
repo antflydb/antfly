@@ -1365,11 +1365,22 @@ fn executeMultiTableCommitOnce(
         participants.deinit(alloc);
     }
 
+    // Cascades can enlist additional tables after SQL admission. All participants
+    // in a transaction must prepare against the same metadata incarnation.
+    var bound_incarnation: ?[16]u8 = null;
+    for (tables) |table| if (table.bound_catalog_incarnation) |incarnation| {
+        if (bound_incarnation) |bound| if (!std.mem.eql(u8, &bound, &incarnation)) return error.CatalogGenerationChanged;
+        bound_incarnation = incarnation;
+    };
     for (tables) |table| {
         var routing = (try table_catalog.transactionRoutingSnapshot(alloc, catalog, table.table_name)) orelse return error.TableNotFound;
         defer routing.deinit(alloc);
         const topology_epoch = routing.topology_epoch;
 
+        if (bound_incarnation) |incarnation| {
+            const actual = routing.snapshot.status.metadata_incarnation orelse return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, &actual, &std.fmt.bytesToHex(incarnation, .lower))) return error.CatalogGenerationChanged;
+        }
         try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
         for (table.range_guards) |owner| {
             const fence = owner.fence;
@@ -1454,6 +1465,31 @@ fn executeMultiTableCommitOnce(
                 if (std.mem.eql(u8, participant.table_name, table.table_name)) break true;
             } else false;
             if (!present) _ = try ensureParticipantTxn(alloc, &participants, table.table_name, routing.resolveGroupForKey("") orelse return error.UnknownGroup, topology_epoch);
+        }
+        if (bound_incarnation != null) {
+            // The snapshot supplies both the incarnation checked above and the
+            // range identity validated by each participant at prepare.
+            var pending: std.AutoHashMapUnmanaged(u64, *ParticipantTxn) = .empty;
+            defer pending.deinit(alloc);
+            for (participants.items) |*participant| {
+                if (participant.route_fence == null and std.mem.eql(u8, participant.table_name, table.table_name))
+                    try pending.put(alloc, participant.group_id, participant);
+            }
+            for (routing.ranges) |range| {
+                if (pending.count() == 0) break;
+                const entry = pending.fetchRemove(range.group_id) orelse continue;
+                const manager = @import("../metadata/table_manager.zig");
+                const range_id = manager.rangeDocIdentityRangeId(range.*);
+                entry.value.route_fence = .{
+                    .metadata_group_id = routing.snapshot.status.metadata_group_id,
+                    .metadata_incarnation = routing.snapshot.status.metadata_incarnation,
+                    .catalog_revision = 0,
+                    .table_id = range.table_id,
+                    .topology_epoch = topology_epoch,
+                    .route = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = range.table_id, .shard_id = manager.rangeDocIdentityShardId(range.*), .range_id = range_id } },
+                };
+            }
+            if (pending.count() != 0) return error.TopologyChanged;
         }
         for (participants.items) |*participant| {
             if (!std.mem.eql(u8, participant.table_name, table.table_name)) continue;
@@ -5895,6 +5931,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), recorder.integrity_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.semantic_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.activation_prepares);
+            try std.testing.expectError(error.CatalogGenerationChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(2), 40_000, 40_001, &.{.{ .table_name = "docs", .bound_catalog_incarnation = @splat(0xaa), .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, null));
             var routing = (try table_catalog.transactionRoutingSnapshot(std.testing.allocator, FakeCatalog.iface(), "docs")).?;
             defer routing.deinit(std.testing.allocator);
             const manager = @import("../metadata/table_manager.zig");

@@ -3658,14 +3658,24 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
     var required = (try transitionBaseDecoderVersion(a, command));
     switch (command) {
         .apply_system_catalog => |bytes| {
-            const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind, expected_resource_id: ?u64 = null, expected_tablespace_id: ?u64 = null } };
+            const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind, expected_incarnation: ?[16]u8 = null, expected_resource_id: ?u64 = null, expected_tablespace_id: ?u64 = null } };
             var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return metadata_topology_protocol.current_version,
             };
             defer parsed.deinit();
+            if (parsed.value.mutation.expected_incarnation != null) required = @max(required, metadata_topology_protocol.bound_catalog_incarnation_version);
             if (parsed.value.mutation.expected_resource_id != null or parsed.value.mutation.expected_tablespace_id != null) required = @max(required, metadata_topology_protocol.bound_ddl_version);
             if (parsed.value.mutation.kind == .graph) required = @max(required, metadata_topology_protocol.graph_definition_version);
+        },
+        .apply_sql_policies => |bytes| {
+            const Header = struct { expected_incarnation: ?[16]u8 = null, expected_schema_version: ?u32 = null };
+            var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return metadata_topology_protocol.current_version,
+            };
+            defer parsed.deinit();
+            if (parsed.value.expected_incarnation != null or parsed.value.expected_schema_version != null) required = @max(required, metadata_topology_protocol.bound_catalog_incarnation_version);
         },
         .register_store, .upsert_store, .upsert_store_heartbeat => |record| {
             if (record.artifact_sources_protocol_version >= 4) {

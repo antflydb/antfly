@@ -34596,19 +34596,6 @@ fn processPdfPageImageEmbeddingWithAllocator(
         generated_pdf_absolute_max_document_pages,
     );
     defer stale.deinit(metadata_alloc);
-    // Discover abandoned attempts without mutating storage. Their deletion is
-    // transferred through lease-fenced bounded publication windows. A
-    // superseded worker therefore cannot delete stages written by its
-    // replacement.
-    const obsolete_stage_keys = try collectObsoletePdfPageEmbeddingStageKeys(
-        runtime,
-        metadata_alloc,
-        request.doc_key,
-        requestArtifactName(request),
-        embedding_name,
-        stage_generation_id,
-    );
-    defer freeKeyList(metadata_alloc, obsolete_stage_keys);
     // Rendering and provider execution are complete before publication begins.
     // Promote/index pages in bounded replay windows, retain old page visibility
     // throughout partial progress, and commit the coverage transition last.
@@ -34625,7 +34612,6 @@ fn processPdfPageImageEmbeddingWithAllocator(
         staged_page_keys.items,
         embedding_name,
         stale.artifact_delete_keys,
-        obsolete_stage_keys,
         request,
     );
 }
@@ -34679,6 +34665,18 @@ fn retirePdfPageEmbeddings(publication: PdfPublication, alloc: Allocator, reques
     defer stale.deinit(alloc);
     try publication.deletes(stale.artifact_delete_keys, true);
 
+    try drainPdfStages(publication, alloc, request);
+    try publication.reserve(3);
+    try markDerivedCoverageSkipped(runtime, publication.window, request, &.{});
+    try publication.finish(request, consumers, .skipped);
+}
+
+// Promotions consume their private keys. Flush promotions before scanning so
+// every remaining key is abandoned. Each delete window carries the same
+// source and ownership fences as publication and completes before coverage.
+fn drainPdfStages(publication: PdfPublication, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) !void {
+    const runtime = publication.runtime;
+    try publication.flush();
     const root = try internal_keys.pdfPageEmbeddingStageRootPrefixAlloc(alloc, request.doc_key, requestArtifactName(request), requestEmbeddingName(request));
     defer alloc.free(root);
     while (true) {
@@ -34688,9 +34686,6 @@ fn retirePdfPageEmbeddings(publication: PdfPublication, alloc: Allocator, reques
         if (!page.has_more) break;
         try publication.flush();
     }
-    try publication.reserve(3);
-    try markDerivedCoverageSkipped(runtime, publication.window, request, &.{});
-    try publication.finish(request, consumers, .skipped);
 }
 
 fn appendOwnedPdfPageDelete(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, key: []const u8) !void {
@@ -34757,7 +34752,6 @@ fn publishPdfPageEmbeddingBatches(
     staged_page_keys: []const []const u8,
     embedding_name: []const u8,
     stale_artifact_keys: []const []const u8,
-    obsolete_stage_keys: []const []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !void {
     const runtime = publication.runtime;
@@ -34802,7 +34796,7 @@ fn publishPdfPageEmbeddingBatches(
         }
     }
     try publication.deletes(stale_artifact_keys, true);
-    try publication.deletes(obsolete_stage_keys, false);
+    try drainPdfStages(publication, metadata_alloc, request);
     try publication.finish(request, consumer_indexes, .produced);
 }
 
@@ -51636,26 +51630,31 @@ test "PDF page publication fences stale windows and drains abandoned attempts" {
     defer a.free(preserved);
     try std.testing.expectEqualStrings("newer", preserved);
 
-    // More than a scan page of residue, including two different attempts.
-    {
-        var writer = try db.core.store.beginWriteTxn();
-        errdefer writer.abort();
-        for (0..generated_pdf_stage_cleanup_page_keys) |i| {
-            var id: [32]u8 = undefined;
-            const stage = try pdfPageEmbeddingStageKeyAlloc(a, "doc", requestArtifactName(request), requestEmbeddingName(request), "crash", try std.fmt.bufPrint(&id, "page:{d:0>6}", .{i + 1}));
-            defer a.free(stage);
-            try writer.put(stage, "private");
+    for ([_]bool{ false, true }) |produce| {
+        // More than a scan page of residue, including two different attempts.
+        {
+            var writer = try db.core.store.beginWriteTxn();
+            errdefer writer.abort();
+            try writer.put(last, "private");
+            for (0..generated_pdf_stage_cleanup_page_keys) |i| {
+                var id: [32]u8 = undefined;
+                const stage = try pdfPageEmbeddingStageKeyAlloc(a, "doc", requestArtifactName(request), requestEmbeddingName(request), "crash", try std.fmt.bufPrint(&id, "page:{d:0>6}", .{i + 1}));
+                defer a.free(stage);
+                try writer.put(stage, "private");
+            }
+            try writer.commit();
         }
-        try writer.commit();
+        publication.guard = try captureEmbeddingSourceGuard(runtime, request, source, try currentRecordDigest(runtime, source));
+        publication.capacity = generated_pdf_stage_cleanup_page_keys;
+        if (produce) {
+            try publishPdfPageEmbeddingBatches(publication, a, &.{"page:1"}, &.{.{ .index_name = "images", .doc_key = "page:1", .vector = &.{} }}, &.{}, &.{}, &.{}, requestEmbeddingName(request), &.{}, request);
+        } else try retirePdfPageEmbeddings(publication, a, request, &.{});
+        const root = try internal_keys.pdfPageEmbeddingStageRootPrefixAlloc(a, "doc", requestArtifactName(request), requestEmbeddingName(request));
+        defer a.free(root);
+        var residue = try backend_scan.scanPrefixKeysPage(a, &runtime.store, root, 1);
+        defer residue.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), residue.keys.len);
     }
-    publication.guard = try captureEmbeddingSourceGuard(runtime, request, source, try currentRecordDigest(runtime, source));
-    publication.capacity = generated_pdf_stage_cleanup_page_keys;
-    try retirePdfPageEmbeddings(publication, a, request, &.{});
-    const root = try internal_keys.pdfPageEmbeddingStageRootPrefixAlloc(a, "doc", requestArtifactName(request), requestEmbeddingName(request));
-    defer a.free(root);
-    var residue = try backend_scan.scanPrefixKeysPage(a, &runtime.store, root, 1);
-    defer residue.deinit(a);
-    try std.testing.expectEqual(@as(usize, 0), residue.keys.len);
 }
 
 test "sparse cleanup guards fence empty sources epochs definitions and source resurrection" {

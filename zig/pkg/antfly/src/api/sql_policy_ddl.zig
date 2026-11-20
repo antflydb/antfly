@@ -102,8 +102,9 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const resolved_bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true } });
+    const resolved_bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true, .include_source_epoch = context.bound_catalog_incarnation != null } });
     const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, resolved_bytes, .{ .allocate = .alloc_always });
+    try context.checkCatalogIncarnation(resolved.source_epoch);
     if (resolved.tables.len != 1) return error.InvalidSqlBackendResponse;
     if (expected_id) |id| if (id != (if (resolved.tables[0]) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
     const physical = resolved.tables[0] orelse return error.TableNotFound;
@@ -115,6 +116,7 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
     var parsed_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, definition.schema_json);
     defer parsed_schema.deinit(a);
     const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed_schema);
+    if (bound) |objects| if (objects.schema_version) |version| if (version != native.version) return error.CatalogGenerationChanged;
     if (native.storage_mode != .relational) return error.UnsupportedSqlShape;
     const layout = try @import("antfly_local_sources").storage_schema.serializeSchema(a, native);
     var schema_digest: [32]u8 = undefined;
@@ -133,7 +135,7 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
     defer if (using_program) |*program| program.deinit();
     var check_program: ?scalar.Program = null;
     defer if (check_program) |*program| program.deinit();
-    const change: policies.Command = switch (ddl.action) {
+    var change: policies.Command = switch (ddl.action) {
         .enable, .disable => unreachable,
         .drop => blk: {
             const record = prior orelse {
@@ -174,6 +176,8 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
             break :blk .{ .expected_revision = state.revision, .change = .{ .put = record } };
         },
     };
+    change.expected_incarnation = context.bound_catalog_incarnation;
+    if (bound) |objects| change.expected_schema_version = objects.schema_version;
     var internal_context = context;
     internal_context.setting_admin = true;
     _ = try server.source.systemCatalog(a, internal_context, .{ .policy_definition_mutate = change });

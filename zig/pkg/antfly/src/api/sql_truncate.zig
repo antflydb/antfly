@@ -306,7 +306,8 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
         if (!try server_mod.tablePermissionCurrentlyAllowed(identity, resource, .admin)) return error.Forbidden;
         if (try server_mod.resolveEffectiveRowFilterJson(a, identity, resource) != null) return error.Forbidden;
     }
-    const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets } }), .{});
+    const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = targets, .include_source_epoch = context.bound_catalog_incarnation != null } }), .{});
+    try context.checkCatalogIncarnation(resolved.source_epoch);
     if (resolved.tables.len != targets.len) return error.InvalidSqlBackendResponse;
     if (expected) |guard| for (resolved.tables, 0..) |table, i| {
         if (guard[i].id != (if (table) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
@@ -324,6 +325,7 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
     for (resolved.tables, requested) |table, *name| name.* = (table orelse return error.TableNotFound).name;
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
+    try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
     for (resolved.tables) |resolved_table| {
         const bound = resolved_table.?;
         for (snapshot.tables) |table| {

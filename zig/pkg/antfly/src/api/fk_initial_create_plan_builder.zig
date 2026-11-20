@@ -165,6 +165,7 @@ pub fn buildWithScratch(
     if (routing_derived.len == 0) return error.InvalidGenerationPublication;
     var snapshot = try settledParentSnapshot(server, context, child.name, routing_derived);
     defer server.source.freeAdminSnapshot(&snapshot);
+    try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
     // Calculate support definitions against this settled read cut, but do
     // not publish any parent here. Begin owns each exact before/after pair in
     // one metadata transaction with the hidden child/name reservation.
@@ -279,6 +280,7 @@ pub fn sealSupport(
     if (status.phase != .preparing_support or !status.plan.support_pending) return error.GenerationPublicationChanged;
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
+    try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
     const parents = try alloc.alloc(publication.Parent, status.plan.parents.len);
     for (status.plan.parents, parents) |pending, *parent| {
         const current = for (snapshot.tables) |table| {

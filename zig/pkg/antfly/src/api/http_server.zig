@@ -6561,8 +6561,9 @@ pub const ApiHttpServer = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const domain = @import("antfly_local_sources").system_catalog_domain;
-        const resolved_bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target} } });
+        const resolved_bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target}, .include_source_epoch = context.bound_catalog_incarnation != null } });
         const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, resolved_bytes, .{ .allocate = .alloc_always });
+        try context.checkCatalogIncarnation(resolved.source_epoch);
         if (resolved.tables.len != 1) return error.InvalidSqlBackendResponse;
         if (expected_id) |id| if (id != (if (resolved.tables[0]) |t| t.table_id else 0)) return error.CatalogGenerationChanged;
         const physical = resolved.tables[0] orelse return error.TableNotFound;
@@ -15099,6 +15100,7 @@ pub const ApiHttpServer = struct {
         const txn_writes: []const db_mod.types.TransactionWrite = @ptrCast(req.writes);
         const tables = [_]distributed_txn.TableCommitRequest{.{
             .table_name = table_name,
+            .bound_catalog_incarnation = request.bound_catalog_incarnation,
             .commit_requires = req.commit_requires,
             .writes = txn_writes,
             .deletes = req.deletes,

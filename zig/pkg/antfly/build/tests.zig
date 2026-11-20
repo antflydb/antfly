@@ -7179,6 +7179,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "model aware media fused reuse rejects a changed provider generation with the same alias",
             "model aware media retained named text permits a changed embedding generation",
             "model aware media vocabulary inference rejects a producing generation change hidden by rollback",
+            "PDF page publication fences stale windows",
+            "source grouping trusts a whole document embedding",
             "shared PDF page embedding checkpoints successful siblings before retry",
             "cached content authority fences legacy writes",
             "backfill skips cached bodies and publishes metadata only",

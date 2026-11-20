@@ -3082,6 +3082,7 @@ const LocalStandaloneMetadata = struct {
                 if (!context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.RowPolicyUnsupported;
                 if (!self.localPolicyPublicationSupported()) return error.RowPolicyUnsupported;
+                try @import("../system_catalog/operations.zig").validateBoundPolicy(alloc, store, group_ids.main_metadata_group_id, command);
                 var encoded: std.Io.Writer.Allocating = .init(alloc);
                 defer encoded.deinit();
                 var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
@@ -3329,6 +3330,10 @@ const LocalStandaloneMetadata = struct {
             .relation_replace => |request| return self.replaceRelationLocked(alloc, context, request),
             .native_memory_create => unreachable,
             .mutate => |request| {
+                if (request.mutation.expected_incarnation) |expected| {
+                    const guard: antfly.public_api.operation.RequestContext = .{ .bound_catalog_incarnation = expected };
+                    try guard.checkMetadataIncarnation(self.metadata_incarnation);
+                }
                 if (request.mutation.native_service != null and request.mutation.native_service != context.native_service) return error.Forbidden;
                 if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
                 var arena = std.heap.ArenaAllocator.init(alloc);

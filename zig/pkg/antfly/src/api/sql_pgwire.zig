@@ -1024,7 +1024,7 @@ const Job = struct {
                 .unknown => null,
                 inline else => |tag| @field(ast.ColumnType, @tagName(tag)),
             };
-            var probe: DescriptionProbe = .{ .server = server, .credential = self.credential, .request = self.request };
+            var probe: DescriptionProbe = .{ .resolution_context = &native_adapter.context, .server = server, .credential = self.credential, .request = self.request };
             guarded.probe = &probe;
             var describe_backend = guarded.backend();
             describe_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
@@ -1034,9 +1034,16 @@ const Job = struct {
             const ddl_catalog = @import("sql_catalog.zig");
             const guard = if (ddl_catalog.bindsExisting(compiled.statement)) blk: {
                 try probe.sample(self.alloc);
-                const bound = try ddl_catalog.describeGuard(server, identity, context, native_adapter.database, native_adapter.namespace, self.alloc, compiled.statement, native_adapter.ddl_search_path);
+                const bound = try ddl_catalog.describeGuard(server, identity, native_adapter.context, native_adapter.database, native_adapter.namespace, self.alloc, compiled.statement, native_adapter.ddl_search_path);
                 break :blk bound.bytes;
             } else try statementBindingGuard(self.alloc, native_adapter.revision, description.binding);
+            const bound_guard = if (guard) |bytes| blk: {
+                if (probe.catalog) |stamp| {
+                    defer self.alloc.free(bytes);
+                    break :blk try std.mem.concat(self.alloc, u8, &.{ incarnation_prefix, &stamp.relation_epoch.incarnation, bytes });
+                }
+                break :blk bytes;
+            } else null;
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
             for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
@@ -1046,13 +1053,13 @@ const Job = struct {
                 .columns = columns,
                 .parameter_types = parameter_types,
                 .parameter_descriptors = try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors),
-                .binding_guard = guard,
+                .binding_guard = bound_guard,
                 .setting_epoch = if (description.settings) |view| view.epoch else null,
             };
             return;
         }
         if (@import("sql_catalog.zig").bindsExisting(compiled.statement)) {
-            if (self.request.binding_guard) |bytes| native_adapter.ddl_guard = try @import("sql_ddl_binding.zig").Guard.decode(bytes);
+            if (self.request.binding_guard) |bytes| native_adapter.ddl_guard = try @import("sql_ddl_binding.zig").Guard.decode((try splitBinding(bytes)).targets);
         }
         const parameters = if (self.request.parameter_cells != null) self.request.parameters else try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
         var execution_backend = guarded.backend();
@@ -1312,6 +1319,7 @@ const Authority = struct {
         // Unrepresentable positive deadlines are effectively unbounded; check()
         // above still rejects expired requests and explicit cancellation.
         var native_context = requestContext(self.credential, &self.request);
+        if (self.request.binding_guard) |guard| native_context.bound_catalog_incarnation = (try splitBinding(guard)).incarnation;
         native_context.sql_completion = if (self.request.completion != null) .{ .ptr = self, .prepare_transaction = prepareTransaction, .prepare_metadata = prepareMetadata, .reject_metadata = rejectMetadata } else null;
         native_context.row_policy_credential = self.identity;
         native_context.table_write_authorization = .{ .ptr = self, .allows = allowsWrite };
@@ -1346,14 +1354,16 @@ const GuardedCatalog = struct {
     indexed_entries: BindingEntries = .empty,
 
     fn indexLargeGuard(self: *GuardedCatalog, a: std.mem.Allocator) !void {
-        const bytes = self.expected_guard orelse return;
+        const envelope = self.expected_guard orelse return;
+        const bytes = (try splitBinding(envelope)).targets;
+        self.expected_guard = bytes;
         if (@import("sql_ddl_binding.zig").Guard.isDdl(bytes)) return;
         var targets = try GuardTargets.init(bytes);
         if (targets.count <= 8) return;
         errdefer self.indexed_entries.deinit(a);
         try self.indexed_entries.ensureTotalCapacity(a, targets.count);
         while (try targets.next()) |target| {
-            self.indexed_entries.putAssumeCapacity(.{ .name = target.name, .id = target.id, .version = target.version, .graph_revision = target.graph_revision }, {});
+            self.indexed_entries.putAssumeCapacity(.{ .name = target.name, .id = target.id, .version = target.version, .column_lineage = target.column_lineage, .graph_revision = target.graph_revision }, {});
         }
     }
 
@@ -1673,6 +1683,7 @@ const GuardedCatalog = struct {
 };
 
 const DescriptionProbe = struct {
+    resolution_context: *operation.RequestContext,
     server: *http.ApiHttpServer,
     credential: *Credential,
     request: wire.Request,
@@ -1683,6 +1694,7 @@ const DescriptionProbe = struct {
         if (self.sampled) return;
         self.sampled = true;
         self.catalog = try catalogStamp(self.server, alloc, self.credential, self.request);
+        if (self.catalog) |stamp| self.resolution_context.bound_catalog_incarnation = stamp.relation_epoch.incarnation;
     }
 };
 
@@ -1726,9 +1738,10 @@ const BindingEntry = struct {
     id: u64,
     name: []const u8,
     version: u32,
+    column_lineage: u32,
     graph_revision: u64,
     fn of(table: catalog.Table) BindingEntry {
-        return .{ .id = table.id, .name = table.physical_name, .version = table.schema_version, .graph_revision = graphRevision(table) };
+        return .{ .id = table.id, .name = table.physical_name, .version = table.schema_version, .column_lineage = table.column_lineage orelse table.schema_version, .graph_revision = graphRevision(table) };
     }
 };
 const BindingEntryContext = struct {
@@ -1736,11 +1749,12 @@ const BindingEntryContext = struct {
         var h = std.hash.Wyhash.init(key.id);
         h.update(key.name);
         std.hash.autoHash(&h, key.version);
+        std.hash.autoHash(&h, key.column_lineage);
         std.hash.autoHash(&h, key.graph_revision);
         return @truncate(h.final());
     }
     pub fn eql(_: @This(), x: BindingEntry, y: BindingEntry, _: usize) bool {
-        return x.id == y.id and x.version == y.version and x.graph_revision == y.graph_revision and std.mem.eql(u8, x.name, y.name);
+        return x.id == y.id and x.version == y.version and x.column_lineage == y.column_lineage and x.graph_revision == y.graph_revision and std.mem.eql(u8, x.name, y.name);
     }
 };
 const BindingEntries = std.ArrayHashMapUnmanaged(BindingEntry, void, BindingEntryContext, true);
@@ -1781,7 +1795,7 @@ fn bindingGuard(alloc: std.mem.Allocator, revision: u64, table: catalog.Table) !
 fn encodeBindingGuard(alloc: std.mem.Allocator, revision: u64, entries: []const BindingEntry) ![]const u8 {
     if (entries.len == 0 or entries.len > max_binding_entries) return error.SqlProgramLimitExceeded;
     var length: usize = 10;
-    for (entries) |item| length = try std.math.add(usize, length, 24 + item.name.len);
+    for (entries) |item| length = try std.math.add(usize, length, 28 + item.name.len);
     const bytes = try alloc.alloc(u8, length);
     std.mem.writeInt(u64, bytes[0..8], revision, .little);
     std.mem.writeInt(u16, bytes[8..10], @intCast(entries.len), .little);
@@ -1792,8 +1806,9 @@ fn encodeBindingGuard(alloc: std.mem.Allocator, revision: u64, entries: []const 
         std.mem.writeInt(u64, entry[4..12], item.id, .little);
         std.mem.writeInt(u32, entry[12..16], item.version, .little);
         std.mem.writeInt(u64, entry[16..24], item.graph_revision, .little);
-        @memcpy(entry[24..][0..item.name.len], item.name);
-        offset += 24 + item.name.len;
+        std.mem.writeInt(u32, entry[24..28], item.column_lineage, .little);
+        @memcpy(entry[28..][0..item.name.len], item.name);
+        offset += 28 + item.name.len;
     }
     return bytes;
 }
@@ -1801,7 +1816,7 @@ fn encodeBindingGuard(alloc: std.mem.Allocator, revision: u64, entries: []const 
 const GuardTargets = struct {
     rest: []const u8,
     count: u16,
-    const Target = struct { id: u64, version: u32, graph_revision: u64, name: []const u8 };
+    const Target = struct { id: u64, version: u32, column_lineage: u32, graph_revision: u64, name: []const u8 };
 
     fn init(guard: []const u8) !GuardTargets {
         if (guard.len < 10) return error.CatalogGenerationChanged;
@@ -1815,23 +1830,37 @@ const GuardTargets = struct {
             return null;
         }
         const entry = self.rest;
-        if (entry.len < 24) return error.CatalogGenerationChanged;
+        if (entry.len < 28) return error.CatalogGenerationChanged;
         const len = std.mem.readInt(u32, entry[0..4], .little);
-        if (len > entry.len - 24) return error.CatalogGenerationChanged;
-        self.rest = entry[24 + len ..];
+        if (len > entry.len - 28) return error.CatalogGenerationChanged;
+        self.rest = entry[28 + len ..];
         self.count -= 1;
-        return .{ .id = std.mem.readInt(u64, entry[4..12], .little), .version = std.mem.readInt(u32, entry[12..16], .little), .graph_revision = std.mem.readInt(u64, entry[16..24], .little), .name = entry[24..][0..len] };
+        return .{ .id = std.mem.readInt(u64, entry[4..12], .little), .version = std.mem.readInt(u32, entry[12..16], .little), .graph_revision = std.mem.readInt(u64, entry[16..24], .little), .column_lineage = std.mem.readInt(u32, entry[24..28], .little), .name = entry[28..][0..len] };
     }
 };
 
-fn sameBindingTargets(before: []const u8, after: []const u8) bool {
+const incarnation_prefix = "epoch-v1" ++ "\x00\x00";
+const BoundTargets = struct { incarnation: ?[16]u8 = null, targets: []const u8 };
+fn splitBinding(bytes: []const u8) !BoundTargets {
+    if (!std.mem.startsWith(u8, bytes, incarnation_prefix)) return .{ .targets = bytes };
+    const rest = bytes[incarnation_prefix.len..];
+    if (rest.len <= 16) return error.CatalogGenerationChanged;
+    return .{ .incarnation = rest[0..16].*, .targets = rest[16..] };
+}
+
+fn sameBindingTargets(original: []const u8, current: []const u8) bool {
+    const old = splitBinding(original) catch return false;
+    const new = splitBinding(current) catch return false;
+    if (!std.meta.eql(old.incarnation, new.incarnation)) return false;
+    const before = old.targets;
+    const after = new.targets;
     if (@import("sql_ddl_binding.zig").Guard.isDdl(before)) return std.mem.eql(u8, before, after);
     var left = GuardTargets.init(before) catch return false;
     var right = GuardTargets.init(after) catch return false;
     if (left.count != right.count) return false;
     while (left.next() catch return false) |x| {
         const y = (right.next() catch return false) orelse return false;
-        if (x.id != y.id or x.graph_revision != y.graph_revision or !std.mem.eql(u8, x.name, y.name)) return false;
+        if (x.id != y.id or x.column_lineage != y.column_lineage or x.graph_revision != y.graph_revision or !std.mem.eql(u8, x.name, y.name)) return false;
     }
     return right.rest.len == 0;
 }
@@ -1865,6 +1894,10 @@ test "SQL pgwire prepared identity rejects same shaped table replacement before 
     const other: catalog.Table = .{ .id = 55, .physical_name = "other_docs", .schema_version = 3, .columns = &.{} };
     const many = try encodeBindingGuard(std.testing.allocator, 7, &.{ BindingEntry.of(table), BindingEntry.of(other) });
     defer std.testing.allocator.free(many);
+    const recreated_column = try bindingGuard(std.testing.allocator, 8, replacement);
+    defer std.testing.allocator.free(recreated_column);
+    try std.testing.expect(!sameBindingTargets(guard, recreated_column));
+    replacement.column_lineage = table.schema_version;
     const compatible = try bindingGuard(std.testing.allocator, 8, replacement);
     defer std.testing.allocator.free(compatible);
     try std.testing.expect(sameBindingTargets(guard, compatible));

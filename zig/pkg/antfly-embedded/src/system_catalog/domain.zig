@@ -327,6 +327,7 @@ pub const Mutation = struct {
     expected_graph_revision: ?u64 = null,
     /// Bound destructive SQL DDL. Zero attests absence for IF EXISTS.
     expected_resource_id: ?u64 = null,
+    expected_incarnation: ?[16]u8 = null,
     expected_tablespace_id: ?u64 = null,
     /// Populated only by native table admission, never accepted from public JSON.
     table_id: u64 = 0,
@@ -334,7 +335,7 @@ pub const Mutation = struct {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "expected_graph_revision") or std.mem.eql(u8, name, "expected_resource_id") or std.mem.eql(u8, name, "expected_tablespace_id")) {
+            if (comptime std.mem.eql(u8, name, "expected_incarnation") or std.mem.eql(u8, name, "expected_graph_revision") or std.mem.eql(u8, name, "expected_resource_id") or std.mem.eql(u8, name, "expected_tablespace_id")) {
                 if (@field(self, name)) |revision| {
                     try jw.objectField(name);
                     try jw.write(revision);

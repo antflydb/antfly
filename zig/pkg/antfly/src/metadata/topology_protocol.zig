@@ -128,7 +128,9 @@ const std = @import("std");
 pub const pinned_restore_job_version: u16 = 94;
 /// Catalog apply checks the physical identity captured by pgwire Bind.
 pub const bound_ddl_version: u16 = 95;
-pub const current_version: u16 = bound_ddl_version;
+/// Bound catalog and policy commands carry guards verified by every applying replica.
+pub const bound_catalog_incarnation_version: u16 = 96;
+pub const current_version: u16 = bound_catalog_incarnation_version;
 
 pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
     const empty: [32]u8 = @splat(0);

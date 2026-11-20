@@ -175,6 +175,7 @@ pub const TableCommitRequest = struct {
 pub const CatalogBinding = struct { logical: []const u8, physical: []const u8 };
 
 pub const OwnedTransactionCommitRequest = struct {
+    bound_catalog_incarnation: ?[16]u8 = null,
     constraint_timing: std.ArrayListUnmanaged(@import("antfly_local_sources").storage_relational_index.ConstraintTiming) = .empty,
 
     // Server-authored identity bindings are persisted with staged operations.
@@ -246,6 +247,7 @@ pub const OwnedTransactionCommitRequest = struct {
 
     pub fn clone(self: OwnedTransactionCommitRequest, alloc: std.mem.Allocator) !OwnedTransactionCommitRequest {
         var out: OwnedTransactionCommitRequest = .{
+            .bound_catalog_incarnation = self.bound_catalog_incarnation,
             .sync_level = self.sync_level,
             .commit_requires = self.commit_requires,
         };
@@ -287,6 +289,10 @@ pub const OwnedTransactionCommitRequest = struct {
     }
 
     pub fn mergeFrom(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, other: *const OwnedTransactionCommitRequest) !void {
+        if (other.bound_catalog_incarnation) |incarnation| {
+            if (self.bound_catalog_incarnation) |bound| if (!std.mem.eql(u8, &bound, &incarnation)) return error.CatalogGenerationChanged;
+            self.bound_catalog_incarnation = incarnation;
+        }
         self.commit_requires = db_mod.types.CommitRequires.strongest(self.commit_requires, other.commit_requires);
         for (other.constraint_timing.items) |mode| try self.setConstraintTiming(alloc, mode);
         for (other.catalog_bindings.items) |binding| try self.bind(alloc, binding.logical, binding.physical);
@@ -340,6 +346,7 @@ pub const OwnedTransactionCommitRequest = struct {
             offset += table_writes.len;
             out[i] = .{
                 .table_name = self.physicalName(table.table_name),
+                .bound_catalog_incarnation = self.bound_catalog_incarnation,
                 .commit_requires = db_mod.types.CommitRequires.strongest(table.commit_requires_floor, table.batch.req.commit_requires orelse self.commit_requires),
                 .default_commit_requires = self.commit_requires,
                 .schema_version = table.schema_version,
@@ -4424,10 +4431,10 @@ pub fn encodeCommitRequest(alloc: std.mem.Allocator, req: OwnedTransactionCommit
 fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommitRequest, trusted: bool) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    const versioned = trusted and (req.commit_requires != null or for (req.tables) |table| {
+    const versioned = trusted and (req.bound_catalog_incarnation != null or req.commit_requires != null or for (req.tables) |table| {
         if (table.commit_requires_floor != null or table.batch.req.commit_requires != null) break true;
     } else false);
-    if (versioned) try out.appendSlice(alloc, "[\"commit-requirements-request-v1\",");
+    if (versioned) try out.appendSlice(alloc, if (req.bound_catalog_incarnation != null) "[\"bound-catalog-request-v1\"," else "[\"commit-requirements-request-v1\",");
     try out.appendSlice(alloc, "{\"read_set\":[");
     for (req.read_set, 0..) |item, i| {
         if (i > 0) try out.append(alloc, ',');
@@ -4476,6 +4483,11 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
         defer alloc.free(timing);
         try out.appendSlice(alloc, timing);
     }
+    if (trusted) if (req.bound_catalog_incarnation) |incarnation| {
+        try out.appendSlice(alloc, ",\"bound_catalog_incarnation\":\"");
+        try out.appendSlice(alloc, &std.fmt.bytesToHex(incarnation, .lower));
+        try out.append(alloc, '"');
+    };
     if (trusted and req.catalog_bindings.items.len != 0) {
         try out.appendSlice(alloc, ",\"catalog_bindings\":");
         const bindings = try std.json.Stringify.valueAlloc(alloc, req.catalog_bindings.items, .{});
@@ -4736,8 +4748,10 @@ fn parseReadSet(alloc: std.mem.Allocator, value: std.json.Value) ![]TransactionR
 fn parseStoredCommitValue(alloc: std.mem.Allocator, encoded: std.json.Value) !OwnedTransactionCommitRequest {
     const value = if (encoded == .array) blk: {
         const fields = encoded.array.items;
-        if (fields.len != 2 or fields[0] != .string or !std.mem.eql(u8, fields[0].string, "commit-requirements-request-v1") or fields[1] != .object)
-            return error.InvalidTransactionSessionRecord;
+        if (fields.len != 2 or fields[0] != .string or fields[1] != .object) return error.InvalidTransactionSessionRecord;
+        const bound = std.mem.eql(u8, fields[0].string, "bound-catalog-request-v1");
+        if (!bound and !std.mem.eql(u8, fields[0].string, "commit-requirements-request-v1")) return error.InvalidTransactionSessionRecord;
+        if (bound != fields[1].object.contains("bound_catalog_incarnation")) return error.InvalidTransactionSessionRecord;
         break :blk fields[1];
     } else encoded;
     if (encoded == .array and !value.object.contains("commit_requires_floors")) return error.InvalidTransactionSessionRecord;
@@ -4781,6 +4795,13 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, encoded: std.json.Value) !Ow
                 write.json_null_fields = try cloneJsonNullFields(alloc, parsed.value);
             }
         }
+    }
+    if (value.object.get("bound_catalog_incarnation")) |field| {
+        if (encoded != .array) return error.InvalidTransactionSessionRecord;
+        if (field != .string or field.string.len != 32) return error.InvalidTransactionSessionRecord;
+        var incarnation: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&incarnation, field.string) catch return error.InvalidTransactionSessionRecord;
+        request.bound_catalog_incarnation = incarnation;
     }
     if (value.object.get("catalog_bindings")) |bindings| {
         if (bindings != .array) return error.InvalidTransactionSessionRecord;
@@ -7958,15 +7979,18 @@ test "distributed txn session preserves numeric tokens across staging savepoints
 
 test "transaction catalog bindings persist privately and cannot be injected publicly" {
     const alloc = std.testing.allocator;
-    const body = "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{}}}},\"catalog_bindings\":[{\"logical\":\"docs\",\"physical\":\"table:untrusted\"}]}";
+    const body = "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{}}}},\"bound_catalog_incarnation\":\"ffffffffffffffffffffffffffffffff\",\"catalog_bindings\":[{\"logical\":\"docs\",\"physical\":\"table:untrusted\"}]}";
     var request = try parseCommitRequest(alloc, body);
     defer request.deinit(alloc);
     try std.testing.expectEqualStrings("docs", request.physicalName("docs"));
+    try std.testing.expect(request.bound_catalog_incarnation == null);
+    request.bound_catalog_incarnation = @splat(7);
     try request.bind(alloc, "docs", "table:original");
     try std.testing.expectError(error.CatalogGenerationChanged, request.bind(alloc, "docs", "table:replacement"));
     const public = try encodeCommitRequest(alloc, request);
     defer alloc.free(public);
     try std.testing.expect(std.mem.indexOf(u8, public, "catalog_bindings") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "bound_catalog_incarnation") == null);
     const stored = try encodeCommitRequestMode(alloc, request, true);
     defer alloc.free(stored);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
@@ -7977,6 +8001,9 @@ test "transaction catalog bindings persist privately and cannot be injected publ
     try std.testing.expectEqualStrings("docs", restored.logicalName("table:original"));
     var copied = try restored.clone(alloc);
     defer copied.deinit(alloc);
+    try std.testing.expectEqual(request.bound_catalog_incarnation, copied.bound_catalog_incarnation);
+    const different: OwnedTransactionCommitRequest = .{ .bound_catalog_incarnation = @splat(8) };
+    try std.testing.expectError(error.CatalogGenerationChanged, copied.mergeFrom(alloc, &different));
     try std.testing.expectEqualStrings("table:original", copied.physicalName("docs"));
 }
 

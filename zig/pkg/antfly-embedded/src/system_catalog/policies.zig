@@ -184,7 +184,15 @@ pub const Record = struct {
 pub const Command = struct {
     version: u16 = 1,
     expected_revision: u64,
+    expected_incarnation: ?[16]u8 = null,
+    expected_schema_version: ?u32 = null,
+
     change: union(enum) { put: Record, drop: struct { id: u64, generation: u64, table_id: u64 } },
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        if (comptime std.mem.eql(u8, field, "expected_incarnation") or std.mem.eql(u8, field, "expected_schema_version")) return @field(self, field) == null;
+        return false;
+    }
 };
 
 pub const Snapshot = struct {

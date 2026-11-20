@@ -3773,15 +3773,14 @@ fn queryNeedsPrimaryTextIndex(req: db_mod.types.SearchRequest) bool {
 
 pub fn schemaVersion(schema_json: []const u8) !u32 {
     if (schema_json.len == 0) return 0;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, schema_json, .{});
-    defer parsed.deinit();
-
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidSchemaUpdateRequest,
+    // Skip schema bodies and index definitions when only the version is needed.
+    const Header = struct { version: std.json.Value = .{ .integer = 0 } };
+    var parsed = std.json.parseFromSlice(Header, std.heap.page_allocator, schema_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.UnexpectedToken => return error.InvalidSchemaUpdateRequest,
+        else => return err,
     };
-    const version_value = root.get("version") orelse return 0;
-    return switch (version_value) {
+    defer parsed.deinit();
+    return switch (parsed.value.version) {
         .integer => |value| std.math.cast(u32, value) orelse error.InvalidSchemaUpdateRequest,
         else => error.InvalidSchemaUpdateRequest,
     };
@@ -4016,15 +4015,54 @@ pub fn indexBirthVersion(alloc: std.mem.Allocator, schema: []const u8, name: []c
     return projection.value.birth(name);
 }
 
-fn stampIndexLifetimes(a: std.mem.Allocator, root: *std.json.ObjectMap, previous: []const u8, version: u32) !void {
-    const indexes = root.get("relational_indexes") orelse return;
-    if (indexes != .array or indexes.array.items.len == 0) return;
+// Only a surviving relational row shape carries continuity across versions.
+fn rowProperties(root: std.json.ObjectMap) ?std.json.ObjectMap {
+    const mode = root.get("storage_mode") orelse return null;
+    if (mode != .string or !std.mem.eql(u8, mode.string, "relational")) return null;
+    const name = root.get("default_type") orelse return null;
+    const definitions = root.get("document_schemas") orelse return null;
+    if (name != .string or definitions != .object) return null;
+    const row = definitions.object.get(name.string) orelse return null;
+    if (row != .object) return null;
+    const schema = row.object.get("schema") orelse return null;
+    if (schema != .object) return null;
+    const properties = schema.object.get("properties") orelse return null;
+    return if (properties == .object) properties.object else null;
+}
+
+fn stampColumnLineage(a: std.mem.Allocator, root: *std.json.ObjectMap, old: std.json.ObjectMap, version: u32) !void {
+    const before = rowProperties(old) orelse return;
+    const after = rowProperties(root.*) orelse return;
+    if (!json_helpers.jsonValuesEqual(old.get("default_type").?, root.get("default_type").?)) return;
+    var it = before.iterator();
+    while (it.next()) |entry| {
+        const current = after.get(entry.key_ptr.*) orelse return;
+        if (!json_helpers.jsonValuesEqual(entry.value_ptr.*, current)) return;
+    }
+    const prior = old.get("version") orelse std.json.Value{ .integer = 0 };
+    const prior_version = switch (prior) {
+        .integer => |v| std.math.cast(u32, v) orelse return,
+        .number_string => |v| std.fmt.parseInt(u32, v, 10) catch return,
+        else => return,
+    };
+    if (prior_version >= version) return;
+    var stamp: std.json.ObjectMap = .empty;
+    try stamp.put(a, "version", .{ .integer = version });
+    try stamp.put(a, "start", .{ .integer = schema_mod.columnLineage(old, prior_version) });
+    try root.put(a, "x-antfly-column-lineage", .{ .object = stamp });
+}
+
+fn stampSchemaLifetimes(a: std.mem.Allocator, root: *std.json.ObjectMap, previous: []const u8, version: u32) !void {
+    if (rowProperties(root.*) == null and root.get("relational_indexes") == null) return;
     const source = if (previous.len == 0) "{}" else previous;
     const old = std.json.parseFromSliceLeaky(std.json.Value, a, source, .{ .parse_numbers = false }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return,
     };
     if (old != .object) return;
+    try stampColumnLineage(a, root, old.object, version);
+    const indexes = root.get("relational_indexes") orelse return;
+    if (indexes != .array or indexes.array.items.len == 0) return;
     const projection = std.json.parseFromSliceLeaky(IndexLifetimesProjection, a, source, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return,
@@ -4085,7 +4123,8 @@ fn normalizeSchemaWithPredecessor(alloc: std.mem.Allocator, schema_json: []const
     if (parsed.value != .object) return error.InvalidSchemaUpdateRequest;
     const root = &parsed.value.object;
     _ = root.orderedRemove(index_lifetimes_field);
-    if (predecessor) |old| try stampIndexLifetimes(parsed.arena.allocator(), root, old, version);
+    _ = root.orderedRemove("x-antfly-column-lineage");
+    if (predecessor) |old| try stampSchemaLifetimes(parsed.arena.allocator(), root, old, version);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);

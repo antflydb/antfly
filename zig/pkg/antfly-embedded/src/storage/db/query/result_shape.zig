@@ -1895,9 +1895,7 @@ pub fn resolveChunkParentId(
     resolver: ChunkParentResolver,
 ) ![]u8 {
     if (hit.artifact_ref) |artifact_ref| {
-        if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) {
-            return try alloc.dupe(u8, artifact_ref.document_id);
-        }
+        return try alloc.dupe(u8, artifact_ref.document_id);
     }
 
     if (internal_keys.isChunkArtifactRecordKey(hit.id) or internal_keys.isAssetArtifactKey(hit.id)) {
@@ -1910,9 +1908,7 @@ pub fn resolveChunkParentId(
     }) |artifact_ref_value| {
         var artifact_ref = artifact_ref_value;
         defer artifact_ref.deinit(alloc);
-        if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) {
-            return try alloc.dupe(u8, artifact_ref.document_id);
-        }
+        return try alloc.dupe(u8, artifact_ref.document_id);
     }
 
     const stored = if (hit.stored_data) |stored_data|
@@ -1927,6 +1923,25 @@ pub fn resolveChunkParentId(
     const parent = parsed.value.object.get("_parent_doc_key") orelse parsed.value.object.get("parent_doc_key") orelse return try alloc.dupe(u8, hit.id);
     if (parent != .string) return error.InvalidChunkArtifact;
     return try alloc.dupe(u8, parent.string);
+}
+
+test "source grouping trusts a whole document embedding in a mixed page index" {
+    const a = std.testing.allocator;
+    const loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!?[]u8 {
+            return error.UnexpectedDocumentRead;
+        }
+    };
+    var hit: types.SearchHit = .{
+        .id = @constCast("doc"),
+        .artifact_ref = .{ .kind = .embedding, .name = @constCast("text"), .document_id = @constCast("doc") },
+    };
+    for ([_]?[]u8{ null, @constCast("{\"parent_doc_key\":\"other\"}") }) |payload| {
+        hit.stored_data = payload;
+        const parent = try resolveChunkParentId(a, hit, .{ .ctx = null, .load_stored = loader.load });
+        defer a.free(parent);
+        try std.testing.expectEqualStrings("doc", parent);
+    }
 }
 
 const ArtifactIdentityMatch = enum {

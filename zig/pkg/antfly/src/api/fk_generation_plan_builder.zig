@@ -98,6 +98,7 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
     try context.ensureActive();
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
+    try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
     const current = for (snapshot.tables) |table| {
         if (table.table_id == before.table_id and std.mem.eql(u8, table.name, before.name)) break table;
     } else return error.CatalogGenerationChanged;

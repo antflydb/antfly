@@ -13058,10 +13058,32 @@ pub const RaftApplyStore = struct {
         return .{ .version = native.version, .digest = digest, .record_digest = record_digest, .has_indexes = has_indexes, .has_schema_search = has_schema_search };
     }
 
+    fn boundPolicyMatches(txn: anytype, group: u64, command: sql_policies.Command, alloc: std.mem.Allocator) !bool {
+        if (!try boundIncarnationMatches(txn, group, command.expected_incarnation)) return false;
+        const expected = command.expected_schema_version orelse return true;
+        if (command.change != .put or command.change.put.schema_version != expected) return false;
+        var key: [160]u8 = undefined;
+        const bytes = txn.get(try tableKeyForGroup(&key, group, command.change.put.table_id)) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const table = try decodeTableRecord(arena.allocator(), bytes);
+        return try @import("../../api/tables.zig").schemaVersion(table.schema_json) == expected;
+    }
+
+    fn boundIncarnationMatches(txn: anytype, group: u64, expected: ?[16]u8) !bool {
+        const incarnation = expected orelse return true;
+        const epoch = try relationSourceEpochTxn(txn, group);
+        return std.mem.eql(u8, &epoch.incarnation, &incarnation);
+    }
+
     fn applySqlPoliciesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
         var parsed = try std.json.parseFromSlice(sql_policies.Command, self.alloc, bytes, .{});
         defer parsed.deinit();
+        if (!try boundPolicyMatches(txn, group_id, parsed.value, self.alloc)) return;
         _ = try self.ensureDerivedCatalogIndexesTxn(txn, group_id);
         const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
         var hash: [32]u8 = undefined;
@@ -14711,6 +14733,7 @@ pub const RaftApplyStore = struct {
     pub fn systemCatalogAdmission(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Mutation) !CatalogAdmission {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
+        if (!try boundIncarnationMatches(&txn, group_id, request.expected_incarnation)) return error.CatalogGenerationChanged;
         const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
         var result: CatalogAdmission = .{ .meta = meta };
         if (request.kind == .table and (request.action == .create or request.action == .set_tablespace)) {
@@ -15062,6 +15085,7 @@ pub const RaftApplyStore = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const meta = try system_catalog_storage.readMeta(a, txn, group_id);
+        if (!try boundIncarnationMatches(txn, group_id, command.mutation.expected_incarnation)) return;
         if (meta.revision != command.expected_revision) return;
         if (command.mutation.kind == .table and command.mutation.action == .create) {
             const namespace = if (std.mem.eql(u8, command.mutation.namespace, system_catalog.default_namespace_name) and

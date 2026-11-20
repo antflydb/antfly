@@ -55,10 +55,13 @@ pub const Guard = struct {
                 if (entry.found_existing) return error.InvalidSqlSyntax;
                 entry.value_ptr.* = parent;
             }
-            for (plan.parents) |parent| for (parent.transitions) |transition| {
-                const binding = expected.fetchRemove(transition.constraint_name) orelse return error.CatalogGenerationChanged;
-                if (binding.value.id != parent.table.table_id or binding.value.schema_version != try @import("tables.zig").schemaVersion(parent.table.schema_json)) return error.CatalogGenerationChanged;
-            };
+            for (plan.parents) |parent| {
+                const version = try @import("tables.zig").schemaVersion(parent.table.schema_json);
+                for (parent.transitions) |transition| {
+                    const binding = expected.fetchRemove(transition.constraint_name) orelse return error.CatalogGenerationChanged;
+                    if (binding.value.id != parent.table.table_id or binding.value.schema_version != version) return error.CatalogGenerationChanged;
+                }
+            }
             if (expected.count() != 0) return error.CatalogGenerationChanged;
         }
 

@@ -809,8 +809,9 @@ pub const Adapter = struct {
             }
         }
         if (!self.server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
-        const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = targets, .include_query_definitions = true, .expected_revision = self.revision } });
+        const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = targets, .include_query_definitions = true, .include_source_epoch = self.context.bound_catalog_incarnation != null, .expected_revision = self.revision } });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
+        try self.context.checkCatalogIncarnation(snapshot.source_epoch);
         if (self.revision) |revision| if (revision != snapshot.revision) return error.CatalogGenerationChanged;
         if (snapshot.tables.len != targets.len) return error.InvalidSqlBackendResponse;
         const bindings = try alloc.alloc(catalog.Table, targets.len);
@@ -919,8 +920,9 @@ pub const Adapter = struct {
         // statement. The coordinator still applies its own durable auth fence.
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const target: system_catalog.Target = .{ .database = scope.database, .namespace = scope.namespace, .table = scope.name };
-        const bytes = try self.server.source.systemCatalog(temporary, self.context, .{ .resolve_many = .{ .targets = &.{target}, .expected_revision = scope.revision } });
+        const bytes = try self.server.source.systemCatalog(temporary, self.context, .{ .resolve_many = .{ .targets = &.{target}, .include_source_epoch = self.context.bound_catalog_incarnation != null, .expected_revision = scope.revision } });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, temporary, bytes, .{});
+        try self.context.checkCatalogIncarnation(snapshot.source_epoch);
         if (snapshot.revision != scope.revision or snapshot.tables.len != 1) return error.CatalogGenerationChanged;
         const current = snapshot.tables[0] orelse return error.CatalogGenerationChanged;
         if (current.table_id != table.id or !std.mem.eql(u8, current.name, table.physical_name)) return error.CatalogGenerationChanged;
@@ -2662,7 +2664,7 @@ pub const Adapter = struct {
             defer if (tables[0].conflict_guards) |*owned| owned.deinit();
             if (guards) |value| try tables[0].mergeConflictGuards(alloc, value);
             var bindings = [_]txn.CatalogBinding{.{ .logical = logical, .physical = table.physical_name }};
-            const statement = txn.OwnedTransactionCommitRequest{ .tables = &tables, .catalog_bindings = .{ .items = &bindings, .capacity = 1, .pointer_stability = .{} } };
+            const statement = txn.OwnedTransactionCommitRequest{ .bound_catalog_incarnation = self.context.bound_catalog_incarnation, .tables = &tables, .catalog_bindings = .{ .items = &bindings, .capacity = 1, .pointer_stability = .{} } };
             if (!(try self.server.transactionRequestAuthorized(self.identity.*, statement))) return error.Forbidden;
             _ = (try self.server.txn_sessions.stageValidated(self.server.alloc, id, &statement, .{ .ptr = self, .validate = validateStaged })) orelse return error.SqlTransactionNotActive;
             self.ranges_staged = true;
