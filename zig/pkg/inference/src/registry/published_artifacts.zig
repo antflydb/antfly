@@ -18,18 +18,19 @@
 const std = @import("std");
 const managed = @import("managed_receipt.zig");
 pub const Expected = struct { publication: ?[32]u8 };
-/// Process-owned successful checksum proofs. Keys own no pathname memory;
+/// Process-owned checksum outcomes. Keys own no pathname memory;
 /// publication, canonical member, declared digest and the complete file stamp
 /// must all match. No on-disk memo can authenticate a receipt member.
 pub const VerificationCache = struct {
     pub const capacity = 4096;
-    const Entry = struct { stamp: managed.ArtifactStamp, used: u64 };
+    const Entry = struct { stamp: managed.ArtifactStamp, used: u64, rejected: bool };
     /// Manager-owned caches outlive the allocators of borrowed acquisitions.
     owner_allocator: ?std.mem.Allocator = null,
     mutex: std.atomic.Mutex = .unlocked,
     builders: [16]std.Io.Mutex = @splat(.init),
     entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
     clock: u64 = 0,
+    rejected_count: usize = 0,
 
     fn lock(self: *VerificationCache) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -43,16 +44,17 @@ pub const VerificationCache = struct {
         for (artifact.sha256.?) |byte| hash.update(&.{std.ascii.toLower(byte)});
         return hash.finalResult();
     }
-    fn hit(self: *VerificationCache, key: [32]u8, stamp: managed.ArtifactStamp) bool {
+    fn hit(self: *VerificationCache, key: [32]u8, stamp: managed.ArtifactStamp) !bool {
         self.lock();
         defer self.mutex.unlock();
         const entry = self.entries.getPtr(key) orelse return false;
         if (!std.meta.eql(entry.stamp, stamp)) return false;
         self.clock +|= 1;
         entry.used = self.clock;
+        if (entry.rejected) return error.ChecksumMismatch;
         return true;
     }
-    fn remember(self: *VerificationCache, a: std.mem.Allocator, key: [32]u8, stamp: managed.ArtifactStamp) !void {
+    fn remember(self: *VerificationCache, a: std.mem.Allocator, key: [32]u8, stamp: managed.ArtifactStamp, rejected: bool) !void {
         self.lock();
         defer self.mutex.unlock();
         self.clock +|= 1;
@@ -64,13 +66,18 @@ pub const VerificationCache = struct {
                 oldest = entry.key_ptr.*;
                 age = entry.value_ptr.used;
             };
-            _ = self.entries.remove(oldest.?);
+            const evicted = self.entries.fetchRemove(oldest.?).?;
+            if (evicted.value.rejected) self.rejected_count -= 1;
         }
-        try self.entries.put(self.owner_allocator orelse a, key, .{ .stamp = stamp, .used = self.clock });
+        const prior_rejected = if (self.entries.get(key)) |entry| entry.rejected else false;
+        try self.entries.put(self.owner_allocator orelse a, key, .{ .stamp = stamp, .used = self.clock, .rejected = rejected });
+        if (prior_rejected != rejected) {
+            if (rejected) self.rejected_count += 1 else self.rejected_count -= 1;
+        }
     }
     fn verify(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, initial: managed.ArtifactStamp, control: managed.VerificationControl) !managed.ArtifactStamp {
         const key = keyFor(publication, artifact);
-        if (self.hit(key, initial)) return initial;
+        if (try self.hit(key, initial)) return initial;
         const builder = &self.builders[key[0] % self.builders.len];
         try control.lock(builder, io);
         defer builder.unlock(io);
@@ -78,24 +85,43 @@ pub const VerificationCache = struct {
         // this request waited. Never reuse the pre-wait filesystem stamp.
         const stamp = managed.ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(io, artifact.canonical_path, .{ .follow_symlinks = false }));
         if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
-        if (self.hit(key, stamp)) return stamp;
-        const verified = try managed.verifyValidatedArtifactWithControl(io, artifact, artifact.sha256.?, control);
-        self.remember(a, key, verified) catch {}; // Cache pressure cannot deny a valid construction.
+        if (try self.hit(key, stamp)) return stamp;
+        const verified = managed.verifyValidatedArtifactWithControl(io, artifact, artifact.sha256.?, control) catch |err| {
+            if (err == error.ChecksumMismatch) self.remember(a, key, stamp, true) catch {};
+            return err;
+        };
+        self.remember(a, key, verified, false) catch {}; // Cache pressure cannot deny a valid construction.
         return verified;
     }
     fn verifyOpened(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, file: std.Io.File, initial: managed.ArtifactStamp, control: managed.VerificationControl) !managed.ArtifactStamp {
         const key = keyFor(publication, artifact);
-        if (self.hit(key, initial)) return initial;
+        if (try self.hit(key, initial)) return initial;
         const builder = &self.builders[key[0] % self.builders.len];
         try control.lock(builder, io);
         defer builder.unlock(io);
         const stamp = managed.ArtifactStamp.fromStat(try file.stat(io));
         if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
-        if (self.hit(key, stamp)) return stamp;
-        const verified = try managed.verifyOpenedArtifactWithControl(io, file, artifact, artifact.sha256.?, control);
-        self.remember(a, key, verified) catch {};
+        if (try self.hit(key, stamp)) return stamp;
+        const verified = managed.verifyOpenedArtifactWithControl(io, file, artifact, artifact.sha256.?, control) catch |err| {
+            if (err == error.ChecksumMismatch) self.remember(a, key, stamp, true) catch {};
+            return err;
+        };
+        self.remember(a, key, verified, false) catch {};
         return verified;
     }
+    fn hasRejections(self: *VerificationCache) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.rejected_count != 0;
+    }
+
+    fn rejectedStamp(self: *VerificationCache, key: [32]u8) ?managed.ArtifactStamp {
+        self.lock();
+        defer self.mutex.unlock();
+        const entry = self.entries.get(key) orelse return null;
+        return if (entry.rejected) entry.stamp else null;
+    }
+
     pub fn deinit(self: *VerificationCache, a: std.mem.Allocator) void {
         self.entries.deinit(self.owner_allocator orelse a);
     }
@@ -343,6 +369,19 @@ pub const PublishedArtifacts = struct {
         const receipt = if (self.receipt) |*value| value else return null;
         const index = receipt.path_index.get(relative) orelse return error.InvalidManagedDownload;
         return self.canonical_index.get(receipt.artifacts[index].canonical_path).?;
+    }
+
+    pub fn hasRejectedChecksum(self: *const PublishedArtifacts, cache: *VerificationCache) !bool {
+        const receipt = self.receipt orelse return false;
+        if (!cache.hasRejections()) return false;
+        for (receipt.artifacts) |*artifact| {
+            if (artifact.sha256 == null) continue;
+            const key = VerificationCache.keyFor(receipt.publication_generation, artifact);
+            const rejected = cache.rejectedStamp(key) orelse continue;
+            const current = managed.ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(self.io, artifact.canonical_path, .{ .follow_symlinks = false }));
+            if (std.meta.eql(rejected, current)) return true;
+        }
+        return false;
     }
 
     pub fn verifyFile(self: *PublishedArtifacts, relative: []const u8) !void {
@@ -851,18 +890,18 @@ test "model selection shared proof cache bounds residency and preserves recent e
     var cache = VerificationCache{};
     defer cache.deinit(a);
     const hot: [32]u8 = @splat(0);
-    try cache.remember(a, hot, stamp);
+    try cache.remember(a, hot, stamp, false);
     for (0..VerificationCache.capacity + 32) |i| {
         var key: [32]u8 = @splat(1);
         std.mem.writeInt(u64, key[0..8], @intCast(i), .little);
-        try cache.remember(a, key, stamp);
-        try std.testing.expect(cache.hit(hot, stamp));
+        try cache.remember(a, key, stamp, false);
+        try std.testing.expect(try cache.hit(hot, stamp));
         try std.testing.expect(cache.entries.count() <= VerificationCache.capacity);
     }
     try std.testing.expectEqual(@as(usize, VerificationCache.capacity), cache.entries.count());
     var changed = stamp;
     changed.size += 1;
-    try std.testing.expect(!cache.hit(hot, changed));
+    try std.testing.expect(!try cache.hit(hot, changed));
 }
 
 test "model selection concurrent acquisitions coalesce one checkpoint checksum" {

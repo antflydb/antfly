@@ -10192,25 +10192,114 @@ pub const ModelManager = struct {
         return modelIdentityWithArtifacts(self.allocator, io, model_dir, manifest, &artifacts, control);
     }
 
-    /// A validated publication declares the expected content hashes. The
-    /// acquired runtime independently verifies those bytes before it may
-    /// acknowledge the revision, so catalog latency is independent of weight size.
-    pub fn declaredEmbeddingRevision(
+    pub const EmbeddingRevisions = struct {
+        const max_backends = std.enums.values(backends.BackendType).len;
+        revisions: [max_backends][32]u8 = undefined,
+        backends: [max_backends]backends.BackendType = undefined,
+        len: usize = 0,
+
+        pub fn values(self: *const EmbeddingRevisions) []const [32]u8 {
+            return self.revisions[0..self.len];
+        }
+    };
+
+    /// This is a bounded list of eligible recipes, not proof that the weights
+    /// were loaded. A pinned acquisition verifies the bytes and actual runtime.
+    pub fn declaredEmbeddingRevisions(
         self: *ModelManager,
         model_dir: []const u8,
         manifest: manifest_mod.ModelManifest,
         control: InferenceExecutionControl,
-    ) !?[32]u8 {
-        if (manifest.managed_publication == null) return null;
+    ) !EmbeddingRevisions {
+        var result: EmbeddingRevisions = .{};
+        if (manifest.managed_publication == null) return result;
         const io = control.io orelse try self.componentPlanIo();
         var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
         defer lease.deinit(io);
         var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = manifest.managed_publication });
         defer artifacts.deinit();
-        if (!hasCompleteChecksums(&artifacts)) return null;
-        const artifact_revision = try receiptedModelRevision(self.allocator, io, &artifacts.receipt.?, null, control, false);
-        const backend = plannedDurableEmbeddingBackend(self.session_manager, manifest);
-        return durableEmbeddingRevision(manifest, imagePreprocessingRevision(manifest, artifact_revision), backend orelse return null);
+        if (!hasCompleteChecksums(&artifacts)) return result;
+        if (try artifacts.hasRejectedChecksum(&self.verified_artifacts)) return error.ChecksumMismatch;
+        const declared = try receiptedModelRevision(self.allocator, io, &artifacts.receipt.?, null, control, false);
+        const artifact_revision = imagePreprocessingRevision(manifest, declared);
+        const manager = &self.session_manager;
+        if (manager.required_backend_invalid) return result;
+        var required: [1]backends.BackendType = undefined;
+        const candidates = manager.requiredBackendCandidates(self.defaultModelBackends(model_dir), &required) catch return result;
+        for (candidates) |backend| {
+            if (!backend.available()) continue;
+            if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
+            if (manifest.embedding_style == .embedding_gemma2 and backend != .native and backend != .metal and backend != .cuda) continue;
+            if (backend == .wasm and manifest.onnx_path == null) continue;
+            if (std.mem.indexOfScalar(backends.BackendType, result.backends[0..result.len], backend) != null) continue;
+            result.backends[result.len] = backend;
+            result.revisions[result.len] = durableEmbeddingRevision(manifest, artifact_revision, backend);
+            result.len += 1;
+        }
+        return result;
+    }
+
+    pub fn acquirePinnedEmbedding(
+        self: *ModelManager,
+        model_dir: []const u8,
+        expected: [32]u8,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.acquireVerifiedPinnedEmbedding(model_dir, expected, control) catch |err| switch (err) {
+            error.ChecksumMismatch => error.PinnedEmbeddingArtifactUnavailable,
+            else => err,
+        };
+    }
+
+    fn acquireVerifiedPinnedEmbedding(
+        self: *ModelManager,
+        model_dir: []const u8,
+        expected: [32]u8,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        const publication = (try self.publicationForRequest(model_dir, control)) orelse return error.InferenceCapabilitiesStale;
+        if (try self.acquireResidentPinnedEmbedding(model_dir, publication, expected)) |handle| return handle;
+        const io = control.io orelse try self.componentPlanIo();
+        var manifest = try manifest_mod.loadBoundFromDir(self.allocator, io, model_dir, publication, false);
+        defer manifest.deinit();
+        const declared = try self.declaredEmbeddingRevisions(model_dir, manifest, control);
+        var compatible: [EmbeddingRevisions.max_backends]backends.BackendType = undefined;
+        var count: usize = 0;
+        for (declared.values(), declared.backends[0..declared.len]) |revision, backend| {
+            if (!std.mem.eql(u8, &revision, &expected)) continue;
+            compatible[count] = backend;
+            count += 1;
+        }
+        if (count == 0) return error.InferenceCapabilitiesStale;
+        const default_backends = self.defaultModelBackends(model_dir);
+        var handle = if (std.mem.eql(backends.BackendType, compatible[0..count], default_backends))
+            try self.acquireFromDirWithControl(model_dir, control)
+        else
+            try self.acquireFromDirWithPreferredBackendsAndControl(model_dir, compatible[0..count], false, control);
+        errdefer handle.releaseObservation();
+        if (!std.meta.eql(handle.get().durable_embedding_revision, @as(?[32]u8, expected))) return error.InferenceCapabilitiesStale;
+        return handle;
+    }
+
+    fn acquireResidentPinnedEmbedding(
+        self: *ModelManager,
+        model_dir: []const u8,
+        publication: [32]u8,
+        expected: [32]u8,
+    ) !?ModelHandle {
+        const defaults = self.defaultModelLoadPolicy(model_dir);
+        var required: [1]backends.BackendType = undefined;
+        const candidates = try self.session_manager.requiredBackendCandidates(defaults.preferred_backends, &required);
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        for (candidates) |backend| {
+            const model = (try self.lookupLoadedModelLocked(model_dir, &.{backend}, false, defaults.cache_policy)) orelse continue;
+            if (!std.meta.eql(model.managed_publication, @as(?[32]u8, publication)) or
+                !std.meta.eql(model.durable_embedding_revision, @as(?[32]u8, expected))) continue;
+            model.active_handles += 1;
+            return .{ .manager = self, .model = model };
+        }
+        return null;
     }
 
     fn loadFromDirUncached(
@@ -17461,21 +17550,6 @@ fn embeddingPlanningBackend(manager: backends.SessionManager) backends.BackendTy
         if (backend == .cuda or backend == .metal or backend == .native) return backend;
     }
     return .native;
-}
-
-fn plannedDurableEmbeddingBackend(manager: backends.SessionManager, manifest: manifest_mod.ModelManifest) ?backends.BackendType {
-    if (manifest.embedding_style == .embedding_gemma2) {
-        const backend = embeddingPlanningBackend(manager);
-        return if (backend.available() and (backend == .cuda or backend == .metal or backend == .native)) backend else null;
-    }
-    if (manager.required_backend) |backend| return if (backend.available()) backend else null;
-    for (manager.preferred_backends) |backend| {
-        if (!backend.available()) continue;
-        if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
-        if (backend == .wasm and manifest.onnx_path == null) continue;
-        return backend;
-    }
-    return null;
 }
 
 test "durable embedding revision fences backend execution recipes" {

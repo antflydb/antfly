@@ -2036,6 +2036,7 @@ const LoadedEmbeddingRuntimeAttemptFn = *const fn (
 
 const LoadedEmbeddingRecoveryOptions = struct {
     trace: ?*embedding_trace.Trace = null,
+    pinned_revision: ?[32]u8 = null,
     preferred_backends: ?[]const backends_mod.BackendType = null,
     cache_default_alias: bool = true,
     pin_on_success: bool = false,
@@ -2104,6 +2105,11 @@ fn acknowledgeEmbeddingRevision(ctx: *httpx.Context, revision: ?[32]u8) !void {
     }
 }
 
+fn embeddingArtifactFailureResponse(ctx: *httpx.Context) !httpx.Response {
+    try ctx.setHeader("X-Antfly-Embedding-Artifact-Unavailable", "true");
+    return transientCapacityFailureResponse(ctx, "EMBEDDING_ARTIFACT_UNAVAILABLE", "this replica could not verify an embedding artifact", "embedding_artifact_unavailable");
+}
+
 fn embeddingRevisionFailureResponse(ctx: *httpx.Context) !httpx.Response {
     try ctx.setHeader("X-Antfly-Capability-Stale", "true");
     return ctx.status(409).json(.{ .@"error" = "MODEL_REVISION_MISMATCH", .message = "the acquired embedding model does not match model_revision; refresh capabilities and replan" });
@@ -2133,10 +2139,16 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
             if (self.options.execution_control) |control| try control.check();
             if (self.options.initial_handle) |initial| {
                 if (initial.model != null) {
-                    const handle = initial.*;
-                    initial.model = null;
-                    return handle;
+                    if (self.options.pinned_revision == null or std.meta.eql(self.options.pinned_revision, initial.get().durable_embedding_revision)) {
+                        const handle = initial.*;
+                        initial.model = null;
+                        return handle;
+                    }
+                    initial.releaseObservation();
                 }
+            }
+            if (self.options.pinned_revision) |revision| {
+                return self.node.model_manager.acquirePinnedEmbedding(self.model_path, revision, self.options.execution_control orelse .{});
             }
             return if (self.options.preferred_backends) |preferred_backends|
                 if (self.options.execution_control) |control|
@@ -14565,6 +14577,7 @@ pub const Node = struct {
                 reserved_units = required_units;
             }
             return self.createGroupedEmbedding(ctx, model_path, admission_manifest, executor_contract, request, borrowed_attachments, .{ .media = media_admission, .reserved_units = &reserved_units, .audio_working_bytes = audio_admission.max_decode_working_bytes }, execution_control) catch |err| {
+                if (err == error.PinnedEmbeddingArtifactUnavailable) return embeddingArtifactFailureResponse(ctx);
                 return groupedEmbeddingFailureResponse(ctx, err);
             };
         }
@@ -14645,10 +14658,12 @@ pub const Node = struct {
                 .execution_control = execution_control,
             };
             runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
+                .pinned_revision = request.model_revision,
                 .execution_control = execution_control,
             }, &attempt, Attempt.run) catch |err|
                 {
                     if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
+                    if (err == error.PinnedEmbeddingArtifactUnavailable) return embeddingArtifactFailureResponse(ctx);
                     if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
                     return inferenceFailureResponse(ctx, err);
                 };
@@ -14881,11 +14896,13 @@ pub const Node = struct {
         var failure_stage: EmbeddingRuntimeFailureStage = .acquire;
         const pipeline_start = embedTimingStart();
         runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
+            .pinned_revision = request.model_revision,
             .failure_stage = &failure_stage,
             .trace = attempt.trace,
             .execution_control = execution_control,
         }, &attempt, Attempt.run) catch |err| {
             if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
+            if (err == error.PinnedEmbeddingArtifactUnavailable) return embeddingArtifactFailureResponse(ctx);
             if (err == error.EmbeddingIdentityMismatch) return ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = "embedding assets or recipe differ from the pinned index identity" });
             if (isInferenceExecutorContractError(err)) return inferenceExecutorContractFailureResponse(ctx, err);
             if (isEmbedRequestOptionError(err)) {
@@ -26036,7 +26053,10 @@ pub const Node = struct {
             return ctx.json(try buildEmbedDensePartialResponse(a, request.model, &partial, if (request.dimensions) |dim| @intCast(dim) else null, true, 0));
         }
         var input_tokens: usize = 0;
-        var handle = try self.model_manager.acquireFromDirWithControl(path, control);
+        var handle = if (request.model_revision) |required|
+            try self.model_manager.acquirePinnedEmbedding(path, required, control)
+        else
+            try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
         const loaded = handle.get();
         try requireServingEmbeddingRevision(request.model_revision, loaded);
@@ -26498,18 +26518,6 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model does not support the requested task" });
         }
 
-        if (expected_revision) |required| {
-            const cached = self.model_manager.acquireLoadedModelWithControl(resolved_path, execution_control) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            const revision = if (cached) |resident| found: {
-                var handle = resident;
-                defer handle.releaseObservation();
-                break :found handle.get().durable_embedding_revision;
-            } else self.model_manager.declaredEmbeddingRevision(resolved_path, manifest, execution_control) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            requireLoadedEmbeddingRevision(required, revision) catch return embeddingRevisionFailureResponse(ctx);
-        }
-
         var runtime_id: model_manager_mod.RuntimeId = 0;
         if (request.task == .reader and !isGenerativeReadModel(&manifest)) {
             var reader = readers_mod.LoadedReader.loadFromDirWithControl(
@@ -26552,8 +26560,14 @@ pub const Node = struct {
                 handle.release();
             }
         } else {
-            var handle = self.model_manager.acquireFromDirWithControl(resolved_path, execution_control) catch |err|
-                return modelLoadFailureResponse(ctx, err);
+            var handle = if (expected_revision) |required|
+                self.model_manager.acquirePinnedEmbedding(resolved_path, required, execution_control) catch |err| {
+                    if (err == error.InferenceCapabilitiesStale) return embeddingRevisionFailureResponse(ctx);
+                    if (err == error.PinnedEmbeddingArtifactUnavailable) return embeddingArtifactFailureResponse(ctx);
+                    return modelLoadFailureResponse(ctx, err);
+                }
+            else
+                self.model_manager.acquireFromDirWithControl(resolved_path, execution_control) catch |err| return modelLoadFailureResponse(ctx, err);
             defer handle.release();
             return try self.acknowledgeModelActivation(ctx, &handle, request.task, expected_revision, execution_control);
         }
@@ -26737,10 +26751,18 @@ pub const Node = struct {
                 var dense_output = manifest.denseEmbeddingOutput();
                 const embedding = std.mem.eql(u8, operation, "embed");
                 var durable_revision: ?[32]u8 = null;
-                const cached_model = self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return modelLoadFailureResponse(ctx, err);
-                const revision: ?[32]u8 = if (cached_model) |cached| loaded: {
-                    var handle = cached;
-                    defer handle.releaseObservation();
+                const include_revisions = if (ctx.query("model_revision_candidates")) |flag| std.mem.eql(u8, flag, "1") else false;
+                const requested_revision = ctx.query("model_revision");
+                var cached_model = self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return modelLoadFailureResponse(ctx, err);
+                defer if (cached_model) |*handle| handle.releaseObservation();
+                const declared = if (embedding and manifest.managed_publication != null and (cached_model == null or include_revisions or requested_revision != null))
+                    self.model_manager.declaredEmbeddingRevisions(path, manifest, control) catch |err| {
+                        if (err == error.ChecksumMismatch) return embeddingArtifactFailureResponse(ctx);
+                        return modelLoadFailureResponse(ctx, err);
+                    }
+                else
+                    model_manager_mod.ModelManager.EmbeddingRevisions{};
+                var revision: ?[32]u8 = if (cached_model) |*handle| loaded: {
                     // Geometry and revision must describe the same serving generation.
                     const serving = handle.get();
                     dense_output = serving.manifest.denseEmbeddingOutput();
@@ -26753,12 +26775,36 @@ pub const Node = struct {
                     break :loaded self.model_manager.modelIdentityForManifestWithControl(path, manifest, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 } else cold: {
                     if (embedding and manifest.managed_publication != null) {
-                        durable_revision = self.model_manager.declaredEmbeddingRevision(path, manifest, control) catch |err| return modelLoadFailureResponse(ctx, err);
+                        if (declared.len > 0) durable_revision = declared.revisions[0];
                         break :cold durable_revision;
                     }
                     break :cold self.model_manager.modelIdentityForManifestWithControl(path, manifest, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 };
                 const catalog_allocator = catalog.arena.allocator();
+                if (embedding and include_revisions) {
+                    var alternatives = std.array_list.Managed(std.json.Value).init(catalog_allocator);
+                    for (declared.values()) |candidate| {
+                        const encoded = try std.fmt.allocPrint(catalog_allocator, "{s}", .{&std.fmt.bytesToHex(candidate, .lower)});
+                        var duplicate = false;
+                        for (alternatives.items) |previous| if (std.mem.eql(u8, previous.string, encoded)) {
+                            duplicate = true;
+                            break;
+                        };
+                        if (!duplicate) try alternatives.append(.{ .string = encoded });
+                    }
+                    if (alternatives.items.len > 1) try info.object.put(catalog_allocator, "model_revisions", .{ .array = alternatives });
+                }
+                if (embedding) if (requested_revision) |required| {
+                    var requested: [32]u8 = undefined;
+                    if (required.len != 64) return embeddingRevisionFailureResponse(ctx);
+                    _ = std.fmt.hexToBytes(&requested, required) catch return embeddingRevisionFailureResponse(ctx);
+                    if (!std.meta.eql(durable_revision, @as(?[32]u8, requested)) and !for (declared.values()) |candidate| {
+                        if (std.mem.eql(u8, &candidate, &requested)) break true;
+                    } else false)
+                        return embeddingRevisionFailureResponse(ctx);
+                    durable_revision = requested;
+                    revision = requested;
+                };
                 const hex = if (revision) |value| std.fmt.bytesToHex(value, .lower) else undefined;
                 if (revision != null) {
                     try info.object.put(catalog_allocator, "model_revision", .{ .string = &hex });
@@ -50728,6 +50774,27 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     try std.testing.expect(managed_refused.status.code >= 400);
     try std.testing.expect(managed_refused.headers.get(embedding_revision.response_header) == null);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+
+    const managed_path = try tmp.dir.realPathFileAlloc(io, "embedders/acme/other", a);
+    defer a.free(managed_path);
+    const publication = try node.model_manager.publicationForRequest(managed_path, .{ .io = io });
+    var managed_manifest = try manifest_mod.loadBoundFromDir(a, io, managed_path, publication, false);
+    defer managed_manifest.deinit();
+    try std.testing.expectError(error.ChecksumMismatch, node.model_manager.modelIdentityForManifestWithControl(managed_path, managed_manifest, .{ .io = io }));
+
+    var quarantined_context = httpx.Context.init(a, io, &managed_request);
+    defer quarantined_context.deinit();
+    var quarantined = try node.listModels(&quarantined_context);
+    defer quarantined.deinit();
+    try std.testing.expectEqual(@as(u16, 503), quarantined.status.code);
+    try std.testing.expectEqualStrings("true", quarantined.headers.get("X-Antfly-Embedding-Artifact-Unavailable").?);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "embedders/acme/other/model.safetensors", .data = weights });
+    var repaired_context = httpx.Context.init(a, io, &managed_request);
+    defer repaired_context.deinit();
+    var repaired = try node.listModels(&repaired_context);
+    defer repaired.deinit();
+    try std.testing.expectEqual(@as(u16, 200), repaired.status.code);
 
     for ([_][]const u8{ "/ai/v1/models/instances", "/ai/v1/models/instances?model_revision=" ++ wrong }) |path| {
         var expired = try httpx.Request.init(a, .POST, path);

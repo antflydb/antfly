@@ -27643,8 +27643,10 @@ pub const IndexManager = struct {
         var cursor = try self.alloc.dupe(u8, lower);
         defer self.alloc.free(cursor);
         var lower_exclusive = false;
+        // A pinned page retains both encoded artifacts and decoded vectors
+        // through insertion. Charge both against the page budget.
         const max_items = if (entry.model_revision != null)
-            @min(vector_backfill_page_items, @max(1, vector_backfill_page_bytes / (@as(usize, entry.dims) * @sizeOf(f32) + 64)))
+            @min(vector_backfill_page_items, @max(1, vector_backfill_page_bytes / (@as(usize, entry.dims) * (2 * @sizeOf(f32)) + 64)))
         else
             vector_backfill_page_items;
         while (true) {
