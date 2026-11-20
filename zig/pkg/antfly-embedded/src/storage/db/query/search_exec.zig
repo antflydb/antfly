@@ -646,6 +646,7 @@ pub const MatchAllExecutor = struct {
         ctx: ?*anyopaque,
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.TextIndex,
+    resolve_primary_ordinal_keys: ?*const fn (?*anyopaque, Allocator, []const doc_set.DocOrdinal, ?u64, []?[]const u8) anyerror!void = null,
     resolve_doc_set_doc_ids: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -21961,6 +21962,87 @@ fn buildCompleteOrPartialTextDocIdMapAlloc(
     return allow_missing or !saw_live_doc or ordinal_to_text_doc_id.count() > 0;
 }
 
+fn resolveTextSortOrdinalScope(
+    alloc: Allocator,
+    scope_alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    snapshot: *const index_mod.IndexSnapshot,
+    constraints: *NativeDocIdConstraints,
+    map: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+    need_stream_scope: bool,
+    control: QueryExecutionControl,
+) !?[]const []const u8 {
+    const resolve = executor.resolve_primary_ordinal_keys orelse return null;
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    var stale: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer stale.deinit(alloc);
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var offset: usize = 0;
+    while (offset < constraints.filter_doc_nums.len) {
+        try control.check();
+        _ = scratch.reset(.retain_capacity);
+        const temp = scratch.allocator();
+        var batch: [256]doc_set.DocOrdinal = undefined;
+        var len: usize = 0;
+        while (offset < constraints.filter_doc_nums.len and len < batch.len) : (offset += 1) {
+            if (offset % 256 == 0) try control.check();
+            const ordinal = constraints.filter_doc_nums[offset];
+            if (!need_stream_scope and map.contains(ordinal)) continue;
+            batch[len] = ordinal;
+            len += 1;
+        }
+        if (len == 0) continue;
+        var resolved: [256]?[]const u8 = undefined;
+        try resolve(executor.ctx, temp, batch[0..len], req.identity_read_generation, resolved[0..len]);
+        var frontier: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+        for (batch[0..len], resolved[0..len]) |ordinal, value| {
+            const key = value orelse {
+                try stale.put(alloc, ordinal, {});
+                _ = map.remove(ordinal);
+                continue;
+            };
+            try keys.append(scope_alloc, try scope_alloc.dupe(u8, key));
+            if (!map.contains(ordinal)) try frontier.put(temp, ordinal, key);
+        }
+        if (frontier.count() == 0) continue;
+        var matches = try snapshot.collectGraphKeyFrontierDocNumsAlloc(temp, frontier, control);
+        defer matches.deinit();
+        var docs = matches.ordinals.iterator();
+        while (docs.next()) |doc| {
+            try control.check();
+            const slot = try map.getOrPut(alloc, doc.value_ptr.*);
+            if (!slot.found_existing or slot.value_ptr.* < doc.key_ptr.*) slot.value_ptr.* = doc.key_ptr.*;
+        }
+    }
+    if (stale.count() != 0) {
+        const replacement = try alloc.alloc(u32, constraints.filter_doc_nums.len - stale.count());
+        var len: usize = 0;
+        for (constraints.filter_doc_nums) |ordinal| {
+            if (stale.contains(ordinal)) continue;
+            replacement[len] = ordinal;
+            len += 1;
+        }
+        if (constraints.filter_doc_nums_owned) alloc.free(constraints.filter_doc_nums);
+        constraints.filter_doc_nums = replacement;
+        constraints.filter_doc_nums_owned = true;
+    }
+    if (!need_stream_scope) {
+        if (map.count() == constraints.filter_doc_nums.len or constraints.filter_doc_ids.len != 0) return keys.items;
+        var docs = map.valueIterator();
+        while (docs.next()) |doc| {
+            try control.check();
+            const key = (try snapshot.storedIdScoped(scope_alloc, doc.*)) orelse return error.StoredDocMissing;
+            // In-memory segments can return a borrowed stored ID. The
+            // snapshot is pinned for the full sort, so both forms are safe.
+            try keys.append(scope_alloc, key);
+        }
+    }
+    if (constraints.legacy_filter == .doc_keys) try keys.appendSlice(scope_alloc, constraints.legacy_filter.doc_keys);
+    return keys.items;
+}
+
 fn repairTextSortOrdinalProjection(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -22137,6 +22219,7 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
             .id = @constCast(stored.id),
             .ordinal = ordinal,
         };
+        if (effective_req.native_key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, stored.id)) continue;
         if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
@@ -22281,6 +22364,7 @@ fn visibleMatchAllOrdinalDocValueCandidateCountAfterCursorAlloc(
             .id = @constCast(stored.id),
             .ordinal = ordinal,
         };
+        if (req.native_key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, stored.id)) continue;
         if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
@@ -22341,11 +22425,12 @@ fn visibleMatchAllOrdinalDocValueCandidateCount(
             return error.UnsupportedQueryRequest;
         };
         identity_scratch.reset();
-        const stored = .{ .id = if (matchAllNeedsIdentity(constraints, executor.is_expired_key != null)) (try snapshot.storedIdScoped(identity_scratch.allocator(), doc_num)) orelse return error.StoredDocMissing else &.{} };
+        const stored = .{ .id = if (matchAllNeedsIdentity(constraints, executor.is_expired_key != null) or req.native_key_predicate != null) (try snapshot.storedIdScoped(identity_scratch.allocator(), doc_num)) orelse return error.StoredDocMissing else &.{} };
         const candidate = MatchAllCandidate{
             .id = @constCast(stored.id),
             .ordinal = ordinal,
         };
+        if (req.native_key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, stored.id)) continue;
         if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
@@ -22752,7 +22837,8 @@ pub fn searchMatchAll(
         const control = QueryExecutionControl{ .cancellation = exec_req.cancellation, .deadline_ns = exec_req.execution_deadline_ns };
         try normalizeNativeDocNumConstraintsAlloc(alloc, &native_constraints);
         const only_ordinals = if (native_constraints.positive_filter) native_constraints.filter_doc_nums else &.{};
-        const key_only = native_constraints.filter_doc_ids.len != 0 and only_ordinals.len == 0;
+        const had_ordinal_scope = only_ordinals.len != 0;
+        const key_only = native_constraints.filter_doc_ids.len != 0 and !had_ordinal_scope;
         if (!key_only and !(try buildCompleteOrPartialTextDocIdMapAlloc(alloc, sort_snapshot, &ordinal_to_text_doc_id, true, only_ordinals, control))) {
             logNativeSortPlanRejection(
                 "*",
@@ -22761,12 +22847,19 @@ pub fn searchMatchAll(
             );
             return error.UnsupportedQueryRequest;
         }
-        if (only_ordinals.len != 0 and ordinal_to_text_doc_id.count() != only_ordinals.len) {
-            try repairTextSortOrdinalProjection(alloc, exec_req, executor, sort_snapshot, only_ordinals, &ordinal_to_text_doc_id, control);
+        var exact_keys_arena = std.heap.ArenaAllocator.init(alloc);
+        defer exact_keys_arena.deinit();
+        const exact_key_alloc = exact_keys_arena.allocator();
+        var resolved_exact_keys: ?[]const []const u8 = null;
+        if (only_ordinals.len != 0 and (ordinal_to_text_doc_id.count() != only_ordinals.len or
+            (has_legacy and native_constraints.filter_doc_ids.len == 0)))
+        {
+            resolved_exact_keys = try resolveTextSortOrdinalScope(alloc, exact_key_alloc, exec_req, executor, sort_snapshot, &native_constraints, &ordinal_to_text_doc_id, has_legacy and native_constraints.filter_doc_ids.len == 0, control);
+            if (resolved_exact_keys == null and ordinal_to_text_doc_id.count() != only_ordinals.len)
+                try repairTextSortOrdinalProjection(alloc, exec_req, executor, sort_snapshot, only_ordinals, &ordinal_to_text_doc_id, control);
         }
-        if (!has_legacy and ordinal_to_text_doc_id.count() == only_ordinals.len and native_constraints.positive_filter and
-            native_constraints.filter_doc_nums.len > 0 and
-            native_constraints.filter_doc_ids.len == 0)
+        if (!has_legacy and ordinal_to_text_doc_id.count() == native_constraints.filter_doc_nums.len and
+            had_ordinal_scope and native_constraints.filter_doc_ids.len == 0)
         {
             return try sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
                 alloc,
@@ -22791,15 +22884,14 @@ pub fn searchMatchAll(
             .prepare_hit = prepareTextSortHit,
             .load = loadTextDocValueSortValue,
         };
-        var exact_keys_arena = std.heap.ArenaAllocator.init(alloc);
-        defer exact_keys_arena.deinit();
-        const exact_keys = if (only_ordinals.len != 0 and native_constraints.filter_doc_ids.len == 0) blk: {
+        const exact_keys = if (native_constraints.filter_doc_ids.len != 0)
+            null
+        else if (resolved_exact_keys) |keys| keys else if (only_ordinals.len != 0) blk: {
             const resolve = executor.resolve_doc_set_doc_ids orelse break :blk null;
-            const scratch = exact_keys_arena.allocator();
             const set = doc_set.ResolvedDocSet{ .ordinals = only_ordinals };
-            const mapped = (try resolve(executor.ctx, scratch, &set, exec_req.identity_read_generation)) orelse break :blk null;
+            const mapped = (try resolve(executor.ctx, exact_key_alloc, &set, exec_req.identity_read_generation)) orelse break :blk null;
             const exceptional = if (native_constraints.legacy_filter == .doc_keys) native_constraints.legacy_filter.doc_keys else &.{};
-            break :blk try std.mem.concat(scratch, []const u8, &.{ mapped, exceptional });
+            break :blk try std.mem.concat(exact_key_alloc, []const u8, &.{ mapped, exceptional });
         } else null;
         var out = try sortAndPageMatchAllCandidateStreamAlloc(alloc, postprocess_req, executor, .{
             .constraints = &native_constraints,

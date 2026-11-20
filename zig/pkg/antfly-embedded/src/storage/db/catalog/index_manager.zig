@@ -29642,7 +29642,7 @@ pub const IndexManager = struct {
         var sparse_txn = try entry.index.beginReadTxn();
         defer sparse_txn.abort();
         const direct = entry.chunk_name == null and entry.embedding_names.len == 0;
-        var primary_txn = if (direct) try store.beginProbeTxn() else try store.beginReadTxn();
+        var primary_txn = try store.beginReadTxn();
         defer primary_txn.abort();
 
         var out: std.ArrayListUnmanaged(u32) = .empty;
@@ -29687,7 +29687,7 @@ pub const IndexManager = struct {
             const OrdinalKey = @TypeOf(internal_keys.identityOrdinalToDocKey(0));
             var storage: [ordinals.len]OrdinalKey = undefined;
             var keys: [ordinals.len][]const u8 = undefined;
-            var values: [ordinals.len]?[]const u8 = @splat(null);
+            var values: [ordinals.len]?[]u8 = @splat(null);
             var key_count: usize = 0;
             for (ordinals[0..len], 0..) |ordinal, i| {
                 if (i != 0 and ordinals[i - 1] == ordinal) continue;
@@ -29695,7 +29695,9 @@ pub const IndexManager = struct {
                 keys[key_count] = &storage[key_count];
                 key_count += 1;
             }
-            try primary_txn.getManySorted(keys[0..key_count], values[0..key_count]);
+            var key_arena = std.heap.ArenaAllocator.init(alloc);
+            defer key_arena.deinit();
+            try primary_txn.getManySortedOwnedScoped(key_arena.allocator(), keys[0..key_count], values[0..key_count]);
             if (direct) {
                 var present: usize = 0;
                 for (values[0..key_count]) |value| if (value) |key| {
@@ -29709,13 +29711,6 @@ pub const IndexManager = struct {
                     if (!entry_num.found_existing) try out.append(alloc, doc_num);
                 }
             } else {
-                // Cursor use can invalidate values borrowed from the primary
-                // transaction. Copy this bounded batch before opening cursors.
-                var key_arena = std.heap.ArenaAllocator.init(alloc);
-                defer key_arena.deinit();
-                for (values[0..key_count]) |*value| if (value.*) |key| {
-                    value.* = try key_arena.allocator().dupe(u8, key);
-                };
                 for (values[0..key_count]) |maybe_key| {
                     try control.check();
                     if (maybe_key) |key| try appendSparseParentProjectionDocNums(alloc, entry, &primary_txn, &sparse_txn, key, &seen, &out, &misses, miss_alloc, locator_complete, control);

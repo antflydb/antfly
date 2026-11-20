@@ -46701,6 +46701,25 @@ pub const DB = struct {
         return try self.core.index_manager.exactScoreDenseEntryWithRequest(entry, controlled);
     }
 
+    fn resolvePrimaryOrdinalKeysCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        ordinals: []const doc_set.DocOrdinal,
+        generation: ?u64,
+        values: []?[]const u8,
+    ) anyerror!void {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (ordinals.len != values.len) return error.InvalidArgument;
+        @memset(values, null);
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        for (ordinals, values) |ordinal, *value| {
+            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse continue;
+            if (!(if (generation) |at| state.isVisibleAt(at) else state.isLive())) continue;
+            value.* = (try doc_identity.lookupDocIdTxn(alloc, &txn, ordinal)) orelse return error.InvalidDocIdentity;
+        }
+    }
+
     fn resolveDocSetDocIdsCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -48834,6 +48853,7 @@ pub const DB = struct {
             .collect_candidates = collectSearchMatchAllCandidatesCallback,
             .collect_candidates_stream = streamSearchMatchAllCandidatesCallback,
             .text_index_entry = textIndexEntryCallback,
+            .resolve_primary_ordinal_keys = resolvePrimaryOrdinalKeysCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .primary_residual_scope = primaryResidualScopeCallback,
@@ -157417,6 +157437,35 @@ test "optional numeric range keeps mixed primary matches for native field sortin
         defer sorted.deinit();
         try std.testing.expectEqual(@as(usize, 1), sorted.hits.len);
         try std.testing.expectEqualStrings("mapped", sorted.hits[0].id);
+
+        const mapped_ordinal = ordinal: {
+            var read = try db.core.store.beginProbeTxn();
+            defer read.abort();
+            break :ordinal (try doc_identity.lookupOrdinalTxn(a, &read, "mapped")).?;
+        };
+        var scope = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(a, &.{ mapped_ordinal, std.math.maxInt(u32) }) };
+        defer scope.deinit(a);
+        executor.live_filter_doc_set = null;
+        executor.nonvisible_doc_set = null;
+        const Predicate = struct {
+            fn deny(_: *anyopaque, _: []const u8) anyerror!bool {
+                return false;
+            }
+        };
+        var argument: u8 = 0;
+        for ([_]u32{ 2, 0 }) |limit| {
+            var rejected = try db_query_search.searchMatchAll(a, .{
+                .index_name = "ft",
+                .limit = limit,
+                .include_stored = false,
+                .resolved_doc_filter = &scope,
+                .native_key_predicate = .{ .ptr = &argument, .allows = Predicate.deny },
+                .order_by = &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } },
+            }, executor);
+            defer rejected.deinit();
+            try std.testing.expectEqual(@as(usize, 0), rejected.hits.len);
+            try std.testing.expectEqual(@as(u32, 0), rejected.total_hits);
+        }
     }
     const forward = try internal_keys.identityDocToOrdinalKeyAlloc(a, "legacy");
     defer a.free(forward);

@@ -1706,6 +1706,15 @@ pub fn applyStoredSearchPatternFilters(
                 var surviving: usize = 0;
                 for (candidates[0..candidate_len], indexes[0..candidate_len]) |hit, index| {
                     try control.check();
+                    // Legacy exclusions settle membership even when the hit
+                    // has no ordinal and the gate also has an ordinal arm.
+                    if (cheap and gate.exclude and gate.legacy.count() != 0 and hit.doc_ordinal == null) {
+                        const parent = if (gate.shared and parent_aware) try parents.get(alloc, executor, hit) else null;
+                        if (gate.legacy.contains(parent orelse hit.id)) {
+                            keep_hits[index] = false;
+                            continue;
+                        }
+                    }
                     if (!key_only and (cheap == (hit.doc_ordinal == null))) {
                         candidates[surviving] = hit;
                         indexes[surviving] = index;
@@ -2586,6 +2595,36 @@ test "optional numeric range skips reverse exclusions for rejected hits" {
     var filter = doc_set.ResolvedDocFilter{ .include = try doc_set.cloneDocKeysAlloc(alloc, &.{"allowed"}) };
     defer filter.deinit(alloc);
     filter.exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{9});
+    var raw = types.SearchResult{ .alloc = alloc, .hits = &.{}, .total_hits = 1 };
+    errdefer raw.deinit();
+    const key = try alloc.dupe(u8, "rejected");
+    const hits = alloc.alloc(types.SearchHit, 1) catch |err| {
+        alloc.free(key);
+        return err;
+    };
+    hits[0] = .{ .id = key };
+    raw.hits = hits;
+    var result = try applyStoredSearchPatternFilters(alloc, .{ .resolved_doc_filter = &filter }, raw, .{
+        .ctx = null,
+        .load_stored = TestStoredLoader.loadStored,
+        .resolve_doc_set_doc_ids = Harness.failReverse,
+    });
+    defer result.deinit();
+    raw.hits = &.{};
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+}
+
+test "optional numeric range applies legacy exclusions before reverse inclusion" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        fn failReverse(_: ?*anyopaque, _: Allocator, _: *const doc_set.ResolvedDocSet, _: ?u64) anyerror!?[]const []const u8 {
+            return error.UnexpectedReverseProjection;
+        }
+    };
+    var filter = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(alloc, &.{7}) };
+    defer filter.deinit(alloc);
+    filter.exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{9});
+    filter.legacy_exclude = try doc_set.cloneDocKeysAlloc(alloc, &.{"rejected"});
     var raw = types.SearchResult{ .alloc = alloc, .hits = &.{}, .total_hits = 1 };
     errdefer raw.deinit();
     const key = try alloc.dupe(u8, "rejected");

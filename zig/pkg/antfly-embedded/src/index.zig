@@ -2596,8 +2596,8 @@ pub const IndexSnapshot = struct {
             flight_slot.* = null;
             flight.failure = failure;
             const outcome: StoredKeyDirectoryFlight.Outcome = if (directory_out != null) .built else if (failure) |err| switch (err) {
-                error.Canceled, error.Timeout => .interrupted,
-                else => .failed,
+                error.InvalidSegment, error.CrcMismatch => .failed,
+                else => .interrupted,
             } else .unavailable;
             flight.outcome.store(outcome, .release);
             shared.stored_key_directory_lock.unlock();
