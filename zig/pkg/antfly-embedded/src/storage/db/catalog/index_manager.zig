@@ -29782,7 +29782,7 @@ pub const IndexManager = struct {
                 var proven: [ordinals.len]bool = @splat(false);
                 if (alignment_available and (alignment_samples < 64 or alignment_hits *| 4 >= alignment_samples)) {
                     alignment_available = try sparse_mod.SparseIndex.tryProveProjectionDocNums(
-                        key_arena.allocator(),
+                        alloc,
                         &sparse_txn,
                         unique_ordinals[0..key_count],
                         values[0..key_count],

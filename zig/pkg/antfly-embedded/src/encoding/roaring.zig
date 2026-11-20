@@ -726,11 +726,12 @@ pub const RoaringBitmap = struct {
     }
 
     /// Remove values in strictly ascending order without allocating. Finish
-    /// the current container before using the bitmap through another API.
+    /// the remover before using the bitmap through another API.
     pub const SortedRemover = struct {
         bitmap: *RoaringBitmap,
         chunk: ?u16 = null,
-        container: ?*Container = null,
+        container_index: ?usize = null,
+        first_empty: ?usize = null,
         read: usize = 0,
         write: usize = 0,
 
@@ -738,11 +739,12 @@ pub const RoaringBitmap = struct {
             const key: u16 = @truncate(value >> 16);
             const low: u16 = @truncate(value);
             if (self.chunk == null or self.chunk.? != key) {
-                self.finish();
+                self.finishContainer();
                 self.chunk = key;
-                self.container = if (self.bitmap.findChunk(key)) |index| &self.bitmap.containers.items[index] else null;
+                self.container_index = self.bitmap.findChunk(key);
             }
-            const container = self.container orelse return;
+            const index = self.container_index orelse return;
+            const container = &self.bitmap.containers.items[index];
             switch (container.*) {
                 .bitmap => |words| bitmapUnset(words, low),
                 .array => |*array| {
@@ -757,19 +759,50 @@ pub const RoaringBitmap = struct {
             }
         }
 
-        pub fn finish(self: *SortedRemover) void {
-            if (self.container) |container| {
+        fn finishContainer(self: *SortedRemover) void {
+            if (self.container_index) |index| {
+                const container = &self.bitmap.containers.items[index];
                 if (container.* == .array and self.write != self.read) {
                     const array = &container.array;
                     const remaining = array.items[self.read..];
                     std.mem.copyForwards(u16, array.items[self.write..][0..remaining.len], remaining);
                     array.shrinkRetainingCapacity(self.write + remaining.len);
                 }
+                if (container.isEmpty()) {
+                    container.deinit(self.bitmap.alloc);
+                    container.* = .{ .array = .empty };
+                    if (self.first_empty == null) self.first_empty = index;
+                }
             }
-            self.container = null;
+            self.container_index = null;
             self.chunk = null;
             self.read = 0;
             self.write = 0;
+        }
+
+        pub fn finish(self: *SortedRemover) void {
+            self.finishContainer();
+            const start = self.first_empty orelse return;
+            const bitmap = self.bitmap;
+            var write = start;
+            for (start..bitmap.keys.items.len) |read| {
+                const container = &bitmap.containers.items[read];
+                if (container.isEmpty()) {
+                    container.deinit(bitmap.alloc);
+                    continue;
+                }
+                bitmap.keys.items[write] = bitmap.keys.items[read];
+                bitmap.containers.items[write] = container.*;
+                write += 1;
+            }
+            if (write == 0) {
+                bitmap.keys.clearAndFree(bitmap.alloc);
+                bitmap.containers.clearAndFree(bitmap.alloc);
+            } else {
+                bitmap.keys.shrinkRetainingCapacity(write);
+                bitmap.containers.shrinkRetainingCapacity(write);
+            }
+            self.first_empty = null;
         }
     };
 
@@ -3088,4 +3121,12 @@ test "optional numeric range sorted removals compact arrays and clear dense word
     try std.testing.expect(!bitmap.contains(65537));
     try std.testing.expect(!bitmap.contains(65536 + 8999));
     try std.testing.expect(!bitmap.contains(2 * 65536 + 7));
+    try std.testing.expectEqual(@as(usize, 2), bitmap.keys.items.len);
+
+    var clear = bitmap.sortedRemover();
+    for (0..4096) |value| clear.remove(@intCast(value));
+    for (65536..65536 + 9000) |value| clear.remove(@intCast(value));
+    clear.finish();
+    try std.testing.expect(bitmap.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), bitmap.containers.capacity);
 }
