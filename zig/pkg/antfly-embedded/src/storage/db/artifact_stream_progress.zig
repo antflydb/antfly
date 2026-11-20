@@ -250,7 +250,7 @@ pub fn prepareExtractionClosure(alloc: std.mem.Allocator, txn: anytype, root: u1
     } else return error.ArtifactCatalogCorrupt;
     if (head_effect.source_index >= proof.sources.len or
         !std.mem.eql(u8, proof.sources[head_effect.source_index].document_key, request.doc_key)) return error.ArtifactCatalogCorrupt;
-    const certificate = try provenance.captureCurrentArtifactCertificate(txn, authorized.authority, view.plan.core.head_key, proof.publication_digest);
+    const certificate = try provenance.captureCurrentArtifactCertificate(txn, authorized.authority, view.plan.core.head_key, proof);
     const state_value = try txn.get(view.plan.core.state_key);
     const directory_value = try txn.get(view.plan.progress);
     if (state_value.len > 512 or directory_value.len > 512) return error.ArtifactCatalogCorrupt;

@@ -836,7 +836,7 @@ pub fn receiptKey(command: Command, source: Source) [receipt_prefix.len + 32]u8 
     return result;
 }
 
-const RejectionSlot = enum(u8) { retry = 0xff, cycle = 0xfe };
+const RejectionSlot = enum(u8) { retry = 0xff, cycle = 0xfe, output_cycle = 0xfd };
 
 fn responseSource(command: Command) Source {
     return if (command.sources.len != 0) command.sources[0] else .{
@@ -869,17 +869,17 @@ pub fn stageRejection(txn: anytype, command: Command, index: u64, reason: Reject
     std.mem.writeInt(u64, raw[37..45], index, .little);
     std.crypto.hash.Blake3.hash(raw[0..45], raw[45..77], .{});
     if (reason != .graph_cycle) return txn.put(&rejectionKey(command, .retry), &raw);
-    try stageCycleSlot(txn, command, responseSource(command), index, &raw);
-    if (command.producer_kind != .graph or command.sources.len <= 1) return;
+    try stageCycleSlot(txn, command, responseSource(command), .cycle, index, &raw);
+    if (command.producer_kind != .graph) return;
     const owners = try command.outputSources();
-    for (command.sources[1..], 1..) |source, source_index| {
-        if (owners.isSet(source_index)) try stageCycleSlot(txn, command, source, index, &raw);
+    for (command.sources, 0..) |source, source_index| {
+        if (owners.isSet(source_index)) try stageCycleSlot(txn, command, source, .output_cycle, index, &raw);
     }
 }
 
-fn stageCycleSlot(txn: anytype, command: Command, source: Source, index: u64, raw: *const [77]u8) !void {
-    const key = rejectionKeyForSource(command, source, .cycle);
-    if (try readRejectionSlot(txn, &key, .cycle)) |existing| {
+fn stageCycleSlot(txn: anytype, command: Command, source: Source, slot: RejectionSlot, index: u64, raw: *const [77]u8) !void {
+    const key = rejectionKeyForSource(command, source, slot);
+    if (try readRejectionSlot(txn, &key, slot)) |existing| {
         // Preserve the first terminal response and keep newer source failures.
         if (std.mem.eql(u8, &existing.publication_digest, &command.publication_digest) or existing.applied_index >= index) return;
     }
@@ -888,12 +888,31 @@ fn stageCycleSlot(txn: anytype, command: Command, source: Source, index: u64, ra
 
 /// Read the last terminal DAG rejection for the command's response slot.
 pub fn latestGraphCycle(txn: anytype, command: Command) !?Rejected {
-    return latestGraphCycleForSource(txn, command, responseSource(command));
+    return readRejectionSlot(txn, &rejectionKey(command, .cycle), .cycle);
 }
 
 pub fn latestGraphCycleForSource(txn: anytype, command: Command, source: Source) !?Rejected {
-    return readRejectionSlot(txn, &rejectionKeyForSource(command, source, .cycle), .cycle);
+    return readRejectionSlot(txn, &rejectionKeyForSource(command, source, .output_cycle), .output_cycle);
 }
+
+/// Point fence for a previously accepted graph output in this Raft history.
+pub const GraphOutputFence = struct {
+    rejection_key: [receipt_prefix.len + 33]u8,
+    accepted_index: u64,
+
+    pub fn init(command: Command, source: Source, position: Position) ?GraphOutputFence {
+        if (command.producer_kind != .graph or position != .raft) return null;
+        return .{
+            .rejection_key = rejectionKeyForSource(command, source, .output_cycle),
+            .accepted_index = position.raft.index,
+        };
+    }
+
+    pub fn requireCurrent(self: GraphOutputFence, txn: anytype) !void {
+        const rejection = (try readRejectionSlot(txn, &self.rejection_key, .output_cycle)) orelse return;
+        if (rejection.applied_index >= self.accepted_index) return error.EnrichmentSourceChanged;
+    }
+};
 
 fn matchingGraphCycle(txn: anytype, command: Command) !?Rejected {
     if (try latestGraphCycle(txn, command)) |cycle| {
@@ -936,7 +955,7 @@ fn readRejectionSlot(txn: anytype, key: []const u8, slot: RejectionSlot) !?Rejec
     const reason = std.enums.fromInt(Rejection, raw[4]) orelse return error.ArtifactCatalogCorrupt;
     const index = std.mem.readInt(u64, raw[37..45], .little);
     if (index == 0) return error.ArtifactCatalogCorrupt;
-    if ((reason == .graph_cycle) != (slot == .cycle)) return error.ArtifactCatalogCorrupt;
+    if ((reason == .graph_cycle) != (slot != .retry)) return error.ArtifactCatalogCorrupt;
     return .{ .publication_digest = raw[5..37].*, .applied_index = index, .reason = reason };
 }
 
@@ -1997,7 +2016,20 @@ test "ordered artifact inventory publication coverage is point bounded idempoten
         .{ .family = .graph, .key = second, .value = null, .source_index = 1 },
     };
     multi.publication_digest = multi.digest();
+    const prior_position: Position = .{ .raft = .{ .term = 1, .index = 16 } };
+    const prior_output = GraphOutputFence.init(multi, sources[1], prior_position).?;
+    try prior_output.requireCurrent(&txn);
     try stageRejection(&txn, multi, 17, .graph_cycle);
+    try std.testing.expectError(error.EnrichmentSourceChanged, prior_output.requireCurrent(&txn));
+    const repaired_position: Position = .{ .raft = .{ .term = 2, .index = 18 } };
+    try GraphOutputFence.init(multi, sources[1], repaired_position).?.requireCurrent(&txn);
+    var dependency_first = multi;
+    dependency_first.producer_scope_key = "another-scope";
+    dependency_first.mutations = multi.mutations[1..];
+    dependency_first.publication_digest = dependency_first.digest();
+    try stageRejection(&txn, dependency_first, 17, .graph_cycle);
+    try GraphOutputFence.init(dependency_first, sources[0], prior_position).?.requireCurrent(&txn);
+    try std.testing.expectError(error.EnrichmentSourceChanged, GraphOutputFence.init(dependency_first, sources[1], prior_position).?.requireCurrent(&txn));
     try std.testing.expectEqual(multi.publication_digest, (try latestGraphCycleForSource(&txn, multi, sources[1])).?.publication_digest);
     // Updating the first source's response slot keeps the second source's
     // terminal response available to a retry of the original batch.
