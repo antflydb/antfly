@@ -49610,7 +49610,7 @@ pub const DB = struct {
             }
             if (pending.count() == 0) return;
             const proof_failure = recovery.proof_failure;
-            if (proof_failure == error.StorageReadTemporarilyUnavailable) return error.StorageReadTemporarilyUnavailable;
+            if (proof_failure) |err| if (err == error.StorageReadTemporarilyUnavailable) return err;
             if (proof_failure == null and recovery.explicit_keys == null) {
                 var explicit: std.StringHashMapUnmanaged(void) = .empty;
                 for ([_]*const doc_set.ResolvedDocSet{ set, &constraints.legacy_filter }) |key_set| {
