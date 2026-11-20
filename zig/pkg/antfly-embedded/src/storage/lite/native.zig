@@ -39582,6 +39582,68 @@ test "lite redo log a reset retry keeps a record another writer appended unseen 
 // Without a usable region the resync used to return before rebuilding a tail
 // it had just found stale (a successor reset the log and appended), so the
 // next append went out from the old cursor. It must rebuild from the log.
+// A reset zeroes only the first header. A crash can keep the reused log's
+// first new record yet lose its end marker, exposing the retired log right
+// after it; recovery must end the log there, not reject it or replay it.
+test "lite redo log a reused log reopens after losing an end marker" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-reuse-lost-marker.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer writer.close();
+        var value: [600]u8 = @splat('r');
+        for (0..6) |i| {
+            value[0] = @intCast('a' + i);
+            var key_buf: [16]u8 = undefined;
+            try writer.beginTransaction();
+            try writer.putDocument(try std.fmt.bufPrint(&key_buf, "retired-{d}", .{i}), &value);
+            try writer.commitTransaction();
+        }
+        const retired_len: usize = @intCast(writer.redo.?.writer.tail);
+        try writer.checkpointRedoLog();
+        try std.testing.expectEqual(@as(u64, 0), writer.redo.?.writer.tail);
+        const retired = try a.alloc(u8, retired_len);
+        defer a.free(retired);
+        _ = try writer.file.readPositionalAll(io, retired, writer.header.redo_log_offset);
+
+        try writer.beginTransaction();
+        try writer.putDocument("live", "one");
+        try writer.commitTransaction();
+        const end: usize = @intCast(writer.redo.?.writer.tail);
+        try std.testing.expect(end + redo_log.header_len <= retired_len);
+        try writer.file.writePositionalAll(io, retired[end..][0..redo_log.header_len], writer.header.redo_log_offset + end);
+        try writer.file.sync(io);
+    }
+    {
+        var region = try shared_lock_region.Region.open(std.heap.page_allocator, io, path);
+        defer region.close();
+        region.resetLogStateForTest();
+    }
+    {
+        var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+        defer reader.close();
+        try expectRedoDocument(&reader, "live", "one");
+        var folded: [600]u8 = @splat('r');
+        folded[0] = 'f';
+        try expectRedoDocument(&reader, "retired-5", &folded);
+    }
+    {
+        var writer = try NativeFile.openWithIo(a, io, path, .{});
+        defer writer.close();
+        try writer.beginTransaction();
+        try writer.putDocument("after", "two");
+        try writer.commitTransaction();
+    }
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reopened.close();
+    try expectRedoDocument(&reopened, "live", "one");
+    try expectRedoDocument(&reopened, "after", "two");
+}
+
 test "lite redo log a region-less reset retry rebuilds the tail before appending" {
     const a = std.testing.allocator;
     const io = std.testing.io;

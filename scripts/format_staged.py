@@ -156,7 +156,6 @@ def format_staged(root, format_blob=None):
         if not selected:
             return
         before = git("write-tree", env=env).strip().decode()
-        changed = []
         for path, (cwd, command) in selected:
             entry = git("ls-files", "--stage", "-z", "--", path, env=env).split(b"\0")[
                 0
@@ -172,7 +171,6 @@ def format_staged(root, format_blob=None):
             )
             if formatted == original:
                 continue
-            changed.append(path)
             new_blob = (
                 git("hash-object", "-w", "--stdin", data=formatted).strip().decode()
             )
@@ -208,48 +206,28 @@ def format_staged(root, format_blob=None):
                 "Formatting overlaps unstaged changes or the index changed. "
                 "No edits were applied. Run make fmt and review/stage the desired hunks."
             ) from error
-        worktree = [(root / path, (root / path).read_bytes()) for path in changed]
-        git("apply", "--whitespace=nowarn", data=patch)
-        formatted_files = [(file, file.read_bytes()) for file, _ in worktree]
+        # Stage first, then touch the worktree. A failed staging update
+        # leaves every file as it was, so there is nothing to roll back and
+        # no rollback can overwrite an editor's save.
         try:
             update_index_under_lock(git, real_index, snapshot, patch)
-        except BaseException as error:
-            kept = restore_worktree(worktree, formatted_files)
-            if isinstance(error, HookError) and not kept:
-                raise
-            message = (
-                error
-                if isinstance(error, HookError)
-                else f"Could not update the index ({error}). No edits were applied."
-            )
-            if kept:
-                message = (
-                    f"{message} These files changed while the hook ran and keep "
-                    f"their formatting edits: {', '.join(kept)}"
-                )
-            if not isinstance(error, Exception):
-                raise
-            raise HookError(str(message)) from error
-        print("Formatted staged files; unstaged edits remain unstaged.")
-
-
-def restore_worktree(worktree, formatted_files):
-    """Put back each file the hook formatted, unless something else has
-    changed it since (an editor saving, say). Returns the files left alone.
-
-    Restoring saved bytes, rather than reverse-applying the patch, cannot
-    fail on a hunk that no longer matches.
-    """
-    kept = []
-    for (file, original), (_, formatted) in zip(worktree, formatted_files):
+        except OSError as error:
+            raise HookError(
+                f"Could not update the index ({error}). No edits were applied."
+            ) from error
         try:
-            if file.read_bytes() == formatted:
-                file.write_bytes(original)
-                continue
-        except OSError:
-            pass
-        kept.append(str(file))
-    return kept
+            git("apply", "--whitespace=nowarn", data=patch)
+        except HookError:
+            # Something changed a formatted hunk since the check. The commit
+            # gets the formatted content; the file keeps the other edit.
+            print(
+                "pre-commit: Formatted the staged files, but the working tree "
+                "changed meanwhile and was left as it is. Run make fmt to "
+                "format it.",
+                file=sys.stderr,
+            )
+            return
+        print("Formatted staged files; unstaged edits remain unstaged.")
 
 
 def update_index_under_lock(git, real_index, snapshot, patch):

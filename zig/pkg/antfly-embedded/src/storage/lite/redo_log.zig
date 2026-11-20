@@ -477,8 +477,28 @@ pub fn replayBounded(
         }
 
         const header = RecordHeader.decode(&header_buf);
+        // A log reset zeroes only the first header, so a reused log keeps
+        // the retired log's bytes past its live tail. Every append writes
+        // an end marker, but a crash can keep a record and lose its marker
+        // (they are not ordered by a sync), exposing those bytes. They are
+        // recognizable without any extra write, much as SQLite's WAL salts
+        // and RocksDB's recycled-log numbers are:
+        //
+        // - A retired record's sequence is at or below the fold that
+        //   retired it, below every live record. After a live record, a
+        //   header that does not move forward is the retired log: its end.
+        // - Unparseable bytes after the first record of a log that has
+        //   been folded (the only kind ever reset) may be the middle of a
+        //   retired record: also the end, as in point-in-time recovery.
+        //
+        // What stale bytes can never present stays corrupt: the next
+        // sequence with a bad checksum, or a gap.
+        const reusable = pos != 0 and (start_after_sequence orelse 0) != 0;
         if (header.magic != magic or header.format_version != format_version or header.header_len != header_len) {
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (reusable) .end_of_region else .corrupt_record };
+        }
+        if (count != 0 and header.commit_sequence <= last_sequence.?) {
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region };
         }
 
         if (max_sequence) |ceiling| {
@@ -830,6 +850,89 @@ test "bounded replay stops before records past the durable ceiling" {
 
     const unbounded = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
     try testing.expectEqual(@as(u64, 3), unbounded.valid_count);
+}
+
+/// Retires the log's first `retired` bytes as a reset does (first header
+/// zeroed), appends `payload` at `sequence`, then puts the retired bytes
+/// back where the new record's end marker went: a crash that kept the
+/// record but not its marker.
+fn reuseLosingMarker(io: Io, file: File, capacity: u64, sequence: u64, payload: []const u8) !u64 {
+    const zeros: [header_len]u8 = @splat(0);
+    const end = header_len + payload.len;
+    var retired: [header_len]u8 = undefined;
+    _ = try file.readPositionalAll(io, &retired, end);
+    try file.writePositionalAll(io, &zeros, 0);
+    var writer = Writer.initAt(file, io, 0, capacity, 0, sequence - 1);
+    try writer.append(sequence, payload);
+    try file.writePositionalAll(io, &retired, end);
+    return end;
+}
+
+test "replay ends a reused log at a retired record past a lost end marker" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    // Retired records of one length, so the new record ends exactly where
+    // a retired header begins.
+    var writer = Writer.init(region.file, io, 0, capacity);
+    for (1..6) |sequence| try writer.append(sequence, "retired!");
+    // Folded through 5 (and a bare commit took 6); the reset log starts at 7.
+    const end = try reuseLosingMarker(io, region.file, capacity, 7, "live-one");
+
+    const outcome = try replayBounded(testing.allocator, region.file, io, 0, capacity, 5, null, 6, null, null);
+    try testing.expectEqual(@as(u64, 1), outcome.valid_count);
+    try testing.expectEqual(@as(?u64, 7), outcome.last_sequence);
+    try testing.expectEqual(end, outcome.valid_bytes);
+    try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
+}
+
+test "replay ends a reused log at retired bytes mid-record past a lost end marker" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var writer = Writer.init(region.file, io, 0, capacity);
+    for (1..4) |sequence| try writer.append(sequence, "a retired payload, long enough that the new record ends inside it, with no header there");
+    const end = try reuseLosingMarker(io, region.file, capacity, 4, "short");
+
+    const outcome = try replayBounded(testing.allocator, region.file, io, 0, capacity, 3, null, 3, null, null);
+    try testing.expectEqual(@as(u64, 1), outcome.valid_count);
+    try testing.expectEqual(end, outcome.valid_bytes);
+    try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
+
+    // A log never folded was never reset: the same bytes are corruption.
+    const fresh = try replayBounded(testing.allocator, region.file, io, 0, capacity, null, null, null, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, fresh.stop_reason);
+}
+
+test "replay keeps rejecting what retired bytes can never be" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(11, "a");
+    try writer.append(12, "b");
+    // The next sequence with a bad checksum, after a folded baseline.
+    const bad: RecordHeader = .{ .payload_len = 1, .commit_sequence = 13, .crc32 = 0xdeadbeef };
+    var header_buf: [header_len]u8 = undefined;
+    bad.encode(&header_buf);
+    try region.file.writePositionalAll(io, &header_buf, writer.tail);
+    try region.file.writePositionalAll(io, "c", writer.tail + header_len);
+    const next = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(@as(u64, 2), next.valid_count);
+    try testing.expectEqual(StopReason.corrupt_record, next.stop_reason);
+
+    // A gap past the live tail.
+    const gap: RecordHeader = .{ .payload_len = 1, .commit_sequence = 15, .crc32 = Crc32.hash("c") };
+    gap.encode(&header_buf);
+    try region.file.writePositionalAll(io, &header_buf, writer.tail);
+    const gapped = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, gapped.stop_reason);
 }
 
 test "a superseded run can be followed by genuinely new records" {
