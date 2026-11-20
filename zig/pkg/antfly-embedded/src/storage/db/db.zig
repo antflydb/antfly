@@ -46717,12 +46717,47 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (ordinals.len != values.len) return error.InvalidArgument;
         @memset(values, null);
-        var txn = try self.core.store.beginProbeTxn();
-        defer txn.abort();
-        for (ordinals, values) |ordinal, *value| {
-            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse continue;
-            if (!(if (generation) |at| state.isVisibleAt(at) else state.isLive())) continue;
-            value.* = (try doc_identity.lookupDocIdTxn(alloc, &txn, ordinal)) orelse return error.InvalidDocIdentity;
+        errdefer for (values) |*slot| {
+            if (slot.*) |key| alloc.free(key);
+            slot.* = null;
+        };
+        var offset: usize = 0;
+        while (offset < ordinals.len) {
+            const page = ordinals[offset..][0..@min(256, ordinals.len - offset)];
+            const output = values[offset..][0..page.len];
+            offset += page.len;
+            var positions: [256]usize = undefined;
+            for (positions[0..page.len], 0..) |*slot, slot_index| slot.* = slot_index;
+            std.mem.sort(usize, positions[0..page.len], page, struct {
+                fn less(numbers: []const doc_set.DocOrdinal, lhs: usize, rhs: usize) bool {
+                    return numbers[lhs] < numbers[rhs];
+                }
+            }.less);
+
+            var txn = try self.core.store.beginProbeTxnWithBlockCacheAdmission(.transient);
+            defer txn.abort();
+            var encoded: [256]@TypeOf(internal_keys.identityOrdinalStateKey(0)) = undefined;
+            var keys: [256][]const u8 = undefined;
+            var records: [256]?[]const u8 = undefined;
+            for (positions[0..page.len], 0..) |position, index| {
+                encoded[index] = internal_keys.identityOrdinalStateKey(page[position]);
+                keys[index] = &encoded[index];
+            }
+            try txn.getManySorted(keys[0..page.len], records[0..page.len]);
+            var visible_count: usize = 0;
+            for (positions[0..page.len], records[0..page.len]) |position, record| {
+                const state = try doc_identity.decodeOrdinalState(record orelse continue);
+                if (!(if (generation) |at| state.isVisibleAt(at) else state.isLive())) continue;
+                positions[visible_count] = position;
+                encoded[visible_count] = internal_keys.identityOrdinalToDocKey(page[position]);
+                keys[visible_count] = &encoded[visible_count];
+                visible_count += 1;
+            }
+            if (visible_count == 0) continue;
+            try txn.getManySorted(keys[0..visible_count], records[0..visible_count]);
+            for (positions[0..visible_count], records[0..visible_count]) |position, record| {
+                output[position] = try alloc.dupe(u8, record orelse return error.InvalidDocIdentity);
+            }
         }
     }
 
@@ -49318,6 +49353,14 @@ pub const DB = struct {
                     if (source_batch.len == 0) return .@"continue";
                     const owner = source_batch.owner;
                     const keys = source_batch.keys[0..source_batch.len];
+                    const needs_reverse = if (source_batch.options.constraints) |constraints|
+                        constraints.positive_filter and
+                            (if (constraints.primary_include_compact)
+                                constraints.primary_include == .ordinals or constraints.primary_include == .ordinal_bitmap
+                            else
+                                constraints.filter_doc_nums.len != 0)
+                    else
+                        false;
                     var visible: [256]bool = @splat(true);
                     var ordinals: [256]?doc_set.DocOrdinal = @splat(null);
                     {
@@ -49340,7 +49383,11 @@ pub const DB = struct {
                             };
                             switch (identity) {
                                 .invisible => visible[i] = false,
-                                .unmapped => {},
+                                .unmapped => if (needs_reverse) {
+                                    if (source_batch.prefix != null) return source_batch.rejectSpeculativeBatch(error.InvalidDocIdentity);
+                                    failures[i] = error.NotFound;
+                                    failed = true;
+                                },
                                 .visible => |ordinal| ordinals[i] = ordinal,
                             }
                         }
@@ -49564,10 +49611,17 @@ pub const DB = struct {
             var unresolved_error: ?anyerror = null;
             var unresolved = pending.iterator();
             while (unresolved.next()) |entry| {
-                if (!recovery.incomplete.? and !recovery.explicit_keys.?.contains(entry.key_ptr.*)) continue;
-                const failure = failures[entry.value_ptr.*].?;
+                const slot = entry.value_ptr.*;
+                const failure = failures[slot].?;
+                if (!recovery.incomplete.?) {
+                    if (!recovery.explicit_keys.?.contains(entry.key_ptr.*)) continue;
+                    if (failure == error.NotFound) {
+                        visible[slot] = recovery.reverse.get(entry.key_ptr.*) == null;
+                        continue;
+                    }
+                }
                 if (failure == error.StorageReadTemporarilyUnavailable) return failure;
-                unresolved_error = failure;
+                unresolved_error = if (failure == error.NotFound) error.InvalidDocIdentity else failure;
             }
             if (unresolved_error) |err| return err;
         }
@@ -158377,13 +158431,33 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
         }
     }
 
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for ([_]usize{ 1, 78 }) |slot| {
+            const id = writes[slot].key;
+            try txn.delete(try internal_keys.identityDocToOrdinalKeyAlloc(scratch, id));
+            try txn.delete(try internal_keys.identityLiveDocToOrdinalKeyAlloc(scratch, id));
+        }
+        try txn.commit();
+
+        var resolved: [4]?[]const u8 = undefined;
+        try DB.resolvePrimaryOrdinalKeysCallback(&db, scratch, &.{ endpoints[1], std.math.maxInt(u32), endpoints[0], endpoints[1] }, generation, &resolved);
+        try std.testing.expectEqualStrings(writes[78].key, resolved[0].?);
+        try std.testing.expect(resolved[1] == null);
+        try std.testing.expectEqualStrings(writes[1].key, resolved[2].?);
+        try std.testing.expectEqualStrings(writes[78].key, resolved[3].?);
+    }
+
     const Record = struct {
         expected: []const u8,
+        ordinal: doc_set.DocOrdinal,
         seen: usize = 0,
 
-        fn visit(raw: ?*anyopaque, id: []const u8, _: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
+        fn visit(raw: ?*anyopaque, id: []const u8, ordinal: ?doc_set.DocOrdinal, _: bool, _: bool) !docstore_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             if (!std.mem.eql(u8, self.expected, id)) return .@"continue";
+            try std.testing.expectEqual(@as(?doc_set.DocOrdinal, self.ordinal), ordinal);
             self.seen += 1;
             return .stop;
         }
@@ -158400,7 +158474,7 @@ test "optional numeric range cold relational scope and ordered cursor prefix han
             var ordinals: [1024]u32 = undefined;
             ordinals[0] = endpoints[endpoint];
             for (ordinals[1..], 0..) |*ordinal, i| ordinal.* = std.math.maxInt(u32) - 1024 + @as(u32, @intCast(i));
-            var record = Record{ .expected = writes[if (endpoint == 0) 1 else 78].key };
+            var record = Record{ .expected = writes[if (endpoint == 0) 1 else 78].key, .ordinal = endpoints[endpoint] };
             const options: db_query_search.MatchAllCandidateCollectOptions = .{
                 .constraints = &.{ .positive_filter = true, .filter_doc_nums = &ordinals },
                 .require_complete_primary_population = true,

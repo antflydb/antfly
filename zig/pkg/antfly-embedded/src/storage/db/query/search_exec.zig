@@ -11336,11 +11336,18 @@ const IndexedPredicateEvaluator = struct {
         evidence.covered.andWith(scope);
         evidence.matches.andWith(scope);
         const covered_count = evidence.covered.cardinality();
-        if (covered_count == scope.cardinality()) {
+        const scope_count = scope.cardinality();
+        if (covered_count == scope_count) {
             evidence.covered.deinit();
             return evidence.matches;
         }
-        if (covered_count == 0) {
+        // Keep physical work charged to the request. When one full pass
+        // fits but a partial pass and replay may not, go straight to stored rows.
+        const use_single_pass = if (self.budget) |budget|
+            scope_count <= budget.remaining_anchors and scope_count +| (scope_count - covered_count) > budget.remaining_anchors
+        else
+            false;
+        if (covered_count == 0 or use_single_pass) {
             evidence.covered.deinit();
             evidence.matches.deinit();
             return self.executeStoredRange(stored, scope);
@@ -12603,6 +12610,20 @@ test "optional numeric range returns full stored results after residual or union
     try std.testing.expectEqual(@as(usize, 1), loader.calls);
     try std.testing.expect(memo.range_projection_disabled and memo.covered == null);
     try std.testing.expect(joined.eql(&retried));
+
+    loader = .{ .fail_first = false };
+    var budget = WorkBudget.init(10, 10);
+    budget.remaining_anchors = scope.cardinality();
+    var budgeted = evaluator;
+    budgeted.budget = &budget;
+    var partial = IndexedPredicateEvaluator.RangeEvidence.init(alloc);
+    try partial.covered.add(1);
+    try partial.matches.add(1);
+    var exact_budget = try budgeted.finishMixedRange(parsed.value, &scope, partial);
+    defer exact_budget.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loader.calls);
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining_anchors);
+    try std.testing.expect(exact_budget.eql(&retried));
 }
 
 const ResidualIdentityContext = struct {

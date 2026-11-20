@@ -1048,10 +1048,23 @@ pub const RoaringBitmap = struct {
     }
 
     pub fn eql(self: *const RoaringBitmap, other: *const RoaringBitmap) bool {
-        if (!std.mem.eql(u16, self.keys.items, other.keys.items)) return false;
-        if (self.containers.items.len != other.containers.items.len) return false;
-
-        for (self.containers.items, other.containers.items) |lhs, rhs| {
+        var left: usize = 0;
+        var right: usize = 0;
+        while (true) {
+            while (left < self.keys.items.len and (right == other.keys.items.len or self.keys.items[left] < other.keys.items[right])) : (left += 1) {
+                if (self.containers.items[left].cardinality() != 0) return false;
+            }
+            while (right < other.keys.items.len and (left == self.keys.items.len or other.keys.items[right] < self.keys.items[left])) : (right += 1) {
+                if (other.containers.items[right].cardinality() != 0) return false;
+            }
+            if (left == self.keys.items.len or right == other.keys.items.len) {
+                return left == self.keys.items.len and right == other.keys.items.len;
+            }
+            if (self.keys.items[left] != other.keys.items[right]) continue;
+            const lhs = self.containers.items[left];
+            const rhs = other.containers.items[right];
+            left += 1;
+            right += 1;
             switch (lhs) {
                 .array => |lhs_array| switch (rhs) {
                     .array => |rhs_array| {
@@ -1067,8 +1080,6 @@ pub const RoaringBitmap = struct {
                 },
             }
         }
-
-        return true;
     }
 
     fn arrayEqualsBitmap(values: []const u16, words: []const u64) bool {
@@ -2979,4 +2990,6 @@ test "optional numeric range bitmap serialization handles denied promotion and e
     try std.testing.expect(!decoded.contains(array_max));
     try std.testing.expect(decoded.contains(65535));
     try std.testing.expectEqual(@as(usize, 1), decoded.keys.items.len);
+    try std.testing.expect(bitmap.eql(&decoded));
+    try std.testing.expect(decoded.eql(&bitmap));
 }
