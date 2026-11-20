@@ -7863,11 +7863,68 @@ fn embedBatchWithEntryForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
-    return withQueryEmbeddingRetry([]const []const f32, alloc, entry, embedBatchWithEntryForTaskOnce, .{ texts, dims, task_type }, task_type, .{
-        .items = @max(texts.len, 1),
-        .modalities = .{ .text = true },
-        .output_tokens = 0,
-    });
+    return embedTextWindow(alloc, entry, texts, dims, task_type) catch |err| {
+        if (err != error.InferenceDiscoveryTooManyItems or texts.len <= 1 or
+            !isAntflyProvider(entry.provider) or entry.antfly_provider != null) return err;
+        return embedSmallerTextWindows(alloc, entry, texts, dims, task_type);
+    };
+}
+
+fn embedTextWindow(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType) ![]const []const f32 {
+    return withQueryEmbeddingRetry([]const []const f32, alloc, entry, embedBatchWithEntryForTaskOnce, .{ texts, dims, task_type }, task_type, textWindowPlacement(texts.len));
+}
+
+fn textWindowPlacement(count: usize) remote_capabilities.DiscoveryShape {
+    return .{ .items = @max(count, 1), .modalities = .{ .text = true }, .output_tokens = 0 };
+}
+
+fn sameTextWindowContract(prior: remote_capabilities.CapabilityLease, current: remote_capabilities.CapabilityLease) bool {
+    if (prior.descriptor_revision) |expected| {
+        const actual = current.descriptor_revision orelse return false;
+        if (!std.mem.eql(u8, expected.slice(), actual.slice())) return false;
+    } else if (current.descriptor_revision != null) return false;
+    const old_model = if (prior.capabilities) |caps| caps.model_revision else null;
+    const new_model = if (current.capabilities) |caps| caps.model_revision else null;
+    return std.meta.eql(old_model, new_model);
+}
+
+fn embedSmallerTextWindows(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType) ![]const []const f32 {
+    var bounded = entry.requestOverlay(alloc);
+    defer bounded.auth_header_cache.deinit(alloc);
+    bounded.deadline_ns = embeddingOperationDeadline(entry);
+    if (task_type == .retrieval_query and entry.planned_embedding_lease == null) bounded.remote_query_workload = true;
+
+    var witness = entry.planned_embedding_lease;
+    var limit = texts.len / 2;
+    const results = try alloc.alloc([]const f32, texts.len);
+    var filled: usize = 0;
+    errdefer {
+        for (results[0..filled]) |vector| alloc.free(vector);
+        alloc.free(results);
+    }
+    while (filled < texts.len) {
+        const count = @min(limit, texts.len - filled);
+        bounded.planned_embedding_lease = null;
+        const placement = (prepareRemoteQueryEmbedding(alloc, &bounded, textWindowPlacement(count)) catch |err| {
+            if (err != error.InferenceDiscoveryTooManyItems or count <= 1) return err;
+            limit = count / 2;
+            continue;
+        }) orelse return error.InferenceCapabilitiesUnavailable;
+        if (witness) |prior| {
+            if (!sameTextWindowContract(prior, placement))
+                return error.InferenceCapabilitiesStale;
+        } else witness = placement;
+        bounded.planned_embedding_lease = placement;
+        const vectors = try embedTextWindow(alloc, &bounded, texts[filled..][0..count], dims, task_type);
+        if (vectors.len != count) {
+            db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+            return error.InvalidEmbeddingResponse;
+        }
+        @memcpy(results[filled..][0..count], vectors);
+        filled += count;
+        alloc.free(vectors);
+    }
+    return results;
 }
 
 // Request-ID sampling keeps all stages of a sampled search correlatable.

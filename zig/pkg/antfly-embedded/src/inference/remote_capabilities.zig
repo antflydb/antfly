@@ -76,16 +76,44 @@ pub const DiscoveryShape = struct {
     }
 };
 
+pub const DiscoveryMediaCost = struct {
+    encoded: usize = 0,
+    framed: usize = 0,
+    pixels: u64 = 0,
+};
+
+pub const DiscoveryMediaGeometry = struct {
+    batch: DiscoveryMediaCost = .{},
+    first: DiscoveryMediaCost = .{},
+
+    pub fn fits(self: DiscoveryMediaGeometry, caps: work.InferenceCapabilities) bool {
+        const bytes = if (caps.framed_attachments) self.batch.framed else self.batch.encoded;
+        if (caps.batch.max_encoded_media_bytes) |limit| if (bytes > limit) return false;
+        if (caps.batch.max_decoded_pixels) |limit| if (self.batch.pixels > limit) return false;
+        return true;
+    }
+};
+
+pub const discovery_media_header = "X-Antfly-Inference-Discovery-Media";
+
 /// Stack-owned headers for discovery. Pass the original selectors to execution.
 pub const DiscoveryHeaders = struct {
     entries: [16][2][]const u8 = undefined,
     value: [64]u8 = undefined,
+    media_value: [125]u8 = undefined,
 
     pub fn withShape(self: *DiscoveryHeaders, base: []const [2][]const u8, shape: DiscoveryShape) ![]const [2][]const u8 {
         if (base.len >= self.entries.len) return error.TooManyInferenceHeaders;
         @memcpy(self.entries[0..base.len], base);
         self.entries[base.len] = .{ discovery_shape_header, try shape.formatHeader(&self.value) };
         return self.entries[0 .. base.len + 1];
+    }
+    pub fn withMediaGeometry(self: *DiscoveryHeaders, shaped: []const [2][]const u8, geometry: DiscoveryMediaGeometry) ![]const [2][]const u8 {
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        const batch = geometry.batch;
+        const first = geometry.first;
+        self.entries[shaped.len] = .{ discovery_media_header, try std.fmt.bufPrint(&self.media_value, "{d}:{d}:{d}:{d}:{d}:{d}", .{ batch.encoded, batch.framed, batch.pixels, first.encoded, first.framed, first.pixels }) };
+        return self.entries[0 .. shaped.len + 1];
     }
 };
 
