@@ -1983,6 +1983,24 @@ pub const Runtime = struct {
         var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
         try self.routeExtractorConfig(alloc, &cfg);
+        if (cfg.provider == .antfly and cfg.resolvedUrl() != null) {
+            var mode: inference_work.BatchMode = .serial_compatibility;
+            var start: usize = 0;
+            while (start < requests.len) {
+                const run = try homogeneousDiscoveryShape(alloc, requests[start..]);
+                var window = run;
+                const caps = (try self.bindExtractorWindow(alloc, &cfg, &window)) orelse return .none;
+                if (caps.batch.mode != .none) {
+                    validateExtractorBatchPlan(alloc, caps, extractorAttachmentTransport(cfg), requests[start .. start + run.items]) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        return .none;
+                    };
+                    if (caps.batch.mode == .native) mode = .native;
+                }
+                start += run.items;
+            }
+            return mode;
+        }
         const caps = (try self.extractorCapabilitiesForRequests(alloc, &cfg, requests)) orelse return .none;
         validateExtractorBatchPlan(alloc, caps, extractorAttachmentTransport(cfg), requests) catch |err| {
             if (err == error.OutOfMemory) return err;

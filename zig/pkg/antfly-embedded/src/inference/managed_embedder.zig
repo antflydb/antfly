@@ -2417,14 +2417,23 @@ pub const ManagedEmbedder = struct {
             var storage: [4][2][]const u8 = undefined;
             const headers = remoteEmbeddingHeaders(entry, auth_header, &storage);
             var placement: remote_capabilities.DiscoveryHeaders = .{};
-            const discovery_headers = if (media_items) |count| try placement.withShape(headers, .{ .items = count, .modalities = .{ .image = true }, .output_tokens = 0 }) else headers;
-            var lease = discoverRemoteEmbeddingLease(entry, http, discovery_headers) catch |err| switch (err) {
-                error.QueryEmbeddingOverloaded => return error.QueueFull,
-                error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilitySelectorAbsent, error.InferenceCapabilitiesStale => return error.InferenceCapacityUnavailable,
-                else => return err,
+            var selected_items = media_items;
+            var lease = while (true) {
+                const discovery_headers = if (selected_items) |count| try placement.withShape(headers, .{ .items = count, .modalities = .{ .image = true }, .output_tokens = 0 }) else headers;
+                break discoverRemoteEmbeddingLease(entry, http, discovery_headers) catch |err| switch (err) {
+                    error.QueryEmbeddingOverloaded => return error.QueueFull,
+                    error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilitySelectorAbsent, error.InferenceCapabilitiesStale => return error.InferenceCapacityUnavailable,
+                    error.InferenceDiscoveryTooManyItems => {
+                        const count = selected_items orelse return err;
+                        if (count <= 1) return err;
+                        selected_items = count / 2;
+                        continue;
+                    },
+                    else => return err,
+                };
             };
             if (lease.capabilities != null) {
-                if (media_items) |count| {
+                if (selected_items) |count| {
                     lease.media_placement_items = count;
                     const caps = &lease.capabilities.?;
                     caps.batch.max_items = @min(caps.batch.max_items, count);

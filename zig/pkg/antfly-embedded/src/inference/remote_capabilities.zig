@@ -1453,6 +1453,11 @@ fn capabilityStaleResponse(response: httpx.Response) bool {
 }
 
 fn discoveryResponseError(response: httpx.Response) anyerror {
+    if (response.status.code == 404) {
+        if (response.headers.get(capability_selector_rejected_header)) |value| {
+            if (std.ascii.eqlIgnoreCase(value, "true")) return error.RemoteCapabilityDiscoveryRejected;
+        }
+    }
     if (response.status.code == 413) {
         if (response.headers.get("X-Antfly-Inference-Discovery-Error")) |reason| {
             if (std.mem.eql(u8, reason, "items")) return error.InferenceDiscoveryTooManyItems;
@@ -1488,6 +1493,27 @@ pub fn discover(
     };
 }
 
+// An older Colony rejects only the shape version with this diagnostic.
+// Keep authority and route selectors identical on the conservative retry.
+fn legacyMediaDiscoveryHeaders(response: httpx.Response, headers: []const [2][]const u8, storage: *DiscoveryHeaders) !?[]const [2][]const u8 {
+    if (response.status.code != 400 or !std.mem.eql(u8, std.mem.trim(u8, response.body orelse "", " \t\r\n"), "invalid inference discovery shape or missing model selector")) return null;
+    if (headers.len > storage.entries.len) return null;
+    for (headers, 0..) |header, index| {
+        if (!std.ascii.eqlIgnoreCase(header[0], discovery_shape_header)) continue;
+        var fields = std.mem.splitScalar(u8, header[1], ':');
+        if (!std.mem.eql(u8, fields.next() orelse return null, "4")) return null;
+        const items = fields.next() orelse return null;
+        _ = fields.next() orelse return null;
+        const tokens = fields.next() orelse return null;
+        // Versions 1–3 cannot represent both unknown media and candidates.
+        if (!std.mem.eql(u8, fields.next() orelse return null, "-") or fields.next() != null) return null;
+        @memcpy(storage.entries[0..headers.len], headers);
+        storage.entries[index][1] = try std.fmt.bufPrint(&storage.value, "1:{s}:1:{s}", .{ items, tokens });
+        return storage.entries[0..headers.len];
+    }
+    return null;
+}
+
 fn discoverOnce(
     alloc: std.mem.Allocator,
     http: *httpx.Client,
@@ -1507,6 +1533,15 @@ fn discoverOnce(
         return error.RemoteCapabilityDiscoveryTransient;
     };
     defer response.deinit();
+    var fallback: DiscoveryHeaders = .{};
+    if (try legacyMediaDiscoveryHeaders(response, headers, &fallback)) |legacy| {
+        const retry = http.get(url, .{ .follow_redirects = false, .headers = legacy, .max_response_size = capability_catalog_response_bytes }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.RemoteCapabilityDiscoveryTransient;
+        };
+        response.deinit();
+        response = retry;
+    }
     if (!response.ok()) return discoveryResponseError(response);
     return try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task());
 }
@@ -1663,7 +1698,7 @@ fn discoverWithContextOnce(
     const scoped_url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(scoped_url);
     const url = scoped_url;
-    var response = http.get(url, .{
+    var options: httpx.RequestOptions = .{
         .follow_redirects = false,
         .headers = headers,
         .timeout_ms = timeout_ms,
@@ -1672,12 +1707,30 @@ fn discoverWithContextOnce(
             context.cancellation.is_cancelled_fn,
         ),
         .max_response_size = capability_catalog_response_bytes,
-    }) catch |err| {
+    };
+    var response = http.get(url, options) catch |err| {
         try context.check(monotonicNowNs(io));
         if (err == error.OutOfMemory) return err;
         return error.RemoteCapabilityDiscoveryTransient;
     };
     defer response.deinit();
+    var fallback: DiscoveryHeaders = .{};
+    var effective_headers = headers;
+    if (try legacyMediaDiscoveryHeaders(response, headers, &fallback)) |legacy| {
+        const retry_now = monotonicNowNs(io);
+        try context.check(retry_now);
+        if (retry_now >= effective_deadline) return error.Timeout;
+        options.headers = legacy;
+        options.timeout_ms = @max(1, (effective_deadline - retry_now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
+        const retry = http.get(url, options) catch |err| {
+            try context.check(monotonicNowNs(io));
+            if (err == error.OutOfMemory) return err;
+            return error.RemoteCapabilityDiscoveryTransient;
+        };
+        response.deinit();
+        response = retry;
+        effective_headers = legacy;
+    }
     const activation_advertised = if (response.headers.get(model_activation_header)) |value|
         std.ascii.eqlIgnoreCase(value, "supported")
     else
@@ -1689,8 +1742,8 @@ fn discoverWithContextOnce(
         const failure = discoveryResponseError(response);
         if (failure == error.RemoteCapabilityDiscoveryTransient) recordDiscoveryRetryHint(alloc, io, response, context);
         if (allow_activation and activation_advertised and response.status.code == 503 and
-            try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context))
-            return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, false);
+            try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, effective_headers, context))
+            return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, effective_headers, context, false);
         if (!allow_activation and !context.passive_refresh and failure == error.RemoteCapabilityDiscoveryUnsupported)
             return error.RemoteCapabilitySelectorAbsent;
         return failure;
@@ -1709,12 +1762,12 @@ fn discoverWithContextOnce(
             try catalogListsExternalEmbedding(alloc, body, model))
             return .{ .value = null, .routing_token = null, .descriptor_revision = null };
         if (allow_activation and activation_advertised) {
-            const loaded = loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context) catch |err| {
+            const loaded = loadMissingModelInstance(alloc, io, http, inference_url, model, operation, effective_headers, context) catch |err| {
                 // Discovery already disproved the previous descriptor.
                 if (err == error.RemoteCapabilityDiscoveryTransient) return error.RemoteCapabilitySelectorAbsent;
                 return err;
             };
-            if (loaded) return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, false) catch |err| {
+            if (loaded) return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, effective_headers, context, false) catch |err| {
                 if (err == error.RemoteCapabilityDiscoveryTransient) return error.RemoteCapabilitySelectorAbsent;
                 return err;
             };
