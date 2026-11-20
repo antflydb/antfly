@@ -3265,17 +3265,71 @@ pub const DocStore = struct {
         return self.scanRowKindReadTxnWithContext(txn, lower, upper, internal_keys.primary_kind, ctx, checkpoint, callback);
     }
 
+    /// Visit one physical source row per owner, skipping artifact tails.
+    pub fn scanStoredDocumentRowsReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        reverse: bool,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+    ) !void {
+        if (reverse) return self.scanStoredDocumentRowsReverse(txn, lower, upper, ctx, checkpoint, callback);
+        return self.scanRowKindReadTxnWithContext(txn, lower, upper, null, ctx, checkpoint, callback);
+    }
+
+    fn scanStoredDocumentRowsReverse(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+    ) !void {
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        const end = if (upper.len != 0) upper else &[_]u8{internal_keys.user_namespace + 1};
+        cursor.setUpperBound(end);
+        var candidate: std.ArrayListUnmanaged(u8) = .empty;
+        defer candidate.deinit(self.alloc);
+        var entry = try cursor.seekAtOrBefore(end);
+        while (entry) |item| {
+            if (std.mem.order(u8, item.key, end) != .lt) {
+                entry = try cursor.prev();
+                continue;
+            }
+            if (std.mem.order(u8, item.key, lower) == .lt or !internal_keys.isInternalUserKey(item.key)) return;
+            const term = internal_keys.findComponentTerminator(item.key, 1) orelse return error.InvalidInternalUserKey;
+            candidate.clearRetainingCapacity();
+            try candidate.appendSlice(self.alloc, item.key[0 .. term + 2]);
+            try candidate.append(self.alloc, internal_keys.relational_row_kind);
+            if (try checkpoint(ctx, candidate.items) == .stop) return;
+            for ([_]u8{ internal_keys.relational_row_kind, internal_keys.primary_kind }) |kind| {
+                candidate.items[term + 2] = kind;
+                const row = (try cursor.seekAtOrBefore(candidate.items)) orelse continue;
+                if (std.mem.eql(u8, row.key, candidate.items)) {
+                    if (try callback(ctx, row.key, row.value) == .stop) return;
+                    break;
+                }
+            }
+            entry = try cursor.seekAtOrBefore(candidate.items[0 .. term + 2]);
+        }
+    }
+
     fn scanRowKindReadTxnWithContext(
         self: *DocStore,
         txn: *Txn,
         lower: []const u8,
         upper: []const u8,
-        row_kind: u8,
+        row_kind: ?u8,
         ctx: ?*anyopaque,
         checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
         callback: ScanWithContextCallback,
     ) !void {
-        var cursor = try txn.openCursor();
+        var cursor = if (row_kind == null) try txn.openPhysicalCursorAdapter() else try txn.openCursor();
         defer cursor.close();
         const end = if (upper.len != 0) upper else &[_]u8{internal_keys.user_namespace + 1};
         cursor.setUpperBound(end);
@@ -3290,7 +3344,7 @@ pub const DocStore = struct {
             const term = internal_keys.findComponentTerminator(item.key, 1) orelse return error.InvalidInternalUserKey;
             candidate.clearRetainingCapacity();
             try candidate.appendSlice(self.alloc, item.key[0 .. term + 2]);
-            try candidate.append(self.alloc, row_kind);
+            try candidate.append(self.alloc, row_kind orelse internal_keys.primary_kind);
             if (try checkpoint(ctx, candidate.items) == .stop) return;
             var current = item;
             if (std.mem.order(u8, current.key, candidate.items) == .lt) {
@@ -3298,6 +3352,16 @@ pub const DocStore = struct {
                 if (!std.mem.startsWith(u8, current.key, candidate.items[0 .. term + 2])) {
                     entry = current;
                     continue;
+                }
+            }
+            if (row_kind == null and !std.mem.eql(u8, current.key, candidate.items)) {
+                candidate.items[term + 2] = internal_keys.relational_row_kind;
+                if (std.mem.order(u8, current.key, candidate.items) == .lt) {
+                    current = (try cursor.seekAtOrAfter(candidate.items)) orelse return;
+                    if (!std.mem.startsWith(u8, current.key, candidate.items[0 .. term + 2])) {
+                        entry = current;
+                        continue;
+                    }
                 }
             }
             if (std.mem.eql(u8, current.key, candidate.items)) {

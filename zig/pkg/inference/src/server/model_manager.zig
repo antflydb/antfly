@@ -10212,6 +10212,7 @@ pub const ModelManager = struct {
         control: InferenceExecutionControl,
     ) !EmbeddingRevisions {
         var result: EmbeddingRevisions = .{};
+        try control.check();
         if (manifest.managed_publication == null) return result;
         const io = control.io orelse try self.componentPlanIo();
         var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
@@ -10225,9 +10226,14 @@ pub const ModelManager = struct {
         const manager = &self.session_manager;
         if (manager.required_backend_invalid) return result;
         var required: [1]backends.BackendType = undefined;
-        const candidates = manager.requiredBackendCandidates(self.defaultModelBackends(model_dir), &required) catch return result;
+        const load_policy = self.defaultModelLoadPolicy(model_dir);
+        const candidates = manager.requiredBackendCandidates(load_policy.preferred_backends, &required) catch return result;
+        const fail_closed_cuda_a4b = load_policy.cache_policy.a4b_request == null and
+            backends.backendOrderSelectsCudaBeforeCpu(candidates) and
+            (try session_factory.resolveCudaA4bInferenceConfigForModelListing(self.allocator, model_dir, manifest, null)) != null;
         for (candidates) |backend| {
             if (!backend.available()) continue;
+            if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) continue;
             if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
             if (manifest.embedding_style == .embedding_gemma2 and backend != .native and backend != .metal and backend != .cuda) continue;
             if (backend == .wasm and manifest.onnx_path == null) continue;

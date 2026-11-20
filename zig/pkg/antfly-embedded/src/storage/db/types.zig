@@ -3059,6 +3059,7 @@ pub const SortProfileField = struct {
 };
 
 pub const SortProfile = struct {
+    text_ranking_passes: u32 = 0,
     plan: []const u8 = "",
     exactness: []const u8 = "",
     source: []const u8 = "",
