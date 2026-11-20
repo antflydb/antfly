@@ -1365,7 +1365,7 @@ fn executeMultiTableCommitOnce(
         participants.deinit(alloc);
     }
 
-    try routeParticipants(alloc, catalog, tables, &participants);
+    const admitted = try routeParticipants(alloc, catalog, tables, &participants);
 
     const participant_ids = try alloc.alloc([]const u8, participants.items.len);
     var participant_ids_initialized: usize = 0;
@@ -1564,7 +1564,7 @@ fn executeMultiTableCommitOnce(
     // admission and the exact range epoch before the coordinator participant
     // records the irreversible commit decision.
     if (!resume_committed) {
-        validateParticipantEpochs(alloc, catalog, participants.items) catch |err| {
+        validateParticipantEpochs(alloc, catalog, participants.items, admitted) catch |err| {
             abort_on_error = false;
             try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
             return err;
@@ -2205,7 +2205,8 @@ const TableRoutes = struct {
     ranges: std.ArrayList(*const manager.RangeRecord) = .empty,
     epoch: u64 = 0,
     groups: ParticipantGroups = .empty,
-    guarded: bool = false,
+    guard_owners: std.AutoHashMapUnmanaged(u64, range_reads.ProofMap) = .empty,
+    proof_count: usize = 0,
 
     fn mergeRequirements(self: *@This(), table: TableCommitRequest) !void {
         const prior = &self.requirements;
@@ -2220,13 +2221,23 @@ const TableRoutes = struct {
         try mergeRequirement(&prior.schema_version, table.schema_version, error.CatalogGenerationChanged);
         try mergeRequirement(&prior.relational_schema_version, table.relational_schema_version, error.InvalidTxnRequest);
         try mergeRequirement(&prior.relational_integrity_generation_set, table.relational_integrity_generation_set, error.PreparedGenerationChanged);
-        try mergeRequirement(&prior.commit_requires, table.commit_requires, error.InvalidTxnRequest);
+        prior.commit_requires = db_mod.types.CommitRequires.strongest(prior.commit_requires, table.commit_requires);
     }
 
     fn mergeRequirement(current: anytype, incoming: @TypeOf(current.*), conflict: anyerror) !void {
         const value = incoming orelse return;
         if (current.*) |prior| if (!std.meta.eql(prior, value)) return conflict;
         current.* = value;
+    }
+};
+
+const range_reads = @import("antfly_local_sources").api_range_read_guards;
+const RoutingIdentity = struct {
+    group_id: u64,
+    incarnation: ?@import("../metadata/api.zig").MetadataClusterIncarnation,
+
+    fn from(snapshot: *const @import("../metadata/api.zig").AdminSnapshot) RoutingIdentity {
+        return .{ .group_id = snapshot.status.metadata_group_id, .incarnation = snapshot.status.metadata_incarnation };
     }
 };
 
@@ -2237,8 +2248,11 @@ fn loadTableRoutes(a: std.mem.Allocator, by_name: *RoutesByName, snapshot: *cons
     for (snapshot.tables) |*descriptor| {
         const routes = by_name.getPtr(descriptor.name) orelse continue;
         try table_catalog.validateTransactionTopologyStableSnapshot(snapshot, descriptor.*);
+        if (routes.descriptor != null) return error.CatalogGenerationChanged;
+        const slot = try by_id.getOrPut(a, descriptor.table_id);
+        if (slot.found_existing) return error.CatalogGenerationChanged;
+        slot.value_ptr.* = routes;
         routes.descriptor = descriptor;
-        try by_id.put(a, descriptor.table_id, routes);
     }
     for (snapshot.ranges) |*range| {
         const routes = by_id.get(range.table_id) orelse continue;
@@ -2250,7 +2264,7 @@ fn loadTableRoutes(a: std.mem.Allocator, by_name: *RoutesByName, snapshot: *cons
     }
 }
 
-fn validateParticipantEpochs(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, participants: []const ParticipantTxn) !void {
+fn validateParticipantEpochs(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, participants: []const ParticipantTxn, admitted: ?RoutingIdentity) !void {
     if (participants.len == 0) return;
     var workspace = std.heap.ArenaAllocator.init(alloc);
     defer workspace.deinit();
@@ -2262,14 +2276,15 @@ fn validateParticipantEpochs(alloc: std.mem.Allocator, catalog: table_catalog.Ca
     }
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
+    if (!std.meta.eql(admitted orelse return error.CatalogGenerationChanged, RoutingIdentity.from(&snapshot))) return error.CatalogGenerationChanged;
     try loadTableRoutes(a, &by_name, &snapshot);
     for (participants) |participant| {
         if (participant.topology_epoch != 0 and by_name.getPtr(participant.table_name).?.epoch != participant.topology_epoch) return error.TopologyChanged;
     }
 }
 
-fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, participants: *std.ArrayListUnmanaged(ParticipantTxn)) !void {
-    if (tables.len == 0) return;
+fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, participants: *std.ArrayListUnmanaged(ParticipantTxn)) !?RoutingIdentity {
+    if (tables.len == 0) return null;
     var workspace = std.heap.ArenaAllocator.init(alloc);
     defer workspace.deinit();
     const a = workspace.allocator();
@@ -2279,7 +2294,6 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
         try TableRoutes.mergeRequirement(&bound_incarnation, table.bound_catalog_incarnation, error.CatalogGenerationChanged);
         const slot = try by_name.getOrPut(a, table.table_name);
         if (slot.found_existing) try slot.value_ptr.mergeRequirements(table) else slot.value_ptr.* = .{ .requirements = table };
-        if (table.range_guards.len != 0) slot.value_ptr.guarded = true;
     }
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
@@ -2301,10 +2315,20 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
                 return error.TopologyChanged;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, fence.route.group_id, topology_epoch);
             if (participant.route_fence) |*existing| {
-                if (!@import("antfly_local_sources").api_range_read_guards.sameOwner(existing.*, fence)) return error.TopologyChanged;
+                if (!range_reads.sameOwner(existing.*, fence)) return error.TopologyChanged;
                 existing.catalog_revision = @max(existing.catalog_revision, fence.catalog_revision);
             } else participant.route_fence = fence;
-            for (owner.proofs) |proof| try participant.range_guards.append(alloc, proof);
+            const observations = try routes.guard_owners.getOrPut(a, fence.route.group_id);
+            if (!observations.found_existing) {
+                if (routes.guard_owners.count() > range_reads.max_owners) return error.TransactionTooLarge;
+                observations.value_ptr.* = .empty;
+            }
+            for (owner.proofs) |proof| {
+                if (!try range_reads.observe(observations.value_ptr, a, proof)) continue;
+                if (routes.proof_count == range_reads.max_proofs) return error.TransactionTooLarge;
+                routes.proof_count += 1;
+                try participant.range_guards.append(alloc, proof);
+            }
         }
 
         for (table.writes) |write| {
@@ -2366,18 +2390,18 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
             if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
             participant.relational_index_maintenance = command;
         }
-        if (table.commit_requires == .direct_enrichments and groups.count() == 0) {
-            _ = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, "") orelse return error.UnknownGroup, topology_epoch);
-        }
     }
     for (by_name.values()) |*routes| {
         const table = routes.requirements;
         const groups = &routes.groups;
         const topology_epoch = routes.epoch;
+        if (table.commit_requires == .direct_enrichments and groups.count() == 0) {
+            _ = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, "") orelse return error.UnknownGroup, topology_epoch);
+        }
         // Match all enlisted owner proofs in one traversal of this table's
         // ranges. Guarded reads keep their observed fence and bound writes get
         // a fence from the same routing snapshot used to choose their group.
-        if (bound_incarnation != null or routes.guarded) {
+        if (bound_incarnation != null or routes.guard_owners.count() != 0) {
             var remaining = groups.count();
             for (routes.ranges.items) |range| {
                 if (remaining == 0) break;
@@ -2419,6 +2443,7 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
             try validateRestorePlan(participant.restore_staging_scope, participant.restore_staging_plan_id);
         }
     }
+    return RoutingIdentity.from(&snapshot);
 }
 
 const ParticipantGroups = std.AutoArrayHashMapUnmanaged(u64, usize);
@@ -5833,10 +5858,12 @@ fn consumerTests() type {
                         try std.testing.expectEqual(@as(u64, if (group_id == 8001) 8 else 7), fence.table_id);
                         try std.testing.expectEqual(@as([32]u8, @splat('1')), fence.metadata_incarnation.?);
                         try std.testing.expectEqual(@as(?u32, if (group_id == 8001) null else 7), req.req.schema_version);
+                        if (group_id != 8001) try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, req.req.commit_requires.?);
                         self.bound_prepares += 1;
                     }
                     try std.testing.expect(req.req.writes.len + req.req.deletes.len + req.req.predicates.len + req.req.integrity.len + req.req.range_guards.len > 0);
                     if (req.req.range_guards.len != 0) {
+                        try std.testing.expectEqual(@as(usize, 1), req.req.range_guards.len);
                         try std.testing.expectEqual(@as(u64, 7002), group_id);
                         try std.testing.expectEqual(@as(?u64, 9007199254740993), req.req.range_guards[0].generation);
                         self.range_prepares += 1;
@@ -6018,9 +6045,9 @@ fn consumerTests() type {
             recorder.includes_audit = true;
             const snapshots_before = FakeCatalog.snapshots;
             const guarded = try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("40112233445566778899aabbccddeeff"), 50_000, 50_001, &.{
-                .{ .table_name = "docs", .schema_version = 7, .bound_catalog_incarnation = @splat(0x11), .range_guards = (&observation)[0..1] },
+                .{ .table_name = "docs", .commit_requires = .none, .schema_version = 7, .bound_catalog_incarnation = @splat(0x11), .range_guards = (&observation)[0..1] },
                 .{ .table_name = "audit", .writes = &.{.{ .key = "log", .value = "{}" }} },
-                .{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
+                .{ .table_name = "docs", .commit_requires = .direct_enrichments, .range_guards = &.{observation}, .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
             }, .write, null);
             try std.testing.expect(guarded == .committed);
             // Routing and the post-prepare fence each take one fresh catalog snapshot.
@@ -6029,6 +6056,39 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 3), recorder.bound_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.range_prepares);
             const prior_begins = recorder.begins.items.len;
+            {
+                var participants: std.ArrayListUnmanaged(ParticipantTxn) = .empty;
+                defer {
+                    for (participants.items) |*participant| participant.deinit(std.testing.allocator);
+                    participants.deinit(std.testing.allocator);
+                }
+                _ = try routeParticipants(std.testing.allocator, FakeCatalog.iface(), &.{
+                    .{ .table_name = "docs", .commit_requires = .direct_enrichments },
+                    .{ .table_name = "docs", .commit_requires = .none, .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
+                }, &participants);
+                try std.testing.expectEqual(@as(usize, 1), participants.items.len);
+                try std.testing.expectEqual(@as(u64, 7002), participants.items[0].group_id);
+                try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, participants.items[0].commit_requires.?);
+            }
+            var inconsistent = observation;
+            inconsistent.proofs = &.{.{ .bucket = 100, .generation = 1 }};
+            try std.testing.expectError(error.SqlWriteConflict, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(4), 60_000, 60_001, &.{
+                .{ .table_name = "docs", .range_guards = &.{observation} },
+                .{ .table_name = "docs", .range_guards = &.{inconsistent} },
+            }, .write, null));
+            const enlisted = [_]ParticipantTxn{.{ .group_id = 7002, .table_name = "docs", .topology_epoch = routing.topology_epoch }};
+            try std.testing.expectError(error.CatalogGenerationChanged, validateParticipantEpochs(std.testing.allocator, FakeCatalog.iface(), &enlisted, .{ .group_id = 1, .incarnation = @splat('2') }));
+            {
+                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena.deinit();
+                var names: RoutesByName = .empty;
+                try names.put(arena.allocator(), "docs", .{ .requirements = .{ .table_name = "docs" } });
+                var snapshot = routing.snapshot;
+                var duplicate = [_]manager.TableRecord{ snapshot.tables[0], snapshot.tables[1] };
+                duplicate[1].name = duplicate[0].name;
+                snapshot.tables = &duplicate;
+                try std.testing.expectError(error.CatalogGenerationChanged, loadTableRoutes(arena.allocator(), &names, &snapshot));
+            }
             try std.testing.expectError(error.CatalogGenerationChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(4), 60_000, 60_001, &.{
                 .{ .table_name = "docs", .schema_version = 7, .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
                 .{ .table_name = "docs", .schema_version = 8, .writes = &.{.{ .key = "doc:z", .value = "{}" }} },

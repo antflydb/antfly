@@ -1556,6 +1556,24 @@ test "pgwire unknown commit cannot publish held cursor rows" {
     try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
 }
 
+test "pgwire simple streaming query sends metadata after its first successful pull" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "SELECT n FROM t\x00");
+    try frame(&input.writer, 'X', "");
+    for ([_]bool{ true, false }) |fail| {
+        var mock: Mock = .{ .stream_rows = 1, .stream_fail_at = if (fail) 0 else null };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(messages);
+        try std.testing.expectEqual(@as(usize, @intFromBool(fail)), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, @intFromBool(!fail)), std.mem.count(u8, messages, "T"));
+        try std.testing.expectEqual(@as(usize, @intFromBool(!fail)), std.mem.count(u8, messages, "D"));
+    }
+}
+
 test "pgwire pull failure and disconnect close snapshots before releasing identity" {
     for ([_]bool{ false, true }) |fail| {
         var input = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -1584,21 +1602,26 @@ test "pgwire simple query and SQL EXECUTE revalidate blocking results between de
         if (prepared) try frame(&input.writer, 'Q', "PREPARE blocking AS SELECT n FROM t ORDER BY n\x00");
         try frame(&input.writer, 'Q', if (prepared) "EXECUTE blocking\x00" else "SELECT n FROM t ORDER BY n\x00");
         try frame(&input.writer, 'X', "");
-        var mock: Mock = .{ .result_override = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .rows = &rows, .command_tag = "SELECT 257" }, .revoke_on_buffered_resume = true };
-        var output = try run(&mock, input.written(), .{});
-        defer output.deinit();
-        var cursor: protocol.Cursor = .{ .bytes = output.written() };
-        var emitted: usize = 0;
-        var forbidden = false;
-        while (cursor.offset < cursor.bytes.len) {
-            const tag = try cursor.int(u8);
-            const length = try cursor.int(u32);
-            const payload = try cursor.take(length - 4);
-            if (tag == 'D') emitted += 1;
-            if (tag == 'E') forbidden = std.mem.indexOf(u8, payload, "42501") != null;
+        for ([_]bool{ false, true }) |denied_at_start| {
+            var mock: Mock = .{ .result_override = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .rows = &rows, .command_tag = "SELECT 257" }, .revoke_on_buffered_resume = true, .cursor_revoked = denied_at_start };
+            var output = try run(&mock, input.written(), .{});
+            defer output.deinit();
+            var cursor: protocol.Cursor = .{ .bytes = output.written() };
+            var emitted: usize = 0;
+            var descriptions: usize = 0;
+            var forbidden = false;
+            while (cursor.offset < cursor.bytes.len) {
+                const tag = try cursor.int(u8);
+                const length = try cursor.int(u32);
+                const payload = try cursor.take(length - 4);
+                if (tag == 'T') descriptions += 1;
+                if (tag == 'D') emitted += 1;
+                if (tag == 'E') forbidden = std.mem.indexOf(u8, payload, "42501") != null;
+            }
+            try std.testing.expectEqual(@as(usize, if (denied_at_start) 0 else 1), descriptions);
+            try std.testing.expectEqual(@as(usize, if (denied_at_start) 0 else 256), emitted);
+            try std.testing.expect(forbidden);
         }
-        try std.testing.expectEqual(@as(usize, 256), emitted);
-        try std.testing.expect(forbidden);
     }
 }
 

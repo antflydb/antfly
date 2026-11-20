@@ -20367,7 +20367,7 @@ pub const DB = struct {
     fn lookupPrimarySnapshotWithSchemaAndOutput(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64) !?types.LookupResult {
         return self.lookupPrimarySnapshotWithPreparedProjection(alloc, output, key, opts, probe, schema_view, primary, primary_timestamp, null);
     }
-    fn lookupPrimarySnapshotWithPreparedProjection(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64, prepared: ?*LookupProjectionPlans) !?types.LookupResult {
+    fn lookupPrimarySnapshotWithPreparedProjection(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, supplied: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64, prepared: ?*LookupProjectionPlans) !?types.LookupResult {
         // Virtual group sources have no independently authorized public row.
         // Owner control queries use the dedicated private lookup path above;
         // producers read their physical source through authenticated snapshots.
@@ -20382,17 +20382,25 @@ pub const DB = struct {
         // Projection borrows the caller's immutable schema and primary snapshot.
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
-        const stored_primary = primary orelse probe.getLeased(store_key) catch |err| switch (err) {
-            error.NotFound => null,
+        const unit_key = internal_keys.isDocumentUnitArtifactRecordKey(store_key);
+        const preloaded = if (unit_key) primary else primary orelse supplied.getLeased(store_key) catch |err| switch (err) {
+            error.NotFound => return null,
             else => return err,
         };
-        if (stored_primary == null and (opts.include_primary_digest or !internal_keys.isDocumentUnitArtifactRecordKey(store_key))) return null;
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
         const policy = if (opts.privacy_original) null else try privacy.capture(self, privacy_arena.allocator());
-        if (!opts.privacy_original) try privacy.requireExpected(privacy_arena.allocator(), opts.privacy_policy_version, policy);
         const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
+        var pinned: ?docstore_mod.DocStore.Txn = if (protected and supplied.probe != null and unit_key) try self.core.store.beginReadTxn() else null;
+        defer if (pinned) |*txn| txn.abort();
+        const probe = if (pinned) |*txn| txn else supplied;
+        const stored_primary = (if (pinned == null) preloaded else null) orelse probe.getLeased(store_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (stored_primary == null and opts.include_primary_digest) return null;
+        if (!opts.privacy_original) try privacy.requireExpected(privacy_arena.allocator(), opts.privacy_policy_version, policy);
         const page = if (stored_primary == null) try virtualPdfPageUnit(self, alloc, probe, store_key, if (protected) policy else null) else null;
         defer if (page) |bytes| alloc.free(bytes);
         const raw = stored_primary orelse page orelse return null;
@@ -20500,7 +20508,7 @@ pub const DB = struct {
             std.crypto.hash.sha2.Sha256.hash(raw, &primary_digest, .{});
             digest = primary_digest;
             if (version == null) {
-                version = primary_timestamp orelse try lookupSnapshotTimestamp(alloc, key, probe);
+                version = (if (pinned == null) primary_timestamp else null) orelse try lookupSnapshotTimestamp(alloc, key, probe);
             }
         }
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -50979,15 +50987,15 @@ pub const DB = struct {
     fn loadStoredSearchDocumentProbe(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
         const store_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
         defer alloc.free(store_key);
-        var txn = try self.core.store.beginProbeTxn();
-        defer txn.abort();
-        const member = try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key);
-        if (member == null and !internal_keys.isDocumentUnitArtifactRecordKey(store_key)) return null;
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
         const policy = try privacy.capture(self, privacy_arena.allocator());
         const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
+        var txn = if (protected and internal_keys.isDocumentUnitArtifactRecordKey(store_key)) try self.core.store.beginReadTxn() else try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        const member = try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key);
+        if (member == null and !internal_keys.isDocumentUnitArtifactRecordKey(store_key)) return null;
         const page = if (member == null) try virtualPdfPageUnit(self, alloc, &txn, store_key, if (protected) policy else null) else null;
         if (page) |bytes| return bytes;
         const raw = member orelse return null;
@@ -51379,7 +51387,11 @@ fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.D
             for (candidates[0..count], probes[0..count]) |item, *probe| probe.* = .{ .candidate = item, .key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(wave.allocator(), keys[item.index], item.outputs[0]) };
             if (!std.sort.isSorted(Probe, probes[0..count], {}, Probe.less)) std.mem.sort(Probe, probes[0..count], {}, Probe.less);
             for (probes[0..count], physical[0..count]) |probe, *key| key.* = probe.key;
-            try txn.getManySortedPhysical(physical[0..count], headers[0..count]);
+            var scope = if (policy != null) try txn.openReadScope(wave.allocator()) else null;
+            defer if (scope) |*read| read.close();
+            if (scope) |*read| {
+                try read.getManySorted(physical[0..count], headers[0..count]);
+            } else try txn.getManySortedPhysical(physical[0..count], headers[0..count]);
             const received = count;
             count = 0;
             for (probes[0..received], headers[0..received]) |probe, header| {
@@ -51391,7 +51403,7 @@ fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.D
                             var backing = inference_work.ReclaimingInvocationAllocator.init(output);
                             var validation = std.heap.ArenaAllocator.init(backing.allocator());
                             defer validation.deinit();
-                            if (!try @import("privacy_read.zig").permitsVirtualPage(validation.allocator(), active, probe.key, txn)) break :candidate;
+                            if (!try @import("privacy_read.zig").permitsVirtualPage(validation.allocator(), active, probe.key, bytes, txn)) break :candidate;
                             if (verified) |indices| try indices.put(output, item.index, {});
                         }
                         const fingerprint = try std.fmt.allocPrint(wave.allocator(), "{s}:{x:0>16}", .{ item.outputs[0], source });
@@ -51682,7 +51694,15 @@ fn loadStoredSearchDocumentsMany(
     for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
 
     const txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    var txn = try self.core.store.beginProbeTxn();
+    var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+    defer privacy_arena.deinit();
+    const privacy = @import("privacy_read.zig");
+    const policy = try privacy.capture(self, privacy_arena.allocator());
+    const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
+    const pin_units = protected and for (read_keys) |key| {
+        if (internal_keys.isDocumentUnitArtifactRecordKey(key)) break true;
+    } else false;
+    var txn = if (pin_units) try self.core.store.beginReadTxn() else try self.core.store.beginProbeTxn();
     defer txn.abort();
     if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
     const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
@@ -51701,14 +51721,9 @@ fn loadStoredSearchDocumentsMany(
         .pinned = if (schema_view) |*view| view else null,
     };
     defer schema_plans.deinit();
-    var privacy_arena = std.heap.ArenaAllocator.init(alloc);
-    defer privacy_arena.deinit();
-    const privacy = @import("privacy_read.zig");
-    const policy = try privacy.capture(self, privacy_arena.allocator());
     var virtual_pages = std.heap.ArenaAllocator.init(alloc);
     defer virtual_pages.deinit();
     var verified_pages: std.AutoHashMapUnmanaged(usize, void) = .empty;
-    const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
     try hydrateVirtualPdfPageUnits(self, virtual_pages.allocator(), &txn, read_keys, read_values, if (protected) policy else null, &verified_pages);
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
@@ -155803,6 +155818,84 @@ test "source semantic media input virtual PDF pages require the physical vector 
             try std.testing.expect(lookup == null and single == null and batch[0] == null);
         }
     }
+
+    // Make the payload resolver publish a replacement witness after the page
+    // header has been read. The in-flight citation belongs to the older cut.
+    const payloads = @import("../artifact_payload.zig");
+    const External = struct {
+        store: *docstore_mod.DocStore,
+        bytes: []const u8,
+        witness_key: []const u8,
+        replacement: ?[192]u8 = null,
+        fetched_bytes: usize = 0,
+        fn retain(_: *anyopaque) void {}
+        fn release(_: *anyopaque) void {}
+        fn prepare(_: *anyopaque, _: []const payloads.Prepared) !void {}
+        fn resolve(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: payloads.Reference) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.fetched_bytes += self.bytes.len;
+            if (self.replacement) |next| {
+                self.replacement = null;
+                try self.store.put(self.witness_key, &next);
+            }
+            return allocator.dupe(u8, self.bytes);
+        }
+    };
+    const reference = try payloads.Reference.forArtifact(vector_key, vector);
+    try db.core.store.put(vector_key, &reference.encode());
+    var external = External{ .store = db.core.store, .bytes = vector, .witness_key = witness };
+    db.core.store.configurePayloadPolicy(.{ .ptr = &external, .vtable = &.{ .retain = External.retain, .release = External.release, .prepare = External.prepare, .resolve = External.resolve } }, false, null);
+    defer db.core.store.configurePayloadPolicy(null, false, null);
+    for (0..3) |path| {
+        try db.core.store.put(witness, &local.encode(policy.prepared.version, source, vector));
+        external.replacement = local.encode(policy.prepared.version, "stale", vector);
+        const present = switch (path) {
+            0 => (try db.lookup(scratch, unit, .{})) != null,
+            1 => (try db.loadStoredSearchDocumentProbe(scratch, unit)) != null,
+            else => (try loadStoredSearchDocumentsMany(&db, scratch, &.{unit}, null))[0] != null,
+        };
+        try std.testing.expect(present);
+        try std.testing.expect((try db.loadStoredSearchDocumentProbe(scratch, unit)) == null);
+    }
+    try std.testing.expectEqual(6 * vector.len, external.fetched_bytes);
+
+    // Ordered publications carry an output revision and causal source proof.
+    // A valid citation and a superseded revision both cost zero payload reads.
+    const publication = @import("artifact_publication.zig");
+    const provenance = @import("artifact_producer_provenance.zig");
+    const namespace: publication.Namespace = @splat(1);
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        try @import("../source_authority.zig").bind(&write, .raft, namespace);
+        var marker: [16]u8 = undefined;
+        std.mem.writeInt(u64, marker[0..8], 1, .little);
+        std.mem.writeInt(u64, marker[8..16], 1, .little);
+        try write.put(&internal_keys.ordered_document_applied_entry_key, &marker);
+        const primary = try publication.capturePrimarySource(scratch, &write, namespace, "doc");
+        var command: publication.Command = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "images", .producer_artifact_name = name, .producer_generation = 1, .sources = &.{primary}, .mutations = &.{.{ .family = .derived_vector, .key = vector_key, .value = vector, .source_index = 0 }}, .publication_digest = @splat(0) };
+        command.publication_digest = command.digest();
+        var activate = command;
+        activate.mode = .activate;
+        try publication.stageAuthority(&write, activate);
+        var proof = try provenance.fromCommand(scratch, command);
+        defer proof.deinit();
+        const encoded = try provenance.encodeAlloc(scratch, proof.proof);
+        const position: publication.Position = .{ .raft = .{ .term = 1, .index = 1 } };
+        try publication.stageArtifactRevisions(scratch, &write, command, position);
+        try provenance.stage(&write, command, encoded, position);
+        try write.commit();
+    }
+    const before = external.fetched_bytes;
+    try std.testing.expect((try db.loadStoredSearchDocumentProbe(scratch, unit)) != null);
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        try publication.stageArtifactTombstoneRevision(&write, namespace, vector_key, .{ .raft = .{ .term = 1, .index = 2 } });
+        try write.commit();
+    }
+    try std.testing.expect((try db.loadStoredSearchDocumentProbe(scratch, unit)) == null);
+    try std.testing.expectEqual(before, external.fetched_bytes);
 }
 
 test "source semantic media input PDF cardinality changes require removing dense consumers" {

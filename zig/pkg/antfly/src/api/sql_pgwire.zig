@@ -606,19 +606,12 @@ const OwnedRead = struct {
 
     fn pull(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
         if (self.detached) return error.InvalidSqlBackendResponse;
-        try request.check();
         // Retained snapshots have a hard initial statement deadline, even if
         // later Execute messages carry a newer per-request deadline.
         try self.authority.request.check();
-        try self.authority.credential.validate();
-        if (self.session_id) |id_hex| {
-            const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
-            if (try self.adapter.server.txn_sessions.principalAccess(self.adapter.server.alloc, id, self.authority.credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
-            var state = (try self.adapter.server.txn_sessions.getSqlState(self.adapter.server.alloc, id)) orelse return error.SqlTransactionNotActive;
-            defer state.deinit(self.adapter.server.alloc);
-            if (state.metadata.failed or state.terminal != null) return error.SqlTransactionNotActive;
-        }
-        try self.retained.check(alloc, self.authority.credential, request, false);
+        var attached = request;
+        attached.session_id = self.session_id;
+        try self.retained.check(alloc, self.authority.credential, attached, false);
         var page = try self.stream.nextBatch(limit);
         errdefer page.deinit();
         const owner = try alloc.create(PageOwner);
@@ -880,6 +873,10 @@ const RetainedRead = struct {
         try request.check();
         try credential.validate();
         if (self.adapter.server.cfg.user_manager != credential.manager) return error.Unauthorized;
+        if (request.session_id) |encoded| {
+            const id = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
+            try self.adapter.server.txn_sessions.requireActiveSqlReader(id, credential.sessionPrincipal());
+        }
         const revision = try self.validateAccess(a, credential);
         var context = try requestContext(credential, &request).platformDeadline();
         if (self.validated_stamp orelse self.cut.stamp) |stamp| context.bound_catalog_incarnation = stamp.relation_epoch.incarnation;
@@ -2758,6 +2755,13 @@ test "SQL pgwire retained reads track the serving policy even without a catalog 
     retained.policies = &.{.{ .resource = "physical", .filter = null }};
     var cancel = std.atomic.Value(bool).init(false);
     const req: wire.Request = .{ .statement = "", .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } }, .cancel_requested = &cancel };
+    const session = try api.txn_sessions.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, 1, credential.sessionPrincipal());
+    const session_id = std.fmt.bytesToHex(session.txn_id, .lower);
+    var attached = req;
+    attached.session_id = &session_id;
+    try retained.check(a, credential, attached, true);
+    try std.testing.expect(api.txn_sessions.remove(a, session.txn_id));
+    try std.testing.expectError(error.SqlTransactionNotActive, retained.check(a, credential, attached, false));
     try manager.addRoleToSubject("bob", "auditor");
     fake.revision += 1;
     fake.binding_lookups = 0;

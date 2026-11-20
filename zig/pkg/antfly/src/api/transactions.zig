@@ -2470,6 +2470,32 @@ pub const SessionRegistry = struct {
         }
     };
 
+    /// Check an attached reader against a single session version without cloning
+    /// staged writes, savepoints or setting overlays on a cache hit.
+    pub fn requireActiveSqlReader(self: *SessionRegistry, txn_id: db_mod.types.TxnId, principal: []const u8) !void {
+        const stripe = self.sessionLock(txn_id);
+        stripe.lock();
+        defer stripe.unlock();
+        if (!self.durableMissIsAuthoritative()) {
+            self.mutex.lock();
+            if (self.sessions.getPtr(txn_id)) |session| {
+                defer self.mutex.unlock();
+                return checkSqlReader(session, principal);
+            }
+            self.mutex.unlock();
+        }
+        const durable = self.durable orelse return error.SqlTransactionNotActive;
+        var session = (try durable.load(txn_id)) orelse return error.SqlTransactionNotActive;
+        defer session.deinit(durable.alloc);
+        return checkSqlReader(&session, principal);
+    }
+
+    fn checkSqlReader(session: *const Session, principal: []const u8) !void {
+        const sql = session.sql orelse return error.SqlTransactionNotActive;
+        if (!principalsEqual(session.principal, principal) or sql.failed or session.terminal_abort or
+            session.terminal_commit != null or session.commit_execution_started) return error.SqlTransactionNotActive;
+    }
+
     pub fn getSqlState(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SqlState {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
@@ -7512,7 +7538,10 @@ test "SQL session metadata and schema fences survive durable records" {
     var registry = SessionRegistry.init(null);
     defer registry.deinit(alloc);
     const info = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "app", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, 9, "alice");
+    try registry.requireActiveSqlReader(info.txn_id, "alice");
+    try std.testing.expectError(error.SqlTransactionNotActive, registry.requireActiveSqlReader(info.txn_id, "bob"));
     try registry.setSqlFailed(alloc, info.txn_id, true);
+    try std.testing.expectError(error.SqlTransactionNotActive, registry.requireActiveSqlReader(info.txn_id, "alice"));
     const session = registry.sessions.get(info.txn_id).?;
     const bytes = try encodeSessionRecord(alloc, session);
     defer alloc.free(bytes);

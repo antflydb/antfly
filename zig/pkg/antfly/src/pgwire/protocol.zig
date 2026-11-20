@@ -1124,7 +1124,7 @@ pub const Session = struct {
                     };
                 }
                 if (portal.stream != null or portal.stream_complete) {
-                    try self.executeStream(portal, requested);
+                    try self.executeStream(portal, requested, false);
                     portal.failed = false;
                     return;
                 }
@@ -1145,7 +1145,7 @@ pub const Session = struct {
                     var req = self.request(portal.statement, portal.parameters, portal.types);
                     req.binding_guard = portal.description.binding_guard;
                     req.setting_epoch = portal.description.setting_epoch;
-                    try self.deliverSelect(result, portal.formats, req, &portal.offset, count, first_delivery);
+                    try self.deliverSelect(result, portal.formats, req, &portal.offset, count, first_delivery, false);
                 } else {
                     try self.dataResult(try result.view(portal.offset, count), portal.formats);
                     portal.offset += count;
@@ -1351,12 +1351,7 @@ pub const Session = struct {
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
-        var req = self.request(cursor.statement, &.{}, &.{});
-        req.binding_guard = cursor.description.binding_guard;
-        req.setting_epoch = cursor.description.setting_epoch;
-        req.database = cursor.database;
-        req.namespace = cursor.namespace;
-        req.search_path = cursor.search_path;
+        const req = self.cursorRequest(cursor);
         try req.check();
         if (cursor.spool != null) {
             self.fetchSpooled(cursor, fetch, req) catch |err| {
@@ -1612,7 +1607,7 @@ pub const Session = struct {
         self.portals.clearRetainingCapacity();
     }
 
-    fn executeStream(self: *Session, portal: *Portal, requested: i32) !void {
+    fn executeStream(self: *Session, portal: *Portal, requested: i32, describe_rows: bool) !void {
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
@@ -1637,6 +1632,7 @@ pub const Session = struct {
                 return error.InvalidResult;
             if (!page.exhausted and result.rowCount() == 0) return error.InvalidResult;
             if (result.sql_nulls) |flags| if (flags.len != result.rowCount()) return error.InvalidResult;
+            if (describe_rows and portal.offset == 0) try self.rowDescription(result.columns, portal.formats);
             try self.dataResult(result, portal.formats);
             remaining -= result.rowCount();
             portal.offset += result.rowCount();
@@ -1689,8 +1685,7 @@ pub const Session = struct {
         defer portal.arena.deinit();
         defer if (portal.stream) |remaining| remaining.close(remaining.context);
         if (stream.columns.len > self.limits.columns) return error.ProgramLimitExceeded;
-        try self.rowDescription(stream.columns, &.{});
-        try self.executeStream(&portal, 0);
+        try self.executeStream(&portal, 0, true);
         return true;
     }
 
@@ -1829,7 +1824,7 @@ pub const Session = struct {
         if (length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
         std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
     }
-    fn deliverSelect(self: *Session, result: backend.Result, formats: []const u16, req: backend.Request, offset: *usize, count: usize, first_delivery: bool) !void {
+    fn deliverSelect(self: *Session, result: backend.Result, formats: []const u16, req: backend.Request, offset: *usize, count: usize, first_delivery: bool, describe_rows: bool) !void {
         const authority = result.cursor_authority orelse return error.InvalidSqlBackendResponse;
         if (!first_delivery) self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
@@ -1840,6 +1835,7 @@ pub const Session = struct {
             var scratch = std.heap.ArenaAllocator.init(self.alloc);
             defer scratch.deinit();
             try authority.validate(authority.ptr, scratch.allocator(), self.identity orelse return error.AuthenticationFailed, req, materialized);
+            if (describe_rows and materialized and result.columns.len != 0) try self.rowDescription(result.columns, formats);
             const page = @min(remaining, 256);
             try self.dataResult(try result.view(offset.*, page), formats);
             offset.* += page;
@@ -1851,11 +1847,13 @@ pub const Session = struct {
     }
 
     fn deliverSimpleResult(self: *Session, result: backend.Result, req: backend.Request) !void {
-        if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
         if (result.cursor_authority != null or std.mem.eql(u8, result.command_tag, "SELECT") or std.mem.startsWith(u8, result.command_tag, "SELECT ")) {
             var offset: usize = 0;
-            try self.deliverSelect(result, &.{}, req, &offset, result.rowCount(), true);
-        } else try self.dataResult(result, &.{});
+            try self.deliverSelect(result, &.{}, req, &offset, result.rowCount(), true, true);
+        } else {
+            if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
+            try self.dataResult(result, &.{});
+        }
         try self.complete(result);
     }
 
