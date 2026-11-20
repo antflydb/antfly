@@ -731,7 +731,7 @@ pub const RoaringBitmap = struct {
         bitmap: *RoaringBitmap,
         chunk: ?u16 = null,
         container_index: ?usize = null,
-        first_empty: ?usize = null,
+        emptied_container: bool = false,
         read: usize = 0,
         write: usize = 0,
 
@@ -771,7 +771,7 @@ pub const RoaringBitmap = struct {
                 if (container.isEmpty()) {
                     container.deinit(self.bitmap.alloc);
                     container.* = .{ .array = .empty };
-                    if (self.first_empty == null) self.first_empty = index;
+                    self.emptied_container = true;
                 }
             }
             self.container_index = null;
@@ -782,17 +782,19 @@ pub const RoaringBitmap = struct {
 
         pub fn finish(self: *SortedRemover) void {
             self.finishContainer();
-            const start = self.first_empty orelse return;
+            if (!self.emptied_container) return;
             const bitmap = self.bitmap;
-            var write = start;
-            for (start..bitmap.keys.items.len) |read| {
+            var write: usize = 0;
+            for (0..bitmap.keys.items.len) |read| {
                 const container = &bitmap.containers.items[read];
                 if (container.isEmpty()) {
                     container.deinit(bitmap.alloc);
                     continue;
                 }
-                bitmap.keys.items[write] = bitmap.keys.items[read];
-                bitmap.containers.items[write] = container.*;
+                if (write != read) {
+                    bitmap.keys.items[write] = bitmap.keys.items[read];
+                    bitmap.containers.items[write] = container.*;
+                }
                 write += 1;
             }
             if (write == 0) {
@@ -802,7 +804,7 @@ pub const RoaringBitmap = struct {
                 bitmap.keys.shrinkRetainingCapacity(write);
                 bitmap.containers.shrinkRetainingCapacity(write);
             }
-            self.first_empty = null;
+            self.emptied_container = false;
         }
     };
 
@@ -3127,6 +3129,25 @@ test "optional numeric range sorted removals compact arrays and clear dense word
     for (0..4096) |value| clear.remove(@intCast(value));
     for (65536..65536 + 9000) |value| clear.remove(@intCast(value));
     clear.finish();
+    try std.testing.expect(bitmap.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), bitmap.containers.capacity);
+}
+
+test "optional numeric range sorted removals drop earlier empty containers" {
+    const alloc = std.testing.allocator;
+    var bitmap = RoaringBitmap.init(alloc);
+    defer bitmap.deinit();
+    try bitmap.addRange(0, 9000);
+    try bitmap.add(65536);
+    var mask = RoaringBitmap.init(alloc);
+    defer mask.deinit();
+    try mask.addRange(0, 9000);
+    bitmap.andNotWith(&mask);
+    try std.testing.expectEqual(@as(usize, 2), bitmap.keys.items.len);
+
+    var remove = bitmap.sortedRemover();
+    remove.remove(65536);
+    remove.finish();
     try std.testing.expect(bitmap.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), bitmap.containers.capacity);
 }

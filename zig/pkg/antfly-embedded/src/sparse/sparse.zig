@@ -5800,7 +5800,7 @@ pub const SparseIndex = struct {
         control: @import("../search/query.zig").ExecutionControl,
     ) !bool {
         // Release proof scratch before the caller starts key-based lookup.
-        var scratch = std.heap.ArenaAllocator.init(alloc);
+        var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer scratch.deinit();
         proveProjectionDocNums(scratch.allocator(), txn, ordinals, primary_keys, proven, control) catch |err| switch (err) {
             error.OutOfMemory,
@@ -5809,6 +5809,10 @@ pub const SparseIndex = struct {
             error.InvalidSegment,
             error.InvalidTableFile,
             error.CrcMismatch,
+            error.TableBlockChecksumMismatch,
+            error.InputOutput,
+            error.FileNotFound,
+            error.WouldBlock,
             error.EndOfStream,
             error.Unsupported,
             => {
@@ -7616,12 +7620,20 @@ test "optional numeric range sparse projection proves only aligned live physical
 
 test "optional numeric range sparse proof falls back on transient reads and propagates cancellation" {
     const Failure = struct {
+        err: anyerror = error.StorageReadTemporarilyUnavailable,
+        multiple_blocks: bool = false,
+
         fn openScope(alloc: Allocator, ptr: *anyopaque) anyerror!backend_erased.ReadScope {
+            const failure: *@This() = @ptrCast(@alignCast(ptr));
             _ = try alloc.alloc(u8, 64);
+            if (failure.multiple_blocks) {
+                _ = try alloc.alloc(u8, 2048);
+                _ = try alloc.alloc(u8, 8192);
+            }
             return .{ .allocator = alloc, .ptr = ptr, .vtable = &.{ .close = abort, .get = read } };
         }
         fn read(ptr: *anyopaque, _: []const u8) anyerror![]const u8 {
-            return @as(*anyerror, @ptrCast(@alignCast(ptr))).*;
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).err;
         }
         fn abort(_: Allocator, _: *anyopaque) void {}
         fn get(_: *anyopaque, _: []const u8) anyerror![]const u8 {
@@ -7634,24 +7646,36 @@ test "optional numeric range sparse proof falls back on transient reads and prop
     var buffer: [1024]u8 align(@alignOf(std.c.max_align_t)) = undefined;
     var memory = std.heap.FixedBufferAllocator.init(&buffer);
     const alloc = memory.allocator();
-    var read_error: anyerror = error.StorageReadTemporarilyUnavailable;
+    var failure: Failure = .{};
     var txn: backend_erased.ReadTxn = .{
         .allocator = alloc,
-        .ptr = &read_error,
+        .ptr = &failure,
         .vtable = &.{ .abort = Failure.abort, .get = Failure.get, .open_cursor = Failure.cursor, .open_read_scope = Failure.openScope },
     };
     defer txn.abort();
-    for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.InvalidTableFile, error.EndOfStream, error.OutOfMemory }) |err| {
-        read_error = err;
+    for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.InvalidTableFile, error.TableBlockChecksumMismatch, error.EndOfStream, error.InputOutput, error.FileNotFound, error.WouldBlock, error.OutOfMemory }) |err| {
+        failure.err = err;
         var proven = [_]bool{true};
         try std.testing.expect(!try SparseIndex.tryProveProjectionDocNums(alloc, &txn, &.{1}, &.{"doc"}, &proven, .{}));
         try std.testing.expectEqual([1]bool{false}, proven);
         try std.testing.expectEqual(@as(usize, 0), memory.end_index);
     }
     var proven = [_]bool{true};
-    read_error = error.Canceled;
+    failure.err = error.Canceled;
     try std.testing.expectError(error.Canceled, SparseIndex.tryProveProjectionDocNums(alloc, &txn, &.{1}, &.{"doc"}, &proven, .{}));
     try std.testing.expectEqual(@as(usize, 0), memory.end_index);
+
+    var tracking: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    var query_arena = std.heap.ArenaAllocator.init(tracking.allocator());
+    defer query_arena.deinit();
+    const query_alloc = query_arena.allocator();
+    const retained = try query_alloc.alloc(u8, 32);
+    @memset(retained, 42);
+    const live = tracking.allocated_bytes - tracking.freed_bytes;
+    failure = .{ .err = error.OutOfMemory, .multiple_blocks = true };
+    try std.testing.expect(!try SparseIndex.tryProveProjectionDocNums(query_alloc, &txn, &.{1}, &.{"doc"}, &proven, .{}));
+    try std.testing.expectEqual(live, tracking.allocated_bytes - tracking.freed_bytes);
+    try std.testing.expectEqual(@as(u8, 42), retained[0]);
 }
 
 test "sparse locator backfill refuses corrupt roots and future incarnations" {
