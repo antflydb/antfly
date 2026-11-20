@@ -125,6 +125,9 @@ pub fn addIndexToTableIndexesJsonWithIo(
     };
     if (config.value != .object) return error.InvalidCreateIndexRequest;
     if (root.get(index_name)) |existing| {
+        const old_revision = try table_index_config.indexModelRevision(alloc, existing);
+        const new_revision = try table_index_config.indexModelRevision(alloc, config.value);
+        if (!std.meta.eql(old_revision, new_revision)) return error.IndexModelRevisionChangeRequiresNewIndex;
         if (!try equivalentIndexConfigValues(alloc, index_name, existing, config.value))
             try @import("antfly_local_sources").api_index_metadata.aliases.ensureUnreferenced(alloc, current_indexes_json, index_name);
     }
@@ -165,6 +168,16 @@ pub fn addIndexToTableIndexesJsonWithIo(
     try out.appendSlice(alloc, stored_config);
     try out.append(alloc, '}');
     return try @import("antfly_local_sources").storage_db_resolver_curation.retainRetiredMetadata(alloc, current_indexes_json, out.items);
+}
+
+test "index alias catalog index mutation requires a new physical name for a model revision change" {
+    const alloc = std.testing.allocator;
+    const ordinary = "{\"type\":\"embeddings\"}";
+    const pinned =
+        \\{"type":"embeddings","embedder":{"provider":"antfly","model":"embed","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+    ;
+    try std.testing.expectError(error.IndexModelRevisionChangeRequiresNewIndex, addIndexToTableIndexesJson(alloc, "{\"semantic\":" ++ ordinary ++ "}", "semantic", pinned));
+    try std.testing.expectError(error.IndexModelRevisionChangeRequiresNewIndex, addIndexToTableIndexesJson(alloc, "{\"semantic\":" ++ pinned ++ "}", "semantic", ordinary));
 }
 
 fn storedIndexConfigForMutationAlloc(

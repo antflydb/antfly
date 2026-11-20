@@ -246,21 +246,27 @@ pub fn isCatalogMetadataField(kind: db_types.IndexKind, field: []const u8) bool 
 
 /// Detect revision pinning in a user index, or in its normalized producer.
 pub fn indexHasModelRevisionPin(alloc: std.mem.Allocator, value: std.json.Value) !bool {
+    return try indexModelRevision(alloc, value) != null;
+}
+
+pub fn indexModelRevision(alloc: std.mem.Allocator, value: std.json.Value) !?[32]u8 {
     if (value != .object) return error.InvalidCreateTableRequest;
-    const kind = value.object.get("type") orelse return false;
-    if (kind != .string or !std.mem.eql(u8, kind.string, "embeddings")) return false;
+    const kind = value.object.get("type") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "embeddings")) return null;
     if (value.object.get("embedder")) |embedder| {
-        if (embedder == .object and try db_types.embeddingProducerModelRevision(embedder.object) != null)
-            return true;
+        if (embedder == .object) {
+            if (try db_types.embeddingProducerModelRevision(embedder.object)) |revision| return revision;
+        }
     }
     if (value.object.get("semantic_producer")) |producer| {
         if (producer != .string) return error.InvalidCreateTableRequest;
+        if (!mayContainModelRevision(producer.string)) return null;
         var identity = try std.json.parseFromSlice(std.json.Value, alloc, producer.string, .{});
         defer identity.deinit();
         if (identity.value != .object) return error.InvalidCreateTableRequest;
-        return try db_types.embeddingProducerModelRevision(identity.value.object) != null;
+        return try db_types.embeddingProducerModelRevision(identity.value.object);
     }
-    return false;
+    return null;
 }
 
 /// Fast rejection for legacy catalog values, including escaped JSON keys.
