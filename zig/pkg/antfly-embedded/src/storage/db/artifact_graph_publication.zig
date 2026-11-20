@@ -251,6 +251,28 @@ test "ordered artifact inventory graph publication validates guards generations 
             try std.testing.expectEqual(@as(u64, 1), (try dag.Storage.load(&read, request.domain)).revision);
             try std.testing.expectEqualSlices(u8, edge, try read.get(edge_key));
         }
+        const reverse = try keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "owner", "g", "links", "entity", "target");
+        defer alloc.free(reverse);
+        {
+            var writer = try store.beginWriteTxn();
+            defer writer.abort();
+            try writer.put(reverse, edge);
+            try std.testing.expectError(error.GraphCycle, writer.commit());
+        }
+        {
+            var writer = try store.beginWriteTxn();
+            errdefer writer.abort();
+            try writer.delete(edge_key);
+            try writer.put(reverse, edge);
+            try writer.commit();
+        }
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 2), (try dag.Storage.load(&read, request.domain)).revision);
+            try std.testing.expectError(error.NotFound, read.get(edge_key));
+            try std.testing.expectEqualSlices(u8, edge, try read.get(reverse));
+        }
     }
     const guards = command.mutation_preconditions;
     command.mutation_preconditions = guards[0..1];

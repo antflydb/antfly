@@ -1455,6 +1455,12 @@ const RaftTableApplyStateMachine = struct {
                 error.InvalidDagMutation => return .invalid_batch_request,
                 else => {},
             };
+            if (req.transaction == null) switch (err) {
+                error.GraphCycle => return .GraphCycle,
+                error.GraphConstraintCapacity => return .GraphConstraintCapacity,
+                error.GraphConstraintNotReady => return .GraphConstraintNotReady,
+                else => {},
+            };
             if (err == error.GraphConstraintBusy) {
                 if (req.transaction) |control| {
                     if (control == .resolve and control.resolve.status == .committed) return null;

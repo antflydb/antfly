@@ -1243,8 +1243,23 @@ pub const LocalDagBinding = struct {
     table_identity: [16]u8,
     edge_types: []const []const u8,
 
+    const present_key = "\x00\x00__metadata__:dag-publication-owner-present";
+
+    pub fn hasBindings(txn: anytype) !bool {
+        const raw = txn.get(present_key) catch |err| {
+            if (err == error.NotFound) return false;
+            return err;
+        };
+        if (!std.mem.eql(u8, raw, "1")) return error.InvalidDagAuthority;
+        return true;
+    }
+
     fn read(alloc: std.mem.Allocator, txn: anytype, command: Command) !?std.json.Parsed(LocalDagBinding) {
-        const raw = txn.get(&localDagBindingKey(command)) catch |err| {
+        return readForProducer(alloc, txn, command.namespace, command.producer_name, command.producer_generation);
+    }
+
+    pub fn readForProducer(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8, name: []const u8, generation: u64) !?std.json.Parsed(LocalDagBinding) {
+        const raw = txn.get(&localDagBindingKeyFor(namespace, name, generation)) catch |err| {
             if (err == error.NotFound) return null;
             return err;
         };
@@ -1354,18 +1369,24 @@ pub const LocalDagBinding = struct {
         const key = localDagBindingKey(command);
         if (txn.get(&key)) |old| {
             if (!std.mem.eql(u8, old, raw)) return error.GraphConstraintAttemptConflict;
-            return;
-        } else |err| if (err != error.NotFound) return err;
-        try txn.put(&key, raw);
+        } else |err| {
+            if (err != error.NotFound) return err;
+            try txn.put(&key, raw);
+        }
+        if (!try hasBindings(txn)) try txn.put(present_key, "1");
     }
 };
 
 fn localDagBindingKey(command: Command) [local_dag_prefix.len + 32]u8 {
+    return localDagBindingKeyFor(command.namespace, command.producer_name, command.producer_generation);
+}
+
+fn localDagBindingKeyFor(namespace: [24]u8, name: []const u8, generation: u64) [local_dag_prefix.len + 32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update(local_dag_prefix);
-    hash.update(&command.namespace);
-    bytes(&hash, command.producer_name);
-    number(&hash, command.producer_generation);
+    hash.update(&namespace);
+    bytes(&hash, name);
+    number(&hash, generation);
     var key: [local_dag_prefix.len + 32]u8 = undefined;
     key[0..local_dag_prefix.len].* = local_dag_prefix.*;
     hash.final(key[local_dag_prefix.len..]);

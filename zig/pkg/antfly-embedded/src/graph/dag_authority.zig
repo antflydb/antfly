@@ -1233,6 +1233,20 @@ pub const Contributions = struct {
         return std.mem.concat(alloc, u8, &.{ prefix, &id, &replacement.owner, replacement.source });
     }
 
+    pub fn matchesReplacement(alloc: A, txn: anytype, id: Digest, replacement: Replacement) !bool {
+        const storage_key = try key(alloc, id, replacement);
+        defer alloc.free(storage_key);
+        var stored: []const u8 = txn.get(storage_key) catch |err| blk: {
+            if (err != error.NotFound) return err;
+            break :blk "";
+        };
+        for (replacement.targets) |target| {
+            const current = (try takeTarget(&stored)) orelse return false;
+            if (!std.mem.eql(u8, current, target)) return false;
+        }
+        return stored.len == 0;
+    }
+
     /// Bind complete replacements and the caller's pinned producer versions
     /// to the attempt. Replacements are ordered by owner and then source.
     pub fn candidate(versions: Digest, replacements: []const Replacement) Digest {

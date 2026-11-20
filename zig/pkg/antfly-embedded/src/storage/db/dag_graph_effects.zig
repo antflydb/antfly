@@ -143,14 +143,17 @@ pub fn artifactReplacement(
     const record = try codec.decodeGraphEdgeBorrowed(value);
     if (record.generation == 0 or codec.isPortableUnboundGraphEdge(value)) return error.GraphConstraintNotReady;
     if (record.generation != generation) return null;
-    const identity: edges.GraphEdgeWrite = .{
+    return try relationshipReplacement(alloc, .{
         .index_name = parsed.index_name,
         .edge_type = parsed.edge_type,
         .source = parsed.source_node orelse parsed.doc_key,
         .target = parsed.target_doc_key,
         .owner = parsed.doc_key,
         .edge_id = parsed.edge_id,
-    };
+    }, present);
+}
+
+fn relationshipReplacement(alloc: A, identity: edges.GraphEdgeWrite, present: bool) !Replacement {
     const source = try alloc.dupe(u8, identity.source);
     errdefer alloc.free(source);
     if (!present) return .{ .owner = owner(identity), .source = source, .targets = &.{} };
@@ -158,6 +161,102 @@ pub fn artifactReplacement(
     errdefer alloc.free(targets);
     targets[0] = try alloc.dupe(u8, identity.target);
     return .{ .owner = owner(identity), .source = source, .targets = targets };
+}
+
+pub const ArtifactChange = struct {
+    key: []const u8,
+    before: ?u64,
+    after: ?u64,
+};
+
+pub fn artifactGeneration(value: ?[]const u8) !?u64 {
+    const raw = value orelse return null;
+    const codec = @import("enrichment/artifact_codec.zig");
+    const generation = (try codec.decodeGraphEdgeBorrowed(raw)).generation;
+    if (generation == 0 or codec.isPortableUnboundGraphEdge(raw)) return error.GraphConstraintNotReady;
+    return generation;
+}
+
+/// Stage all co-located contributions of a physical writer in their final
+/// state. Already staged producer decisions are recognized by their manifest.
+pub fn stageLocalArtifactChanges(alloc: A, txn: anytype, namespace: [24]u8, changes: []const ArtifactChange) !void {
+    const Binding = @import("artifact_publication.zig").LocalDagBinding;
+    const validation = @import("../../graph/dag_validation.zig");
+    const Entry = struct {
+        domain: authority.Digest,
+        replacement: Replacement,
+
+        fn before(_: void, left: @This(), right: @This()) bool {
+            return switch (std.mem.order(u8, &left.domain, &right.domain)) {
+                .lt => true,
+                .gt => false,
+                .eq => lessThan({}, left.replacement, right.replacement),
+            };
+        }
+    };
+    var entries: std.ArrayList(Entry) = .empty;
+    for (changes) |change| {
+        if (change.before == change.after) continue;
+        const parsed = (try keys.parseGraphEdgeArtifactKeyAlloc(alloc, change.key)) orelse return error.InvalidDagAuthority;
+        inline for (.{ false, true }) |present| {
+            if (if (present) change.after else change.before) |generation| {
+                if (try Binding.readForProducer(alloc, txn, namespace, parsed.index_name, generation)) |binding| {
+                    defer binding.deinit();
+                    for (binding.value.edge_types) |edge_type| {
+                        if (!std.mem.eql(u8, edge_type, parsed.edge_type)) continue;
+                        const id = try authority.domain(binding.value.table_identity, generation, parsed.index_name, edge_type);
+                        const replacement = try relationshipReplacement(alloc, .{
+                            .index_name = parsed.index_name,
+                            .edge_type = parsed.edge_type,
+                            .source = parsed.source_node orelse parsed.doc_key,
+                            .target = parsed.target_doc_key,
+                            .owner = parsed.doc_key,
+                            .edge_id = parsed.edge_id,
+                        }, present);
+                        if (!try authority.Contributions.matchesReplacement(alloc, txn, id, replacement))
+                            try entries.append(alloc, .{ .domain = id, .replacement = replacement });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    std.mem.sort(Entry, entries.items, {}, Entry.before);
+    const replacements = try alloc.alloc(Replacement, entries.items.len);
+    for (entries.items, replacements) |entry, *item| item.* = entry.replacement;
+    const Clock = struct {
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+    };
+    var clock_context: u8 = 0;
+    var budget: validation.Budget = .{ .clock = .{ .context = &clock_context, .now = Clock.now } };
+    var start: usize = 0;
+    while (start < entries.items.len) {
+        const domain = entries.items[start].domain;
+        var end = start + 1;
+        while (end < entries.items.len and std.mem.eql(u8, &domain, &entries.items[end].domain)) : (end += 1) {}
+        const state = try authority.Storage.requireActive(txn, domain);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly/dag-physical-writer/v1");
+        hash.update(&domain);
+        var revision: [8]u8 = undefined;
+        std.mem.writeInt(u64, &revision, state.revision, .big);
+        hash.update(&revision);
+        const version = hash.finalResult();
+        const candidate = authority.Contributions.candidate(version, replacements[start..end]);
+        const vote: @import("../transactions.zig").DagDomainPrepare = .{
+            .domain = domain,
+            .epoch = state.owner_epoch,
+            .revision = state.revision,
+            .producer_versions = version,
+            .attempt = .{ .id = candidate, .transaction = candidate[0..16].*, .candidate = candidate },
+            .replacements = replacements[start..end],
+        };
+        var witness: validation.Witness = .{};
+        _ = try vote.stagePublication(alloc, txn, &budget, &witness);
+        start = end;
+    }
 }
 
 fn matches(edge: anytype, index: []const u8, edge_type: []const u8) bool {

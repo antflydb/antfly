@@ -130,6 +130,10 @@ cannot substitute for this owner. The existing
 `IndexManager.beginGraphPrimaryMutation` fence protects shard-local graph
 preparation and publication, but cannot serialize a table-wide constraint.
 
+Where a graph binding and its authority are co-located, the physical writer
+stages final relationship afterimages and retirements in the same ledger
+transaction. This includes explicit and field-derived artifacts.
+
 The domain needs its own authoritative accepted adjacency, maintained alongside
 accepted contribution manifests. This avoids scanning a lagging private graph
 index and avoids a cross-shard query round trip for every visited edge. The
