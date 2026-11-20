@@ -68,9 +68,20 @@ pub const ResolvedDocFilter = struct {
     include: ResolvedDocSet = .all,
     exclude: ResolvedDocSet = .none,
 
+    // Request-local exceptional primary keys unioned with the ordinal operand.
+    // Wire-resolved filters use the ordinary include and exclude sets.
+    legacy_include: ResolvedDocSet = .none,
+    legacy_exclude: ResolvedDocSet = .none,
+
+    pub fn hasLegacy(self: *const ResolvedDocFilter) bool {
+        return self.legacy_include != .none or self.legacy_exclude != .none;
+    }
+
     pub fn deinit(self: *ResolvedDocFilter, alloc: Allocator) void {
         self.include.deinit(alloc);
         self.exclude.deinit(alloc);
+        self.legacy_include.deinit(alloc);
+        self.legacy_exclude.deinit(alloc);
         self.* = .{};
     }
 };
