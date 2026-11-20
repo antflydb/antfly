@@ -1978,11 +1978,19 @@ pub const Backend = struct {
     }
 
     pub fn close(self: *Backend) void {
+        self.closeWithNativeStorageDestination(null);
+    }
+
+    fn closeWithNativeStorageDestination(self: *Backend, destination: ?*?*storage_io.NativeStorage) void {
         self.closing.store(true, .release);
         self.detachLocalBlockCacheReclaimer();
         self.background_executor.drain();
         self.waitForGenerationReadersToDrain();
         self.releaseTrackedResourceUsage();
+        if (destination) |owner| {
+            owner.* = self.storage_owner;
+            self.storage_owner = null;
+        }
         recovery_mod.close(Backend, self);
     }
 
@@ -2800,14 +2808,6 @@ pub const Backend = struct {
     pub fn snapshotNativeStorageStats(self: *const Backend) ?storage_io.NativeStorageStats {
         const owner = self.storage_owner orelse return null;
         return owner.snapshotStats();
-    }
-
-    /// Retains the internally-created native storage after this LSM backend is
-    /// closed. Backends using a caller-owned Storage return null; that caller
-    /// already owns the required lifetime.
-    pub fn acquireNativeStorageLease(self: *Backend) !?storage_io.NativeStorage.Lease {
-        const owner = self.storage_owner orelse return null;
-        return try owner.acquireLease();
     }
 
     pub fn maintenanceDebtHint(self: *const Backend) u64 {
@@ -9402,6 +9402,12 @@ pub const BackendHandle = struct {
     }
 
     pub fn close(self: *BackendHandle) void {
+        self.closeWithNativeStorageDestination(null);
+    }
+
+    /// Transfer locally allocated storage after draining legacy users. The
+    /// destination becomes responsible for destroying it with the page allocator.
+    pub fn closeWithNativeStorageDestination(self: *BackendHandle, destination: ?*?*storage_io.NativeStorage) void {
         if (self.internal_flush_worker) |worker| {
             worker.stopAndJoin(true);
             self.backend.options.maintenance_waker = null;
@@ -9409,7 +9415,7 @@ pub const BackendHandle = struct {
             self.allocator.destroy(worker);
             self.internal_flush_worker = null;
         }
-        self.backend.close();
+        self.backend.closeWithNativeStorageDestination(destination);
         self.allocator.destroy(self.backend);
         if (self.background_runtime) |*runtime| runtime.deinit();
         self.* = undefined;

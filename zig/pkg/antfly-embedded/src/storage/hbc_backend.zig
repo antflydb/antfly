@@ -65,8 +65,8 @@ pub const OpenedBackend = union(enum) {
 pub const NativeBackend = struct {
     read_only: bool = false,
     storage: lsm_backend.Storage,
-    storage_lease: ?lsm_backend.NativeStorageLease,
     storage_owner: ?*lsm_backend.NativeStorage,
+    storage_owner_allocator: Allocator,
     root_dir: []u8,
 
     pub fn openIfAuthoritative(alloc: Allocator, root_dir: []const u8, options: LsmOptions) !?*NativeBackend {
@@ -109,38 +109,38 @@ pub const NativeBackend = struct {
         native.* = .{
             .read_only = options.backend_options.backend.read_only,
             .storage = storage,
-            .storage_lease = null,
             .storage_owner = storage_owner,
+            .storage_owner_allocator = alloc,
             .root_dir = owned_root,
         };
         storage_owner = null;
         return native;
     }
 
+    /// The caller closes the legacy handle into storage_owner after releasing
+    /// its LSM-bound views.
     pub fn detachFromLsm(alloc: Allocator, handle: *lsm_backend.BackendHandle) !*NativeBackend {
         const backend = handle.backend;
         const root = try alloc.dupe(u8, backend.root_dir orelse return error.MissingStorageRoot);
         errdefer alloc.free(root);
-        var lease = try backend.acquireNativeStorageLease();
-        errdefer if (lease) |*owned| owned.deinit();
-        const storage = if (lease) |*owned| owned.storage() else backend.storage orelse return error.MissingStorageBackend;
+        const storage = backend.storage orelse return error.MissingStorageBackend;
         const native = try alloc.create(NativeBackend);
-        errdefer alloc.destroy(native);
+        // The native backend still opens files and mappings after the LSM
+        // closes. A lease keeps existing handles alive through shutdown, but
+        // only the storage owner keeps admission open for new handles.
         native.* = .{
             .storage = storage,
-            .storage_lease = lease,
             .storage_owner = null,
+            .storage_owner_allocator = std.heap.page_allocator,
             .root_dir = root,
         };
-        lease = null;
         return native;
     }
 
     pub fn close(self: *NativeBackend, alloc: Allocator) void {
-        if (self.storage_lease) |*lease| lease.deinit();
         if (self.storage_owner) |owner| {
             owner.deinit();
-            alloc.destroy(owner);
+            self.storage_owner_allocator.destroy(owner);
         }
         alloc.free(self.root_dir);
         alloc.destroy(self);
