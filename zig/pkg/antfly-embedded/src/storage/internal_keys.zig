@@ -141,6 +141,9 @@ pub const GlobalReplayKind = enum(u8) {
     // frequently written, replay-metadata families this store happens to
     // have populated in between.
     next_sequence = 0x59,
+    /// The first sequence the per-hint index covers (see
+    /// `replay_hint_index_floor_key`).
+    hint_index_floor = 0x5a,
     latest_sequence = 0x03,
     replication_applied = 0x04,
     ordered_document_applied = 0x05,
@@ -208,13 +211,18 @@ pub const replay_meta_next_sequence_key = globalReplayPrefix(.next_sequence);
 /// and no format-version key. Antfly is unreleased: this build never writes
 /// or reads v1 layouts. `requireCurrentReplayJournalFormat` refuses them.
 pub const replay_journal_format_v2: u32 = 2;
-/// v3: every append updates the latest-sequence marker of each hint its
-/// record carries, so a marker bounds that hint's work exactly. A v2 or
-/// base journal is upgraded with each marker raised to the journal head.
+/// v3: every append puts an entry in each hint lane its record carries,
+/// whatever consumers are active (an empty index entry on a shared-lane
+/// store), so "a record for this hint in (a, b]" is one seek. A v2 or base
+/// journal is upgraded with the index floor at its head.
 pub const replay_journal_format_v3: u32 = 3;
 pub const replay_journal_format_current: u32 = replay_journal_format_v3;
 pub const replay_journal_format_version_key = globalReplayPrefix(.journal_format_version);
 pub const journal_credit_ledger_key = globalReplayPrefix(.journal_credit_ledger);
+/// Sequences from this one on have an entry in each hint lane their record
+/// carries (a payload copy where readers use hint lanes, an empty index
+/// entry on a shared-lane store). An upgraded journal starts it at its head.
+pub const replay_hint_index_floor_key = globalReplayPrefix(.hint_index_floor);
 
 pub fn encodeReplayJournalFormatVersion(version: u32) [4]u8 {
     var raw: [4]u8 = undefined;

@@ -1517,11 +1517,10 @@ fn runDenseVectorUpdateDeleteScenario(allocator: Allocator, path: []const u8, io
 /// never leave the catalog saying the index is gone while its own HBC
 /// metadata (dims, root node, postings), held under a fixed name-derived
 /// scope in `native_catalog_backend.Backend`, survives underneath --
-/// exactly the ordering `removeWithAtomicMutation`'s dense branch depends
-/// on: `HBCIndex.deleteNativeCatalogScopeForRemoval` (one durable
-/// `native_catalog_backend.deleteAllForScope` batch) must complete before
-/// the catalog-removal commit (`persistCatalogExcludingWithAtomicMutation`)
-/// becomes durable.
+/// nor still name the index over a scope whose postings are erased:
+/// `removeWithAtomicMutation`'s dense branch commits the scope's deletes
+/// (`HBCIndex.nativeCatalogScopeDeletesForRemoval`) in the same
+/// transaction as the catalog removal.
 ///
 /// Setup (admitting "img" at dims=3, writing one document, draining to
 /// idle) runs on plain `std.testing.io`, fully durable, *before* the swept
@@ -1535,6 +1534,19 @@ fn runDenseVectorUpdateDeleteScenario(allocator: Allocator, path: []const u8, io
 /// side atomicity question, not this delete-side one); narrowing to the
 /// delete keeps this scenario pinned to exactly what #1216 and this fix
 /// are about.
+fn expectDenseHit(allocator: Allocator, handle: *DbHandle, id: []const u8) !void {
+    var result = try handle.db.search(allocator, .{
+        .index_name = "img",
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 8 } },
+        .limit = 8,
+    });
+    defer result.deinit();
+    for (result.hits) |hit| {
+        if (std.mem.eql(u8, hit.id, id)) return;
+    }
+    return error.TestExpectedDenseHit;
+}
+
 fn runDenseNativeCatalogDimensionDeleteScenario(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
     _ = checkpoints;
     {
@@ -1556,9 +1568,9 @@ fn runDenseNativeCatalogDimensionDeleteScenario(allocator: Allocator, path: []co
 
 /// Reopens with ordinary IO (matching every other scenario's post-crash
 /// check) and asserts the only two consistent outcomes: either "img" is
-/// still configured -- the delete never became durable, or only its
-/// scope-delete half did -- in which case the catalog's own config (still
-/// dims=3) must still open and search cleanly, or "img" is gone and its
+/// still configured -- the delete never became durable -- in which case it
+/// must still find the document it indexed before the delete, or "img" is
+/// gone and its
 /// scope is provably clean, proven by re-admitting it at a *different*
 /// dims (4) and writing/searching through it. A `DimensionMismatch` (or
 /// any other error) from either branch is exactly the bug: the catalog
@@ -1576,16 +1588,12 @@ fn checkDenseNativeCatalogDimensionDeleteInvariant(
     defer handle.close();
 
     if (handle.db.core.index_manager.get("img") != null) {
-        var result = try handle.db.search(allocator, .{
-            .index_name = "img",
-            .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 8 } },
-            .limit = 8,
-        });
-        result.deinit();
+        // "old" was indexed and durable before the swept delete began.
+        try expectDenseHit(allocator, &handle, "old");
         return;
     }
 
-    // The delete completed (or its catalog-removal half did). Deletion
+    // The delete completed. Deletion
     // schedules generated-artifact cleanup on the durable repair owner;
     // join it before reusing the name, same as the #1216 regression test
     // ("lite external dense dimension replacement keeps writes
@@ -1675,12 +1683,21 @@ fn checkDenseNativeCatalogDimensionAdmitAndDeleteInvariant(
     // at dims=4, is reached only when the catalog has no entry at all), so
     // a live catalog entry here is always dims=3.
     if (handle.db.core.index_manager.get("img") != null) {
-        var result = try handle.db.search(allocator, .{
-            .index_name = "img",
-            .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 8 } },
-            .limit = 8,
-        });
-        result.deinit();
+        // A surviving "old" was acknowledged before the delete: the index
+        // still configured over it must find it once caught up.
+        var looked_up = try handle.db.lookup(allocator, "old", .{});
+        if (looked_up) |*found| {
+            found.deinit(allocator);
+            try handle.db.runUntilIdle();
+            try expectDenseHit(allocator, &handle, "old");
+        } else {
+            var result = try handle.db.search(allocator, .{
+                .index_name = "img",
+                .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 8 } },
+                .limit = 8,
+            });
+            result.deinit();
+        }
         return;
     }
 

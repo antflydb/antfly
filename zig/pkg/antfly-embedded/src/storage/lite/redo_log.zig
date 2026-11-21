@@ -162,13 +162,56 @@ pub const RecordHeader = struct {
     }
 };
 
+/// "ARDE" read as a little-endian u32: an end trailer.
+pub const trailer_magic: u32 = 0x45445241;
+
+/// What every append writes right after its record, where the next record's
+/// header will go: the run's salt and the record's sequence, under their own
+/// checksum. It is a durable end boundary apart from the record itself, so
+/// damage to a run's last record (which leaves nothing of the run after it)
+/// is still told apart from the run's end: the damaged record's header
+/// still leads to its trailer.
+pub const Trailer = struct {
+    sequence: u64,
+    salt: u64,
+
+    pub fn encode(self: Trailer, out: *[header_len]u8) void {
+        @memset(out, 0);
+        std.mem.writeInt(u32, out[0..4], trailer_magic, .little);
+        std.mem.writeInt(u16, out[4..6], format_version, .little);
+        std.mem.writeInt(u16, out[6..8], @intCast(header_len), .little);
+        std.mem.writeInt(u64, out[12..20], self.sequence, .little);
+        std.mem.writeInt(u64, out[24..32], self.salt, .little);
+        std.mem.writeInt(u32, out[20..24], trailerChecksum(out), .little);
+    }
+
+    fn decode(bytes: *const [header_len]u8) ?Trailer {
+        if (std.mem.readInt(u32, bytes[0..4], .little) != trailer_magic) return null;
+        if (std.mem.readInt(u16, bytes[4..6], .little) != format_version) return null;
+        if (std.mem.readInt(u16, bytes[6..8], .little) != header_len) return null;
+        if (!isAllZero(bytes[8..12])) return null;
+        if (std.mem.readInt(u32, bytes[20..24], .little) != trailerChecksum(bytes)) return null;
+        return .{ .sequence = std.mem.readInt(u64, bytes[12..20], .little), .salt = std.mem.readInt(u64, bytes[24..32], .little) };
+    }
+
+    fn trailerChecksum(bytes: *const [header_len]u8) u32 {
+        var crc = Crc32.init();
+        crc.update(bytes[12..20]);
+        crc.update(bytes[24..32]);
+        return crc.final();
+    }
+};
+
 /// Reads the header at `offset` (`available` bytes remain there). Version
 /// 1 headers are 24 bytes and carry salt 0.
 const ReadHeader = union(enum) {
     /// Fewer bytes than a header needs.
     short,
-    /// An all-zero header: the log's end.
+    /// An all-zero header: the log's end (a version 1 end marker, or space
+    /// never written).
     zero,
+    /// An end trailer.
+    trailer: Trailer,
     /// Not a header of any known version.
     garbage,
     record: struct { header: RecordHeader, len: usize },
@@ -181,6 +224,10 @@ fn readHeaderAt(file: File, io: Io, offset: u64, available: u64) !ReadHeader {
     const got = try file.readPositionalAll(io, buf[0..want], offset);
     if (got < legacy_header_len) return .short;
     if (isAllZero(buf[0..legacy_header_len])) return .zero;
+    if (std.mem.readInt(u32, buf[0..4], .little) == trailer_magic) {
+        if (got < header_len) return .short;
+        return if (Trailer.decode(&buf)) |trailer| .{ .trailer = trailer } else .garbage;
+    }
     var header = RecordHeader.decodeLegacy(buf[0..legacy_header_len]);
     const len = header.knownLength() orelse return .garbage;
     if (len == header_len) {
@@ -254,7 +301,7 @@ pub const Writer = struct {
             .record => |first| first.header.salt,
             // A resumed log always starts with a record; without one,
             // nothing can share this run.
-            .short, .zero, .garbage => self.freshSalt(),
+            .short, .zero, .trailer, .garbage => self.freshSalt(),
         };
         self.salt = salt;
         return salt;
@@ -321,7 +368,8 @@ pub const Writer = struct {
         // have left payload bytes past this record's end (recovery clears
         // only a torn header), and without the marker replay would read
         // them as the next header whenever this record is shorter.
-        const end_marker: [header_len]u8 = @splat(0);
+        var end_marker: [header_len]u8 = undefined;
+        (Trailer{ .sequence = commit_sequence, .salt = header.salt }).encode(&end_marker);
         const marker_len: usize = if (record_len + header_len <= self.remaining()) header_len else 0;
         try writePositionalPairAll(self.file, self.io, payload, end_marker[0..marker_len], offset + header_len);
         try self.file.writePositionalAll(self.io, &header_buf, offset);
@@ -398,6 +446,12 @@ pub const Writer = struct {
             self.file.writePositionalAll(self.io, zeros[0..chunk], self.base_offset + pos) catch break;
             pos += chunk;
         }
+        // The record before the mark ends in a trailer again.
+        if (m.last_sequence) |sequence| if (self.salt) |salt| if (m.tail != 0 and m.tail + header_len <= self.capacity) {
+            var trailer: [header_len]u8 = undefined;
+            (Trailer{ .sequence = sequence, .salt = salt }).encode(&trailer);
+            self.file.writePositionalAll(self.io, &trailer, self.base_offset + m.tail) catch {};
+        };
         self.tail = m.tail;
         self.last_sequence = m.last_sequence;
     }
@@ -621,6 +675,13 @@ pub fn replayBounded(
             // never a torn write (a real torn write leaves whatever bytes
             // landed, not all-zero bytes).
             .zero => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region },
+            // This run's end. A retired run's trailer (another salt) past a
+            // lost one is the end too, after a restart.
+            .trailer => |trailer| return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = stop: {
+                const salt = run_salt orelse break :stop .end_of_region;
+                if (trailer.salt == salt) break :stop if (trailer.sequence == (last_sequence orelse 0)) .end_of_region else try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence);
+                break :stop if (restartable) .end_of_region else .corrupt_record;
+            } },
             // A log restart zeroes only the first header, so a restarted
             // log keeps the retired log's bytes past its live tail; a crash
             // that keeps a record but loses its end marker exposes them.
@@ -758,7 +819,7 @@ pub fn replayBounded(
 pub fn firstRecordNewerThan(allocator: Allocator, file: File, io: Io, base_offset: u64, capacity: u64, floor: u64) !?u64 {
     const header, const len = switch (try readHeaderAt(file, io, base_offset, capacity)) {
         .record => |record| .{ record.header, record.len },
-        .short, .zero, .garbage => return null,
+        .short, .zero, .trailer, .garbage => return null,
     };
     if (header.commit_sequence <= floor) return null;
     if (len + @as(u64, header.payload_len) > capacity) return null;
@@ -790,7 +851,24 @@ fn recordIntact(allocator: Allocator, file: File, io: Io, offset: u64, available
 fn unclearStop(file: File, io: Io, base_offset: u64, capacity: u64, pos: u64, restartable: bool, run_salt: ?u64, last_sequence: ?u64) !StopReason {
     const salt = run_salt orelse return .corrupt_record;
     if (!restartable or salt == 0 or pos == 0) return .corrupt_record;
+    if (try damagedRecordAt(file, io, base_offset, capacity, pos, salt, last_sequence orelse 0)) return .corrupt_record;
     return if (try laterRunHeader(file, io, base_offset, capacity, pos + 1, salt, last_sequence orelse 0)) .corrupt_record else .end_of_region;
+}
+
+/// Whether the bytes at `pos`, read as a header whatever its damage, lead
+/// to this run's trailer for the next record: a committed record whose
+/// header was damaged, even when it is the run's last.
+fn damagedRecordAt(file: File, io: Io, base_offset: u64, capacity: u64, pos: u64, salt: u64, after: u64) !bool {
+    if (pos + header_len > capacity) return false;
+    var buf: [header_len]u8 = undefined;
+    if (try file.readPositionalAll(io, &buf, base_offset + pos) < header_len) return false;
+    const header = RecordHeader.decode(&buf);
+    if (header.commit_sequence <= after) return false;
+    const trailer_at = pos + header_len + @as(u64, header.payload_len);
+    if (trailer_at + header_len > capacity) return false;
+    if (try file.readPositionalAll(io, &buf, base_offset + trailer_at) < header_len) return false;
+    const trailer = Trailer.decode(&buf) orelse return false;
+    return trailer.salt == salt and trailer.sequence == header.commit_sequence;
 }
 
 /// Whether a version 2 header with `salt` and a sequence past `after`
@@ -824,7 +902,7 @@ fn laterRunHeader(file: File, io: Io, base_offset: u64, capacity: u64, from: u64
 pub fn firstRecordSalt(file: File, io: Io, base_offset: u64, capacity: u64) !?u64 {
     return switch (try readHeaderAt(file, io, base_offset, capacity)) {
         .record => |record| record.header.salt,
-        .short, .zero, .garbage => null,
+        .short, .zero, .trailer, .garbage => null,
     };
 }
 
@@ -1189,16 +1267,23 @@ test "replay rejects a damaged salt inside a run, not a short log" {
     try testing.expectEqual(StopReason.corrupt_record, damaged.stop_reason);
     try testing.expectEqual(second, damaged.valid_bytes);
 
-    // Damage to the last record's salt leaves nothing of the run after it:
-    // indistinguishable from the run's end without a durable watermark.
+    // Damage to the last record's salt: its trailer, written after it, still
+    // carries the run's salt and its sequence.
     byte[0] ^= 0x5a;
     try region.file.writePositionalAll(io, &byte, second + 24);
     _ = try region.file.readPositionalAll(io, &byte, third + 24);
     byte[0] ^= 0x5a;
     try region.file.writePositionalAll(io, &byte, third + 24);
     const last = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
-    try testing.expectEqual(StopReason.end_of_region, last.stop_reason);
+    try testing.expectEqual(StopReason.corrupt_record, last.stop_reason);
     try testing.expectEqual(third, last.valid_bytes);
+
+    // A run that really ends there stops cleanly at the trailer.
+    var clean = Writer.init(region.file, io, 0, capacity);
+    try clean.append(11, "a");
+    const ended = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.end_of_region, ended.stop_reason);
+    try testing.expectEqual(clean.tail, ended.valid_bytes);
 }
 
 test "replay keeps rejecting what retired bytes can never be" {

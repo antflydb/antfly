@@ -13293,7 +13293,7 @@ pub const IndexManager = struct {
         defer self.alloc.free(key);
         const value = try std.json.Stringify.valueAlloc(self.alloc, job, .{});
         defer self.alloc.free(value);
-        try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, job.name, cfg.config_json, .{ .put = .{ .key = key, .value = value } });
+        try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, job.name, cfg.config_json, .{ .put = .{ .key = key, .value = value } }, null);
     }
 
     /// Remove reservation and enqueue existing bounded artifact cleanup in one
@@ -13313,7 +13313,7 @@ pub const IndexManager = struct {
             try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, name, cfg.config_json, .{ .put_delete = .{
                 .put = .{ .key = cleanup.key.?, .value = cleanup.value.? },
                 .delete = key,
-            } });
+            } }, null);
             return true;
         }
         return false;
@@ -15494,16 +15494,14 @@ pub const IndexManager = struct {
                 // #1216: a native-catalog HBC index's own metadata (dims,
                 // root node, postings) lives under a fixed, name-derived
                 // scope, independent of the generated-artifact cleanup
-                // above. Clear it durably before the catalog mutation below
-                // makes this index's removal visible, so a crash between
-                // the two can never leave the catalog saying "img" is gone
+                // above. Its deletes commit in the same transaction as the
+                // catalog mutation below: a crash can never leave the
+                // catalog naming "img" over an erased scope, nor "img" gone
                 // while its stale dims survive underneath a later
-                // re-admission -- see `HBCIndex.deleteNativeCatalogScopeForRemoval`.
-                // perf/lwa-maint-serialize: these two commits must never let
-                // background maintenance reclaim against the first one's
-                // own retirement debt before the second lands -- see
-                // `HBCIndex.pauseMaintenanceAcrossRemoval`'s own doc
-                // comment (#1216's own two-commit race).
+                // re-admission -- see `HBCIndex.nativeCatalogScopeDeletesForRemoval`.
+                // perf/lwa-maint-serialize: background maintenance must not
+                // write the scope between loading those deletes and the
+                // commit -- see `HBCIndex.pauseMaintenanceAcrossRemoval`.
                 entry.index.pauseMaintenanceAcrossRemoval();
                 // Only valid while `entry.index` itself still is --
                 // `retireDenseIndexEntry` below destroys it, so the
@@ -15512,9 +15510,10 @@ pub const IndexManager = struct {
                 // every early-return failure path above that point, where
                 // `entry.index` is still live.
                 errdefer entry.index.resumeMaintenanceAcrossRemoval();
-                try entry.index.deleteNativeCatalogScopeForRemoval();
+                var scope_deletes = try entry.index.nativeCatalogScopeDeletesForRemoval();
+                defer if (scope_deletes) |*deletes| deletes.deinit();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
-                try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
+                try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, name, null, commit_mutation, if (scope_deletes) |*deletes| deletes else null);
                 entry.index.resumeMaintenanceAcrossRemoval();
                 const replicated_leann = if (entry.index.leann) |leann_store| leann_store.isReplicated() else false;
                 self.retireDenseIndexEntry(entry);
@@ -25373,7 +25372,7 @@ pub const IndexManager = struct {
         excluded_name: []const u8,
         atomic_mutation: ?AtomicCatalogMutation,
     ) !void {
-        return self.persistCatalogExcludingWithConfigAndAtomicMutation(store, excluded_name, null, atomic_mutation);
+        return self.persistCatalogExcludingWithConfigAndAtomicMutation(store, excluded_name, null, atomic_mutation, null);
     }
 
     /// Compute reachability in the post-removal catalog. Preserve explicit
@@ -25461,7 +25460,8 @@ pub const IndexManager = struct {
         return kept.toOwnedSlice(self.alloc);
     }
 
-    fn persistCatalogExcludingWithConfigAndAtomicMutation(self: *IndexManager, store: anytype, excluded_name: []const u8, removed_config: ?[]const u8, atomic_mutation: ?AtomicCatalogMutation) !void {
+    /// `scope_deletes`, when given, commit in the same native transaction.
+    fn persistCatalogExcludingWithConfigAndAtomicMutation(self: *IndexManager, store: anytype, excluded_name: []const u8, removed_config: ?[]const u8, atomic_mutation: ?AtomicCatalogMutation, scope_deletes: ?*const native_catalog_backend.ScopeDeletes) !void {
         const data = if (self.get(excluded_name) != null)
             try serializeCatalogExcluding(self.alloc, self, excluded_name)
         else
@@ -25484,6 +25484,7 @@ pub const IndexManager = struct {
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
         try @import("../artifact_projection_certificate.zig").remove(&txn, excluded_name);
         try txn.put(index_catalog_key, data);
+        if (scope_deletes) |deletes| try txn.putIndexCatalogBatch(deletes.scope, deletes.mutations);
         var retiring_names: std.ArrayList([]const u8) = .empty;
         defer retiring_names.deinit(self.alloc);
         const primary_retiring = if (removed_config) |config|

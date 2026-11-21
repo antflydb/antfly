@@ -5254,12 +5254,17 @@ pub const HBCIndex = struct {
     /// Callers must call this -- and let it complete -- before committing
     /// the catalog mutation that makes the index's removal visible; see
     /// `native_catalog_backend.deleteAllForScope`.
-    pub fn deleteNativeCatalogScopeForRemoval(self: *HBCIndex) !void {
+    /// A delete for each record under this index's native-catalog scope, for
+    /// index removal to commit in the same transaction as the catalog
+    /// mutation that makes the removal visible: a crash can never leave the
+    /// catalog naming this index over an erased scope, nor a removed index's
+    /// stale scope under a later re-admission. Null for every other backend.
+    pub fn nativeCatalogScopeDeletesForRemoval(self: *HBCIndex) !?native_catalog_backend.ScopeDeletes {
         const backend = switch (self.env_owner) {
             .native_catalog => |backend| backend,
-            .lsm, .native => return,
+            .lsm, .native => return null,
         };
-        try native_catalog_backend.deleteAllForScope(self.alloc, backend.sink, backend.scope);
+        return try native_catalog_backend.ScopeDeletes.load(self.alloc, backend.sink, backend.scope);
     }
 
     /// perf/lwa-maint-serialize (#1216's own two-commit race): call before
