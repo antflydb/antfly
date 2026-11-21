@@ -336,6 +336,9 @@ implementation for their production stage interfaces. Direct encoder/decoder
 tasks qualify resident incremental receivers through `decoder_stage`; custom
 dispatchers retain their scheduling contract. Encoder placement decisions publish
 exact capability/ABI fallback reasons through the uniform diagnostic report.
+Full-prefix host and resident decoders share one input signature bound per
+request. Token and encoder-mask slices remain borrowed. An optional all-ones
+query mask grows in the request owner and is reused at later steps.
 
 `execution/audio_schedule.zig` owns the existing audio instruction tape and its
 arena layout. Alias lifetime propagation uses ML's same allocation-free liveness
