@@ -10543,17 +10543,14 @@ test "lite durable empty index deletion syncs an earlier ride-along tombstone" {
     store.ride_along_idle_ns = 10 * std.time.ns_per_s;
 
     const prefix = "/directory/";
-    var record = native.CatalogMutation{ .key = prefix ++ "entry", .value = "value" };
-    const Apply = struct {
-        fn run(context: *anyopaque, file: *native.NativeFile) !void {
-            const mutation: *const native.CatalogMutation = @ptrCast(@alignCast(context));
-            try file.putIndexCatalogBatch(&.{mutation.*});
-        }
-    };
-    try store.submitIndexMutation(&record, Apply.run, true);
-    record.is_delete = true;
-    record.value = "";
-    try store.submitIndexMutation(&record, Apply.run, false);
+    const key = prefix ++ "entry";
+    try store.file.putIndexCatalogRecord(key, "value");
+    {
+        try store.file.beginTransaction();
+        errdefer store.file.abortTransaction();
+        try store.file.deleteIndexCatalogRecord(key);
+        try store.file.commitTransactionWithDurability(false, null);
+    }
     const pending = store.file.committedSequence();
     try std.testing.expect(store.file.durableSequence() < pending);
 
