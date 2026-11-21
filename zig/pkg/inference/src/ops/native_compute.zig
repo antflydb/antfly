@@ -34444,14 +34444,6 @@ fn packedExpertRowBlockBase(
 
 const decodeFp16Le = quant_codec.decodeFp16Le;
 
-fn decodeF32Le(b0: u8, b1: u8, b2: u8, b3: u8) f32 {
-    const bits: u32 = @as(u32, b0) |
-        (@as(u32, b1) << 8) |
-        (@as(u32, b2) << 16) |
-        (@as(u32, b3) << 24);
-    return @bitCast(bits);
-}
-
 fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     var owned_output = try OwnedDenseOutput.copy(self, getData(input));

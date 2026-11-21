@@ -2042,14 +2042,6 @@ fn gemma4MtpActiveMaterializeEnabled() bool {
     return decoder_forward.activeMaterializationEnabled();
 }
 
-fn gemma4MtpActiveMaterializeSupported(
-    kind: ops.BackendKind,
-    config: gpt_mod.Config,
-    total_seq_len: usize,
-) bool {
-    return decoder_forward.activeMaterializationSupported(kind, config, total_seq_len);
-}
-
 fn gemma4MtpAcceptBonusDefault(kind: ops.BackendKind) bool {
     return kind != .metal;
 }
@@ -2085,10 +2077,6 @@ fn gemma4MtpDedicatedRuntimeEnabled() bool {
 
 fn gemma4MtpVerifyDeviceResultEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_VERIFY_DEVICE_RESULT", false);
-}
-
-fn gemma4MtpMaterializeReplayEnabled() bool {
-    return decoder_forward.materializationReplayEnabled();
 }
 
 /// Fold the correction/bonus materialize forward into the next verify: the

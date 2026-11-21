@@ -5149,14 +5149,6 @@ fn prepareProjectionPackBeforeProfile(session: *const Session, target: *Imported
     return null;
 }
 
-fn selectPhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator) !void {
-    return selectPhysicalInvocationWithCleanup(prepared, session, target, root_pool, inputs, allocator, .{});
-}
-
-inline fn selectPhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
-    return selectPhysicalInvocationControlled(prepared, session, target, root_pool, inputs, allocator, cleanup, null);
-}
-
 fn projectionHostIngress(target: *const ImportedOnnxSession, inputs: []const kernel_routes.InputBinding) ?kernel_routes.InputBinding {
     if (inputs.len != 1 or inputs[0].value != .imported_host) return null;
     var binding = inputs[0];
@@ -5270,10 +5262,6 @@ noinline fn prepareDevicePhysicalInvocation(prepared: *prepared_mod.PreparedInvo
     return selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, if (control) |active| active.* else null);
 }
 
-fn preparePhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator) !void {
-    return preparePhysicalInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, .{}, null);
-}
-
 fn preparePhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?InferenceExecutionControl) !void {
     if (InvocationInputFacts.needsResidentStorage(shapes)) return preparePhysicalResidentInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, cleanup, control);
     var facts: InvocationInputFacts = undefined;
@@ -5284,10 +5272,6 @@ fn preparePhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocati
 
 // Resident planes remain allocation-free for ordinary small input sets, but
 // their large scratch frame is never entered for a dense host invocation.
-noinline fn preparePhysicalResidentInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator) !void {
-    return preparePhysicalResidentInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, .{}, null);
-}
-
 noinline fn preparePhysicalResidentInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?InferenceExecutionControl) !void {
     var storage: InvocationInputFacts.ResidentStorage = undefined;
     var facts: InvocationInputFacts = undefined;
