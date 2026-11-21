@@ -729,6 +729,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
         try policy.authorize(state.value, internal);
         try stageVisibleSplits(&client, a, source, &catalog_routes, &state, selection.after, internal);
+        try enrollOneSplitSuccessor(&client, a, source, &catalog_routes, state.value, selection.after, internal);
         return executeIceberg(&client, a, selection, limits, &policy, .{ .source = source, .captured = &catalog_routes }, internal);
     }
     var captured = try source.capturePhysical(a, definition, internal);
@@ -738,6 +739,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
     try policy.authorize(state.value, internal);
     try stageVisibleSplits(&client, a, source, &captured, &state, selection.after, internal);
+    try enrollOneSplitSuccessor(&client, a, source, &captured, state.value, selection.after, internal);
     var provider: native.ScheduledProvider(roots.Routed, RoutedFactory, Policy) = .{ .factory = .{ .source = source, .captured = &captured }, .policy = &policy };
     if (limits) |bounds|
         return .{ .page = try delivery.pull(&client, &provider, a, selection.id, selection.after, bounds, internal) };
@@ -808,6 +810,16 @@ fn stageVisibleSplits(client: *config.Client, a: A, source: source_api.Source, r
         parsed.* = observed;
     }
     try routes.validateInstalledRoutes(parsed.value);
+}
+
+fn enrollOneSplitSuccessor(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, state: control.State, cursor: control.Digest, request: Context) !void {
+    for (state.roots) |root| {
+        if (state.phase != .streaming or root.split_handoff == null or root.split_consumer_epoch != null) continue;
+        _ = try state.contextAt(cursor);
+        if (state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) return error.ChangefeedLeaseExpired;
+        const mutation = try source.enrollSplitSuccessor(a, routes, state, root, request);
+        return change(client, a, state, mutation, request);
+    }
 }
 
 const RoutedFactory = struct {

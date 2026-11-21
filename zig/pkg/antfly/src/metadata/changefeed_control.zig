@@ -200,7 +200,7 @@ fn writePhysicalRootRecord(value: anytype, writer: anytype) @TypeOf(writer.*).Er
                 try writer.objectField(name);
                 try writer.write(physical);
             }
-        } else if (comptime std.mem.eql(u8, name, "split_handoff")) {
+        } else if (comptime (std.mem.eql(u8, name, "split_handoff") or std.mem.eql(u8, name, "split_grant_sequence") or std.mem.eql(u8, name, "split_consumer_epoch"))) {
             if (@field(value, name)) |handoff| {
                 try writer.objectField(name);
                 try writer.write(handoff);
@@ -235,6 +235,8 @@ pub const Root = struct {
     last_reconciliation: ?root_intent.Reconciliation = null,
     physical: ?PhysicalRoot = null,
     split_handoff: ?SplitHandoff = null,
+    split_grant_sequence: ?u64 = null,
+    split_consumer_epoch: ?u64 = null,
 
     pub fn jsonStringify(self: Root, writer: anytype) @TypeOf(writer.*).Error!void {
         return writePhysicalRootRecord(self, writer);
@@ -465,7 +467,13 @@ pub const State = struct {
                 try handoff.validate(root.namespace);
                 if (!std.meta.eql(root.physical, @as(?PhysicalRoot, handoff.predecessor)) or root.consumer_epoch == 0)
                     return error.InvalidChangefeed;
-            }
+                if (root.split_grant_sequence) |grant| {
+                    if (grant == 0 or grant > self.authority_sequence) return error.InvalidChangefeed;
+                }
+                if (root.split_consumer_epoch) |epoch| {
+                    if (epoch == 0 or root.split_grant_sequence == null) return error.InvalidChangefeed;
+                }
+            } else if (root.split_grant_sequence != null or root.split_consumer_epoch != null) return error.InvalidChangefeed;
             if (root.renewed_through > self.expires_at or (root.consumer_epoch == 0 and root.renewed_through != 0)) return error.InvalidChangefeed;
             if (root.consumer_epoch == 0) {
                 if (root.start != 0 or root.delivered.order(.{}) != .eq or root.acknowledged.order(.{}) != .eq or root.reclaimed_through != 0 or root.snapshot != null) return error.InvalidChangefeed;
@@ -603,6 +611,7 @@ pub const Mutation = union(enum) {
     enroll: struct { namespace: Namespace, ownership_epoch: u64, grant_sequence: u64, consumer_epoch: u64, start: u64, snapshot: ?Snapshot = null },
     rebind: struct { namespace: Namespace, previous: u64, next: u64, proof: Digest },
     stage_split_handoff: struct { namespace: Namespace, ownership_epoch: u64, handoff: SplitHandoff },
+    confirm_split_successor: struct { namespace: Namespace, grant_sequence: u64, consumer_epoch: u64 },
     refresh_grant: struct { namespace: Namespace, previous: u64 },
     stage_catalog_start: []const u8,
     seal: Seal,
@@ -628,7 +637,7 @@ pub const Mutation = union(enum) {
             .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
             .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
             .stage_catalog_start, .renew_catalog => return provider_history_protocol_version,
-            .stage_split_handoff => return physical_history_protocol_version,
+            .stage_split_handoff, .confirm_split_successor => return physical_history_protocol_version,
             .plan_roots => |plans| for (plans) |plan| {
                 if (plan.physical != null) return physical_history_protocol_version;
             },
@@ -668,6 +677,9 @@ pub const Mutation = union(enum) {
             .stage_split_handoff => |value| {
                 if (!nz(value.namespace) or value.ownership_epoch == 0) return error.InvalidChangefeed;
                 try value.handoff.validate(value.namespace);
+            },
+            .confirm_split_successor => |value| {
+                if (!nz(value.namespace) or value.grant_sequence == 0 or value.consumer_epoch == 0) return error.InvalidChangefeed;
             },
             .refresh_grant => |value| if (!nz(value.namespace) or value.previous == 0) return error.InvalidChangefeed,
             .rebind => |value| if (!nz(value.namespace) or value.previous == 0 or value.next <= value.previous or !nz(value.proof)) return error.InvalidChangefeed,
@@ -936,12 +948,27 @@ pub const Mutation = union(enum) {
                     !std.meta.eql(previous.physical, @as(?PhysicalRoot, staged.handoff.predecessor))) return error.ChangefeedConflict;
                 if (previous.split_handoff) |handoff| {
                     if (!std.meta.eql(handoff, staged.handoff)) return error.ChangefeedConflict;
-                    return state;
+                    if (previous.split_grant_sequence != null) return state;
                 }
                 if (staged.handoff.cut.reclaimed > previous.acknowledged.sequence)
                     return error.ChangefeedResynchronizationRequired;
                 const roots = try a.dupe(Root, state.roots);
                 roots[index].split_handoff = staged.handoff;
+                roots[index].split_grant_sequence = stamp.sequence;
+                next.roots = roots;
+            },
+            .confirm_split_successor => |confirmed| {
+                if (state.phase != .streaming) return error.ChangefeedConflict;
+                const index = try state.rootIndex(confirmed.namespace);
+                const previous = state.roots[index];
+                if (previous.split_handoff == null or previous.split_grant_sequence != confirmed.grant_sequence)
+                    return error.ChangefeedConflict;
+                if (previous.split_consumer_epoch) |epoch| {
+                    if (epoch != confirmed.consumer_epoch) return error.ChangefeedConflict;
+                    return state;
+                }
+                const roots = try a.dupe(Root, state.roots);
+                roots[index].split_consumer_epoch = confirmed.consumer_epoch;
                 next.roots = roots;
             },
             .rebind => |binding| {
@@ -1608,6 +1635,17 @@ test "changefeed stages a split proof without changing retained cursor positions
     defer decoded.deinit();
     try std.testing.expectEqualDeep(staged.roots[0].split_handoff, decoded.value.roots[0].split_handoff);
     try std.testing.expectEqual(staged.revision, (try step(a, staged, mutation)).revision);
+    var confirmation: Mutation = .{ .confirm_split_successor = .{
+        .namespace = namespace,
+        .grant_sequence = staged.roots[0].split_grant_sequence.?,
+        .consumer_epoch = 7,
+    } };
+    const ready = try step(a, staged, confirmation);
+    try std.testing.expectEqual(@as(?u64, 7), ready.roots[0].split_consumer_epoch);
+    try std.testing.expectEqual(staged.latest_cursor, ready.latest_cursor);
+    try std.testing.expectEqual(ready.revision, (try step(a, ready, confirmation)).revision);
+    confirmation.confirm_split_successor.consumer_epoch += 1;
+    try std.testing.expectError(error.ChangefeedConflict, step(a, ready, confirmation));
     mutation.stage_split_handoff.handoff.cut.root_generation += 1;
     try std.testing.expectError(error.ChangefeedConflict, step(a, staged, mutation));
 }

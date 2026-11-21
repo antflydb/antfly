@@ -259,6 +259,53 @@ pub const Source = struct {
         } };
     }
 
+    pub fn enrollSplitSuccessor(self: Source, a: A, captured: *const Captured, state: control.State, root: control.Root, context: Context) !control.Mutation {
+        const handoff = root.split_handoff orelse return error.ChangefeedConflict;
+        const grant_sequence = root.split_grant_sequence orelse return error.ChangefeedConflict;
+        const definition = state.definition orelse return error.ChangefeedConflict;
+        const table_id = std.mem.readInt(u64, root.namespace[0..8], .big);
+        const table = for (definition.tables) |candidate| {
+            if (candidate.table_id == table_id) break candidate;
+        } else return error.ChangefeedResynchronizationRequired;
+        const successor = try captured.findPhysical(table_id, handoff.successor.group_id, handoff.successor.range_id);
+        if (!std.mem.eql(u8, &successor.namespace, &root.namespace)) return error.ChangefeedResynchronizationRequired;
+        const wire = @import("history_control_operations.zig").wire;
+        const inspect: wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .inspect_policy = .{
+            .namespace = root.namespace,
+            .authority = state.authority,
+        } } };
+        const observed = try self.controls.execute(a, successor.fence, successor.table_name, inspect, context);
+        if (!observed.confirmed()) return error.RaftBatchWriteOutcomeUnknown;
+        if (observed.outcome.? == .rejected) return observed.outcome.?.rejected.asError();
+        const policy = observed.outcome.?.applied.policy orelse return error.HistoryCorrupt;
+        const command: wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .enroll = .{
+            .namespace = root.namespace,
+            .authority = state.authority,
+            .sequence = grant_sequence,
+            .consumer = state.consumerId(),
+            .definition = definition.identity(),
+            .expires_at_seconds = state.expires_at,
+            .policy_revision = table.policy_revision,
+            .limit = policy.limit,
+            .require_commit_clock = table.contract == .native_relational,
+            .retained_start = 0,
+            .split_origin = .{
+                .transition = handoff.cut.transition,
+                .attempt = handoff.cut.attempt,
+                .predecessor_group = handoff.predecessor.group_id,
+                .successor_group = handoff.successor.group_id,
+            },
+        } } };
+        const enrolled = try self.controls.execute(a, successor.fence, successor.table_name, command, context);
+        if (!enrolled.confirmed()) return error.RaftBatchWriteOutcomeUnknown;
+        if (enrolled.outcome.? == .rejected) return enrolled.outcome.?.rejected.asError();
+        const consumer = enrolled.outcome.?.applied.consumer orelse return error.HistoryCorrupt;
+        if (consumer.start != 0 or consumer.policy_revision != table.policy_revision or
+            !std.mem.eql(u8, &consumer.id, &command.command.enroll.consumer))
+            return error.HistoryResynchronizationRequired;
+        return .{ .confirm_split_successor = .{ .namespace = root.namespace, .grant_sequence = grant_sequence, .consumer_epoch = consumer.epoch } };
+    }
+
     /// Authorization must precede capture. Returned locators borrow the owned
     /// generation, so they remain valid even after the publisher retires it.
     pub fn capture(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
