@@ -5156,6 +5156,19 @@ fn selectPhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session:
 inline fn selectPhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
     return selectPhysicalInvocationControlled(prepared, session, target, root_pool, inputs, allocator, cleanup, null);
 }
+
+fn projectionHostIngress(target: *const ImportedOnnxSession, inputs: []const kernel_routes.InputBinding) ?kernel_routes.InputBinding {
+    if (inputs.len != 1 or inputs[0].value != .imported_host) return null;
+    var binding = inputs[0];
+    const host = &binding.value.imported_host;
+    if (host.target != .metal or host.owned_ingress) return null;
+    for (target.static_runtime_inputs) |input| if (input.node_id == binding.node_id) return null;
+    const kernels = target.cb.vtable.kernels orelse return null;
+    if (!kernels.accepts(target.cb.vtable) or kernels.createHostInput == null or kernels.hostInputRequirements == null) return null;
+    host.owned_ingress = true;
+    return binding;
+}
+
 fn selectPhysicalInvocationControlled(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?InferenceExecutionControl) !void {
     var known = true;
     for (inputs) |fact| if (fact.value == .unknown) {
@@ -5170,12 +5183,34 @@ fn selectPhysicalInvocationControlled(prepared: *prepared_mod.PreparedInvocation
     const profile = if (prepared.region_execution_profile) |claim| claim.profile else .unknown;
     var selection_policy: @import("../execution/region_route.zig").SelectionPolicy = .select_regions;
     while (true) {
+        var selected_inputs = inputs;
+        var promoted: [1]kernel_routes.InputBinding = undefined;
         if (known) {
-            prepared.routes = try root_pool.prepareRoutesWithProfileAndCleanup(inputs, selection_policy, profile, cleanup);
+            if (root_pool.metal_projection_region_candidate and profile == .synchronous and selection_policy == .select_regions) {
+                if (projectionHostIngress(target, inputs)) |binding| {
+                    promoted[0] = binding;
+                    // Bank requirements are queried under the candidate's
+                    // actual Metal metadata operation. An unavailable bank
+                    // leaves the original admitted import in service.
+                    prepared.routes = root_pool.prepareRoutesWithProfileAndCleanup(&promoted, selection_policy, profile, cleanup) catch |err| switch (err) {
+                        error.PreparedHostIngressBindingChanged => null,
+                        else => return err,
+                    };
+                    if (prepared.routes) |route| {
+                        if (route.pool.completeOwnedPayload() != null) {
+                            selected_inputs = &promoted;
+                        } else {
+                            prepared.routes = null;
+                            route.releaseWithCleanup(cleanup);
+                        }
+                    }
+                }
+            }
+            if (prepared.routes == null) prepared.routes = try root_pool.prepareRoutesWithProfileAndCleanup(inputs, selection_policy, profile, cleanup);
         } else prepared.routes = null;
         const pool = if (prepared.routes) |routes| routes.pool else root_pool;
         if (session.run_admission) |admission| prepared.frame_claim = try pool.claimWarm(.{ .controller = admission.controller, .backend_class = admission.backend_class });
-        const acquisition = try pool.claimRegions(allocator, if (prepared.frame_claim) |*claim| claim else null, inputs);
+        const acquisition = try pool.claimRegions(allocator, if (prepared.frame_claim) |*claim| claim else null, selected_inputs);
         switch (acquisition) {
             .no_regions => {
                 // A private packed prefill frame is meaningful only when its

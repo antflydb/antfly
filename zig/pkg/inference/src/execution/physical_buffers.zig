@@ -185,9 +185,9 @@ pub const Pool = struct {
     native_frame_dispatch: bool = false,
     cuda_frame_dispatch: bool = false,
     metal_frame_dispatch: bool = false,
-    /// Only a canonical single-partition row head can qualify through its
+    /// Only a canonical single-partition projection head can qualify through its
     /// synchronous region. The root grants no primitive Frame credit.
-    metal_row_region_candidate: bool = false,
+    metal_projection_region_candidate: bool = false,
     coverage_backend: ?ops.ComputeBackend = null,
     payload_coverage: @import("owned_coverage.zig").Coverage = .{ .compatibility = .no_selected_routes },
     route_owner: ?*prepared_routes.PreparedRoutes = null,
@@ -814,7 +814,7 @@ pub const Pool = struct {
         if (!@import("dense_decoder_backend.zig").available(&backend)) return null;
         const native = backend.kind() == .native;
         const cuda = backend.kind() == .cuda;
-        if (!self.owns_plan or self.accounting == null or self.payload_coverage == .complete or self.native_frame_dispatch != native or self.cuda_frame_dispatch != cuda or self.metal_frame_dispatch or self.metal_row_region_candidate or
+        if (!self.owns_plan or self.accounting == null or self.payload_coverage == .complete or self.native_frame_dispatch != native or self.cuda_frame_dispatch != cuda or self.metal_frame_dispatch or self.metal_projection_region_candidate or
             (!native and !cuda) or self.backends.len != 1 or self.backends[0].vtable != backend.vtable or self.backends[0].ptr != backend.ptr or
             reachable.len != graph.nodeCount() or self.kernels.len != graph.nodeCount() or
             self.frames.items.len != 0 or self.pending_frames != 0 or self.prepared_backings.load(.acquire) or
@@ -1149,7 +1149,7 @@ pub const Pool = struct {
         const ledger = try accounting.Ledger.create(self.allocator);
         errdefer ledger.release();
         const child = try self.allocator.create(Pool);
-        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .metal_frame_dispatch = self.metal_frame_dispatch, .metal_row_region_candidate = self.metal_row_region_candidate, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .host_workspace_allocator = self.host_workspace_allocator, .root_pool = self };
+        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .metal_frame_dispatch = self.metal_frame_dispatch, .metal_projection_region_candidate = self.metal_projection_region_candidate, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .host_workspace_allocator = self.host_workspace_allocator, .root_pool = self };
         if (self.literal_store) |store| {
             store.retain();
             child.literal_store = store;
@@ -1160,7 +1160,7 @@ pub const Pool = struct {
 
     fn prepareVariant(root: *Pool, inputs: []const route.InputBinding, policy: @import("region_route.zig").SelectionPolicy, profile: @import("region_route.zig").ExecutionProfile) !?*prepared_routes.PreparedRoutes {
         var metadata: @import("backend_operation.zig").Scope = .{};
-        if (root.cuda_frame_dispatch or root.metal_frame_dispatch or (root.metal_row_region_candidate and profile == .synchronous and policy == .select_regions)) {
+        if (root.cuda_frame_dispatch or root.metal_frame_dispatch or (root.metal_projection_region_candidate and profile == .synchronous and policy == .select_regions)) {
             const backend = root.coverage_backend orelse return error.MissingPreparedKernelRoute;
             try @import("backend_operation.zig").enterInto(&backend, root.coverage_graph, null, .metadata, &metadata);
         }
@@ -1181,7 +1181,7 @@ pub const Pool = struct {
         try @import("reachable_projection.zig").deactivate(child);
         child.selection = try RouteSelection.createSourceWithAuthority(child, inputs, authority);
         if (policy == .select_regions) try child.prepareRegionsWithAuthority(authority);
-        if (child.metal_row_region_candidate and child.region_execution_profile == .synchronous and child.regions.len == 1 and authority != null) child.metal_frame_dispatch = true;
+        if (child.metal_projection_region_candidate and child.region_execution_profile == .synchronous and child.regions.len == 1 and authority != null) child.metal_frame_dispatch = true;
         const capture_supported = try child.applyRouteRequirements();
         try child.recomputeHostWorkspace();
         try child.prepareHostIngress();
@@ -1204,7 +1204,7 @@ pub const Pool = struct {
             @import("device_owned_coverage.zig").assess(child, child.coverage_backend.?, authority)
         else
             @import("owned_coverage.zig").assess(child);
-        if (child.metal_row_region_candidate and child.payload_coverage != .complete) child.metal_frame_dispatch = false;
+        if (child.metal_projection_region_candidate and child.payload_coverage != .complete) child.metal_frame_dispatch = false;
         const immutable = child.immutable_bindings orelse return error.MissingImmutableKernelBindings;
         // Epoch is identity, not a hash of equivalent metadata. Every cache hit
         // still calls full backend matches and validates its concrete policy.

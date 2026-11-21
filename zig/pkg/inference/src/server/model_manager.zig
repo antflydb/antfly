@@ -12934,6 +12934,17 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     const stats = session.executionDiagnostics().?.execution.?;
     try std.testing.expectEqual(@as(u64, 1), stats.runtime_region_plan_dispatches);
     try std.testing.expectEqual(if (count == 2) @as(u64, 2) else 6, stats.runtime_region_plan_covered_nodes);
+    const physical = stats.prepared_payload_coverage orelse return error.MissingPreparedPayloadCoverage;
+    switch (physical) {
+        .complete => |owned| {
+            try std.testing.expectEqual(.device, owned.accounting_class);
+            try std.testing.expectEqual(stats.runtime_region_plan_covered_nodes, @as(u64, @intCast(owned.operations)));
+        },
+        .compatibility => |reason| {
+            std.debug.print("Metal packed projection coverage declined: {s}\n", .{@tagName(reason)});
+            return error.MissingOwnedPayloadWitness;
+        },
+    }
     try std.testing.expect(compute.packed_projection_entries != null);
     try std.testing.expect(!metal.hasActiveFrame(compute.provider_impl.raw_decode_runtime) and !metal.hasSubmittedFrame(compute.provider_impl.raw_decode_runtime));
     const after = controller.snapshot();

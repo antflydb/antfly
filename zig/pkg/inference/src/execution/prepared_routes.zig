@@ -229,7 +229,7 @@ pub const PreparedRoutes = struct {
     /// An exact physical variant may only reuse their original bound handles;
     /// overriding model/literal nodes requires a fresh semantic preparation.
     pub fn validateRuntimeInputs(self: *const PreparedRoutes, inputs: []const @import("../graph/interpreter.zig").RuntimeInput, default_backend: *const ops.ComputeBackend) !void {
-        const verify_row_input = self.pool.metal_row_region_candidate and self.pool.completeOwnedPayload() != null;
+        const verify_projection_input = self.pool.metal_projection_region_candidate and self.pool.completeOwnedPayload() != null;
         for (inputs) |input| {
             const slot = self.pool.plan.slotForNode(input.node_id) orelse return error.InvalidRuntimeInputNode;
             // Weight initializers can also be parameter-shaped graph nodes.
@@ -239,7 +239,7 @@ pub const PreparedRoutes = struct {
                 if (input.value != original.value or backend.ptr != original.implementation.context or @as(*const anyopaque, backend.vtable) != original.implementation.table) return error.PreparedImmutableBindingChanged;
             } else {
                 if (self.immutable.find(input.node_id) != null or (!slot.roles.runtime_input and slot.kind != .runtime_input)) return error.PreparedImmutableBindingChanged;
-                if (verify_row_input) {
+                if (verify_projection_input) {
                     const selected = self.pool.selection.?.inputs.find(input.node_id) orelse return error.PreparedRegionBindingChanged;
                     if (selected != .resident or !try matchesResidentPlane(input.source_backend orelse default_backend, input.value, selected.resident)) return error.PreparedRegionBindingChanged;
                 }

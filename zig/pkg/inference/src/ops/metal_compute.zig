@@ -11700,16 +11700,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const owned_payload_services: @import("kernel_backend.zig").OwnedPayloadServices = .{ .accepts = acceptsPhysicalImplementation, .available = ownedPayloadAvailable, .input = ownedPayloadInput, .route = ownedPayloadRoute, .region = ownedPayloadRegion };
     fn ownedPayloadRegion(ctx: *anyopaque, owned: *const @import("../execution/region_route.zig").Owned) bool {
         if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table) or
-            owned.vtable != &DenseProjectionRegion.table or owned.policy_key != 1) return false;
+            owned.vtable != &DenseProjectionRegion.table) return false;
         const self: *const DenseProjectionRegion = @ptrCast(@alignCast(owned.context));
         if (@as(*anyopaque, @ptrCast(self.compute)) != ctx or self.count < 2 or self.count > 3 or
-            self.packed_request != null or self.scratch_bytes != 0 or owned.entry_node != self.nodes[0]) return false;
+            owned.entry_node != self.nodes[0]) return false;
         const need = owned.requirements;
-        if (need.dispatch_workspace.byte_size != 0 or need.dispatch_workspace.host_byte_size != 0 or
+        if (need.dispatch_workspace.byte_size != self.scratch_bytes or need.dispatch_workspace.host_byte_size != 0 or
             need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0) return false;
-        return owned.covered_nodes.ptr == &self.nodes and owned.covered_nodes.len == self.count and
-            owned.input_nodes.ptr == &self.inputs and owned.input_nodes.len == self.count + 1 and
-            need.outputs.ptr == &self.outputs and need.outputs.len == self.count;
+        if (owned.covered_nodes.ptr != &self.nodes or owned.covered_nodes.len < self.count or owned.covered_nodes.len > self.nodes.len or
+            owned.input_nodes.ptr != &self.inputs or owned.input_nodes.len != self.count + 1 or
+            need.outputs.ptr != &self.outputs or need.outputs.len != self.count) return false;
+        const pack_request = self.packed_request orelse return owned.policy_key == 1 and self.scratch_bytes == 0 and owned.covered_nodes.len == self.count;
+        if (owned.policy_key != 2 or self.scratch_bytes == 0 or need.dispatch_workspace.alignment != @alignOf(f32) or pack_request.count != self.count) return false;
+        const scope = self.compute.packed_projection_profile orelse return false;
+        const current = scope.packed_request orelse return false;
+        if (!std.meta.eql(pack_request, current) or scope.packed_owner == null or !scope.matchesScope()) return false;
+        const linear: *PreparedDenseLinear = @ptrCast(@alignCast(self.linears[0].context));
+        const layout = pack_request.layout() catch return false;
+        return (layout.outputBytes(linear.descriptor.operation.linear.rows) catch return false) == self.scratch_bytes;
     }
     fn ownedPayloadAvailable(ctx: *anyopaque) bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
@@ -12427,7 +12435,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         owner.packed_request = expected;
         owner.scratch_bytes = try (try expected.layout()).outputBytes(semantic.linears[0].operation.linear.rows);
         const items = try request.allocator.alloc(region.Owned, 1);
-        items[0] = .{ .context = owner, .implementation = request.implementation, .key = entry, .policy_key = 2, .covered_nodes = owner.nodes[0..covered_count], .input_nodes = owner.inputs[0 .. owner.count + 1], .entry_node = entry, .requirements = .{ .outputs = owner.outputs[0..owner.count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table };
+        items[0] = .{ .context = owner, .implementation = request.implementation, .key = entry, .policy_key = 2, .covered_nodes = owner.nodes[0..covered_count], .input_nodes = owner.inputs[0 .. owner.count + 1], .entry_node = entry, .requirements = .{ .outputs = owner.outputs[0..owner.count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes, .alignment = @alignOf(f32) }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table };
         transferred = true;
         return .{ .allocator = request.allocator, .items = items };
     }
@@ -55073,7 +55081,7 @@ const PreparedDenseRegionFixture = struct {
         const selected = (try pool.prepareRoutesWithProfile(&.{activation}, .select_regions, profile.profile)) orelse return error.MissingPreparedRoutes;
         defer selected.release();
         try std.testing.expectEqual(@as(usize, 1), selected.pool.regions.len);
-        try std.testing.expect(pool.metal_row_region_candidate);
+        try std.testing.expect(pool.metal_projection_region_candidate);
         const coverage = selected.pool.completeOwnedPayload() orelse {
             std.debug.print("Metal assigned row coverage: {any}\n", .{selected.pool.payload_coverage});
             return error.MissingOwnedPayloadWitness;
