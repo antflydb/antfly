@@ -245,6 +245,79 @@ their file layouts and metadata rules differ. They are implementation details,
 not separate public commands. The public CLI should stay centered on
 `antfly inference export` and `antfly inference quantize`.
 
+## Mixed-Precision GGUF Plans
+
+A single `--format` gives every eligible tensor the same width. Tensors are not
+equally sensitive: the token table, attention projections and the last layers
+usually hurt the output more per lost bit than the FFN layers do. A
+mixed-precision plan gives each tensor its own format so the whole file meets a
+size budget with the least damage. This follows the measure-then-allocate
+approach of quantization compilers such as LookAtMyQuant, restricted to formats
+Antfly already runs, so no new kernels are needed.
+
+The workflow has three steps:
+
+```text
+# 1. Measure: per tensor, per candidate format, encoded bytes and a loss.
+antfly inference export <model-dir> --target gguf --format q4_k \
+  --quantize-sensitivity sensitivity.json [--sensitivity-formats q4_0,q4_k,q5_k,q6_k,q8_0]
+
+# 2. Allocate: one format per tensor, least summed loss within the budget.
+antfly inference quantize-plan --sensitivity sensitivity.json \
+  --bits-per-weight 5.0 --output plan.json        # or --budget-bytes <n>
+
+# 3. Export with the plan.
+antfly inference export <model-dir> --target gguf --format q4_k \
+  --quantize-plan plan.json --output model.mixed.gguf
+```
+
+Rules:
+
+- The plan refines the base `--format`. It may only re-target tensors that
+  format already quantizes, so per-architecture policy (norms, biases, split
+  tensors, multimodal towers kept dense) still applies. `"none"` keeps a
+  planned tensor dense. The budget covers only the planned tensors. A K-family
+  base (256-value blocks) leaves tensors whose rows are not a multiple of 256
+  dense and outside the plan; a 32-value base such as `q8_0` makes more tensors
+  eligible, and candidates whose blocks do not fit a tensor are skipped for it.
+- A plan fails closed: a tensor the export does not write, a tensor the base
+  format keeps dense, an unknown format, or a format whose blocks do not divide
+  the tensor's rows is an error, and nothing is changed.
+- Plans apply to single-file GGUF exports. GLiNER, ClipClap and Florence-2
+  bundle exports reject the flags for now.
+
+Loss sources:
+
+- `--quantize-sensitivity` writes a data-free proxy, `weight_sse`: the summed
+  squared reconstruction error of each tensor in each format. It needs no data
+  or runtime, but it does not see activations, so it over-weights large tensors
+  whose inputs are small and cannot tell which layers the output depends on.
+- An output-space metric replaces each candidate's `loss` in the same file.
+  `scripts/quant_plan/embedding_sensitivity.py measure` does this for
+  embedders: it exports one tensor at a time in each candidate format (every
+  other planned tensor dense) and records the mean `1 - cos` against the dense
+  model over a corpus. Its `evaluate` command compares plans with uniform
+  formats by cosine loss and nearest-neighbor recall at equal file size.
+  Decoders would use token KL, Whisper WER, and GLiNER span F1 in the same way.
+
+The allocator (`src/quantize/mixed_plan.zig`) treats losses as additive across
+tensors. It walks each tensor's lower convex hull of (bytes, loss) in order of
+loss saved per byte, fills leftover budget, repairs gaps with pairwise
+exchanges, and runs a dynamic program over bytes rounded up to 1/65536 of the
+budget beside it; the better plan wins and always fits the real budget.
+
+File formats:
+
+```json
+{"schema": "antfly-quant-sensitivity/v1", "metric": "weight_sse", "tensors": [
+  {"name": "blk.0.attn_q.weight", "elements": 589824, "candidates": [
+    {"format": "q4_k", "bytes": 331776, "loss": 0.81},
+    {"format": "q8_0", "bytes": 626688, "loss": 0.01}]}]}
+
+{"schema": "antfly-quant-plan/v1", "budget_bytes": 0, "planned_bytes": 0,
+ "bits_per_weight": 0, "total_loss": 0, "tensors": {"blk.0.attn_q.weight": "q8_0"}}
+```
+
 ## Code Organization
 
 The command is organized as a small dispatcher plus target-specific
@@ -259,6 +332,8 @@ implementations:
 - `src/quantize/safetensors_export.zig` maps `quantize --target safetensors`
   requests onto the safetensors exporter.
 - `src/quantize/constants.zig` owns shared CLI defaults used by all targets.
+- `src/quantize/mixed_plan.zig` owns sensitivity and plan files, the
+  allocator, and the `antfly inference quantize-plan` command.
 - `src/quantize/variants_manifest.zig` owns ClipClap variant file naming and
   `antfly_inference_variants.json` generation.
 - `src/native_export_gguf.zig` remains the GGUF-specific exporter and

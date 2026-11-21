@@ -19,6 +19,7 @@ const onnx_variant = @import("onnx_variant.zig");
 const gguf_export = @import("gguf_export.zig");
 const safetensors_export = @import("safetensors_export.zig");
 const options = @import("options.zig");
+pub const mixed_plan = @import("mixed_plan.zig");
 
 const print = std.debug.print;
 const Allocator = std.mem.Allocator;
@@ -31,6 +32,7 @@ test {
     _ = gguf_export;
     _ = safetensors_export;
     _ = options;
+    _ = mixed_plan;
 }
 
 pub fn main(allocator: Allocator, io: std.Io, args: []const []const u8) !void {
@@ -66,6 +68,10 @@ fn printUsage(command_name: []const u8) void {
         \\  --quantize-exclude <csv-prefixes>
         \\  --projector-output <path>
         \\  --projector-format auto|antfly|clip
+        \\  --quantize-plan <plan.json>  Per-tensor formats from `antfly inference quantize-plan`
+        \\  --quantize-sensitivity <out.json>
+        \\                             Measure per-tensor weight error instead of exporting
+        \\  --sensitivity-formats <csv> Candidate formats to measure (default: q4_0,q4_k,q5_k,q6_k,q8_0)
         \\  --dry-run
         \\
         \\Safetensors target options:
@@ -106,6 +112,15 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--projector-format") and i + 1 < args.len) {
             opts.projector_format = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--quantize-plan") and i + 1 < args.len) {
+            opts.quantize_plan_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--quantize-sensitivity") and i + 1 < args.len) {
+            opts.sensitivity_output_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--sensitivity-formats") and i + 1 < args.len) {
+            opts.sensitivity_formats = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--dry-run")) {
             opts.dry_run = true;

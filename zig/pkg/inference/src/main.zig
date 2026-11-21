@@ -342,6 +342,8 @@ pub fn runFromArgs(
         try inference.native_export.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "quantize")) {
         try inference.native_quantize.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "quantize-plan")) {
+        try inference.native_quantize.planMain(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "quant-kernel-codegen")) {
         try inference.native_quant_kernel_codegen.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "run-artifact")) {
@@ -848,6 +850,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  compile-artifact Compile one or more traced generation artifacts
         \\  export    Convert a model artifact to ONNX, GGUF, or safetensors
         \\  quantize  Create a quantized model variant
+        \\  quantize-plan Choose per-tensor quantization formats under a size budget
         \\  quant-kernel-codegen Verify or rewrite dev-generated quant kernel sources
         \\  run-artifact Run or validate a compiled offline artifact
         \\  transcribe Run native audio transcription from the command line

@@ -51,6 +51,9 @@ pub fn run(allocator: Allocator, io: std.Io, opts: options.Options) !void {
         opts.quantize_exclude_prefixes != null or
         opts.projector_output_path != null or
         opts.projector_format != null or
+        opts.quantize_plan_path != null or
+        opts.sensitivity_output_path != null or
+        opts.sensitivity_formats != null or
         opts.dry_run)
     {
         return error.InvalidArguments;
