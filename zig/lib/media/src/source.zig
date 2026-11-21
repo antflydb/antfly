@@ -268,9 +268,8 @@ pub const FileRange = struct {
     pub fn readAt(context: *anyopaque, offset: u64, bytes: []u8, control: Control) !usize {
         try control.check();
         const self: *FileRange = @ptrCast(@alignCast(context));
-        const n = try self.file.readPositional(self.io, &.{bytes}, offset);
-        try control.check();
-        return n;
+        // Source records the transfer before its post-read cancellation check.
+        return self.file.readPositional(self.io, &.{bytes}, offset);
     }
 };
 
@@ -363,6 +362,39 @@ test "file range adapter performs independent positional reads" {
     defer head.deinit();
     try std.testing.expectEqualStrings("efgh", tail.bytes);
     try std.testing.expectEqualStrings("abcd", head.bytes);
+}
+
+test "file transfer completed during cancellation consumes the shared byte allowance" {
+    const io = std.testing.io;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const file = try dir.dir.createFile(io, "source", .{ .read = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, "abcd");
+    const Provider = struct {
+        file_range: FileRange,
+        reading: bool = false,
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: Control) !usize {
+            const p: *@This() = @ptrCast(@alignCast(raw));
+            return FileRange.readAt(&p.file_range, offset, out, .{ .context = p, .check_fn = begin });
+        }
+        fn begin(raw: ?*const anyopaque) !void {
+            const p: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            try check(p);
+            p.reading = true;
+        }
+        fn check(raw: ?*const anyopaque) !void {
+            const p: *const @This() = @ptrCast(@alignCast(raw.?));
+            if (p.reading) return error.Cancelled;
+        }
+    };
+    var provider = Provider{ .file_range = .{ .file = file, .io = io } };
+    var src = Source{ .allocator = std.testing.allocator, .identity = "file", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = 4 } }, .limits = .{ .max_total_bytes = 4 } };
+    var worker = src.view(std.testing.allocator, null, .{ .context = &provider, .check_fn = Provider.check });
+    try std.testing.expectError(error.Cancelled, worker.read(0, 4));
+    try std.testing.expectEqual(@as(u64, 4), worker.total_bytes);
+    try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
+    try std.testing.expectError(error.ResourceLimitExceeded, src.read(0, 1));
 }
 
 test "source shared lease admission is retained and denied without provider reads" {

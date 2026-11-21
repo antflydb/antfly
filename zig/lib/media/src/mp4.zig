@@ -125,7 +125,7 @@ const Tables = struct {
     scale: u32 = 0,
     handler: u32 = 0,
     matrix: [9]i32 = @splat(0),
-    description_seen: bool = false,
+    description_bytes: ?[]const u8 = null,
     self_contained: bool = false,
 };
 
@@ -368,7 +368,9 @@ const Parser = struct {
                 if (self.tracks > self.limits.max_tracks) return error.ResourceLimitExceeded;
                 var t = Tables{};
                 try self.trackBoxes(b.payload, &t, 0);
-                if (t.handler == tag("vide") and t.track != null and selected == null) {
+                if (t.description_bytes) |description_bytes|
+                    try self.description(description_bytes, &t, t.handler == tag("vide") and selected == null);
+                if (t.track != null) {
                     if (t.id == 0 or t.scale == 0) return error.MalformedMedia;
                     if (!t.self_contained) return error.UnsupportedDataReference;
                     try self.limits.validateDimensions(t.track.?);
@@ -435,7 +437,10 @@ const Parser = struct {
                             std.mem.eql(u8, ref.payload, &.{ 0, 0, 0, 1 });
                     }
                 },
-                tag("stsd") => try self.description(p, t),
+                tag("stsd") => {
+                    if (t.description_bytes != null) return error.MalformedMedia;
+                    t.description_bytes = p;
+                },
                 tag("stsz"), tag("stz2") => {
                     if (t.sizes.len != 0) return error.MalformedMedia;
                     t.sizes = p;
@@ -471,9 +476,7 @@ const Parser = struct {
             cursor = b.end;
         }
     }
-    fn description(self: *Parser, bytes: []const u8, t: *Tables) !void {
-        if (t.description_seen) return error.MalformedMedia;
-        t.description_seen = true;
+    fn description(self: *Parser, bytes: []const u8, t: *Tables, candidate: bool) !void {
         if (bytes.len < 8) return error.MalformedMedia;
         const count = u32be(bytes[4..8]);
         if (count > self.limits.max_tracks) return error.ResourceLimitExceeded;
@@ -482,7 +485,13 @@ const Parser = struct {
             const b = try self.box(bytes, cursor);
             const known: ?Codec = if (b.typ == tag("avc1") or b.typ == tag("avc3")) .avc else if (b.typ == tag("jpeg")) .mjpeg else if (b.typ == tag("hvc1") or b.typ == tag("hev1")) .hevc else if (b.typ == tag("av01")) .av1 else null;
             if (known) |codec| supported: {
-                if (!self.limits.codecs.contains(codec)) break :supported;
+                if (!candidate or !self.limits.codecs.contains(codec)) {
+                    // Count and bound the child boxes of inactive visual entries too.
+                    if (b.payload.len < 78) return error.MalformedMedia;
+                    var child: usize = 78;
+                    while (child < b.payload.len) child = (try self.box(b.payload, child)).end;
+                    break :supported;
+                }
                 if (count != 1) return error.UnsupportedSampleDescription;
                 if (b.payload.len < 78) return error.MalformedMedia;
                 const width = u16be(b.payload[24..26]);
@@ -704,11 +713,11 @@ test "mp4 HEVC and AV1 sample descriptions require explicit consumer codec suppo
         } else @memcpy(bytes[102..106], &[_]u8{ 0x81, 0, 0x0c, 0 });
         var parser = Parser{ .limits = .{}, .control = .{} };
         var tables = Tables{};
-        try parser.description(bytes[0..size], &tables);
+        try parser.description(bytes[0..size], &tables, true);
         try std.testing.expect(tables.track == null);
         parser.limits.codecs = std.EnumSet(Codec).initMany(&.{ .hevc, .av1 });
         tables = .{};
-        try parser.description(bytes[0..size], &tables);
+        try parser.description(bytes[0..size], &tables, true);
         try std.testing.expectEqual(if (hevc) Codec.hevc else Codec.av1, tables.track.?.codec);
         try std.testing.expectEqualStrings(bytes[102..size], tables.track.?.codec_config);
         try std.testing.expectEqual(@as(u3, if (hevc) 4 else 0), tables.track.?.nal_length_bytes);

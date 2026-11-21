@@ -206,7 +206,7 @@ pub const Inspection = struct {
     owns_webm_index: bool = false,
     selected: ?[]usize = null,
     configurations: ?*video.h264_dynamic.Session = null,
-    signal: video.h264.Color = .{},
+    presentation: PacketPresentation = .{},
     plan: Plan = .{},
     fn matches(self: *const Inspection, bytes: []const u8, reader: ?*const media.mp4.Reader, configuration: Configuration) bool {
         return self.borrowed == reader and self.bytes.len == bytes.len and (bytes.len == 0 or self.bytes.ptr == bytes.ptr) and self.configuration.selection == configuration.selection and std.meta.eql(self.configuration.webm, configuration.webm) and std.meta.eql(self.configuration.sampling, configuration.sampling) and self.configuration.decoder.policy == configuration.decoder.policy;
@@ -274,6 +274,7 @@ pub const Inspection = struct {
                 ts.?.index.releaseHeaders();
                 break :retry try parameterSession(a, &self.reader, false, null);
             };
+            self.presentation = try PacketPresentation.init(a, self.reader.track, self.configurations);
             self.selectPackets(a, configuration) catch |err| {
                 if ((err != error.SharedAdmissionExceeded and !(err == error.OutOfMemory and self.bounded.denied)) or ts == null or ts.?.index.planningHeaders() == null) return err;
                 if (self.configurations) |registry| registry.releasePlanningHeaders();
@@ -284,12 +285,7 @@ pub const Inspection = struct {
                 if (self.configurations) |registry| registry.releasePlanningHeaders();
                 transport.index.releaseHeaders();
             }
-            self.plan = try inspectSelectedPacketPlan(a, &self.reader, control, true, self.selected.?, self.configurations);
-            if (self.reader.track.codec == .avc and self.configurations == null) {
-                const cfg = try video.h264.configParse(a, self.reader.track.avcc);
-                defer cfg.groups.deinit(a);
-                self.signal = cfg.color;
-            }
+            self.plan = try inspectSelectedPacketPlan(a, &self.reader, control, true, self.selected.?, self.configurations, self.presentation);
         }
     }
     fn selectPackets(self: *Inspection, a: std.mem.Allocator, configuration: Configuration) !void {
@@ -816,15 +812,37 @@ fn policyLayout(track: media.mp4.Track, display: video.display.Layout, width: u3
     return .{ .width = g.width, .height = g.height, .presentation_width = display.width, .presentation_height = display.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = if (matrix == .gbr_identity) .gbr_reference else if (width % 16 == 0) .q13_components else .q16_luma };
 }
 
-/// The bitstream's color and aspect apply where the container says nothing. A
-/// container pasp wins over the stream's SAR, as in other players, and policySignal
-/// refuses color that conflicts.
-fn hevcPolicy(a: std.mem.Allocator, track: media.mp4.Track, width: u32, height: u32) !video.preparation.Options {
-    const signal = (try video.hevc_config.parse(a, track.codec_config)) orelse return policy(track, width, height);
-    var effective = track;
-    if (!track.pixel_aspect_declared) effective.pixel_aspect = .{ .horizontal = signal.sar.horizontal, .vertical = signal.sar.vertical };
-    return policySignal(effective, width, height, .{ .primaries = signal.primaries, .transfer = signal.transfer, .matrix = signal.matrix });
-}
+/// Presentation metadata from the active codec configuration. Dynamic AVC
+/// resolves the packet's epoch through the same interface as static tracks.
+const PacketPresentation = struct {
+    width: u32 = 0,
+    height: u32 = 0,
+    signal: video.h264.Color = .{},
+
+    fn init(a: std.mem.Allocator, track: media.mp4.Track, registry: ?*video.h264_dynamic.Session) !PacketPresentation {
+        var result = PacketPresentation{ .width = track.width, .height = track.height };
+        if (track.codec == .hevc) {
+            if (try video.hevc_config.parse(a, track.codec_config)) |signal| result.signal = .{
+                .primaries = signal.primaries,
+                .transfer = signal.transfer,
+                .matrix = signal.matrix,
+                .sar = .{ @intCast(signal.sar.horizontal), @intCast(signal.sar.vertical) },
+            };
+        } else if (track.codec == .avc and registry == null) {
+            const cfg = try video.h264.configParse(a, track.avcc);
+            defer cfg.groups.deinit(a);
+            result = .{ .width = @intCast(cfg.width), .height = @intCast(cfg.height), .signal = cfg.color };
+        }
+        if (registry == null) _ = try policySignal(track, result.width, result.height, result.signal);
+        return result;
+    }
+
+    fn at(self: PacketPresentation, registry: ?*video.h264_dynamic.Session, id: usize) !PacketPresentation {
+        const session = registry orelse return self;
+        const cfg = try session.configAt(id);
+        return .{ .width = @intCast(cfg.width), .height = @intCast(cfg.height), .signal = cfg.color };
+    }
+};
 
 fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader, cache_headers: bool, headers: ?[]const []u8) !?*video.h264_dynamic.Session {
     if (reader.track.codec != .avc) return null;
@@ -837,9 +855,6 @@ fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader, cache_heade
         }
         return session;
     }
-    const cfg = try video.h264.configParse(a, reader.track.avcc);
-    defer cfg.groups.deinit(a);
-    _ = try policySignal(reader.track, @intCast(cfg.width), @intCast(cfg.height), cfg.color);
     return null;
 }
 
@@ -993,6 +1008,17 @@ fn webmPolicy(track: media.webm.Track, width: u32, height: u32, signal: video.h2
     common.color_info = &declaration;
     var options = try policyLayout(common, layout.display, width, signal);
     options.crop = layout.crop;
+    return options;
+}
+fn webmFramePolicy(track: media.webm.Track, frame: anytype) !video.preparation.Options {
+    const color = frame.color;
+    try validateWebmSignal(track, frame.bit_depth, frame.chroma_format, color.full_range);
+    var options = try webmPolicy(track, frame.width, frame.height, .{
+        .primaries = if (color.primaries == 2) null else color.primaries,
+        .transfer = if (color.transfer == 2) null else color.transfer,
+        .matrix = if (color.matrix == 2 or track.codec == .vp8) null else color.matrix,
+    });
+    if (options.tone_mapping == .none) options.rgb_rounding = video.preparation.softwareSdrRounding(frame.width, frame.chroma_format, frame.bit_depth, options.matrix);
     return options;
 }
 fn webmHost(track: media.webm.Track, frame: *const video.codecs.Frame) !video.preparation.HostSurface {
@@ -1156,13 +1182,14 @@ test "HEVC output planning and preparation share the bitstream's aspect" {
     var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
     defer reader.deinit();
     try std.testing.expectEqual(reader.track.pixel_aspect.horizontal, reader.track.pixel_aspect.vertical);
-    const stream = try hevcPolicy(a, reader.track, reader.track.width, reader.track.height);
+    const presentation = try PacketPresentation.init(a, reader.track, null);
+    const stream = try policySignal(reader.track, reader.track.width, reader.track.height, presentation.signal);
     const container = try policy(reader.track, reader.track.width, reader.track.height);
     try std.testing.expect(stream.width != container.width);
     var preparation = stream;
     preparation.rgb_rounding = .q13_reconstructed;
     const expected = (try video.preparation.geometry(reader.track.width, reader.track.height, preparation)).values() * @sizeOf(f32);
-    const planned = try selectionOutputBytes(a, &.{0}, &reader, null, null, null);
+    const planned = try selectionOutputBytes(presentation, &.{0}, &reader, null, null, null);
     try std.testing.expectEqual(expected, planned.bytes);
 }
 
@@ -1172,8 +1199,9 @@ test "An explicit square pasp wins over a stream's SAR" {
     var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
     defer reader.deinit();
     try std.testing.expect(reader.track.pixel_aspect_declared);
-    try std.testing.expectEqual((try policy(reader.track, 64, 64)).presentation_width, (try hevcPolicy(a, reader.track, 64, 64)).presentation_width);
-    try std.testing.expectEqual(@as(u32, 64), (try hevcPolicy(a, reader.track, 64, 64)).presentation_width);
+    const presentation = try PacketPresentation.init(a, reader.track, null);
+    try std.testing.expectEqual((try policy(reader.track, 64, 64)).presentation_width, (try policySignal(reader.track, 64, 64, presentation.signal)).presentation_width);
+    try std.testing.expectEqual(@as(u32, 64), (try policySignal(reader.track, 64, 64, presentation.signal)).presentation_width);
 }
 
 test "embeddinggemma2 video contract pixels follow the first decodable track on both routes" {
@@ -1257,10 +1285,8 @@ pub const Plan = struct {
 /// Use the same decoded geometry/display policy as preflight. No packet reads,
 /// decoding, or second picture index is needed to size final preparation spans.
 const OutputSlabPlan = struct { bytes: usize = 0, transient: usize = 0, commands: u64 = 0 };
-fn selectionOutputBytes(a: std.mem.Allocator, selected: []const usize, reader: ?*media.mp4.Reader, configurations: ?*video.h264_dynamic.Session, webm_reader: ?*media.webm.Reader, webm_index: ?video.webm_pictures.Index) !OutputSlabPlan {
+fn selectionOutputBytes(presentation: PacketPresentation, selected: []const usize, reader: ?*media.mp4.Reader, configurations: ?*video.h264_dynamic.Session, webm_reader: ?*media.webm.Reader, webm_index: ?video.webm_pictures.Index) !OutputSlabPlan {
     var result = OutputSlabPlan{ .commands = preparationSlots(selected) };
-    const static_config = if (reader) |r| (if (r.track.codec == .avc and configurations == null) try video.h264.configParse(a, r.track.avcc) else null) else null;
-    defer if (static_config) |cfg| cfg.groups.deinit(a);
     for (selected) |id| {
         var source_width: u32 = 0;
         var source_height: u32 = 0;
@@ -1269,17 +1295,16 @@ fn selectionOutputBytes(a: std.mem.Allocator, selected: []const usize, reader: ?
             const picture = index.pictures[id];
             source_width = picture.width;
             source_height = picture.height;
-            preparation = try webmPolicy(webm_reader.?.track, picture.width, picture.height, .{});
-            if (preparation.tone_mapping == .none) preparation.rgb_rounding = video.preparation.softwareSdrRounding(picture.width, picture.chroma_format, picture.bit_depth, preparation.matrix);
+            preparation = try webmFramePolicy(webm_reader.?.track, picture);
             break :blk try video.preparation.geometry(picture.width, picture.height, preparation);
         } else blk: {
             const track = reader.?.track;
-            const cfg = if (configurations) |session| try session.configAt(id) else static_config;
-            const width: u32 = @intCast(if (cfg) |c| c.width else track.width);
-            const height: u32 = @intCast(if (cfg) |c| c.height else track.height);
+            const frame = try presentation.at(configurations, id);
+            const width = frame.width;
+            const height = frame.height;
             source_width = width;
             source_height = height;
-            preparation = if (cfg) |c| try policySignal(track, width, height, c.color) else if (track.codec == .hevc) try hevcPolicy(a, track, width, height) else try policy(track, width, height);
+            preparation = try policySignal(track, width, height, frame.signal);
             // Portable decode can reconstruct full chroma even when container
             // colour signalling alone does not specify its rounding policy.
             if (preparation.tone_mapping == .none) preparation.rgb_rounding = .q13_reconstructed;
@@ -1438,8 +1463,7 @@ fn inspectSelectedWebmPlan(reader: *const media.webm.Reader, index: video.webm_p
         if (plan.pictures >= plan.picture_indexes.len) return error.ResourceLimitExceeded;
         plan.picture_indexes[plan.pictures] = id;
         const picture = index.pictures[id];
-        var preparation = try webmPolicy(reader.track, picture.width, picture.height, .{});
-        if (preparation.tone_mapping == .none) preparation.rgb_rounding = video.preparation.softwareSdrRounding(picture.width, picture.chroma_format, picture.bit_depth, preparation.matrix);
+        const preparation = try webmFramePolicy(reader.track, picture);
         try plan.picture(picture.width, picture.height, preparation);
         if (metal and @import("builtin").os.tag == .macos and reader.track.codec != .vp8 and picture.chroma_format == 1 and (picture.bit_depth == 8 or picture.bit_depth == 10)) {
             const estimate = try video.apple.surfaceAdmissionBytesForDepth(picture.width, picture.height, selected.len, picture.bit_depth);
@@ -1465,19 +1489,14 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
     return inspectPacketPlan(a, &input.reader, control, sampling, metal, null);
 }
 fn inspectPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, control: Control, sampling: Sampling, metal: bool, selection: ?*const ReaderSelection) !Plan {
-    // AVC combines VUI and container declarations in parameterSession below.
-    if (reader.track.codec == .hevc) {
-        _ = try hevcPolicy(a, reader.track, reader.track.width, reader.track.height);
-    } else if (reader.track.codec != .avc) _ = try policy(reader.track, reader.track.width, reader.track.height);
     const configurations = try parameterSession(a, reader, false, null);
     defer if (configurations) |session| session.deinit();
+    const presentation = try PacketPresentation.init(a, reader.track, configurations);
     const selected = try selectReader(a, reader, sampling, reader.input.control, selection, configurations);
     defer a.free(selected);
-    return inspectSelectedPacketPlan(a, reader, control, metal, selected, configurations);
+    return inspectSelectedPacketPlan(a, reader, control, metal, selected, configurations, presentation);
 }
-fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, control: Control, metal: bool, selected: []const usize, configurations: ?*video.h264_dynamic.Session) !Plan {
-    const static_config = if (reader.track.codec == .avc and configurations == null) try video.h264.configParse(a, reader.track.avcc) else null;
-    defer if (static_config) |cfg| cfg.groups.deinit(a);
+fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, control: Control, metal: bool, selected: []const usize, configurations: ?*video.h264_dynamic.Session, presentation: PacketPresentation) !Plan {
     var plan = Plan{ .commands = preparationSlots(selected), .metal_preparation = metal, .decoder_host_bytes = 128 * 1024 * 1024 };
     if (metal and reader.track.codec == .avc and !reader.track.inband_parameter_sets and try compatibleApple(a, reader.track.avcc)) {
         plan.apple_surface_bytes = std.math.cast(usize, try video.apple.surfaceAdmissionBytes(reader.track.width, reader.track.height, selected.len)) orelse return error.ResourceLimitExceeded;
@@ -1495,10 +1514,8 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
         try control.check();
         if (plan.pictures >= plan.picture_indexes.len) return error.ResourceLimitExceeded;
         plan.picture_indexes[plan.pictures] = index;
-        const cfg = if (configurations) |session| try session.configAt(index) else static_config;
-        const width = if (cfg) |value| value.width else reader.track.width;
-        const height = if (cfg) |value| value.height else reader.track.height;
-        try plan.picture(@intCast(width), @intCast(height), if (cfg) |value| try policySignal(reader.track, @intCast(width), @intCast(height), value.color) else if (reader.track.codec == .hevc) try hevcPolicy(a, reader.track, @intCast(width), @intCast(height)) else try policy(reader.track, @intCast(width), @intCast(height)));
+        const frame = try presentation.at(configurations, index);
+        try plan.picture(frame.width, frame.height, try policySignal(reader.track, frame.width, frame.height, frame.signal));
     }
     return plan;
 }
@@ -1806,16 +1823,11 @@ pub const Prefetch = struct {
         defer if (inspection == null) {
             if (configurations) |session| session.deinit();
         };
+        const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
+        const presentation = if (inspection) |owner| owner.presentation else if (!webm) try PacketPresentation.init(a, track, configurations) else PacketPresentation{};
         const selected = if (inspection) |owner| try a.dupe(usize, owner.selected.?) else if (webm_index) |index| try selectWebm(a, index, sampling, source.control, self.webm_input) else try selectReader(a, &reader, sampling, source.control, self.reader_selection, configurations);
         self.selected = selected;
-        const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
-        var signal = if (inspection) |owner| owner.signal else video.h264.Color{};
-        if (inspection == null and !webm and reader.track.codec == .avc and configurations == null) {
-            const cfg = try video.h264.configParse(a, reader.track.avcc);
-            defer cfg.groups.deinit(a);
-            signal = cfg.color;
-        }
-        var capture = Capture{ .reader_selection = self.reader_selection, .a = a, .cb = undefined, .track = track, .webm_track = if (webm) webm_reader.track else null, .pool = pool, .control = source.control, .output = &.{}, .frame_tokens = &.{}, .selected = selected, .signal = signal, .metal = if (self.preparer) |*value| value else null, .io = self.io, .prefetch = self, .decoder = self.decoder };
+        var capture = Capture{ .reader_selection = self.reader_selection, .a = a, .cb = undefined, .track = track, .webm_track = if (webm) webm_reader.track else null, .pool = pool, .control = source.control, .output = &.{}, .frame_tokens = &.{}, .selected = selected, .signal = presentation.signal, .metal = if (self.preparer) |*value| value else null, .io = self.io, .prefetch = self, .decoder = self.decoder };
         try self.put(.{ .header = selected });
         var misses: [32]usize = undefined;
         var miss_slots: [32]usize = undefined;
@@ -1854,7 +1866,7 @@ pub const Prefetch = struct {
             if (pool) |shared| try self.preparer.?.admit(shared, 16 * 1024 * 1024);
         };
         capture.metal = if (self.preparer) |*value| value else null;
-        if (self.preparer) |*preparer| try configureOutputSlab(preparer, pool, try selectionOutputBytes(a, prepare_packets[0..prepare_count], if (webm) null else &reader, configurations, if (webm) &webm_reader else null, webm_index));
+        if (self.preparer) |*preparer| try configureOutputSlab(preparer, pool, try selectionOutputBytes(presentation, prepare_packets[0..prepare_count], if (webm) null else &reader, configurations, if (webm) &webm_reader else null, webm_index));
         capture.decode_slots = miss_slots[0..missing];
         if (webm) {
             try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, self.webm_input);
@@ -2307,15 +2319,10 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     defer if (inspection == null) {
         if (configurations) |session| session.deinit();
     };
+    const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
+    const presentation = if (inspection) |owner| owner.presentation else if (!webm) try PacketPresentation.init(a, track, configurations) else PacketPresentation{};
     const selected = if (inspection) |owner| try a.dupe(usize, owner.selected.?) else if (webm_index) |index| try selectWebm(a, index, sampling, source.control, webm_input) else try selectReader(a, &reader, sampling, source.control, selection, configurations);
     defer a.free(selected);
-    const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
-    var signal = if (inspection) |owner| owner.signal else video.h264.Color{};
-    if (inspection == null and !webm and reader.track.codec == .avc and configurations == null) {
-        const cfg = try video.h264.configParse(a, reader.track.avcc);
-        defer cfg.groups.deinit(a);
-        signal = cfg.color;
-    }
     // Backend access follows admitted parsing, including for standalone
     // callers. Rejected inputs must never dereference an unopened backend.
     // Borrow this already inspected input until the synchronous consumer joins;
@@ -2335,7 +2342,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
             .webm = webm,
             .selected = selected,
             .configurations = configurations,
-            .signal = signal,
+            .presentation = presentation,
         };
         const producer = try Prefetch.startInput(a, io, try MetalCompute.videoDevice(cb), bytes, borrowed, control, sampling, pool, cache, selection, decoder, webm_input, cache_pins, inspection orelse &prepared, coefficients, null);
         defer producer.deinit();
@@ -2356,7 +2363,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     if (resident) |tensors| @memset(tensors, null);
     var clip_hash: [32]u8 = @splat(0);
     if (cache != null and selection == null) clip_hash = try clipBinding(bytes, borrowed, webm_input, source.control, cache_pins, null);
-    var capture = Capture{ .observer = observer, .observe_only = observe_only, .decoder = decoder, .reader_selection = selection, .cache = cache, .clip_hash = clip_hash, .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .webm_track = if (webm) webm_reader.track else null, .control = source.control, .output = output, .frame_tokens = frame_tokens };
+    var capture = Capture{ .observer = observer, .observe_only = observe_only, .decoder = decoder, .reader_selection = selection, .cache = cache, .clip_hash = clip_hash, .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = presentation.signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .webm_track = if (webm) webm_reader.track else null, .control = source.control, .output = output, .frame_tokens = frame_tokens };
     defer capture.discardNativePending();
     var jobs: [8]ProjectionJob = undefined;
     var scheduler = ProjectionScheduler{ .queue = .init(jobs[0..queueCapacity(pool, selected.len)]), .capture = &capture };
@@ -2398,7 +2405,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         }
     }
     capture.metal = if (preparer) |*value| value else null;
-    if (missing != 0) if (preparer) |*value| try configureOutputSlab(value, pool, try selectionOutputBytes(a, misses[0..missing], if (webm) null else &reader, configurations, if (webm) &webm_reader else null, webm_index));
+    if (missing != 0) if (preparer) |*value| try configureOutputSlab(value, pool, try selectionOutputBytes(presentation, misses[0..missing], if (webm) null else &reader, configurations, if (webm) &webm_reader else null, webm_index));
     capture.decode_slots = miss_slots[0..missing];
     const replay_source = if (webm) webm_reader.input else reader.input;
     const reads_before_decode = replay_source.total_bytes;
@@ -3263,14 +3270,7 @@ const Capture = struct {
         if (self.copyDuplicate(slot)) return;
         const track = self.webm_track orelse return error.InvalidSamplingMetadata;
         const host = try webmHost(track, frame);
-        const color = frame.color;
-        const signal = video.h264.Color{
-            .primaries = if (color.primaries == 2) null else color.primaries,
-            .transfer = if (color.transfer == 2) null else color.transfer,
-            .matrix = if (color.matrix == 2 or track.codec == .vp8) null else color.matrix,
-        };
-        var options = try webmPolicy(track, frame.width, frame.height, signal);
-        if (options.tone_mapping == .none) options.rgb_rounding = video.preparation.softwareSdrRounding(frame.width, frame.chroma_format, frame.bit_depth, options.matrix);
+        var options = try webmFramePolicy(track, frame);
         options.admission_pool = self.pool;
         if (try self.observe(slot, .{ .host = host }, options)) return;
         if (self.metal) |metal| {
@@ -3287,11 +3287,7 @@ const Capture = struct {
         if (self.copyDuplicate(slot)) return;
         const track = self.webm_track orelse return error.InvalidSamplingMetadata;
         if (track.colour.range != 0 and (track.colour.range == 2) != surface.format.fullRange()) return error.UnsupportedVideoColor;
-        // Reuse portable declaration validation, including siting and depth.
-        try validateWebmSignal(track, picture.bit_depth, picture.chroma_format, picture.color.full_range);
-        const c = picture.color;
-        var options = try webmPolicy(track, picture.width, picture.height, .{ .primaries = if (c.primaries == 2) null else c.primaries, .transfer = if (c.transfer == 2) null else c.transfer, .matrix = if (c.matrix == 2) null else c.matrix });
-        if (options.tone_mapping == .none) options.rgb_rounding = video.preparation.softwareSdrRounding(picture.width, picture.chroma_format, picture.bit_depth, options.matrix);
+        var options = try webmFramePolicy(track, picture);
         options.admission_pool = self.pool;
         if (try self.observe(slot, .{ .surface = surface }, options)) return;
         if (self.metal) |metal| {
@@ -3330,7 +3326,7 @@ const Capture = struct {
         self.apple_published += 1;
         const slot = std.mem.indexOfScalar(usize, self.selected, id) orelse return error.InvalidPacketIndex;
         if (self.copyDuplicate(slot)) return;
-        var options = try hevcPolicy(self.a, self.track, surface.width, surface.height);
+        var options = try policySignal(self.track, surface.width, surface.height, self.signal);
         options.admission_pool = self.pool;
         if (try self.observe(slot, .{ .surface = surface }, options)) return;
         if (self.metal) |metal| {
@@ -3636,6 +3632,21 @@ test "embeddinggemma2 video cancellation before consumer entry joins and drains 
     live = false;
     try std.testing.expectEqual(@as(usize, 0), bounded.live);
     try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+}
+
+test "embeddinggemma2 WebM HDR planning combines sparse container and indexed AV1 colour" {
+    var reader: media.webm.Reader = undefined;
+    reader.track = .{ .number = 1, .codec = .av1, .width = 64, .height = 64, .colour = .{ .matrix = 9 } };
+    var pictures = [_]video.webm_pictures.Picture{.{ .pts = 0, .duration = null, .width = 64, .height = 64, .bit_depth = 10, .color = .{ .primaries = 9, .transfer = 16, .matrix = 9 } }};
+    const index = video.webm_pictures.Index{ .allocator = std.testing.allocator, .pictures = &pictures };
+    try std.testing.expectEqual(video.preparation.ToneMapping.pq_reinhard_100, (try webmFramePolicy(reader.track, pictures[0])).tone_mapping);
+    const plan = try inspectSelectedWebmPlan(&reader, index, false, &.{0});
+    try std.testing.expectEqual(@as(usize, 1), plan.pictures);
+    const slab = try selectionOutputBytes(.{}, &.{0}, null, null, &reader, index);
+    try std.testing.expect(slab.bytes > 0);
+    reader.track.colour.transfer = 1;
+    try std.testing.expectError(error.UnsupportedVideoColor, inspectSelectedWebmPlan(&reader, index, false, &.{0}));
+    try std.testing.expectError(error.UnsupportedVideoColor, selectionOutputBytes(.{}, &.{0}, null, null, &reader, index));
 }
 
 test "embeddinggemma2 video WebM presentation and container colour reach model preparation" {

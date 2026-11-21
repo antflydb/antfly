@@ -42,14 +42,11 @@ pub fn shape(group: grouped.Group) !?micro.Shape {
     if (group.title != null or group.content.len != 1) return null;
     const part = group.content[0];
     if (part == .audio) return .{ .bytes = part.audio.bytes.len, .tokens = 1024 };
-    const dimensions = switch (part) {
-        .image => |bytes| try @import("image.zig").inspectEncodedForInference(bytes, null),
-        .raster => |raster| blk: {
-            try raster.validate();
-            break :blk @import("image.zig").EncodedImageInfo{ .width = raster.width, .height = raster.height };
-        },
-        else => return null,
-    };
+    if (part != .image and part != .raster) return null;
+    return try imageShape(part, try group.imageInfo(0));
+}
+
+fn imageShape(part: grouped.Part, dimensions: @import("image.zig").EncodedImageInfo) !micro.Shape {
     const geometry = try projector.embeddingGemma2ImageGeometry(dimensions.width, dimensions.height);
     return .{
         .geometry_key = projector.embeddingGemma2GeometryKey(geometry),
@@ -71,13 +68,13 @@ pub fn groupShape(group: grouped.Group) !micro.Shape {
         result.bytes = title.len;
         result.tokens = @min(8192, result.tokens +| title.len);
     }
-    for (group.content) |part| switch (part) {
+    for (group.content, 0..) |part, index| switch (part) {
         .text => |text| {
             result.bytes = try std.math.add(usize, result.bytes, text.len);
             result.tokens = @min(@as(usize, 8192), try std.math.add(usize, result.tokens, text.len));
         },
         .image, .raster => {
-            const item = (try shape(.{ .content = &.{part} })).?;
+            const item = try imageShape(part, try group.imageInfo(index));
             result.bytes = try std.math.add(usize, result.bytes, item.bytes);
             result.pixels = try std.math.add(u64, result.pixels, item.pixels);
             result.tokens = @min(@as(usize, 8192), try std.math.add(usize, result.tokens, item.tokens));
@@ -112,6 +109,7 @@ const Ticket = struct {
     group: ?grouped.Group = null,
     control: Control,
     input_tokens: usize,
+    geometry_key: u64,
 };
 
 /// Options/timing compatibility and generation identity are part of admission.
@@ -128,7 +126,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
     var general = false;
     for (groups) |group| {
         grouped.validateGroup(group, options) catch return null;
-        if ((shape(group) catch return null) == null) general = true;
+        if (group.title != null or (group.content[0] != .image and group.content[0] != .raster and group.content[0] != .audio)) general = true;
         if (group.content.len != 1 or (groups[0].content.len == 1 and @backingInt(std.meta.activeTag(group.content[0])) != @backingInt(std.meta.activeTag(groups[0].content[0])))) general = true;
     }
     if (session.backend() == .cuda) {
@@ -163,7 +161,8 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
     var largest_sequence: usize = 0;
     var largest_decoded: usize = 0;
     for (groups, 0..) |group, index| {
-        shapes[index] = if (general) (groupShape(group) catch return null) else (shape(group) catch return null) orelse return null;
+        const dimensions = if (!general and !audio_mode) group.imageInfo(0) catch return null else null;
+        shapes[index] = if (general) (groupShape(group) catch return null) else if (dimensions) |info| imageShape(group.content[0], info) catch return null else (try shape(group)).?;
         // General queue bytes include captions and raw buffers. A valid item
         // may fit the executor's encoded-media cap but exceed this queue cap.
         if (general and shapes[index].bytes > max_bytes) return null;
@@ -174,8 +173,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
         } else raster_mode = raw;
         const part = group.content[0];
         largest_input = @max(largest_input, shapes[index].bytes);
-        if (!general and !audio_mode) {
-            const info = if (raw) @import("image.zig").EncodedImageInfo{ .width = part.raster.width, .height = part.raster.height } else try @import("image.zig").inspectEncodedForInference(part.image, null);
+        if (dimensions) |info| {
             if (grouped.boundedVision(session.backend())) {
                 const geometry = try projector.embeddingGemma2ImageGeometry(info.width, info.height);
                 largest_patches = @max(largest_patches, geometry.grid_x * geometry.grid_y);
@@ -183,7 +181,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
                 if (!raw) largest_decoded = @max(largest_decoded, try std.math.mul(usize, try std.math.mul(usize, info.width, info.height), 3));
             } else largest_scratch = @max(largest_scratch, try projector.embeddingGemma2ImageScratch(info.width, info.height, 2 * 1024 * 1024 * 1024));
         }
-        payloads[index] = .{ .session = session, .tokenizer = tokenizer, .gate = gate, .options = effective_options, .part = part, .group = if (general) group else null, .control = control, .input_tokens = shapes[index].tokens };
+        payloads[index] = .{ .session = session, .tokenizer = tokenizer, .gate = gate, .options = effective_options, .part = part, .group = if (general) group else null, .control = control, .input_tokens = shapes[index].tokens, .geometry_key = shapes[index].geometry_key };
         identities[index] = if (raw) .{ .item_id = part.raster.item_id, .source_fingerprint = part.raster.source_fingerprint, .page_number = part.raster.page_number } else .{};
     }
     // Plan against immutable policy limits without reserving GPU scratch.
@@ -262,8 +260,7 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
     if (items.len == 0 or items.len > 4) return error.InvalidImageBatch;
     const first = items[0].payloadAs(Ticket);
     if (first.group == null and first.part != .audio and @import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_IMAGE_BROKER_TRACE")) {
-        const geometry = (try shape(.{ .content = &.{first.part} })).?.geometry_key;
-        std.debug.print("gemma4-image-cohort items={d} geometry={d}\n", .{ items.len, geometry });
+        std.debug.print("gemma4-image-cohort items={d} geometry={d}\n", .{ items.len, first.geometry_key });
     }
     var cohort = micro.ExecutionControl{ .items = items };
     var control = first.control;
@@ -460,8 +457,8 @@ test "embeddinggemma2 prepared broker accounts mixed and video groups before dec
     const parts = [_]grouped.Part{ .{ .video = "coded bytes" }, .{ .text = "caption" } };
     try std.testing.expectError(error.InvalidVideoReaderSelection, groupShape(.{ .content = &parts }));
     var items = [_]@import("embedding_gemma2_video.zig").PixelInspection{.{ .bytes = parts[0].video, .pixels = 320 * 240 }};
-    const videos = grouped.AdmittedVideos{ .items = &items };
-    const video = try groupShape(.{ .content = &parts, .videos = &videos });
+    const metadata = grouped.GroupMedia{ .videos = .{ .items = &items } };
+    const video = try groupShape(.{ .content = &parts, .media = &metadata });
     try std.testing.expectEqual(@as(u64, 320 * 240), video.pixels);
     try std.testing.expectEqual(@as(usize, 8192), video.tokens);
     try std.testing.expectEqual(@as(usize, 18), video.bytes);
