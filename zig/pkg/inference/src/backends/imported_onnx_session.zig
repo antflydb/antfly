@@ -168,25 +168,52 @@ pub fn inspectGraphCompatibilityWithContext(allocator: std.mem.Allocator, onnx_p
     return inspectGraphCompatibilityWithControl(allocator, onnx_path, external_base_dir, logical_path, .{});
 }
 
+pub const CompatibilityImportContext = struct {
+    external_base_dir: []const u8,
+    specialize_audio: bool,
+    specialize_text: bool,
+
+    pub fn init(onnx_path: []const u8, external_base_dir: ?[]const u8, logical_path: ?[]const u8) CompatibilityImportContext {
+        const import_path = logical_path orelse onnx_path;
+        return .{
+            .external_base_dir = external_base_dir orelse std.fs.path.dirname(onnx_path) orelse ".",
+            .specialize_audio = shouldSpecializeClipclapAudioInputTime(import_path),
+            .specialize_text = shouldSpecializeClipclapTextInputShape(import_path),
+        };
+    }
+
+    pub fn forCatalog(onnx_path: []const u8, logical_path: ?[]const u8) CompatibilityImportContext {
+        const external_base = if (logical_path) |path| std.fs.path.dirname(path) else null;
+        return init(onnx_path, external_base, logical_path);
+    }
+
+    pub fn eql(self: CompatibilityImportContext, other: CompatibilityImportContext) bool {
+        return self.specialize_audio == other.specialize_audio and
+            self.specialize_text == other.specialize_text and
+            std.mem.eql(u8, self.external_base_dir, other.external_base_dir);
+    }
+};
+
 pub fn inspectGraphCompatibilityWithControl(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8, logical_path: ?[]const u8, control: InferenceExecutionControl) !void {
     try control.check();
     var mapped = try c_file.MmapRegion.init(allocator, onnx_path);
     defer mapped.deinit();
+    mapped.preserveFileCacheOnDeinit();
     if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
     mapped.adviseSequentialPrefix(@min(mapped.data.len, 16 * 1024 * 1024));
 
-    const model_dir = external_base_dir orelse std.fs.path.dirname(onnx_path) orelse ".";
-    var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, mapped.data, model_dir);
+    const import_context = CompatibilityImportContext.init(onnx_path, external_base_dir, logical_path);
+    var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, mapped.data, import_context.external_base_dir);
     defer model.deinit();
 
     var clipclap_dim_overrides: onnx_graph.DimOverrides = .empty;
     defer clipclap_dim_overrides.deinit(allocator);
     var use_clipclap_dim_overrides = false;
-    if (shouldSpecializeClipclapAudioInputTime(logical_path orelse onnx_path)) {
+    if (import_context.specialize_audio) {
         try clipclap_dim_overrides.put(allocator, "time", clipclap_audio_input_frames);
         use_clipclap_dim_overrides = true;
     }
-    if (shouldSpecializeClipclapTextInputShape(logical_path orelse onnx_path)) {
+    if (import_context.specialize_text) {
         try clipclap_dim_overrides.put(allocator, "batch_size", clipclap_text_batch);
         try clipclap_dim_overrides.put(allocator, "sequence_length", clipclap_text_sequence_length);
         use_clipclap_dim_overrides = true;
@@ -233,6 +260,7 @@ pub const OnnxArtifactSet = struct {
 pub fn inspectSignature(arena: std.mem.Allocator, onnx_path: []const u8) !struct { inputs: []TensorInfo, outputs: []TensorInfo } {
     var mapped = try c_file.MmapRegion.init(arena, onnx_path);
     defer mapped.deinit();
+    mapped.preserveFileCacheOnDeinit();
     if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
     var model = try onnx_graph.parseLazyAsModelWithBaseDir(arena, mapped.data, std.fs.path.dirname(onnx_path) orelse ".");
     defer model.deinit();
@@ -281,6 +309,7 @@ pub fn inspectArtifactSetWithControl(allocator: std.mem.Allocator, onnx_path: []
     else
         try c_file.MmapRegion.init(allocator, onnx_path);
     defer mapped.deinit();
+    mapped.preserveFileCacheOnDeinit();
     if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
     mapped.adviseSequentialPrefix(@min(mapped.data.len, 16 * 1024 * 1024));
 
@@ -325,21 +354,10 @@ pub fn inspectArtifactSetWithControl(allocator: std.mem.Allocator, onnx_path: []
             allocator.free(full_path);
             return err;
         };
-        const offset: u64 = @intCast(external.offset);
-        if (offset > file_size) {
+        external.validateRange(file_size) catch |err| {
             allocator.free(full_path);
-            return error.ExternalRegionOutOfBounds;
-        }
-        if (external.length >= 0) {
-            const end = std.math.add(u64, offset, @as(u64, @intCast(external.length))) catch {
-                allocator.free(full_path);
-                return error.ExternalRegionOutOfBounds;
-            };
-            if (end > file_size) {
-                allocator.free(full_path);
-                return error.ExternalRegionOutOfBounds;
-            }
-        }
+            return err;
+        };
 
         if (duplicate) {
             allocator.free(full_path);

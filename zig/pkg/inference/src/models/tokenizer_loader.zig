@@ -870,6 +870,63 @@ test "tokenizer source compatibility uses resolved architecture and rejects non-
 
 /// Construction follows model metadata; serving admits the selected parse peak
 /// before calling this owner and adopts the result with its retained lease.
+const gemma_identity = @import("embedding_gemma2_identity.zig");
+
+pub fn usesDurableGemmaTokenizer(man: manifest_mod.ModelManifest, artifacts: *const PublishedArtifacts) bool {
+    return man.embedding_style == .embedding_gemma2 and
+        if (artifacts.receipt) |*receipt| receipt.hasCompleteChecksums() else false;
+}
+
+test "model selection legacy checksum aliases use the same managed Gemma tokenizer" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const receipt_mod = @import("../registry/managed_receipt.zig");
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{}" });
+    try temp.dir.writeFile(io, .{ .sub_path = "tokenizer.model", .data = "unused" });
+    try temp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "weights" });
+    try temp.dir.symLink(io, "tokenizer.json", "historical-tokenizer.json", .{});
+    try temp.dir.writeFile(io, .{ .sub_path = receipt_mod.complete_filename, .data =
+        \\{"version":1,"artifacts":[
+        \\{"path":"model.safetensors","size":7,"sha256":"1111111111111111111111111111111111111111111111111111111111111111"},
+        \\{"path":"tokenizer.model","size":6,"sha256":"2222222222222222222222222222222222222222222222222222222222222222"},
+        \\{"path":"historical-tokenizer.json","size":2},
+        \\{"path":"tokenizer.json","size":2,"sha256":"3333333333333333333333333333333333333333333333333333333333333333"}]}
+    });
+    const root = try temp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var artifacts = try PublishedArtifacts.init(a, io, root, null);
+    defer artifacts.deinit();
+    try std.testing.expect(!artifacts.receipt.?.all_checksums_declared);
+    try std.testing.expect(artifacts.receipt.?.hasCompleteChecksums());
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .embedding_style = .embedding_gemma2, .tokenizer_type = .huggingface };
+    try std.testing.expect(usesDurableGemmaTokenizer(manifest, &artifacts));
+    for ([_]bool{ false, true }) |compat| {
+        try std.testing.expectEqual(manifest_mod.TokenizerType.huggingface, try tokenizerKindWithArtifacts(manifest, &artifacts, compat));
+    }
+}
+
+pub fn readGemmaSidecar(artifacts: *const PublishedArtifacts, sidecar: gemma_identity.CheckedSidecar) ![]u8 {
+    const member: []const u8 = switch (sidecar) {
+        .tokenizer => "tokenizer.json",
+        .processor => "processor_config.json",
+    };
+    return artifacts.read(member, gemma_identity.max_sidecar_bytes) catch |err| switch (err) {
+        error.FileTooLarge => return sidecar.invalidError(),
+        else => return err,
+    };
+}
+
+pub fn loadDurableGemmaTokenizer(a: std.mem.Allocator, artifacts: *const PublishedArtifacts) !*hf_tokenizer.HfTokenizer {
+    const bytes = try readGemmaSidecar(artifacts, .tokenizer);
+    defer artifacts.allocator.free(bytes);
+    return hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(a, bytes, .{ .validate_root = gemma_identity.validateTokenizerRoot }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEmbeddingGemma2Tokenizer,
+    };
+}
+
 pub const Options = struct {
     artifacts: ?*PublishedArtifacts = null,
     cache: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
@@ -899,7 +956,9 @@ pub fn loadSelected(allocator: std.mem.Allocator, model_dir: []const u8, manifes
     errdefer result.deinit(allocator);
     switch (kind) {
         .huggingface => {
-            result.hf = if (man.gliner_architecture == .boundary) blk: {
+            result.hf = if (options.artifacts != null and usesDurableGemmaTokenizer(man, options.artifacts.?))
+                try loadDurableGemmaTokenizer(allocator, options.artifacts.?)
+            else if (man.gliner_architecture == .boundary) blk: {
                 const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
                 const bytes = if (options.artifacts) |artifacts| try artifacts.readPath(path, 32 * 1024 * 1024) else try c_file.readFileMax(allocator, path, 32 * 1024 * 1024);
                 defer allocator.free(bytes);
@@ -1006,6 +1065,7 @@ pub fn tokenizerGemmaCompat(man: manifest_mod.ModelManifest, model_dir: []const 
 }
 
 pub fn tokenizerKindWithArtifacts(man: manifest_mod.ModelManifest, artifacts: *const PublishedArtifacts, gemma_compat: bool) !manifest_mod.TokenizerType {
+    if (usesDurableGemmaTokenizer(man, artifacts)) return .huggingface;
     if (gemma_compat) {
         if (try artifacts.resolve("tokenizer.model")) |path| {
             artifacts.allocator.free(path);

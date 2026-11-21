@@ -3586,6 +3586,30 @@ pub fn encodeQueryRequestWithGraphWireMode(
         try appendEmbeddingsField(alloc, &out, &first, dense_queries, sparse_queries);
         try appendEmbeddingLimits(alloc, &out, &first, dense_queries, sparse_queries, req.limit);
     }
+    const knn_revision = if (req.query == .dense_knn) req.query.dense_knn.model_revision_fence else null;
+    var revision_count: usize = 0;
+    if (knn_revision) |revision| {
+        if (dense_queries.len != 0) return error.UnsupportedQueryRequest;
+        const name = req.index_name orelse return error.UnsupportedQueryRequest;
+        try appendJsonFieldName(alloc, &out, &first, "_embedding_model_revisions");
+        try out.append(alloc, '{');
+        try appendJsonString(alloc, &out, name);
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, &std.fmt.bytesToHex(revision, .lower));
+        revision_count = 1;
+    }
+    for (dense_queries) |dense| {
+        const revision = dense.query.model_revision_fence orelse continue;
+        if (revision_count == 0) {
+            try appendJsonFieldName(alloc, &out, &first, "_embedding_model_revisions");
+            try out.append(alloc, '{');
+        } else try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, dense.index_name);
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, &std.fmt.bytesToHex(revision, .lower));
+        revision_count += 1;
+    }
+    if (revision_count != 0) try out.append(alloc, '}');
     if (req.hierarchy_children != null) {
         // Child traversal is an ordered hierarchy scan rather than a relevance
         // query. Keeping the query clause out of the internal wire request also

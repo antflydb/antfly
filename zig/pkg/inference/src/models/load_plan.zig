@@ -141,6 +141,13 @@ pub fn tokenizerLoadAdmissionPlanWithArtifacts(
     var sentencepiece_sidecar_bytes: usize = 0;
     // Admission and loading must inspect the same catalog-selected artifacts,
     // including export-local vocabularies and root metadata fallbacks.
+    if (artifacts) |source| if (@import("tokenizer_loader.zig").usesDurableGemmaTokenizer(man.*, source)) {
+        const receipt = &source.receipt.?;
+        const tokenizer = receipt.find("tokenizer.json") orelse return error.InvalidEmbeddingGemma2Tokenizer;
+        const processor = receipt.find("processor_config.json") orelse return error.InvalidEmbeddingGemma2Processor;
+        const encoded = std.math.cast(usize, @max(tokenizer.size, processor.size)) orelse return error.ResourceLimitExceeded;
+        return tokenizerAdmissionPlan(encoded, .huggingface);
+    };
     if (tokenizer_type == .huggingface) {
         if (man.tokenizer_json_path) |path| return tokenizerFileAdmissionPlan(allocator, path, .huggingface);
         if (man.vocab_txt_path) |path| {

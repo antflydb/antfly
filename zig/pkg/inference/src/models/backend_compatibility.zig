@@ -38,6 +38,14 @@ pub fn nativeBackendsAvailable() bool {
     return build_options.enable_native or build_options.enable_metal or build_options.enable_cuda;
 }
 
+pub fn embeddingBackendUsesOnnxPrimary(manifest: manifest_mod.ModelManifest, backend: backends.BackendType) bool {
+    return artifactCandidateForBackend(manifest, backend) == .onnx;
+}
+
+pub fn embeddingBackendUsesJinaAdapter(manifest: manifest_mod.ModelManifest, backend: backends.BackendType) bool {
+    return session_factory.usesJinaRetrievalAdapter(manifest, backend);
+}
+
 pub fn manifestHasNativeAssets(man: manifest_mod.ModelManifest) bool {
     return man.nativeWeightArtifactKind() != null;
 }
@@ -471,7 +479,18 @@ pub fn compatibilitySummaryForBackend(
     return compatibilitySummaryForBackendWithControl(allocator, model_dir, man, backend, .{});
 }
 
-fn compatibilitySummaryForBackendWithControl(allocator: std.mem.Allocator, model_dir: []const u8, man: *const manifest_mod.ModelManifest, backend: backends.BackendType, control: InferenceExecutionControl) !?CompatibilitySummary {
+pub const CompatibilityOnnxSlot = enum { primary, visual, audio, text_projection, visual_projection, audio_projection };
+
+pub const OnnxCompatibilityCheck = struct {
+    context: *anyopaque,
+    check: *const fn (*anyopaque, CompatibilityOnnxSlot, []const u8, ?[]const u8, InferenceExecutionControl) anyerror!?CompatibilitySummary,
+};
+
+pub fn compatibilitySummaryForBackendWithControl(allocator: std.mem.Allocator, model_dir: []const u8, man: *const manifest_mod.ModelManifest, backend: backends.BackendType, control: InferenceExecutionControl) !?CompatibilitySummary {
+    return compatibilitySummaryForBackendWithOnnxCheck(allocator, model_dir, man, backend, control, null);
+}
+
+pub fn compatibilitySummaryForBackendWithOnnxCheck(allocator: std.mem.Allocator, model_dir: []const u8, man: *const manifest_mod.ModelManifest, backend: backends.BackendType, control: InferenceExecutionControl, onnx_check: ?OnnxCompatibilityCheck) !?CompatibilitySummary {
     try control.check();
     const candidate = artifactCandidateForBackend(man.*, backend) orelse return null;
 
@@ -519,7 +538,7 @@ fn compatibilitySummaryForBackendWithControl(allocator: std.mem.Allocator, model
     };
     try control.check();
     if (candidate == .gguf) {
-        var maybe_report = host_weights.inspectGgufModelForListing(
+        var maybe_report = session_factory.inspectGgufModelForListing(
             allocator,
             model_dir,
             candidate_manifest,
@@ -551,7 +570,7 @@ fn compatibilitySummaryForBackendWithControl(allocator: std.mem.Allocator, model
                     .message = "GGUF is missing required normalized tensors",
                 };
             }
-            if (!ggufInspectionSupportsBackend(report.*, backend)) {
+            if (!session_factory.ggufInspectionSupportsBackend(report.*, backend)) {
                 return .{
                     .level = .incompatible,
                     .code = .unsupported_tensor_type,
@@ -606,39 +625,52 @@ fn compatibilitySummaryForBackendWithControl(allocator: std.mem.Allocator, model
         const primary = path_index == 0;
         if (!primary and !std.mem.endsWith(u8, path, ".onnx")) continue;
         const logical_path = if (primary) man.onnx_logical_path else null;
-        const base = if (logical_path) |logical| std.fs.path.dirname(logical) else null;
+        const imported_onnx = backends.imported_onnx_session;
+        const import_context = imported_onnx.CompatibilityImportContext.forCatalog(path, logical_path);
         var duplicate = false;
-        for (onnx_paths[first_onnx_path..path_index]) |previous| {
-            if (previous) |existing| {
-                if (std.mem.eql(u8, existing, path)) {
-                    duplicate = true;
-                    break;
-                }
+        for (onnx_paths[first_onnx_path..path_index], first_onnx_path..) |previous, previous_index| {
+            const existing = previous orelse continue;
+            if (!std.mem.eql(u8, existing, path)) continue;
+            const previous_logical = if (previous_index == 0) man.onnx_logical_path else null;
+            const previous_context = imported_onnx.CompatibilityImportContext.forCatalog(existing, previous_logical);
+            if (import_context.eql(previous_context)) {
+                duplicate = true;
+                break;
             }
         }
         if (duplicate) continue;
 
-        var artifacts = backends.imported_onnx_session.inspectArtifactSetWithControl(allocator, path, base, null, control) catch |err| {
-            if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
-            return .{
-                .level = .incompatible,
-                .code = .invalid_graph,
-                .message = "ONNX graph or external tensor data is invalid or unreadable",
-            };
-        };
-        artifacts.deinit();
-
-        backends.imported_onnx_session.inspectGraphCompatibilityWithControl(allocator, path, base, logical_path, control) catch |err| {
-            if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
-            return .{
-                .level = .incompatible,
-                .code = .invalid_graph,
-                .message = "ONNX graph cannot be converted and validated by the selected backend",
-            };
-        };
+        const invalid = if (onnx_check) |check|
+            try check.check(check.context, @fromBackingInt(@intCast(path_index)), path, logical_path, control)
+        else
+            try inspectOnnxCompatibility(allocator, path, logical_path, control);
+        if (invalid) |summary| return summary;
     }
     try control.check();
     return summaryFromAssessment(assessment);
+}
+
+pub fn inspectOnnxCompatibility(allocator: std.mem.Allocator, path: []const u8, logical_path: ?[]const u8, control: InferenceExecutionControl) !?CompatibilitySummary {
+    const base = backends.imported_onnx_session.CompatibilityImportContext.forCatalog(path, logical_path).external_base_dir;
+    var artifacts = backends.imported_onnx_session.inspectArtifactSetWithControl(allocator, path, base, null, control) catch |err| {
+        if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
+        return .{
+            .level = .incompatible,
+            .code = .invalid_graph,
+            .message = "ONNX graph or external tensor data is invalid or unreadable",
+        };
+    };
+    artifacts.deinit();
+
+    backends.imported_onnx_session.inspectGraphCompatibilityWithControl(allocator, path, base, logical_path, control) catch |err| {
+        if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
+        return .{
+            .level = .incompatible,
+            .code = .invalid_graph,
+            .message = "ONNX graph cannot be converted and validated by the selected backend",
+        };
+    };
+    return null;
 }
 
 pub fn qwen3EmbeddingSupportsBackend(backend: backends.BackendType) bool {

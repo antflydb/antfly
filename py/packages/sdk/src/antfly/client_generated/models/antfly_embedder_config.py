@@ -38,6 +38,9 @@ class AntflyEmbedderConfig:
         Attributes:
             provider (AntflyEmbedderConfigProvider):
             model (str): The embedding model name (maps to models/embedders/{name}/ directory). Example: bge-base-en-v1.5.
+            model_revision (str | Unset): Physical hosted embedding model revision advertised by scoped inference discovery.
+                Supported for managed dense embeddings with distributed ordered vector publication. To change revisions, build a
+                new index and finish backfill before switching the serving alias.
             model_identity (str | Unset): Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this
                 when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication.
             api_url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
@@ -51,6 +54,7 @@ class AntflyEmbedderConfig:
 
     provider: AntflyEmbedderConfigProvider
     model: str
+    model_revision: str | Unset = UNSET
     model_identity: str | Unset = UNSET
     api_url: str | Unset = UNSET
     retrieval: EmbeddingRetrievalConfig | Unset = UNSET
@@ -60,6 +64,8 @@ class AntflyEmbedderConfig:
         provider = self.provider.value
 
         model = self.model
+
+        model_revision = self.model_revision
 
         model_identity = self.model_identity
 
@@ -77,6 +83,8 @@ class AntflyEmbedderConfig:
                 "model": model,
             }
         )
+        if model_revision is not UNSET:
+            field_dict["model_revision"] = model_revision
         if model_identity is not UNSET:
             field_dict["model_identity"] = model_identity
         if api_url is not UNSET:
@@ -95,6 +103,8 @@ class AntflyEmbedderConfig:
 
         model = d.pop("model")
 
+        model_revision = d.pop("model_revision", UNSET)
+
         model_identity = d.pop("model_identity", UNSET)
 
         api_url = d.pop("api_url", UNSET)
@@ -109,6 +119,7 @@ class AntflyEmbedderConfig:
         antfly_embedder_config = cls(
             provider=provider,
             model=model,
+            model_revision=model_revision,
             model_identity=model_identity,
             api_url=api_url,
             retrieval=retrieval,

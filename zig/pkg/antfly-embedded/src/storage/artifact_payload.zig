@@ -151,6 +151,7 @@ pub const Metadata = struct {
     header: codec.Header,
     dense_dimensions: ?u32,
     reference: ?Reference,
+    model_revision: ?[32]u8 = null,
 
     pub fn decode(value: []const u8) !Metadata {
         if (isReference(value)) {
@@ -171,6 +172,7 @@ pub const Metadata = struct {
             else
                 try codec.decodeDenseEmbeddingDims(value),
             .reference = null,
+            .model_revision = if (header.kind == .dense_embedding and header.version != codec.codec_version) try codec.denseEmbeddingModelRevision(value) else null,
         };
     }
 
@@ -400,9 +402,9 @@ pub const Session = struct {
         self.reference_mutated = true;
         if (isReference(value)) return error.PhysicalVectorReferenceNotWritable;
         const header = codec.decodeHeader(value) catch return value;
-        // Elided stubs (transient LEANN vectors) hold no vector: keep them
-        // inline instead of preparing a payload.
-        if (header.kind != .dense_embedding or header.flags.vector_elided) return value;
+        // Only v1 dense vectors fit the compact reference. Revision-bound
+        // vectors keep their trailer inline, as do elided stubs.
+        if (header.kind != .dense_embedding or header.version != codec.codec_version or header.flags.vector_elided) return value;
         const reference = try Reference.forArtifact(key, value);
         const alloc = self.arena.allocator();
         const borrowed: Prepared = .{ .reference = reference, .artifact = &.{} };

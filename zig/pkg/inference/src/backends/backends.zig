@@ -682,13 +682,16 @@ pub const SessionManager = struct {
             return preferred;
         if (!self.uninterruptibleBackendsAllowed()) return backendOrderWithCudaAvailability(scratch, preferred, false);
         if (comptime !build_options.enable_cuda) return backendOrderWithCudaAvailability(scratch, preferred, false);
-        const known = cuda_probe.load(.acquire);
-        if (known != .unknown) return backendOrderWithCudaAvailability(scratch, preferred, known == .present);
-        var guard: execution_control.UninterruptibleGuard = if (control) |active| try active.enterUninterruptible(.uninterruptible) else .{};
-        defer guard.deinit();
-        const cuda_available = cudaDeviceAvailable();
-        if (control) |active| try active.check();
-        return backendOrderWithCudaAvailability(scratch, preferred, cuda_available);
+        return backendOrderWithCudaAvailability(scratch, preferred, try probeCudaDeviceWithControl(control));
+    }
+
+    /// Discovery uses known CUDA availability without starting a driver probe.
+    pub fn declaredExecutionBackendOrder(self: *const SessionManager, scratch: *BackendOrderBuffer, preferred: []const BackendType) []const BackendType {
+        if (self.required_backend != null or preferred.len <= 1 or
+            std.mem.indexOfScalar(BackendType, preferred, .cuda) == null)
+            return preferred;
+        const available = self.uninterruptibleBackendsAllowed() and build_options.enable_cuda and knownCudaDeviceAvailability() != false;
+        return backendOrderWithCudaAvailability(scratch, preferred, available);
     }
 
     pub fn bestAvailable(self: *const SessionManager) ?BackendType {
@@ -750,32 +753,96 @@ fn backendOrderWithCudaAvailability(scratch: *[backend_order_capacity]BackendTyp
     return scratch[0..count];
 }
 
-const CudaProbe = enum(u8) { unknown, absent, present };
-var cuda_probe = std.atomic.Value(CudaProbe).init(.unknown);
+const cuda_probe_time = @import("antfly_platform").time;
+pub const CudaDeviceState = enum { available, unavailable, retryable };
+
+const CudaDeviceEvidence = struct {
+    // A single atomic publishes the classification and deadline together.
+    // Zero is unobserved and maxInt records successful initialization.
+    const present = std.math.maxInt(u64);
+    const retryable_bit = @as(u64, 1) << 63;
+    const deadline_mask = retryable_bit - 1;
+    until: std.atomic.Value(u64) = .init(0),
+
+    fn known(self: *const CudaDeviceEvidence, now: ?u64) ?CudaDeviceState {
+        const encoded = self.until.load(.acquire);
+        if (encoded == present) return .available;
+        const deadline = encoded & deadline_mask;
+        if (deadline == 0 or (now orelse cuda_probe_time.monotonicNs()) >= deadline) return null;
+        return if (encoded & retryable_bit != 0) .retryable else .unavailable;
+    }
+
+    fn remember(self: *CudaDeviceEvidence, now: u64, failure: ?anyerror) CudaDeviceState {
+        const state: CudaDeviceState = if (failure) |err| switch (err) {
+            error.CudaUnavailable, error.NoCudaDevices, error.CudaSymbolMissing, error.CudaDriverTooOld, error.CudaArtifactUnsupportedDevice => .unavailable,
+            else => .retryable,
+        } else .available;
+        const encoded = switch (state) {
+            .available => present,
+            .unavailable => @min(now +| (60 * std.time.ns_per_s), deadline_mask - 1),
+            .retryable => @min(now +| std.time.ns_per_s, deadline_mask - 1) | retryable_bit,
+        };
+        self.until.store(encoded, .release);
+        return state;
+    }
+};
+
+var cuda_device_evidence: CudaDeviceEvidence = .{};
 var cuda_probe_mutex: std.atomic.Mutex = .unlocked;
 
-fn probeCudaDevice() bool {
-    const context = @import("../ops/cuda/context.zig");
-    _ = context.probeDefault() catch |err| {
-        std.log.info("CUDA is not in the automatic backend order: {s}", .{@errorName(err)});
-        return false;
-    };
-    return true;
+/// Only execution hosts that allow uninterruptible native calls may probe.
+pub fn cudaDeviceAvailable() bool {
+    return probeCudaDeviceWithControl(null) catch false;
 }
 
-/// Initializes a device once per process, not on every backend selection.
-/// Only execution hosts that allow uninterruptible native calls may invoke this.
-pub fn cudaDeviceAvailable() bool {
-    if (comptime !build_options.enable_cuda) return false;
-    const known = cuda_probe.load(.acquire);
-    if (known != .unknown) return known == .present;
-    while (!cuda_probe_mutex.tryLock()) std.atomic.spinLoopHint();
+/// Read cached device evidence without initializing a driver on discovery.
+pub fn knownCudaDeviceAvailability() ?bool {
+    return if (knownCudaDeviceState()) |state| state == .available else null;
+}
+
+pub fn knownCudaDeviceState() ?CudaDeviceState {
+    return cuda_device_evidence.known(null);
+}
+
+pub fn probeCudaDeviceWithControl(control: ?execution_control.InferenceExecutionControl) !bool {
+    return (try probeCudaDeviceStateWithControl(control)) == .available;
+}
+
+pub fn probeCudaDeviceStateWithControl(control: ?execution_control.InferenceExecutionControl) !CudaDeviceState {
+    if (comptime !build_options.enable_cuda) return .unavailable;
+    if (knownCudaDeviceState()) |state| return state;
+    while (!cuda_probe_mutex.tryLock()) {
+        if (control) |active| try active.check();
+        if (knownCudaDeviceState()) |state| return state;
+        cuda_probe_time.sleepNs(std.time.ns_per_ms);
+    }
     defer cuda_probe_mutex.unlock();
-    const raced = cuda_probe.load(.acquire);
-    if (raced != .unknown) return raced == .present;
-    const present = probeCudaDevice();
-    cuda_probe.store(if (present) .present else .absent, .release);
-    return present;
+    if (knownCudaDeviceState()) |state| return state;
+    var guard: execution_control.UninterruptibleGuard = if (control) |active| guarded: {
+        try active.check();
+        break :guarded try active.enterUninterruptible(.uninterruptible);
+    } else .{};
+    defer guard.deinit();
+
+    var failure: ?anyerror = null;
+    if (@import("../ops/cuda/context.zig").probeDefault()) |_| {} else |err| {
+        failure = err;
+        std.log.info("CUDA is not in the automatic backend order: {s}", .{@errorName(err)});
+    }
+    if (control) |active| try active.check();
+    return cuda_device_evidence.remember(cuda_probe_time.monotonicNs(), failure);
+}
+
+test "model selection CUDA device evidence recovers after a transient driver failure" {
+    var evidence: CudaDeviceEvidence = .{};
+    try std.testing.expectEqual(@as(?CudaDeviceState, null), evidence.known(0));
+    try std.testing.expectEqual(.retryable, evidence.remember(0, error.CudaDriverError));
+    try std.testing.expectEqual(@as(?CudaDeviceState, .retryable), evidence.known(std.time.ns_per_s - 1));
+    try std.testing.expectEqual(@as(?CudaDeviceState, null), evidence.known(std.time.ns_per_s));
+    try std.testing.expectEqual(.unavailable, evidence.remember(std.time.ns_per_s, error.NoCudaDevices));
+    try std.testing.expectEqual(@as(?CudaDeviceState, .unavailable), evidence.known(2 * std.time.ns_per_s));
+    try std.testing.expectEqual(.available, evidence.remember(2 * std.time.ns_per_s, null));
+    try std.testing.expectEqual(@as(?CudaDeviceState, .available), evidence.known(120 * std.time.ns_per_s));
 }
 
 fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
@@ -914,10 +981,10 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
 }
 
 test "automatic backend candidates do not initialize a device" {
-    const before = cuda_probe.load(.acquire);
+    const before = cuda_device_evidence.until.load(.acquire);
     const order = automaticBackends();
     _ = SessionManager.init(std.testing.allocator);
-    try std.testing.expectEqual(before, cuda_probe.load(.acquire));
+    try std.testing.expectEqual(before, cuda_device_evidence.until.load(.acquire));
     if (build_options.enable_cuda) {
         try std.testing.expectEqual(BackendType.cuda, order[0]);
         try std.testing.expect(backendOrderSelectsCudaBeforeCpu(order));
@@ -938,9 +1005,9 @@ test "automatic execution order removes unavailable CUDA before model fallback p
     manager.required_backend = null;
     manager.required_backend_invalid = false;
     manager.process_termination_available = false;
-    const before = cuda_probe.load(.acquire);
+    const before = cuda_device_evidence.until.load(.acquire);
     try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, try manager.executionBackendOrder(&scratch, preferred, null));
-    try std.testing.expectEqual(before, cuda_probe.load(.acquire));
+    try std.testing.expectEqual(before, cuda_device_evidence.until.load(.acquire));
 }
 
 test "automatic execution order checks cancellation before probing a device" {
@@ -955,9 +1022,9 @@ test "automatic execution order checks cancellation before probing a device" {
     const preferred: []const BackendType = &.{ .cuda, .metal, .native };
     var scratch: BackendOrderBuffer = undefined;
     const control: execution_control.InferenceExecutionControl = .{ .cancellation = .{ .is_cancelled_fn = Cancelled.cancelled } };
-    const before = cuda_probe.load(.acquire);
+    const before = cuda_device_evidence.until.load(.acquire);
     try std.testing.expectError(error.Cancelled, manager.executionBackendOrder(&scratch, preferred, control));
-    try std.testing.expectEqual(before, cuda_probe.load(.acquire));
+    try std.testing.expectEqual(before, cuda_device_evidence.until.load(.acquire));
 }
 
 test "auto backend order prefers Metal then native without compiled CUDA" {

@@ -47,7 +47,9 @@ class TinyLlamaReference:
     def __init__(self, directory):
         raw = (directory / "model.safetensors").read_bytes()
         if hashlib.sha256(raw).hexdigest() != WEIGHT_SHA256:
-            raise ValueError("expected pinned IlyasMoutawwakil/tiny-random-llama weights")
+            raise ValueError(
+                "expected pinned IlyasMoutawwakil/tiny-random-llama weights"
+            )
         header_size = struct.unpack_from("<Q", raw)[0]
         header = json.loads(raw[8 : 8 + header_size])
         self.weights = {}
@@ -80,8 +82,7 @@ class TinyLlamaReference:
         if cols != len(x):
             raise ValueError(f"invalid linear input for {name}")
         return [
-            sum(x[k] * weights[j * cols + k] for k in range(cols))
-            for j in range(rows)
+            sum(x[k] * weights[j * cols + k] for k in range(cols)) for j in range(rows)
         ]
 
     def norm(self, x, name):
@@ -151,8 +152,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--output", action="append", required=True, type=Path)
-    parser.add_argument("--prefill-output", action="append", default=[], type=Path, help="Chunked-prefill final-prompt logits, checked against the same independent reference")
-    parser.add_argument("--reference-output", type=Path, help="Write the independently computed full-logit F32 reference")
+    parser.add_argument(
+        "--prefill-output",
+        action="append",
+        default=[],
+        type=Path,
+        help="Chunked-prefill final-prompt logits, checked against the same independent reference",
+    )
+    parser.add_argument(
+        "--reference-output",
+        type=Path,
+        help="Write the independently computed full-logit F32 reference",
+    )
     parser.add_argument("--prompt-length", type=int, default=8)
     parser.add_argument("--decode-steps", type=int, default=4)
     parser.add_argument("--tolerance", type=float, required=True)
@@ -175,18 +186,30 @@ def main():
     outputs += [(path, 1) for path in options.prefill_output]
     for path, steps in outputs:
         values = float32_values(path.read_bytes())
-        if len(values) != model.vocab * steps or not all(math.isfinite(v) for v in values):
+        if len(values) != model.vocab * steps or not all(
+            math.isfinite(v) for v in values
+        ):
             raise ValueError(f"invalid output length or nonfinite logits: {path}")
         for step in range(steps):
             start, end = step * model.vocab, (step + 1) * model.vocab
-            deltas = [abs(a - b) for a, b in zip(values[start:end], reference[start:end])]
+            deltas = [
+                abs(a - b) for a, b in zip(values[start:end], reference[start:end])
+            ]
             maximum = max(deltas)
             passed = passed and maximum <= options.tolerance
-            print(json.dumps({
-                "output": str(path), "step": step, "max_abs": maximum,
-                "rms": math.sqrt(sum(d * d for d in deltas) / len(deltas)),
-                "tolerance": options.tolerance, "passed": maximum <= options.tolerance,
-            }, sort_keys=True))
+            print(
+                json.dumps(
+                    {
+                        "output": str(path),
+                        "step": step,
+                        "max_abs": maximum,
+                        "rms": math.sqrt(sum(d * d for d in deltas) / len(deltas)),
+                        "tolerance": options.tolerance,
+                        "passed": maximum <= options.tolerance,
+                    },
+                    sort_keys=True,
+                )
+            )
     return 0 if passed else 1
 
 

@@ -32,7 +32,7 @@ pub const Host = struct {
             fn reserve(_: *anyopaque, _: runtime.tier.memory.BackendClass, _: runtime.tier.memory.Limits, _: runtime.tier.memory.AdmissionAmounts) !runtime.tier.memory.AdmissionLease {
                 return error.ResourceTemporarilyUnavailable;
             }
-            fn unhealthy(_: *anyopaque, _: []const u8, _: backends.BackendType) bool {
+            fn unhealthy(_: *anyopaque, _: []const u8, _: ?managed_receipt.Installation, _: backends.BackendType) bool {
                 return false;
             }
             fn limits(_: *anyopaque, _: session_loader.ModelSource, _: backends.BackendRuntime, fallback: runtime.tier.memory.Limits) !runtime.tier.memory.Limits {
@@ -315,21 +315,29 @@ pub fn bindOptionalSessionProfile(
 pub const ArtifactDigestCache = struct {
     const Entry = struct { signature: [32]u8, digest: [32]u8 };
     pub var mutex: std.atomic.Mutex = .unlocked;
+    pub var builders: [16]std.Io.Mutex = @splat(.init);
     pub var entries: [256]?Entry = @splat(null);
     pub var next: usize = 0;
     pub var forbid_hashing_for_test: bool = false;
 
+    fn lookup(signature: [32]u8) ?[32]u8 {
+        spinLock(&mutex);
+        defer mutex.unlock();
+        for (entries) |item| if (item) |entry| {
+            if (std.mem.eql(u8, &entry.signature, &signature)) return entry.digest;
+        };
+        return null;
+    }
+
     pub fn digestWithControl(io: std.Io, artifact: managed_receipt.ValidatedArtifact, control: InferenceExecutionControl) ![32]u8 {
         try control.check();
         const signature = try componentDependencySignature(io, &.{artifact.canonical_path});
-        spinLock(&mutex);
-        for (entries) |item| if (item) |entry| {
-            if (std.mem.eql(u8, &entry.signature, &signature)) {
-                mutex.unlock();
-                return entry.digest;
-            }
-        };
-        mutex.unlock();
+        if (lookup(signature)) |digest| return digest;
+        const builder = &builders[signature[0] % builders.len];
+        try managed_receipt.lockVerification(control, builder, io);
+        defer builder.unlock(io);
+        if (!std.mem.eql(u8, &signature, &try componentDependencySignature(io, &.{artifact.canonical_path}))) return error.ModelArtifactsChanging;
+        if (lookup(signature)) |digest| return digest;
         const memo_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.antfly-sha256-cache", .{artifact.canonical_path});
         defer std.heap.page_allocator.free(memo_path);
         const memo_bytes = std.Io.Dir.cwd().readFileAlloc(io, memo_path, std.heap.page_allocator, .limited(1024)) catch null;
@@ -610,7 +618,7 @@ pub const Runtime = struct {
         } else null;
         // Hash only after tokenizer/session admission owns the loaded assets.
         const embedding_snapshot: ?eg2_identity.Snapshot = if (embedding_signature) |before| blk: {
-            const snapshot = try eg2_identity.snapshotCached(allocator, assets.preparation_io orelse std.Options.debug_io, model_dir, man.safetensors_path.?, control orelse .{});
+            const snapshot = assets.verified_embedding_snapshot orelse try eg2_identity.snapshotCached(allocator, assets.preparation_io orelse std.Options.debug_io, model_dir, man.safetensors_path.?, control orelse .{});
             if (!std.mem.eql(u8, &before, &snapshot.signature)) return error.ModelArtifactsChanging;
             break :blk snapshot;
         } else null;
@@ -622,7 +630,9 @@ pub const Runtime = struct {
         errdefer if (model_storage_owned) allocator.destroy(model);
         const chunk_planning = try chunkPlanningSnapshotWithControl(allocator, assets.preparation_io orelse std.Options.debug_io, man, resolution_revision, control orelse .{});
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(allocator, assets.preparation_io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
-        if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevisionWithControl(allocator, assets.preparation_io orelse std.Options.debug_io, man, control orelse .{}))) return error.ModelArtifactsChanging;
+        if (resolution_file_revision) |expected| {
+            if (!std.mem.eql(u8, &expected, &try resolutionModelRevisionWithControl(allocator, assets.preparation_io orelse std.Options.debug_io, man, control orelse .{}))) return error.ModelArtifactsChanging;
+        }
         var resolved_session = session;
         resolved_session.model_contract = @import("../models/session_contract.zig").resolve(session.model_contract, &man, session.backend());
         model.* = .{
@@ -650,6 +660,9 @@ pub const Runtime = struct {
             .florence_reader_config = florence_reader_config,
             .chat_tmpl = chat_tmpl,
             .managed_publication = man.managed_publication,
+            .managed_installation = assets.managed_installation,
+            .selected_artifact_validation = assets.selected_artifact_validation,
+            .durable_embedding_revision = if (assets.artifact_revision) |revision| durableEmbeddingRevisionForSession(man, revision, session) else null,
             .whisper_prompt_cache = if (managed_whisper_prompt) |prompt| prompt.cache else null,
             .whisper_prompt_admission = if (managed_whisper_prompt) |prompt| prompt.admission else null,
             .chat_template_failed = chat_template_failed,
@@ -739,6 +752,9 @@ pub const Runtime = struct {
     }
 
     pending_primary: ?PrimaryConstruction = null,
+    managed_installation: ?managed_receipt.Installation = null,
+    durable_embedding_revision: ?[32]u8 = null,
+    selected_artifact_validation: bool = false,
     managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId = 0,
     residency_mode: RuntimeResidencyMode = .backend_managed,
@@ -1122,6 +1138,15 @@ pub const Runtime = struct {
         try bindOptionalSessionProfile(&session_manager, kind, profile_bundle);
         var load_host = self.host.session_loading;
         load_host.required_residency = try self.requiredSessionResidency();
+        var selected_artifacts = if (self.selected_artifact_validation)
+            try PublishedArtifacts.initForSelectedArtifacts(self.allocator, io, self.model_dir, .{ .publication = self.managed_publication }, control orelse .{})
+        else
+            null;
+        defer if (selected_artifacts) |*artifacts| artifacts.deinit();
+        if (selected_artifacts) |*artifacts| {
+            artifacts.verification_cache = self.host.session_loading.verification_cache;
+            artifacts.verification_control = control orelse .{};
+        }
         var loaded = try session_loader.loadComponent(
             self.allocator,
             load_host,
@@ -1131,7 +1156,7 @@ pub const Runtime = struct {
             &session_manager,
             control,
             .{ .path = self.model_dir, .publication = self.managed_publication },
-            null,
+            if (selected_artifacts) |*artifacts| artifacts else null,
         );
         defer loaded.deinit();
         try self.verifyOwnerPublication(control);
@@ -1712,7 +1737,7 @@ pub const Runtime = struct {
         defer self.projector_store_mutex.unlock();
         if (self.projector_store) |store| return store;
         const io = self.publicationIo(control);
-        var proof = try ComponentConstruction.init(self.allocator, io, .{ .path = self.model_dir, .publication = self.managed_publication }, control, null);
+        var proof = try ComponentConstruction.initWithValidation(self.allocator, io, .{ .path = self.model_dir, .publication = self.managed_publication }, control, null, self.selected_artifact_validation);
         defer proof.deinit();
         proof.artifacts().verification_cache = self.host.session_loading.verification_cache;
         const physical = try proof.artifacts().constructionPath(path);
@@ -1909,7 +1934,11 @@ pub const Assets = struct {
     preparation_io: ?std.Io,
     executor_io: ?std.Io,
     resolution_revision: [32]u8,
-    resolution_file_revision: [32]u8,
+    resolution_file_revision: ?[32]u8,
+    verified_embedding_snapshot: ?eg2_identity.Snapshot = null,
+    managed_installation: ?managed_receipt.Installation = null,
+    artifact_revision: ?[32]u8 = null,
+    selected_artifact_validation: bool = false,
     native_kv_asset_generation: ?[32]u8,
     tokenizer_type: manifest_mod.TokenizerType,
     gliner_span_tokenizer_digest: ?@import("gliner_decide_qualification.zig").Digest = null,
@@ -2030,6 +2059,9 @@ pub const TokenizerAdmission = struct {
     }
 };
 pub const PrimaryPreparation = struct {
+    pub const Pinned = struct { artifacts: PublishedArtifacts, manifest: manifest_mod.ModelManifest };
+    pinned: ?Pinned = null,
+    declared_receipt_revisions: ?*[64]DeclaredReceiptRevision = null,
     host: Host,
     component_sessions: *backends.SessionManager,
     executor_io: ?std.Io,
@@ -2056,18 +2088,33 @@ pub fn preparePrimary(allocator: std.mem.Allocator, model_dir: []const u8, sourc
     var session_snapshot = source_sessions.*;
     const sm = &session_snapshot;
 
+    var pinned = preparation.pinned;
+    defer if (pinned) |*owned| {
+        owned.manifest.deinit();
+        owned.artifacts.deinit();
+    };
     if (control) |active| try active.update(.loading_model, 0, 4);
 
-    const io = sm.io orelse std.Options.debug_io;
+    const io = if (control) |active| active.io orelse sm.io orelse std.Options.debug_io else sm.io orelse std.Options.debug_io;
     var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, io, model_dir);
     var publication_owned = true;
     defer if (publication_owned) publication_lease.deinit(io);
-    const managed_publication = try managed_receipt.publicationGeneration(allocator, io, model_dir);
-    // Load manifest
-    var man = try manifest_mod.loadFromDir(allocator, model_dir);
+    const managed_publication = if (pinned) |owned| owned.artifacts.publication else try managed_receipt.publicationGeneration(allocator, io, model_dir);
+    var tokenizer_artifacts = if (pinned) |owned| owned.artifacts else try PublishedArtifacts.initWithControl(allocator, io, model_dir, .{ .publication = managed_publication }, control orelse .{});
+    var artifacts_owned = true;
+    defer if (artifacts_owned) tokenizer_artifacts.deinit();
+    var man = if (pinned) |owned| owned.manifest else if (managed_publication != null and !std.mem.endsWith(u8, model_dir, ".onnx"))
+        try manifest_mod.loadFromPublishedArtifacts(allocator, model_dir, &tokenizer_artifacts, false)
+    else
+        try manifest_mod.loadFromDir(allocator, model_dir);
+    pinned = null;
     var man_owned = true;
     errdefer if (man_owned) man.deinit();
     if (!std.meta.eql(managed_publication, man.managed_publication)) return error.ModelArtifactsChanging;
+    if (control) |active| if (active.model_selection) |selected| {
+        if (!selected.matches(model_dir) or !std.meta.eql(selected.publication, managed_publication)) return error.ModelArtifactsChanging;
+    };
+    try tokenizer_artifacts.verifyPublication();
     if (control) |active| try active.update(.loading_model, 1, 4);
     var policy_backend_scratch: [7]backends.BackendType = undefined;
     if (preparation.serving_policy) |policy| {
@@ -2110,16 +2157,36 @@ pub fn preparePrimary(allocator: std.mem.Allocator, model_dir: []const u8, sourc
         defer files.deinit();
         break :native_generation native_kv_identity.fileGeneration(std.Io.Dir.cwd(), sm.io orelse std.Options.debug_io, &files.entries) catch null;
     };
-    var tokenizer_artifacts = try PublishedArtifacts.init(allocator, io, model_dir, .{ .publication = managed_publication });
-    var artifacts_owned = true;
-    defer if (artifacts_owned) tokenizer_artifacts.deinit();
     tokenizer_artifacts.verification_cache = preparation.host.session_loading.verification_cache;
-    const resolution_file_revision = try resolutionModelRevisionWithControl(allocator, sm.io orelse std.Options.debug_io, man, control orelse .{});
-    const resolution_revision = try modelIdentityWithArtifacts(allocator, io, model_dir, man, &tokenizer_artifacts, control orelse .{});
+    tokenizer_artifacts.verification_control = control orelse .{};
     const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
-        try eg2_identity.signature(allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
+        try eg2_identity.signature(allocator, io, model_dir, try embeddingGemma2Weights(man))
     else
         null;
+    const verify_selected = preparation.pinned != null and hasCompleteChecksums(&tokenizer_artifacts);
+    if (verify_selected) {
+        inline for (.{ "config_path", "model_manifest_path", "tokenizer_json_path", "vocab_txt_path", "tokenizer_config_path", "special_tokens_map_path", "preprocessor_config_path", "processor_config_path" }) |field| {
+            if (@field(man, field)) |path| try tokenizer_artifacts.verifyPath(path);
+        }
+        if (embedding_signature != null) {
+            if ((try tokenizer_artifacts.requireCatalogMember(try embeddingGemma2Weights(man))).size > eg2_identity.max_weight_bytes) return error.PinnedEmbeddingArtifactUnavailable;
+            for (eg2_identity.sidecars) |member| {
+                const path = try std.fs.path.join(allocator, &.{ model_dir, member });
+                defer allocator.free(path);
+                if ((try tokenizer_artifacts.requireCatalogMember(path)).size > eg2_identity.max_sidecar_bytes) return error.PinnedEmbeddingArtifactUnavailable;
+                try tokenizer_artifacts.verifyPath(path);
+            }
+        }
+    }
+    const resolution_file_revision = if (verify_selected) null else try resolutionModelRevisionWithControl(allocator, io, man, control orelse .{});
+    const resolution_revision = if (verify_selected) declared: {
+        const receipt = &tokenizer_artifacts.receipt.?;
+        const revision = if (preparation.declared_receipt_revisions) |cache|
+            try cache[receipt.publication_generation[0] % cache.len].get(allocator, io, receipt, control orelse .{})
+        else
+            try receiptedModelRevision(allocator, io, receipt, null, control orelse .{}, false);
+        break :declared imagePreprocessingRevision(man, revision);
+    } else try modelIdentityWithArtifacts(allocator, io, model_dir, man, &tokenizer_artifacts, control orelse .{});
 
     var qualified_profile_bundle: ?kernel_jit_profile_output.LoadedProfileBundle =
         if (sm.kernel_jit.qualified_profile_path) |path|
@@ -2170,6 +2237,11 @@ pub fn preparePrimary(allocator: std.mem.Allocator, model_dir: []const u8, sourc
     };
 
     if (control) |active| try active.check();
+    if (tokenizer_loader.usesDurableGemmaTokenizer(man, &tokenizer_artifacts)) {
+        const bytes = try tokenizer_loader.readGemmaSidecar(&tokenizer_artifacts, .processor);
+        defer allocator.free(bytes);
+        try eg2_identity.validateProcessor(allocator, bytes);
+    }
     const parsed_tokenizer = try tokenizer_loader.loadSelected(allocator, model_dir, &man, tokenizer_type, .{
         .artifacts = &tokenizer_artifacts,
         .cache = preparation.tokenizer_options.cache,
@@ -2195,7 +2267,19 @@ pub fn preparePrimary(allocator: std.mem.Allocator, model_dir: []const u8, sourc
     else
         null;
     errdefer if (managed_prompt) |*prompt| prompt.deinit();
+    const verified_embedding_snapshot = if (verify_selected and embedding_signature != null)
+        try verifiedGemmaEmbeddingSnapshot(&tokenizer_artifacts, man.safetensors_path.?, embedding_signature.?)
+    else
+        null;
+    const artifact_revision = if (hasCompleteChecksums(&tokenizer_artifacts))
+        try embeddingArtifactRevision(man, resolution_revision, &tokenizer_artifacts)
+    else
+        null;
     const assets = Assets{
+        .managed_installation = tokenizer_artifacts.installation,
+        .artifact_revision = artifact_revision,
+        .selected_artifact_validation = verify_selected,
+        .verified_embedding_snapshot = verified_embedding_snapshot,
         .whisper_prompt = .{ .prepared = managed_prompt },
         .manifest = man,
         .hf_tok = hf_tok,
@@ -2566,41 +2650,151 @@ pub fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: [
         owned = if (standalone) null else try managed_receipt.loadValidated(a, io, receipt_root);
         break :blk if (owned) |*validated| validated else null;
     };
-    if (receipt) |validated| {
-        const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, validated.artifacts);
-        defer a.free(artifacts);
-        std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
-            fn less(_: void, left: managed_receipt.ValidatedArtifact, right: managed_receipt.ValidatedArtifact) bool {
-                return std.mem.lessThan(u8, left.path, right.path);
-            }
-        }.less);
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        for (artifacts) |artifact| {
-            try control.check();
-            var decoded: [32]u8 = undefined;
-            if (published) |source| {
-                try source.verifyFileWithControl(artifact.path, control);
-                if (artifact.sha256) |digest| {
-                    // verifyFile authenticated this digest against the actual
-                    // file and retained its complete construction stamp.
-                    _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
-                } else decoded = try ArtifactDigestCache.digestWithControl(io, artifact, control);
-            } else decoded = try ArtifactDigestCache.digestWithControl(io, artifact, control);
-            if (artifact.sha256) |digest| {
-                if (digest.len != 64) return error.InvalidManagedDownload;
-                var expected: [32]u8 = undefined;
-                _ = std.fmt.hexToBytes(&expected, digest) catch return error.InvalidManagedDownload;
-                if (!std.mem.eql(u8, &expected, &decoded)) return error.ChecksumMismatch;
-            }
-            hash.update(artifact.path);
-            hash.update(&.{0});
-            hash.update(&decoded);
+    const revision = if (receipt) |validated|
+        try receiptedModelRevision(a, io, validated, published, control, true)
+    else
+        try resolutionModelRevisionWithControl(a, io, manifest, control);
+    return imagePreprocessingRevision(manifest, revision);
+}
+
+pub fn hasCompleteChecksums(artifacts: *const PublishedArtifacts) bool {
+    return if (artifacts.receipt) |*receipt| receipt.hasCompleteChecksums() else false;
+}
+
+// Explicit checksums make the digest a function of the raw receipt. If a
+// legacy entry inherits a checksum through a symlink, its effective digest
+// also depends on this installation's validated alias bindings.
+pub const DeclaredReceiptRevision = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    entry: ?struct { publication: [32]u8, revision: [32]u8 } = null,
+
+    pub fn get(self: *DeclaredReceiptRevision, a: std.mem.Allocator, io: std.Io, receipt: *const managed_receipt.ValidatedReceipt, control: InferenceExecutionControl) ![32]u8 {
+        if (!receipt.all_checksums_declared) return receiptedModelRevision(a, io, receipt, null, control, false);
+        spinLock(&self.lock);
+        const cached = self.entry;
+        self.lock.unlock();
+        if (cached) |entry| {
+            if (std.mem.eql(u8, &entry.publication, &receipt.publication_generation)) return entry.revision;
         }
-        var result: [32]u8 = undefined;
-        hash.final(&result);
-        return imagePreprocessingRevision(manifest, result);
+        const revision = try receiptedModelRevision(a, io, receipt, null, control, false);
+        spinLock(&self.lock);
+        defer self.lock.unlock();
+        self.entry = .{ .publication = receipt.publication_generation, .revision = revision };
+        return revision;
     }
-    return imagePreprocessingRevision(manifest, try resolutionModelRevisionWithControl(a, io, manifest, control));
+};
+
+pub fn receiptedModelRevision(
+    a: std.mem.Allocator,
+    io: std.Io,
+    receipt: *const managed_receipt.ValidatedReceipt,
+    published: ?*PublishedArtifacts,
+    control: InferenceExecutionControl,
+    comptime verify: bool,
+) ![32]u8 {
+    const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, receipt.artifacts);
+    defer a.free(artifacts);
+    std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
+        fn less(_: void, left: managed_receipt.ValidatedArtifact, right: managed_receipt.ValidatedArtifact) bool {
+            return std.mem.lessThan(u8, left.path, right.path);
+        }
+    }.less);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (artifacts) |artifact| {
+        try control.check();
+        const digest: ?[]const u8 = if (verify)
+            if (published) |source| try source.verifiedFileDigest(artifact.path) else null
+        else
+            artifact.sha256 orelse return error.InvalidManagedDownload;
+        const decoded = if (digest) |hex| blk: {
+            var checksum: [32]u8 = undefined;
+            if (hex.len != 64) return error.InvalidManagedDownload;
+            _ = std.fmt.hexToBytes(&checksum, hex) catch return error.InvalidManagedDownload;
+            break :blk checksum;
+        } else legacy: {
+            const checksum = try ArtifactDigestCache.digestWithControl(io, artifact, control);
+            if (artifact.sha256) |hex| {
+                var expected: [32]u8 = undefined;
+                if (hex.len != 64) return error.InvalidManagedDownload;
+                _ = std.fmt.hexToBytes(&expected, hex) catch return error.InvalidManagedDownload;
+                if (!std.mem.eql(u8, &expected, &checksum)) return error.ChecksumMismatch;
+            }
+            break :legacy checksum;
+        };
+        hash.update(artifact.path);
+        hash.update(&.{0});
+        hash.update(&decoded);
+    }
+    var result: [32]u8 = undefined;
+    hash.final(&result);
+    try control.check();
+    return result;
+}
+
+// Bind each selected artifact to its execution role. The receipt covers all
+// bytes, but two executable selections can use different members of it.
+pub fn embeddingArtifactRevision(manifest: manifest_mod.ModelManifest, receipt_revision: [32]u8, artifacts: *const PublishedArtifacts) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(&receipt_revision);
+    if (tokenizer_loader.usesDurableGemmaTokenizer(manifest, artifacts)) {
+        hash.update(eg2_identity.managed_tokenizer_recipe);
+        hash.update(&.{0});
+    }
+    inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {
+        if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest, field)) == ?[]const u8) {
+            if (@field(manifest, field)) |path| {
+                hash.update(field);
+                hash.update(&.{0});
+                hash.update(try artifacts.receiptMemberPath(path));
+                hash.update(&.{0});
+            }
+        }
+    }
+    return hash.finalResult();
+}
+
+/// Durable indexes require a stable vector recipe in addition to model content.
+/// Gemma's qualified native and Metal recipes are compatible. Other backends
+/// retain separate identities until their embedding recipes are qualified.
+/// Bump the domain when the generic embedding recipe changes incompatibly.
+pub fn durableEmbeddingRevision(manifest: manifest_mod.ModelManifest, artifact_revision: [32]u8, backend: backends.BackendType) [32]u8 {
+    return durableEmbeddingRevisionWithCudaPolicy(manifest, artifact_revision, backend, null);
+}
+
+fn durableEmbeddingRevisionForSession(manifest: manifest_mod.ModelManifest, artifact_revision: [32]u8, session: backends.Session) [32]u8 {
+    return durableEmbeddingRevisionWithCudaPolicy(manifest, artifact_revision, session.backend(), session_factory.getEmbeddingGemma2CudaPolicy(session));
+}
+
+pub fn durableEmbeddingRevisionWithCudaPolicy(manifest: manifest_mod.ModelManifest, artifact_revision: [32]u8, backend: backends.BackendType, cuda_policy: ?@import("../ops/cuda/embedding_gemma2_policy.zig").Policy) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-durable-embedding-v2\x00");
+    hash.update(&artifact_revision);
+    if (manifest.embedding_style == .embedding_gemma2) {
+        const gemma = @import("../models/embedding_gemma2_identity.zig");
+        hash.update(gemma.recipe);
+        const encoded = std.fmt.bytesToHex(hash.finalResult(), .lower);
+        const backend_identity = if (cuda_policy) |policy| gemma.forCudaPolicy(encoded, policy) else gemma.forBackend(encoded, backend);
+        var digest: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, &backend_identity) catch unreachable;
+        return digest;
+    }
+    hash.update(@tagName(backend));
+    return hash.finalResult();
+}
+
+pub fn embeddingGemma2Weights(manifest: manifest_mod.ModelManifest) ![]const u8 {
+    if (manifest.nativeWeightArtifactKind() != .safetensors) return error.UnsupportedEmbeddingGemma2Weights;
+    return manifest.safetensors_path.?;
+}
+
+fn verifiedGemmaEmbeddingSnapshot(artifacts: *PublishedArtifacts, weights: []const u8, signature: [32]u8) !@import("../models/embedding_gemma2_identity.zig").Snapshot {
+    const identity = @import("../models/embedding_gemma2_identity.zig");
+    var digests: [identity.sidecars.len + 1][32]u8 = undefined;
+    for (identity.sidecars ++ .{std.fs.path.basename(weights)}, &digests) |member, *digest| {
+        const hex = try artifacts.verifiedFileDigest(member) orelse return error.InvalidManagedDownload;
+        _ = std.fmt.hexToBytes(digest, hex) catch return error.InvalidManagedDownload;
+    }
+    return .{ .digest = identity.fromDigests(digests), .signature = signature };
 }
 
 pub const ManagedWhisperPrompt = struct {

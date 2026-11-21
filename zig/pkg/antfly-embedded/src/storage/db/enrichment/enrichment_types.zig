@@ -200,6 +200,7 @@ pub const GeneratedEnrichmentRequest = struct {
     /// instead of extracting a single source_field.
     source_template: []const u8 = "",
     expected_dims: u32 = 0,
+    model_revision: ?[32]u8 = null,
     /// Provenance of an elided embedding; checked before re-embedding.
     expected_source_hash: ?u64 = null,
     /// Fallback proof for legacy artifacts without an immutable producer revision.
@@ -362,6 +363,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .source_field = source_field,
         .source_template = source_template,
         .expected_dims = request.expected_dims,
+        .model_revision = request.model_revision,
         .chunk_size = request.chunk_size,
         .chunk_overlap = request.chunk_overlap,
         .chunker_json = chunker_json,

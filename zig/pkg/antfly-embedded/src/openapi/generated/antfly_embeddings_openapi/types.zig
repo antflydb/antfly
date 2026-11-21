@@ -6,6 +6,8 @@ const antfly_provider_openapi = @import("antfly_provider_openapi");
 
 /// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. **Features:** - Local ONNX-based embedding generation - Query-time embeddings are served from an in-memory cache (64 MiB budget, 5-minute TTL by default) with concurrent identical requests coalesced onto a single computation; there is no persistent on-disk cache tier **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
 pub const AntflyEmbedderConfig = struct {
+    /// Physical hosted embedding model revision advertised by scoped inference discovery. Supported for managed dense embeddings with distributed ordered vector publication. To change revisions, build a new index and finish backfill before switching the serving alias.
+    model_revision: ?[]const u8 = null,
     /// Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication.
     model_identity: ?[]const u8 = null,
     provider: []const u8,
@@ -17,6 +19,7 @@ pub const AntflyEmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "model_revision", "model_revision", true },
         .{ "model_identity", "model_identity", true },
         .{ "provider", "provider", false },
         .{ "model", "model", false },
@@ -34,6 +37,10 @@ pub const AntflyEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.model_revision) |value| {
+            try jw.objectField("model_revision");
+            try jw.write(value);
+        }
         if (self.model_identity) |value| {
             try jw.objectField("model_identity");
             try jw.write(value);
@@ -305,6 +312,8 @@ pub const EmbedderConfig = struct {
     truncate: ?[]const u8 = null,
     /// Whether to strip new lines from the input text before embedding.
     strip_new_lines: ?bool = null,
+    /// Physical hosted embedding model revision advertised by scoped inference discovery. Supported for managed dense embeddings with distributed ordered vector publication. To change revisions, build a new index and finish backfill before switching the serving alias.
+    model_revision: ?[]const u8 = null,
     /// Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication.
     model_identity: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -342,6 +351,7 @@ pub const EmbedderConfig = struct {
         .{ "input_type", "input_type", true },
         .{ "truncate", "truncate", true },
         .{ "strip_new_lines", "strip_new_lines", true },
+        .{ "model_revision", "model_revision", true },
         .{ "model_identity", "model_identity", true },
         .{ "api_url", "api_url", true },
         .{ "sparse", "sparse", true },
@@ -436,6 +446,10 @@ pub const EmbedderConfig = struct {
         }
         if (self.strip_new_lines) |value| {
             try jw.objectField("strip_new_lines");
+            try jw.write(value);
+        }
+        if (self.model_revision) |value| {
+            try jw.objectField("model_revision");
             try jw.write(value);
         }
         if (self.model_identity) |value| {

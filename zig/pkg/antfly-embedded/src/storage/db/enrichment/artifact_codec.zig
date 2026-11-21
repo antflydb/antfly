@@ -22,6 +22,7 @@ const edge_weight = @import("../../../graph/edge_weight.zig");
 pub const codec_version: u16 = 1;
 pub const graph_edge_codec_version: u16 = 2;
 pub const graph_edge_ttl_codec_version: u16 = 3;
+const pinned_dense_codec_version: u16 = 4;
 pub const magic: [8]u8 = .{ 'A', 'F', 'E', 'N', 'R', 'C', 'H', 0 };
 pub const header_len: usize = magic.len + @sizeOf(u16) + @sizeOf(u8) + @sizeOf(u8) + @sizeOf(u64) + @sizeOf(u32);
 
@@ -103,29 +104,35 @@ test "embedding reprocess generations preserve legacy hashes and isolate complet
 }
 
 pub fn encodeDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, vector: []const f32) ![]u8 {
-    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, false, vector);
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, false, null, vector);
 }
 
 /// A produced embedding, marked `text_input` when the producer embedded text
 /// alone (see `Flags.text_input`).
 pub fn encodeProducedDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, text_input: bool, vector: []const f32) ![]u8 {
-    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, text_input, vector);
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, text_input, null, vector);
 }
 
 /// Only explicit user-vector ingress may set this origin. In particular, an
 /// absent source hash in old or imported output does not establish authorship.
 pub fn encodeAuthoredDenseEmbeddingAlloc(alloc: Allocator, vector: []const f32) ![]u8 {
-    return encodeDenseEmbeddingWithOriginAlloc(alloc, null, true, false, vector);
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, null, true, false, null, vector);
 }
 
-fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, authored: bool, text_input: bool, vector: []const f32) ![]u8 {
-    const payload_len = @sizeOf(u32) + vector.len * @sizeOf(u32);
+/// A revision is part of the immutable output bytes and travels with the
+/// vector through ordered replay, snapshots and shard transfer.
+pub fn encodeProducedDenseEmbeddingAtRevisionAlloc(alloc: Allocator, source_hash: ?u64, text_input: bool, revision: [32]u8, vector: []const f32) ![]u8 {
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, text_input, revision, vector);
+}
+
+fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, authored: bool, text_input: bool, revision: ?[32]u8, vector: []const f32) ![]u8 {
+    const payload_len = @sizeOf(u32) + vector.len * @sizeOf(u32) + (if (revision == null) @as(usize, 0) else 32);
     const total_len = header_len + payload_len;
     const out = try alloc.alloc(u8, total_len);
     errdefer alloc.free(out);
 
     writeHeader(out[0..header_len], .{
-        .version = codec_version,
+        .version = if (revision == null) codec_version else pinned_dense_codec_version,
         .kind = .dense_embedding,
         .flags = .{ .has_source_hash = source_hash != null, .authored = authored, .text_input = text_input },
         .source_hash = source_hash orelse 0,
@@ -139,6 +146,7 @@ fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, auth
         std.mem.writeInt(u32, out[pos..][0..4], @as(u32, @bitCast(value)), .little);
         pos += @sizeOf(u32);
     }
+    if (revision) |value| @memcpy(out[pos..][0..32], &value);
     return out;
 }
 
@@ -149,7 +157,7 @@ const elided_payload_len: usize = @sizeOf(u32) + @sizeOf(u64);
 /// hash and origin) but not the vector. `vector_digest` identifies the dropped
 /// vector so a later write can tell whether the stub still describes it.
 pub fn encodeElidedDenseEmbeddingAlloc(alloc: Allocator, header: Header, dims: u32, vector_digest: u64) ![]u8 {
-    if (header.kind != .dense_embedding) return error.InvalidArtifactKind;
+    if (header.kind != .dense_embedding or header.version != codec_version) return error.InvalidArtifactKind;
     const out = try alloc.alloc(u8, header_len + elided_payload_len);
     errdefer alloc.free(out);
     var flags = header.flags;
@@ -170,8 +178,25 @@ pub fn encodeElidedDenseEmbeddingAlloc(alloc: Allocator, header: Header, dims: u
 /// keeping the stub's header (source hash and origin).
 pub fn encodeRestoredDenseEmbeddingAlloc(alloc: Allocator, stub_header: Header, vector: []const f32) ![]u8 {
     if (stub_header.kind != .dense_embedding) return error.InvalidArtifactKind;
-    const out = try encodeDenseEmbeddingWithOriginAlloc(alloc, if (stub_header.flags.has_source_hash) stub_header.source_hash else null, stub_header.flags.authored, stub_header.flags.text_input, vector);
+    const out = try encodeDenseEmbeddingWithOriginAlloc(alloc, if (stub_header.flags.has_source_hash) stub_header.source_hash else null, stub_header.flags.authored, stub_header.flags.text_input, null, vector);
     return out;
+}
+
+test "ordered artifact inventory pinned dense vectors carry their exact revision with the bytes" {
+    const alloc = std.testing.allocator;
+    const revision: [32]u8 = @splat(0xaa);
+    const vector = [_]f32{ 0.5, -1.25, 3.0 };
+    const pinned = try encodeProducedDenseEmbeddingAtRevisionAlloc(alloc, 7, true, revision, &vector);
+    defer alloc.free(pinned);
+    const ordinary = try encodeProducedDenseEmbeddingAlloc(alloc, 7, true, &vector);
+    defer alloc.free(ordinary);
+    try std.testing.expectEqual(@as(?[32]u8, revision), try denseEmbeddingModelRevision(pinned));
+    try std.testing.expectEqual(@as(?[32]u8, null), try denseEmbeddingModelRevision(ordinary));
+    try std.testing.expectEqual(@as(usize, 32), pinned.len - ordinary.len);
+    try std.testing.expectEqual(@as(u32, 3), try decodeDenseEmbeddingDims(pinned));
+    var decoded: [3]f32 = undefined;
+    try std.testing.expectEqualSlices(f32, &vector, try decodeDenseEmbeddingInto(pinned, &decoded));
+    try std.testing.expectError(error.InvalidArtifactPayload, denseEmbeddingModelRevision(pinned[0 .. pinned.len - 1]));
 }
 
 test "int8 elided stub keeps a close copy and still reads as a stub" {
@@ -369,17 +394,26 @@ pub fn decodeDenseEmbeddingDims(data: []const u8) !u32 {
     return std.mem.readInt(u32, payload[0..4], .little);
 }
 
-fn denseEmbeddingPayload(data: []const u8) ![]const u8 {
+pub fn denseEmbeddingPayload(data: []const u8) ![]const u8 {
     const header = try decodeHeader(data);
     if (header.kind != .dense_embedding) return error.InvalidArtifactKind;
     if (header.flags.vector_elided) return error.VectorElided;
     if (header.payload_len < @sizeOf(u32)) return error.InvalidArtifactPayload;
 
-    const payload = data[header_len..][0..header.payload_len];
+    const trailer_len: usize = if (header.version == pinned_dense_codec_version) 32 else 0;
+    if (header.payload_len < @sizeOf(u32) + trailer_len) return error.InvalidArtifactPayload;
+    const payload = data[header_len .. data.len - trailer_len];
     const dims = std.mem.readInt(u32, payload[0..4], .little);
     const vector_bytes = payload.len - @sizeOf(u32);
     if (vector_bytes != @as(usize, dims) * @sizeOf(u32)) return error.InvalidVectorDimensions;
     return payload;
+}
+
+pub fn denseEmbeddingModelRevision(data: []const u8) !?[32]u8 {
+    const header = try decodeHeader(data);
+    if (header.kind != .dense_embedding or header.version != pinned_dense_codec_version) return null;
+    _ = try denseEmbeddingPayload(data);
+    return data[data.len - 32 ..][0..32].*;
 }
 
 pub fn decodeDenseEmbeddingJsonVectorAlloc(alloc: Allocator, data: []const u8) !std.json.Value {
@@ -750,7 +784,9 @@ pub fn decodeHeaderPrefix(data: []const u8) !Header {
         @backingInt(Kind.graph_edge) => .graph_edge,
         else => return error.InvalidArtifactKind,
     };
-    if (version != codec_version and !((version == graph_edge_codec_version or version == graph_edge_ttl_codec_version) and kind == .graph_edge)) {
+    const graph_version = (version == graph_edge_codec_version or version == graph_edge_ttl_codec_version) and kind == .graph_edge;
+    const pinned_dense = version == pinned_dense_codec_version and kind == .dense_embedding;
+    if (version != codec_version and !graph_version and !pinned_dense) {
         return error.UnsupportedArtifactCodecVersion;
     }
 
@@ -764,6 +800,8 @@ pub fn decodeHeaderPrefix(data: []const u8) !Header {
         flags.has_graph_generation or flags.portable_unbound_graph_generation or
         (kind != .dense_embedding and kind != .sparse_embedding))) return error.InvalidArtifactHeader;
     if (flags.text_input and (flags.authored or kind != .dense_embedding)) return error.InvalidArtifactHeader;
+    if (pinned_dense and (flags.authored or flags.vector_elided or flags.int8_payload or flags.has_graph_generation or flags.portable_unbound_graph_generation))
+        return error.InvalidArtifactHeader;
 
     const payload_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += @sizeOf(u32);

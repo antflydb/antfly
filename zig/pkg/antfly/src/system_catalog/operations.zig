@@ -395,7 +395,8 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     const versioned_support = if (command.plan) |plan| plan.support_schema_format != .legacy or fk_publication.hasStampedSupport(plan.parents) else false;
     const guarded = command.plan != null and command.plan.?.expected_incarnation != null;
     const version = if (guarded) protocol.guarded_generation_admission_version else if (versioned_support) protocol.guarded_publication_version else protocol.fk_initial_create_version;
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, version);
+    const required = if (command.plan) |plan| try protocol.pinnedEmbeddingDecoderVersion(alloc, plan.child.indexes_json, false) else 0;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, @max(version, required));
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;

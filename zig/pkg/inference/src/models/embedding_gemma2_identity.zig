@@ -71,6 +71,10 @@ pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/emb
 }
 
 pub const sidecars = [_][]const u8{ "config.json", "tokenizer.json", "tokenizer_config.json", "processor_config.json", "config_sentence_transformers.json", "1_Pooling/config.json" };
+pub const managed_tokenizer_recipe = "huggingface-root-tokenizer-json-v1";
+pub const max_sidecar_bytes = 64 * 1024 * 1024;
+pub const max_weight_bytes = 4 * 1024 * 1024 * 1024;
+
 pub const Snapshot = struct { digest: [64]u8, signature: [32]u8 };
 
 fn same(a: std.json.Value, b: std.json.Value) bool {
@@ -99,7 +103,10 @@ fn same(a: std.json.Value, b: std.json.Value) bool {
 }
 
 pub fn validateProcessor(a: std.mem.Allocator, bytes: []const u8) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" });
+    const parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEmbeddingGemma2Processor,
+    };
     defer parsed.deinit();
     const reference = try std.json.parseFromSlice(std.json.Value, a, @embedFile("embedding_gemma2_processor.json"), .{});
     defer reference.deinit();
@@ -110,17 +117,31 @@ pub fn validateProcessor(a: std.mem.Allocator, bytes: []const u8) !void {
 }
 
 pub fn validateTokenizer(a: std.mem.Allocator, bytes: []const u8) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" });
+    const parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEmbeddingGemma2Tokenizer,
+    };
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidEmbeddingGemma2Tokenizer;
-    const processor = parsed.value.object.get("post_processor") orelse return error.InvalidEmbeddingGemma2Tokenizer;
+    try validateTokenizerRoot(a, parsed.value);
+}
+
+pub fn validateTokenizerRoot(a: std.mem.Allocator, value: std.json.Value) !void {
+    if (value != .object) return error.InvalidEmbeddingGemma2Tokenizer;
+    const model = value.object.get("model") orelse return error.InvalidEmbeddingGemma2Tokenizer;
+    if (model != .object) return error.InvalidEmbeddingGemma2Tokenizer;
+    switch (model.object.get("vocab") orelse return error.InvalidEmbeddingGemma2Tokenizer) {
+        .object => |vocab| if (vocab.count() == 0) return error.InvalidEmbeddingGemma2Tokenizer,
+        .array => |vocab| if (vocab.items.len == 0) return error.InvalidEmbeddingGemma2Tokenizer,
+        else => return error.InvalidEmbeddingGemma2Tokenizer,
+    }
+    const processor = value.object.get("post_processor") orelse return error.InvalidEmbeddingGemma2Tokenizer;
     const reference = try std.json.parseFromSlice(std.json.Value, a,
         \\{"type":"TemplateProcessing","single":[{"SpecialToken":{"id":"<bos>","type_id":0}},{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"<eos>","type_id":0}}],"special_tokens":{"<bos>":{"id":"<bos>","ids":[2],"tokens":["<bos>"]},"<eos>":{"id":"<eos>","ids":[1],"tokens":["<eos>"]}}}
     , .{});
     defer reference.deinit();
     if (processor != .object) return error.InvalidEmbeddingGemma2Tokenizer;
     for ([_][]const u8{ "type", "single", "special_tokens" }) |key| if (!same(processor.object.get(key) orelse return error.InvalidEmbeddingGemma2Tokenizer, reference.value.object.get(key).?)) return error.InvalidEmbeddingGemma2Tokenizer;
-    const added = parsed.value.object.get("added_tokens") orelse return error.InvalidEmbeddingGemma2Tokenizer;
+    const added = value.object.get("added_tokens") orelse return error.InvalidEmbeddingGemma2Tokenizer;
     if (added != .array) return error.InvalidEmbeddingGemma2Tokenizer;
     const required = [_]struct { id: i64, token: []const u8 }{
         .{ .id = 0, .token = "<pad>" },          .{ .id = 1, .token = "<eos>" },         .{ .id = 2, .token = "<bos>" },
@@ -144,12 +165,41 @@ pub fn validateTokenizer(a: std.mem.Allocator, bytes: []const u8) !void {
     }
 }
 
-pub fn signature(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights: []const u8) ![32]u8 {
+pub const CheckedSidecar = enum {
+    processor,
+    tokenizer,
+
+    pub fn fromPath(relative: []const u8) ?CheckedSidecar {
+        if (std.mem.eql(u8, relative, "processor_config.json")) return .processor;
+        if (std.mem.eql(u8, relative, "tokenizer.json")) return .tokenizer;
+        return null;
+    }
+
+    pub fn invalidError(self: CheckedSidecar) error{ InvalidEmbeddingGemma2Processor, InvalidEmbeddingGemma2Tokenizer } {
+        return switch (self) {
+            .processor => error.InvalidEmbeddingGemma2Processor,
+            .tokenizer => error.InvalidEmbeddingGemma2Tokenizer,
+        };
+    }
+
+    pub fn validate(self: CheckedSidecar, a: std.mem.Allocator, bytes: []const u8) !void {
+        switch (self) {
+            .processor => try validateProcessor(a, bytes),
+            .tokenizer => try validateTokenizer(a, bytes),
+        }
+    }
+};
+
+pub fn requireWeightBinding(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights: []const u8) !void {
     const actual_weights = try receipt.resolveRegularFilePath(a, io, weights);
     defer a.free(actual_weights);
     const contained_weights = try receipt.resolveContainedArtifactPath(a, io, directory, std.fs.path.basename(weights));
     defer a.free(contained_weights);
     if (!std.mem.eql(u8, actual_weights, contained_weights)) return error.ModelArtifactOutsideRoot;
+}
+
+pub fn signature(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights: []const u8) ![32]u8 {
+    try requireWeightBinding(a, io, directory, weights);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     for (0..sidecars.len + 1) |i| {
         const path = try receipt.resolveContainedArtifactPath(a, io, directory, if (i == sidecars.len) std.fs.path.basename(weights) else sidecars[i]);
@@ -184,11 +234,10 @@ pub fn snapshot(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights
         const name = if (i == sidecars.len) "weights" else sidecars[i];
         const path = try receipt.resolveContainedArtifactPath(a, io, directory, if (i == sidecars.len) std.fs.path.basename(weights) else name);
         defer a.free(path);
-        var region = try file.MmapRegion.initLimited(a, path, if (i == sidecars.len) 4 * 1024 * 1024 * 1024 else 64 * 1024 * 1024);
+        var region = try file.MmapRegion.initLimited(a, path, if (i == sidecars.len) max_weight_bytes else max_sidecar_bytes);
         defer region.deinit();
         region.preserveFileCacheOnDeinit();
-        if (std.mem.eql(u8, name, "processor_config.json")) try validateProcessor(a, region.data);
-        if (std.mem.eql(u8, name, "tokenizer.json")) try validateTokenizer(a, region.data);
+        if (CheckedSidecar.fromPath(name)) |sidecar| try sidecar.validate(a, region.data);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         var offset: usize = 0;
         while (offset < region.data.len) {

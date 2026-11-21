@@ -499,32 +499,38 @@ pub fn inspectArtifactDependencies(
     single_path: ?[]const u8,
     index_path: ?[]const u8,
 ) !ArtifactDependencies {
-    var paths = std.ArrayListUnmanaged([]u8).empty;
-    errdefer {
-        for (paths.items) |path| allocator.free(path);
-        paths.deinit(allocator);
-    }
-
     if (single_path) |path| {
-        const owned_path = try allocator.dupe(u8, path);
-        paths.append(allocator, owned_path) catch |err| {
-            allocator.free(owned_path);
-            return err;
-        };
-        return .{
-            .allocator = allocator,
-            .paths = try paths.toOwnedSlice(allocator),
-        };
+        const paths = try allocator.alloc([]u8, 1);
+        errdefer allocator.free(paths);
+        paths[0] = try allocator.dupe(u8, path);
+        return .{ .allocator = allocator, .paths = paths };
     }
 
     const path = index_path orelse return error.NoSafetensorsArtifact;
-    const owned_index_path = try allocator.dupe(u8, path);
-    paths.append(allocator, owned_index_path) catch |err| {
-        allocator.free(owned_index_path);
-        return err;
-    };
     const index_bytes = try c_file.readFileMax(allocator, path, max_header_size);
     defer allocator.free(index_bytes);
+    return inspectIndexDependencies(allocator, path, index_bytes, .{});
+}
+
+/// Inspect authenticated index bytes with the same shard-name rules as the
+/// runtime. The result includes the index itself and each unique shard.
+pub fn inspectIndexDependencies(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    index_bytes: []const u8,
+    control: ExecutionControl,
+) !ArtifactDependencies {
+    try control.check();
+    var paths = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (paths.items) |member| allocator.free(member);
+        paths.deinit(allocator);
+    }
+    {
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        try paths.append(allocator, owned_path);
+    }
     var index = try ShardedIndex.load(allocator, index_bytes);
     defer index.deinit();
     if (index.weight_map.count() == 0) return error.EmptyWeightMap;
@@ -534,6 +540,7 @@ pub fn inspectArtifactDependencies(
     defer seen_shards.deinit(allocator);
     var index_it = index.weight_map.iterator();
     while (index_it.next()) |entry| {
+        try control.check();
         const shard_name = entry.value_ptr.*;
         try validateShardPath(shard_name);
         if (seen_shards.contains(shard_name)) continue;

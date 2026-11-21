@@ -5572,6 +5572,7 @@ pub const DataServer = struct {
     store_registration_confirmed: bool = false,
     store_root_registration_active: std.atomic.Value(bool) = .init(false),
     store_root_last_probe_at_ms: std.atomic.Value(u64) = .init(0),
+    pin_protocol_probe_after_ms: std.atomic.Value(u64) = .init(0),
     store_root_urgent_probe_requested: std.atomic.Value(bool) = .init(false),
     reporter_incarnation_mutex: std.atomic.Mutex = .unlocked,
     reporter_incarnation: u64 = 0,
@@ -12732,6 +12733,23 @@ pub const DataServer = struct {
     }
 
     pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
+        if (req.artifact_catalog) |command| {
+            if (command.binding.effect_protocol >= inventory.pinned_embedding_revision_protocol)
+                return @import("../common/data_raft_protocol.zig").batch_pinned_embedding_revision_protocol_version;
+        }
+        if (req.online_source) |command| if (command == .admit) {
+            if (command.admit.artifact_catalog) |binding| if (binding.effect_protocol >= inventory.pinned_embedding_revision_protocol)
+                return @import("../common/data_raft_protocol.zig").batch_pinned_embedding_revision_protocol_version;
+        };
+        if (req.merge_page) |page| if (page.source.artifact_catalog) |binding| {
+            if (binding.effect_protocol >= inventory.pinned_embedding_revision_protocol)
+                return @import("../common/data_raft_protocol.zig").batch_pinned_embedding_revision_protocol_version;
+        };
+        if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| if (source.artifact_catalog) |binding| {
+            if (binding.effect_protocol >= inventory.pinned_embedding_revision_protocol)
+                return @import("../common/data_raft_protocol.zig").batch_pinned_embedding_revision_protocol_version;
+        };
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
@@ -18435,6 +18453,22 @@ pub const DataServer = struct {
         return retainReplicaRootIncarnation(&self.replica_root_incarnation, loaded.incarnation);
     }
 
+    fn artifactSourcesReportVersion(self: *DataServer, remote: *RemoteMetadataSource, snapshot: *const antfly.metadata_api.AdminSnapshot, store_id: u64) u16 {
+        const pin_version = antfly.metadata.table_manager.pinned_embedding_store_protocol;
+        // Once our advertisement is committed, metadata has already fenced
+        // every decoder. New membership must pass the same durable barrier.
+        for (snapshot.stores) |store| {
+            if (store.store_id == store_id and store.artifact_sources_protocol_version >= pin_version) return pin_version;
+        }
+        if (snapshot.status.table_topology_protocol_version < @import("../metadata/topology_protocol.zig").pinned_embedding_revision_version)
+            return pin_version - 1;
+        const now = self.backgroundMonotonicMs();
+        const next = self.pin_protocol_probe_after_ms.load(.acquire);
+        if (now < next or self.pin_protocol_probe_after_ms.cmpxchgStrong(next, now +| 10_000, .acq_rel, .acquire) != null)
+            return pin_version - 1;
+        return if (remote.pinnedEmbeddingReadiness() catch false) pin_version else pin_version - 1;
+    }
+
     pub fn registerNodeIfConfigured(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
         const registration = self.store_registration orelse return;
@@ -18495,7 +18529,7 @@ pub const DataServer = struct {
             .reporter_incarnation = try self.reporterIncarnation(),
             .replica_root_incarnation = root_incarnation,
             .replica_root_public_key = public_key,
-            .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
+            .artifact_sources_protocol_version = self.artifactSourcesReportVersion(remote_metadata, &protocol_snapshot, registration.store_id),
             .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
             .relational_topology_protocol_version = if (self.data_raft != null) antfly.metadata.table_manager.relational_topology_protocol_version else 0,
             .dense_native_storage_protocol_version = dense_native_capability,
@@ -19388,7 +19422,7 @@ pub const DataServer = struct {
             .embedding_activity_protocol_version = embedding_activity_protocol_version,
             .embedding_activity_sequence = self.embedding_activity_report_sequence.fetchAdd(1, .monotonic),
             .reporter_incarnation = reporter_incarnation,
-            .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
+            .artifact_sources_protocol_version = self.artifactSourcesReportVersion(remote_metadata, &snapshot, registration.store_id),
             .dense_native_storage_protocol_version = dense_native_capability,
             .relational_topology_protocol_version = if (self.data_raft != null) antfly.metadata.table_manager.relational_topology_protocol_version else 0,
             .live = true,
@@ -29334,6 +29368,18 @@ const RemoteMetadataSource = struct {
                 return client.storeRootSigningReadiness(base_uri);
             }
         }.call, {});
+    }
+
+    fn pinnedEmbeddingReadiness(self: *RemoteMetadataSource) !bool {
+        const budget: antfly.metadata_http_client.RequestBudget = .{
+            .deadline_ns = self.awakeNs() +| 750 * std.time.ns_per_ms,
+            .io = self.io,
+        };
+        return self.withMetadataApiClientBudget(bool, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: void, attempt_budget: ?antfly.metadata_http_client.RequestBudget) !bool {
+                return client.pinnedEmbeddingReadiness(base_uri, attempt_budget);
+            }
+        }.call, {}, budget);
     }
 
     fn reportNodeStatus(self: *RemoteMetadataSource, report: antfly.metadata.table_manager.StoreStatusReport) !void {
