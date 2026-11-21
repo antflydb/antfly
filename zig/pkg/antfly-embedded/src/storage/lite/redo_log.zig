@@ -704,7 +704,21 @@ pub fn replayBounded(
             // A retired run's record is whole under its own salt: the end.
             // Anything else here (a committed record with a damaged salt,
             // retired payload bytes that read as a header) is unclear.
-            const retired = try recordIntact(allocator, file, io, base_offset + pos, remaining, header, record_header_len, &payload_buf);
+            const complete = try readRecordPayload(allocator, file, io, base_offset + pos, remaining, header, record_header_len, &payload_buf);
+            const retired = complete and header.checksum(payload_buf.items) == header.crc32;
+            // The older writer could leave no trailer at the extent edge.
+            // A checksum that matches only with this run's salt provides
+            // evidence that its last record is damaged, not retired bytes.
+            if (complete and !retired and record_header_len == header_len and
+                remaining - record_header_len - header.payload_len < header_len and
+                header.commit_sequence > (last_sequence orelse 0))
+            {
+                var corrected = header;
+                corrected.salt = salt;
+                if (corrected.checksum(payload_buf.items) == header.crc32) {
+                    return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+                }
+            }
             return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (retired and restartable) .end_of_region else try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence) };
         };
 
@@ -827,15 +841,13 @@ pub fn firstRecordNewerThan(allocator: Allocator, file: File, io: Io, base_offse
     return header.commit_sequence;
 }
 
-/// Whether the record whose header is at `offset` is whole: its payload is
-/// all there and matches its checksum. Reuses `buf`.
-fn recordIntact(allocator: Allocator, file: File, io: Io, offset: u64, available: u64, header: RecordHeader, header_bytes: usize, buf: *std.ArrayList(u8)) !bool {
+/// Reads a complete record payload at `offset`. Reuses `buf`.
+fn readRecordPayload(allocator: Allocator, file: File, io: Io, offset: u64, available: u64, header: RecordHeader, header_bytes: usize, buf: *std.ArrayList(u8)) !bool {
     const payload_len: u64 = header.payload_len;
     if (header_bytes + payload_len > available) return false;
     buf.clearRetainingCapacity();
     try buf.resize(allocator, payload_len);
-    if (try file.readPositionalAll(io, buf.items, offset + header_bytes) < payload_len) return false;
-    return header.checksum(buf.items) == header.crc32;
+    return try file.readPositionalAll(io, buf.items, offset + header_bytes) == payload_len;
 }
 
 /// How a scan stops at `pos` on bytes that are neither this run's next
@@ -1274,6 +1286,11 @@ test "replay rejects a damaged salt inside a run, not a short log" {
     const last = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
     try testing.expectEqual(StopReason.corrupt_record, last.stop_reason);
     try testing.expectEqual(third, last.valid_bytes);
+
+    // The legacy capacity rule could omit the trailer at the extent edge.
+    const trailerless = try replayBounded(testing.allocator, region.file, io, 0, writer.tail, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, trailerless.stop_reason);
+    try testing.expectEqual(third, trailerless.valid_bytes);
 
     // A run that really ends there stops cleanly at the trailer.
     var clean = Writer.init(region.file, io, 0, capacity);

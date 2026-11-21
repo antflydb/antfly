@@ -6769,7 +6769,7 @@ pub const Store = struct {
             var probe_gate: SyncExclusiveGate = .{ .store = self };
             const probe_hooks: native.SyncLockHooks = .{
                 .context = &probe_gate,
-                .release = releaseStoreMutexForSync,
+                .release = releaseStoreMutexForOverlayProbe,
                 .reacquire = reacquireStoreMutexAfterSync,
             };
             switch (try self.file.planIndexScopeDeletion(prefix, head.scope_delete_exact_key, other_bytes, probe_hooks)) {
@@ -6875,6 +6875,14 @@ pub const Store = struct {
         /// this call never unlocked in the first place.
         held_through_sync: bool = false,
     };
+
+    fn releaseStoreMutexForOverlayProbe(context: *anyopaque) void {
+        const gate: *SyncExclusiveGate = @ptrCast(@alignCast(context));
+        // The coordinator still owns mutation authority. Exclusive callers
+        // wait for this group under the same counter used during sync.
+        gate.store.commit_in_sync += 1;
+        gate.store.mutex.unlock();
+    }
 
     fn releaseStoreMutexForSync(context: *anyopaque) void {
         const gate: *SyncExclusiveGate = @ptrCast(@alignCast(context));
@@ -10536,6 +10544,25 @@ test "lite native docstore skips redo folding for an empty index scope" {
     var sink: @import("native_catalog_sink.zig").Sink = .{ .store = &store, .allocator = allocator };
     try @import("../native_catalog_backend.zig").deleteAllForScope(allocator, sink.sink(), "unused");
     try std.testing.expectEqual(before, store.file.committedSequence());
+}
+
+test "lite overlay probe lends the Store mutex even with an exclusive waiter" {
+    var store: Store = undefined;
+    store.mutex = .{};
+    store.commit_in_sync = 0;
+    store.exclusive_waiting = .init(1);
+    var gate: Store.SyncExclusiveGate = .{ .store = &store };
+    store.mutex.lock();
+
+    Store.releaseStoreMutexForOverlayProbe(&gate);
+    try std.testing.expect(store.mutex.tryLock());
+    try std.testing.expectEqual(@as(usize, 1), store.commit_in_sync);
+    store.mutex.unlock();
+    try std.testing.expect(!tryLockStoreExclusive(&store));
+
+    Store.reacquireStoreMutexAfterSync(&gate);
+    try std.testing.expectEqual(@as(usize, 0), store.commit_in_sync);
+    store.mutex.unlock();
 }
 
 test "lite durable empty index deletion syncs an earlier ride-along tombstone" {
