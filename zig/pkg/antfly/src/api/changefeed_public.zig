@@ -848,8 +848,20 @@ pub fn stageVisibleMerges(client: *config.Client, a: A, source: source_api.Sourc
     }
 }
 
+fn atNativeTopologyBoundary(a: A, state: control.State) !bool {
+    if (state.phase != .streaming or !state.atDeliveryBoundary()) return false;
+
+    // An acknowledged participant frame can leave a coordinated transaction
+    // open. Its continuation authenticates the current root vector.
+    const context = state.acknowledged_provider_context;
+    if (!hasIceberg(state.definition.?)) return context.len == 0;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    return (try composed_context.Context.decode(arena.allocator(), context)).native.len == 0;
+}
+
 pub fn progressMergeDrain(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, state: control.State, cursor: control.Digest, request: Context) !void {
-    if (state.phase != .streaming or !state.atDeliveryBoundary()) return;
+    if (!try atNativeTopologyBoundary(a, state)) return;
     for (state.roots) |root| {
         const drain = root.merge_drain orelse continue;
         if (root.released) {
@@ -897,7 +909,7 @@ pub fn progressSplitSuccessor(client: *config.Client, a: A, source: source_api.S
             const mutation = try source.enrollSplitSuccessor(a, routes, state, root, request);
             return change(client, a, state, mutation, request);
         }
-        if (!state.atDeliveryBoundary() or root.pending_control != null or handoff.cut.reserved_bytes != 0 or
+        if (!try atNativeTopologyBoundary(a, state) or root.pending_control != null or handoff.cut.reserved_bytes != 0 or
             root.acknowledged.order(.{ .sequence = handoff.cut.latest }) != .eq) continue;
         return change(client, a, state, .{ .activate_split_successor = .{
             .namespace = root.namespace,
