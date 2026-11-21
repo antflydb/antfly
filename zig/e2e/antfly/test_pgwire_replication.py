@@ -740,6 +740,21 @@ def test_pg_recvlogical_resume_after_restart(
                 assert resumed.read_bytes().count(b"after-node-failover") == 1
                 assert all(marker not in resumed.read_bytes() for marker in markers)
                 if topology:
+                    catalog = requests.get(
+                        f"{server.data_api_urls[1]}/tables",
+                        headers={"X-Antfly-Trusted-Principal": env["PGPASSWORD"]},
+                        timeout=10,
+                    )
+                    assert catalog.ok, catalog.text
+                    tables = catalog.json()
+                    names = {"smoke", "public.smoke", "default.public.smoke"}
+                    ids = [
+                        int(table["table_id"])
+                        for table in tables
+                        if table["name"] in names
+                    ]
+                    assert len(ids) == 1, [table["name"] for table in tables]
+                    smoke_table_id = ids[0]
 
                     def topology_snapshot():
                         leader = server.metadata_stable_leader_id(timeout_s=30)
@@ -748,7 +763,7 @@ def test_pg_recvlogical_resume_after_restart(
                         table = next(
                             table
                             for table in snapshot["tables"]
-                            if table.get("logical_name", table["name"]) == "smoke"
+                            if int(table["table_id"]) == smoke_table_id
                         )
                         ranges = sorted(
                             (
