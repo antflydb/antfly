@@ -21,11 +21,13 @@
 //   local/<build>/inference/<runtime>/  inference WASM, workers and shaders
 //
 // <build> is a content hash, so the service worker may cache it forever.
+// Files over 25 MiB are moved to dist/local-r2/ for the R2 bucket; pass
+// --upload (and --local for `npm run dev:mail`) to upload them here.
 // The model is published separately with publish-local-model.mjs.
-import { cp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
@@ -33,7 +35,7 @@ const here = fileURLToPath(new URL("./", import.meta.url));
 const local = join(here, "mail-public", "local");
 const staging = join(here, "dist", "local-staging");
 const zig = process.env.ANTFLY_ZIG ?? "zig";
-// Workers static assets accept files up to 25 MiB.
+// Workers static assets accept files up to 25 MiB; larger files go to R2.
 const ASSET_LIMIT = 25 * 1024 ** 2;
 const embedding = {
   dimensions: Number(process.env.LOCAL_EMBEDDING_DIMENSIONS ?? 256),
@@ -88,18 +90,33 @@ await cp(join(root, "ts/packages/web/dist"), join(staging, "web"), { recursive: 
 const [runtimeDir] = await readdir(join(staging, "inference"));
 if (!runtimeDir) throw Error("prepare-runtime produced no runtime directory");
 
-// 3. Content-addressed build directory and config.
+// 3. Content-addressed build directory and config. Files over the Workers
+// asset limit (the WASM modules) go to the private R2 bucket under the same
+// versioned path; the Worker serves /local/<build>/ from R2 when assets miss.
 const hash = createHash("sha256");
+const oversized = [];
 for (const path of await files(staging)) {
   hash.update(path.slice(staging.length)).update("\0").update(await readFile(path));
-  const size = (await stat(path)).size;
-  if (size > ASSET_LIMIT)
-    throw Error(`${path.slice(staging.length)} is ${(size / 1024 ** 2).toFixed(1)} MiB; Workers assets allow 25 MiB per file`);
+  if ((await stat(path)).size > ASSET_LIMIT) oversized.push(path.slice(staging.length + 1));
 }
 const build = hash.digest("hex").slice(0, 16);
 await rm(local, { recursive: true, force: true });
 await mkdir(local, { recursive: true });
 await cp(staging, join(local, build), { recursive: true });
+const r2 = join(here, "dist", "local-r2");
+await rm(r2, { recursive: true, force: true });
+for (const path of oversized) {
+  await mkdir(dirname(join(r2, build, path)), { recursive: true });
+  await rename(join(local, build, path), join(r2, build, path));
+}
+const bucket = process.env.LOCAL_RUNTIME_BUCKET ?? "antfly-mail-models";
+for (const path of oversized) {
+  const key = `${bucket}/local-runtime/${build}/${path}`;
+  if (process.argv.includes("--upload")) {
+    const where = process.argv.includes("--local") ? "--local" : "--remote";
+    run("npx", ["wrangler", "r2", "object", "put", key, "--file", join(r2, build, path), where], here);
+  } else console.log(`upload to R2: npx wrangler r2 object put ${key} --file dist/local-r2/${build}/${path} --remote`);
+}
 const base = `/local/${build}/`;
 const config = {
   build,

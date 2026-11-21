@@ -52,11 +52,13 @@ Enable it on a deployment:
 
 ```sh
 # 1. Build the browser runtime into mail-public/local/ (Zig 0.17 + pnpm).
+#    The WASM modules exceed the 25 MiB Workers asset limit, so --upload puts
+#    them in the R2 bucket under the same versioned path.
 #    Optional: LOCAL_EMBEDDING_DIMENSIONS=128|256|512|768, LOCAL_EMBEDDING_MAX_TOKENS.
-ANTFLY_ZIG=/path/to/zig npm run build:local
-
-# 2. Publish a text-only copy of EmbeddingGemma 2 to the private model bucket.
 npx wrangler r2 bucket create antfly-mail-models
+ANTFLY_ZIG=/path/to/zig npm run build:local -- --upload
+
+# 2. Publish a text-only copy of EmbeddingGemma 2 to the same private bucket.
 antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
 npm run publish:local-model -- \
   --model-dir ~/.antfly/inference/models/google/embeddinggemma-2--antfly-... \
@@ -67,13 +69,16 @@ The publish script removes the image/audio towers, which the browser never
 loads, and writes a `catalog.json` with SHA-256 pins that the browser verifies.
 Files are served same-origin from `/local/models/` to signed-in users only. The
 weights keep their upstream license; serving them is subject to its terms. For
-`npm run dev:mail`, add `--local` to upload into the local Miniflare bucket.
+`npm run dev:mail`, add `--local` to both upload commands to use the local
+Miniflare bucket.
 Without `mail-public/local/` or a published catalog, the opt-in panel reports
 that on-device search is not installed, and the rest of the app is unaffected.
 
-Building the browser WASM bundle needs a lot of memory: its build step declares
-a 20 GiB ceiling. On smaller machines, run `zig build wasm -j1 --maxrss <bytes>`
-in `zig/` first, then `LOCAL_SKIP_ZIG=1 npm run build:local`.
+Building the embedded database WASM needs a lot of memory: its LLVM step
+declares a 20 GiB ceiling and was killed on a 16 GiB machine. Build it on a
+larger host (CI uses one) and copy `zig/zig-out/antfly-wasm/`, then run
+`LOCAL_SKIP_ZIG=1 npm run build:local`. The inference WASM builds in about
+four minutes within that budget.
 
 Limits:
 

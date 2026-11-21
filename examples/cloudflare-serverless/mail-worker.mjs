@@ -44,6 +44,17 @@ export const contentSecurityPolicy =
 // The on-device embedding model, published by the operator to a private R2
 // bucket (see publish-local-model.mjs). Served only to signed-in users so the
 // deployment is not an open mirror; never contains user data.
+// Content-addressed public runtime code (no user data), so no session needed.
+async function localRuntime(env, pathname) {
+  const object = await env.MAIL_MODELS.get("local-runtime/" + pathname.slice("/local/".length));
+  if (!object) return null;
+  const type = pathname.endsWith(".wasm")
+    ? "application/wasm"
+    : /\.m?js$/.test(pathname)
+      ? "text/javascript"
+      : "application/octet-stream";
+  return new Response(object.body, { headers: { "Content-Type": type, "Content-Length": String(object.size) } });
+}
 async function localModel(env, pathname, method) {
   const path = pathname.slice("/local/models/".length);
   if (
@@ -81,14 +92,18 @@ export default {
     if (!url.pathname.startsWith("/mail/") && url.pathname !== "/api/me" && !modelPath) {
       if (request.method !== "GET" || !env.MAIL_ASSETS)
         return new Response("not found", { status: 404 });
-      const asset = await env.MAIL_ASSETS.fetch(request),
-        headers = new Headers(asset.headers);
+      const runtime = /^\/local\/[a-f0-9]{16}\/[A-Za-z0-9._/-]+$/.test(url.pathname);
+      let asset = await env.MAIL_ASSETS.fetch(request);
+      // Runtime files over the 25 MiB asset limit live in R2 at the same path.
+      if (runtime && asset.status === 404 && env.MAIL_MODELS && !url.pathname.includes(".."))
+        asset = (await localRuntime(env, url.pathname)) ?? asset;
+      const headers = new Headers(asset.headers);
       headers.set("Content-Security-Policy", contentSecurityPolicy);
       headers.set("X-Content-Type-Options", "nosniff");
       // The service worker must update promptly; versioned runtimes never change.
       if (url.pathname === "/sw.js" || url.pathname === "/local/config.json")
         headers.set("Cache-Control", "no-cache");
-      else if (asset.ok && /^\/local\/[a-f0-9]{16}\//.test(url.pathname))
+      else if (asset.ok && runtime)
         headers.set("Cache-Control", "public, max-age=31536000, immutable");
       return new Response(asset.body, { status: asset.status, headers });
     }

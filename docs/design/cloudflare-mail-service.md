@@ -235,12 +235,17 @@ path for that.
 
 Covered by tests:
 
-- The embedded WASM smoke test runs tracked storage through the OPFS store
-  against an in-memory directory: empty load, incremental checkpoints, reopen in
-  a fresh module, dense and hybrid search after restore, and torn-manifest
-  fallback.
+- `wasm_opfs_store_test.mjs` checks the checkpoint protocol without WASM:
+  incremental writes, deletes, two-generation GC, torn-manifest fallback,
+  failed blob writes and missing blobs.
+- The embedded WASM smoke test adds the same round trip on the real module,
+  plus dense and hybrid search after a restore in a fresh instance. Its bundle
+  type-checks, but the 20 GiB LLVM step could not finish on the 16 GiB
+  development host, so that smoke has yet to run (CI's WASM job runs it).
 - `test-backends-runtime.mjs` adds `embed` checks to the synthetic
-  full-geometry EmbeddingGemma 2 fixture.
+  full-geometry EmbeddingGemma 2 fixture. These pass against a freshly built
+  `antfly-extraction-cpu.wasm`, along with the rest of the browser runtime
+  suite.
 - `test/mail-local.test.mjs` covers the sync log and backfill, the bounded
   export, route scoping, CSP and caching headers, document and query shapes,
   media-tower stripping and catalog pins, opt-in UI, sign-out wipe and offline
@@ -252,5 +257,10 @@ Not yet validated:
   quality, embedding throughput on CPU and OPFS behavior under quota pressure
   per engine.
 - Running the stripped checkpoint through the full loader.
-- Deployed Workers asset limits for the runtime files (`build-local.mjs` fails
-  the build if any file exceeds 25 MiB).
+- An end-to-end `build-local.mjs` run and a deployment.
+
+Runtime files over the 25 MiB Workers asset limit (the WASM modules; the CPU
+inference module alone is 27 MB) are uploaded to the private R2 bucket under
+the same content-addressed path. The Worker serves `/local/<build>/…` from R2
+when the asset is missing. This is public code, so it needs no session, and it
+is cached as immutable.

@@ -183,6 +183,32 @@ test("static assets allow WASM and workers but stay same-origin; runtimes are im
   );
 });
 
+test("runtime files over the asset limit are served from R2 at their versioned path", async () => {
+  const keys = [];
+  const e = env({
+    MAIL_ASSETS: { fetch: async () => new Response("missing", { status: 404 }) },
+    MAIL_MODELS: {
+      async get(key) {
+        keys.push(key);
+        return key === "local-runtime/0123456789abcdef/antfly/antfly.wasm" ? { body: "wasm", size: 4 } : null;
+      },
+    },
+  });
+  const wasm = await get("/local/0123456789abcdef/antfly/antfly.wasm", e);
+  assert.equal(wasm.status, 200);
+  assert.equal(wasm.headers.get("Content-Type"), "application/wasm");
+  assert.match(wasm.headers.get("Cache-Control"), /immutable/);
+  assert.equal(wasm.headers.get("Content-Security-Policy"), contentSecurityPolicy);
+  // Unversioned paths and other prefixes never reach the bucket.
+  assert.equal((await get("/local/config.json", e)).status, 404);
+  assert.equal((await get("/local/0123456789abcdef/missing.js", e)).status, 404);
+  assert.equal((await get("/antfly.wasm", e)).status, 404);
+  assert.deepEqual(keys, [
+    "local-runtime/0123456789abcdef/antfly/antfly.wasm",
+    "local-runtime/0123456789abcdef/missing.js",
+  ]);
+});
+
 test("local documents carry display fields, one lexical field and the vector", () => {
   const message = {
     id: crypto.randomUUID(),
