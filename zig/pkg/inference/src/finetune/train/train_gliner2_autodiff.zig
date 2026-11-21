@@ -4396,7 +4396,6 @@ fn populateCudaWeights(
     var it = store.resident_weights.iterator();
     while (it.next()) |entry| {
         const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
-        errdefer allocator.free(owned_key);
         try cuda.insertWeightFromLoaded(owned_key, entry.value_ptr);
     }
 }
@@ -4410,7 +4409,6 @@ fn populateCudaNamedWeight(
     if (comptime !build_options.enable_cuda) return error.CudaBackendUnavailable;
     const loaded = store.resident_weights.getPtr(name) orelse return error.MissingWeight;
     const owned_key = try allocator.dupe(u8, name);
-    errdefer allocator.free(owned_key);
     try cuda.insertWeightFromLoaded(owned_key, loaded);
 }
 

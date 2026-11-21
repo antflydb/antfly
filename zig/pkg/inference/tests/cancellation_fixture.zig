@@ -203,7 +203,7 @@ pub fn main(init: std.process.Init) !void {
             .vtable = &Fixture.vtable,
             .execution_gate = &fixture.execution_gate,
             .run_admission = .{
-                .controller = &node.model_manager.resource_domain.?.admission,
+                .controller = node.model_manager.resource_domain.?.admission,
                 .backend_class = .cpu,
                 .limits = .{},
                 .static_workspace_bytes = 4096,

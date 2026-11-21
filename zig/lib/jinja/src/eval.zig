@@ -346,6 +346,8 @@ pub const Eval = struct {
                     .is_none => Value.bln(val == .none),
                     .is_not_none => Value.bln(val != .none),
                     .is_boolean => Value.bln(val == .boolean),
+                    .is_true => Value.bln(val == .boolean and val.boolean),
+                    .is_false => Value.bln(val == .boolean and !val.boolean),
                 };
             },
             .call => |c| {
@@ -562,30 +564,48 @@ pub const Eval = struct {
             else => return .undefined,
         };
 
-        const len: i64 = @intCast(items.len);
-        var start: i64 = 0;
-        var stop: i64 = len;
+        // Use wide arithmetic so extreme negative indices/steps cannot overflow
+        // while normalizing. Omitted reverse bounds differ from explicit -1.
+        const len: i128 = @intCast(items.len);
+        const step: i128 = if (sl.step) |value| try self.sliceInteger(value) else 1;
+        if (step == 0) return error.InvalidArguments;
+        const lower: i128 = if (step > 0) 0 else -1;
+        const upper = if (step > 0) len else len - 1;
+        const start = if (sl.start) |value|
+            std.math.clamp(try self.sliceIndex(value, len), lower, upper)
+        else if (step > 0) 0 else len - 1;
+        const stop = if (sl.stop) |value|
+            std.math.clamp(try self.sliceIndex(value, len), lower, upper)
+        else if (step > 0) len else -1;
+        const distance = if (step > 0) stop - start else start - stop;
+        const stride = if (step > 0) step else -step;
+        const count: usize = @intCast(if (distance <= 0) 0 else @divTrunc(distance + stride - 1, stride));
+        if (count == 0) return .{ .list = &.{} };
+        // Keep the common contiguous slice as a borrowed view.
+        if (step == 1) return .{ .list = items[@intCast(start)..@intCast(stop)] };
+        const result = try self.arena.alloc(Value, count);
+        for (result, 0..) |*item, i| item.* = items[@intCast(start + @as(i128, @intCast(i)) * step)];
+        return .{ .list = result };
+    }
 
-        if (sl.start) |s| {
-            const sv = try self.evalExpr(s);
-            if (sv == .integer) start = sv.integer;
-        }
-        if (sl.stop) |s| {
-            const sv = try self.evalExpr(s);
-            if (sv == .integer) stop = sv.integer;
-        }
+    fn sliceInteger(self: *Eval, expr: *ast.Expr) !i64 {
+        const value = try self.evalExpr(expr);
+        if (value != .integer) return error.InvalidArguments;
+        return value.integer;
+    }
 
-        // Normalize negative indices
-        if (start < 0) start = @max(0, len + start);
-        if (stop < 0) stop = @max(0, len + stop);
-        start = @min(start, len);
-        stop = @min(stop, len);
-        if (start >= stop) return .{ .list = &.{} };
-
-        return .{ .list = items[@intCast(start)..@intCast(stop)] };
+    fn sliceIndex(self: *Eval, expr: *ast.Expr, len: i128) !i128 {
+        const index: i128 = try self.sliceInteger(expr);
+        return if (index < 0) len + index else index;
     }
 
     fn applyFilter(self: *Eval, val: Value, name: []const u8, args: []const *ast.Expr) !Value {
+        if (std.mem.eql(u8, name, "tojson")) {
+            if (args.len != 0) return error.InvalidArguments;
+            var json = std.ArrayListUnmanaged(u8).empty;
+            try self.appendJson(&json, val);
+            return Value.str(try json.toOwnedSlice(self.arena));
+        }
         if (std.mem.eql(u8, name, "trim")) {
             if (val == .string) {
                 return Value.str(std.mem.trim(u8, val.string, &.{ ' ', '\t', '\n', '\r' }));
@@ -683,6 +703,73 @@ pub const Eval = struct {
         return val; // unknown filter — pass through
     }
 
+    /// Jinja's default tojson uses sorted keys, ASCII JSON and HTML-safe strings.
+    /// Serialize values rather than emitting diagnostic [map]/[list] text into
+    /// checkpoint tool-call prompts. Punctuation matches Python's default dumps.
+    fn appendJson(self: *Eval, out: *std.ArrayListUnmanaged(u8), value: Value) anyerror!void {
+        switch (value) {
+            .map => |map| {
+                const keys = try self.arena.dupe([]const u8, map.keys());
+                std.mem.sort([]const u8, keys, {}, struct {
+                    fn less(_: void, a: []const u8, b: []const u8) bool {
+                        return std.mem.order(u8, a, b) == .lt;
+                    }
+                }.less);
+                try out.append(self.arena, '{');
+                for (keys, 0..) |key, i| {
+                    if (i > 0) try out.appendSlice(self.arena, ", ");
+                    try self.appendJson(out, Value.str(key));
+                    try out.appendSlice(self.arena, ": ");
+                    try self.appendJson(out, map.get(key).?);
+                }
+                try out.append(self.arena, '}');
+            },
+            .list => |items| {
+                try out.append(self.arena, '[');
+                for (items, 0..) |item, i| {
+                    if (i > 0) try out.appendSlice(self.arena, ", ");
+                    try self.appendJson(out, item);
+                }
+                try out.append(self.arena, ']');
+            },
+            .string => |text| {
+                const encoded = try std.json.Stringify.valueAlloc(self.arena, text, .{ .escape_unicode = true });
+                for (encoded) |byte| switch (byte) {
+                    '<' => try out.appendSlice(self.arena, "\\u003c"),
+                    '>' => try out.appendSlice(self.arena, "\\u003e"),
+                    '&' => try out.appendSlice(self.arena, "\\u0026"),
+                    '\'' => try out.appendSlice(self.arena, "\\u0027"),
+                    else => try out.append(self.arena, byte),
+                };
+            },
+            .integer => |number| try out.appendSlice(self.arena, try std.json.Stringify.valueAlloc(self.arena, number, .{})),
+            .float => |number| try self.appendJsonFloat(out, number),
+            .boolean => |boolean| try out.appendSlice(self.arena, if (boolean) "true" else "false"),
+            .none => try out.appendSlice(self.arena, "null"),
+            .undefined, .macro => return error.InvalidArguments,
+        }
+    }
+
+    fn appendJsonFloat(self: *Eval, out: *std.ArrayListUnmanaged(u8), number: f64) !void {
+        if (std.math.isNan(number)) return out.appendSlice(self.arena, "NaN");
+        if (std.math.isInf(number)) return out.appendSlice(self.arena, if (number < 0) "-Infinity" else "Infinity");
+        var buffer: [std.fmt.float.bufferSize(.decimal, f64)]u8 = undefined;
+        const scientific = try std.fmt.float.render(&buffer, number, .{ .mode = .scientific });
+        const e = std.mem.indexOfScalar(u8, scientific, 'e').?;
+        const exponent = try std.fmt.parseInt(i32, scientific[e + 1 ..], 10);
+        if (exponent >= -4 and exponent < 16) {
+            const decimal = try std.fmt.float.render(&buffer, number, .{ .mode = .decimal });
+            try out.appendSlice(self.arena, decimal);
+            if (std.mem.indexOfScalar(u8, decimal, '.') == null) try out.appendSlice(self.arena, ".0");
+        } else {
+            try out.appendSlice(self.arena, scientific[0..e]);
+            try out.appendSlice(self.arena, if (exponent < 0) "e-" else "e+");
+            const magnitude: u32 = @intCast(if (exponent < 0) -exponent else exponent);
+            if (magnitude < 10) try out.append(self.arena, '0');
+            try out.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, "{d}", .{magnitude}));
+        }
+    }
+
     // --- Macro calls ---
 
     fn callMacro(self: *Eval, mac: MacroValue, args: []const *ast.Expr, kwargs: []const ast.KwArg) anyerror!Value {
@@ -742,6 +829,24 @@ pub const Eval = struct {
             return obj.map.get(key.string) orelse if (args.len == 2) try self.evalExpr(args[1]) else .none;
         }
         if (obj == .string) {
+            if (std.mem.eql(u8, method, "startswith") or std.mem.eql(u8, method, "endswith")) {
+                if (args.len != 1) return error.InvalidArguments;
+                const pattern = try self.evalExpr(args[0]);
+                if (pattern != .string) return error.InvalidArguments;
+                return Value.bln(if (std.mem.eql(u8, method, "startswith"))
+                    std.mem.startsWith(u8, obj.string, pattern.string)
+                else
+                    std.mem.endsWith(u8, obj.string, pattern.string));
+            }
+            if (std.mem.eql(u8, method, "strip") or std.mem.eql(u8, method, "lstrip") or std.mem.eql(u8, method, "rstrip")) {
+                if (args.len > 1) return error.InvalidArguments;
+                const chars = if (args.len == 1) blk: {
+                    const value = try self.evalExpr(args[0]);
+                    if (value != .string) return error.InvalidArguments;
+                    break :blk value.string;
+                } else " \t\n\r\x0b\x0c\u{1c}\u{1d}\u{1e}\u{1f}\u{85}\u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+                return Value.str(try trimUnicodeString(obj.string, chars, !std.mem.eql(u8, method, "rstrip"), !std.mem.eql(u8, method, "lstrip")));
+            }
             if (std.mem.eql(u8, method, "split")) {
                 if (args.len > 0) {
                     const sep_val = try self.evalExpr(args[0]);
@@ -752,6 +857,27 @@ pub const Eval = struct {
             }
         }
         return .undefined;
+    }
+
+    fn trimUnicodeString(text: []const u8, chars: []const u8, left: bool, right: bool) ![]const u8 {
+        const char_view = try std.unicode.Utf8View.init(chars);
+        var iter = (try std.unicode.Utf8View.init(text)).iterator();
+        var first: ?usize = null;
+        var last: usize = 0;
+        var offset: usize = 0;
+        while (iter.nextCodepointSlice()) |codepoint| {
+            var candidates = char_view.iterator();
+            const matches = while (candidates.nextCodepointSlice()) |candidate| {
+                if (std.mem.eql(u8, candidate, codepoint)) break true;
+            } else false;
+            if (!matches) {
+                if (first == null) first = offset;
+                last = offset + codepoint.len;
+            }
+            offset += codepoint.len;
+        }
+        if (first == null) return text[0..0];
+        return text[if (left) first.? else 0..if (right) last else text.len];
     }
 
     fn evalRange(self: *Eval, args: []const *ast.Expr) !Value {

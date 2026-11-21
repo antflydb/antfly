@@ -141,7 +141,12 @@ pub fn convertNodeWithScope(
 
         // Activations (fused)
         .Relu => builder.relu(inputs[0]),
-        .Gelu => builder.gelu(inputs[0]),
+        .Gelu => blk: {
+            const approximation = getString(node.attributes, "approximate", "none");
+            if (std.mem.eql(u8, approximation, "none")) break :blk builder.geluExact(inputs[0]);
+            if (std.mem.eql(u8, approximation, "tanh")) break :blk builder.gelu(inputs[0]);
+            return error.InvalidAttribute;
+        },
         .FastGelu => builder.gelu(inputs[0]),
         .Sigmoid => convertSigmoid(builder, inputs[0]),
         .Silu => builder.silu(inputs[0]),
@@ -237,7 +242,7 @@ pub fn convertNodeWithScope(
         .GroupNormalization => convertGroupNorm(builder, node, inputs),
         .SkipLayerNormalization => convertSkipLayerNorm(builder, node, inputs),
         .If => convertIf(allocator, builder, node, inputs, extra_outputs, outer_scope),
-        .Loop => convertLoop(allocator, builder, node, inputs, outer_scope),
+        .Loop => convertLoop(allocator, builder, node, inputs, extra_outputs, outer_scope),
         .Scan => convertScan(allocator, builder, node, inputs, extra_outputs, outer_scope),
     };
 }
@@ -4875,171 +4880,87 @@ fn cubicResizeWeight(x: f32, a: f32) f32 {
 /// We unroll by inlining the body sub-graph N times, chaining
 /// loop-carried deps from one iteration to the next. Scan outputs
 /// are concatenated across iterations.
+/// Inline a supported subgraph. Never substitute a primary result for an
+/// unimplemented secondary output or leave stale state after a failed body op.
+fn inlineSubgraph(
+    allocator: std.mem.Allocator,
+    builder: *Builder,
+    body: *const proto.GraphProto,
+    names: *std.StringHashMapUnmanaged(NodeId),
+    outer_scope: ?*const NameScope,
+) ConvertError!void {
+    for (body.initializers) |initializer| {
+        var attributes = [_]AttributeProto{.{ .name = "value", .t = initializer, .attr_type = .tensor }};
+        const constant = NodeProto{ .op_type = "Constant", .attributes = &attributes };
+        try names.put(allocator, initializer.name, try convertConstant(allocator, builder, &constant));
+    }
+    const scope = NameScope{ .map = names, .parent = outer_scope };
+    for (body.nodes) |*node| {
+        if (node.inputs.len > 16 or node.outputs.len == 0 or node.outputs.len > 8) return error.UnsupportedOp;
+        var inputs: [16]NodeId = @splat(null_node);
+        for (node.inputs, 0..) |name, i| {
+            if (name.len > 0) inputs[i] = scope.lookup(name) orelse return error.MissingInput;
+        }
+        var extras: [7]NodeId = @splat(null_node);
+        const primary = try convertNodeWithScope(allocator, builder, node, inputs[0..node.inputs.len], extras[0 .. node.outputs.len - 1], &scope);
+        for (node.outputs, 0..) |name, i| {
+            if (name.len == 0) continue;
+            const id = if (i == 0) primary else extras[i - 1];
+            if (id == null_node) return error.UnsupportedOp;
+            try names.put(allocator, name, id);
+        }
+    }
+    for (body.outputs) |output| {
+        if (scope.lookup(output.name) == null) return error.MissingInput;
+    }
+}
+
 fn convertLoop(
     allocator: std.mem.Allocator,
     builder: *Builder,
     node: *const NodeProto,
     inputs: []const NodeId,
+    extra_outputs: ?[]NodeId,
     outer_scope: ?*const NameScope,
 ) ConvertError!NodeId {
     if (inputs.len < 2) return error.MissingInput;
+    const body = getGraph(node.attributes, "body") orelse return error.UnsupportedOp;
+    if (body.inputs.len != inputs.len or inputs.len < 3) return error.UnsupportedOp;
+    const num_carried = inputs.len - 2;
+    // Scan outputs need empty/stacked tensor semantics which this unroller does
+    // not implement. Reject them instead of returning a carried value for them.
+    if (body.outputs.len != num_carried + 1) return error.UnsupportedOp;
+    if (node.outputs.len > 0 and node.outputs.len != num_carried) return error.UnsupportedOp;
 
-    // inputs[0] = max_trip_count M, inputs[1] = initial condition
-    // inputs[2..] = initial loop-carried dependencies
-    const trip_count_value = materializeConstantScalar(builder, inputs[0]);
-    if (trip_count_value == null) {
-        log.warn("Loop: cannot unroll — trip count is not a constant", .{});
-        return error.UnsupportedOp;
+    if (inputs[0] == null_node) return error.UnsupportedOp;
+    const trip_value = materializeConstantScalar(builder, inputs[0]) orelse return error.UnsupportedOp;
+    if (!std.math.isFinite(trip_value) or @trunc(trip_value) != trip_value) return error.InvalidAttribute;
+    if (trip_value > 128) return error.UnsupportedOp;
+    const trip_count: usize = @intFromFloat(@max(0, trip_value));
+    var condition = if (inputs[1] == null_node) try builder.scalarConst(.bool_, 1) else inputs[1];
+    const carried = try allocator.dupe(NodeId, inputs[2..]);
+    defer allocator.free(carried);
+    for (0..trip_count) |iteration| {
+        const active = materializeConstantScalar(builder, condition) orelse return error.UnsupportedOp;
+        if (active == 0) break;
+        var names: std.StringHashMapUnmanaged(NodeId) = .empty;
+        defer names.deinit(allocator);
+        const iter = try builder.scalarConst(.i64, @floatFromInt(iteration));
+        try names.put(allocator, body.inputs[0].name, iter);
+        try names.put(allocator, body.inputs[1].name, condition);
+        for (carried, body.inputs[2..]) |id, input| try names.put(allocator, input.name, id);
+        try inlineSubgraph(allocator, builder, body, &names, outer_scope);
+        const scope = NameScope{ .map = &names, .parent = outer_scope };
+        condition = scope.lookup(body.outputs[0].name) orelse return error.MissingInput;
+        for (carried, body.outputs[1..]) |*id, output| id.* = scope.lookup(output.name) orelse return error.MissingInput;
     }
-
-    const trip_count: usize = @intFromFloat(trip_count_value.?);
-    if (trip_count == 0) {
-        // Zero iterations: return initial loop-carried deps.
-        // Loop returns loop_carried + scan_outputs. With 0 iters, scan outputs are empty.
-        if (inputs.len > 2) return inputs[2]; // first loop-carried dep
-        return inputs[0]; // fallback
-    }
-    if (trip_count > 128) {
-        log.warn("Loop: trip count {d} exceeds unroll limit of 128", .{trip_count});
-        return error.UnsupportedOp;
-    }
-
-    const body_graph = getGraph(node.attributes, "body") orelse return error.UnsupportedOp;
-    if (body_graph.nodes.len == 0 or body_graph.inputs.len < 2) return error.UnsupportedOp;
-
-    const num_loop_carried = body_graph.inputs.len - 2; // subtract iter_num and cond
-    const num_body_outputs = body_graph.outputs.len;
-    if (num_body_outputs == 0) return error.UnsupportedOp;
-    const num_scan_outputs = if (num_body_outputs > num_loop_carried + 1)
-        num_body_outputs - num_loop_carried - 1
-    else
-        0;
-
-    // Build output-name → node-index map for the sub-graph
-    var body_output_map = std.StringHashMapUnmanaged(u32).empty;
-    defer body_output_map.deinit(allocator);
-    for (body_graph.nodes, 0..) |*bn, idx| {
-        for (bn.outputs) |out_name| {
-            if (out_name.len > 0) {
-                try body_output_map.put(allocator, out_name, @intCast(idx));
-            }
+    if (extra_outputs) |extras| {
+        for (carried[1..], 0..) |id, i| {
+            if (i >= extras.len) break;
+            extras[i] = id;
         }
     }
-
-    // Current loop-carried values (start with initial values from inputs[2..])
-    var carried = std.ArrayListUnmanaged(NodeId).empty;
-    defer carried.deinit(allocator);
-    for (0..num_loop_carried) |i| {
-        const input_idx = i + 2;
-        if (input_idx < inputs.len) {
-            try carried.append(allocator, inputs[input_idx]);
-        } else {
-            try carried.append(allocator, null_node);
-        }
-    }
-
-    // Accumulate scan outputs per iteration for later concat
-    var scan_accum = std.ArrayListUnmanaged(std.ArrayListUnmanaged(NodeId)).empty;
-    defer {
-        for (scan_accum.items) |*s| s.deinit(allocator);
-        scan_accum.deinit(allocator);
-    }
-    for (0..num_scan_outputs) |_| {
-        try scan_accum.append(allocator, std.ArrayListUnmanaged(NodeId).empty);
-    }
-
-    // Unroll: for each iteration, inline the body sub-graph
-    for (0..trip_count) |iter| {
-        // Map body input names → current values
-        var name_map = std.StringHashMapUnmanaged(NodeId).empty;
-        defer name_map.deinit(allocator);
-
-        // Body input 0: iteration number (i64 scalar)
-        const iter_const = try builder.scalarConst(.i32, @floatFromInt(iter));
-        if (body_graph.inputs.len > 0 and body_graph.inputs[0].name.len > 0) {
-            try name_map.put(allocator, body_graph.inputs[0].name, iter_const);
-        }
-        // Body input 1: condition (pass through)
-        if (body_graph.inputs.len > 1 and body_graph.inputs[1].name.len > 0) {
-            try name_map.put(allocator, body_graph.inputs[1].name, inputs[1]);
-        }
-        // Body inputs 2..N: loop-carried deps
-        for (0..num_loop_carried) |ci| {
-            if (ci + 2 < body_graph.inputs.len and body_graph.inputs[ci + 2].name.len > 0) {
-                try name_map.put(allocator, body_graph.inputs[ci + 2].name, carried.items[ci]);
-            }
-        }
-
-        // Nested scope for implicit captures (outer-graph references).
-        const body_scope = NameScope{ .map = &name_map, .parent = outer_scope };
-
-        // Process body nodes in order (they should be topologically sorted)
-        for (body_graph.nodes) |*bn| {
-            // Resolve inputs — skip node if any required input is unmapped
-            var body_inp: [16]NodeId = @splat(null_node);
-            const ninp = @min(bn.inputs.len, 16);
-            var all_resolved = true;
-            for (0..ninp) |bi| {
-                if (bn.inputs[bi].len > 0) {
-                    if (body_scope.lookup(bn.inputs[bi])) |nid| {
-                        body_inp[bi] = nid;
-                    } else {
-                        all_resolved = false;
-                        break;
-                    }
-                }
-            }
-            if (!all_resolved) continue;
-
-            // Convert the node
-            const result_id = convertNodeWithScope(allocator, builder, bn, body_inp[0..ninp], null, &body_scope) catch |e| switch (e) {
-                error.UnsupportedOp => {
-                    log.warn("Loop body iter {d}: skipping unsupported op '{s}'", .{ iter, bn.op_type });
-                    continue;
-                },
-                else => {
-                    log.warn("Loop body iter {d}: {s} failed: {}", .{ iter, bn.op_type, e });
-                    return e;
-                },
-            };
-
-            // Map outputs
-            if (bn.outputs.len > 0 and bn.outputs[0].len > 0) {
-                try name_map.put(allocator, bn.outputs[0], result_id);
-            }
-            for (bn.outputs[1..]) |out_name| {
-                if (out_name.len > 0) {
-                    try name_map.put(allocator, out_name, result_id);
-                }
-            }
-        }
-
-        // Extract body outputs: [cond_out, v_1_out, ..., scan_1, ...]
-        // Update loop-carried values
-        for (0..num_loop_carried) |ci| {
-            const out_idx = ci + 1; // skip cond_out
-            if (out_idx < body_graph.outputs.len and body_graph.outputs[out_idx].name.len > 0) {
-                if (name_map.get(body_graph.outputs[out_idx].name)) |nid| {
-                    carried.items[ci] = nid;
-                }
-            }
-        }
-
-        // Accumulate scan outputs
-        for (0..num_scan_outputs) |si| {
-            const out_idx = num_loop_carried + 1 + si;
-            if (out_idx < body_graph.outputs.len and body_graph.outputs[out_idx].name.len > 0) {
-                if (name_map.get(body_graph.outputs[out_idx].name)) |nid| {
-                    try scan_accum.items[si].append(allocator, nid);
-                }
-            }
-        }
-    }
-
-    // Loop outputs: [final_loop_carried..., concat(scan_outputs)...]
-    // The primary output (index 0) is typically the first loop-carried dep
-    if (carried.items.len > 0) return carried.items[0];
-    return inputs[0]; // fallback
+    return carried[0];
 }
 
 /// Convert ONNX Scan by unrolling over the sequence dimension.
@@ -5092,26 +5013,35 @@ fn convertScan(
     }
     const K: usize = body_graph.outputs.len - N; // number of scan output elements per step
 
+    if (M > 8 or K > 8) return error.UnsupportedOp;
+    if (node.outputs.len > 0 and node.outputs.len != N + K) return error.UnsupportedOp;
+    for ([_][]const u8{ "scan_input_axes", "scan_input_directions", "scan_output_axes", "scan_output_directions" }, [_]usize{ M, M, K, K }) |name, expected| {
+        const values = getInts(node.attributes, name);
+        if (values.len != 0 and values.len != expected) return error.InvalidAttribute;
+    }
+
     // scan_input_axes: which axis to iterate for each scan input (default all 0)
     const scan_input_axes_attr = getInts(node.attributes, "scan_input_axes");
     var scan_input_axes: [8]u8 = @splat(0);
     for (0..M) |i| {
         if (i < scan_input_axes_attr.len) {
-            scan_input_axes[i] = @intCast(scan_input_axes_attr[i]);
+            const rank = builder.graph.node(inputs[N + i]).output_shape.rank();
+            const axis = scan_input_axes_attr[i];
+            const normalized = if (axis < 0) axis + rank else axis;
+            if (normalized < 0 or normalized >= rank) return error.InvalidAttribute;
+            scan_input_axes[i] = @intCast(normalized);
         }
     }
 
     // scan_input_directions: 0=forward, 1=backward (default all forward)
     const scan_input_dirs_attr = getInts(node.attributes, "scan_input_directions");
+    const scan_output_dirs = getInts(node.attributes, "scan_output_directions");
+    for (scan_input_dirs_attr) |direction| if (direction != 0 and direction != 1) return error.InvalidAttribute;
+    for (scan_output_dirs) |direction| if (direction != 0 and direction != 1) return error.InvalidAttribute;
 
     // scan_output_axes: which axis to accumulate scan outputs along (default all 0)
     const scan_output_axes_attr = getInts(node.attributes, "scan_output_axes");
     var scan_output_axes: [8]u8 = @splat(0);
-    for (0..K) |i| {
-        if (i < scan_output_axes_attr.len) {
-            scan_output_axes[i] = @intCast(scan_output_axes_attr[i]);
-        }
-    }
 
     // Determine sequence length from first scan input
     const first_scan_idx = N; // first scan input in node inputs
@@ -5122,6 +5052,10 @@ fn convertScan(
         return error.UnsupportedOp;
     }
     const seq_len_u: usize = @intCast(seq_len);
+    for (0..M) |mi| {
+        const shape = builder.graph.node(inputs[N + mi]).output_shape;
+        if (shape.rank() == 0 or shape.dim(scan_input_axes[mi]) != seq_len) return error.ShapeMismatch;
+    }
 
     // Initialize state variables
     var state = std.ArrayListUnmanaged(NodeId).empty;
@@ -5206,63 +5140,23 @@ fn convertScan(
             const squeezed_shape = Shape{
                 .dtype = scan_shape.dtype,
                 .dims = squeezed_dims,
-                .rank_ = if (rank > 1) rank - 1 else 1,
+                .rank_ = rank - 1,
             };
-            const slice_elem = if (rank > 1)
-                try builder.reshape(sliced, squeezed_shape)
-            else
-                sliced;
+            const slice_elem = try builder.reshape(sliced, squeezed_shape);
 
             if (N + mi < body_graph.inputs.len and body_graph.inputs[N + mi].name.len > 0) {
                 try name_map.put(allocator, body_graph.inputs[N + mi].name, slice_elem);
             }
         }
 
-        // Nested scope for implicit captures from outer graph.
+        try inlineSubgraph(allocator, builder, body_graph, &name_map, outer_scope);
+
         const body_scope = NameScope{ .map = &name_map, .parent = outer_scope };
-
-        // Process body nodes in topological order
-        for (body_graph.nodes) |*bn| {
-            var body_inp: [16]NodeId = @splat(null_node);
-            const ninp = @min(bn.inputs.len, 16);
-            var all_resolved = true;
-            for (0..ninp) |bi| {
-                if (bn.inputs[bi].len > 0) {
-                    if (body_scope.lookup(bn.inputs[bi])) |nid| {
-                        body_inp[bi] = nid;
-                    } else {
-                        all_resolved = false;
-                        break;
-                    }
-                }
-            }
-            if (!all_resolved) continue;
-
-            const result_id = convertNodeWithScope(allocator, builder, bn, body_inp[0..ninp], null, &body_scope) catch |e| switch (e) {
-                error.UnsupportedOp => {
-                    log.warn("Scan body step {d}: skipping unsupported op '{s}'", .{ t_raw, bn.op_type });
-                    continue;
-                },
-                else => {
-                    log.warn("Scan body step {d}: {s} failed: {}", .{ t_raw, bn.op_type, e });
-                    return e;
-                },
-            };
-
-            if (bn.outputs.len > 0 and bn.outputs[0].len > 0) {
-                try name_map.put(allocator, bn.outputs[0], result_id);
-            }
-            for (bn.outputs[1..]) |out_name| {
-                if (out_name.len > 0) {
-                    try name_map.put(allocator, out_name, result_id);
-                }
-            }
-        }
 
         // Extract body outputs: first N are updated state, rest are scan elements
         for (0..N) |i| {
             if (body_graph.outputs[i].name.len > 0) {
-                if (name_map.get(body_graph.outputs[i].name)) |nid| {
+                if (body_scope.lookup(body_graph.outputs[i].name)) |nid| {
                     state.items[i] = nid;
                 }
             }
@@ -5270,11 +5164,16 @@ fn convertScan(
         for (0..K) |ki| {
             const out_idx = N + ki;
             if (out_idx < body_graph.outputs.len and body_graph.outputs[out_idx].name.len > 0) {
-                if (name_map.get(body_graph.outputs[out_idx].name)) |nid| {
+                if (body_scope.lookup(body_graph.outputs[out_idx].name)) |nid| {
                     // Unsqueeze: insert dim=1 at scan_output_axis for concat
-                    const out_axis: u8 = scan_output_axes[ki];
                     const elem_shape = builder.graph.node(nid).output_shape;
                     const elem_rank = elem_shape.rank();
+                    if (elem_rank >= 8) return error.TooManyDimensions;
+                    const declared_axis = if (ki < scan_output_axes_attr.len) scan_output_axes_attr[ki] else 0;
+                    const normalized_axis = if (declared_axis < 0) declared_axis + elem_rank + 1 else declared_axis;
+                    if (normalized_axis < 0 or normalized_axis > elem_rank) return error.InvalidAttribute;
+                    const out_axis: u8 = @intCast(normalized_axis);
+                    scan_output_axes[ki] = out_axis;
                     var unsq_dims: [8]i64 = @splat(0);
                     var di: u8 = 0;
                     for (0..elem_rank + 1) |d| {
@@ -5302,7 +5201,8 @@ fn convertScan(
     defer scan_results.deinit(allocator);
     for (0..K) |ki| {
         const elems = scan_accum.items[ki].items;
-        if (elems.len == 0) continue;
+        if (elems.len != seq_len_u) return error.UnsupportedOp;
+        if (ki < scan_output_dirs.len and scan_output_dirs[ki] == 1) std.mem.reverse(NodeId, elems);
         const out_axis: u8 = scan_output_axes[ki];
         var result = elems[0];
         for (elems[1..]) |next| {
@@ -5379,57 +5279,18 @@ fn convertIf(
             }
         }
 
-        // Nested scope: local name_map wins, otherwise fall back to outer_scope
-        // so body nodes can capture parent-graph values implicitly.
+        try inlineSubgraph(allocator, builder, branch_graph, &name_map, outer_scope);
         const body_scope = NameScope{ .map = &name_map, .parent = outer_scope };
-
-        // Process branch body nodes in topological order
-        for (branch_graph.nodes) |*bn| {
-            var body_inp: [16]NodeId = @splat(null_node);
-            const ninp = @min(bn.inputs.len, 16);
-            var all_resolved = true;
-            for (0..ninp) |bi| {
-                if (bn.inputs[bi].len > 0) {
-                    if (body_scope.lookup(bn.inputs[bi])) |nid| {
-                        body_inp[bi] = nid;
-                    } else {
-                        all_resolved = false;
-                        break;
-                    }
-                }
-            }
-            if (!all_resolved) continue;
-
-            const result_id = convertNodeWithScope(allocator, builder, bn, body_inp[0..ninp], null, &body_scope) catch |e| switch (e) {
-                error.UnsupportedOp => {
-                    log.warn("If {s}: skipping unsupported op '{s}'", .{ branch_name, bn.op_type });
-                    continue;
-                },
-                else => {
-                    log.warn("If {s}: {s} failed: {}", .{ branch_name, bn.op_type, e });
-                    return e;
-                },
-            };
-
-            // Map all outputs
-            for (bn.outputs, 0..) |out_name, oi| {
-                if (out_name.len > 0) {
-                    // For multi-output sub-ops, first output gets the result_id
-                    _ = oi;
-                    try name_map.put(allocator, out_name, result_id);
-                }
-            }
-        }
 
         // Extract branch outputs — these correspond to the If node's outputs
         if (branch_graph.outputs.len > 0 and branch_graph.outputs[0].name.len > 0) {
-            if (name_map.get(branch_graph.outputs[0].name)) |primary| {
+            if (body_scope.lookup(branch_graph.outputs[0].name)) |primary| {
                 // Fill extra outputs for multi-output If
                 if (extra_outputs) |eo| {
                     for (branch_graph.outputs[1..], 0..) |out, ei| {
                         if (ei >= eo.len) break;
                         if (out.name.len > 0) {
-                            if (name_map.get(out.name)) |nid| {
+                            if (body_scope.lookup(out.name)) |nid| {
                                 eo[ei] = nid;
                             }
                         }
@@ -7849,7 +7710,14 @@ test "convertNode Gelu emits fused" {
     const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
     const node = NodeProto{ .op_type = "Gelu" };
     const result = try convertNode(allocator, &b, &node, &.{x}, null);
-    try std.testing.expect(g.node(result).op.isFused());
+    try std.testing.expect(g.node(result).op == .fused_gelu_exact);
+    var approximate_attrs = [_]proto.AttributeProto{.{ .name = "approximate", .s = "tanh" }};
+    const approximate = NodeProto{ .op_type = "Gelu", .attributes = &approximate_attrs };
+    const tanh_result = try convertNode(allocator, &b, &approximate, &.{x}, null);
+    try std.testing.expect(g.node(tanh_result).op == .fused_gelu);
+    var unsupported_attrs = [_]proto.AttributeProto{.{ .name = "approximate", .s = "other" }};
+    const unsupported = NodeProto{ .op_type = "Gelu", .attributes = &unsupported_attrs };
+    try std.testing.expectError(error.InvalidAttribute, convertNode(allocator, &b, &unsupported, &.{x}, null));
 }
 
 test "convertNode Softmax emits fused" {
@@ -8449,7 +8317,7 @@ test "convertNodeWithScope Loop body captures outer-scope value" {
         .{ .name = "v_in" },
     };
     var body_outputs = [_]proto.ValueInfoProto{
-        .{ .name = "cond_out" },
+        .{ .name = "cond_in" },
         .{ .name = "v_out" },
     };
     _ = &body_nodes;
@@ -8523,7 +8391,7 @@ test "convertNode Loop unrolls constant iterations" {
         .{ .name = "v_in" },
     };
     var body_outputs = [_]proto.ValueInfoProto{
-        .{ .name = "cond_out" },
+        .{ .name = "cond_in" },
         .{ .name = "v_out" },
     };
     _ = &body_nodes;
@@ -8940,4 +8808,43 @@ test "convertNode GatherND infers coordinate slices and validates batch dimensio
     const bad_depth = try b.parameter("bad_depth", Shape.init(.i64, &.{ 5, 4 }));
     const unbatched = NodeProto{ .op_type = "GatherND" };
     try std.testing.expectError(error.InvalidAttribute, convertNode(a, &b, &unbatched, &.{ data, bad_depth }, null));
+}
+
+test "control flow Loop honors conditions and rejects incomplete semantics" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = Builder.init(&graph);
+    const trip = try b.scalarConst(.i64, 3);
+    const yes = try b.scalarConst(.bool_, 1);
+    const no = try b.scalarConst(.bool_, 0);
+    const x = try b.parameter("x", Shape.init(.f32, &.{4}));
+    const dynamic = try b.parameter("condition", Shape.scalar(.bool_));
+    var body_inputs = [_]proto.ValueInfoProto{ .{ .name = "i" }, .{ .name = "cond" }, .{ .name = "value" } };
+    var body_outputs = [_]proto.ValueInfoProto{ .{ .name = "cond" }, .{ .name = "out" } };
+    var body_in = [_][]const u8{ "value", "value" };
+    var body_out = [_][]const u8{"out"};
+    var nodes = [_]NodeProto{.{ .op_type = "Add", .inputs = &body_in, .outputs = &body_out }};
+    var attrs = [_]AttributeProto{.{ .name = "body", .attr_type = .graph, .g = .{ .nodes = &nodes, .inputs = &body_inputs, .outputs = &body_outputs } }};
+    const loop = NodeProto{ .op_type = "Loop", .attributes = &attrs };
+    try std.testing.expectEqual(x, try convertNode(a, &b, &loop, &.{ trip, no, x }, null));
+    try std.testing.expectError(error.UnsupportedOp, convertNode(a, &b, &loop, &.{ trip, dynamic, x }, null));
+    nodes[0].op_type = "UnimplementedBodyOp";
+    try std.testing.expectError(error.UnsupportedOp, convertNode(a, &b, &loop, &.{ trip, yes, x }, null));
+    nodes[0].op_type = "Add";
+    body_in[0] = "unresolved";
+    try std.testing.expectError(error.MissingInput, convertNode(a, &b, &loop, &.{ trip, yes, x }, null));
+    body_in[0] = "value";
+    // The body can stop after its first iteration, with a captured constant.
+    var outer_names: std.StringHashMapUnmanaged(NodeId) = .empty;
+    defer outer_names.deinit(a);
+    try outer_names.put(a, "stop", no);
+    const scope = NameScope{ .map = &outer_names };
+    body_outputs[0].name = "stop";
+    const once = try convertNodeWithScope(a, &b, &loop, &.{ trip, yes, x }, null, &scope);
+    try std.testing.expectEqual(x, graph.node(once).inputs[0]);
+    try std.testing.expectEqual(x, graph.node(once).inputs[1]);
+    // A missing body output cannot leave the previous carried value in place.
+    body_outputs[1].name = "missing";
+    try std.testing.expectError(error.MissingInput, convertNodeWithScope(a, &b, &loop, &.{ trip, yes, x }, null, &scope));
 }

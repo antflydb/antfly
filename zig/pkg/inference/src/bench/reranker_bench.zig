@@ -104,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
         printResult(opts, opts.docs.items.len, result);
     }
 
-    if (opts.format == .text and model.session.backend() != .onnx) {
+    if (opts.format == .text) {
         var debug_backend = session_factory.getComputeBackend(model.session, allocator) catch |err| switch (err) {
             error.NotArchSession => return,
             else => return err,

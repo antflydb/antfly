@@ -16,6 +16,7 @@
 pub const planner = @import("planner.zig");
 pub const cache = @import("cache.zig");
 pub const memory = @import("memory.zig");
+pub const admission_domain = @import("admission_domain.zig");
 pub const prefetch = @import("prefetch.zig");
 pub const shared = @import("shared.zig");
 
@@ -23,6 +24,7 @@ test {
     _ = planner;
     _ = cache;
     _ = memory;
+    _ = admission_domain;
     _ = prefetch;
     _ = shared;
 }

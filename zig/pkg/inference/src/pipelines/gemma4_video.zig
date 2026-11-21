@@ -201,7 +201,7 @@ pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Alloca
         // some rejections only surface mid-bitstream. Portable decoding decides
         // what's really invalid; either route projects on the device.
         if (!std.mem.startsWith(u8, bytes, "\x1a\x45\xdf\xa3") and !media.transport_stream.isTransportStream(bytes)) {
-            if (projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes, admission.explicit_scratch_limit == 0)) |projected| {
+            if (projector_mod.encodeProjectedVideoWithSession(cb, a, projector, bytes, admission.explicit_scratch_limit == 0, admission.session)) |projected| {
                 return projected;
             } else |err| {
                 // Decoder envelope rejections can retry under portable admission.
@@ -388,6 +388,7 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
         .pool = &pool,
         .inspection_scope = &inspection,
     }) catch |err| return inputError(err);
+    if (admission.session) |session| if (session.backend() == .pjrt) return @import("../execution/media_projection.zig").companionVideoFrames(session, cb, a, frames.prepared, timestamps, replay_bytes, control);
     return frames.project(timestamps, replay_bytes);
 }
 
@@ -487,13 +488,13 @@ test "gemma4 video indexing and decoding share one bounded pool" {
 test "gemma4 video reserves portable memory through generation admission" {
     const generation = @import("generation.zig");
     const messages = [_]generation.Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
-    const portable = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .generic);
+    const portable = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .generic, null);
     try std.testing.expectEqual(portable_host_bytes, portable.host_scratch_bytes);
     try std.testing.expectEqual(token_allowance, portable.token_allowance);
-    const cuda = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .cuda);
+    const cuda = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .cuda, null);
     try std.testing.expectEqual(@as(usize, 0), cuda.host_scratch_bytes);
     const text = [_]generation.Message{.{ .role = "user", .content = "describe" }};
-    try std.testing.expectEqual(@as(usize, 0), (try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &text, .{ .family = .gemma }, .generic)).host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), (try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &text, .{ .family = .gemma }, .generic, null)).host_scratch_bytes);
 }
 
 test "gemma4 video decodes AV1 in MP4 like its WebM route" {
@@ -554,7 +555,7 @@ test "gemma4 video prepays HEVC inspection and admits surfaces after activation"
     try std.testing.expectEqual(@as(usize, 0), reserved.surface_bytes);
     const generation = @import("generation.zig");
     const messages = [_]generation.Message{.{ .role = "user", .content = "describe", .video_bytes = bytes }};
-    const admitted = try generation.nativeGenerationMediaAdmissionForBackend(a, "", &messages, .{ .family = .gemma }, .generic);
+    const admitted = try generation.nativeGenerationMediaAdmissionForBackend(a, "", &messages, .{ .family = .gemma }, .generic, null);
     try std.testing.expectEqual(reserved.host_bytes, admitted.host_scratch_bytes);
     try std.testing.expectEqual(reserved.surface_bytes, admitted.backend_scratch_bytes);
     // Surfaces at 4K Main 10 are the case the portable budget undercounted.
@@ -999,7 +1000,7 @@ test "gemma4 video admission propagates cancellation during container scanning" 
     };
     const messages = [_]@import("generation.zig").Message{.{ .role = "user", .content = "", .video_bytes = @embedFile("../testdata/video/h264-18001.mp4") }};
     var state: State = .{};
-    try std.testing.expectError(error.Timeout, @import("generation.zig").nativeGenerationMediaAdmissionControlled(std.testing.allocator, "", &messages, .{ .family = .gemma }, .generic, .{ .ptr = &state, .check_fn = State.check }));
+    try std.testing.expectError(error.Timeout, @import("generation.zig").nativeGenerationMediaAdmissionControlled(std.testing.allocator, "", &messages, .{ .family = .gemma }, .generic, null, .{ .ptr = &state, .check_fn = State.check }));
 }
 
 test "gemma4 video NVDEC plan ignores AV1 samples without visible output" {
