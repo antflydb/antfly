@@ -39,8 +39,29 @@ pub const Picture = struct {
     apple_compatible: bool = true,
 };
 pub const Restart = struct { packet: usize = 0, logical: usize = 0, sequence: ?struct { packet: usize, offset: usize, size: usize } = null };
+/// Bounds a single replay, including any separately read sequence bootstrap.
+pub const ReplayBudget = struct {
+    restart: Restart,
+    packet_stop: usize,
+    coded_bytes: usize,
+
+    pub fn fits(self: ReplayBudget, indexed: Index, reader: *const media.webm.Reader, start: Restart, stop: usize, control: media.source.Control) !bool {
+        if (start.packet >= stop or stop > self.packet_stop) return false;
+        const payload = try indexed.packetBytes(reader.packets, start.packet, stop, control);
+        const seed = if (start.sequence) |span| span.size else 0;
+        return payload <= self.coded_bytes and seed <= self.coded_bytes - payload;
+    }
+
+    pub fn coldRestart(self: ReplayBudget, indexed: Index, reader: *const media.webm.Reader, first: usize, stop: usize, control: media.source.Control) !Restart {
+        const candidate = indexed.restartFor(first);
+        if (try self.fits(indexed, reader, candidate, stop, control)) return candidate;
+        if (self.restart.logical > first or !try self.fits(indexed, reader, self.restart, stop, control)) return error.ResourceLimitExceeded;
+        return self.restart;
+    }
+};
+
 pub const ReplayStats = struct { first_packet: usize = 0, packets_decoded: usize = 0, bootstrap_bytes: usize = 0, output_copy_bytes: u64 = 0, outputs_skipped: usize = 0 };
-pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 65536, decoder: codecs.Options = .{}, strategy: enum { headers, reconstruct } = .headers, replay_stats: ?*ReplayStats = null, copy_unselected_outputs: bool = false, packet_stop: ?usize = null };
+pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 65536, decoder: codecs.Options = .{}, strategy: enum { headers, reconstruct } = .headers, replay_stats: ?*ReplayStats = null, copy_unselected_outputs: bool = false, packet_stop: ?usize = null, replay_budget: ?ReplayBudget = null };
 pub const Index = struct {
     allocator: std.mem.Allocator,
     pictures: []Picture,
@@ -339,7 +360,7 @@ pub fn walkIndexed(a: std.mem.Allocator, reader: *media.webm.Reader, options: Op
             if (id >= indexed.pictures.len) return error.InvalidPacketIndex;
             first = @min(first, id);
         }
-        restart = indexed.restartFor(first);
+        restart = if (options.replay_budget) |budget| try budget.coldRestart(indexed, reader, first, budget.packet_stop, options.decoder.control) else indexed.restartFor(first);
     }
     return walkFrom(a, reader, options, restart, selected, context, accept, null, null);
 }
@@ -384,9 +405,15 @@ pub const Continuation = struct {
         if (self.configured) |previous| if (!std.meta.eql(previous, config)) return error.InvalidDecodeOptions;
         if (first < self.logical) return walkIndexed(self.allocator, self.reader, options, indexed, selected, context, accept);
         var restart = Restart{ .packet = self.packet, .logical = self.logical };
-        const warm = self.vp8_session != null or self.session != null;
+        var warm = self.vp8_session != null or self.session != null;
+        if (warm) if (options.replay_budget) |budget| {
+            if (!try budget.fits(indexed, self.reader, restart, budget.packet_stop, options.decoder.control)) {
+                self.deinit();
+                warm = false;
+            }
+        };
         if (!warm) {
-            restart = indexed.restartFor(first);
+            restart = if (options.replay_budget) |budget| try budget.coldRestart(indexed, self.reader, first, budget.packet_stop, options.decoder.control) else indexed.restartFor(first);
             self.packet = restart.packet;
             self.logical = restart.logical;
         }
@@ -497,7 +524,7 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
     if (selected) |ids| for (ids) |id| {
         last = @max(last, id);
     };
-    const packet_stop = options.packet_stop orelse reader.packets.len;
+    const packet_stop = if (options.replay_budget) |budget| budget.packet_stop else options.packet_stop orelse reader.packets.len;
     if (packet_stop > reader.packets.len or restart.packet > packet_stop or restart.logical > options.max_pictures) return error.InvalidPacketIndex;
     if (options.replay_stats) |stats| stats.* = .{ .first_packet = restart.packet };
     var logical: usize = restart.logical;

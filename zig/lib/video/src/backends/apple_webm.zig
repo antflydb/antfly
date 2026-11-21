@@ -26,6 +26,7 @@ pub const Options = struct {
     decode: apple.Options = .{},
     pool: ?*media.admission.Pool = null,
     device_surfaces: bool = false,
+    replay_budget: ?pictures.ReplayBudget = null,
 };
 pub const Receipt = struct { hardware: bool, submitted_packets: usize };
 pub const Sink = struct {
@@ -204,10 +205,15 @@ pub const Continuation = struct {
         self.allocator.destroy(self);
     }
     pub fn decodeTo(self: *@This(), reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, sink: Sink) !Receipt {
+        return self.decodeBounded(reader, indexed, selected, self.options.replay_budget, sink);
+    }
+    pub fn decodeBounded(self: *@This(), reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, budget: ?pictures.ReplayBudget, sink: Sink) !Receipt {
         if (self.busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return error.InvalidDecodeOptions;
         defer self.busy.store(false, .release);
         if (reader.packets.ptr != self.reader.packets.ptr or reader.packets.len != self.reader.packets.len or !std.mem.eql(u8, reader.input.identity, self.reader.input.identity)) return error.InvalidVideoIndex;
-        return decode(self.allocator, reader, indexed, selected, self.options, sink, self, null);
+        var options = self.options;
+        options.replay_budget = budget;
+        return decode(self.allocator, reader, indexed, selected, options, sink, self, null);
     }
 };
 pub fn decodeTo(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, sink: Sink) !Receipt {
@@ -229,15 +235,22 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     const config = if (validated) |config| config else if (continuation) |owner| try owner.validateIndex(reader, indexed) else try validate(reader, indexed);
     const shape = indexed.pictures[0];
     var restart: pictures.Restart = .{};
-    const warm = if (continuation) |owner| owner.native != null else false;
+    var warm = if (continuation) |owner| owner.native != null else false;
+    const end = indexed.pictures[last].packet_index.?;
     if (warm) {
         const owner = continuation.?;
         // Forward work needs no restart-index scan. Seeking must not disturb
         // references retained for later forward work.
         if (indexed.pictures[first].packet_index.? < owner.next_packet) return decode(a, reader, indexed, selected, options, sink, null, config);
         restart = .{ .packet = owner.next_packet, .logical = first };
-    } else restart = indexed.restartFor(first);
-    const end = indexed.pictures[last].packet_index.?;
+        if (options.replay_budget) |budget| {
+            if (end - restart.packet + 1 > options.decode.max_decode_packets or !try budget.fits(indexed, reader, restart, end + 1, reader.input.control)) {
+                owner.reset();
+                warm = false;
+            }
+        }
+    }
+    if (!warm) restart = if (options.replay_budget) |budget| try budget.coldRestart(indexed, reader, first, end + 1, reader.input.control) else indexed.restartFor(first);
     if (restart.packet > end) return error.InvalidVideoIndex;
     if (end - restart.packet + 1 > options.decode.max_decode_packets) return error.ResourceLimitExceeded;
     const bytes = try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, selected.len, shape.bit_depth);

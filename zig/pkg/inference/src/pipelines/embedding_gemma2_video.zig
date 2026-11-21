@@ -88,9 +88,7 @@ pub const WebmInput = struct {
         policy: video.sampling.TimestampPolicy,
         ids: [32]usize = @splat(0),
         count: usize,
-        first_packet: usize,
-        packet_stop: usize,
-        coded_bytes: usize,
+        replay: video.webm_pictures.ReplayBudget,
     };
 
     pub const BoundTimeline = struct {
@@ -150,7 +148,7 @@ pub const WebmDecoderContinuation = struct {
         if (self.permit) |*permit| permit.deinit();
         self.permit = null;
     }
-    fn decode(self: *@This(), reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture) !?video.apple_webm.Receipt {
+    fn decode(self: *@This(), reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, budget: ?video.webm_pictures.ReplayBudget) !?video.apple_webm.Receipt {
         if (@import("builtin").os.tag != .macos) return null;
         const session = self.session orelse return null;
         if (self.apple == null) {
@@ -170,7 +168,7 @@ pub const WebmDecoderContinuation = struct {
             // budget, including when Metal borrows it without a pixel copy.
             self.apple = owner;
         }
-        return self.apple.?.decodeTo(reader, indexed, selected, .{ .context = capture, .accept = Capture.publishAppleWebm }) catch |err| {
+        return self.apple.?.decodeBounded(reader, indexed, selected, budget, .{ .context = capture, .accept = Capture.publishAppleWebm }) catch |err| {
             self.deinit();
             return err;
         };
@@ -1539,8 +1537,8 @@ test "embeddinggemma2 video reader timestamps and cache binding survive independ
 
     const span = planned.window.?;
     var bytes_in_span: usize = 0;
-    for (reader.packets[span.first_packet..span.packet_stop]) |packet| bytes_in_span += packet.size;
-    try std.testing.expectEqual(bytes_in_span, try index.packetBytes(reader.packets, span.first_packet, span.packet_stop, .{}));
+    for (reader.packets[span.replay.restart.packet..span.replay.packet_stop]) |packet| bytes_in_span += packet.size;
+    try std.testing.expectEqual(bytes_in_span, try index.packetBytes(reader.packets, span.replay.restart.packet, span.replay.packet_stop, .{}));
     const Sink = struct {
         fn frame(_: *anyopaque, _: usize, _: *const video.codecs.Frame) !void {
             return error.TestUnexpectedResult;
@@ -1552,6 +1550,23 @@ test "embeddinggemma2 video reader timestamps and cache binding survive independ
     const reads_before_replay = source.reads;
     try std.testing.expectError(error.InvalidPacketIndex, video.webm_pictures.walkIndexed(a, &reader, bounded_replay, index, &.{0}, &marker, Sink.frame));
     try std.testing.expectEqual(reads_before_replay, source.reads);
+
+    var restart_reader = reader;
+    var restart_packets = [_]media.webm.Packet{ reader.packets[0], reader.packets[0], reader.packets[0] };
+    restart_packets[0].size = 10;
+    restart_packets[1].size = 2;
+    restart_packets[2].size = 3;
+    restart_reader.packets = &restart_packets;
+    const Replay = video.webm_pictures;
+    var restarts = [_]Replay.Restart{
+        .{ .packet = 1, .logical = 65_536 },
+        .{ .packet = 2, .logical = 65_537, .sequence = .{ .packet = 0, .offset = 0, .size = 10 } },
+    };
+    const restart_index = Replay.Index{ .allocator = a, .pictures = &.{}, .restarts = &restarts };
+    const replay = Replay.ReplayBudget{ .restart = restarts[0], .packet_stop = 3, .coded_bytes = 5 };
+    try std.testing.expectEqual(restarts[0], try replay.coldRestart(restart_index, &restart_reader, 65_537, 3, .{}));
+    try std.testing.expect(try replay.fits(restart_index, &restart_reader, .{ .packet = 2 }, 3, .{}));
+    try std.testing.expect(!try replay.fits(restart_index, &restart_reader, .{}, 3, .{}));
 
     var cancelled_scope = InspectionScope{ .allocator = a };
     defer cancelled_scope.deinit();
@@ -2007,7 +2022,7 @@ pub fn planWebmWindow(input: WebmInput, timestamp_policy: video.sampling.Timesta
     const total = try std.math.add(usize, payload, if (restart.sequence) |sequence| sequence.size else 0);
     if (total > limit) return error.ResourceLimitExceeded;
     var result = input;
-    result.window = .{ .index = input.index, .policy = timestamp_policy, .count = selected.len, .first_packet = restart.packet, .packet_stop = packet_stop, .coded_bytes = total };
+    result.window = .{ .index = input.index, .policy = timestamp_policy, .count = selected.len, .replay = .{ .restart = restart, .packet_stop = packet_stop, .coded_bytes = total } };
     @memcpy(result.window.?.ids[0..selected.len], selected);
     return result;
 }
@@ -2016,7 +2031,7 @@ pub fn webmPacketByteCount(input: WebmInput, sampling: Sampling, control: Contro
     const index = try input.boundIndex();
     try control.check();
     try input.reader.input.checkControl();
-    if (try webmWindow(input, sampling)) |window| return window.coded_bytes;
+    if (try webmWindow(input, sampling)) |window| return window.replay.coded_bytes;
     if (index.coded_bytes) |total| return total;
     const adapter = control.imageWorkControl();
     return video.webm_pictures.codedBytes(input.reader, .{ .context = adapter.context, .check_fn = adapter.check_fn });
@@ -3254,21 +3269,30 @@ fn decodeAppleHevc(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
     capture.decoder.record(if (receipt.hardware) .apple_hardware else .apple_software);
     return true;
 }
-fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput) !video.apple_webm.Receipt {
+fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput, budget: ?video.webm_pictures.ReplayBudget) !video.apple_webm.Receipt {
     if (input) |bound| if (bound.apple_continuation) |owner| {
-        if (bound.window) |window| if (owner.apple) |apple| {
-            if (apple.next_packet < window.first_packet) owner.deinit();
-        };
-        if (try owner.decode(reader, indexed, selected, capture)) |value| return value;
+        if (try owner.decode(reader, indexed, selected, capture, budget)) |value| return value;
     };
-    return video.apple_webm.decodeTo(a, reader, indexed, selected, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .pool = capture.pool, .device_surfaces = capture.metal != null }, .{ .context = capture, .accept = Capture.publishAppleWebm });
+    return video.apple_webm.decodeTo(a, reader, indexed, selected, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .pool = capture.pool, .device_surfaces = capture.metal != null, .replay_budget = budget }, .{ .context = capture, .accept = Capture.publishAppleWebm });
 }
 fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput) !void {
     if (capture.prefetch) |producer| try producer.waitForDecoder();
+    const budget = if (input) |bound| if (bound.window) |window| blk: {
+        var replay = window.replay;
+        var stop: usize = 0;
+        for (selected) |id| {
+            if (id >= indexed.pictures.len) return error.InvalidVideoIndex;
+            const packet = indexed.pictures[id].packet_index orelse return error.InvalidVideoIndex;
+            if (packet >= replay.packet_stop) return error.InvalidVideoIndex;
+            stop = @max(stop, packet + 1);
+        }
+        replay.packet_stop = stop;
+        break :blk replay;
+    } else null else null;
     const estimate = if (indexed.pictures.len != 0) try video.apple.surfaceAdmissionBytesForDepth(indexed.pictures[0].width, indexed.pictures[0].height, selected.len, indexed.pictures[0].bit_depth) else 0;
     if (capture.decoder.policy == .automatic and estimate > 512 * 1024 * 1024) capture.decoder.fallback();
     if (capture.decoder.policy != .portable and (capture.decoder.policy == .apple or estimate <= 512 * 1024 * 1024)) {
-        const receipt: ?video.apple_webm.Receipt = decodeAppleWebm(a, reader, indexed, selected, capture, input) catch |err| blk: {
+        const receipt: ?video.apple_webm.Receipt = decodeAppleWebm(a, reader, indexed, selected, capture, input, budget) catch |err| blk: {
             try appleUnavailable(capture, err);
             break :blk @as(?video.apple_webm.Receipt, null);
         };
@@ -3279,14 +3303,12 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
     }
     capture.decoder.record(.portable);
     var options = webmDecodeOptions(reader.input.control, capture.pool);
-    if (input) |bound| if (bound.window) |window| {
-        options.packet_stop = window.packet_stop;
-    };
+    options.replay_budget = budget;
+    if (budget != null) options.max_pictures = indexed.pictures.len;
     if (if (input) |bound| bound.continuation else null) |owner| {
         // Model preparation borrows a reader copy with per-window cancellation.
         // Retained codec state stays bound to the request's immutable reader.
         if (owner.reader.packets.ptr != reader.packets.ptr or !std.mem.eql(u8, owner.reader.input.identity, reader.input.identity)) return error.InvalidVideoIndex;
-        if (input.?.window) |window| if (owner.packet < window.first_packet) owner.deinit();
         var bound_index = indexed;
         bound_index.reader = owner.reader;
         try owner.walk(bound_index, options, selected, capture, Capture.publishWebm);
