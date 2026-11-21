@@ -75,18 +75,49 @@ const Dependencies = struct {
         self.extend(index, node * 2 + 1, mid, hi, first, stop, end, origin, timescale);
     }
 };
-/// Pure immutable planning metadata. No source, decoder, admission token or
-/// mutable seek cache survives a request. The cache's arena owns every slice.
+/// The cache's arena owns the versioned planning metadata. Packet indices
+/// are immutable. Requests share the atomic AVC candidate probe results.
 pub const Snapshot = struct {
-    timed: []video.sampling.TimedPicture,
+    static_candidates: ?[]video.decode_plan.SeekCache.Candidate = null,
+
+    transport: ?video.transport_seek.Mapping = null,
+    registry: ?video.h264_dynamic.Snapshot = null,
+    hevc_predecessors: []usize,
     timeline: video.sampling.Timeline,
     logical: ?video.h264_pictures.Index,
     dependencies: ?Dependencies,
     origin: i64,
     duration_ns: i64,
+    fn candidateCount(owner: *const Owner) usize {
+        if (owner.reader.track.codec != .avc or owner.registry != null) return 0;
+        var count: usize = 0;
+        for (owner.reader.packets) |packet| count += @intFromBool(packet.sync);
+        return count;
+    }
+    pub fn storageBytes(owner: *const Owner) usize {
+        var bytes = std.mem.sliceAsBytes(owner.hevc_predecessors).len +| std.mem.sliceAsBytes(owner.timeline.entries).len +| std.mem.sliceAsBytes(owner.timeline.maxima).len;
+        if (owner.transport) |map| bytes +|= std.mem.sliceAsBytes(map.nals).len +| std.mem.sliceAsBytes(map.runs).len;
+        if (owner.registry) |registry| bytes +|= video.h264_dynamic.Snapshot.storageBytes(registry);
+        if (owner.logical) |index| bytes +|= std.mem.sliceAsBytes(index.pictures).len;
+        if (owner.dependencies) |deps| bytes +|= std.mem.sliceAsBytes(deps.ids).len +| std.mem.sliceAsBytes(deps.maxima).len;
+        return bytes +| candidateCount(owner) *| @sizeOf(video.decode_plan.SeekCache.Candidate);
+    }
     pub fn copy(a: std.mem.Allocator, owner: *const Owner) !Snapshot {
-        if (owner.registry != null) return error.UnsupportedVideoProfile;
-        var result: Snapshot = .{ .timed = try a.dupe(video.sampling.TimedPicture, owner.timed), .timeline = owner.timeline, .logical = owner.logical, .dependencies = owner.dependencies, .origin = owner.origin, .duration_ns = try owner.durationNs() };
+        var result: Snapshot = .{ .hevc_predecessors = try a.dupe(usize, owner.hevc_predecessors), .timeline = owner.timeline, .logical = owner.logical, .dependencies = owner.dependencies, .origin = owner.origin, .duration_ns = try owner.durationNs() };
+        if (owner.reader.track.codec == .avc and owner.registry == null) {
+            const candidates = try a.alloc(video.decode_plan.SeekCache.Candidate, candidateCount(owner));
+            var n: usize = 0;
+            for (owner.reader.packets, 0..) |packet, i| {
+                if (i % 256 == 0) try owner.reader.input.control.check();
+                if (packet.sync) {
+                    candidates[n] = .{ .packet = i };
+                    n += 1;
+                }
+            }
+            result.static_candidates = candidates;
+        }
+        if (owner.transport) |map| result.transport = try map.copy(a);
+        if (owner.registry) |registry| result.registry = try video.h264_dynamic.Snapshot.copy(a, registry);
         result.timeline.entries = try a.dupe(@typeInfo(@TypeOf(owner.timeline.entries)).pointer.child, owner.timeline.entries);
         result.timeline.maxima = try a.dupe(i128, owner.timeline.maxima);
         result.timeline.allocator = a;
@@ -107,13 +138,14 @@ pub const Snapshot = struct {
 };
 
 pub const Owner = struct {
+    transport: ?video.transport_seek.Mapping = null,
+    hevc_predecessors: []usize = &.{},
     borrowed_planning: bool = false,
     duration_ns: ?i64 = null,
     continuation: model_video.DecoderContinuation,
     source_binding: [32]u8,
     allocator: std.mem.Allocator,
     reader: *media.mp4.Reader,
-    timed: []video.sampling.TimedPicture,
     timeline: video.sampling.Timeline,
     metadata_reservation: media.admission.Token,
     seek_cache: ?video.decode_plan.SeekCache = null,
@@ -124,55 +156,85 @@ pub const Owner = struct {
     pool: *media.admission.Pool,
     limits: @import("media_chunk_limits.zig").Limits,
     pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits) !Owner {
+        return initPlanned(a, reader, pool, limits, null);
+    }
+    pub fn initPlanned(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits, transport: ?*video.transport_seek.Index) !Owner {
         if (reader.packets.len == 0) return error.EmptyVideo;
+        if (reader.packets.len > limits.max_index_packets) return error.ResourceLimitExceeded;
         if (reader.input.identity.len == 0) return error.InvalidVideoReaderSelection;
-        const registry = if (reader.track.inband_parameter_sets) try video.h264_dynamic.Session.initPlanning(a, reader, .{ .max_parameter_packets = reader.packets.len }) else null;
+        var planning = video.h264_pictures.Options.forTrack(reader.packets.len);
+        planning.decode.max_dependency_packets = limits.max_dependency_packets;
+        const headers = if (transport) |ts| ts.planningHeaders() else null;
+        const registry = if (headers) |source| try video.h264_dynamic.Session.initWithHeaders(a, reader, planning.decode, source) else if (reader.track.requiresAvcRegistry()) try video.h264_dynamic.Session.initPlanning(a, reader, planning.decode) else null;
         errdefer if (registry) |owner| owner.deinit();
         var logical: ?video.h264_pictures.Index = null;
         errdefer if (logical) |*index| index.deinit();
-        if (reader.track.codec == .avc) {
-            const cfg = try video.h264.configParse(a, reader.track.avcc);
-            defer cfg.groups.deinit(a);
-            if (reader.track.inband_parameter_sets or !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes or cfg.groups.count > 1 or cfg.redundant) logical = try video.h264_pictures.planning(a, reader, .{ .max_packets = reader.packets.len, .max_pictures = reader.packets.len }, registry);
-        }
+        if (try video.packet_sampling.needsLogicalIndex(a, reader.track))
+            logical = try video.h264_pictures.planning(a, reader, planning, registry);
+        if (registry) |session| session.releasePlanningHeaders();
+        if (transport) |ts| ts.releaseHeaders();
         const count = if (logical) |index| index.pictures.len else reader.packets.len;
-        var metadata_bytes = try std.math.add(usize, try video.sampling.Timeline.storageBytes(count), try std.math.mul(usize, count, @sizeOf(video.sampling.TimedPicture)));
-        if (reader.track.codec == .avc) metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, reader.packets.len, @sizeOf(usize)));
+        var index_bytes: usize = if ((reader.track.codec == .avc and registry == null) or reader.track.codec == .hevc)
+            try std.math.mul(usize, reader.packets.len, @sizeOf(usize))
+        else
+            0;
         if (logical != null) {
             const base = try std.math.ceilPowerOfTwo(usize, @max(@as(usize, 1), count));
-            metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, try std.math.add(usize, count, try std.math.mul(usize, base, 2)), @sizeOf(usize)));
+            const slots = try std.math.add(usize, count, try std.math.mul(usize, base, 2));
+            index_bytes = try std.math.add(usize, index_bytes, try std.math.mul(usize, slots, @sizeOf(usize)));
         }
-        var metadata_reservation = try pool.acquire(.{ .host_bytes = metadata_bytes });
-        errdefer metadata_reservation.deinit();
-        const timed = try a.alloc(video.sampling.TimedPicture, count);
-        errdefer a.free(timed);
-        var origin: i64 = std.math.maxInt(i64);
-        if (logical) |index| {
-            for (timed, index.pictures) |*dest, picture| {
-                dest.* = .{ .pts = picture.pts, .duration = picture.duration };
-                origin = @min(origin, picture.pts);
+        var memory = media.admission.TrackedAllocator{ .backing = a, .limit = std.math.maxInt(usize), .reservation = try pool.acquire(.{}) };
+        errdefer memory.reservation.deinit();
+        const scratch = memory.allocator();
+        var timeline = build: {
+            const timed = scratch.alloc(video.sampling.TimedPicture, count) catch |err| return memory.denied orelse err;
+            defer scratch.free(timed);
+            if (logical) |index| {
+                for (timed, index.pictures) |*dest, picture| {
+                    dest.* = .{ .pts = picture.pts, .duration = picture.duration };
+                }
+            } else {
+                for (timed, reader.packets) |*dest, packet| {
+                    dest.* = .{ .pts = packet.pts, .duration = packet.duration, .hidden = packet.hidden };
+                }
             }
-        } else {
-            for (timed, reader.packets) |*dest, packet| {
-                dest.* = .{ .pts = packet.pts, .duration = packet.duration };
-                origin = @min(origin, packet.pts);
-            }
-        }
-        var timeline = try video.sampling.Timeline.init(a, timed, reader.input.control);
+            break :build video.sampling.Timeline.initEdited(scratch, timed, reader.input.control, reader.track.edit) catch |err| return if (err == error.OutOfMemory) memory.denied orelse err else err;
+        };
+        // Transfer the retained timeline and its charge to the movable owner.
+        // Timed pictures have been freed and edited-out entries were never allocated.
+        timeline.allocator = a;
         errdefer timeline.deinit();
-        var seek_cache: ?video.decode_plan.SeekCache = if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null;
+        try memory.reservation.resize(.{ .host_bytes = try std.math.add(usize, memory.live, index_bytes) });
+        const hevc_predecessors = try a.alloc(usize, if (reader.track.codec == .hevc) reader.packets.len else 0);
+        errdefer a.free(hevc_predecessors);
+        if (hevc_predecessors.len != 0) try video.hevc_restart.fillPredecessors(reader, hevc_predecessors);
+        var seek_cache: ?video.decode_plan.SeekCache = if (registry) |session| registrySeekCache(a, reader, session) else if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null;
         errdefer if (seek_cache) |*cache| cache.deinit();
         var dependencies: ?Dependencies = if (logical) |index| try Dependencies.init(a, index) else null;
         errdefer if (dependencies) |*index| index.deinit();
-        return .{ .metadata_reservation = metadata_reservation, .dependencies = dependencies, .timeline = timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool, .limits = limits };
+        return .{ .hevc_predecessors = hevc_predecessors, .metadata_reservation = memory.reservation, .dependencies = dependencies, .timeline = timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .logical = logical, .registry = registry, .origin = timeline.first, .pool = pool, .limits = limits };
+    }
+    fn registrySeekCache(a: std.mem.Allocator, reader: *const media.mp4.Reader, registry: *const video.h264_dynamic.Session) video.decode_plan.SeekCache {
+        var cache = video.decode_plan.SeekCache.forPage(a, reader, registry.progressive_idrs.items);
+        cache.registry = registry;
+        for (registry.entries.items) |entry| {
+            const cfg = entry.config;
+            if (!cfg.frame_only or cfg.separate_planes or cfg.profile == 88) return cache;
+        }
+        cache.complete = true;
+        return cache;
     }
     pub fn fromSnapshot(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits, snapshot: *const Snapshot) !Owner {
         try reader.input.control.check();
         var logical = snapshot.logical;
         if (logical) |*index| index.allocator = a;
-        var reservation = try pool.acquire(.{ .host_bytes = if (reader.track.codec == .avc) try std.math.mul(usize, reader.packets.len, @sizeOf(usize)) else 0 });
-        errdefer reservation.deinit();
-        return .{ .borrowed_planning = true, .duration_ns = snapshot.duration_ns, .metadata_reservation = reservation, .dependencies = snapshot.dependencies, .timeline = snapshot.timeline, .seek_cache = if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = snapshot.timed, .logical = logical, .registry = null, .origin = snapshot.origin, .pool = pool, .limits = limits };
+        var options = video.h264_pictures.Options.forTrack(reader.packets.len);
+        options.decode.max_dependency_packets = limits.max_dependency_packets;
+        const registry = if (snapshot.registry) |*shared| try shared.bind(a, reader, options.decode) else null;
+        errdefer if (registry) |session| session.deinit();
+        var seek_cache = if (registry) |session| registrySeekCache(a, reader, session) else if (reader.track.codec == .avc) video.decode_plan.SeekCache.forPage(a, reader, &.{}) else null;
+        if (seek_cache) |*cache| cache.candidates = snapshot.static_candidates;
+        return .{ .hevc_predecessors = snapshot.hevc_predecessors, .borrowed_planning = true, .duration_ns = snapshot.duration_ns, .metadata_reservation = .{}, .dependencies = snapshot.dependencies, .timeline = snapshot.timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .logical = logical, .registry = registry, .origin = snapshot.origin, .pool = pool, .limits = limits };
     }
     pub fn deinit(self: *Owner) void {
         self.continuation.deinit();
@@ -182,114 +244,139 @@ pub const Owner = struct {
         if (!self.borrowed_planning) {
             if (self.dependencies) |*index| index.deinit();
             if (self.logical) |*index| index.deinit();
-            self.allocator.free(self.timed);
+            self.allocator.free(self.hevc_predecessors);
         }
         self.metadata_reservation.deinit();
     }
     pub fn durationNs(self: *const Owner) !i64 {
         if (self.duration_ns) |value| return value;
-        var stop: i128 = self.origin;
-        for (self.timed) |picture| stop = @max(stop, @as(i128, picture.pts) + (picture.duration orelse return error.UnknownVideoDuration));
+        const stop = self.timeline.last;
         return std.math.cast(i64, @divFloor((stop - self.origin) * std.time.ns_per_s + self.reader.track.timescale - 1, self.reader.track.timescale)) orelse error.TimestampOverflow;
     }
     pub fn prepare(self: *Owner, policy: video.sampling.TimestampPolicy) !Window {
         const a = self.allocator;
         const selected = try self.timeline.select(a, self.reader.track.timescale, policy, self.reader.input.control, true);
         defer a.free(selected);
-        const packets = try a.alloc(usize, selected.len);
-        defer a.free(packets);
-        var first: usize = std.math.maxInt(usize);
-        var stop: usize = 0;
+        var selected_packets: [32]usize = undefined;
+        const packets = selected_packets[0..selected.len];
+        var storage: [32]video.decode_plan.Run = undefined;
+        var count: usize = 0;
         for (selected, packets) |id, *packet| {
             packet.* = if (self.logical) |index| index.pictures[id].first_packet else id;
-            first = @min(first, packet.*);
-            const last = if (self.logical) |index| index.pictures[id].last_packet orelse return error.IncompleteVideoPicture else id;
-            stop = @max(stop, last + 1);
+            if (self.reader.track.codec == .avc) continue;
+            const start = if (self.reader.track.codec == .hevc)
+                try video.hevc_restart.startFor(self.reader.packets, self.hevc_predecessors, packet.*)
+            else
+                packet.*;
+            storage[count] = .{ .first = start, .last = packet.* };
+            count += 1;
         }
         if (self.reader.track.codec == .avc) {
-            var plan = try video.decode_plan.create(a, self.reader, packets, .{ .seek_cache = if (self.seek_cache) |*cache| cache else null, .portable_config = true, .max_decode_packets = self.limits.max_dependency_packets, .max_run_packets = self.limits.max_dependency_packets });
+            // Overlapping display intervals can select A, B, A. Preserve those
+            // output slots while planning each coded dependency only once.
+            var unique: [32]usize = undefined;
+            var n: usize = 0;
+            for (packets) |packet| {
+                if (std.mem.indexOfScalar(usize, unique[0..n], packet) != null) continue;
+                unique[n] = packet;
+                n += 1;
+            }
+            var plan = try video.decode_plan.create(a, self.reader, unique[0..n], .{ .seek_cache = if (self.seek_cache) |*cache| cache else null, .portable_config = true, .headers_only = true, .max_decode_packets = self.limits.max_dependency_packets, .max_run_packets = self.limits.max_dependency_packets });
             defer plan.deinit();
-            for (plan.runs) |run| first = @min(first, run.first);
-            // Reorder drain is bounded. Logical completion below extends this
-            // prefix when a field/partition assembly crosses the nominal tail.
-            stop = @min(self.reader.packets.len, stop +| 32);
-        }
-        if (self.logical) |index| {
-            var changed = true;
-            while (changed) {
-                changed = false;
-                const before_first = first;
-                const before_stop = stop;
-                self.dependencies.?.extend(index, 1, 0, self.dependencies.?.base, &first, &stop, policy.end_ns orelse return error.InvalidSamplingPolicy, self.origin, self.reader.track.timescale);
-                changed = first != before_first or stop != before_stop;
-                if (stop - first > self.limits.max_dependency_packets) return error.ChunkDependencyBudgetExceeded;
-            }
-        }
-        if (stop <= first or stop - first > self.limits.max_dependency_packets) return error.ChunkDependencyBudgetExceeded;
-        var coded_bytes: u64 = 0;
-        for (self.reader.packets[first..stop]) |packet| coded_bytes = try std.math.add(u64, coded_bytes, packet.size);
-        if (coded_bytes > self.limits.max_coded_window_bytes) return error.ChunkCodedWindowBudgetExceeded;
-        var view = self.reader.*;
-        view.packets = self.reader.packets[first..stop];
-        const bootstrap = if (self.registry) |registry| try registry.bootstrapBefore(a, first) else null;
-        defer if (bootstrap) |bytes| a.free(bytes);
-        if (try std.math.add(u64, coded_bytes, if (bootstrap) |value| value.len else 0) > self.limits.max_coded_window_bytes) return error.ChunkCodedWindowBudgetExceeded;
-        var window = try video.live_windows.borrowWithParameters(a, &view, bootstrap orelse &.{}, .{ .max_packets = self.limits.max_dependency_packets, .stream = .{ .max_bytes = self.limits.max_coded_window_bytes, .admission_pool = self.pool, .control = self.reader.input.control } });
-        errdefer window.deinit();
-        for (window.reader.packets) |*packet| packet.pts = try std.math.sub(i64, packet.pts, self.origin);
-        var subset: ?video.h264_pictures.Index = null;
-        errdefer if (subset) |*index| index.deinit();
-        if (self.logical) |index| {
-            var pictures = std.ArrayList(video.h264.Picture).empty;
-            errdefer pictures.deinit(a);
-            var pending_pts: ?i64 = null;
-            var pending_packet: ?usize = null;
-            const deps = &self.dependencies.?;
-            const begin = deps.lower(index, first);
-            const finish = deps.lower(index, stop);
-            const local_ids = try a.dupe(usize, deps.ids[begin..finish]);
-            defer a.free(local_ids);
-            std.mem.sort(usize, local_ids, {}, std.sort.asc(usize));
-            for (local_ids) |id| {
-                const picture = index.pictures[id];
-                const last = picture.last_packet.?;
-                if (last >= stop) {
-                    const pts = try std.math.sub(i64, picture.pts, self.origin);
-                    pending_pts = if (pending_pts) |old| @min(old, pts) else pts;
-                    pending_packet = if (pending_packet) |old| @min(old, picture.first_packet - first) else picture.first_packet - first;
-                    continue;
+            count = 0;
+            for (plan.runs) |run| {
+                var begin = run.first;
+                var end = run.last + 1;
+                if (self.logical) |index| {
+                    // Complete each selected picture, including members whose
+                    // PTS falls beyond the last sampling target.
+                    for (selected, packets) |id, packet| {
+                        if (packet >= run.first and packet <= run.last) end = @max(end, index.pictures[id].last_packet.? + 1);
+                    }
+                    while (true) {
+                        const previous_first = begin;
+                        const previous_stop = end;
+                        self.dependencies.?.extend(index, 1, 0, self.dependencies.?.base, &begin, &end, policy.end_ns orelse return error.InvalidSamplingPolicy, self.origin, self.reader.track.timescale);
+                        if (end - begin > self.limits.max_dependency_packets) return error.ChunkDependencyBudgetExceeded;
+                        if (begin == previous_first and end == previous_stop) break;
+                    }
                 }
-                var copy = picture;
-                copy.first_packet -= first;
-                copy.last_packet = last - first;
-                copy.pts = try std.math.sub(i64, picture.pts, self.origin);
-                try pictures.append(a, copy);
+                storage[count] = .{ .first = begin, .last = end - 1 };
+                count += 1;
             }
-            subset = .{ .allocator = a, .pictures = try pictures.toOwnedSlice(a), .timescale = self.reader.track.timescale, .packet_count = window.reader.packets.len, .pending_pts = pending_pts, .pending_first_packet = pending_packet };
         }
-        if (subset == null) {
-            const cfg = if (self.reader.track.codec == .avc) try video.h264.configParse(a, self.reader.track.avcc) else null;
-            defer if (cfg) |configuration| configuration.groups.deinit(a);
-            const pictures = try a.alloc(video.h264.Picture, window.reader.packets.len);
-            for (pictures, window.reader.packets, 0..) |*picture, packet, id| picture.* = .{ .first_packet = id, .last_packet = id, .pts = packet.pts, .duration = packet.duration, .width = if (cfg) |configuration| @intCast(configuration.width) else self.reader.track.width, .height = if (cfg) |configuration| @intCast(configuration.height) else self.reader.track.height, .bit_depth = if (cfg) |configuration| configuration.bit_depth else 8, .chroma_format = if (cfg) |configuration| configuration.chroma_format else 1 };
-            subset = .{ .allocator = a, .pictures = pictures, .timescale = self.reader.track.timescale, .packet_count = pictures.len };
+        // Presentation order can differ from decode order, including HEVC
+        // leading pictures whose restart precedes the previous target's IRAP.
+        std.mem.sort(video.decode_plan.Run, storage[0..count], {}, struct {
+            fn less(_: void, left: video.decode_plan.Run, right: video.decode_plan.Run) bool {
+                return left.first < right.first;
+            }
+        }.less);
+        var merged: usize = 0;
+        for (storage[0..count]) |run| {
+            if (merged != 0 and run.first <= storage[merged - 1].last + 1) {
+                storage[merged - 1].last = @max(storage[merged - 1].last, run.last);
+            } else {
+                storage[merged] = run;
+                merged += 1;
+            }
         }
-        return .{ .coded = window, .logical = subset, .packet_base = first, .source_binding = self.source_binding };
+        count = merged;
+        const runs = storage[0..count];
+        var total_packets: usize = 0;
+        var coded_bytes: u64 = 0;
+        var prefix_storage: [32]video.live_windows.PacketPrefix = undefined;
+        var scratch = media.admission.TrackedAllocator{ .backing = a, .limit = self.limits.max_coded_window_bytes, .reservation = try self.pool.acquire(.{}) };
+        defer scratch.reservation.deinit();
+        const staging = scratch.allocator();
+        var prefix_count: usize = 0;
+        defer for (prefix_storage[0..prefix_count]) |prefix| staging.free(prefix.bytes);
+        for (runs, 0..) |run, i| {
+            const local = total_packets;
+            total_packets += run.last - run.first + 1;
+            if (total_packets > self.limits.max_dependency_packets) return error.ChunkDependencyBudgetExceeded;
+            for (self.reader.packets[run.first .. run.last + 1]) |packet| coded_bytes += packet.size;
+            if (self.registry) |registry| {
+                const prefix = registry.bootstrap(staging, run.first, i != 0 and self.reader.track.inband_parameter_sets) catch |err| return if (err == error.OutOfMemory) scratch.denied orelse err else err;
+                prefix_storage[prefix_count] = .{ .index = local, .bytes = prefix };
+                prefix_count += 1;
+                coded_bytes = try std.math.add(u64, coded_bytes, prefix.len);
+            }
+            if (coded_bytes > self.limits.max_coded_window_bytes) return error.ChunkCodedWindowBudgetExceeded;
+        }
+        const options = video.live_windows.Options{ .max_packets = self.limits.max_dependency_packets, .stream = .{ .max_bytes = self.limits.max_coded_window_bytes, .admission_pool = self.pool, .control = self.reader.input.control } };
+        var window = try video.live_windows.borrowRuns(a, self.reader, runs, options);
+        errdefer window.deinit();
+        if (self.registry) |registry| {
+            var local: usize = 0;
+            for (runs) |run| {
+                window.reader.packets[local].avc_epoch_start = registry.independentEpochStart(run.first) == run.first;
+                local += run.last - run.first + 1;
+            }
+        }
+        try video.live_windows.attachPrefixes(&window, prefix_storage[0..prefix_count], options);
+        for (window.reader.packets) |*packet| packet.pts = try std.math.sub(i64, packet.pts, self.origin);
+        var result = Window{ .coded = window, .runs = storage, .run_count = count, .packet_base = runs[0].first, .source_binding = self.source_binding };
+        result.packet_count = packets.len;
+        for (packets, result.packet_ids[0..packets.len]) |packet, *id| id.* = try video.live_windows.localPacket(runs, packet);
+        return result;
     }
 };
 pub const Window = struct {
     coded: video.live_windows.Window,
+    runs: [32]video.decode_plan.Run,
+    run_count: usize,
     source_binding: [32]u8,
-    logical: ?video.h264_pictures.Index = null,
+    packet_ids: [32]usize = undefined,
+    packet_count: usize = 0,
     selection: ?model_video.ReaderSelection = null,
     packet_base: usize,
     /// Bind only after the Window reaches its final address; workers borrow it.
     pub fn bind(self: *Window, policy: video.sampling.TimestampPolicy, pool: *media.admission.Pool) !void {
-        if (self.logical) |*index| self.selection = try model_video.ReaderSelection.initImmutable(self.coded.reader.allocator, &self.coded.reader, .{ .source_timestamps = policy }, index, pool, self.coded.reader.input.control, self.source_binding, self.packet_base);
+        self.selection = try model_video.ReaderSelection.fromMappedPacketIds(self.coded.reader.allocator, &self.coded.reader, .{ .source_timestamps = policy }, self.packet_ids[0..self.packet_count], pool, self.coded.reader.input.control, self.source_binding, self.packet_base, self.runs[0..self.run_count]);
     }
     pub fn deinit(self: *Window) void {
         if (self.selection) |*selection| selection.deinit();
-        if (self.logical) |*index| index.deinit();
         self.coded.deinit();
     }
 };
@@ -331,5 +418,36 @@ test "model aware media packet interval index matches closure for scattered fiel
         try std.testing.expectEqual(expected_stop, actual_stop);
         const selected = deps.ids[deps.lower(index, actual_first)..deps.lower(index, actual_stop)];
         for (selected) |id| try std.testing.expect(pictures[id].first_packet >= actual_first and pictures[id].first_packet < actual_stop);
+    }
+}
+
+test "model aware media restarts a compact AVC window at a non-IDR epoch, cold and cached" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .identity = "non-idr", .storage = .{ .borrowed = @embedFile("../testdata/video/h264-sps-intra-geometry.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 64 * 1024 * 1024 } };
+    const limits = @import("media_chunk_limits.zig").Limits{ .max_dependency_packets = 1 };
+    var cold = try Owner.init(a, &reader, &pool, limits);
+    defer cold.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const snapshot = try Snapshot.copy(arena.allocator(), &cold);
+    var warm = try Owner.fromSnapshot(a, &reader, &pool, limits, &snapshot);
+    defer warm.deinit();
+    const epoch = cold.registry.?.epochs.items[1];
+    try std.testing.expect(epoch.independent and epoch.start > 0);
+    const tick = reader.packets[epoch.start].pts - cold.origin;
+    const ns: u64 = @intCast(@divFloor(@as(i128, tick) * std.time.ns_per_s, reader.track.timescale));
+    var expected = try video.h264.decodeFrame(a, &reader, epoch.start, .{});
+    defer expected.deinit();
+    for ([_]*Owner{ &cold, &warm }) |owner| {
+        var window = try owner.prepare(.{ .start_ns = @intCast(ns), .end_ns = @intCast(ns + std.time.ns_per_s), .max_frames = 1 });
+        defer window.deinit();
+        try std.testing.expectEqual(epoch.start, window.packet_base);
+        try std.testing.expectEqual(@as(usize, 1), window.coded.reader.packets.len);
+        var frame = try video.h264.decodeFrame(a, &window.coded.reader, 0, .{});
+        defer frame.deinit();
+        try std.testing.expectEqualSlices(u8, expected.nv12, frame.nv12);
     }
 }

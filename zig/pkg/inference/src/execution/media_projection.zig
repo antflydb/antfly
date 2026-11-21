@@ -136,7 +136,7 @@ fn imageFeatures(session: Session, a: std.mem.Allocator, prepared: companion.Pre
 
 /// Each decoded frame reuses the exact still-image semantic stage, retaining
 /// the existing video processor's smaller grid and presentation timestamps.
-pub fn companionVideoFrames(session: Session, cb: *const @import("../ops/ops.zig").ComputeBackend, a: std.mem.Allocator, prepared: []const ?companion.PreparedImage, timestamps: []const i64, control: ?Control) !companion.ProjectedVideo {
+pub fn companionVideoFrames(session: Session, cb: *const @import("../ops/ops.zig").ComputeBackend, a: std.mem.Allocator, prepared: []const ?companion.PreparedImage, timestamps: []const i64, decoder_source_bytes: u64, control: ?Control) !companion.ProjectedVideo {
     if (session.backend() != .pjrt or prepared.len != timestamps.len or prepared.len == 0 or prepared.len > 32) return error.InvalidVideoFrame;
     var values: std.ArrayList(f32) = .empty;
     defer values.deinit(a);
@@ -165,5 +165,5 @@ pub fn companionVideoFrames(session: Session, cb: *const @import("../ops/ops.zig
     const owned_counts = try counts.toOwnedSlice(a);
     errdefer a.free(owned_counts);
     const owned_times = try times.toOwnedSlice(a);
-    return .{ .images = .{ .allocator = a, .backend = cb, .embeddings = tensor, .tokens_per_image = owned_counts, .hidden_size = hidden, .batches_executed = owned_counts.len, .max_batch_executed = 1 }, .timestamps_us = owned_times, .stats = .{ .decoded_frames = owned_counts.len, .selected_frames = owned_counts.len } };
+    return .{ .images = .{ .allocator = a, .backend = cb, .embeddings = tensor, .tokens_per_image = owned_counts, .hidden_size = hidden, .batches_executed = owned_counts.len, .max_batch_executed = 1 }, .timestamps_us = owned_times, .stats = .{ .decoder_source_bytes = decoder_source_bytes, .selected_frames = owned_counts.len } };
 }

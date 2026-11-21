@@ -133,6 +133,37 @@ def quantize(values):
     return result
 
 
+# GGUF dimensions are innermost first. Each Q4_0 block stores 32 weights
+# as a two-byte scale and sixteen packed bytes.
+E4B_WEIGHT_SHAPES = {
+    "ffn_gate": (2560, 10240),
+    "ffn_up": (2560, 10240),
+    "ffn_down": (10240, 2560),
+    "inp_gate": (2560, 256),
+    "proj": (256, 2560),
+}
+
+
+def checked_weights(reader):
+    tensors = {t.name: t for t in reader.tensors}
+    selected = {}
+    for name, shape in E4B_WEIGHT_SHAPES.items():
+        tensor = tensors[f"blk.0.{name}.weight"]
+        if int(tensor.tensor_type) != 2:
+            raise ValueError(f"Expected Q4_0: {tensor.name}")
+        if tuple(tensor.shape) != shape:
+            raise ValueError(
+                f"{tensor.name}: expected GGUF dimensions {shape}, got {tuple(tensor.shape)}"
+            )
+        expected_bytes = shape[0] // 32 * 18 * shape[1]
+        if tensor.data.nbytes != expected_bytes:
+            raise ValueError(
+                f"{tensor.name}: expected {expected_bytes} packed bytes, got {tensor.data.nbytes}"
+            )
+        selected[name] = tensor
+    return selected
+
+
 def identical(actual, expected, context):
     if not np.array_equal(actual.view(np.uint32), expected.view(np.uint32)):
         raise ValueError("Bitwise mismatch: " + context)
@@ -154,25 +185,20 @@ def main():
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True
     ).strip():
         raise RuntimeError("GPU busy")
+    selected = checked_weights(GGUFReader(str(args.gguf)))
     gpu = Cuda()
     try:
-        reader = GGUFReader(str(args.gguf))
-        tensors = {t.name: t for t in reader.tensors}
         weights = {}
         hashes = {}
-        for name in ["ffn_gate", "ffn_up", "ffn_down", "inp_gate", "proj"]:
-            tensor = tensors[f"blk.0.{name}.weight"]
-            if int(tensor.tensor_type) != 2:
-                raise ValueError(f"Expected Q4_0: {tensor.name}")
+        for name, tensor in selected.items():
             weights[name] = gpu.array(tensor.data)
             hashes[tensor.name] = hashlib.sha256(tensor.data.tobytes()).hexdigest()
         rng = np.random.default_rng(72)
         checks = []
-        for kind, indim, outdim, threads, oldcols, newcols, oldname in [
+        for kind, weight_name, threads, oldcols, newcols, oldname in [
             (
                 "ffn_pair",
-                2560,
-                10240,
+                "ffn_gate",
                 160,
                 4,
                 1,
@@ -180,24 +206,30 @@ def main():
             ),
             (
                 "ffn_down",
-                10240,
-                2560,
+                "ffn_down",
                 256,
                 4,
                 1,
                 "termite_linear_q4_0_q8_1_f32_tile4_w8",
             ),
-            ("ple_gate", 2560, 256, 256, 4, 1, "termite_linear_q4_0_q8_1_f32_tile4_w8"),
+            (
+                "ple_gate",
+                "inp_gate",
+                256,
+                4,
+                1,
+                "termite_linear_q4_0_q8_1_f32_tile4_w8",
+            ),
             (
                 "ple_projection",
-                256,
-                2560,
+                "proj",
                 128,
                 4,
                 8,
                 "termite_linear_q4_0_q8_1_f32_tile4",
             ),
         ]:
+            indim, outdim = E4B_WEIGHT_SHAPES[weight_name]
             old = gpu.function(args.baseline_cubin, oldname)
             new = gpu.function(
                 args.candidate_cubin, f"termite_gemma4_small_{kind}_q8_1_f32"
@@ -223,14 +255,7 @@ def main():
                         activation,
                     ]
                 else:
-                    weight = weights[
-                        {
-                            "ffn_down": "ffn_down",
-                            "ple_gate": "inp_gate",
-                            "ple_projection": "proj",
-                        }[kind]
-                    ]
-                    parameters = [dst, source, weight]
+                    parameters = [dst, source, weights[weight_name]]
                 old_parameters = (
                     parameters
                     if kind == "ffn_pair"
@@ -241,6 +266,8 @@ def main():
                 )
                 gpu.launch(old, old_parameters, outdim // oldcols, threads)
                 expected = gpu.read(dst, outdim, np.float32)
+                # Every unwritten lane must differ, even for all-zero reference output.
+                gpu.upload(dst, np.bitwise_not(expected.view(np.uint32)))
                 gpu.launch(new, new_parameters, outdim // newcols, threads)
                 identical(
                     gpu.read(dst, outdim, np.float32), expected, f"{kind}/{trial}"

@@ -137,35 +137,31 @@ With no variant the pull is `auto`. Keep one variant per model directory: a seco
 
 ## Local Gemma4 Video Prompts
 
-Linux CUDA builds accept one local H.264 MP4 clip with a Gemma4 GGUF model and
-its matching vision projector:
+Gemma 4 generation accepts one video alongside text when the model has its
+matching vision projector. For example, to describe a local MP4 file, run
 
 ```bash
 antfly inference generate /models/gemma4 'Describe this video.' \
   --video clip.mp4 --backend cuda --max-tokens 128 --disable-thinking
 ```
 
-The GPU must support compute capability 7.5 or newer, and the NVIDIA driver must
-expose `libnvcuvid.so.1` and support H.264 NVDEC decoding.
-In NVIDIA containers, expose the driver's `video` capability alongside `compute`
-and `utility`. The runtime uses checked-in CUDA kernels; video decoding does not
-require FFmpeg, a CUDA compiler, or NVRTC at runtime.
+The CLI, native generation library, and inference gateway support video. Named
+gateway targets declare `video: supported` under `inference_capabilities`.
+Audio tracks in the clip are ignored. Each selected frame contributes up to 70
+visual tokens. The model targets one frame per second in presentation order and
+uniformly spaces up to 32 targets across the clip. MP4 edit bounds apply.
 
-Clips must be progressive 8-bit 4:2:0 SDR, at most 256 MiB and 60 seconds, with
-coded dimensions no larger than 4096 on either axis and no more than 18,000
-samples. The GPU's own decoder minimum and maximum dimensions also apply.
-Frames are selected in presentation order at one frame per second, with up to
-70 visual tokens per selected frame. MP4 edit-list end times are respected.
-Decoded surfaces, resized patches, projected features, and the prompt embedding
-handoff stay on the GPU. Compressed packets, timestamps, and model weights still
-use host memory; weights upload once per request.
+On Linux, the CUDA path uses NVDEC for compatible progressive H.264, HEVC and
+AV1 MP4 files. Its limits include 256 MiB, 60 seconds, 18,000 samples and 4096
+pixels per coded axis. The GPU must also support the clip's codec, bit depth
+and dimensions. NVIDIA containers should expose the driver's `video` capability
+alongside `compute` and `utility`. The runtime uses checked-in CUDA kernels.
 
-This route supports the local CLI and native generation library. The HTTP API
-does not accept video yet. Audio tracks in the clip are ignored. Rotation,
-non-square pixels, HDR, interlacing, other codecs, mixed image/audio attachments,
-raw prompts, and speculative decoding are unsupported. Unsupported clips fail
-explicitly. NVDEC owns additional driver memory outside Antfly's tensor-budget
-counters; leave GPU headroom for decoder surfaces when setting memory limits.
+When NVDEC is unavailable or a clip falls outside its decoder envelope, the
+runtime tries the host's portable decoding route under the request's memory
+budget. Projection still runs on the selected backend. HEVC requires NVDEC or
+VideoToolbox. See the [inference gateway reference](../reference/inference-gateway.md)
+for supported inputs and host-specific decoder requirements.
 
 ## Model Storage
 

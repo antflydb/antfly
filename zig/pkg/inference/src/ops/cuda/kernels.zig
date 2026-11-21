@@ -2404,6 +2404,7 @@ pub const KernelModule = struct {
     copy_u8: driver_mod.CUfunction = null,
     f32_to_bf16: driver_mod.CUfunction = null,
     f32_to_f16: driver_mod.CUfunction = null,
+    bf16_to_f16_in_place: driver_mod.CUfunction = null,
     f32_to_i32: driver_mod.CUfunction = null,
     round_f32: driver_mod.CUfunction = null,
     dequant_q4_0_bf16: driver_mod.CUfunction = null,
@@ -3856,6 +3857,7 @@ pub const KernelModule = struct {
         }
         errdefer gqa_attention_decode_splitk_online_workspace.free(ctx);
 
+        loaded.bf16_to_f16_in_place = loadOptionalFunction(ctx, module, "termite_bf16_to_f16_in_place");
         loaded.q4_q8_gate_up_k2560_n10240 = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9) loadOptionalFunction(ctx, module, "termite_gemma4_small_ffn_pair_q8_1_f32") else null;
         loaded.q4_q8_down_k10240_n2560 = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9) loadOptionalFunction(ctx, module, "termite_gemma4_small_ffn_down_q8_1_f32") else null;
         loaded.q4_q8_projection_k2560_n256 = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9) loadOptionalFunction(ctx, module, "termite_gemma4_small_ple_gate_q8_1_f32") else null;
@@ -4966,6 +4968,18 @@ pub const KernelModule = struct {
         var count_u32 = try toU32(count);
         var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &count_u32 });
         try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn convertBf16ToF16InPlace(self: *KernelModule, ctx: *context_mod.CudaContext, data: buffer_mod.DeviceBuffer, count: usize) driver_mod.Error!bool {
+        const function = self.bf16_to_f16_in_place orelse return false;
+        try checkRawBytes(data, try checkedTensorElements(count, @sizeOf(u16)));
+        if (count != 0) {
+            var ptr = data.ptr;
+            var n = try toU32(count);
+            var params = [_]?*anyopaque{ @ptrCast(&ptr), @ptrCast(&n) };
+            try launch1d(function, ctx, count, &params);
+        }
+        return true;
     }
 
     pub fn launchF32ToI32(

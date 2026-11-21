@@ -723,6 +723,22 @@ pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !
     return createCudaSessionWithKernelJit(allocator, model_path, .{});
 }
 
+/// The offline core benchmark can exercise the compact projector on the GB10
+/// before the first media request. Serving uses the release device policy.
+pub fn createGemma4CudaQualificationSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
+    const session = try createCudaSession(allocator, model_path);
+    errdefer session.close();
+    if (comptime build_options.enable_cuda) {
+        const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        const compute = self.backend_data.cuda.compute;
+        const cfg = getGptConfig(session) orelse return error.WrongArchitecture;
+        if (compute.gemma4_dense_qualified and @import("../ops/cuda/ple_host.zig").eligibleConfig(cfg) and
+            compute.ctx.info.compute_major == 12 and compute.ctx.info.compute_minor == 1)
+            try compute.configureGemma4Projector(.qualification);
+    }
+    return session;
+}
+
 pub const GlinerCudaPrecision = cuda_weights.GlinerCudaPrecision;
 
 /// Explicit precision for qualification and model owners. Automatic selection
@@ -13488,7 +13504,7 @@ pub const StagedExecution = struct {
         const self: *const StagedExecution = @ptrCast(@alignCast(raw orelse return error.InvalidVideoProbeContext));
         try self.control.check();
     }
-    fn videoCache(raw: *anyopaque, cb: *const ops.ComputeBackend, bytes: []const u8, max_tokens: usize) anyerror!ops.EmbeddingCacheScope {
+    fn videoCache(raw: *anyopaque, cb: *const ops.ComputeBackend, prepared: *const @import("../ops/cuda/video.zig").PreparedEmbedding, max_tokens: usize) anyerror!ops.EmbeddingCacheScope {
         if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
         _ = try self.cacheReceiver(cb);
@@ -13511,9 +13527,9 @@ pub const StagedExecution = struct {
         self.active = false;
         // Parser-only metadata: no surfaces, consumer or numerical work. This
         // allocator never calls the external quota supplier under the marker;
-        // its temporary footprint replaces the same later MP4 reader lifetime.
+        // the immutable packet table and display selection are already admitted.
         const metadata = platform.allocator.processAllocator(platform.allocator.concurrentFallback());
-        const observed = @import("../ops/cuda/video.zig").probeEmbeddingMp4(metadata, &compute.ctx, bytes, .{ .context = self, .check_fn = checkVideoProbe }, &preparation) catch |err| {
+        const observed = @import("../ops/cuda/video.zig").probeEmbeddingMp4(metadata, &compute.ctx, prepared, .{ .context = self, .check_fn = checkVideoProbe }, &preparation) catch |err| {
             preparation.finishOutsideExecution();
             return err;
         };

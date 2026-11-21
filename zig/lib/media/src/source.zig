@@ -25,6 +25,20 @@ pub const Control = struct {
         if (self.check_fn) |callback| try callback(self.context);
     }
 };
+pub const ReadControl = struct {
+    source: Control,
+    worker: Control,
+    pub fn control(self: *const ReadControl) Control {
+        if (self.source.check_fn == null) return self.worker;
+        if (self.worker.check_fn == null or (self.source.check_fn == self.worker.check_fn and self.source.context == self.worker.context)) return self.source;
+        return .{ .context = self, .check_fn = check };
+    }
+    fn check(raw: ?*const anyopaque) !void {
+        const self: *const ReadControl = @ptrCast(@alignCast(raw.?));
+        try self.source.check();
+        try self.worker.check();
+    }
+};
 pub const Limits = struct {
     max_read_bytes: usize = 16 * 1024 * 1024,
     max_retained_bytes: usize = 32 * 1024 * 1024,
@@ -32,6 +46,8 @@ pub const Limits = struct {
     max_reads: usize = 100_000,
 };
 pub const Range = struct {
+    /// Opt in when callbacks and their allocator support simultaneous reads.
+    concurrent: bool = false,
     /// Content digest or immutable object/version binding. Providers supplying
     /// this must validate that every returned range belongs to that snapshot.
     /// A display URL or unverified ETag is insufficient.
@@ -46,7 +62,8 @@ pub const Range = struct {
 };
 pub const Storage = union(enum) { borrowed: []const u8, range: Range };
 
-/// A source is caller-owned, immovable while leases exist, and single-consumer.
+/// A source is caller-owned and stays in place while leases or views exist.
+/// Give each worker a view to keep per-consumer I/O statistics.
 /// Provider context and borrowed bytes must outlive this source and its leases.
 /// Identity must name immutable content (e.g. an object version or digest).
 pub const Source = struct {
@@ -60,6 +77,17 @@ pub const Source = struct {
     total_bytes: u64 = 0,
     reads: usize = 0,
 
+    pending_bytes: u64 = 0,
+    provider_busy: std.atomic.Value(u32) = .init(0),
+    physical: ?*Source = null,
+    mutex: std.Io.Mutex = .init,
+
+    /// A worker keeps its allocator, cancellation and local statistics. All
+    /// descendants charge successful and partial I/O to the same physical owner.
+    /// The owner must outlive every view and its leases.
+    pub fn view(self: *Source, allocator: std.mem.Allocator, pool: ?*admission.Pool, control: Control) Source {
+        return .{ .allocator = allocator, .storage = self.storage, .identity = self.identity, .limits = self.limits, .control = control, .admission_pool = pool, .physical = self.physical orelse self };
+    }
     pub fn length(self: *const Source) u64 {
         return switch (self.storage) {
             .borrowed => |b| b.len,
@@ -67,48 +95,151 @@ pub const Source = struct {
         };
     }
     pub fn read(self: *Source, offset: u64, size: usize) !Lease {
-        try self.control.check();
+        return self.readControlled(offset, size, .{});
+    }
+    pub fn readReclaiming(self: *Source, offset: u64, size: usize, reclaimer: ?admission.Reclaimer) !Lease {
+        return self.readWithControl(offset, size, .{}, reclaimer);
+    }
+    pub fn readControlled(self: *Source, offset: u64, size: usize, caller: Control) !Lease {
+        return self.readWithControl(offset, size, caller, null);
+    }
+    fn readWithControl(self: *Source, offset: u64, size: usize, caller: Control, reclaimer: ?admission.Reclaimer) !Lease {
+        const owner = self.physical orelse self;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const controls = ReadControl{ .source = owner.control, .worker = self.control };
+        const combined = ReadControl{ .source = controls.control(), .worker = caller };
+        const control = combined.control();
+        try control.check();
         if (offset > self.length() or size > self.length() - offset) return error.UnexpectedEndOfSource;
-        if (size > self.limits.max_read_bytes or size > self.limits.max_retained_bytes -| self.retained_bytes or
-            size > self.limits.max_total_bytes -| self.total_bytes) return error.ResourceLimitExceeded;
-        if (self.reads >= self.limits.max_reads) return error.ResourceLimitExceeded;
-        var reservation = if (self.admission_pool) |pool| try pool.acquire(.{ .host_bytes = size }) else admission.Token{};
-        errdefer reservation.deinit();
-        self.retained_bytes += size;
-        errdefer self.retained_bytes -= size;
-        switch (self.storage) {
-            .borrowed => |bytes| {
-                self.reads += 1;
-                self.total_bytes += size;
-                return .{ .bytes = bytes[@intCast(offset)..][0..size], .source = self, .reservation = reservation };
-            },
-            .range => |range| {
-                if (range.borrow_at) |borrow| {
-                    if (try borrow(range.context, offset, size, self.control)) |bytes| {
-                        if (bytes.len != size) return error.InvalidSourceRead;
-                        try self.control.check();
-                        self.reads += 1;
-                        self.total_bytes += size;
-                        return .{ .bytes = bytes, .source = self, .reservation = reservation };
-                    }
-                }
-                const owned = try self.allocator.alloc(u8, size);
-                errdefer self.allocator.free(owned);
-                var done: usize = 0;
-                while (done < size) {
-                    try self.control.check();
-                    if (self.reads >= self.limits.max_reads) return error.ResourceLimitExceeded;
-                    self.reads += 1;
-                    const n = try range.read_at(range.context, offset + done, owned[done..], self.control);
-                    if (n == 0) return error.UnexpectedEndOfSource;
-                    if (n > size - done) return error.InvalidSourceRead;
-                    self.total_bytes += n;
-                    done += n;
-                }
-                try self.control.check();
-                return .{ .bytes = owned, .source = self, .owned = owned, .reservation = reservation };
-            },
+        if (self.storage == .borrowed) {
+            var token = try self.admitBytes(size, reclaimer);
+            errdefer token.deinit();
+            owner.mutex.lockUncancelable(io);
+            defer owner.mutex.unlock(io);
+            if (!self.canRead(size) or !owner.canRead(size)) return error.ResourceLimitExceeded;
+            self.chargeBorrowed(size);
+            if (owner != self) owner.chargeBorrowed(size);
+            return .{ .bytes = self.storage.borrowed[@intCast(offset)..][0..size], .source = self, .reservation = token };
         }
+        // Mutable providers retain serial semantics. Poll only a contended gate
+        // so a waiting worker can observe a provider-independent deadline.
+        const serial = !self.storage.range.concurrent;
+        if (serial and owner.provider_busy.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
+            while (true) {
+                try control.check();
+                if (owner.provider_busy.swap(2, .acquire) == 0) break;
+                try std.Io.futexWaitTimeout(io, u32, &owner.provider_busy.raw, 2, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } });
+            }
+        }
+        defer if (serial and owner.provider_busy.swap(0, .release) == 2) {
+            std.Io.futexWake(io, u32, &owner.provider_busy.raw, 1);
+        };
+        try self.reserveRead(owner, size);
+        var done: usize = 0;
+        var first_call_used = false;
+        defer {
+            owner.mutex.lockUncancelable(io);
+            defer owner.mutex.unlock(io);
+            self.settleRead(size, done, first_call_used);
+            if (owner != self) owner.settleRead(size, done, first_call_used);
+        }
+        errdefer self.releaseBytes(size);
+        var reservation = try self.admitBytes(size, reclaimer);
+        errdefer reservation.deinit();
+        const range = self.storage.range;
+        if (range.borrow_at) |borrow| {
+            const result = borrow(range.context, offset, size, control) catch |err| {
+                first_call_used = true;
+                return err;
+            };
+            if (result) |bytes| {
+                first_call_used = true;
+                if (bytes.len != size) return error.InvalidSourceRead;
+                done = size;
+                try control.check();
+                return .{ .bytes = bytes, .source = self, .reservation = reservation };
+            }
+        }
+        const owned = self.allocator.alloc(u8, size) catch |err| retry: {
+            if (!admission.Reclaimer.reclaim(reclaimer)) return err;
+            break :retry try self.allocator.alloc(u8, size);
+        };
+        errdefer self.allocator.free(owned);
+        while (done < size) {
+            try control.check();
+            if (first_call_used) try self.chargeCall(owner);
+            first_call_used = true;
+            const n = try range.read_at(range.context, offset + done, owned[done..], control);
+            if (n == 0) return error.UnexpectedEndOfSource;
+            if (n > size - done) return error.InvalidSourceRead;
+            done += n;
+        }
+        try control.check();
+        return .{ .bytes = owned, .source = self, .owned = owned, .reservation = reservation };
+    }
+    fn admitBytes(self: *Source, size: usize, reclaimer: ?admission.Reclaimer) !admission.Token {
+        return if (self.admission_pool) |pool| pool.acquire(.{ .host_bytes = size }) catch |err| retry: {
+            if (!admission.Reclaimer.reclaim(reclaimer)) return err;
+            break :retry try pool.acquire(.{ .host_bytes = size });
+        } else admission.Token{};
+    }
+    fn chargeBorrowed(self: *Source, size: usize) void {
+        self.reads += 1;
+        self.total_bytes += size;
+        self.retained_bytes += size;
+    }
+    fn reserveRead(self: *Source, owner: *Source, size: usize) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        owner.mutex.lockUncancelable(io);
+        defer owner.mutex.unlock(io);
+        if (!self.canRead(size) or !owner.canRead(size)) return error.ResourceLimitExceeded;
+        self.pending_bytes += size;
+        self.reads += 1;
+        self.retained_bytes += size;
+        if (owner != self) {
+            owner.pending_bytes += size;
+            owner.reads += 1;
+            owner.retained_bytes += size;
+        }
+    }
+    fn chargeCall(self: *Source, owner: *Source) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        owner.mutex.lockUncancelable(io);
+        defer owner.mutex.unlock(io);
+        if (self.reads >= self.limits.max_reads or owner.reads >= owner.limits.max_reads) return error.ResourceLimitExceeded;
+        self.reads += 1;
+        if (owner != self) owner.reads += 1;
+    }
+    fn settleRead(self: *Source, size: usize, transferred: usize, first_call_used: bool) void {
+        if (!first_call_used) self.reads -= 1;
+        self.pending_bytes -= size;
+        self.total_bytes += transferred;
+    }
+    fn releaseBytes(self: *Source, size: usize) void {
+        const owner = self.physical orelse self;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        owner.mutex.lockUncancelable(io);
+        defer owner.mutex.unlock(io);
+        self.retained_bytes -= size;
+        if (owner != self) owner.retained_bytes -= size;
+    }
+    /// Capacity available to a physical read at this instant, including other
+    /// workers' leases. read() verifies the limits again under the same lock.
+    pub fn remaining(self: *Source) Limits {
+        const owner = self.physical orelse self;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        owner.mutex.lockUncancelable(io);
+        defer owner.mutex.unlock(io);
+        return .{
+            .max_read_bytes = @min(self.limits.max_read_bytes, owner.limits.max_read_bytes),
+            .max_retained_bytes = @min(self.limits.max_retained_bytes -| self.retained_bytes, owner.limits.max_retained_bytes -| owner.retained_bytes),
+            .max_total_bytes = @min(self.limits.max_total_bytes -| self.total_bytes -| self.pending_bytes, owner.limits.max_total_bytes -| owner.total_bytes -| owner.pending_bytes),
+            .max_reads = @min(self.limits.max_reads -| self.reads, owner.limits.max_reads -| owner.reads),
+        };
+    }
+    fn canRead(self: *const Source, size: usize) bool {
+        return size <= self.limits.max_read_bytes and size <= self.limits.max_retained_bytes -| self.retained_bytes and
+            size <= self.limits.max_total_bytes -| self.total_bytes -| self.pending_bytes and self.reads < self.limits.max_reads;
     }
 };
 /// Move-only by convention. Independent leases survive subsequent reads. Release
@@ -120,8 +251,8 @@ pub const Lease = struct {
     reservation: admission.Token = .{},
     pub fn deinit(self: *Lease) void {
         if (self.source) |s| {
-            s.retained_bytes -= self.bytes.len;
             if (self.owned) |owned| s.allocator.free(owned);
+            s.releaseBytes(self.bytes.len);
         }
         self.reservation.deinit();
         self.* = .{ .bytes = &.{}, .source = null };
@@ -131,12 +262,14 @@ pub const Lease = struct {
 pub const FileRange = struct {
     file: std.Io.File,
     io: std.Io,
+    pub fn range(self: *FileRange, length: u64) Range {
+        return .{ .concurrent = true, .context = self, .read_at = readAt, .length = length };
+    }
     pub fn readAt(context: *anyopaque, offset: u64, bytes: []u8, control: Control) !usize {
         try control.check();
         const self: *FileRange = @ptrCast(@alignCast(context));
-        const n = try self.file.readPositional(self.io, &.{bytes}, offset);
-        try control.check();
-        return n;
+        // Source records the transfer before its post-read cancellation check.
+        return self.file.readPositional(self.io, &.{bytes}, offset);
     }
 };
 
@@ -222,13 +355,46 @@ test "file range adapter performs independent positional reads" {
     defer file.close(io);
     try file.writeStreamingAll(io, "abcdefgh");
     var provider = FileRange{ .file = file, .io = io };
-    var src = Source{ .allocator = std.testing.allocator, .identity = "immutable-file-v1", .storage = .{ .range = .{ .context = &provider, .read_at = FileRange.readAt, .length = 8 } } };
+    var src = Source{ .allocator = std.testing.allocator, .identity = "immutable-file-v1", .storage = .{ .range = provider.range(8) } };
     var tail = try src.read(4, 4);
     defer tail.deinit();
     var head = try src.read(0, 4);
     defer head.deinit();
     try std.testing.expectEqualStrings("efgh", tail.bytes);
     try std.testing.expectEqualStrings("abcd", head.bytes);
+}
+
+test "file transfer completed during cancellation consumes the shared byte allowance" {
+    const io = std.testing.io;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const file = try dir.dir.createFile(io, "source", .{ .read = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, "abcd");
+    const Provider = struct {
+        file_range: FileRange,
+        reading: bool = false,
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: Control) !usize {
+            const p: *@This() = @ptrCast(@alignCast(raw));
+            return FileRange.readAt(&p.file_range, offset, out, .{ .context = p, .check_fn = begin });
+        }
+        fn begin(raw: ?*const anyopaque) !void {
+            const p: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            try check(p);
+            p.reading = true;
+        }
+        fn check(raw: ?*const anyopaque) !void {
+            const p: *const @This() = @ptrCast(@alignCast(raw.?));
+            if (p.reading) return error.Cancelled;
+        }
+    };
+    var provider = Provider{ .file_range = .{ .file = file, .io = io } };
+    var src = Source{ .allocator = std.testing.allocator, .identity = "file", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = 4 } }, .limits = .{ .max_total_bytes = 4 } };
+    var worker = src.view(std.testing.allocator, null, .{ .context = &provider, .check_fn = Provider.check });
+    try std.testing.expectError(error.Cancelled, worker.read(0, 4));
+    try std.testing.expectEqual(@as(u64, 4), worker.total_bytes);
+    try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
+    try std.testing.expectError(error.ResourceLimitExceeded, src.read(0, 1));
 }
 
 test "source shared lease admission is retained and denied without provider reads" {
@@ -280,4 +446,76 @@ test "source immutable range borrows enforce limits and fall back across extents
     try std.testing.expectError(error.ResourceLimitExceeded, src.read(7, 1));
     try std.testing.expectEqual(@as(usize, 2), provider.borrows);
     try std.testing.expectEqual(@as(u64, 7), src.total_bytes);
+}
+
+test "source views share short read charges and retained leases" {
+    const Provider = struct {
+        calls: usize = 0,
+        fn read(raw: *anyopaque, _: u64, dest: []u8, _: Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            dest[0] = 0;
+            return 1;
+        }
+    };
+    var provider = Provider{};
+    var source = Source{ .allocator = std.testing.allocator, .identity = "short", .storage = .{ .range = .{ .length = 8, .read_at = Provider.read, .context = &provider } }, .limits = .{ .max_reads = 4, .max_retained_bytes = 4 } };
+    var decoder = source.view(source.allocator, null, .{});
+    var sibling = decoder.view(source.allocator, null, .{});
+    var held = try decoder.read(0, 2);
+    defer held.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, sibling.read(2, 3));
+    var header = try sibling.read(2, 1);
+    header.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, decoder.read(3, 2));
+    try std.testing.expectEqual(@as(usize, 4), provider.calls);
+    try std.testing.expectEqual(@as(u64, 4), source.total_bytes);
+    try std.testing.expectEqual(@as(u64, 3), decoder.total_bytes);
+    try std.testing.expectEqual(@as(usize, 2), source.retained_bytes);
+}
+
+test "concurrent range callbacks share credits without holding the physical lock" {
+    const Provider = struct {
+        sibling: *Source,
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset == 0) {
+                try std.testing.expectEqual(@as(u64, 1), self.sibling.remaining().max_total_bytes);
+                var nested = try self.sibling.read(1, 1);
+                defer nested.deinit();
+                out[0] = nested.bytes[0];
+            } else out[0] = 42;
+            return 1;
+        }
+    };
+    var p: Provider = undefined;
+    var owner = Source{ .allocator = std.testing.allocator, .identity = "range", .storage = .{ .range = .{ .context = &p, .length = 2, .read_at = Provider.read, .concurrent = true } }, .limits = .{ .max_reads = 2, .max_total_bytes = 2 } };
+    var sibling = owner.view(owner.allocator, null, .{});
+    p = .{ .sibling = &sibling };
+    var result = try owner.read(0, 1);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u8, 42), result.bytes[0]);
+    try std.testing.expectEqual(@as(u64, 2), owner.total_bytes);
+    try std.testing.expectEqual(@as(u64, 1), sibling.total_bytes);
+}
+
+test "waiting for a serialized range honors cancellation without charging a call" {
+    const Provider = struct {
+        checks: usize = 0,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.checks += 1;
+            if (self.checks == 3) return error.Cancelled;
+        }
+        fn read(_: *anyopaque, _: u64, _: []u8, _: Control) !usize {
+            return error.UnexpectedProviderCall;
+        }
+    };
+    var provider = Provider{};
+    var source = Source{ .allocator = std.testing.allocator, .identity = "busy", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = 1 } } };
+    source.provider_busy.store(1, .release);
+    var worker = source.view(source.allocator, null, .{ .context = &provider, .check_fn = Provider.check });
+    try std.testing.expectError(error.Cancelled, worker.read(0, 1));
+    try std.testing.expectEqual(@as(usize, 0), source.reads);
+    try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
 }
