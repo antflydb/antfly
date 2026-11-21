@@ -26,7 +26,33 @@ pub const state_key = "\x00\x00__committed_history__:state";
 /// The predecessor frontier at the ordered range cut. Storage publishes this
 /// witness alongside the new range and its apply receipt.
 pub const SplitCut = struct {
-    pub const key = "\x00\x00__committed_history__:split_cut";
+    const legacy_key = "\x00\x00__committed_history__:split_cut";
+    const key_prefix = legacy_key ++ ":";
+    pub const Key = [key_prefix.len + 16]u8;
+
+    pub fn key(transition: u64, attempt: u64) Key {
+        var raw: Key = undefined;
+        raw[0..key_prefix.len].* = key_prefix.*;
+        std.mem.writeInt(u64, raw[key_prefix.len..][0..8], transition, .big);
+        std.mem.writeInt(u64, raw[key_prefix.len + 8 ..][0..8], attempt, .big);
+        return raw;
+    }
+
+    pub fn load(txn: anytype, transition: u64, attempt: u64) !?SplitCut {
+        const raw = txn.get(&key(transition, attempt)) catch |err| {
+            if (err != error.NotFound) return err;
+            const previous = txn.get(legacy_key) catch |legacy_err| {
+                if (legacy_err == error.NotFound) return null;
+                return legacy_err;
+            };
+            const legacy = try SplitCut.decode(previous);
+            return if (legacy.transition == transition and legacy.attempt == attempt) legacy else null;
+        };
+        const cut = try SplitCut.decode(raw);
+        if (cut.transition != transition or cut.attempt != attempt) return error.HistoryCorrupt;
+        return cut;
+    }
+
     pub const encoded_size = 164;
     namespace: frame.Namespace,
     transition: u64,

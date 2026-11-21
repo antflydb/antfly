@@ -8247,8 +8247,16 @@ pub const DB = struct {
         const history_cut: ?[history.SplitCut.encoded_size]u8 = if (identity) |entry| cut: {
             var read = try self.core.store.beginProbeTxn();
             defer read.abort();
-            const frontier = (try history.load(&read)) orelse break :cut null;
             const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+            const boundary = history.frame.digest(transition.split_key);
+            if (try history.SplitCut.load(&read, transition.transition_id, transition.attempt_epoch)) |previous| {
+                if (!std.mem.eql(u8, &namespace, &previous.namespace) or
+                    previous.successor_group != transition.destination_group_id or
+                    !std.mem.eql(u8, &boundary, &previous.boundary))
+                    return error.HistoryResynchronizationRequired;
+                break :cut null;
+            }
+            const frontier = (try history.load(&read)) orelse break :cut null;
             if (!std.mem.eql(u8, &namespace, &frontier.namespace)) return error.HistoryResynchronizationRequired;
             break :cut (history.SplitCut{
                 .namespace = namespace,
@@ -8259,7 +8267,7 @@ pub const DB = struct {
                 .index = entry.index,
                 .latest = frontier.latest,
                 .reclaimed = frontier.reclaimed,
-                .boundary = history.frame.digest(transition.split_key),
+                .boundary = boundary,
                 .root_generation = self.core.root_generation,
                 .reserved_bytes = frontier.reserved_bytes,
             }).encode();
@@ -8288,7 +8296,8 @@ pub const DB = struct {
         defer metadata_writes.deinit(self.alloc);
         try metadata_writes.append(self.alloc, .{ .key = range_state_mod.range_key, .value = range_value });
         if (identity) |entry| try metadata_writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
-        if (history_cut != null) try metadata_writes.append(self.alloc, .{ .key = history.SplitCut.key, .value = &history_cut.? });
+        const history_cut_key = history.SplitCut.key(transition.transition_id, transition.attempt_epoch);
+        if (history_cut != null) try metadata_writes.append(self.alloc, .{ .key = &history_cut_key, .value = &history_cut.? });
         if (replication_lsn) |lsn| try metadata_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_marker_buf));
         if (replication_payload) |payload| {
             const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
@@ -162322,6 +162331,7 @@ test "db split finalization records the predecessor committed history frontier t
     };
     const entry: OrderedApplyReceipt = .{ .term = 2, .index = 9 };
     const later: OrderedApplyReceipt = .{ .term = 2, .index = 10 };
+    const second_entry: OrderedApplyReceipt = .{ .term = 2, .index = 11 };
     const split: types.SplitTransitionMutation = .{
         .kind = .finalize,
         .transition_id = 5,
@@ -162329,6 +162339,10 @@ test "db split finalization records the predecessor committed history frontier t
         .destination_group_id = 7,
         .split_key = "doc:m",
     };
+    var second_split = split;
+    second_split.transition_id += 1;
+    second_split.destination_group_id += 1;
+    second_split.split_key = "doc:g";
     {
         var db = try DB.open(alloc, path, options);
         defer db.close();
@@ -162343,20 +162357,25 @@ test "db split finalization records the predecessor committed history frontier t
         try db.applyOrderedTimestampedMutation(.{ .source_producer = .ordinary, .writes = &.{.{ .key = "doc:a", .value = "{\"value\":1}" }} }, .{ .term = 2, .index = 8 }, 100, false);
         try db.applyRangeFinalization(split, entry, null, null);
         try db.applyOrderedTimestampedMutation(.{ .source_producer = .ordinary, .writes = &.{.{ .key = "doc:a", .value = "{\"value\":2}" }} }, later, 110, false);
+        try db.applyRangeFinalization(second_split, second_entry, null, null);
     }
     var db = try DB.open(alloc, path, options);
     defer db.close();
     try db.applyRangeFinalization(split, entry, null, null);
-    try std.testing.expectEqualStrings("doc:m", db.getRange().end);
-    try std.testing.expectEqual(later, (try db.orderedApplyReceipt()).?);
+    try std.testing.expectEqualStrings("doc:g", db.getRange().end);
+    try std.testing.expectEqual(second_entry, (try db.orderedApplyReceipt()).?);
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
-    const cut = try history.SplitCut.decode(try read.get(history.SplitCut.key));
+    const cut = (try history.SplitCut.load(&read, split.transition_id, split.attempt_epoch)).?;
     try std.testing.expectEqual(namespace, cut.namespace);
     try std.testing.expectEqual(split.transition_id, cut.transition);
     try std.testing.expectEqual(split.destination_group_id, cut.successor_group);
     try std.testing.expectEqual(entry.index, cut.index);
     try std.testing.expectEqual(history.frame.digest(split.split_key), cut.boundary);
     try std.testing.expectEqual(@as(u64, 1), cut.latest);
+    const successor_cut = (try history.SplitCut.load(&read, second_split.transition_id, second_split.attempt_epoch)).?;
+    try std.testing.expectEqual(second_entry.index, successor_cut.index);
+    try std.testing.expectEqual(@as(u64, 2), successor_cut.latest);
+    try std.testing.expect((try history.SplitCut.load(&read, split.transition_id, split.attempt_epoch + 1)) == null);
     try std.testing.expectEqual(@as(u64, 2), (try history.load(&read)).?.latest);
 }
