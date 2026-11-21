@@ -75,7 +75,7 @@ pub const Column = struct {
     spec: operators.AggregateSpec,
     values: Values,
     pub fn init(spec: operators.AggregateSpec) Column {
-        return .{ .spec = spec, .values = if (spec.distinct or spec.kind == .pattern_set) .{ .dynamic = .empty } else if (spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg)) .{ .exact = .empty } else if (spec.input_element == .numeric and (spec.kind == .min or spec.kind == .max)) .{ .fixed = .empty } else switch (spec.kind) {
+        return .{ .spec = spec, .values = if (spec.distinct or spec.kind == .pattern_set or spec.kind == .array_agg) .{ .dynamic = .empty } else if (spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg)) .{ .exact = .empty } else if (spec.input_element == .numeric and (spec.kind == .min or spec.kind == .max)) .{ .fixed = .empty } else switch (spec.kind) {
             .count => .{ .counts = .empty },
             .sum => if (spec.input_type == .integer) .{ .integers = .empty } else .{ .numbers = .empty },
             .avg => .{ .numbers = .empty },
@@ -87,7 +87,7 @@ pub const Column = struct {
                 .string => .{ .bytes = .empty },
                 else => .{ .dynamic = .empty },
             },
-            .pattern_set => unreachable,
+            .pattern_set, .array_agg => unreachable,
         } };
     }
     const PageView = struct { column: Column, lease: paging.Pager.Lease };

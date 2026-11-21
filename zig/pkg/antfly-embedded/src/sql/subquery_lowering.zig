@@ -1078,9 +1078,51 @@ const Builder = struct {
         return window;
     }
 
+    /// Casting a position to Boolean needs only its existence, since every
+    /// array subscript produced by ARRAY(SELECT ...) is positive. Keep the
+    /// child's sort, offset and limit inside the derived input and preserve
+    /// NULL-safe element comparison and the NULL result for an absent value.
+    fn booleanArrayPosition(self: *Builder, array_query: *const ast.Select, probe: *const ast.Scalar, demand: ?*const ast.Scalar) !*const ast.Scalar {
+        const alias = try std.fmt.allocPrint(self.alloc, "$array_match_{d}", .{self.serial});
+        self.serial += 1;
+        if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+        try self.outer.put(self.alloc, alias, {});
+        const needle = try self.prerequisite(try self.rewriteDemand(probe, demand), demand);
+        const filter = try self.alloc.create(ast.Predicate);
+        filter.* = .{ .scalar = try self.scalar(.{ .binary = .{ .op = .is_not_distinct, .left = try self.field("$array_input", "$element"), .right = needle } }) };
+        const query = try self.alloc.create(ast.Select);
+        query.* = .{
+            .source = try self.relation(.{ .derived = .{ .query = array_query, .alias = "$array_input", .columns = &.{"$element"} } }),
+            .predicate = filter,
+            .count_all = true,
+            .count_alias = "$count",
+        };
+        self.source = try self.relation(.{ .join = .{
+            .kind = .left,
+            .left = self.source,
+            .right = try self.relation(.{ .derived = .{ .query = query, .alias = alias, .hidden = true, .lateral = true } }),
+            .demand = demand,
+        } });
+        const exists = try self.scalar(.{ .binary = .{ .op = .gt, .left = try self.field(alias, "$count"), .right = try self.scalar(.{ .literal = .{ .integer = 0 } }) } });
+        return self.scalar(.{ .case_when = .{
+            .branches = try self.alloc.dupe(ast.Scalar.Branch, &.{.{ .condition = exists, .value = try self.scalar(.{ .literal = .{ .boolean = true } }) }}),
+            .otherwise = try self.scalar(.{ .cast = .{ .type = .boolean, .operand = try self.scalar(.{ .literal = .null }) } }),
+        } });
+    }
+
     fn rewriteDemand(self: *Builder, input: *const ast.Scalar, demand: ?*const ast.Scalar) anyerror!*const ast.Scalar {
         if (!has(input)) return input;
+        if (input.* == .cast and input.cast.type == .boolean and input.cast.operand.* == .call) {
+            const position = input.cast.operand.call;
+            if (std.mem.eql(u8, position.name, "array_position") and position.args.len == 2 and !position.star and !position.distinct and position.window == null and position.filter == null and position.within_group == null and position.args[0].* == .call) {
+                const array = position.args[0].call;
+                if (array.subquery) |child| {
+                    if (std.mem.eql(u8, array.name, "$array_subquery")) return self.booleanArrayPosition(child, position.args[1], demand);
+                }
+            }
+        }
         if (input.* == .call and input.call.subquery != null) {
+            if (std.mem.eql(u8, input.call.name, "$array_subquery")) return error.UnsupportedSqlShape;
             if (std.mem.eql(u8, input.call.name, "$row_scalar")) return self.rowProducer(input, demand);
             if (std.mem.eql(u8, input.call.name, "$scalar") and (demand != null or try self.scalarNeedsApply(input.call.subquery.?.*)))
                 return self.scalarProducer(input.call.subquery.?, demand);

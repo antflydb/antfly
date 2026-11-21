@@ -36,7 +36,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const target = options.target;
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
+    const source_scope_storage_tests = b.addTest(.{ .root_module = data_storage_test_mod, .filters = compileFiltersWithAnchors(b, &.{"data storage module tests are reachable"}, &.{"db ordered source scope"}), .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-scope-native-control-test", "Verify physical source scope controls and atomic ordered recovery").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, source_scope_storage_tests, &.{"db ordered source scope"}).step);
+    const source_plan_apply_tests = @import("linked_tests.zig").add(b, .{ .name = "source-plan-apply-tests", .root_module = data_runtime_test_mod, .filters = &.{ "data raft source plan", "data raft source scope" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-plan-apply-test", "Verify activated frozen source plan native dispatch and lost-result recovery").dependOn(&source_plan_apply_tests.run(b).step);
+    const history_apply_tests = @import("linked_tests.zig").add(b, .{ .name = "ordered-history-apply-tests", .root_module = data_runtime_test_mod, .filters = &.{ "data raft ordered history", "source scope", "source producer closure", "source legacy terminal", "source legacy inventory", "source producer control" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("history-control-apply-test", "Verify native retention completion precedes shared Raft applied publication").dependOn(&history_apply_tests.run(b).step);
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data raft ordered history",
+        "data raft source plan",
+        "data raft source scope",
         "data runtime commit requirements",
         "data runtime ordered artifact upload handoff",
         "data runtime hosted FK retirement",
@@ -131,6 +140,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
+        "remote metadata changefeed port shares budgets and never fails over uncertain writes",
         "remote metadata source restore staging authority binds every owner read",
         "remote table descriptors prefer ordered peers before legacy fallback",
         "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
@@ -303,11 +313,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "db ordered source scope",
         "privacy data raft apply batches WAL-durable commands without one SST per entry",
         "privacy data raft apply compaction families are contiguous and separate hot metadata from history",
         "membership reducer",
         "FK retirement worker",
         "data raft online topology arbitration persists exact rejection and scopes release across reopen",
+        "data raft history control",
         // Regressions previously selected only by unit-test-progress.
         "split status decodes an omitted nullable source phase",
         "derive merge transition phases",
@@ -427,6 +439,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
     };
     const lib_data_storage_runtime_filters = selectTestFilters(b, &lib_data_storage_default_filters);
+    const history_projection_filters = &.{ "data raft history control", "data raft protocol barrier persists and transfers in snapshots", "data raft merge pages projection cannot acknowledge native source retention controls", "data raft merge pages native source projection requires trusted delegate and retries before shared applied publication" };
+    const history_projection_tests = b.addTest(.{ .root_module = data_storage_test_mod, .filters = compileFiltersWithAnchors(b, &.{"data storage module tests are reachable"}, history_projection_filters), .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_history_projection_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, history_projection_tests, history_projection_filters);
+    b.step("history-control-projection-test", "Verify retention projection cannot advance without native ownership and activation").dependOn(&run_history_projection_tests.step);
     const lib_data_storage_tests = b.addTest(.{
         .root_module = data_storage_test_mod,
         .filters = compileFiltersWithAnchors(
@@ -453,7 +469,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // clients through shared runtime tests. Link the same production
         // provider archives as the consumer executable; keeping its physical
         // source selection does not itself satisfy those extern symbols.
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ lib_data_runtime_tests.executable, implementation_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ lib_data_runtime_tests.executable, implementation_tests, history_apply_tests.executable, source_plan_apply_tests.executable }) catch @panic("OOM"),
         .run_lib_data_runtime_tests = run_lib_data_runtime_tests,
         .run_lib_data_storage_tests = run_lib_data_storage_tests,
     };

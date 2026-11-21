@@ -17,6 +17,7 @@ const replication_backfill = @import("metadata/replication_backfill.zig");
 
 test {
     _ = replication_backfill;
+    _ = @import("foreign/postgres_libpq.zig");
 }
 
 /// Implementation source choices for this compilation root.

@@ -29,6 +29,8 @@ const data_apply_client = @import("../storage/data_raft_apply_client.zig");
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const backend_types = @import("antfly_local_sources").storage_backend_types;
 const db_types = @import("antfly_local_sources").storage_db_types;
+const completion_history = @import("antfly_local_sources").storage_history_publication_wire;
+const completion_admission = @import("antfly_local_sources").storage_history_admission_wire;
 const runtime_callbacks = @import("antfly_local_sources").storage_db_runtime_callbacks;
 const replication_contract = @import("antfly_local_sources").storage_db_replication_contract;
 const document_artifact_child_range = @import("antfly_local_sources").storage_db_document_artifact_child_range;
@@ -269,6 +271,55 @@ test "source owner fenced descriptor disappearance is availability not absence" 
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ProvisionedKernelOwnerSource.queryGroupLocalRouted(&source, std.testing.allocator, fence, 7, "rows", .{}, .stale));
 }
 
+test "ordered history routed read rejects unsupported barriers and leader loss before owner acquisition" {
+    const Fixture = struct {
+        waits: usize = 0,
+        captures: usize = 0,
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+            const groups = try alloc.alloc(table_catalog.CatalogGroupRoute, 1);
+            groups[0] = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } };
+            return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .groups = groups } };
+        }
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedOwnerAcquisition;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn wait(ptr: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.waits += 1;
+            return error.NotLeader;
+        }
+        fn capture(ptr: *anyopaque, _: u64) !read_gate.ReadSafetyBarrier.FrozenProof {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captures += 1;
+            return error.UnexpectedCapture;
+        }
+        fn validate(_: *anyopaque, _: u64, _: read_gate.ReadSafetyBarrier.FrozenProof, _: ?u64, _: @import("antfly_cancellation").CancellationToken) !void {
+            return error.UnexpectedValidation;
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{};
+    var source = ProvisionedKernelOwnerSource.init(a, "unused", .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .validate_route = Fixture.resolve } }, read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .route = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } } };
+    const history = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 1, .big);
+    std.mem.writeInt(u64, namespace[8..16], 7, .big);
+    std.mem.writeInt(u64, namespace[16..24], 7, .big);
+    var request: history.history_page.Request = .{ .reference = .{ .namespace = namespace, .authority = @splat(1), .consumer = @splat(2), .epoch = 1, .grant = 1, .definition = @splat(3) }, .after = .{}, .now_seconds = 100 };
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, source.orderedHistoryPageRouted(a, fence, "docs", request));
+    source.read_safety_barrier = .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.wait, .capture_frozen = Fixture.capture, .validate_frozen = Fixture.validate } };
+    request.reference.namespace[0] ^= 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, source.orderedHistoryPageRouted(a, fence, "docs", request));
+    request.reference.namespace[0] ^= 1;
+    try std.testing.expectError(error.NotLeader, source.orderedHistoryPageRouted(a, fence, "docs", request));
+    try std.testing.expectEqual(@as(usize, 1), fixture.waits);
+    try std.testing.expectEqual(@as(usize, 0), fixture.captures);
+    try std.testing.expectEqual(@as(usize, 0), source.ownerCountForTest());
+}
+
 pub const ProvisionedKernelOwnerSource = struct {
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
@@ -280,6 +331,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     row_policy_authority_issuer: ?[]const u8 = null,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     transaction_recovery_source: ?transaction_recovery_source.Source = null,
+    completion_recovery: ?@import("completion_recovery_queue.zig").Port = null,
     restore_descriptor_recovery: ?RestoreDescriptorRecovery = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
@@ -975,6 +1027,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn writeSource(self: *ProvisionedKernelOwnerSource) table_write_source.TableWriteSource {
         return .{
             .ptr = self,
+            .supports_transaction_producer_phases = true,
             .vtable = &.{
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
@@ -1763,7 +1816,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         raft_term: u64,
         raft_index: u64,
     ) !void {
-        return self.applyPreparedReplicatedBatchClassified(alloc, group_id, table_name, descriptor, req, raft_term, raft_index, null);
+        return self.applyPreparedRowEntry(alloc, group_id, table_name, descriptor, req, raft_term, raft_index, null, null);
+    }
+
+    pub fn applyPreparedTimestampedBatchGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        req: db_types.BatchRequest,
+        raft_term: u64,
+        raft_index: u64,
+        committed_at_ns: i64,
+    ) !void {
+        if (committed_at_ns <= 0 or req.source_producer != .ordinary or req.transaction != null) return error.InvalidBatchRequest;
+        return self.applyPreparedRowEntry(alloc, group_id, table_name, descriptor, req, raft_term, raft_index, committed_at_ns, null);
     }
 
     pub fn applyPreparedReplicatedBatchClassified(
@@ -1775,6 +1843,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         req: db_types.BatchRequest,
         raft_term: u64,
         raft_index: u64,
+        terminal_failure: ?*const fn (anyerror, db_types.BatchRequest) bool,
+    ) !void {
+        return self.applyPreparedRowEntry(alloc, group_id, table_name, descriptor, req, raft_term, raft_index, null, terminal_failure);
+    }
+
+    fn applyPreparedRowEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        req: db_types.BatchRequest,
+        raft_term: u64,
+        raft_index: u64,
+        committed_at_ns: ?i64,
         terminal_failure: ?*const fn (anyerror, db_types.BatchRequest) bool,
     ) !void {
         // The Raft progress driver owns the committed entry and its retry
@@ -1801,6 +1884,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
+        if (committed_at_ns) |clock| {
+            lease.owner().timestampedBatchAtRaftEntry(table_name, request_json, raft_term, raft_index, clock) catch |err| {
+                if (terminal_failure) |classify| if (classify(err, req)) lease.entry.apply_handoff_until_ns.store(0, .release);
+                return err;
+            };
+            lease.entry.apply_handoff_until_ns.store(0, .release);
+            return;
+        }
         var response = lease.owner().replicatedBatchAtRaftEntryJson(
             table_name,
             request_json,
@@ -1814,6 +1905,483 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
         lease.entry.apply_handoff_until_ns.store(0, .release);
         defer response.deinit();
+    }
+
+    /// Apply retention through the same descriptor-pinned owner as row replay.
+    /// This never resolves live metadata on the Raft progress thread.
+    pub fn applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        command: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command,
+        raft_term: u64,
+        raft_index: u64,
+    ) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome {
+        var lease = if (!@import("builtin").is_test or self.apply_control_started.load(.acquire))
+            try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false, .{ .term = raft_term, .index = raft_index })
+        else blk: {
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            break :blk self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_graph_indexes = false }) catch |err| switch (err) {
+                error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
+                else => return err,
+            };
+        };
+        defer lease.deinit();
+        const json = try std.json.Stringify.valueAlloc(alloc, command, .{});
+        defer alloc.free(json);
+        var response = try lease.owner().orderedHistoryControlJson(table_name, json, raft_term, raft_index);
+        lease.entry.apply_handoff_until_ns.store(0, .release);
+        defer response.deinit();
+        if (response.bytes().len > 4096) return error.InvalidArgument;
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome, alloc, response.bytes(), .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    pub fn applyPreparedOrderedSourceScopeControlGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        command: @import("antfly_local_sources").storage_source_scope_control.Command,
+        raft_term: u64,
+        raft_index: u64,
+    ) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
+        try command.validate();
+        if (self.online_source_authority != .raft) return error.HistoryAuthorityRequired;
+        if (command.intent.owner.group_id != group_id) return error.HistoryResynchronizationRequired;
+        var lease = if (!@import("builtin").is_test or self.apply_control_started.load(.acquire))
+            try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false, .{ .term = raft_term, .index = raft_index })
+        else blk: {
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            break :blk self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_graph_indexes = false }) catch |err| switch (err) {
+                error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
+                else => return err,
+            };
+        };
+        defer lease.deinit();
+        const outcome = try lease.owner().orderedSourceScopeControl(alloc, table_name, command, raft_term, raft_index);
+        lease.entry.apply_handoff_until_ns.store(0, .release);
+        return outcome;
+    }
+
+    pub fn applyPreparedOrderedLegacyTerminalResolutionGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        command: @import("antfly_local_sources").storage_source_producer_policy.LegacyTerminalCommand,
+        raft_term: u64,
+        raft_index: u64,
+    ) !@import("antfly_local_sources").storage_source_legacy_terminal_ordered.Outcome {
+        try command.validate();
+        if (self.online_source_authority != .raft) return error.HistoryAuthorityRequired;
+        if (command.owner.group_id != group_id) return error.HistoryResynchronizationRequired;
+        var lease = if (!@import("builtin").is_test or self.apply_control_started.load(.acquire))
+            try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false, .{ .term = raft_term, .index = raft_index })
+        else blk: {
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            break :blk self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_graph_indexes = false }) catch |err| switch (err) {
+                error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
+                else => return err,
+            };
+        };
+        defer lease.deinit();
+        const outcome = try lease.owner().orderedLegacyTerminalResolution(alloc, table_name, command, raft_term, raft_index);
+        lease.entry.apply_handoff_until_ns.store(0, .release);
+        return outcome;
+    }
+
+    pub fn applyPreparedOrderedSourceProducerClosureGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        owner: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion.RoutedOwner,
+        raft_term: u64,
+        raft_index: u64,
+    ) !@import("antfly_local_sources").storage_source_producer_policy.Closure {
+        try owner.validate();
+        if (self.online_source_authority != .raft) return error.HistoryAuthorityRequired;
+        if (owner.group_id != group_id) return error.HistoryResynchronizationRequired;
+        var lease = if (!@import("builtin").is_test or self.apply_control_started.load(.acquire))
+            try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false, .{ .term = raft_term, .index = raft_index })
+        else blk: {
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            break :blk self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_graph_indexes = false }) catch |err| switch (err) {
+                error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
+                else => return err,
+            };
+        };
+        defer lease.deinit();
+        const outcome = try lease.owner().orderedSourceProducerClosure(alloc, table_name, owner, raft_term, raft_index);
+        lease.entry.apply_handoff_until_ns.store(0, .release);
+        return outcome;
+    }
+
+    pub fn applyPreparedOrderedSourceRetirementGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        command: @import("antfly_local_sources").storage_source_scope_retirement.Command,
+        raft_term: u64,
+        raft_index: u64,
+    ) !@import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery {
+        _ = try command.proof();
+        if (self.online_source_authority != .raft) return error.HistoryAuthorityRequired;
+        if (command.intent.owner.group_id != group_id) return error.HistoryResynchronizationRequired;
+        var lease = if (!@import("builtin").is_test or self.apply_control_started.load(.acquire))
+            try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false, .{ .term = raft_term, .index = raft_index })
+        else blk: {
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            break :blk self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_graph_indexes = false }) catch |err| switch (err) {
+                error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
+                else => return err,
+            };
+        };
+        defer lease.deinit();
+        const outcome = try lease.owner().orderedSourceRetirement(alloc, table_name, command, raft_term, raft_index);
+        lease.entry.apply_handoff_until_ns.store(0, .release);
+        return outcome;
+    }
+
+    pub fn applyPreparedOrderedSourcePlanControlGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        command: @import("antfly_local_sources").storage_source_plan_wire.Command,
+        raft_term: u64,
+        raft_index: u64,
+    ) !@import("antfly_local_sources").storage_source_plan_control.Outcome {
+        var lease = if (!@import("builtin").is_test or self.apply_control_started.load(.acquire))
+            try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false, .{ .term = raft_term, .index = raft_index })
+        else blk: {
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            break :blk self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_graph_indexes = false }) catch |err| switch (err) {
+                error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
+                else => return err,
+            };
+        };
+        defer lease.deinit();
+        const json = try std.json.Stringify.valueAlloc(alloc, command, .{});
+        defer alloc.free(json);
+        var response = try lease.owner().orderedSourcePlanControlJson(table_name, json, raft_term, raft_index);
+        lease.entry.apply_handoff_until_ns.store(0, .release);
+        defer response.deinit();
+        if (response.bytes().len > 4096) return error.InvalidArgument;
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_source_plan_control.Outcome, alloc, response.bytes(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    const source_plan_http = @import("../data/source_plan_http_wire.zig");
+    const SourcePlanReadKind = enum { observation, chunk, outcome, checkpoint, scope, scope_outcome, retirement_outcome, producer_closure, legacy_terminal, legacy_inventory };
+    fn SourcePlanReadInput(comptime kind: SourcePlanReadKind) type {
+        return switch (kind) {
+            .observation => source_plan_http.ObserveRequest,
+            .scope => @import("antfly_local_sources").storage_source_scope_control.Query,
+            .producer_closure => @import("antfly_local_sources").storage_source_producer_policy.Query,
+            .legacy_terminal => @import("antfly_local_sources").storage_source_legacy_terminal_ordered.Query,
+            .legacy_inventory => @import("antfly_local_sources").storage_source_legacy_inventory.Query,
+            .scope_outcome => @import("antfly_local_sources").storage_source_scope_ordered.Recovery,
+            .retirement_outcome => @import("antfly_local_sources").storage_source_scope_retirement_ordered.Query,
+            .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Request,
+            .chunk => source_plan_http.ChunkRequest,
+            .outcome => source_plan_http.ControlRequest,
+        };
+    }
+    fn SourcePlanReadResult(comptime kind: SourcePlanReadKind) type {
+        return switch (kind) {
+            .observation => source_plan_http.control.Observation,
+            .scope => @import("antfly_local_sources").storage_source_scope_control.Observation,
+            .producer_closure => @import("antfly_local_sources").storage_source_producer_policy.Observation,
+            .legacy_terminal => @import("antfly_local_sources").storage_source_legacy_terminal_ordered.Observation,
+            .legacy_inventory => @import("antfly_local_sources").storage_source_legacy_inventory.Observation,
+            .scope_outcome => @import("antfly_local_sources").storage_source_scope_ordered.Outcome,
+            .retirement_outcome => @import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery,
+            .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Reply,
+            .chunk => source_plan_http.control.Read,
+            .outcome => source_plan_http.control.Outcome,
+        };
+    }
+    pub fn sourceRetirementOutcomeRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_scope_retirement_ordered.Query) !@import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery {
+        return self.sourcePlanReadRouted(a, fence, table, .retirement_outcome, request);
+    }
+    pub fn sourceScopeOutcomeRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_scope_ordered.Recovery) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
+        return self.sourcePlanReadRouted(a, fence, table, .scope_outcome, request);
+    }
+    pub fn legacyRecoveryInventoryRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_legacy_inventory.Query) !@import("antfly_local_sources").storage_source_legacy_inventory.Observation {
+        return self.sourcePlanReadRouted(a, fence, table, .legacy_inventory, request);
+    }
+    pub fn legacyTerminalOutcomeRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_legacy_terminal_ordered.Query) !@import("antfly_local_sources").storage_source_legacy_terminal_ordered.Observation {
+        return self.sourcePlanReadRouted(a, fence, table, .legacy_terminal, request);
+    }
+    pub fn sourceProducerClosureObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_producer_policy.Query) !@import("antfly_local_sources").storage_source_producer_policy.Observation {
+        return self.sourcePlanReadRouted(a, fence, table, .producer_closure, request);
+    }
+    pub fn sourceScopeObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_scope_control.Query) !@import("antfly_local_sources").storage_source_scope_control.Observation {
+        return self.sourcePlanReadRouted(a, fence, table, .scope, request);
+    }
+    pub fn sourceCheckpointObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_checkpoint_read.Request) !@import("antfly_local_sources").storage_source_checkpoint_read.Reply {
+        return self.sourcePlanReadRouted(a, fence, table, .checkpoint, request);
+    }
+    pub fn sourcePlanObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: source_plan_http.ObserveRequest) !source_plan_http.control.Observation {
+        return self.sourcePlanReadRouted(a, fence, table, .observation, request);
+    }
+    pub fn sourcePlanChunkRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: source_plan_http.ChunkRequest) !source_plan_http.control.Read {
+        return self.sourcePlanReadRouted(a, fence, table, .chunk, request);
+    }
+    pub fn sourcePlanOutcomeRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: source_plan_http.ControlRequest) !source_plan_http.control.Outcome {
+        return self.sourcePlanReadRouted(a, fence, table, .outcome, request);
+    }
+    fn sourcePlanReadRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, comptime kind: SourcePlanReadKind, request: SourcePlanReadInput(kind)) !SourcePlanReadResult(kind) {
+        if (self.online_source_authority != .raft) return error.ChangefeedCapabilityUnsupported;
+        if (comptime kind == .outcome) {
+            try request.validate(a);
+            if (request.operation != .recover) return error.InvalidSourcePlanWire;
+        } else try request.validate();
+        const expected = if (kind == .scope or kind == .producer_closure or kind == .legacy_terminal or kind == .legacy_inventory) request.owner else if (kind == .scope_outcome or kind == .retirement_outcome) request.command.intent.owner else request.source_owner;
+        const group = fence.route.group_id;
+        if (expected.group_id != group) return error.TopologyChanged;
+        const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
+        try context.ensureActive();
+        try self.validateRoutedRead(a, fence, group, table);
+        var descriptor = try self.loadCompletionDescriptor(a, group, table, context);
+        defer descriptor.deinit(a);
+        try @import("completion_owner_admission.zig").require(a, self.catalog, table, fence, descriptor.view(), expected, context);
+        const barrier = self.read_safety_barrier;
+        const capture = barrier.vtable.capture_frozen orelse return error.ChangefeedCapabilityUnsupported;
+        const validate = barrier.vtable.validate_frozen orelse return error.ChangefeedCapabilityUnsupported;
+        const opts: db_types.ScanOptions = .{ .execution_deadline_ns = context.deadline_ns, .cancellation = fence.admission_cancellation };
+        try self.prepareRetainedScanRead(group, "", "", opts, .read_index);
+        const proof = try capture(barrier.ptr, group);
+        if (proof.incarnation == 0 or proof.term == 0 or proof.applied_index == 0) return error.ReadUnavailable;
+        const minimum = switch (kind) {
+            .observation => request.query.minimum_applied_index,
+            .checkpoint, .scope, .scope_outcome, .retirement_outcome, .producer_closure, .legacy_terminal, .legacy_inventory => request.minimum_applied_index,
+            .chunk => request.request.query.minimum_applied_index,
+            .outcome => request.receipt.?.index,
+        };
+        if (proof.applied_index < minimum) return error.StorageReadTemporarilyUnavailable;
+        try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
+        var lease = try self.acquireWithControls(group, table, .from(opts));
+        defer lease.deinit();
+        const identity = fence.route.identity_namespace;
+        if (lease.entry.identity.table_id != identity.table_id or lease.entry.identity.shard_id != identity.shard_id or lease.entry.identity.range_id != identity.range_id) return error.HistoryResynchronizationRequired;
+        try self.validateRoutedRead(a, fence, group, table);
+        const result = switch (kind) {
+            .observation => try lease.owner().sourcePlanObservation(a, table, request.query),
+            .scope => try lease.owner().sourceScopeObservation(a, table, request),
+            .producer_closure => try lease.owner().sourceProducerClosureObservation(a, table, request),
+            .legacy_terminal => try lease.owner().legacyTerminalOutcome(a, table, request),
+            .legacy_inventory => try lease.owner().legacyRecoveryInventory(a, table, request),
+            .scope_outcome => try lease.owner().sourceScopeOutcome(a, table, request),
+            .retirement_outcome => try lease.owner().sourceRetirementOutcome(a, table, request),
+            .checkpoint => try lease.owner().sourceCheckpointObservation(a, table, request),
+            .chunk => try lease.owner().sourcePlanChunk(a, table, request.request),
+            .outcome => try lease.owner().sourcePlanOutcome(a, table, .{ .command = request.command, .entry = request.receipt.?, .minimum_applied_index = minimum }),
+        };
+        errdefer if (comptime kind == .chunk) a.free(result.bytes);
+        errdefer if (comptime kind == .legacy_inventory) {
+            var owned = result;
+            owned.deinit(a);
+        };
+        try @import("completion_owner_admission.zig").require(a, self.catalog, table, fence, descriptor.view(), expected, context);
+        try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
+        try self.validateRoutedRead(a, fence, group, table);
+        try context.ensureActive();
+        return result;
+    }
+
+    const completion_decision = @import("antfly_local_sources").storage_history_decision_wire;
+    const HistoryReadKind = enum { page, bootstrap, outcome, grant, resolution, publication, admission, decision };
+    fn HistoryReadInput(comptime kind: HistoryReadKind) type {
+        return switch (kind) {
+            .page => table_write_source.history_page.Request,
+            .bootstrap => table_write_source.history_page.BootstrapRequest,
+            .outcome => table_write_source.history_ordered.Lookup,
+            .grant => table_write_source.history_consumer.GrantIdentity,
+            .resolution => table_write_source.history_resolution_wire.Request,
+            .publication => completion_history.CompletionPublicationQuery,
+            .admission => completion_admission.Query,
+            .decision => completion_decision.Query,
+        };
+    }
+    fn HistoryReadResult(comptime kind: HistoryReadKind) type {
+        return switch (kind) {
+            .page => table_write_source.history_page.Page,
+            .bootstrap => table_write_source.history_page.BootstrapPage,
+            .outcome => table_write_source.history_ordered.Outcome,
+            .grant => table_write_source.history_consumer.GrantObservation,
+            .resolution => table_write_source.history_resolution_wire.Reply,
+            .publication => completion_history.CompletionPublicationObservation,
+            .admission => completion_admission.Reply,
+            .decision => completion_decision.OwnedReply,
+        };
+    }
+
+    /// Private retained-history reads never fall back to stale consistency.
+    pub fn orderedHistoryPageRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: table_write_source.history_page.Request) !table_write_source.history_page.Page {
+        return self.historyReadRouted(alloc, fence, table_name, .page, request);
+    }
+
+    pub fn orderedHistoryBootstrapPageRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: table_write_source.history_page.BootstrapRequest) !table_write_source.history_page.BootstrapPage {
+        return self.historyReadRouted(alloc, fence, table_name, .bootstrap, request);
+    }
+
+    /// Exact receipt recovery has the same route and leader fences as pages.
+    pub fn orderedHistoryOutcomeRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: table_write_source.history_ordered.Lookup) !table_write_source.history_ordered.Outcome {
+        return self.historyReadRouted(alloc, fence, table_name, .outcome, request);
+    }
+
+    pub fn orderedHistoryGrantRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, identity: table_write_source.history_consumer.GrantIdentity) !table_write_source.history_consumer.GrantObservation {
+        return self.historyReadRouted(alloc, fence, table_name, .grant, identity);
+    }
+
+    pub fn orderedHistoryResolutionRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: table_write_source.history_resolution_wire.Request) !table_write_source.history_resolution_wire.Reply {
+        return self.historyReadRouted(alloc, fence, table_name, .resolution, request);
+    }
+
+    pub fn orderedHistoryPublicationRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, query: completion_history.CompletionPublicationQuery) !completion_history.CompletionPublicationObservation {
+        try query.validate();
+        if (query.owner.group_id != fence.route.group_id) return error.TopologyChanged;
+        const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
+        var bounded = fence;
+        bounded.admission_deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
+        bounded.admission_deadline_io = null;
+        return self.historyReadRouted(alloc, bounded, table_name, .publication, query);
+    }
+
+    /// Original-owner coordinator decision and retained admission from one
+    /// native snapshot under the same final quorum/catalog fences as receipts.
+    pub fn orderedHistoryDecisionRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, query: completion_decision.Query) !completion_decision.OwnedReply {
+        try query.validate();
+        if (query.owner.group_id != fence.route.group_id) return error.TopologyChanged;
+        const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
+        var bounded = fence;
+        bounded.admission_deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
+        bounded.admission_deadline_io = null;
+        return self.historyReadRouted(alloc, bounded, table_name, .decision, query);
+    }
+
+    pub const CapturedCompletionOwner = struct {
+        owner: @FieldType(completion_admission.Query, "owner"),
+        observation: completion_admission.Reply,
+    };
+
+    /// Capture a candidate only after qualifying its actual writable native
+    /// root, retained-history state and positive cut through the leader barrier.
+    /// The result reserves no space and grants no permission to bypass the
+    /// original owner checks during BEGIN/PREPARE/RESOLVE/publication.
+    pub fn captureCompletionOwnerRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, expected_table_binding: [32]u8, original: request_operation.RequestContext) !CapturedCompletionOwner {
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        try context.ensureActive();
+        var bounded = fence;
+        bounded.admission_deadline_ns = scope.deadline_ns;
+        bounded.admission_deadline_io = null;
+        bounded.admission_cancellation = context.cancellation;
+        try self.validateRoutedRead(alloc, bounded, fence.route.group_id, table_name);
+        var descriptor = try self.loadCompletionDescriptor(alloc, fence.route.group_id, table_name, context);
+        defer descriptor.deinit(alloc);
+        const owner = try @import("completion_owner_admission.zig").capture(alloc, self.catalog, table_name, bounded, descriptor.view(), context);
+        if (!std.mem.eql(u8, &owner.table_binding, &expected_table_binding)) return error.TopologyChanged;
+        const observation = try self.historyReadRouted(alloc, bounded, table_name, .admission, completion_admission.Query{ .owner = owner });
+        try context.ensureActive();
+        return .{ .owner = owner, .observation = observation };
+    }
+
+    fn historyReadRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, comptime kind: HistoryReadKind, request: HistoryReadInput(kind)) !HistoryReadResult(kind) {
+        if (self.online_source_authority != .raft) return error.ChangefeedCapabilityUnsupported;
+        const barrier = self.read_safety_barrier;
+        const capture = barrier.vtable.capture_frozen orelse return error.ChangefeedCapabilityUnsupported;
+        const validate = barrier.vtable.validate_frozen orelse return error.ChangefeedCapabilityUnsupported;
+        const group = fence.route.group_id;
+        try self.validateRoutedRead(alloc, fence, group, table_name);
+        const identity = fence.route.identity_namespace;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], identity.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
+        const requested_namespace = switch (kind) {
+            .page, .bootstrap => request.reference.namespace,
+            .outcome => request.command.namespace(),
+            .grant => request.namespace,
+            .resolution => request.namespace,
+            .publication, .admission, .decision => request.owner.namespace,
+        };
+        if (comptime kind == .grant or kind == .bootstrap) try request.validate();
+        if (comptime kind == .resolution) {
+            try request.validate();
+            if (request.authority != .raft) return error.ChangefeedCapabilityUnsupported;
+        }
+        if (!std.mem.eql(u8, &namespace, &requested_namespace)) return error.HistoryResynchronizationRequired;
+        const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
+        const opts: db_types.ScanOptions = .{ .execution_deadline_ns = context.deadline_ns, .cancellation = fence.admission_cancellation };
+        var publication_descriptor: ?LoadedDescriptor = if (comptime kind == .publication or kind == .admission or kind == .decision) try self.loadCompletionDescriptor(alloc, group, table_name, context) else null;
+        defer if (publication_descriptor) |*owned| owned.deinit(alloc);
+        if (comptime kind == .publication or kind == .admission or kind == .decision) {
+            try request.validate();
+            try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
+        }
+        try self.prepareRetainedScanRead(group, "", "", opts, .read_index);
+        const proof = try capture(barrier.ptr, group);
+        if (proof.incarnation == 0 or proof.term == 0 or proof.applied_index == 0) return error.ReadUnavailable;
+        if (comptime kind == .outcome) {
+            if (request.entry.term == 0 or request.entry.index == 0) return error.InvalidOrderedApplyReceipt;
+            if (request.minimum_applied_index < request.entry.index) return error.InvalidHistoryAdmission;
+            if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
+        }
+        if (comptime kind == .resolution or kind == .publication or kind == .admission or kind == .decision) if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
+        try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
+        var lease = try self.acquireWithControls(group, table_name, .from(opts));
+        defer lease.deinit();
+        if (lease.entry.identity.table_id != identity.table_id or lease.entry.identity.shard_id != identity.shard_id or lease.entry.identity.range_id != identity.range_id) return error.HistoryResynchronizationRequired;
+        try self.validateRoutedRead(alloc, fence, group, table_name);
+        var result = switch (kind) {
+            // Page/grant requests have no caller-supplied native index: a
+            // positive persisted marker establishes native Raft authority.
+            // The quorum/owner fences establish freshness for every read.
+            .page => try lease.owner().orderedHistoryPage(alloc, table_name, request, 1),
+            .bootstrap => try lease.owner().orderedHistoryBootstrapPage(alloc, table_name, request, 1),
+            .outcome => try lease.owner().orderedHistoryOutcome(alloc, table_name, request),
+            .grant => try lease.owner().orderedHistoryGrant(alloc, table_name, request, 1),
+            // ReadIndex includes no-ops and protocol barriers which never
+            // mutate this root. Its persisted marker is deliberately sparse.
+            // applyReady publishes group progress only after native effects
+            // finish, so a read transaction opened after the barrier observes
+            // those effects. Keep the caller's native minimum; final quorum
+            // and owner validation reject concurrent commits or replacement.
+            .resolution => try lease.owner().historyResolution(alloc, table_name, request),
+            .publication => try lease.owner().historyPublication(alloc, table_name, request),
+            .admission => try lease.owner().historyAdmission(alloc, table_name, request),
+            .decision => try lease.owner().historyDecision(alloc, table_name, request),
+        };
+        errdefer if (comptime kind == .page or kind == .bootstrap or kind == .decision) result.deinit();
+        if (comptime kind == .publication or kind == .admission or kind == .decision) try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
+        try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
+        try self.validateRoutedRead(alloc, fence, group, table_name);
+        // Preserve the actual persisted native cut. Quorum progress is a
+        // separate proof and must never be relabelled as a native mutation.
+        // Return only after every final owner and quorum fence passes.
+        if (comptime kind == .resolution) return table_write_source.history_resolution_wire.Reply.init(request, result.cut, result.resolution);
+        if (comptime kind == .publication) return completion_history.CompletionPublicationObservation.init(request, result.cut, result.publication);
+        return result;
     }
 
     pub fn waitForCurrentSyncGroupLocal(
@@ -3113,6 +3681,31 @@ pub const ProvisionedKernelOwnerSource = struct {
         return result;
     }
 
+    pub fn loadDescriptorWithContext(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, context: request_operation.RequestContext) !LoadedDescriptor {
+        try context.ensureActive();
+        var budget = self.catalog.budget(self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }));
+        budget.cancellation = context.cancellation;
+        var descriptor = try self.loadDescriptorWithBudget(alloc, group_id, table_name, budget);
+        errdefer descriptor.deinit(alloc);
+        try context.ensureActive();
+        return descriptor;
+    }
+
+    pub fn loadCompletionDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, context: request_operation.RequestContext) !LoadedDescriptor {
+        try context.ensureActive();
+        var budget = self.catalog.budget(null);
+        budget.deadline_ns = @min(budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }) orelse std.math.maxInt(u64), budget.nowNs() +| 5 * std.time.ns_per_s);
+        budget.cancellation = context.cancellation;
+        const result = try self.loadDescriptorWithBudget(alloc, group_id, table_name, budget);
+        errdefer {
+            var owned = result;
+            owned.deinit(alloc);
+        }
+        try budget.checkpoint();
+        try context.ensureActive();
+        return result;
+    }
+
     pub fn loadDescriptor(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
@@ -3641,6 +4234,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .ok;
     }
 
+    fn enqueueCompletionRecovery(ptr: ?*anyopaque, raw: abi.BorrowedBytes) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const port = self.completion_recovery orelse return .changefeed_capability_unsupported;
+        const wire = @import("antfly_local_sources").storage_history_recovery_wire;
+        if (raw.len > wire.max_bytes or (raw.len != 0 and raw.ptr == null)) return .invalid_argument;
+        var parsed = wire.decode(self.alloc, raw.slice()) catch |err| return transactionRecoveryStatus(err);
+        defer parsed.deinit();
+        port.enqueue(parsed.value) catch |err| return transactionRecoveryStatus(err);
+        return .ok;
+    }
+
     fn transactionRecoveryConfig(self: *ProvisionedKernelOwnerSource) abi.TransactionRecoveryConfig {
         const source = self.transaction_recovery_source orelse return .{};
         const options = source.options();
@@ -3658,6 +4262,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .acknowledge_participant_fn = if (options.replicated_metadata) transactionRecoveryAcknowledge else null,
             .acknowledge_participants_fn = if (options.replicated_metadata) transactionRecoveryAcknowledgeMany else null,
             .cleanup_transaction_fn = if (options.replicated_metadata) transactionRecoveryCleanup else null,
+            .enqueue_completion_fn = if (options.replicated_metadata and self.completion_recovery != null) enqueueCompletionRecovery else null,
         };
     }
 
@@ -6323,6 +6928,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             .restore_staging_scope = context.restore_staging_scope,
             .restore_staging_plan_id = context.restore_staging_plan_id,
             .transaction = .{ .begin = .{
+                .ordinary_producer = context.source_producer == .ordinary,
+                .legacy_producer = context.source_producer == .legacy_cdc,
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = platform_time.realtimeNs(),
@@ -6343,6 +6950,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         topology_epoch: u64,
         req: db_types.TransactionIntentRequest,
     ) !?void {
+        if (req.source_admission != null) return error.UnsupportedOperation;
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         comptime std.debug.assert(@sizeOf(db_types.TransactionWrite) == @sizeOf(db_types.BatchWrite));
         if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
@@ -6374,6 +6982,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             .restore_staging_scope = req.restore_staging_scope,
             .restore_staging_plan_id = req.restore_staging_plan_id,
             .transaction = .{ .prepare = .{
+                .ordinary_producer = req.completion_ordinary_producer,
+                .legacy_producer = req.completion_legacy_producer,
                 .txn_id = txn_id,
                 .topology_epoch = topology_epoch,
             } },

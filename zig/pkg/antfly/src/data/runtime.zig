@@ -1246,6 +1246,12 @@ const RaftTableApplyStateMachine = struct {
         applied_index_publication_failure_once: bool = false,
         document_apply_attempts: usize = 0,
         document_apply_successes: usize = 0,
+        history_reply_lost_once_at_index: ?u64 = null,
+        source_plan_reply_lost_once_at_index: ?u64 = null,
+        source_scope_reply_lost_once_at_index: ?u64 = null,
+        source_retirement_reply_lost_once_at_index: ?u64 = null,
+        source_producer_closure_reply_lost_once_at_index: ?u64 = null,
+        legacy_terminal_reply_lost_once_at_index: ?u64 = null,
     } else struct {};
 
     const ApplyFailureKey = struct {
@@ -1335,6 +1341,22 @@ const RaftTableApplyStateMachine = struct {
         InitialChildProvisionAlreadyCommitted,
         SqlFeatureNotSupported,
         SqlArraySubscriptError,
+        InvalidHistoryAdmission,
+        HistoryResynchronizationRequired,
+        HistoryConsumerConflict,
+        HistoryConsumerLimit,
+        HistoryCheckpointConflict,
+        HistoryFull,
+        HistoryPreparedTransactionsPresent,
+        SourceOutcomeUnresolved,
+        InvalidSourceAdmission,
+        SourceReceiptExpired,
+        SourcePendingWork,
+        SourcePayloadConflict,
+        SourceAdmissionBackpressure,
+        SourceCheckpointConflict,
+        SourceTransactionIdentityConflict,
+        SourceAlreadyCommitted,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
@@ -1350,6 +1372,23 @@ const RaftTableApplyStateMachine = struct {
                 if (err == @field(@import("../api/relational_integrity_errors.zig").Error, field)) return @field(ExpectedApplyFailure, field);
             }
             return switch (err) {
+                error.InvalidHistoryAdmission => .InvalidHistoryAdmission,
+                error.HistoryResynchronizationRequired => .HistoryResynchronizationRequired,
+                error.HistoryConsumerConflict => .HistoryConsumerConflict,
+                error.HistoryConsumerLimit => .HistoryConsumerLimit,
+                error.HistoryCheckpointConflict => .HistoryCheckpointConflict,
+                error.HistoryFull => .HistoryFull,
+                error.HistoryPreparedTransactionsPresent => .HistoryPreparedTransactionsPresent,
+                error.SourceOutcomeUnresolved => .SourceOutcomeUnresolved,
+                error.InvalidSourceAdmission => .InvalidSourceAdmission,
+                error.SourceReceiptExpired => .SourceReceiptExpired,
+                error.SourcePendingWork => .SourcePendingWork,
+                error.SourcePayloadConflict => .SourcePayloadConflict,
+                error.SourceAdmissionBackpressure => .SourceAdmissionBackpressure,
+                error.SourceCheckpointConflict => .SourceCheckpointConflict,
+                error.SourceTransactionIdentityConflict => .SourceTransactionIdentityConflict,
+                error.SourceAlreadyCommitted => .SourceAlreadyCommitted,
+
                 error.InvalidArtifactCatalogCommand => .InvalidArtifactCatalogCommand,
                 error.ArtifactCatalogEpochChanged => .ArtifactCatalogEpochChanged,
                 error.ArtifactCatalogScopeChanged => .ArtifactCatalogScopeChanged,
@@ -1402,6 +1441,23 @@ const RaftTableApplyStateMachine = struct {
                 if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../api/relational_integrity_errors.zig").Error, field);
             }
             return switch (self) {
+                .InvalidHistoryAdmission => error.InvalidHistoryAdmission,
+                .HistoryResynchronizationRequired => error.HistoryResynchronizationRequired,
+                .HistoryConsumerConflict => error.HistoryConsumerConflict,
+                .HistoryConsumerLimit => error.HistoryConsumerLimit,
+                .HistoryCheckpointConflict => error.HistoryCheckpointConflict,
+                .HistoryFull => error.HistoryFull,
+                .HistoryPreparedTransactionsPresent => error.HistoryPreparedTransactionsPresent,
+                .SourceOutcomeUnresolved => error.SourceOutcomeUnresolved,
+                .InvalidSourceAdmission => error.InvalidSourceAdmission,
+                .SourceReceiptExpired => error.SourceReceiptExpired,
+                .SourcePendingWork => error.SourcePendingWork,
+                .SourcePayloadConflict => error.SourcePayloadConflict,
+                .SourceAdmissionBackpressure => error.SourceAdmissionBackpressure,
+                .SourceCheckpointConflict => error.SourceCheckpointConflict,
+                .SourceTransactionIdentityConflict => error.SourceTransactionIdentityConflict,
+                .SourceAlreadyCommitted => error.SourceAlreadyCommitted,
+
                 .InvalidArtifactCatalogCommand => error.InvalidArtifactCatalogCommand,
                 .ArtifactCatalogEpochChanged => error.ArtifactCatalogEpochChanged,
                 .ArtifactCatalogScopeChanged => error.ArtifactCatalogScopeChanged,
@@ -1929,7 +1985,24 @@ const RaftTableApplyStateMachine = struct {
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
         storage_owner_descriptor: ?kernel_owner_descriptor.Descriptor,
+        history_commit_time_ns: ?i64,
+        exact_prepare: bool,
     ) !void {
+        const required_protocol = if (exact_prepare)
+            data_raft_batch.exact_prepare_protocol_version
+        else if (history_commit_time_ns != null)
+            @import("history_clock_entry.zig").required_protocol_version
+        else
+            try @import("../common/data_raft_protocol.zig").completionProtocolVersion(self.alloc, req);
+        if (required_protocol) |required| {
+            if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+            const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
+            const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
+                error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
+                else => return err,
+            };
+            if (floor < required) return error.UnsupportedBatchProtocolVersion;
+        }
         if (@import("builtin").is_test) {
             self.test_faults.document_apply_attempts += 1;
             if (self.test_faults.semantic_rejection_once) |rejection| {
@@ -1973,20 +2046,33 @@ const RaftTableApplyStateMachine = struct {
                 if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
                 return;
             };
-            try owner_source.applyPreparedReplicatedBatchClassified(
-                self.alloc,
-                group_id,
-                table_name,
-                descriptor,
-                req,
-                entry.term,
-                entry.index,
-                struct {
-                    fn isTerminal(err: anyerror, batch: antfly.db.types.BatchRequest) bool {
-                        return ExpectedApplyFailure.forRequest(err, batch) != null;
-                    }
-                }.isTerminal,
-            );
+            if (history_commit_time_ns) |clock| {
+                try owner_source.applyPreparedTimestampedBatchGroupLocalAtRaftEntry(
+                    self.alloc,
+                    group_id,
+                    table_name,
+                    descriptor,
+                    req,
+                    entry.term,
+                    entry.index,
+                    clock,
+                );
+            } else {
+                try owner_source.applyPreparedReplicatedBatchClassified(
+                    self.alloc,
+                    group_id,
+                    table_name,
+                    descriptor,
+                    req,
+                    entry.term,
+                    entry.index,
+                    struct {
+                        fn isTerminal(err: anyerror, batch: antfly.db.types.BatchRequest) bool {
+                            return ExpectedApplyFailure.forRequest(err, batch) != null;
+                        }
+                    }.isTerminal,
+                );
+            }
             // The descriptor-pinned owner call intentionally bypasses the
             // ProvisionedTableWriteSource mutation vtable. Publish the
             // corresponding control-plane cache invalidation and status wake
@@ -2002,6 +2088,163 @@ const RaftTableApplyStateMachine = struct {
             );
         }
         if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
+    }
+
+    fn applyHistoryControlForEntry(self: *RaftTableApplyStateMachine, group_id: u64, index: u64, term: u64, control: @import("history_control_entry.zig").Entry) !void {
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
+        const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
+            error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (floor < @import("history_control_entry.zig").requiredProtocol(control.history_control.command)) return error.UnsupportedBatchProtocolVersion;
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const outcome = owner.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(self.alloc, group_id, control.table, control.storage_owner, control.history_control.command, term, index) catch |err| switch (err) {
+            error.WriterLocked, error.StorageBusy, error.ResourceBudgetExceeded, error.StorageOwnerAdmissionPending, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (@import("builtin").is_test) if (self.test_faults.history_reply_lost_once_at_index == index) {
+            self.test_faults.history_reply_lost_once_at_index = null;
+            return error.RaftApplyWriterUnavailable;
+        };
+        switch (outcome) {
+            .applied => {},
+            .rejected => |reason| self.recordApplyFailure(group_id, index, term, ExpectedApplyFailure.fromError(reason.asError()).?),
+            // The marker proves application, not its old result. Require the
+            // proposer to recover the live lease rather than reporting success.
+            .superseded => self.recordApplyFailure(group_id, index, term, .SourceOutcomeUnresolved),
+        }
+    }
+
+    fn applySourcePlanForEntry(self: *RaftTableApplyStateMachine, group_id: u64, index: u64, term: u64, control: @import("source_plan_entry.zig").Entry) !void {
+        try control.validate();
+        if (control.source_owner.group_id != group_id) return error.HistoryResynchronizationRequired;
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
+        const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
+            error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (floor < @import("source_plan_entry.zig").required_protocol_version) return error.UnsupportedBatchProtocolVersion;
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const outcome = owner.applyPreparedOrderedSourcePlanControlGroupLocalAtRaftEntry(self.alloc, group_id, control.table, control.storage_owner, control.source_plan, term, index) catch |err| switch (err) {
+            error.WriterLocked, error.StorageBusy, error.ResourceBudgetExceeded, error.StorageOwnerAdmissionPending, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (@import("builtin").is_test) if (self.test_faults.source_plan_reply_lost_once_at_index == index) {
+            self.test_faults.source_plan_reply_lost_once_at_index = null;
+            return error.RaftApplyWriterUnavailable;
+        };
+        switch (outcome) {
+            .applied => {},
+            .rejected => |reason| self.recordApplyFailure(group_id, index, term, ExpectedApplyFailure.fromError(reason.asError()).?),
+            // The marker proves application, not its old result. Require the
+            // proposer to recover the live lease rather than reporting success.
+            .superseded => self.recordApplyFailure(group_id, index, term, .SourceOutcomeUnresolved),
+        }
+    }
+
+    fn applySourceScopeForEntry(self: *RaftTableApplyStateMachine, group_id: u64, index: u64, term: u64, control: @import("source_scope_entry.zig").Entry) !void {
+        try control.validate();
+        if (control.source_owner.group_id != group_id) return error.HistoryResynchronizationRequired;
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
+        const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
+            error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (floor < @import("source_scope_entry.zig").required_protocol_version) return error.UnsupportedBatchProtocolVersion;
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const outcome = owner.applyPreparedOrderedSourceScopeControlGroupLocalAtRaftEntry(self.alloc, group_id, control.table, control.storage_owner, control.source_scope_control, term, index) catch |err| switch (err) {
+            error.WriterLocked, error.StorageBusy, error.ResourceBudgetExceeded, error.StorageOwnerAdmissionPending, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (@import("builtin").is_test) if (self.test_faults.source_scope_reply_lost_once_at_index == index) {
+            self.test_faults.source_scope_reply_lost_once_at_index = null;
+            return error.RaftApplyWriterUnavailable;
+        };
+        switch (outcome) {
+            .applied => {},
+            .rejected => |reason| self.recordApplyFailure(group_id, index, term, ExpectedApplyFailure.fromError(reason.asError()).?),
+            // The marker proves application, not its old result. Require the
+            // proposer to recover the live lease rather than reporting success.
+            .superseded => self.recordApplyFailure(group_id, index, term, .SourceOutcomeUnresolved),
+        }
+    }
+
+    fn applyLegacyTerminalForEntry(self: *RaftTableApplyStateMachine, group_id: u64, index: u64, term: u64, control: @import("source_legacy_terminal_entry.zig").Entry) !void {
+        try control.validate();
+        if (control.source_owner.group_id != group_id) return error.HistoryResynchronizationRequired;
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
+        const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
+            error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (floor < @import("source_legacy_terminal_entry.zig").required_protocol_version) return error.UnsupportedBatchProtocolVersion;
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const outcome = owner.applyPreparedOrderedLegacyTerminalResolutionGroupLocalAtRaftEntry(self.alloc, group_id, control.table, control.storage_owner, control.source_legacy_terminal, term, index) catch |err| switch (err) {
+            error.WriterLocked, error.StorageBusy, error.ResourceBudgetExceeded, error.StorageOwnerAdmissionPending, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (@import("builtin").is_test) if (self.test_faults.legacy_terminal_reply_lost_once_at_index == index) {
+            self.test_faults.legacy_terminal_reply_lost_once_at_index = null;
+            return error.RaftApplyWriterUnavailable;
+        };
+        switch (outcome) {
+            .applied => {},
+            .rejected => |reason| self.recordApplyFailure(group_id, index, term, ExpectedApplyFailure.fromError(reason.asError()).?),
+            .superseded => self.recordApplyFailure(group_id, index, term, .SourceOutcomeUnresolved),
+        }
+    }
+
+    fn applySourceProducerClosureForEntry(self: *RaftTableApplyStateMachine, group_id: u64, index: u64, term: u64, control: @import("source_producer_closure_entry.zig").Entry) !void {
+        try control.validate();
+        if (control.source_owner.group_id != group_id) return error.HistoryResynchronizationRequired;
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
+        const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
+            error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (floor < @import("source_producer_closure_entry.zig").required_protocol_version) return error.UnsupportedBatchProtocolVersion;
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        _ = owner.applyPreparedOrderedSourceProducerClosureGroupLocalAtRaftEntry(self.alloc, group_id, control.table, control.storage_owner, control.source_owner, term, index) catch |err| switch (err) {
+            error.WriterLocked, error.StorageBusy, error.ResourceBudgetExceeded, error.StorageOwnerAdmissionPending, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (@import("builtin").is_test) if (self.test_faults.source_producer_closure_reply_lost_once_at_index == index) {
+            self.test_faults.source_producer_closure_reply_lost_once_at_index = null;
+            return error.RaftApplyWriterUnavailable;
+        };
+    }
+
+    fn applySourceRetirementForEntry(self: *RaftTableApplyStateMachine, group_id: u64, index: u64, term: u64, control: @import("source_retirement_entry.zig").Entry) !void {
+        try control.validate();
+        if (control.source_owner.group_id != group_id) return error.HistoryResynchronizationRequired;
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
+        const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
+            error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (floor < @import("source_retirement_entry.zig").required_protocol_version) return error.UnsupportedBatchProtocolVersion;
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const outcome = owner.applyPreparedOrderedSourceRetirementGroupLocalAtRaftEntry(self.alloc, group_id, control.table, control.storage_owner, control.source_retirement, term, index) catch |err| switch (err) {
+            error.WriterLocked, error.StorageBusy, error.ResourceBudgetExceeded, error.StorageOwnerAdmissionPending, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (@import("builtin").is_test) if (self.test_faults.source_retirement_reply_lost_once_at_index == index) {
+            self.test_faults.source_retirement_reply_lost_once_at_index = null;
+            return error.RaftApplyWriterUnavailable;
+        };
+        switch (outcome) {
+            .applied => {},
+            .rejected => |reason| self.recordApplyFailure(group_id, index, term, ExpectedApplyFailure.fromError(reason.asError()).?),
+            // The marker proves application, not its old result. Require the
+            // proposer to recover the live lease rather than reporting success.
+            .superseded => self.recordApplyFailure(group_id, index, term, .SourceOutcomeUnresolved),
+        }
     }
 
     fn publishAppliedReady(
@@ -2253,15 +2496,52 @@ const RaftTableApplyStateMachine = struct {
             if (entry.index > last_index) last_index = entry.index;
             if (entry.index <= completed_index) continue;
             if (entry.entry_type == .normal and data_raft_batch.looksLikeEnvelope(entry.data)) {
-                var decoded = try data_raft_batch.decode(self.alloc, entry.data);
-                defer decoded.deinit(self.alloc);
+                var applying = try data_raft_batch.decodeForApply(self.alloc, entry.data);
+                defer applying.deinit(self.alloc);
+                if (applying == .source_legacy_terminal) {
+                    try self.applyLegacyTerminalForEntry(group_id, entry.index, entry.term, applying.source_legacy_terminal.value());
+                    completed_index = entry.index;
+                    self.advanceRetryApplyCheckpoint(group_id, entry.index, entry.term, true);
+                    continue;
+                }
+                if (applying == .source_producer_closure) {
+                    try self.applySourceProducerClosureForEntry(group_id, entry.index, entry.term, applying.source_producer_closure.value());
+                    completed_index = entry.index;
+                    self.advanceRetryApplyCheckpoint(group_id, entry.index, entry.term, true);
+                    continue;
+                }
+                if (applying == .source_retirement) {
+                    try self.applySourceRetirementForEntry(group_id, entry.index, entry.term, applying.source_retirement.value());
+                    completed_index = entry.index;
+                    self.advanceRetryApplyCheckpoint(group_id, entry.index, entry.term, true);
+                    continue;
+                }
+                if (applying == .source_scope_control) {
+                    try self.applySourceScopeForEntry(group_id, entry.index, entry.term, applying.source_scope_control.value());
+                    completed_index = entry.index;
+                    self.advanceRetryApplyCheckpoint(group_id, entry.index, entry.term, true);
+                    continue;
+                }
+                if (applying == .source_plan) {
+                    try self.applySourcePlanForEntry(group_id, entry.index, entry.term, applying.source_plan.value());
+                    completed_index = entry.index;
+                    self.advanceRetryApplyCheckpoint(group_id, entry.index, entry.term, true);
+                    continue;
+                }
+                if (applying == .history_control) {
+                    try self.applyHistoryControlForEntry(group_id, entry.index, entry.term, applying.history_control.value());
+                    completed_index = entry.index;
+                    self.advanceRetryApplyCheckpoint(group_id, entry.index, entry.term, true);
+                    continue;
+                }
+                const decoded = applying.batch;
                 if (decoded.protocol_barrier_version == null and batchRequiresTopologyArbitration(decoded.batch.req)) {
                     if (self.topology_apply_store) |store| if (try store.topologyRejection(self.alloc, group_id, entry.index)) |rejection| {
                         // The ordered raw fold rejected this whole command.
                         // Advance the native marker without its effects before
                         // publishing the same typed outcome to the proposer.
                         if (batchRequiresDocumentDbApply(decoded.batch.req)) {
-                            self.applyDocumentBatchForEntry(group_id, entry.index, entry.term, decoded.table_name, .{}, if (decoded.storage_owner_descriptor) |*value| value.view() else null) catch |err| switch (err) {
+                            self.applyDocumentBatchForEntry(group_id, entry.index, entry.term, decoded.table_name, .{}, if (decoded.storage_owner_descriptor) |*value| value.view() else null, null, false) catch |err| switch (err) {
                                 error.RaftApplyWriterUnavailable, error.StorageOwnerAdmissionPending, error.RetainedEffectsFull, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
                                 else => return err,
                             };
@@ -2292,6 +2572,8 @@ const RaftTableApplyStateMachine = struct {
                         decoded.table_name,
                         decoded.batch.req,
                         if (decoded.storage_owner_descriptor) |*value| value.view() else null,
+                        decoded.history_commit_time_ns,
+                        decoded.exact_prepare,
                     ) catch |err| {
                         // Writer contention can arise during receipt recovery
                         // or lifecycle publication, beyond mutation admission.
@@ -2302,10 +2584,11 @@ const RaftTableApplyStateMachine = struct {
                             // results, not state-machine failures. Every replica
                             // rejects the prepare at this log index and continues.
                             self.recordApplyFailure(group_id, entry.index, entry.term, failure);
-                            std.log.debug("data raft document apply rejected group_id={} index={} table={s} err={s}", .{
+                            std.log.debug("data raft document apply rejected group_id={} index={} table={s} transaction_phase={s} err={s}", .{
                                 group_id,
                                 entry.index,
                                 decoded.table_name,
+                                if (decoded.batch.req.transaction) |transaction| @tagName(transaction) else "none",
                                 @errorName(err),
                             });
                         } else if (err == error.RaftApplyWriterUnavailable or
@@ -3958,6 +4241,8 @@ const DataRaftProtocolActivationEntry = struct {
 const DataRaftBatchProtocolPreflight = struct {
     conf_state_fingerprint: u64 = 0,
     activatable_version: u16 = 0,
+    /// Unknown capability is retryable, not confirmed decoder incompatibility.
+    failure: enum { none, unavailable, unsupported } = .none,
 };
 
 const DataRaftProtocolPeer = struct {
@@ -5641,8 +5926,12 @@ pub const DataServer = struct {
     background_jobs_mutex: std.atomic.Mutex = .unlocked,
     background_jobs_owner_id: u64 = 0,
     background_jobs_shutdown: std.atomic.Value(bool) = .init(false),
+    changefeed_maintenance_active: std.atomic.Value(bool) = .init(false),
+    changefeed_maintenance_after: ?@import("../metadata/changefeed_control.zig").Id = null,
+    changefeed_maintenance_due_ms: std.atomic.Value(u64) = .init(0),
     // Preparation may own up to 16 MiB per transaction. Bound concurrency as
     // well as queued observation bytes, independent of local shard count.
+    completion_recovery_queue: @import("../api/completion_recovery_queue.zig").Queue = .{},
     relational_ttl_queue: server_coordinated_ttl.Queue = .{ .max_jobs = 4 },
     artifact_publication_queue: artifact_publication_dispatch.Queue = .{},
     relational_ttl_completed: std.atomic.Value(u64) = .init(0),
@@ -5834,6 +6123,8 @@ pub const DataServer = struct {
     owned_incoming_graph_route_io: ?lsm_storage_io.IoStorage = null,
     owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
+    pgwire_spool_files: ?@import("../serverless/artifacts/fs_store.zig").FsStore = null,
+    pgwire_spool_store: ?@import("../serverless/artifacts/store.zig").ArtifactStore = null,
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
     hot_standby_cfg: DataServerHotStandbyConfig = .{},
@@ -6313,6 +6604,7 @@ pub const DataServer = struct {
         _ = owner_source.withNativeMigrationPolicy(self.provisioned_storage.denseNativeMigrationPolicySource());
         _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
         _ = owner_source.withTransactionRecoverySource(self.write_source.transactionRecoverySource());
+        owner_source.completion_recovery = .{ .ptr = self, .enqueue_fn = enqueueCompletionRecovery };
         _ = owner_source.withRestoreDescriptorRecovery(.{ .ptr = self, .recover_fn = recoverRestoreDescriptor });
         _ = owner_source.withRemoteContent(self.api_server_cfg.remote_content);
         _ = owner_source.withCoordinatedTtl(.{ .ptr = self, .expire_fn = expireRelationalRows });
@@ -6937,6 +7229,19 @@ pub const DataServer = struct {
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         var api_server_cfg = self.api_server_cfg;
+        if (api_server_cfg.pgwire) |wire| if (wire.replication_spool) |spool| {
+            if (api_server_cfg.pgwire_spool_store != null) return error.PgSpoolStorageUnsupported;
+            self.pgwire_spool_files = try @import("../serverless/artifacts/fs_store.zig").FsStore.initExisting(self.alloc, spool.directory);
+            api_server_cfg.pgwire_spool_store = (&self.pgwire_spool_files.?).sharedSpoolArtifactStore(spool.namespace, .{}) catch |err| {
+                self.pgwire_spool_files.?.deinit();
+                self.pgwire_spool_files = null;
+                return err;
+            };
+        };
+        errdefer if (self.pgwire_spool_files) |*files| {
+            files.deinit();
+            self.pgwire_spool_files = null;
+        };
         if (self.remote_metadata != null) api_server_cfg.configureRemoteCatalogPublicationAuthority();
         if (self.data_request_lifecycle_hook != null) {
             if (api_server_cfg.query_result_lifecycle_hook != null)
@@ -7014,6 +7319,26 @@ pub const DataServer = struct {
             self.routedRaftBatchWriter()
         else
             null;
+        api_server_cfg.native_source_plan_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = sourcePlanControlOperation } else null;
+        api_server_cfg.native_source_plan_observe = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourcePlanObserveOperation } else null;
+        api_server_cfg.native_source_scope_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = sourceScopeControlOperation } else null;
+        api_server_cfg.native_source_retirement_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = sourceRetirementControlOperation } else null;
+        api_server_cfg.native_source_scope_observe = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourceScopeObserveOperation } else null;
+        api_server_cfg.native_source_producer_closure_observe = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourceProducerClosureObserveOperation } else null;
+        api_server_cfg.native_source_producer_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = sourceProducerControlOperation } else null;
+        api_server_cfg.native_legacy_inventory = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = legacyInventoryOperation } else null;
+        api_server_cfg.native_legacy_terminal = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = legacyTerminalOperation } else null;
+        api_server_cfg.native_source_checkpoint_observe = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourceCheckpointObserveOperation } else null;
+        api_server_cfg.native_source_plan_chunk = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourcePlanChunkOperation } else null;
+        api_server_cfg.native_history_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = historyControlOperation } else null;
+        api_server_cfg.native_history_bootstrap_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyBootstrapPageOperation } else null;
+        api_server_cfg.native_history_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPageOperation } else null;
+        api_server_cfg.native_history_grant = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyGrantOperation } else null;
+        api_server_cfg.native_history_resolution = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyResolutionOperation } else null;
+        api_server_cfg.native_history_decision = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyDecisionOperation } else null;
+        api_server_cfg.native_history_owner = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyOwnerOperation } else null;
+        api_server_cfg.native_history_publication = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPublicationOperation } else null;
+        api_server_cfg.native_history_roots = if (linked_storage and (self.data_raft != null or self.remote_metadata != null)) self.historyRootsSource() else null;
         api_server_cfg.backend_runtime = self.backend_runtime;
         api_server_cfg.restore_owner = .{ .ptr = self, .execute_fn = restoreOwnerControl };
         api_server_cfg.restore_parent_activation = .{ .ptr = self, .execute_fn = restoreParentActivationControl };
@@ -7127,9 +7452,15 @@ pub const DataServer = struct {
         self.write_source.setLocalChangeHook(self.localChangeHook());
         self.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+        self.write_source.completion_coordinator = if (linked_storage and self.data_raft != null) .{ .owners = self.historyOwnerPort(), .recovery = self.completionRecovery() } else null;
         _ = self.write_source.withStandaloneSqlRangeGuards(self.data_raft == null and api_server_cfg.deployment_mode == .standalone);
+        _ = self.write_source.withNativeHistoryOwner(self.data_raft == null and api_server_cfg.deployment_mode == .standalone);
+        const physical_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority = if (self.data_raft != null) .raft else if (api_server_cfg.deployment_mode == .standalone) .native else null;
+        _ = try self.write_source.withSourceAuthority(physical_authority);
+        if (self.data_raft_apply) |apply_sm| _ = try apply_sm.write_source.withSourceAuthority(physical_authority);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+            apply_sm.write_source.completion_coordinator = self.write_source.completion_coordinator;
         }
         const promotion_leadership = self.promotionLeadershipSource();
         api_server_cfg.relational_maintenance_leadership = self.relationalMaintenanceLeadershipSource();
@@ -7184,6 +7515,7 @@ pub const DataServer = struct {
         // Graph queries issued through the provisioned source and auxiliary
         // API helpers share one fenced directory. This prevents duplicate L1s
         // from diverging and gives both paths the configured durable L2.
+        self.pgwire_spool_store = api_server_cfg.pgwire_spool_store;
         self.http_server.?.bindIncomingGraphRoutes(self.read_source.source());
         antfly.public_api.kernel_bridge.setAntflyProvider(&self.http_server.?, self.read_source.antfly_provider);
         const ttl_port: server_coordinated_ttl.Port = .{ .ptr = self, .expire_fn = expireRelationalRows };
@@ -7384,6 +7716,79 @@ pub const DataServer = struct {
         self.alloc.destroy(job);
     }
 
+    const CompletionRecoveryJob = struct {
+        server: *DataServer,
+        observation: *@import("../api/completion_recovery_queue.zig").Queue.Job,
+        io: std.Io,
+        term: u64,
+    };
+
+    fn enqueueCompletionRecovery(ptr: *anyopaque, request: @import("antfly_local_sources").storage_history_recovery_wire.Request) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        const runtime = self.backend_runtime orelse return error.ResourceBudgetExceeded;
+        if (runtime.durable_jobs.executesInline()) return error.ResourceBudgetExceeded;
+        const io = runtime.io() orelse return error.ResourceBudgetExceeded;
+        try request.validate();
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        // Native maintenance may hold a DB lease: never wait behind Raft here.
+        if (!self.data_raft_mutex.tryLock()) return error.ReadUnavailable;
+        const term = blk: {
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse return error.NotLeader;
+            const host = raft.host.http_host.host;
+            if (!host.isLocalLeader(request.owner.group_id)) return error.NotLeader;
+            break :blk (host.raftStatus(request.owner.group_id) orelse return error.NotLeader).hard.current_term;
+        };
+        const observation = (try self.completion_recovery_queue.reserve(io, self.alloc, request)) orelse return;
+        errdefer self.completion_recovery_queue.release(io, observation);
+        const job = try self.alloc.create(CompletionRecoveryJob);
+        errdefer self.alloc.destroy(job);
+        job.* = .{ .server = self, .observation = observation, .io = io, .term = term };
+        const owner = try self.dataServerBackgroundOwnerId(runtime);
+        try runtime.durable_jobs.submit(.{ .owner_id = owner, .class = .maintenance, .ptr = job, .run = runCompletionRecoveryJob, .deinit = deinitCompletionRecoveryJob });
+    }
+
+    fn checkCompletionRecoveryLeadership(ptr: *anyopaque, context: antfly.public_api.operation.RequestContext) !void {
+        const job: *CompletionRecoveryJob = @ptrCast(@alignCast(ptr));
+        const self = job.server;
+        try context.ensureActive();
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        // This check runs on the deferred job, outside every native DB lease
+        // and outside participant transport locks, so bounded waiting is safe.
+        try self.lockHistoryRaftOwner(context);
+        defer self.data_raft_mutex.unlock();
+        const raft = self.data_raft orelse return error.NotLeader;
+        const host = raft.host.http_host.host;
+        const group = job.observation.request.owner.group_id;
+        if (!host.isLocalLeader(group) or (host.raftStatus(group) orelse return error.NotLeader).hard.current_term != job.term) return error.NotLeader;
+    }
+
+    fn runCompletionRecoveryJob(ptr: *anyopaque) !void {
+        const job: *CompletionRecoveryJob = @ptrCast(@alignCast(ptr));
+        const self = job.server;
+        const context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&self.background_jobs_shutdown) };
+        checkCompletionRecoveryLeadership(job, context) catch |err| switch (err) {
+            error.NotLeader, error.Canceled, error.Cancelled => return,
+            else => return err,
+        };
+        var recovery = self.completionRecovery();
+        recovery.guard = .{ .ptr = job, .check_fn = checkCompletionRecoveryLeadership };
+        _ = recovery.runRetained(self.alloc, job.observation.request, context) catch |err| switch (err) {
+            error.NotLeader, error.Canceled, error.Cancelled => return,
+            else => return err,
+        };
+        // Native retained metadata, not queue membership, owns retry/completion
+        // authority. A later maintenance sweep reconciles any unfinished work.
+    }
+
+    fn deinitCompletionRecoveryJob(ptr: *anyopaque) void {
+        const job: *CompletionRecoveryJob = @ptrCast(@alignCast(ptr));
+        job.server.completion_recovery_queue.release(job.io, job.observation);
+        job.server.alloc.destroy(job);
+    }
+
     fn expireRelationalRows(ptr: *anyopaque, request: server_coordinated_ttl.Request) !u32 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
@@ -7438,13 +7843,14 @@ pub const DataServer = struct {
             // eviction can close the original TTL worker without self-joining.
             const result = @import("../api/relational_ttl.zig").expireStep(
                 self.alloc,
-                self.write_source.catalog,
+                self.status_source,
                 self.read_source.source(),
                 self.write_source.source(),
                 observation.request,
                 .fromAtomic(&self.background_jobs_shutdown),
                 .{ .next_candidate = job.next_candidate },
             ) catch |err| {
+                std.log.debug("coordinated TTL observation failed table_id={d} group_id={d} err={s}", .{ observation.request.table_id, observation.request.group_id, @errorName(err) });
                 _ = self.relational_ttl_failed.fetchAdd(1, .monotonic);
                 switch (err) {
                     // A setup allocation/deadline failure did not attempt any
@@ -7460,6 +7866,8 @@ pub const DataServer = struct {
             };
             _ = self.relational_ttl_expired.fetchAdd(result.expired, .monotonic);
             _ = self.relational_ttl_failed.fetchAdd(result.failed, .monotonic);
+            if (result.last_error) |err|
+                std.log.debug("coordinated TTL mutation deferred table_id={d} group_id={d} err={s}", .{ observation.request.table_id, observation.request.group_id, @errorName(err) });
             if (result.next_candidate == observation.request.candidates.len) {
                 _ = self.relational_ttl_completed.fetchAdd(1, .monotonic);
                 return;
@@ -9607,6 +10015,9 @@ pub const DataServer = struct {
         self.runLeannReplicationRound() catch |err| {
             std.log.warn("leann replication deferred err={s}", .{@errorName(err)});
         };
+        self.requestChangefeedMaintenance() catch |err| {
+            std.log.warn("changefeed maintenance dispatch deferred err={s}", .{@errorName(err)});
+        };
         self.runInitialFkRetirementRound() catch |err| {
             std.log.warn("initial FK retirement maintenance deferred err={s}", .{@errorName(err)});
         };
@@ -9797,6 +10208,9 @@ pub const DataServer = struct {
         self.http_observer_lease = null;
         if (self.http_server) |*http_server| http_server.deinit();
         self.http_server = null;
+        self.pgwire_spool_store = null;
+        if (self.pgwire_spool_files) |*files| files.deinit();
+        self.pgwire_spool_files = null;
         _ = self.read_source.withAntflyProvider(null);
         _ = self.write_source.withAntflyProvider(null);
         if (self.data_raft_apply) |apply_sm| {
@@ -9941,6 +10355,7 @@ pub const DataServer = struct {
         self.write_source.deinit();
         // Owner jobs drained before caches; native callbacks have now stopped
         // too, so no admission can race this final assertion/reclamation.
+        self.completion_recovery_queue.deinit();
         self.relational_ttl_queue.deinit();
         self.artifact_publication_queue.deinit();
         if (self.owned_incoming_graph_route_store) |*store| store.deinit();
@@ -12219,6 +12634,14 @@ pub const DataServer = struct {
         return owner.restoreOwnerControl(alloc, group_id, table_name, descriptor, input, if (local_term != null) .{ .ptr = &proposal, .propose = Proposal.propose } else null, .{ .secret_store = self.api_server_cfg.secret_store, .node_config = self.api_server_cfg.node_config }, context);
     }
 
+    pub fn completionRecovery(self: *DataServer) @import("../api/completion_recovery.zig").Recovery {
+        return .{ .catalog = self.write_source.catalog, .decisions = self.historyDecisionPort(), .resolutions = self.historyResolutionPort(), .publications = self.historyPublicationPort(), .participants = self.completionParticipantPort() };
+    }
+
+    pub fn completionParticipantPort(self: *DataServer) @import("../api/completion_participant.zig").Port {
+        return .{ .writer = self.routedRaftBatchWriter() };
+    }
+
     fn routedRaftBatchWriter(self: *DataServer) antfly.public_api.internal_group_operations.RoutedRaftBatchWriter {
         return .{
             .ptr = self,
@@ -12709,12 +13132,25 @@ pub const DataServer = struct {
         // must not reject a v23 command that a mixed v26/v27 group can admit.
         // Once the floor is active, later writes can negotiate the revision
         // upgrade without probing both protocols on every mixed-group write.
-        if (batchMutatesDocuments(req) and (active >= minimum or minimum <= data_raft_batch.timestamp_protocol_version) and now_ns >= probe_after_ns)
+        if (batchMutatesDocuments(req) and (active >= minimum or minimum <= data_raft_batch.timestamp_protocol_version) and now_ns >= probe_after_ns) {
+            const history = @import("history_clock_entry.zig");
+            if (comptime linked_storage) {
+                // Preserve the legacy-resolution rollout before selecting
+                // the timestamped history format for ordinary writers.
+                if (active >= @max(minimum, @import("source_legacy_terminal_entry.zig").required_protocol_version) and history.eligible(req))
+                    return @max(minimum, history.required_protocol_version);
+            }
             return @max(minimum, @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version);
+        }
         return minimum;
     }
 
     fn raftBatchRequestForActiveProtocol(req: antfly.db.types.BatchRequest, active_protocol_version: u16, realtime_ns: u64) !antfly.db.types.BatchRequest {
+        if (req.transaction) |mutation| if (mutation == .prepare and mutation.prepare.completion_owner != null) {
+            // These inputs were frozen before BEGIN. Proposal admission must
+            // not choose a new timestamp or document-version interpretation.
+            if (req.timestamp_ns == 0 or req.document_version_scheme != .revision_v1) return error.InvalidBatchRequest;
+        };
         // Old v27 decoders reinterpret the neutral cleanup scheme as legacy
         // and reject it. Never prepare such a proposal before its all-member
         // barrier; matching document-revision support is insufficient.
@@ -12731,7 +13167,8 @@ pub const DataServer = struct {
         return proposal;
     }
 
-    pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+    pub fn requiredRaftBatchProtocolVersion(alloc: std.mem.Allocator, req: antfly.db.types.BatchRequest) !u16 {
+        if (try @import("../common/data_raft_protocol.zig").completionProtocolVersion(alloc, req)) |required| return required;
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
@@ -13276,24 +13713,948 @@ pub const DataServer = struct {
         deadline_ns: u64,
         cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
     ) DataRaftBatchProtocolPreflight {
-        if (!plan.routes_complete) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
+        if (!plan.routes_complete) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint, .failure = .unavailable };
         const minimum_peer_version = if (required_version >= data_raft_batch.merge_transition_protocol_version)
             required_version
         else
             data_raft_batch.activation_barrier_protocol_version;
         for (plan.peers) |peer| {
-            if (self.probeDataRaftBatchProtocolVersion(
+            const version = self.probeDataRaftBatchProtocolVersion(
                 alloc,
                 peer.node_id,
                 peer.raft_url,
                 deadline_ns,
                 cancellation,
-            ) < minimum_peer_version) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
+            );
+            if (version < minimum_peer_version) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint, .failure = if (version == 0) .unavailable else .unsupported };
         }
         return .{
             .conf_state_fingerprint = plan.conf_state_fingerprint,
             .activatable_version = required_version,
         };
+    }
+
+    /// Request-scoped feed-root transport. HTTP ingress continues to use the
+    /// local-only callback so a forwarded request cannot bounce between peers.
+    pub fn historyRootsSource(self: *DataServer) @import("../api/history_roots.zig").Source {
+        return .{ .catalog = self.write_source.catalog, .controls = self.historyControlPort(), .pages = self.historyPagePort(), .bootstrap_pages = self.historyBootstrapPagePort(), .grants = self.historyGrantPort() };
+    }
+
+    pub fn historyControlPort(self: *DataServer) @import("../api/history_control_operations.zig").Port {
+        return .{ .ptr = self, .execute_fn = historyControlRoutedOperation };
+    }
+
+    pub fn historyPagePort(self: *DataServer) @import("../api/history_page_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = historyPageRoutedOperation };
+    }
+
+    pub fn historyBootstrapPagePort(self: *DataServer) @import("../api/history_page_operations.zig").Bootstrap.Port {
+        return .{ .ptr = self, .read_fn = historyBootstrapPageRoutedOperation };
+    }
+
+    pub fn historyResolutionPort(self: *DataServer) @import("../api/history_resolution_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = historyResolutionRoutedOperation };
+    }
+
+    pub fn historyGrantPort(self: *DataServer) @import("../api/history_grant_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = historyGrantRoutedOperation };
+    }
+
+    pub fn historyPublicationPort(self: *DataServer) @import("../api/history_publication_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = historyPublicationRoutedOperation };
+    }
+
+    const HistoryOperation = enum { control, page, bootstrap_page, grant, resolution, publication, owner, decision, source_plan_control, source_plan_observe, source_plan_chunk, source_checkpoint_observe, source_scope_observe, source_producer_closure_observe, source_producer_control, legacy_terminal_control, legacy_inventory_observe, source_scope_control, source_retirement_control };
+    fn historyRequestType(comptime kind: HistoryOperation) type {
+        return switch (kind) {
+            .control => @import("../api/history_control_operations.zig").wire.Request,
+            .page => @import("../api/history_page_operations.zig").Request,
+            .bootstrap_page => @import("../api/history_page_operations.zig").Bootstrap.Request,
+            .grant => @import("../api/history_grant_operations.zig").Request,
+            .resolution => @import("../api/history_resolution_operations.zig").Request,
+            .decision => @import("../api/history_decision_operations.zig").Request,
+            .owner => @import("../api/history_owner_operations.zig").Request,
+            .publication => @import("../api/history_publication_operations.zig").Request,
+            .source_plan_control => SourcePlanHttp.ControlRequest,
+            .source_plan_observe => SourcePlanHttp.ObserveRequest,
+            .source_scope_observe => ScopeRead.Query,
+            .source_producer_closure_observe => ProducerRead.Query,
+            .source_producer_control => ProducerControlHttp.Request,
+            .legacy_terminal_control => LegacyTerminalHttp.Request,
+            .legacy_inventory_observe => LegacyInventoryHttp.Request,
+            .source_scope_control => ScopeControlHttp.Request,
+            .source_retirement_control => RetirementHttp.Request,
+            .source_checkpoint_observe => CheckpointRead.Request,
+            .source_plan_chunk => SourcePlanHttp.ChunkRequest,
+        };
+    }
+    fn historyResultType(comptime kind: HistoryOperation) type {
+        return switch (kind) {
+            .control => @import("../api/history_control_operations.zig").wire.Response,
+            .page => @import("../api/history_page_operations.zig").pages.Page,
+            .bootstrap_page => @import("../api/history_page_operations.zig").pages.BootstrapPage,
+            .grant => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation,
+            .resolution => @import("../api/history_resolution_operations.zig").wire.Reply,
+            .decision => @import("../api/history_decision_operations.zig").Reply,
+            .owner => @import("../api/history_owner_operations.zig").Reply,
+            .publication => @import("../api/history_publication_operations.zig").Reply,
+            .source_plan_control => SourcePlanHttp.ControlReply,
+            .source_plan_observe => SourcePlanHttp.control.Observation,
+            .source_scope_observe => ScopeRead.Observation,
+            .source_producer_closure_observe => ProducerRead.Observation,
+            .source_producer_control => ProducerControlHttp.Reply,
+            .legacy_terminal_control => LegacyTerminalHttp.Reply,
+            .legacy_inventory_observe => LegacyInventoryHttp.Reply,
+            .source_scope_control => ScopeControlHttp.Reply,
+            .source_retirement_control => RetirementHttp.OwnedReply,
+            .source_checkpoint_observe => CheckpointRead.Reply,
+            .source_plan_chunk => SourcePlanHttp.control.Read,
+        };
+    }
+    fn historyControlRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.control), context: antfly.public_api.operation.RequestContext) !historyResultType(.control) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .control, input, context);
+    }
+    fn historyPageRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.page), context: antfly.public_api.operation.RequestContext) !historyResultType(.page) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .page, input, context);
+    }
+    fn historyBootstrapPageRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.bootstrap_page), context: antfly.public_api.operation.RequestContext) !historyResultType(.bootstrap_page) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .bootstrap_page, input, context);
+    }
+    fn historyPublicationRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.publication), context: antfly.public_api.operation.RequestContext) !historyResultType(.publication) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .publication, input, context);
+    }
+    fn historyResolutionRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.resolution), context: antfly.public_api.operation.RequestContext) !historyResultType(.resolution) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .resolution, input, context);
+    }
+    fn historyGrantRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.grant), context: antfly.public_api.operation.RequestContext) !historyResultType(.grant) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .grant, input, context);
+    }
+    fn historyRoutedOperation(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, comptime kind: HistoryOperation, input: historyRequestType(kind), original: antfly.public_api.operation.RequestContext) !historyResultType(kind) {
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        var request_scope = try @import("../api/history_publication_operations.zig").Scope.init(original_fence, original);
+        const bounded_original = request_scope.context();
+        try bounded_original.ensureActive();
+        try original_fence.validate();
+        if (table.len == 0 or table.len > 1024) return error.InvalidCatalogRouteFence;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], original_fence.route.identity_namespace.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], original_fence.route.identity_namespace.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], original_fence.route.identity_namespace.range_id, .big);
+        if (comptime kind == .source_plan_control) {
+            try input.validate(alloc);
+        } else if (comptime kind == .source_plan_observe or kind == .source_plan_chunk or kind == .source_checkpoint_observe or (kind == .source_scope_observe or kind == .source_producer_closure_observe or kind == .source_producer_control or kind == .legacy_terminal_control or kind == .legacy_inventory_observe) or kind == .source_scope_control or kind == .source_retirement_control) {
+            try input.validate();
+        } else try input.validate(namespace);
+        if (comptime kind == .source_plan_control or kind == .source_plan_observe or kind == .source_plan_chunk or kind == .source_checkpoint_observe or (kind == .source_scope_observe or kind == .source_producer_closure_observe or kind == .source_producer_control or kind == .legacy_terminal_control or kind == .legacy_inventory_observe) or kind == .source_scope_control or kind == .source_retirement_control) {
+            const incarnation = original_fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
+            const source_owner = if (kind == .legacy_inventory_observe) input.query.owner else if ((kind == .source_scope_observe or kind == .source_producer_closure_observe or kind == .source_producer_control or kind == .legacy_terminal_control)) input.owner else if ((kind == .source_scope_control or kind == .source_retirement_control)) input.owner() else input.source_owner;
+            if (source_owner.group_id != original_fence.route.group_id or
+                source_owner.metadata_group_id != original_fence.metadata_group_id or
+                source_owner.topology_epoch != original_fence.topology_epoch or
+                !std.mem.eql(u8, &source_owner.metadata_incarnation, &incarnation) or
+                !std.mem.eql(u8, &source_owner.namespace, &namespace)) return error.InvalidCatalogRouteFence;
+        }
+        const Clock = antfly.public_api.table_catalog.RoutingBudget;
+        var clock = Clock.initIo(null, self.dataRaftIo());
+        const now = clock.nowNs();
+        clock.deadline_ns = @min(clock.deadlineFrom(.{ .deadline_ns = bounded_original.deadline_ns, .io = bounded_original.deadline_io }) orelse std.math.maxInt(u64), now +| 5 * std.time.ns_per_s);
+        var context = bounded_original;
+        context.deadline_ns = clock.deadline_ns;
+        context.deadline_io = clock.io;
+        try context.ensureActive();
+        var fence = original_fence;
+        fence.admission_deadline_ns = context.deadline_ns;
+        fence.admission_deadline_io = context.deadline_io;
+        fence.admission_cancellation = context.cancellation;
+        const group = fence.route.group_id;
+        const observed: struct { local: bool, node: u64, leader: ?u64, hosted: bool } = blk: {
+            try self.lockHistoryRaftOwner(context);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse break :blk .{ .local = false, .node = 0, .leader = null, .hosted = false };
+            const host = raft.host.http_host.host;
+            break :blk .{ .local = host.isLocalLeader(group), .node = host.cfg.local_node_id, .leader = host.leaderId(group), .hosted = host.raftStatus(group) != null };
+        };
+        if (observed.local) return switch (kind) {
+            .control => historyControlOperation(self, alloc, fence, table, input, context),
+            .page => historyPageOperation(self, alloc, fence, table, input, context),
+            .bootstrap_page => historyBootstrapPageOperation(self, alloc, fence, table, input, context),
+            .grant => historyGrantOperation(self, alloc, fence, table, input, context),
+            .resolution => historyResolutionOperation(self, alloc, fence, table, input, context),
+            .decision => historyDecisionOperation(self, alloc, fence, table, input, context),
+            .owner => historyOwnerOperation(self, alloc, fence, table, input, context),
+            .publication => historyPublicationOperation(self, alloc, fence, table, input, context),
+            .source_plan_control => sourcePlanControlOperation(self, alloc, fence, table, input, context),
+            .source_plan_observe => sourcePlanObserveOperation(self, alloc, fence, table, input, context),
+            .source_scope_observe => sourceScopeObserveOperation(self, alloc, fence, table, input, context),
+            .source_producer_closure_observe => sourceProducerClosureObserveOperation(self, alloc, fence, table, input, context),
+            .source_producer_control => sourceProducerControlOperation(self, alloc, fence, table, input, context),
+            .legacy_terminal_control => legacyTerminalOperation(self, alloc, fence, table, input, context),
+            .legacy_inventory_observe => legacyInventoryOperation(self, alloc, fence, table, input, context),
+            .source_scope_control => sourceScopeControlOperation(self, alloc, fence, table, input, context),
+            .source_retirement_control => sourceRetirementControlOperation(self, alloc, fence, table, input, context),
+            .source_checkpoint_observe => sourceCheckpointObserveOperation(self, alloc, fence, table, input, context),
+            .source_plan_chunk => sourcePlanChunkOperation(self, alloc, fence, table, input, context),
+        };
+        // Only a compact, deadline-aware peer capture may discover a remote
+        // endpoint. Never use the generic admin-snapshot routing fallback or
+        // rotate through placement candidates when the leader is unknown.
+        const metadata = self.remote_metadata orelse return error.GroupLeaderUnavailable;
+        const peers = try metadata.acquireControlReadGeneration(.{ .clock = clock, .cancellation = context.cancellation });
+        defer peers.release();
+        const target = try peers.historyControlLeader(group, observed.node, observed.leader, observed.hosted);
+        const uri = (try peers.nodeUri(alloc, target)) orelse return error.GroupLeaderUnavailable;
+        defer alloc.free(uri);
+        try context.ensureActive();
+        var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
+        var lane = try self.acquireDataRaftForwardLaneUntil(group, clock.deadline_ns.?, .{ .discovery = .cached, .cancellation = &cancellation });
+        defer lane.release();
+        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{ .max_response_bytes = if (kind == .page) @import("../api/history_page_operations.zig").wire.prefixSize(input.request) + @as(usize, input.request.max_bytes) else if (kind == .bootstrap_page) @import("../api/history_page_operations.zig").Bootstrap.wire.prefixSize(input.request) + @as(usize, input.request.max_bytes) else if (kind == .decision) @import("../api/history_decision_operations.zig").max_reply_bytes else if (kind == .source_retirement_control) RetirementHttp.max_reply_bytes else if (kind == .source_scope_control) ScopeControlHttp.max_reply_bytes else if (kind == .legacy_inventory_observe) LegacyInventoryHttp.max_reply_bytes else if (kind == .legacy_terminal_control) LegacyTerminalHttp.max_reply_bytes else if (kind == .source_producer_control) ProducerControlHttp.max_reply_bytes else if (kind == .source_producer_closure_observe) ProducerRead.max_observation_bytes else if (kind == .source_scope_observe) ScopeRead.max_bytes else if (kind == .source_plan_chunk) SourcePlanHttp.max_bytes else @import("../api/history_control_operations.zig").wire.max_bytes });
+        defer executor.deinit();
+        var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+        _ = client.withInternalServiceAuth(self.api_server_cfg.internal_service_secret, self.api_server_cfg.internal_service_issuer);
+        return switch (kind) {
+            .control => client.fetchGroupHistoryControl(uri, group, table, input, fence, context),
+            .page => client.fetchGroupHistoryPage(uri, group, table, input, fence, context),
+            .bootstrap_page => client.fetchGroupHistoryBootstrapPage(uri, group, table, input, fence, context),
+            .grant => client.fetchGroupHistoryGrant(uri, group, table, input, fence, context),
+            .resolution => client.fetchGroupHistoryResolution(uri, group, table, input, fence, context),
+            .decision => client.fetchGroupHistoryDecision(uri, group, table, input, fence, context),
+            .owner => client.fetchGroupHistoryOwner(uri, group, table, input, fence, context),
+            .publication => client.fetchGroupHistoryPublication(uri, group, table, input, fence, context),
+            .source_plan_control => client.fetchGroupSourcePlanControl(uri, group, table, input, fence, context),
+            .source_plan_observe => client.fetchGroupSourcePlanObservation(uri, group, table, input, fence, context),
+            .source_scope_observe => client.fetchGroupSourceScopeObservation(uri, group, table, input, fence, context),
+            .source_producer_closure_observe => client.fetchGroupSourceProducerClosureObservation(uri, group, table, input, fence, context),
+            .source_producer_control => client.fetchGroupSourceProducerClose(uri, group, table, input, fence, context),
+            .legacy_terminal_control => client.fetchGroupLegacyTerminal(uri, group, table, input, fence, context),
+            .legacy_inventory_observe => client.fetchGroupLegacyInventory(uri, group, table, input, fence, context),
+            .source_scope_control => client.fetchGroupSourceScopeControl(uri, group, table, input, fence, context),
+            .source_retirement_control => client.fetchGroupSourceRetirementControl(uri, group, table, input, fence, context),
+            .source_checkpoint_observe => client.fetchGroupSourceCheckpointObservation(uri, group, table, input, fence, context),
+            .source_plan_chunk => client.fetchGroupSourcePlanChunk(uri, group, table, input, fence, context),
+        };
+    }
+
+    pub fn historyDecisionPort(self: *DataServer) @import("../api/history_decision_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = historyDecisionRoutedOperation };
+    }
+    fn historyDecisionRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.decision), context: antfly.public_api.operation.RequestContext) !historyResultType(.decision) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .decision, input, context);
+    }
+    fn historyDecisionOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.decision), context: antfly.public_api.operation.RequestContext) !historyResultType(.decision) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .decision, input, context);
+    }
+
+    pub fn historyOwnerPort(self: *DataServer) @import("../api/history_owner_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = historyOwnerRoutedOperation };
+    }
+    fn historyOwnerRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.owner), context: antfly.public_api.operation.RequestContext) !historyResultType(.owner) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .owner, input, context);
+    }
+    fn historyOwnerOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.owner), context: antfly.public_api.operation.RequestContext) !historyResultType(.owner) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .owner, input, context);
+    }
+    fn captureHistoryOwner(owner: anytype, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.owner), context: antfly.public_api.operation.RequestContext) !historyResultType(.owner) {
+        const captured = try owner.captureCompletionOwnerRouted(alloc, fence, table, input.expected_table_binding, context);
+        const result: historyResultType(.owner) = .{ .owner = captured.owner, .observation = captured.observation };
+        try result.validate(input, fence);
+        return result;
+    }
+
+    fn historyPublicationOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.publication), context: antfly.public_api.operation.RequestContext) !historyResultType(.publication) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .publication, input, context);
+    }
+
+    fn historyResolutionOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.resolution), context: antfly.public_api.operation.RequestContext) !historyResultType(.resolution) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .resolution, input, context);
+    }
+
+    fn historyGrantOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.grant), context: antfly.public_api.operation.RequestContext) !historyResultType(.grant) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .grant, input, context);
+    }
+
+    fn historyPageOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.page), context: antfly.public_api.operation.RequestContext) !historyResultType(.page) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .page, input, context);
+    }
+    fn historyBootstrapPageOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.bootstrap_page), context: antfly.public_api.operation.RequestContext) !historyResultType(.bootstrap_page) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .bootstrap_page, input, context);
+    }
+
+    /// Retry only transient read admission. Each attempt revalidates the same
+    /// route and identity with a fresh ReadIndex, within one original budget.
+    /// This helper never submits a history control or advances a consumer ACK.
+    fn historyLocalRead(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, comptime kind: HistoryOperation, input: historyRequestType(kind), original: antfly.public_api.operation.RequestContext) !historyResultType(kind) {
+        comptime std.debug.assert(kind != .control);
+        try original.ensureActive();
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        const apply = self.data_raft_apply orelse return error.ChangefeedCapabilityUnsupported;
+        const owner = apply.kernel_owner_source orelse return error.ChangefeedCapabilityUnsupported;
+        const Clock = antfly.public_api.table_catalog.RoutingBudget;
+        var clock = Clock.initIo(null, self.dataRaftIo());
+        clock.deadline_ns = @min(clock.deadlineFrom(.{ .deadline_ns = original.deadline_ns, .io = original.deadline_io }) orelse std.math.maxInt(u64), clock.nowNs() +| 5 * std.time.ns_per_s);
+        var context = original;
+        context.deadline_ns = clock.deadline_ns;
+        context.deadline_io = clock.io;
+        var fence = original_fence;
+        fence.admission_deadline_ns = context.deadline_ns;
+        fence.admission_deadline_io = context.deadline_io;
+        fence.admission_cancellation = context.cancellation;
+        while (true) {
+            try context.ensureActive();
+            var result = (switch (kind) {
+                .page => owner.orderedHistoryPageRouted(alloc, fence, table, input.request),
+                .bootstrap_page => owner.orderedHistoryBootstrapPageRouted(alloc, fence, table, input.request),
+                .grant => owner.orderedHistoryGrantRouted(alloc, fence, table, input.identity),
+                .resolution => owner.orderedHistoryResolutionRouted(alloc, fence, table, input.binding()),
+                .decision => owner.orderedHistoryDecisionRouted(alloc, fence, table, input.binding()),
+                .owner => captureHistoryOwner(owner, alloc, fence, table, input, context),
+                .publication => owner.orderedHistoryPublicationRouted(alloc, fence, table, input.binding()),
+                .control, .source_plan_control, .source_plan_observe, .source_plan_chunk, .source_checkpoint_observe, .source_scope_observe, .source_producer_closure_observe, .source_producer_control, .legacy_terminal_control, .legacy_inventory_observe, .source_scope_control, .source_retirement_control => unreachable,
+            }) catch |err| switch (err) {
+                error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.StorageKernelOwnerTransitionRequired, error.StorageOwnerAdmissionPending, error.ResourceBudgetExceeded => {
+                    try self.sleepDataRaftRetry(std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+            errdefer if (kind == .page or kind == .bootstrap_page or kind == .decision) result.deinit();
+            try context.ensureActive();
+            return result;
+        }
+    }
+
+    pub fn sourceRetirementControlPort(self: *DataServer) @import("../api/source_retirement_operations.zig").Port {
+        return .{ .ptr = self, .execute_fn = sourceRetirementControlRoutedOperation };
+    }
+    fn sourceRetirementControlRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: RetirementHttp.Request, context: antfly.public_api.operation.RequestContext) !RetirementHttp.OwnedReply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_retirement_control, request, context);
+    }
+    fn sourceRetirementControlOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: RetirementHttp.Request, context: antfly.public_api.operation.RequestContext) !RetirementHttp.OwnedReply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        try request.validate();
+        const digest = try request.digest(a);
+        switch (request.operation) {
+            .submit => {
+                var result = try self.submitSourceRetirementIntentLocal(a, fence, table, request.intent.?, request.coordinator_locator.?);
+                defer result.deinit();
+                return RetirementHttp.ownReply(a, request, .{ .request_digest = digest, .command = result.authorized.command, .receipt = result.entry, .outcome = result.outcome });
+            },
+            .recover => return RetirementHttp.ownReply(a, request, .{ .request_digest = digest, .command = request.recovery.?.command, .receipt = request.recovery.?.entry, .outcome = try self.recoverSourceRetirementLocal(a, fence, table, request.recovery.?) }),
+        }
+    }
+
+    pub fn sourceScopeControlPort(self: *DataServer) @import("../api/source_scope_control_operations.zig").Port {
+        return .{ .ptr = self, .execute_fn = sourceScopeControlRoutedOperation };
+    }
+    fn sourceScopeControlRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: ScopeControlHttp.Request, context: antfly.public_api.operation.RequestContext) !ScopeControlHttp.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_scope_control, request, context);
+    }
+    fn sourceScopeControlOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: ScopeControlHttp.Request, context: antfly.public_api.operation.RequestContext) !ScopeControlHttp.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        try request.validate();
+        const digest = try request.digest(a);
+        return switch (request.operation) {
+            .submit => blk: {
+                const result = try self.submitSourceScopeIntentLocal(a, fence, table, request.intent.?);
+                break :blk .{ .request_digest = digest, .command = result.command, .receipt = result.entry, .outcome = result.outcome };
+            },
+            .recover => .{ .request_digest = digest, .command = request.recovery.?.command, .receipt = request.recovery.?.entry, .outcome = try self.recoverSourceScopeControlLocal(a, fence, table, request.recovery.?) },
+        };
+    }
+
+    pub fn sourcePlanControlPort(self: *DataServer) @import("../api/source_plan_operations.zig").ControlPort {
+        return .{ .ptr = self, .execute_fn = sourcePlanControlRoutedOperation };
+    }
+    pub fn sourcePlanObservePort(self: *DataServer) @import("../api/source_plan_operations.zig").ObservePort {
+        return .{ .ptr = self, .read_fn = sourcePlanObserveRoutedOperation };
+    }
+    pub fn sourcePlanChunkPort(self: *DataServer) @import("../api/source_plan_operations.zig").ChunkPort {
+        return .{ .ptr = self, .read_fn = sourcePlanChunkRoutedOperation };
+    }
+    fn sourcePlanControlRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: SourcePlanHttp.ControlRequest, context: antfly.public_api.operation.RequestContext) !SourcePlanHttp.ControlReply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_plan_control, request, context);
+    }
+    fn sourcePlanObserveRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: SourcePlanHttp.ObserveRequest, context: antfly.public_api.operation.RequestContext) !SourcePlanHttp.control.Observation {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_plan_observe, request, context);
+    }
+    fn sourcePlanChunkRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: SourcePlanHttp.ChunkRequest, context: antfly.public_api.operation.RequestContext) !SourcePlanHttp.control.Read {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_plan_chunk, request, context);
+    }
+    fn sourcePlanControlOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: SourcePlanHttp.ControlRequest, context: antfly.public_api.operation.RequestContext) !SourcePlanHttp.ControlReply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        const digest = try request.digest(a);
+        return switch (request.operation) {
+            .submit => blk: {
+                const result = try self.submitSourcePlanControlLocal(a, fence, table, request);
+                break :blk .{ .request_digest = digest, .receipt = result.entry, .outcome = result.outcome };
+            },
+            .recover => .{ .request_digest = digest, .receipt = request.receipt, .outcome = try self.recoverSourcePlanControlLocal(a, fence, table, request) },
+        };
+    }
+    const LegacyInventoryHttp = @import("source_legacy_inventory_http_wire.zig");
+    pub fn legacyInventoryPort(self: *DataServer) @import("../api/source_legacy_inventory_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = legacyInventoryRoutedOperation };
+    }
+    fn legacyInventoryRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: LegacyInventoryHttp.Request, context: antfly.public_api.operation.RequestContext) !LegacyInventoryHttp.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .legacy_inventory_observe, input, context);
+    }
+    fn legacyInventoryOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: LegacyInventoryHttp.Request, context: antfly.public_api.operation.RequestContext) !LegacyInventoryHttp.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try input.validate();
+        const digest = try input.digest(a);
+        var observed = try self.sourcePlanLocalRead(a, fence, table, .legacy_inventory, input.query, context);
+        errdefer observed.deinit(a);
+        try context.ensureActive();
+        return .{ .version = 1, .request_digest = digest, .observation = observed };
+    }
+
+    pub fn legacyTerminalPort(self: *DataServer) @import("../api/source_legacy_terminal_operations.zig").Port {
+        return .{ .ptr = self, .execute_fn = legacyTerminalRoutedOperation };
+    }
+    fn legacyTerminalRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: LegacyTerminalHttp.Request, context: antfly.public_api.operation.RequestContext) !LegacyTerminalHttp.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .legacy_terminal_control, request, context);
+    }
+    fn legacyTerminalOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: LegacyTerminalHttp.Request, original: antfly.public_api.operation.RequestContext) !LegacyTerminalHttp.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try request.validate();
+        var scope = try @import("../api/history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        try context.ensureActive();
+        var bounded = fence;
+        bounded.admission_deadline_ns = context.deadline_ns;
+        bounded.admission_deadline_io = context.deadline_io;
+        bounded.admission_cancellation = context.cancellation;
+        const request_digest = try request.digest(a);
+        var reply: LegacyTerminalHttp.Reply = switch (request.operation) {
+            .submit => blk: {
+                const result = try self.submitLegacyTerminalLocal(a, bounded, table, request.command);
+                break :blk .{ .request_digest = request_digest, .receipt = result.entry, .outcome = result.outcome };
+            },
+            .recover => .{ .request_digest = request_digest, .receipt = request.receipt, .outcome = try self.recoverLegacyTerminalLocal(a, bounded, table, request.query(request.receipt.?)) },
+        };
+        context.ensureActive() catch {
+            reply.outcome = null;
+        };
+        return reply;
+    }
+
+    pub fn sourceProducerControlPort(self: *DataServer) @import("../api/source_producer_control_operations.zig").Port {
+        return .{ .ptr = self, .execute_fn = sourceProducerControlRoutedOperation };
+    }
+    fn sourceProducerControlRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: ProducerControlHttp.Request, context: antfly.public_api.operation.RequestContext) !ProducerControlHttp.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_producer_control, request, context);
+    }
+    fn sourceProducerControlOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: ProducerControlHttp.Request, original: antfly.public_api.operation.RequestContext) !ProducerControlHttp.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try request.validate();
+        var scope = try @import("../api/history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        try context.ensureActive();
+        var bounded = fence;
+        bounded.admission_deadline_ns = context.deadline_ns;
+        bounded.admission_deadline_io = context.deadline_io;
+        bounded.admission_cancellation = context.cancellation;
+        const request_digest = try request.digest(a);
+        const result = try self.submitSourceProducerClosureLocal(a, bounded, table, request.owner);
+        var reply: ProducerControlHttp.Reply = .{ .request_digest = request_digest, .receipt = result.entry, .outcome = result.outcome };
+        context.ensureActive() catch {
+            reply.outcome = null;
+        };
+        return reply;
+    }
+    pub fn sourceProducerClosureObservationPort(self: *DataServer) @import("../api/source_producer_closure_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = sourceProducerClosureObserveRoutedOperation };
+    }
+    fn sourceProducerClosureObserveRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: ProducerRead.Query, context: antfly.public_api.operation.RequestContext) !ProducerRead.Observation {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_producer_closure_observe, request, context);
+    }
+    fn sourceProducerClosureObserveOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: ProducerRead.Query, context: antfly.public_api.operation.RequestContext) !ProducerRead.Observation {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.sourcePlanLocalRead(a, fence, table, .producer_closure, request, context);
+    }
+    pub fn sourceScopeObservationPort(self: *DataServer) @import("../api/source_scope_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = sourceScopeObserveRoutedOperation };
+    }
+    fn sourceScopeObserveRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: ScopeRead.Query, context: antfly.public_api.operation.RequestContext) !ScopeRead.Observation {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_scope_observe, request, context);
+    }
+    fn sourceScopeObserveOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: ScopeRead.Query, context: antfly.public_api.operation.RequestContext) !ScopeRead.Observation {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.sourcePlanLocalRead(a, fence, table, .scope, request, context);
+    }
+    pub fn sourceCheckpointObservationPort(self: *DataServer) @import("../api/source_checkpoint_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = sourceCheckpointObserveRoutedOperation };
+    }
+    fn sourceCheckpointObserveRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: CheckpointRead.Request, context: antfly.public_api.operation.RequestContext) !CheckpointRead.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_checkpoint_observe, request, context);
+    }
+    fn sourceCheckpointObserveOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: CheckpointRead.Request, context: antfly.public_api.operation.RequestContext) !CheckpointRead.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.sourcePlanLocalRead(a, fence, table, .checkpoint, request, context);
+    }
+    const SourcePlanReadKind = enum { observe, chunk, checkpoint, scope, producer_closure, legacy_terminal, legacy_inventory };
+    fn sourcePlanLocalRead(self: *DataServer, a: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, comptime kind: SourcePlanReadKind, request: if (kind == .observe) SourcePlanHttp.ObserveRequest else if (kind == .scope) ScopeRead.Query else if (kind == .producer_closure) ProducerRead.Query else if (kind == .legacy_inventory) LegacyInventory.Query else if (kind == .legacy_terminal) LegacyRead.Query else if (kind == .checkpoint) CheckpointRead.Request else SourcePlanHttp.ChunkRequest, original: antfly.public_api.operation.RequestContext) !(if (kind == .observe) SourcePlanHttp.control.Observation else if (kind == .scope) ScopeRead.Observation else if (kind == .producer_closure) ProducerRead.Observation else if (kind == .legacy_inventory) LegacyInventory.Observation else if (kind == .legacy_terminal) LegacyRead.Observation else if (kind == .checkpoint) CheckpointRead.Reply else SourcePlanHttp.control.Read) {
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        const apply = self.data_raft_apply orelse return error.ChangefeedCapabilityUnsupported;
+        const owner = apply.kernel_owner_source orelse return error.ChangefeedCapabilityUnsupported;
+        const Clock = antfly.public_api.table_catalog.RoutingBudget;
+        var clock = Clock.initIo(null, self.dataRaftIo());
+        clock.deadline_ns = @min(clock.deadlineFrom(.{ .deadline_ns = original.deadline_ns, .io = original.deadline_io }) orelse std.math.maxInt(u64), clock.nowNs() +| 5 * std.time.ns_per_s);
+        var context = original;
+        context.deadline_ns = clock.deadline_ns;
+        context.deadline_io = clock.io;
+        var fence = original_fence;
+        fence.admission_deadline_ns = context.deadline_ns;
+        fence.admission_deadline_io = context.deadline_io;
+        fence.admission_cancellation = context.cancellation;
+        while (true) {
+            try context.ensureActive();
+            const result = (switch (kind) {
+                .observe => owner.sourcePlanObservationRouted(a, fence, table, request),
+                .scope => owner.sourceScopeObservationRouted(a, fence, table, request),
+                .producer_closure => owner.sourceProducerClosureObservationRouted(a, fence, table, request),
+                .legacy_terminal => owner.legacyTerminalOutcomeRouted(a, fence, table, request),
+                .legacy_inventory => owner.legacyRecoveryInventoryRouted(a, fence, table, request),
+                .checkpoint => owner.sourceCheckpointObservationRouted(a, fence, table, request),
+                .chunk => owner.sourcePlanChunkRouted(a, fence, table, request),
+            }) catch |err| switch (err) {
+                error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.StorageKernelOwnerTransitionRequired, error.StorageOwnerAdmissionPending, error.ResourceBudgetExceeded => {
+                    try self.sleepDataRaftRetry(std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+            errdefer if (comptime kind == .chunk) a.free(result.bytes);
+            errdefer if (comptime kind == .legacy_inventory) {
+                var owned = result;
+                owned.deinit(a);
+            };
+            try context.ensureActive();
+            return result;
+        }
+    }
+    pub fn recoverLegacyTerminalLocal(self: *DataServer, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, query: LegacyRead.Query) !LegacyRead.Observation {
+        try query.validate();
+        return self.sourcePlanLocalRead(a, fence, table, .legacy_terminal, query, .{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
+    }
+
+    pub fn legacyRecoveryInventoryLocal(self: *DataServer, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, query: LegacyInventory.Query) !LegacyInventory.Observation {
+        try query.validate();
+        return self.sourcePlanLocalRead(a, fence, table, .legacy_inventory, query, .{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
+    }
+
+    fn sourcePlanObserveOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: SourcePlanHttp.ObserveRequest, context: antfly.public_api.operation.RequestContext) !SourcePlanHttp.control.Observation {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.sourcePlanLocalRead(a, fence, table, .observe, request, context);
+    }
+    fn sourcePlanChunkOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: SourcePlanHttp.ChunkRequest, context: antfly.public_api.operation.RequestContext) !SourcePlanHttp.control.Read {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.sourcePlanLocalRead(a, fence, table, .chunk, request, context);
+    }
+
+    fn historyControlOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: @import("../api/history_control_operations.zig").wire.Request, context: antfly.public_api.operation.RequestContext) !@import("../api/history_control_operations.zig").wire.Response {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        return switch (input.operation) {
+            .submit => blk: {
+                const submitted = try self.submitHistoryControlLocal(alloc, fence, table, input.command);
+                break :blk .{ .version = 1, .receipt = submitted.entry, .outcome = submitted.outcome };
+            },
+            .recover => .{ .version = 1, .receipt = input.receipt, .outcome = try self.recoverHistoryControlLocal(alloc, fence, table, input.command, input.receipt.?) },
+        };
+    }
+
+    const SourcePlanHttp = @import("source_plan_http_wire.zig");
+    const ScopeControlHttp = @import("source_scope_http_wire.zig");
+    const RetirementHttp = @import("source_retirement_http_wire.zig");
+    const ScopeRead = @import("antfly_local_sources").storage_source_scope_control;
+    const ProducerRead = @import("antfly_local_sources").storage_source_producer_policy;
+    const LegacyInventory = @import("antfly_local_sources").storage_source_legacy_inventory;
+    const LegacyRead = @import("antfly_local_sources").storage_source_legacy_terminal_ordered;
+    const LegacyTerminalHttp = @import("source_legacy_terminal_http_wire.zig");
+    const ProducerControlHttp = @import("source_producer_control_http_wire.zig");
+    const CheckpointRead = @import("antfly_local_sources").storage_source_checkpoint_read;
+    const NativeControlKind = enum { history, source_plan, source_scope, source_retirement, producer_closure, legacy_terminal };
+    fn NativeControlCommand(comptime kind: NativeControlKind) type {
+        return switch (kind) {
+            .history => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command,
+            .source_plan => SourcePlanHttp.ControlRequest,
+            .source_scope => ScopeRead.Command,
+            .source_retirement => @import("antfly_local_sources").storage_source_scope_retirement.Command,
+            .producer_closure => @import("antfly_local_sources").storage_transaction_completion.RoutedOwner,
+            .legacy_terminal => LegacyRead.policy.LegacyTerminalCommand,
+        };
+    }
+    fn NativeControlOutcome(comptime kind: NativeControlKind) type {
+        return switch (kind) {
+            .history => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome,
+            .source_plan => SourcePlanHttp.control.Outcome,
+            .source_scope => @import("antfly_local_sources").storage_source_scope_ordered.Outcome,
+            .source_retirement => @import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery,
+            .producer_closure => ProducerRead.Observation,
+            .legacy_terminal => LegacyRead.Observation,
+        };
+    }
+    fn NativeControlReceipt(comptime kind: NativeControlKind) type {
+        return switch (kind) {
+            .history => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Entry,
+            .source_plan => SourcePlanHttp.control.Entry,
+            .source_scope => ScopeRead.scope.Cut,
+            .source_retirement => ScopeRead.scope.Cut,
+            .producer_closure => ScopeRead.scope.Cut,
+            .legacy_terminal => ScopeRead.scope.Cut,
+        };
+    }
+    fn ControlSubmission(comptime kind: NativeControlKind) type {
+        return struct { entry: NativeControlReceipt(kind), outcome: ?NativeControlOutcome(kind) = null };
+    }
+    pub const HistorySubmission = ControlSubmission(.history);
+    pub const SourcePlanSubmission = ControlSubmission(.source_plan);
+    pub const SourceProducerClosureSubmission = ControlSubmission(.producer_closure);
+    pub const LegacyTerminalSubmission = ControlSubmission(.legacy_terminal);
+    pub const SourceScopeSubmission = struct {
+        command: ScopeRead.Command,
+        entry: ScopeRead.scope.Cut,
+        outcome: ?@import("antfly_local_sources").storage_source_scope_ordered.Outcome,
+    };
+
+    pub const SourceRetirementSubmission = struct {
+        authorized: @import("../api/source_retirement_authority.zig").OwnedCommand,
+        entry: ?ScopeRead.scope.Cut,
+        outcome: ?@import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery,
+        pub fn deinit(self: *SourceRetirementSubmission) void {
+            self.authorized.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// The intent cannot carry coordinator evidence. Keep the independent read
+    /// and its admission alive with every accepted or ambiguous submission.
+    pub fn submitSourceRetirementIntentLocal(self: *DataServer, a: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, intent: @import("antfly_local_sources").storage_source_scope_retirement.Intent, coordinator_locator: []const u8) !SourceRetirementSubmission {
+        try intent.validate();
+        try original_fence.validate();
+        if (intent.owner.group_id != original_fence.route.group_id) return error.HistoryResynchronizationRequired;
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        const raft = self.data_raft orelse return error.ChangefeedCapabilityUnsupported;
+        const original: antfly.public_api.operation.RequestContext = .{ .deadline_ns = original_fence.admission_deadline_ns, .deadline_io = original_fence.admission_deadline_io, .cancellation = original_fence.admission_cancellation };
+        var context = try original.platformDeadline();
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
+        try self.lockHistoryRaftOwner(context);
+        const leader = raft.host.http_host.host.isLocalLeader(intent.owner.group_id);
+        self.data_raft_mutex.unlock();
+        if (!leader) return error.GroupLeaderUnavailable;
+        var authorized = try (@import("../api/source_retirement_authority.zig").Authority{ .catalog_source = self.write_source.catalog, .decision_port = self.historyDecisionPort() }).capture(a, intent, coordinator_locator, context);
+        errdefer authorized.deinit();
+        try context.ensureActive();
+        var bounded = original_fence;
+        bounded.admission_deadline_ns = context.deadline_ns;
+        bounded.admission_deadline_io = context.deadline_io;
+        const result = self.submitNativeControlLocal(a, bounded, table, .source_retirement, authorized.command) catch |err| switch (err) {
+            error.RaftBatchWriteOutcomeUnknown => return .{ .authorized = authorized, .entry = null, .outcome = null },
+            else => return err,
+        };
+        return .{ .authorized = authorized, .entry = result.entry, .outcome = result.outcome };
+    }
+
+    fn validateHistoryProposalAuthority(expected_term: u64, current_term: u64, expected_membership: u64, current_membership: u64, is_leader: bool) !void {
+        if (!is_leader or expected_term == 0 or expected_term != current_term or expected_membership != current_membership) return error.GroupLeaderUnavailable;
+    }
+
+    fn lockHistoryRaftOwner(self: *DataServer, context: antfly.public_api.operation.RequestContext) !void {
+        while (!self.data_raft_mutex.tryLock()) {
+            try context.ensureActive();
+            try self.sleepDataRaftRetry(std.time.ns_per_ms);
+        }
+        errdefer self.data_raft_mutex.unlock();
+        try context.ensureActive();
+    }
+
+    /// Private local-leader submission. Known accepted controls preserve their
+    /// exact receipt on failure; RaftBatchWriteOutcomeUnknown is ambiguous.
+    pub fn submitHistoryControlLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table_name: []const u8, command: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command) !HistorySubmission {
+        return self.submitNativeControlLocal(alloc, original_fence, table_name, .history, command);
+    }
+    pub fn submitSourcePlanControlLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table_name: []const u8, command: SourcePlanHttp.ControlRequest) !SourcePlanSubmission {
+        try command.validate(alloc);
+        if (command.operation != .submit) return error.InvalidSourcePlanWire;
+        return self.submitNativeControlLocal(alloc, original_fence, table_name, .source_plan, command);
+    }
+    /// No caller-supplied metadata cut is accepted. Capture fresh authority
+    /// before proposal and return that exact command with every known receipt.
+    pub fn submitSourceScopeIntentLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, intent: ScopeRead.Intent) !SourceScopeSubmission {
+        try intent.validate();
+        try original_fence.validate();
+        if (intent.owner.group_id != original_fence.route.group_id) return error.HistoryResynchronizationRequired;
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        if (self.data_raft == null) return error.ChangefeedCapabilityUnsupported;
+        const remote = self.remote_metadata orelse return error.MetadataUnavailable;
+        const original: antfly.public_api.operation.RequestContext = .{ .deadline_ns = original_fence.admission_deadline_ns, .deadline_io = original_fence.admission_deadline_io, .cancellation = original_fence.admission_cancellation };
+        const normalized = try original.platformDeadline();
+        const now = platform_time.monotonicNs();
+        const remaining = if (normalized.deadline_ns) |limit| limit -| now else 5 * std.time.ns_per_s;
+        if (remaining == 0) return error.DeadlineExceeded;
+        var bounded = original_fence;
+        bounded.admission_deadline_ns = now +| @min(remaining, 5 * std.time.ns_per_s);
+        bounded.admission_deadline_io = null;
+        const context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = bounded.admission_deadline_ns, .cancellation = bounded.admission_cancellation };
+        const command = try remote.authorizeSourceScopeIntent(alloc, intent, context);
+        try context.ensureActive();
+        const result = try self.submitNativeControlLocal(alloc, bounded, table, .source_scope, command);
+        return .{ .command = command, .entry = result.entry, .outcome = result.outcome };
+    }
+
+    /// One owner-fenced cumulative intake closure, not a drain certificate.
+    /// Accepted entry identity is retained on lost confirmation. Only a fresh
+    /// qualified observation establishes the current closure state.
+    pub fn submitSourceProducerClosureLocal(self: *DataServer, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, original_owner: @import("antfly_local_sources").storage_transaction_completion.RoutedOwner) !SourceProducerClosureSubmission {
+        try original_owner.validate();
+        try @import("../api/source_owner_scope.zig").requireFence(original_owner, fence);
+        return self.submitNativeControlLocal(a, fence, table, .producer_closure, original_owner);
+    }
+    /// Observation-only recovery; this cannot append a protocol barrier or
+    /// closure command, and does not assert the original proposal committed.
+    pub fn recoverSourceProducerClosureLocal(self: *DataServer, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, original_owner: @import("antfly_local_sources").storage_transaction_completion.RoutedOwner, receipt: ScopeRead.scope.Cut) !ProducerRead.Observation {
+        try original_owner.validate();
+        try @import("../api/source_owner_scope.zig").requireFence(original_owner, fence);
+        if (receipt.term == 0 or receipt.index == 0) return error.InvalidSourceAdmission;
+        return self.recoverNativeControlLocal(a, fence, table, .producer_closure, original_owner, receipt, receipt.index);
+    }
+
+    /// Admit only against a qualified persisted closure. The actual native
+    /// writer independently verifies the retained original terminal decision.
+    pub fn submitLegacyTerminalLocal(self: *DataServer, a: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, command: LegacyRead.policy.LegacyTerminalCommand) !LegacyTerminalSubmission {
+        try command.validate();
+        try @import("../api/source_owner_scope.zig").requireFence(command.owner, original_fence);
+        var scope = try @import("../api/history_publication_operations.zig").Scope.init(original_fence, .{});
+        const context = scope.context();
+        try context.ensureActive();
+        var fence = original_fence;
+        fence.admission_deadline_ns = context.deadline_ns;
+        fence.admission_deadline_io = context.deadline_io;
+        fence.admission_cancellation = context.cancellation;
+        const closure = try self.sourcePlanLocalRead(a, fence, table, .producer_closure, .{ .version = 1, .owner = command.owner, .minimum_applied_index = 1 }, context);
+        if (closure.closure == null) return error.SourcePendingWork;
+        try context.ensureActive();
+        return self.submitNativeControlLocal(a, fence, table, .legacy_terminal, command);
+    }
+
+    fn submitNativeControlLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table_name: []const u8, comptime kind: NativeControlKind, command: NativeControlCommand(kind)) !ControlSubmission(kind) {
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        const raft = self.data_raft orelse return error.ChangefeedCapabilityUnsupported;
+        const apply_sm = self.data_raft_apply orelse return error.ChangefeedCapabilityUnsupported;
+        const owner = apply_sm.kernel_owner_source orelse return error.ChangefeedCapabilityUnsupported;
+        if (owner.online_source_authority != .raft) return error.ChangefeedCapabilityUnsupported;
+        try original_fence.validate();
+        const original_context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = original_fence.admission_deadline_ns, .deadline_io = original_fence.admission_deadline_io, .cancellation = original_fence.admission_cancellation };
+        const routing_now = self.dataRaftMonotonicNs();
+        const normalized = try original_context.platformDeadline();
+        const remaining_ns = if (normalized.deadline_ns) |limit| limit -| platform_time.monotonicNs() else 5 * std.time.ns_per_s;
+        if (remaining_ns == 0) return error.DeadlineExceeded;
+        const request_io = self.dataRaftIo();
+        var fence = original_fence;
+        fence.admission_deadline_ns = routing_now +| @min(remaining_ns, 5 * std.time.ns_per_s);
+        fence.admission_deadline_io = if (request_io) |*io| @import("antfly_runtime_abi").io_abi.Borrow.init(io) else null;
+        const context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation };
+        const deadline = fence.admission_deadline_ns.?;
+        const group = fence.route.group_id;
+        const required = switch (kind) {
+            .history => @import("history_control_entry.zig").requiredProtocol(command),
+            .source_plan => @import("source_plan_entry.zig").required_protocol_version,
+            .source_scope => @import("source_scope_entry.zig").required_protocol_version,
+            .source_retirement => @import("source_retirement_entry.zig").required_protocol_version,
+            .producer_closure => @import("source_producer_closure_entry.zig").required_protocol_version,
+            .legacy_terminal => @import("source_legacy_terminal_entry.zig").required_protocol_version,
+        };
+        // Create cache ownership atomically with the hosted-group check, so
+        // retirement cannot clean the group just before a stale insertion.
+        const activation = blk: {
+            try self.lockHistoryRaftOwner(context);
+            defer self.data_raft_mutex.unlock();
+            if (!raft.host.http_host.host.isLocalLeader(group)) return error.GroupLeaderUnavailable;
+            break :blk try self.dataRaftProtocolActivationEntry(group);
+        };
+        defer activation.release(self.alloc);
+        while (!activation.activation_mutex.tryLock()) {
+            try context.ensureActive();
+            try self.sleepDataRaftRetry(std.time.ns_per_ms);
+        }
+        var activation_locked = true;
+        defer if (activation_locked) activation.activation_mutex.unlock();
+        const authority = blk: {
+            try self.lockHistoryRaftOwner(context);
+            defer self.data_raft_mutex.unlock();
+            if (!raft.host.http_host.host.isLocalLeader(group)) return error.GroupLeaderUnavailable;
+            const status = raft.host.http_host.host.raftStatus(group) orelse return error.GroupLeaderUnavailable;
+            break :blk .{ .term = status.hard.current_term, .plan = try self.dataRaftProtocolProbePlanLocked(alloc, raft, group, status.conf_state, raft.host.http_host.host.cfg.local_node_id) };
+        };
+        var plan = authority.plan;
+        defer plan.deinit(alloc);
+        var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(fence.admission_cancellation);
+        const preflight = self.dataRaftBatchProtocolPreflight(alloc, plan, required, deadline, &cancellation);
+        if (preflight.activatable_version < required) return switch (preflight.failure) {
+            .unsupported => error.ChangefeedCapabilityUnsupported,
+            .none, .unavailable => error.GroupLeaderUnavailable,
+        };
+        try context.ensureActive();
+        const admission_source = &apply_sm.write_source;
+        const admission_deadline = admission_source.catalog.budget(null).nowNs() +| (deadline -| self.dataRaftMonotonicNs());
+        var admission = try admission_source.acquireRoutedWriteAdmission(alloc, table_name, fence, admission_deadline, fence.admission_cancellation);
+        var admission_active = true;
+        defer if (admission_active) admission.deinit();
+        var descriptor = try owner.loadDescriptorWithContext(alloc, group, table_name, context);
+        defer descriptor.deinit(alloc);
+        const expected_identity = fence.route.identity_namespace;
+        if (descriptor.identity.table_id != expected_identity.table_id or descriptor.identity.shard_id != expected_identity.shard_id or descriptor.identity.range_id != expected_identity.range_id) return error.HistoryResynchronizationRequired;
+        if (comptime kind == .source_plan) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.source_owner, context);
+        if (comptime kind == .producer_closure) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command, context);
+        if (comptime kind == .legacy_terminal) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.owner, context);
+        if (comptime kind == .source_scope or kind == .source_retirement) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.intent.owner, context);
+        const encoded = switch (kind) {
+            .history => try @import("history_control_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .history_control = .{ .command = command } }, required),
+            .source_plan => try @import("source_plan_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.source_owner, .source_plan = command.command }, required),
+            .source_scope => try @import("source_scope_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.intent.owner, .source_scope_control = command }, required),
+            .source_retirement => try @import("source_retirement_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.intent.owner, .source_retirement = command }, required),
+            .producer_closure => try @import("source_producer_closure_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command, .source_producer_closure = true }, required),
+            .legacy_terminal => try @import("source_legacy_terminal_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.owner, .source_legacy_terminal = command }, required),
+        };
+        defer alloc.free(encoded);
+        const durable = try self.durableDataRaftBatchProtocolVersion(group);
+        activation.protocol_version.store(durable, .release);
+        var token: ?RaftTableApplyStateMachine.ApplyOutcomeToken = null;
+        defer if (token) |registered| apply_sm.cancelRegisteredApplyOutcome(registered);
+        const accepted: ControlSubmission(kind) = blk: {
+            try self.lockHistoryRaftOwner(context);
+            defer self.data_raft_mutex.unlock();
+            try context.ensureActive();
+            const status = raft.host.http_host.host.raftStatus(group) orelse return error.GroupLeaderUnavailable;
+            try validateHistoryProposalAuthority(authority.term, status.hard.current_term, plan.conf_state_fingerprint, dataRaftConfStateFingerprint(status.conf_state), raft.host.http_host.host.isLocalLeader(group));
+            if (!dataRaftProtocolUsable(activation, authority.term, required)) {
+                const barrier = try data_raft_batch.encodeProtocolBarrier(alloc, table_name, required);
+                defer alloc.free(barrier);
+                var barrier_index: ?u64 = null;
+                raft.host.http_host.proposeWithReceipt(group, barrier, &barrier_index) catch |err| {
+                    if (barrier_index == null) return err;
+                };
+                if (barrier_index == null) return error.GroupLeaderUnavailable;
+                activation.pending_version.store(required, .release);
+                activation.pending_term.store(authority.term, .release);
+            }
+            try context.ensureActive();
+            var accepted_index: ?u64 = null;
+            raft.host.http_host.proposeWithReceipt(group, encoded, &accepted_index) catch |err| {
+                if (accepted_index == null) return err;
+            };
+            const index = accepted_index orelse return error.RaftBatchWriteOutcomeUnknown;
+            token = apply_sm.registerApplyOutcomeToken(group, index, authority.term) catch null;
+            break :blk .{ .entry = .{ .term = authority.term, .index = index } };
+        };
+        admission.deinit();
+        admission_active = false;
+        activation.activation_mutex.unlock();
+        activation_locked = false;
+        self.reachDataRequestLifecycle(.{ .phase = .proposal_accepted, .group_id = group, .log_index = accepted.entry.index, .table_name = table_name }) catch return accepted;
+        const registered = token orelse return accepted;
+        while (true) {
+            context.ensureActive() catch return accepted;
+            const slice_deadline = @min(deadline, self.dataRaftMonotonicNs() +| 10 * std.time.ns_per_ms);
+            apply_sm.waitApplyOutcome(registered, slice_deadline) catch |err| switch (err) {
+                error.Timeout => if (self.dataRaftMonotonicNs() < deadline) continue else return accepted,
+                else => return accepted,
+            };
+            break;
+        }
+        _ = apply_sm.takeRegisteredApplyOutcome(registered);
+        token = null;
+        const recovered = self.recoverNativeControlLocal(alloc, fence, table_name, kind, command, accepted.entry, accepted.entry.index) catch |err| {
+            std.log.warn("native control result remains unconfirmed group={} index={} err={s}", .{ group, accepted.entry.index, @errorName(err) });
+            return accepted;
+        };
+        return .{ .entry = accepted.entry, .outcome = recovered };
+    }
+
+    /// Recover only the original receipt. Transient read contention may retry;
+    /// this operation never appends a barrier or control command.
+    pub fn recoverHistoryControlLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table_name: []const u8, command: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command, receipt: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Entry) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome {
+        return self.recoverNativeControlLocal(alloc, original_fence, table_name, .history, command, receipt, receipt.index);
+    }
+    pub fn recoverSourcePlanControlLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table_name: []const u8, command: SourcePlanHttp.ControlRequest) !SourcePlanHttp.control.Outcome {
+        try command.validate(alloc);
+        if (command.operation != .recover) return error.InvalidSourcePlanWire;
+        return self.recoverNativeControlLocal(alloc, original_fence, table_name, .source_plan, command, command.receipt.?, command.receipt.?.index);
+    }
+    pub fn recoverSourceScopeControlLocal(self: *DataServer, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, recovery: @import("antfly_local_sources").storage_source_scope_ordered.Recovery) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
+        try recovery.validate();
+        return self.recoverNativeControlLocal(alloc, fence, table, .source_scope, recovery.command, recovery.entry, recovery.minimum_applied_index);
+    }
+    pub fn recoverSourceRetirementLocal(self: *DataServer, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, query: @import("antfly_local_sources").storage_source_scope_retirement_ordered.Query) !@import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery {
+        try query.validate();
+        return self.recoverNativeControlLocal(a, fence, table, .source_retirement, query.command, query.entry, query.minimum_applied_index);
+    }
+    fn recoverNativeControlLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table_name: []const u8, comptime kind: NativeControlKind, command: NativeControlCommand(kind), receipt: NativeControlReceipt(kind), minimum_applied_index: u64) !NativeControlOutcome(kind) {
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        const apply_sm = self.data_raft_apply orelse return error.ChangefeedCapabilityUnsupported;
+        const owner = apply_sm.kernel_owner_source orelse return error.ChangefeedCapabilityUnsupported;
+        const original: antfly.public_api.operation.RequestContext = .{ .deadline_ns = original_fence.admission_deadline_ns, .deadline_io = original_fence.admission_deadline_io, .cancellation = original_fence.admission_cancellation };
+        const now = self.dataRaftMonotonicNs();
+        const normalized = try original.platformDeadline();
+        const remaining = if (normalized.deadline_ns) |limit| limit -| platform_time.monotonicNs() else 5 * std.time.ns_per_s;
+        if (remaining == 0) return error.DeadlineExceeded;
+        const request_io = self.dataRaftIo();
+        var fence = original_fence;
+        fence.admission_deadline_ns = now +| @min(remaining, 5 * std.time.ns_per_s);
+        fence.admission_deadline_io = if (request_io) |*io| @import("antfly_runtime_abi").io_abi.Borrow.init(io) else null;
+        const context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation };
+        while (true) {
+            try context.ensureActive();
+            return (switch (kind) {
+                .history => owner.orderedHistoryOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = minimum_applied_index }),
+                .source_scope => owner.sourceScopeOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = minimum_applied_index }),
+                .source_retirement => owner.sourceRetirementOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = minimum_applied_index }),
+                .producer_closure => owner.sourceProducerClosureObservationRouted(alloc, fence, table_name, .{ .version = 1, .owner = command, .minimum_applied_index = @max(minimum_applied_index, receipt.index) }),
+                .legacy_terminal => owner.legacyTerminalOutcomeRouted(alloc, fence, table_name, .{ .version = 1, .owner = command.owner, .command = command, .entry = receipt, .minimum_applied_index = @max(minimum_applied_index, receipt.index) }),
+                .source_plan => blk: {
+                    var lookup = command;
+                    lookup.operation = .recover;
+                    lookup.receipt = receipt;
+                    break :blk owner.sourcePlanOutcomeRouted(alloc, fence, table_name, lookup);
+                },
+            }) catch |err| switch (err) {
+                error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.StorageKernelOwnerTransitionRequired, error.StorageOwnerAdmissionPending, error.ResourceBudgetExceeded => {
+                    try self.sleepDataRaftRetry(std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+        }
     }
 
     fn proposeRaftBatchGroupWithLeaderWait(
@@ -13317,9 +14678,19 @@ pub const DataServer = struct {
             return error.OnlineMergeArtifactCatalogUncoordinated;
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
-        const minimum_protocol_version = requiredRaftBatchProtocolVersion(req);
+        const minimum_protocol_version = if (@import("antfly_local_sources").api_internal_batch.requiresExactPrepareProtocol(req))
+            data_raft_batch.exact_prepare_protocol_version
+        else
+            try requiredRaftBatchProtocolVersion(alloc, req);
         var required_protocol_version = minimum_protocol_version;
         const deadline_ns = @min(route.admission_deadline_ns orelse std.math.maxInt(u64), self.dataRaftMonotonicNs() +| leader_wait_ns);
+        const completion_command = @import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(req);
+        if (completion_command) {
+            if (!linked_storage or req.restore_staging_scope != null or route.initial_child_bootstrap != null) return error.ChangefeedCapabilityUnsupported;
+            if (route.write_route_fence == null) return error.InvalidCatalogRouteFence;
+        }
+        const completion_io = self.dataRaftIo();
+        const completion_context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = deadline_ns, .deadline_io = if (completion_io) |*io| @import("antfly_runtime_abi").io_abi.Borrow.init(io) else null, .cancellation = route.visibility_cancellation };
         try ensureDataRaftBatchRouteActive(route);
         try self.reachDataRequestLifecycle(.{
             .phase = .routing_started,
@@ -13484,7 +14855,12 @@ pub const DataServer = struct {
                         protocol_activation_lock_owned = false;
                     }
                     if (comptime linked_storage) {
-                        prepared_json = try (try self.ensureKernelOwnerSource()).prepareEnrichments(alloc, group_id, table_name, req, deadline_ns, if (route.cancellation) |signal| signal.token() else .none);
+                        const remaining_ns = deadline_ns -| self.dataRaftMonotonicNs();
+                        if (remaining_ns == 0) return error.LeaderUnavailable;
+                        // Kernel preparation and inference use the platform
+                        // clock, which need not share the Raft I/O clock epoch.
+                        const native_deadline_ns = platform_time.monotonicNs() +| remaining_ns;
+                        prepared_json = try (try self.ensureKernelOwnerSource()).prepareEnrichments(alloc, group_id, table_name, req, native_deadline_ns, if (route.cancellation) |signal| signal.token() else route.visibility_cancellation);
                         req.prepared_enrichments_json = prepared_json;
                     } else return error.CommitRequirementUnavailable;
                     try ensureDataRaftBatchRouteActive(route);
@@ -13531,10 +14907,24 @@ pub const DataServer = struct {
                         const owner_source = try self.ensureKernelOwnerSource();
                         storage_owner_descriptor = if (route.initial_child_bootstrap) |bootstrap|
                             try owner_source.loadInitialChildDescriptor(alloc, group_id, table_name, bootstrap)
+                        else if (completion_command)
+                            try owner_source.loadCompletionDescriptor(alloc, group_id, table_name, completion_context)
                         else
                             try owner_source.loadDescriptor(alloc, group_id, table_name);
                     }
                 }
+            }
+
+            if (completion_command and preflighted_local_leader) {
+                const owner = switch (req.transaction.?) {
+                    .begin => |begin| begin.completion_owner orelse return error.InvalidHistoryAdmission,
+                    .prepare => |prepare| prepare.completion_owner orelse return error.InvalidHistoryAdmission,
+                    .resolve => |resolve| resolve.completion_owner orelse return error.InvalidHistoryAdmission,
+                    .publish_completion => |publication| publication.completion_owner,
+                    else => return error.InvalidBatchRequest,
+                };
+                const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
+                try @import("../api/completion_owner_admission.zig").require(alloc, admission_source.catalog, table_name, route.write_route_fence.?, storage_owner_descriptor.?.view(), owner, completion_context);
             }
 
             var target_index: ?u64 = null;
@@ -13629,21 +15019,28 @@ pub const DataServer = struct {
                             if (minimum_protocol_version >= data_raft_batch.merge_transition_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
                         }
-                        proposal_req = try raftBatchRequestForActiveProtocol(
-                            req,
-                            active_protocol_version,
-                            self.dataRaftRealtimeNs(),
-                        );
+                        const realtime_ns = self.dataRaftRealtimeNs();
+                        proposal_req = try raftBatchRequestForActiveProtocol(req, active_protocol_version, realtime_ns);
                         const proposal_term = status.hard.current_term;
-                        const encoded = if (comptime linked_storage)
-                            try data_raft_batch.encodeWithStorageOwnerDescriptor(
-                                alloc,
-                                table_name,
-                                proposal_req,
-                                if (restore_owner_descriptor) |*descriptor| descriptor.view() else storage_owner_descriptor.?.view(),
-                            )
-                        else
-                            try data_raft_batch.encode(alloc, table_name, proposal_req);
+                        const encoded = if (comptime linked_storage) blk: {
+                            const descriptor = if (restore_owner_descriptor) |*value| value.view() else storage_owner_descriptor.?.view();
+                            const history = @import("history_clock_entry.zig");
+                            if (active_protocol_version >= history.required_protocol_version and history.eligible(proposal_req) and
+                                descriptor.restore == null and !descriptor.restore_cancel_recovery and !descriptor.restore_ha_replay and
+                                descriptor.restore_bootstrap_json.len == 0 and descriptor.initial_child_bootstrap_json.len == 0 and
+                                (descriptor.table_storage == null or descriptor.table_storage.?.engine == .local))
+                            {
+                                const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, proposal_req);
+                                defer alloc.free(body);
+                                break :blk try history.encode(alloc, .{
+                                    .table = table_name,
+                                    .storage_owner = descriptor,
+                                    .history_commit_time_ns = std.math.cast(i64, realtime_ns) orelse return error.InvalidBatchRequest,
+                                    .row_batch_json = body,
+                                }, active_protocol_version);
+                            }
+                            break :blk try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, table_name, proposal_req, descriptor);
+                        } else try data_raft_batch.encode(alloc, table_name, proposal_req);
                         defer alloc.free(encoded);
                         var accepted_index: ?u64 = null;
                         raft.host.http_host.proposeWithReceipt(group_id, encoded, &accepted_index) catch |err| {
@@ -13926,7 +15323,7 @@ pub const DataServer = struct {
                                     self.api_server_cfg.internal_service_secret,
                                     self.api_server_cfg.internal_service_issuer,
                                 );
-                                const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, proposal_req);
+                                const body = try @import("antfly_local_sources").api_internal_batch.encodeRoutedBatchRequest(alloc, proposal_req);
                                 defer alloc.free(body);
                                 const forwarding = self.nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse {
                                     try self.sleepDataRaftBatchLeaderRetry();
@@ -14149,7 +15546,7 @@ pub const DataServer = struct {
             self.api_server_cfg.internal_service_secret,
             self.api_server_cfg.internal_service_issuer,
         );
-        const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, req);
+        const body = try @import("antfly_local_sources").api_internal_batch.encodeRoutedBatchRequest(alloc, req);
         defer alloc.free(body);
         const forwarding = self.nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse return false;
         const encoded_route_fence = if (route.write_route_fence) |fence|
@@ -23075,6 +24472,70 @@ pub const DataServer = struct {
         try lane.submit(job);
     }
 
+    fn requestChangefeedMaintenance(self: *DataServer) !void {
+        if (!linked_storage or self.remote_metadata == null or self.data_raft == null or self.background_jobs_shutdown.load(.acquire)) return;
+        const now_ms = self.backgroundMonotonicMs();
+        if (now_ms < self.changefeed_maintenance_due_ms.load(.acquire)) return;
+        if (self.changefeed_maintenance_active.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        errdefer self.changefeed_maintenance_active.store(false, .release);
+        const runtime = try self.ensureBackendRuntime();
+        if (runtime.durable_jobs.executesInline()) {
+            self.changefeed_maintenance_active.store(false, .release);
+            return;
+        }
+        self.changefeed_maintenance_due_ms.store(now_ms +| 1000, .release);
+        try runtime.durable_jobs.submit(.{
+            .owner_id = try self.dataServerBackgroundOwnerId(runtime),
+            .class = .maintenance,
+            .ptr = self,
+            .run = runChangefeedMaintenanceJob,
+            .deinit = deinitChangefeedMaintenanceJob,
+        });
+    }
+
+    fn deinitChangefeedMaintenanceJob(ptr: *anyopaque) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.changefeed_maintenance_active.store(false, .release);
+    }
+
+    fn runChangefeedMaintenanceJob(ptr: *anyopaque) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const remote = self.remote_metadata orelse return;
+        const metadata = remote.statusSource().changefeeds orelse return;
+        const io = self.dataRaftIo() orelse return;
+        const request: antfly.public_api.operation.RequestContext = .{
+            .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" },
+            .deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s,
+            .cancellation = .fromAtomic(&self.background_jobs_shutdown),
+        };
+        try request.ensureActive();
+        const now = self.dataRaftRealtimeNs() / std.time.ns_per_s;
+        const page = try remote.scanChangefeedMaintenance(self.alloc, .{ .now = now, .after = self.changefeed_maintenance_after }, request);
+        const SpoolRegistry = @import("../metadata/pg_spool_artifacts.zig").Registry;
+        const spool: ?SpoolRegistry = if (self.pgwire_spool_store orelse self.api_server_cfg.document_artifact_store) |store| blk: {
+            const candidate: SpoolRegistry = .{ .store = store, .io = io };
+            candidate.requireAvailable(self.api_server_cfg.deployment_mode != .standalone, request) catch |err| switch (err) {
+                error.PgSpoolStorageUnsupported => break :blk null,
+                else => return err,
+            };
+            break :blk candidate;
+        } else null;
+        for (page.items()) |id| {
+            try request.ensureActive();
+            @import("../api/changefeed_public.zig").maintainNativeFeedWithSpool(metadata, self.historyRootsSource(), io, self.alloc, id, spool, request) catch |err| switch (err) {
+                error.ChangefeedConflict,
+                error.MetadataMutationOutcomeUnknown,
+                error.ChangefeedResynchronizationRequired,
+                error.GroupLeaderUnavailable,
+                error.ReadUnavailable,
+                error.StorageReadTemporarilyUnavailable,
+                => {},
+                else => std.log.warn("changefeed owner maintenance deferred err={s}", .{@errorName(err)}),
+            };
+        }
+        self.changefeed_maintenance_after = page.next;
+    }
+
     fn requestAutoBulkFinishBackground(self: *DataServer) !void {
         if (self.auto_bulk_finish_active.load(.acquire)) return;
         const now_ms = self.backgroundMonotonicMs();
@@ -24869,16 +26330,16 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
         try std.testing.expect(!onlineMergeRaftBatchHasArtifactBarrier(admitted));
         admitted.artifact_catalog = .{ .namespace = @splat(1), .binding = binding, .catalogs = catalogs };
         try std.testing.expect(onlineMergeRaftBatchHasArtifactBarrier(admitted));
-        try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, DataServer.requiredRaftBatchProtocolVersion(admitted));
+        try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, admitted));
         var extended_admission = admitted;
         extended_admission.artifact_catalog.?.binding.effect_protocol = 15;
-        try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(extended_admission));
+        try std.testing.expectEqual(@as(u16, 15), try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, extended_admission));
         extended_admission = admitted;
         extended_admission.artifact_catalog = null;
         extended_admission.online_source.?.admit.artifact_catalog.?.effect_protocol = 15;
-        try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(extended_admission));
+        try std.testing.expectEqual(@as(u16, 15), try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, extended_admission));
         const invalid_publication: antfly.db.types.BatchRequest = .{ .artifact_publication = .{ .mode = .activate, .namespace = @splat(0), .authority_epoch = 0, .catalog_digest = @splat(0), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) } };
-        try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(invalid_publication));
+        try std.testing.expectEqual(@as(u16, 15), try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, invalid_publication));
         try std.testing.expectError(error.InvalidBatchRequest, @import("antfly_local_sources").storage_db_artifact_publication.validateRequest(alloc, invalid_publication));
         const adoption: antfly.db.types.BatchRequest = .{ .merge_proof_adoption = .{
             .transition_id = 1,
@@ -24887,7 +26348,7 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             .proof_digest = @splat(2),
             .record_digest = @splat(3),
         } };
-        try std.testing.expectEqual(data_raft_batch.merge_proof_adoption_protocol_version, DataServer.requiredRaftBatchProtocolVersion(adoption));
+        try std.testing.expectEqual(data_raft_batch.merge_proof_adoption_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, adoption));
         // The current decoder must support this feature's stable activation
         // floor, including after later features raise the advertised version.
         try std.testing.expect(data_raft_batch.protocol_version >= data_raft_batch.merge_proof_adoption_protocol_version);
@@ -24900,7 +26361,7 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             .artifact_effects = &.{.{ .key = "untrusted", .value = null }},
         } };
         const merge_page_protocol = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
-        try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(unbound_vector_page));
+        try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, unbound_vector_page));
         var unbound_vector_chunk = unbound_vector_page;
         unbound_vector_chunk.merge_page.?.artifact_effects = &.{};
         unbound_vector_chunk.merge_page.?.chunk = .{
@@ -24913,7 +26374,7 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             .data = "x",
             .chunk_digest = @splat(2),
         };
-        try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(unbound_vector_chunk));
+        try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, unbound_vector_chunk));
         admitted.artifact_catalog.?.binding.epoch += 1;
         try std.testing.expect(!onlineMergeRaftBatchHasArtifactBarrier(admitted));
         var accepted = rollback_accept;
@@ -25491,6 +26952,13 @@ const ControlReadGeneration = struct {
         return std.mem.indexOfScalar(u64, group.nodes.items, node_id) != null;
     }
 
+    fn historyControlLeader(self: *const ControlReadGeneration, group_id: u64, local_node: u64, observed_leader: ?u64, hosted: bool) !u64 {
+        const group = self.groups.get(group_id) orelse return error.GroupLeaderUnavailable;
+        const leader = (if (hosted) observed_leader else group.leader) orelse return error.GroupLeaderUnavailable;
+        if (leader == 0 or leader == local_node or !self.readable(group_id, leader) or !self.nodes.contains(leader)) return error.GroupLeaderUnavailable;
+        return leader;
+    }
+
     fn forwardingUri(self: *const ControlReadGeneration, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
         const url = self.forwarding_nodes.get(node_id) orelse return null;
         if (url.len == 0) return null;
@@ -25874,6 +27342,38 @@ const RemoteMetadataSource = struct {
         self.internal_service_secret = secret;
         self.internal_service_issuer = issuer;
         return self;
+    }
+
+    pub fn authorizeSourceScopeIntent(self: *RemoteMetadataSource, alloc: std.mem.Allocator, intent: @import("antfly_local_sources").storage_source_scope_control.Intent, context: antfly.public_api.operation.RequestContext) !@import("antfly_local_sources").storage_source_scope_control.Command {
+        try intent.validate();
+        try context.ensureActive();
+        const normalized = try context.platformDeadline();
+        const now = platform_time.monotonicNs();
+        const remaining = if (normalized.deadline_ns) |limit| limit -| now else 5 * std.time.ns_per_s;
+        if (remaining == 0) return error.DeadlineExceeded;
+        var bounded = context;
+        bounded.deadline_ns = now +| @min(remaining, 5 * std.time.ns_per_s);
+        bounded.deadline_io = null;
+        var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(bounded.cancellation);
+        const budget: antfly.metadata_http_client.RequestBudget = .{ .deadline_ns = try requestDeadlineOnClock(bounded, self.awakeNs(), 5 * std.time.ns_per_s), .cancellation = &cancellation, .io = self.io };
+        var last_error: anyerror = error.ReadUnavailable;
+        for (0..self.base_uris.len) |attempt| {
+            try bounded.ensureActive();
+            try ensureBudgetActive(budget);
+            const index = try self.metadataReadApiIndexForAttemptWithBudget(attempt, budget);
+            var client = self.metadataClient(alloc);
+            const command = client.authorizeSourceScopeIntent(self.base_uris[index], intent, bounded) catch |err| switch (err) {
+                error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.ChangefeedCapabilityUnsupported => {
+                    last_error = err;
+                    continue;
+                },
+                else => return err,
+            };
+            try bounded.ensureActive();
+            return command;
+        }
+        try bounded.ensureActive();
+        return last_error;
     }
 
     fn metadataClient(
@@ -26637,6 +28137,8 @@ const RemoteMetadataSource = struct {
         return .{
             .ptr = self,
             .routing = self.catalogSource().routingSource() catch unreachable,
+            .changefeeds = .{ .ptr = self, .read_fn = remoteChangefeedRead, .mutate_fn = remoteChangefeedMutate, .authority_fn = remoteChangefeedAuthority },
+            .pg_publications = self.pgPublicationPort(),
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
                 .table_record = remoteTableRecord,
@@ -27836,6 +29338,135 @@ const RemoteMetadataSource = struct {
         try routing_budget.checkpoint();
         ensureBudgetActive(outer_budget) catch |err| return if (err == error.Cancelled or err == error.Canceled) error.Canceled else error.CatalogRoutingSnapshotTimeout;
         return last_err;
+    }
+
+    fn accessFencedMetadata(self: *RemoteMetadataSource, a: std.mem.Allocator, original: antfly.public_api.operation.RequestContext, mutation: bool, unbound: anytype) !@TypeOf(unbound).Response {
+        var request = original;
+        request.deadline_ns = try requestDeadlineOnClock(original, self.awakeNs(), 5 * std.time.ns_per_s);
+        request.deadline_io = runtime_io_abi.Borrow.init(&self.io);
+        var signal = antfly.common.http.http_common.RequestCancellation.fromToken(request.cancellation);
+        const budget: antfly.metadata_http_client.RequestBudget = .{ .deadline_ns = request.deadline_ns.?, .io = self.io, .cancellation = &signal };
+        // Discover identity under the original budget. A cached head supplies
+        // identity only; the state endpoint always executes its own strong read.
+        const head = try self.fetchHeadWithBudget(budget);
+        const incarnation = head.metadata_incarnation orelse return error.MetadataIncarnationUnavailable;
+        var input = unbound;
+        input.bind(head.metadata_group_id, incarnation);
+        const first = try self.metadataReadApiIndexForAttemptWithBudget(0, budget);
+        var last_error: anyerror = error.MissingMetadataApi;
+        // A mutation gets exactly one selected peer. An unknown outcome must
+        // return to the durable owner for reconciliation, never peer failover.
+        const attempts = if (mutation) @min(self.base_uris.len, 1) else self.base_uris.len;
+        for (0..attempts) |attempt| {
+            try request.ensureActive();
+            try ensureBudgetActive(budget);
+            const index = (first + attempt) % self.base_uris.len;
+            var client = self.metadataClient(a);
+            var reply = input.send(&client, self.base_uris[index], request) catch |err| {
+                if (mutation) return err;
+                try request.ensureActive();
+                if (err == error.OutOfMemory or err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded) return err;
+                last_error = err;
+                continue;
+            };
+            errdefer reply.deinit();
+            original.ensureActive() catch |err| return if (mutation) error.MetadataMutationOutcomeUnknown else err;
+            self.noteMetadataReadSuccessWithBudget(index, budget) catch |err| return if (mutation) error.MetadataMutationOutcomeUnknown else err;
+            return reply;
+        }
+        return last_error;
+    }
+
+    const FencedChangefeedCall = struct {
+        const feeds = @import("../api/changefeed_metadata.zig");
+        const Response = std.json.Parsed(feeds.Reply);
+        input: feeds.Request,
+
+        fn bind(self: *@This(), group: u64, incarnation: @import("../metadata/changefeed_control.zig").Digest) void {
+            self.input.metadata_group_id = group;
+            self.input.metadata_incarnation = incarnation;
+        }
+
+        fn send(self: @This(), client: *antfly.metadata_http_client.MetadataHttpClient, uri: []const u8, request: antfly.public_api.operation.RequestContext) !Response {
+            return client.accessChangefeedState(uri, self.input, request);
+        }
+    };
+
+    const FencedPublicationCall = struct {
+        const publication = @import("../metadata/pg_publication.zig");
+        const Response = std.json.Parsed(publication.Reply);
+        input: publication.Request,
+
+        fn bind(self: *@This(), group: u64, incarnation: @import("../metadata/changefeed_control.zig").Digest) void {
+            self.input.group = group;
+            self.input.incarnation = incarnation;
+        }
+
+        fn send(self: @This(), client: *antfly.metadata_http_client.MetadataHttpClient, uri: []const u8, request: antfly.public_api.operation.RequestContext) !Response {
+            return client.accessPgPublication(uri, self.input, request);
+        }
+    };
+
+    pub fn accessPgPublication(self: *RemoteMetadataSource, a: std.mem.Allocator, database: @import("../metadata/changefeed_control.zig").Digest, name: []const u8, write: ?@import("../metadata/pg_publication.zig").Write, request: antfly.public_api.operation.RequestContext) !FencedPublicationCall.Response {
+        try FencedPublicationCall.publication.requireAuthority(request);
+        const call: FencedPublicationCall = .{ .input = .{ .group = 0, .incarnation = @splat(0), .database = database, .name = name, .write = write } };
+        return self.accessFencedMetadata(a, request, write != null, call);
+    }
+
+    pub fn pgPublicationPort(self: *RemoteMetadataSource) FencedPublicationCall.publication.Port {
+        const publication = FencedPublicationCall.publication;
+        const Adapter = struct {
+            fn read(raw: *anyopaque, a: std.mem.Allocator, database: @import("../metadata/changefeed_control.zig").Digest, name: []const u8, request: antfly.public_api.operation.RequestContext) !?std.json.Parsed(publication.Record) {
+                const source: *RemoteMetadataSource = @ptrCast(@alignCast(raw));
+                var reply = try source.accessPgPublication(a, database, name, null, request);
+                if (reply.value.record) |record| return .{ .arena = reply.arena, .value = record };
+                reply.deinit();
+                return null;
+            }
+
+            fn mutate(raw: *anyopaque, a: std.mem.Allocator, write: publication.Write, request: antfly.public_api.operation.RequestContext) !void {
+                const source: *RemoteMetadataSource = @ptrCast(@alignCast(raw));
+                var reply = try source.accessPgPublication(a, write.next.database, write.next.name, write, request);
+                defer reply.deinit();
+            }
+        };
+        return .{ .ptr = self, .read = Adapter.read, .mutate = Adapter.mutate };
+    }
+
+    fn accessChangefeedMetadata(self: *RemoteMetadataSource, a: std.mem.Allocator, action: @import("../api/changefeed_metadata.zig").Action, id: ?@import("../metadata/changefeed_control.zig").Id, write: ?[]const u8, scan: ?@import("../api/changefeed_metadata.zig").ScanRequest, original: antfly.public_api.operation.RequestContext) !std.json.Parsed(@import("../api/changefeed_metadata.zig").Reply) {
+        const call: FencedChangefeedCall = .{ .input = .{ .action = action, .id = id, .write = write, .scan = scan, .metadata_group_id = 0, .metadata_incarnation = @splat(0) } };
+        return self.accessFencedMetadata(a, original, action == .mutate, call);
+    }
+
+    fn remoteChangefeedRead(ptr: *anyopaque, a: std.mem.Allocator, id: @import("../metadata/changefeed_control.zig").Id, request: antfly.public_api.operation.RequestContext) ![]u8 {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var reply = try self.accessChangefeedMetadata(a, .read, id, null, null, request);
+        defer reply.deinit();
+        return a.dupe(u8, reply.value.state.?);
+    }
+
+    fn remoteChangefeedMutate(ptr: *anyopaque, a: std.mem.Allocator, write: @import("../metadata/changefeed_control.zig").Write, request: antfly.public_api.operation.RequestContext) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const bytes = try @import("../metadata/changefeed_control.zig").encodeWrite(a, write);
+        defer a.free(bytes);
+        var reply = try self.accessChangefeedMetadata(a, .mutate, null, bytes, null, request);
+        defer reply.deinit();
+    }
+
+    fn remoteChangefeedAuthority(ptr: *anyopaque, a: std.mem.Allocator, request: antfly.public_api.operation.RequestContext) !?@import("../metadata/changefeed_control.zig").Stamp {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var reply = try self.accessChangefeedMetadata(a, .authority, null, null, null, request);
+        defer reply.deinit();
+        return reply.value.authority;
+    }
+
+    pub fn scanChangefeedMaintenance(self: *RemoteMetadataSource, a: std.mem.Allocator, input: @import("../api/changefeed_metadata.zig").ScanRequest, request: antfly.public_api.operation.RequestContext) !@import("../metadata/changefeed_control.zig").MaintenanceScan {
+        var reply = try self.accessChangefeedMetadata(a, .scan_maintenance, null, null, input, request);
+        defer reply.deinit();
+        const page = reply.value.scan.?;
+        var result: @import("../metadata/changefeed_control.zig").MaintenanceScan = .{ .count = page.ids.len, .next = page.next };
+        @memcpy(result.ids[0..result.count], page.ids);
+        return result;
     }
 
     fn remotePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {
@@ -34969,22 +36600,314 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "data raft source scope metadata authorization captures fresh phase and cut" {
+            const helper = @import("source_scope_authorization_test.zig");
+            var fake: helper.Fake = .{};
+            var remote = try RemoteMetadataSource.initWithRequestExecutors(std.testing.allocator, &.{ "http://missing", "http://active" }, &.{.{ .ptr = &fake, .vtable = &.{ .execute = helper.Fake.execute } }}, std.testing.io);
+            defer remote.deinit();
+            remote.internal_service_secret = "source-scope-authorizer-test-secret-long-enough";
+            try helper.run(std.testing.allocator, &remote, &fake);
+        }
+
+        test "data raft source plan staging waits for native receipts and retains deterministic rejection" {
+            if (comptime !linked_storage) return error.SkipZigTest;
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root_dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-plan-native-apply", .{tmp.sub_path});
+            defer a.free(root_dir);
+            const projection_root = try std.fmt.allocPrint(a, "{s}/projection", .{root_dir});
+            defer a.free(projection_root);
+            const native_root = try std.fmt.allocPrint(a, "{s}/native", .{root_dir});
+            defer a.free(native_root);
+            var projection = try DataRaftApplyStore.init(a, .{ .root_dir = projection_root, .native_source_delegate = true });
+            defer projection.deinit();
+            var owner = antfly.public_api.ProvisionedKernelOwnerSource.init(a, native_root, antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier());
+            defer owner.deinit();
+            var sm = try RaftTableApplyStateMachine.init(a, native_root, antfly.public_api.table_catalog.emptyCatalogSource(), null);
+            defer sm.deinit();
+            sm.attachKernelOwnerSource(&owner);
+            sm.topology_apply_store = &projection;
+            const plan = @import("source_plan_entry.zig");
+            const storage = plan.wire.control.storage;
+            var namespace: [24]u8 = undefined;
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 11, .big);
+            std.mem.writeInt(u64, namespace[16..24], 13, .big);
+            const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
+            const routed: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(3), .root_generation = 0, .group_id = 601, .topology_epoch = 1 };
+            const root = try plan.rootFor(routed);
+            var frame: [128]u8 = @splat(255);
+            @memcpy(frame[0..4], "AFP1");
+            std.mem.writeInt(u32, frame[4..8], 1, .little);
+            std.mem.writeInt(u64, frame[8..16], 10, .little);
+            std.mem.writeInt(u64, frame[16..24], 11, .little);
+            std.mem.writeInt(u64, frame[24..32], 1, .little);
+            const digest = try storage.frozenDigest(&frame);
+            @memcpy(frame[32..64], &digest);
+            var checksum: storage.Digest = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&frame, &checksum, .{});
+            const hashes = [_]storage.Digest{storage.chunkDigest(0, &frame)};
+            var attempt: [16]u8 = @splat(1);
+            std.mem.writeInt(u64, attempt[0..8], 1, .big);
+            var command: plan.wire.control.Request = .{ .root = root, .spec = .{ .namespace = storage.namespaceFor(root, 1), .storage_epoch = 1, .binding = @splat(2), .domain = storage.domainFor(@splat(2)), .attempt = attempt, .bytes = frame.len, .checksum = checksum, .plan_digest = digest, .chunk_hashes = &hashes }, .action = .begin };
+            var encoded = try plan.wire.Encoded.init(a, command);
+            defer encoded.deinit();
+            var control: plan.Entry = .{ .table = "docs", .storage_owner = .{ .lsm_root_generation = 0, .identity = .{ .table_id = 7, .shard_id = 11, .range_id = 13 }, .schema_json = "{}", .indexes_json = "{}" }, .source_owner = routed, .source_plan = encoded.command };
+            const beginning = try plan.encode(a, control, plan.required_protocol_version);
+            defer a.free(beginning);
+            const pending: raft_engine.core.Entry = .{ .term = 1, .index = 2, .entry_type = .normal, .data = beginning };
+            try std.testing.expectError(error.HistoryResynchronizationRequired, sm.stateMachine().applyReady(602, null, &.{pending}, &.{}));
+            try std.testing.expectEqual(@as(u64, 0), sm.appliedIndex(602));
+            try std.testing.expectError(error.UnsupportedBatchProtocolVersion, sm.stateMachine().applyReady(601, null, &.{pending}, &.{}));
+            try std.testing.expectEqual(@as(u64, 0), sm.appliedIndex(601));
+            sm.retry_apply_checkpoints.clearRetainingCapacity();
+            const Apply = struct {
+                fn projectionFirst(store: *DataRaftApplyStore, entry: raft_engine.core.Entry) !void {
+                    const bytes = try antfly.raft.state_machine.encodeCommittedEntries(std.testing.allocator, &.{entry});
+                    defer std.testing.allocator.free(bytes);
+                    try store.applyBatch(601, entry.index, bytes);
+                }
+                fn run(state: *RaftTableApplyStateMachine, store: *DataRaftApplyStore, value: plan.Entry, index: u64, failure: ?RaftTableApplyStateMachine.ExpectedApplyFailure) !void {
+                    const bytes = try plan.encode(std.testing.allocator, value, plan.required_protocol_version);
+                    defer std.testing.allocator.free(bytes);
+                    const entry: raft_engine.core.Entry = .{ .term = 1, .index = index, .entry_type = .normal, .data = bytes };
+                    try projectionFirst(store, entry);
+                    const token = try state.registerApplyOutcomeToken(601, index, 1);
+                    defer state.cancelRegisteredApplyOutcome(token);
+                    try state.stateMachine().applyReady(601, null, &.{entry}, &.{});
+                    try std.testing.expectEqual(index, state.appliedIndex(601));
+                    const outcome = state.takeRegisteredApplyOutcome(token).?;
+                    if (failure) |expected| try std.testing.expectEqual(expected, outcome.failed) else try std.testing.expectEqual(.succeeded, outcome);
+                }
+            };
+            // A claimed envelope version cannot replace a durable activation
+            // or the presence of the applying native owner implementation.
+            const unsupported_root = try std.fmt.allocPrint(a, "{s}/no-native-delegate", .{root_dir});
+            defer a.free(unsupported_root);
+            var unsupported = try DataRaftApplyStore.init(a, .{ .root_dir = unsupported_root, .native_source_delegate = false });
+            defer unsupported.deinit();
+            try std.testing.expectError(error.StorageKernelOwnerUnavailable, Apply.projectionFirst(&unsupported, pending));
+            const older_root = try std.fmt.allocPrint(a, "{s}/older-protocol", .{root_dir});
+            defer a.free(older_root);
+            var older = try DataRaftApplyStore.init(a, .{ .root_dir = older_root, .native_source_delegate = true });
+            defer older.deinit();
+            const older_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", plan.required_protocol_version - 1);
+            defer a.free(older_barrier);
+            try Apply.projectionFirst(&older, .{ .term = 1, .index = 1, .entry_type = .normal, .data = older_barrier });
+            try std.testing.expectError(error.UnsupportedBatchProtocolVersion, Apply.projectionFirst(&older, pending));
+            try std.testing.expectEqual(@as(u64, 1), (try older.latestBatchForTransition(601)).?.last_entry_index);
+            const barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", plan.required_protocol_version);
+            defer a.free(barrier);
+            const barrier_entry: raft_engine.core.Entry = .{ .term = 1, .index = 1, .entry_type = .normal, .data = barrier };
+            try Apply.projectionFirst(&projection, barrier_entry);
+            try sm.stateMachine().applyReady(601, null, &.{barrier_entry}, &.{});
+            try Apply.projectionFirst(&projection, pending);
+            const token = try sm.registerApplyOutcomeToken(601, 2, 1);
+            defer sm.cancelRegisteredApplyOutcome(token);
+            sm.test_faults.source_plan_reply_lost_once_at_index = 2;
+            try std.testing.expectError(error.RaftApplyWriterUnavailable, sm.stateMachine().applyReady(601, null, &.{pending}, &.{}));
+            try std.testing.expectEqual(@as(u64, 1), sm.appliedIndex(601));
+            try std.testing.expect(!try sm.applyOutcomeReady(token));
+            const durable = try owner.applyPreparedOrderedSourcePlanControlGroupLocalAtRaftEntry(a, 601, "docs", control.storage_owner, control.source_plan, 1, 2);
+            try std.testing.expect(durable == .applied and durable.applied.present);
+            try sm.stateMachine().applyReady(601, null, &.{pending}, &.{});
+            try std.testing.expectEqual(@as(u64, 2), sm.appliedIndex(601));
+            try std.testing.expectEqual(.succeeded, sm.takeRegisteredApplyOutcome(token).?);
+            control.source_plan.action = .seal;
+            try Apply.run(&sm, &projection, control, 3, .SourcePendingWork);
+            command.action = .chunk;
+            command.chunk = &frame;
+            var chunk = try plan.wire.Encoded.init(a, command);
+            defer chunk.deinit();
+            control.source_plan = chunk.command;
+            try Apply.run(&sm, &projection, control, 4, null);
+            control.source_plan = encoded.command;
+            control.source_plan.action = .seal;
+            try Apply.run(&sm, &projection, control, 5, null);
+            const sealed = try owner.applyPreparedOrderedSourcePlanControlGroupLocalAtRaftEntry(a, 601, "docs", control.storage_owner, control.source_plan, 1, 5);
+            try std.testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, sealed.applied.sealed_position.?[8..16], .little));
+            control.source_plan.action = .fence;
+            try Apply.run(&sm, &projection, control, 6, null);
+            control.source_plan.action = .reclaim;
+            try Apply.run(&sm, &projection, control, 7, null);
+            control.source_plan.action = .begin;
+            try Apply.run(&sm, &projection, control, 8, .SourceReceiptExpired);
+            const ScopeHarness = struct {
+                pub fn apply(state: *RaftTableApplyStateMachine, entry: raft_engine.core.Entry) !void {
+                    try state.stateMachine().applyReady(601, null, &.{entry}, &.{});
+                }
+                pub fn index(state: *RaftTableApplyStateMachine) u64 {
+                    return state.appliedIndex(601);
+                }
+                pub fn closureStillRequiresDrainage(state: *RaftTableApplyStateMachine, entry: raft_engine.core.Entry) !void {
+                    const before = state.test_faults.document_apply_successes;
+                    const drainage_token = try state.registerApplyOutcomeToken(601, entry.index, entry.term);
+                    defer state.cancelRegisteredApplyOutcome(drainage_token);
+                    try apply(state, entry);
+                    try std.testing.expectEqual(RaftTableApplyStateMachine.ExpectedApplyFailure.SourcePendingWork, state.takeRegisteredApplyOutcome(drainage_token).?.failed);
+                    try std.testing.expectEqual(before, state.test_faults.document_apply_successes);
+                }
+                pub fn legacyTerminal(state: *RaftTableApplyStateMachine, entry: raft_engine.core.Entry, lose_reply: bool) !void {
+                    const before = state.test_faults.document_apply_successes;
+                    const receipt_token = try state.registerApplyOutcomeToken(601, entry.index, entry.term);
+                    defer state.cancelRegisteredApplyOutcome(receipt_token);
+                    if (lose_reply) {
+                        state.test_faults.legacy_terminal_reply_lost_once_at_index = entry.index;
+                        try std.testing.expectError(error.RaftApplyWriterUnavailable, apply(state, entry));
+                        try std.testing.expectEqual(entry.index - 1, state.appliedIndex(601));
+                        try std.testing.expect(!try state.applyOutcomeReady(receipt_token));
+                    }
+                    try apply(state, entry);
+                    try std.testing.expectEqual(RaftTableApplyStateMachine.ExpectedApplyFailure.txn_not_found, state.takeRegisteredApplyOutcome(receipt_token).?.failed);
+                    try std.testing.expectEqual(before, state.test_faults.document_apply_successes);
+                }
+                pub fn lostProducerClosureReply(state: *RaftTableApplyStateMachine, entry: raft_engine.core.Entry) !void {
+                    const before = state.test_faults.document_apply_successes;
+                    const closure_token = try state.registerApplyOutcomeToken(601, entry.index, entry.term);
+                    defer state.cancelRegisteredApplyOutcome(closure_token);
+                    state.test_faults.source_producer_closure_reply_lost_once_at_index = entry.index;
+                    try std.testing.expectError(error.RaftApplyWriterUnavailable, apply(state, entry));
+                    try std.testing.expectEqual(entry.index - 1, state.appliedIndex(601));
+                    try std.testing.expect(!try state.applyOutcomeReady(closure_token));
+                    try apply(state, entry);
+                    try std.testing.expectEqual(.succeeded, state.takeRegisteredApplyOutcome(closure_token).?);
+                    try std.testing.expectEqual(before, state.test_faults.document_apply_successes);
+                }
+                pub fn lostRetirementReply(state: *RaftTableApplyStateMachine, entry: raft_engine.core.Entry) !void {
+                    const retirement_before = state.test_faults.document_apply_successes;
+                    const retirement_token = try state.registerApplyOutcomeToken(601, entry.index, entry.term);
+                    defer state.cancelRegisteredApplyOutcome(retirement_token);
+                    state.test_faults.source_retirement_reply_lost_once_at_index = entry.index;
+                    try std.testing.expectError(error.RaftApplyWriterUnavailable, apply(state, entry));
+                    try std.testing.expectEqual(@as(u64, 11), state.appliedIndex(601));
+                    try std.testing.expect(!try state.applyOutcomeReady(retirement_token));
+                    try apply(state, entry);
+                    const retirement_outcome = state.takeRegisteredApplyOutcome(retirement_token).?;
+                    try std.testing.expectEqual(RaftTableApplyStateMachine.ExpectedApplyFailure.SourceCheckpointConflict, retirement_outcome.failed);
+                    try std.testing.expectEqual(retirement_before, state.test_faults.document_apply_successes);
+                }
+                pub fn lostReply(state: *RaftTableApplyStateMachine, entry: raft_engine.core.Entry) !void {
+                    const scope_before = state.test_faults.document_apply_successes;
+                    const scope_token = try state.registerApplyOutcomeToken(601, entry.index, entry.term);
+                    defer state.cancelRegisteredApplyOutcome(scope_token);
+                    state.test_faults.source_scope_reply_lost_once_at_index = entry.index;
+                    try std.testing.expectError(error.RaftApplyWriterUnavailable, apply(state, entry));
+                    try std.testing.expectEqual(@as(u64, 9), state.appliedIndex(601));
+                    try std.testing.expect(!try state.applyOutcomeReady(scope_token));
+                    try apply(state, entry);
+                    const scope_outcome = state.takeRegisteredApplyOutcome(scope_token).?;
+                    try std.testing.expectEqual(RaftTableApplyStateMachine.ExpectedApplyFailure.SourcePendingWork, scope_outcome.failed);
+                    try std.testing.expectEqual(scope_before, state.test_faults.document_apply_successes);
+                }
+            };
+            try @import("source_scope_apply_native_test.zig").run(a, &sm, &projection, control.storage_owner, routed, ScopeHarness);
+            try @import("source_retirement_apply_native_test.zig").run(a, &sm, &projection, &owner, control.storage_owner, routed, ScopeHarness);
+            try @import("source_producer_closure_apply_native_test.zig").run(a, &sm, &projection, &owner, control.storage_owner, routed, ScopeHarness);
+            try @import("source_legacy_terminal_apply_native_test.zig").run(a, &sm, &projection, &owner, control.storage_owner, routed, ScopeHarness);
+        }
+
+        test "data raft ordered history waits for native receipts and preserves rejection outcomes" {
+            if (comptime !linked_storage) return error.SkipZigTest;
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/history-native-apply", .{tmp.sub_path});
+            defer a.free(root);
+            const projection_root = try std.fmt.allocPrint(a, "{s}/projection", .{root});
+            defer a.free(projection_root);
+            const native_root = try std.fmt.allocPrint(a, "{s}/native", .{root});
+            defer a.free(native_root);
+            var projection = try DataRaftApplyStore.init(a, .{ .root_dir = projection_root, .native_source_delegate = true });
+            defer projection.deinit();
+            var owner = antfly.public_api.ProvisionedKernelOwnerSource.init(a, native_root, antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier());
+            defer owner.deinit();
+            var sm = try RaftTableApplyStateMachine.init(a, native_root, antfly.public_api.table_catalog.emptyCatalogSource(), null);
+            defer sm.deinit();
+            sm.attachKernelOwnerSource(&owner);
+            sm.topology_apply_store = &projection;
+            const history = @import("history_control_entry.zig");
+            const contract = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+            var namespace: [24]u8 = undefined;
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 11, .big);
+            std.mem.writeInt(u64, namespace[16..24], 13, .big);
+            const grant: contract.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
+            var control: history.Entry = .{ .table = "docs", .storage_owner = .{ .lsm_root_generation = 0, .identity = .{ .table_id = 7, .shard_id = 11, .range_id = 13 }, .schema_json = "{}", .indexes_json = "{}" }, .history_control = .{ .command = .{ .enroll = grant } } };
+            const enrollment = try history.encode(a, control, history.required_protocol_version);
+            defer a.free(enrollment);
+            const pending_entry: raft_engine.core.Entry = .{ .term = 1, .index = 2, .entry_type = .normal, .data = enrollment };
+            try std.testing.expectError(error.UnsupportedBatchProtocolVersion, sm.stateMachine().applyReady(601, null, &.{pending_entry}, &.{}));
+            try std.testing.expectEqual(@as(u64, 0), sm.appliedIndex(601));
+            sm.retry_apply_checkpoints.clearRetainingCapacity();
+            const Apply = struct {
+                fn projectionFirst(store: *DataRaftApplyStore, entry: raft_engine.core.Entry) !void {
+                    const bytes = try antfly.raft.state_machine.encodeCommittedEntries(std.testing.allocator, &.{entry});
+                    defer std.testing.allocator.free(bytes);
+                    try store.applyBatch(601, entry.index, bytes);
+                }
+            };
+            const barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", history.required_protocol_version);
+            defer a.free(barrier);
+            const barrier_entry: raft_engine.core.Entry = .{ .term = 1, .index = 1, .entry_type = .normal, .data = barrier };
+            try Apply.projectionFirst(&projection, barrier_entry);
+            try sm.stateMachine().applyReady(601, null, &.{barrier_entry}, &.{});
+            try Apply.projectionFirst(&projection, pending_entry);
+            const token = try sm.registerApplyOutcomeToken(601, 2, 1);
+            defer sm.cancelRegisteredApplyOutcome(token);
+            sm.test_faults.history_reply_lost_once_at_index = 2;
+            try std.testing.expectError(error.RaftApplyWriterUnavailable, sm.stateMachine().applyReady(601, null, &.{pending_entry}, &.{}));
+            try std.testing.expectEqual(@as(u64, 1), sm.appliedIndex(601));
+            try std.testing.expect(!try sm.applyOutcomeReady(token));
+            const durable = try owner.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 601, "docs", control.storage_owner, control.history_control.command, 1, 2);
+            try std.testing.expectEqual(@as(u64, 1), durable.applied.consumer.?.epoch);
+            try sm.stateMachine().applyReady(601, null, &.{pending_entry}, &.{});
+            try std.testing.expectEqual(@as(u64, 2), sm.appliedIndex(601));
+            try std.testing.expect(try sm.applyOutcomeReady(token));
+            try std.testing.expectEqual(.succeeded, sm.takeRegisteredApplyOutcome(token).?);
+            const ref: contract.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = 1, .grant = grant.sequence, .definition = grant.definition };
+            control.history_control.command = .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 100 } };
+            const rejected = try history.encode(a, control, history.required_protocol_version);
+            defer a.free(rejected);
+            const rejected_entry: raft_engine.core.Entry = .{ .term = 1, .index = 3, .entry_type = .normal, .data = rejected };
+            try Apply.projectionFirst(&projection, rejected_entry);
+            const rejected_token = try sm.registerApplyOutcomeToken(601, 3, 1);
+            defer sm.cancelRegisteredApplyOutcome(rejected_token);
+            try sm.stateMachine().applyReady(601, null, &.{rejected_entry}, &.{});
+            try std.testing.expectEqual(@as(u64, 3), sm.appliedIndex(601));
+            try std.testing.expectEqual(RaftTableApplyStateMachine.ExpectedApplyFailure.HistoryCheckpointConflict, sm.takeRegisteredApplyOutcome(rejected_token).?.failed);
+            // A deterministic rejection completes its log entry without
+            // poisoning the consumer or blocking the next valid command.
+            control.history_control.command = .{ .inspect = ref };
+            const inspection = try history.encode(a, control, history.required_protocol_version);
+            defer a.free(inspection);
+            const inspection_entry: raft_engine.core.Entry = .{ .term = 1, .index = 4, .entry_type = .normal, .data = inspection };
+            try Apply.projectionFirst(&projection, inspection_entry);
+            const inspection_token = try sm.registerApplyOutcomeToken(601, 4, 1);
+            defer sm.cancelRegisteredApplyOutcome(inspection_token);
+            try sm.stateMachine().applyReady(601, null, &.{inspection_entry}, &.{});
+            try std.testing.expectEqual(@as(u64, 4), sm.appliedIndex(601));
+            try std.testing.expectEqual(.succeeded, sm.takeRegisteredApplyOutcome(inspection_token).?);
+            const inspected = try owner.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 601, "docs", control.storage_owner, control.history_control.command, 1, 4);
+            try std.testing.expectEqual(@as(u64, 1), inspected.applied.consumer.?.epoch);
+        }
+
         test "time series document revision protocol dominates older envelope features" {
             const p = @import("../common/data_raft_protocol.zig");
             var req: antfly.db.types.BatchRequest = .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "row", .value = "{}" }} };
-            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req));
             req.document_version_scheme = .legacy;
-            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+            try std.testing.expect(try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req) < p.batch_document_revisions_protocol_version);
             // A copy can carry only a floor, with no signed TTL source or
             // current-write marker. It still requires every applying replica
             // to understand the versioned envelope before proposal.
             req.merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
             req.merge_page = .{ .source = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .pin_digest = @splat(7), .applied_index = 1 }, .sequence = 1, .phase = .rows, .next = "row", .exhausted = true, .digest = @splat(0), .timestamps = &.{1}, .document_version_floor = 1 };
             req.merge_page.?.digest = @import("antfly_local_sources").storage_db_merge_page_contract.commandDigest(req);
-            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req));
             req.merge_page.?.document_version_floor = 0;
             req.merge_page.?.digest = @import("antfly_local_sources").storage_db_merge_page_contract.commandDigest(req);
-            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+            try std.testing.expect(try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req) < p.batch_document_revisions_protocol_version);
             req = .{ .restore_staging = .{ .import_page = .{
                 .expected = @splat(1),
                 .next = "progress",
@@ -34993,9 +36916,9 @@ fn consumerTests() type {
                 .document_timestamps = .{ .version_floor = 0 },
             } } };
             // Even an empty source must explicitly preserve timestamp absence.
-            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req));
             req.restore_staging.?.import_page.document_timestamps = null;
-            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+            try std.testing.expect(try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req) < p.batch_document_revisions_protocol_version);
         }
 
         test "time series optional revision upgrade preserves a mixed group's mandatory protocol floor" {
@@ -37997,33 +39920,33 @@ fn consumerTests() type {
             defer alloc.free(retirement);
             try std.testing.expectEqual(
                 @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = retirement, .value = "1" }} }),
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .merge_artifacts = &.{.{ .key = retirement, .value = "1" }} }),
             );
             const row_protocol = @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"one\"}]}}}" }} }));
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }} }));
-            try std.testing.expectEqual(row_protocol, DataServer.requiredRaftBatchProtocolVersion(.{ .predicates = &.{.{ .key = "row", .expected_version = 0, .unique_absence = true }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"one\"}]}}}" }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }} }));
+            try std.testing.expectEqual(row_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .predicates = &.{.{ .key = "row", .expected_version = 0, .unique_absence = true }} }));
             try std.testing.expectEqual(
                 data_raft_batch.merge_artifacts_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = "artifact", .value = "payload" }} }),
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .merge_artifacts = &.{.{ .key = "artifact", .value = "payload" }} }),
             );
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_endpoint_cleanup = true }));
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .transaction = .{ .resolve = .{ .txn_id = @splat(0), .status = .committed, .commit_version = 1 } } }));
-            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(.{ .transaction = .{ .prepare = .{ .txn_id = @splat(0), .topology_epoch = 1 } } }) < data_raft_batch.merge_retirements_protocol_version);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "a", .value = "{\"links\":[\"hub\"]}" }}, .transaction = .{ .prepare = .{ .txn_id = @splat(0), .topology_epoch = 1 } } }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .graph_endpoint_cleanup = true }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .transaction = .{ .resolve = .{ .txn_id = @splat(0), .status = .committed, .commit_version = 1 } } }));
+            try std.testing.expect(try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(0), .topology_epoch = 1 } } }) < data_raft_batch.merge_retirements_protocol_version);
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .writes = &.{.{ .key = "a", .value = "{\"links\":[\"hub\"]}" }}, .transaction = .{ .prepare = .{ .txn_id = @splat(0), .topology_epoch = 1 } } }));
             // A pending-target write is a deterministic rejection. It must
             // advance the committed entry so the next cleanup page can apply.
             try std.testing.expectEqual(error.IntegrityTopologyBusy, RaftTableApplyStateMachine.ExpectedApplyFailure.forRequest(error.IntegrityTopologyBusy, .{ .graph_writes = &.{.{ .index_name = "g", .source = "new", .target = "hub", .edge_type = "R" }} }).?.toError());
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .deletes = &.{"b"} }));
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} }));
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one" }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .deletes = &.{"b"} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one" }} }));
             const relationship = try antfly.internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "fact", "g", "R", "b", "a", "one");
             defer alloc.free(relationship);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = relationship, .value = "payload" }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .merge_artifacts = &.{.{ .key = relationship, .value = "payload" }} }));
 
             try std.testing.expectEqual(
                 data_raft_batch.timestamp_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{}),
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{}),
             );
             try std.testing.expect(!batchRequiresDocumentDbApply(.{
                 .split_transition = .{
@@ -38064,7 +39987,7 @@ fn consumerTests() type {
             }));
             try std.testing.expectEqual(
                 data_raft_batch.merge_transition_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{
                     .merge_source_transition = .{
                         .kind = .finalize,
                         .transition_id = 7001,
@@ -38074,7 +39997,7 @@ fn consumerTests() type {
             );
             try std.testing.expectEqual(
                 data_raft_batch.split_delta_predecessor_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{
                     .split_replication = .{
                         .transition_id = 7001,
                         .attempt_epoch = 1,
@@ -38093,7 +40016,7 @@ fn consumerTests() type {
             );
             try std.testing.expectEqual(
                 data_raft_batch.merge_copy_attempt_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{
                     .merge_checkpoint = .{
                         .kind = .accept,
                         .transition_id = 7001,
@@ -42781,7 +44704,7 @@ fn consumerTests() type {
             const value = try codec.encodeProducedDenseEmbeddingAlloc(a, 7, true, &.{ 1, 2 });
             defer a.free(value);
             const request: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "v", .value = value }} };
-            const required = DataServer.requiredRaftBatchProtocolVersion(request);
+            const required = try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request);
             try std.testing.expectEqual(@as(u16, 29), required);
             var activated = DataRaftProtocolActivationEntry{};
             activated.protocol_version.store(28, .release);
@@ -42865,7 +44788,7 @@ fn consumerTests() type {
             const revisions = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
             const cleanup = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
             try std.testing.expect(cleanup > revisions);
-            try std.testing.expectEqual(cleanup, DataServer.requiredRaftBatchProtocolVersion(request));
+            try std.testing.expectEqual(cleanup, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
             // A group already activated at v27 is still unsafe: neither a
             // durable old barrier nor a same-term pending one admits cleanup.
             var activation: DataRaftProtocolActivationEntry = .{};
@@ -42899,6 +44822,1838 @@ fn consumerTests() type {
                 var invalid = proposal;
                 invalid.writes = &.{.{ .key = "ordinary", .value = "{}" }};
                 try std.testing.expectError(error.InvalidBatchRequest, antfly.db.types.validateGraphEndpointCleanupCommand(invalid));
+            }
+        }
+
+        test "data raft ordered history completion HTTP treats malformed mutation replies as unknown" {
+            const mod = @import("../api/completion_participant.zig");
+            const http = antfly.common.http;
+            const a = std.testing.allocator;
+            const Fake = struct {
+                const Mode = enum { valid, wrong_counts, malformed, duplicate, missing_ack, wrong_content_type, outcome_header, oversized, lost, source_conflict, source_unknown, source_empty };
+                mode: Mode = .valid,
+                calls: usize = 0,
+                fn realtimeNs(_: *anyopaque) i128 {
+                    return 42 * std.time.ns_per_s;
+                }
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/docs%2Fa%3F/batch-routed-v1"));
+                    try internal_service_auth.verifyToken(alloc, request.header(internal_service_auth.header_name).?, .{ .secret = "completion-response-contract-secret-long-enough", .issuer = "history-test" }, 42);
+                    try std.testing.expect(request.header(antfly.metadata_api.catalog_route_fence_header) != null);
+                    try std.testing.expect(request.cancellation != null);
+                    try std.testing.expect(request.timeout_ms.? > 0 and request.timeout_ms.? <= 1000);
+                    if (request.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
+                    if (self.mode == .lost) return error.ConnectionResetByPeer;
+                    var response: http.HttpResponse = .{ .status = if (self.mode == .source_conflict or self.mode == .source_unknown or self.mode == .source_empty) 409 else 201 };
+                    errdefer response.deinit(alloc);
+                    response.content_type = try alloc.dupe(u8, if (self.mode == .wrong_content_type) "text/plain" else "application/json");
+                    response.body = if (self.mode == .oversized) try alloc.alloc(u8, 4097) else try alloc.dupe(u8, switch (self.mode) {
+                        .source_conflict, .source_unknown, .source_empty => "SourcePayloadConflict",
+                        .malformed => "{",
+                        .duplicate => "{\"inserted\":0,\"inserted\":0,\"deleted\":0,\"transformed\":0}",
+                        .wrong_counts => "{\"inserted\":1,\"deleted\":0,\"transformed\":0}",
+                        else => "{\"inserted\":0,\"deleted\":0,\"transformed\":0}",
+                    });
+                    if (self.mode == .oversized) @memset(response.body, 'x');
+                    response.headers = try alloc.alloc(http.Header, if (self.mode == .missing_ack) 0 else if (self.mode == .outcome_header or self.mode == .source_unknown or self.mode == .source_empty) 2 else 1);
+                    @memset(response.headers, .{ .name = &.{}, .value = &.{} });
+                    if (response.headers.len > 0) {
+                        response.headers[0].name = try alloc.dupe(u8, antfly.metadata_api.catalog_route_fence_ack_header);
+                        response.headers[0].value = try alloc.dupe(u8, antfly.metadata_api.catalog_route_fence_ack_value);
+                    }
+                    if (self.mode == .outcome_header or self.mode == .source_unknown or self.mode == .source_empty) {
+                        response.headers[1].name = try alloc.dupe(u8, antfly.public_api.internal_batch_forwarding.outcome_header);
+                        response.headers[1].value = try alloc.dupe(u8, if (self.mode == .source_empty) "" else antfly.public_api.internal_batch_forwarding.outcome_unknown_v1);
+                    }
+                    return response;
+                }
+            };
+            var fake: Fake = .{};
+            var client = antfly.public_api.ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute }, .realtime_ns_fn = Fake.realtimeNs });
+            _ = client.withInternalServiceAuth("completion-response-contract-secret-long-enough", "history-test");
+            var adapter: mod.HttpWriter = .{ .client = &client, .base_uri = "http://node.invalid" };
+            const fence: antfly.metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .catalog_revision = 9, .table_id = 7, .topology_epoch = 4, .route = .{ .group_id = 601, .range_id = 601, .identity_namespace = .{ .table_id = 7, .shard_id = 601, .range_id = 601 } } };
+            const forwarding: antfly.public_api.internal_batch_forwarding.Context = .{ .remaining_ms = 1000, .forwards_remaining = 0, .campaign_allowed = false };
+            _ = try adapter.writer().write(a, .{ .catalog = fence }, 601, "docs/a?", .{}, forwarding, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s });
+            for ([_]Fake.Mode{ .wrong_counts, .malformed, .duplicate, .missing_ack, .wrong_content_type, .outcome_header, .oversized, .lost, .source_unknown, .source_empty }) |mode| {
+                fake.mode = mode;
+                const before = fake.calls;
+                if (adapter.writer().write(a, .{ .catalog = fence }, 601, "docs/a?", .{}, forwarding, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s })) |_| return error.TestExpectedError else |err| switch (err) {
+                    error.RaftBatchWriteOutcomeUnknown, error.RaftBatchWriteTransportOutcomeUnknown => {},
+                    else => return err,
+                }
+                try std.testing.expectEqual(before + 1, fake.calls);
+            }
+            fake.mode = .source_conflict;
+            const before_conflict = fake.calls;
+            try std.testing.expectError(error.SourcePayloadConflict, adapter.writer().write(a, .{ .catalog = fence }, 601, "docs/a?", .{}, forwarding, .{}));
+            try std.testing.expectEqual(before_conflict + 1, fake.calls);
+        }
+
+        test "data raft ordered history completion participant preserves command scopes and never retries mutations" {
+            const participant_mod = @import("../api/completion_participant.zig");
+            const completion = @import("../api/completion_plan.zig");
+            const a = std.testing.allocator;
+            var namespace: [24]u8 = undefined;
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 601, .big);
+            std.mem.writeInt(u64, namespace[16..24], 601, .big);
+            const binding: completion.completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = 3, .group_id = 601, .topology_epoch = 4 };
+            var frozen = try completion.Plan.freeze(a, @splat(5), @splat(6), binding, &.{.{ .owner = binding, .locator = "table2:00000004:docs:601", .roles = completion.completion.Roles.guards, .prepare = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = @splat(5), .topology_epoch = 4, .completion_owner = binding } } } }}, 1001);
+            defer frozen.deinit();
+            const fence: antfly.metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = binding.metadata_incarnation, .catalog_revision = 9, .table_id = 7, .topology_epoch = 4, .route = .{ .group_id = 601, .range_id = 601, .identity_namespace = .{ .table_id = 7, .shard_id = 601, .range_id = 601 } } };
+            const Fake = struct {
+                calls: usize = 0,
+                fail: bool = false,
+                expected_sync: ?antfly.db.types.SyncLevel = null,
+                visibility_error: ?anyerror = null,
+                cancel_after: ?*std.atomic.Value(bool) = null,
+                fn write(ptr: *anyopaque, _: std.mem.Allocator, authority: antfly.public_api.internal_group_operations.RoutedBatchAuthority, group: u64, table: []const u8, req: antfly.db.types.BatchRequest, forwarding: antfly.public_api.internal_batch_forwarding.Context, context: antfly.public_api.operation.RequestContext) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try context.ensureActive();
+                    try std.testing.expectEqual(@as(u64, 601), group);
+                    try std.testing.expectEqualStrings("docs", table);
+                    try std.testing.expect(authority == .catalog);
+                    try std.testing.expect(forwarding.remaining_ms > 0 and forwarding.remaining_ms <= 5000);
+                    try std.testing.expect(!forwarding.campaign_allowed);
+                    try std.testing.expectEqual(context.deadline_ns, authority.catalog.admission_deadline_ns);
+                    if (req.transaction.? == .prepare) {
+                        try std.testing.expectEqual(@as(u64, 1000), req.timestamp_ns);
+                        try std.testing.expectEqual(@as(u64, 3), req.transaction.?.prepare.completion_owner.?.root_generation);
+                        try std.testing.expectEqual(.revision_v1, req.document_version_scheme);
+                    }
+                    if (self.expected_sync) |level| {
+                        try std.testing.expectEqual(level, req.sync_level);
+                        try std.testing.expect(req.transaction.? == .resolve);
+                        try std.testing.expectEqual(.committed, req.transaction.?.resolve.status);
+                        try std.testing.expectEqual(@as(u64, 1002), req.transaction.?.resolve.commit_version);
+                        try std.testing.expectEqual(@as(usize, 0), req.writes.len);
+                        try std.testing.expectEqual(@as(usize, 0), req.transforms.len);
+                        if (self.visibility_error) |err| return err;
+                    }
+                    if (self.fail) return error.RaftBatchWriteOutcomeUnknown;
+                    if (self.cancel_after) |value| value.store(true, .release);
+                    return {};
+                }
+            };
+            var fake: Fake = .{};
+            const port: participant_mod.Port = .{ .writer = .{ .ptr = &fake, .write_fn = Fake.write } };
+            try port.submit(a, &frozen, 0, fence, .begin, .{});
+            try port.submit(a, &frozen, 0, fence, .prepare, .{});
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            var wrong = fence;
+            wrong.topology_epoch += 1;
+            try std.testing.expectError(error.TopologyChanged, port.submit(a, &frozen, 0, wrong, .begin, .{}));
+            try std.testing.expectError(error.InvalidTxnRecord, port.submit(a, &frozen, 0, fence, .{ .resolve = .{ .status = .pending, .commit_version = 1002 } }, .{}));
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            fake.fail = true;
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, port.submit(a, &frozen, 0, fence, .prepare, .{}));
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+            fake.fail = false;
+            var cancelled = std.atomic.Value(bool).init(true);
+            var scoped = fence;
+            scoped.admission_cancellation = antfly.db.types.CancellationToken.fromAtomic(&cancelled);
+            try std.testing.expectError(error.Canceled, port.submit(a, &frozen, 0, scoped, .begin, .{}));
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+            cancelled.store(false, .release);
+            fake.cancel_after = &cancelled;
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, port.submit(a, &frozen, 0, scoped, .begin, .{}));
+            try std.testing.expectEqual(@as(usize, 4), fake.calls);
+            fake.cancel_after = null;
+            cancelled.store(false, .release);
+            const decisions = @import("../api/history_decision_operations.zig").wire;
+            const lookup: decisions.Query = .{ .owner = binding, .transaction_id = frozen.admission.transaction_id, .minimum_applied_index = 1 };
+            var observation: decisions.Reply = .{ .request_digest = lookup.digest(), .cut = .{ .term = 1, .index = 2 }, .decision = .{
+                .record = .{ .status = .committed, .begin_timestamp = 1000, .created_at_ns = 1001, .commit_version = 1002, .finalized_at_ns = 1002, .prepared = true, .intents_resolved = true, .digest = @splat(7) },
+                .admission = .{ .admission = frozen.admission, .digest = frozen.admission.digest() },
+            } };
+            for ([_]antfly.db.types.SyncLevel{ .full_text, .enrichments, .full_index }) |level| {
+                fake.expected_sync = level;
+                try port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = level }, .{});
+            }
+            fake.expected_sync = .full_index;
+            fake.visibility_error = error.EnrichmentWorkerFailed;
+            try std.testing.expectError(error.EnrichmentWorkerFailed, port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = .full_index }, .{}));
+            fake.visibility_error = error.EnrichmentRetryInProgress;
+            try std.testing.expectError(error.EnrichmentRetryInProgress, port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = .full_index }, .{}));
+            const visibility_calls = fake.calls;
+            try std.testing.expectError(error.InvalidBatchRequest, port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = .write }, .{}));
+            try std.testing.expectError(error.TopologyChanged, port.submitRetained(a, lookup, observation, 0, wrong, .{ .visibility = .full_index }, .{}));
+            observation.decision.?.record.status = .pending;
+            observation.decision.?.record.commit_version = 0;
+            observation.decision.?.record.finalized_at_ns = 0;
+            observation.decision.?.record.intents_resolved = false;
+            try std.testing.expectError(error.SourceOutcomeUnresolved, port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = .full_index }, .{}));
+            observation.decision.?.record.status = .aborted;
+            observation.decision.?.record.finalized_at_ns = 1002;
+            try std.testing.expectError(error.SourceOutcomeUnresolved, port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = .full_index }, .{}));
+            try std.testing.expectEqual(visibility_calls, fake.calls);
+        }
+
+        test "data raft ordered history frozen plan owns canonical payloads through allocation failures" {
+            const Frozen = @import("../api/completion_plan.zig");
+            const Fixture = struct {
+                fn owner(group: u64) Frozen.completion.RoutedOwner {
+                    var namespace: [24]u8 = undefined;
+                    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+                    std.mem.writeInt(u64, namespace[8..16], group, .big);
+                    std.mem.writeInt(u64, namespace[16..24], group, .big);
+                    return .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = 3, .group_id = group, .topology_epoch = 4 };
+                }
+                fn input(binding: Frozen.completion.RoutedOwner, roles: u8) Frozen.Input {
+                    return .{ .owner = binding, .locator = if (binding.group_id == 601) "table2:00000004:docs:601" else "table2:00000004:docs:602", .roles = roles, .prepare = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = @splat(5), .topology_epoch = binding.topology_epoch, .completion_owner = binding } } } };
+                }
+                fn run(a: std.mem.Allocator) !void {
+                    const row = try a.dupe(u8, "{\"n\":1}");
+                    defer a.free(row);
+                    // Deliberately reverse route enumeration. A guard/checkpoint
+                    // participant remains present even though it emits no rows.
+                    var effect = input(owner(601), Frozen.completion.Roles.effects);
+                    const writes = [_]antfly.db.types.TransactionWrite{.{ .key = "row", .value = row }};
+                    effect.prepare = try (antfly.db.types.TransactionIntentRequest{
+                        .completion_owner = owner(601),
+                        .writes = &writes,
+                        .row_policy_principal_proof = "signed-principal",
+                        .row_policy_database = "database",
+                        .row_policy_admitted_at_seconds = 123,
+                        .normalized_graph_rows = true,
+                        .schema_version = 4,
+                        .relational_schema_version = 5,
+                        .relational_integrity_generation_set = @splat(7),
+                    }).completionBatch(@splat(5), 1000, 4);
+                    var plan = try Frozen.Plan.freeze(a, @splat(5), @splat(6), owner(602), &.{ input(owner(602), Frozen.completion.Roles.guards | Frozen.completion.Roles.checkpoint), effect }, 1001);
+                    var plan_live = true;
+                    defer if (plan_live) plan.deinit();
+                    try std.testing.expectEqual(@as(u64, 601), plan.participants[0].owner.group_id);
+                    try std.testing.expectEqual(@as(u64, 602), plan.participants[1].owner.group_id);
+                    row[5] = '9';
+                    var retry = try plan.prepare(a, 0);
+                    defer retry.deinit(a);
+                    try std.testing.expectEqualStrings("{\"n\":1}", retry.req.writes[0].value);
+                    try std.testing.expectEqualStrings("signed-principal", retry.req.row_policy_principal_proof);
+                    try std.testing.expectEqualStrings("database", retry.req.row_policy_database);
+                    try std.testing.expectEqual(@as(i64, 123), retry.req.row_policy_admitted_at_seconds);
+                    try std.testing.expect(retry.req.normalized_graph_rows);
+                    try std.testing.expectEqual(@as(?u32, 4), retry.req.schema_version);
+                    try std.testing.expectEqual(@as(?u32, 5), retry.req.relational_schema_version);
+                    try std.testing.expectEqualDeep(@as(?[32]u8, @splat(7)), retry.req.relational_integrity_generation_set);
+                    const encoded = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(a, retry.req);
+                    defer a.free(encoded);
+                    try plan.admission.requirePreparedInput(owner(601).namespace, encoded);
+                    const begin = try plan.begin(1);
+                    try std.testing.expectEqual(@as(usize, 2), begin.transaction.?.begin.participants.len);
+                    try std.testing.expectEqualStrings("table2:00000004:docs:602", begin.transaction.?.begin.participants[0]);
+                    try std.testing.expectEqual(@as(u64, 1001), begin.transaction.?.begin.created_at_ns);
+                    const begin_bytes = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(a, begin);
+                    defer a.free(begin_bytes);
+                    try std.testing.expectEqualDeep(owner(602), begin.transaction.?.begin.completion_owner.?);
+                    try std.testing.expectEqual(@as(u64, 1000), begin.transaction.?.begin.begin_timestamp);
+                    var no_effect = try plan.prepare(a, 1);
+                    defer no_effect.deinit(a);
+                    try std.testing.expectEqual(@as(usize, 0), no_effect.req.writes.len);
+                    plan.deinit();
+                    plan_live = false;
+                    // Decoded retries own every slice independently of the plan.
+                    try std.testing.expectEqualStrings("row", retry.req.writes[0].key);
+                    try std.testing.expectEqualStrings("{\"n\":1}", retry.req.writes[0].value);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+            const a = std.testing.allocator;
+            const good = Fixture.input(Fixture.owner(601), Frozen.completion.Roles.effects);
+            var derived = try Frozen.Plan.freezeDerived(a, @splat(5), Fixture.owner(601), &.{ good, Fixture.input(Fixture.owner(602), Frozen.completion.Roles.guards) }, 1001);
+            defer derived.deinit();
+            var reordered = try Frozen.Plan.freezeDerived(a, @splat(5), Fixture.owner(601), &.{ Fixture.input(Fixture.owner(602), Frozen.completion.Roles.guards), good }, 9000);
+            defer reordered.deinit();
+            try std.testing.expectEqualDeep(derived.admission.digest(), reordered.admission.digest());
+            try std.testing.expectError(error.InvalidBatchRequest, (antfly.db.types.TransactionIntentRequest{}).completionBatch(@splat(5), 1000, 4));
+            try std.testing.expectError(error.UnsupportedOperation, (antfly.db.types.TransactionIntentRequest{ .completion_owner = Fixture.owner(601), .restore_staging_scope = @splat(9) }).completionBatch(@splat(5), 1000, 4));
+            try std.testing.expectError(error.InvalidBatchRequest, (antfly.db.types.TransactionIntentRequest{ .completion_owner = Fixture.owner(601), .completion_input_digest = @splat(9) }).completionBatch(@splat(5), 1000, 4));
+
+            try std.testing.expectError(error.InvalidParticipant, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{ good, good }, 1001));
+            var wrong = good;
+            wrong.prepare.transaction.?.prepare.completion_owner.?.root_generation += 1;
+            try std.testing.expectError(error.TopologyChanged, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
+            wrong = good;
+            wrong.locator = "table2:00000004:docs:602";
+            try std.testing.expectError(error.InvalidParticipant, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
+            wrong = good;
+            wrong.prepare.timestamp_ns = 0;
+            try std.testing.expectError(error.InvalidBatchRequest, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
+            wrong = good;
+            wrong.prepare.document_version_scheme = .legacy;
+            try std.testing.expectError(error.InvalidBatchRequest, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
+            wrong = good;
+            wrong.prepare.sync_level = .propose;
+            try std.testing.expectError(error.InvalidBatchRequest, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
+        }
+
+        test "data raft ordered history local submission confirms through real Raft and ReadIndex" {
+            if (comptime !linked_storage) return error.SkipZigTest;
+            const a = std.testing.allocator;
+            var producer_closure_owner: ?@import("antfly_local_sources").storage_transaction_completion.RoutedOwner = null;
+            const Catalog = struct {
+                fn snapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return .{ .status = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .metrics = .{} }, .tables = @constCast(&[_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" }}), .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{ .group_id = 601, .table_id = 7, .range_id = 601, .start_key = "", .end_key = null }}), .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+                }
+                fn free(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn routingSnapshot(ptr: *anyopaque, deadline: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+                    const result = try antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot(ptr, deadline);
+                    for (result.tables) |*table| table.routing_storage_binding = @import("antfly_local_sources").common_topology_records.tableStorageBinding(table.*);
+                    return result;
+                }
+                fn tableSnapshot(ptr: *anyopaque, _: []const u8, deadline: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+                    return routingSnapshot(ptr, deadline);
+                }
+                fn iface(ptr: *anyopaque) antfly.public_api.table_catalog.CatalogSource {
+                    const Adapter = antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free);
+                    return .{ .ptr = ptr, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = routingSnapshot, .table_routing_snapshot = tableSnapshot, .linearizable_table_routing_snapshot = tableSnapshot, .linearizable_routing_snapshot = routingSnapshot, .free_routing_snapshot = Adapter.freeRoutingSnapshot } };
+                }
+            };
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/history-proposal", .{tmp.sub_path});
+            defer a.free(root);
+            const projection_root = try std.fmt.allocPrint(a, "{s}/projection", .{root});
+            defer a.free(projection_root);
+            var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(a, .{});
+            defer runtime.deinit();
+            var catalog_context: u8 = 0;
+            const catalog = Catalog.iface(&catalog_context);
+            var owner = antfly.public_api.ProvisionedKernelOwnerSource.init(a, root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier());
+            defer owner.deinit();
+            var projection = try DataRaftApplyStore.init(a, .{ .root_dir = projection_root, .native_source_delegate = true });
+            defer projection.deinit();
+            var sm = try RaftTableApplyStateMachine.init(a, root, catalog, runtime.ptr());
+            defer sm.deinit();
+            sm.attachKernelOwnerSource(&owner);
+            sm.topology_apply_store = &projection;
+            const Apply = struct {
+                raw: *DataRaftApplyStore,
+                native: *RaftTableApplyStateMachine,
+                fn apply(ptr: *anyopaque, group: u64, snapshot: ?raft_engine.core.types.Snapshot, entries: []const raft_engine.core.Entry, reads: []const raft_engine.core.types.ReadState) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (entries.len != 0) {
+                        const encoded = try antfly.raft.state_machine.encodeCommittedEntries(std.testing.allocator, entries);
+                        defer std.testing.allocator.free(encoded);
+                        try self.raw.applyBatch(group, entries[entries.len - 1].index, encoded);
+                    }
+                    try self.native.stateMachine().applyReady(group, snapshot, entries, reads);
+                }
+                fn retry(ptr: *anyopaque, group: u64, err: anyerror) bool {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    return RaftTableApplyStateMachine.isApplyRetryable(self.native, group, err);
+                }
+            };
+            var apply: Apply = .{ .raw = &projection, .native = &sm };
+            var log = raft_engine.core.MemoryStorage.init(a);
+            defer log.deinit();
+            var host = antfly.raft.host.Host.init(a, .{ .local_node_id = 1 }, .{ .io = std.testing.io, .runtime_hooks = .{ .state_machine = .{ .ptr = &apply, .vtable = &.{ .apply_ready = Apply.apply, .is_apply_retryable = Apply.retry } } } });
+            defer host.deinit();
+            _ = try host.runtime_host.ensureReplica(.{ .group = .{ .group_id = 601, .local_node_id = 1, .raft_config = .{ .id = 1, .group_id = 601, .peers = &.{1}, .election_tick = 5, .heartbeat_tick = 1, .pre_vote = false }, .storage = log.storage() }, .bootstrap = .empty });
+            try host.campaignGroup(601);
+            _ = try host.runProgressRoundBounded(64, 64);
+            try std.testing.expect(host.isLocalLeader(601));
+            const DiagnosticTransport = struct {
+                fn execute(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    return error.UnexpectedRemoteRaftRequest;
+                }
+            };
+            var transport_context: u8 = 0;
+            var transport_stack = try antfly.raft.transport.HttpTransportStack.init(a, .{
+                .snapshot = .{ .root_dir = root },
+            }, .{ .ptr = &transport_context, .vtable = &.{ .execute = DiagnosticTransport.execute } }, std.testing.io, null);
+            defer transport_stack.deinit();
+            var http: antfly.raft.HttpHost = undefined;
+            http.host = &host;
+            http.transport_stack = &transport_stack;
+            var managed: antfly.raft.ManagedHttpHostService = undefined;
+            managed.metrics = .{};
+            managed.host.http_host = &http;
+            managed.host.owned_data_store = &projection;
+            managed.host.owned_wal_replica_provider = null;
+            managed.host.owned_file_replica_provider = null;
+            const server = try a.create(DataServer);
+            defer a.destroy(server);
+            server.* = .{ .alloc = a, .data_raft = &managed, .data_raft_apply = &sm, .kernel_owner_source = &owner, .backend_runtime = runtime.ptr(), .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{}, .query_async_limit = .nothing, .listener_cfg = undefined };
+            defer server.provisioned_storage.deinit();
+            defer {
+                var it = server.data_raft_protocol_activations.valueIterator();
+                while (it.next()) |entry| entry.*.release(a);
+                server.data_raft_protocol_activations.deinit(a);
+                server.data_raft_protocol_capabilities.deinit(a);
+            }
+            _ = owner.withReadSafetyBarrier(server.dataReadSafetyBarrier());
+            const Progress = struct {
+                server: *DataServer,
+                host: *antfly.raft.host.Host,
+                stopped: std.atomic.Value(bool) = .init(false),
+                fn run(self: *@This()) !void {
+                    while (!self.stopped.load(.acquire)) {
+                        lockAtomic(&self.server.data_raft_mutex);
+                        _ = self.host.runProgressRoundBounded(64, 64) catch |err| {
+                            self.server.data_raft_mutex.unlock();
+                            return err;
+                        };
+                        self.server.data_raft_mutex.unlock();
+                        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    }
+                }
+            };
+            var progress: Progress = .{ .server = server, .host = &host };
+            var worker = try std.testing.io.concurrent(Progress.run, .{&progress});
+            defer {
+                progress.stopped.store(true, .release);
+                worker.await(std.testing.io) catch {};
+            }
+            const route = try antfly.public_api.table_catalog.routedGroupIdSnapshotUntil(a, catalog, "docs", 601, null);
+            var namespace: [24]u8 = undefined;
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 601, .big);
+            std.mem.writeInt(u64, namespace[16..24], 601, .big);
+            const control = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+            const grant: control.Grant = .{ .namespace = namespace, .authority = try @import("../api/history_policy_provisioning.zig").authority(route.fence().?), .consumer = @splat(2), .definition = @splat(3), .sequence = 1, .expires_at_seconds = 1000, .policy_revision = 1 };
+            var unknown_group = route.fence().?;
+            unknown_group.route.group_id = 602;
+            try std.testing.expectError(error.GroupLeaderUnavailable, server.submitHistoryControlLocal(a, unknown_group, "docs", .{ .enroll = grant }));
+            try std.testing.expectEqual(@as(usize, 0), server.data_raft_protocol_activations.count());
+            const submitted = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .enroll = grant });
+            try std.testing.expect(submitted.outcome != null);
+            try std.testing.expectEqual(@as(u64, 1), submitted.outcome.?.applied.consumer.?.epoch);
+            try std.testing.expect(submitted.entry.index > 1);
+            try std.testing.expectEqual(@import("history_control_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            const ref: control.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = 1, .grant = 1, .definition = grant.definition };
+            for ([_][]const u8{ "{\"v\":1}", "{\"v\":2}" }) |value| {
+                var descriptor = try owner.loadDescriptorWithContext(a, 601, "docs", .{});
+                defer descriptor.deinit(a);
+                const encoded = try data_raft_batch.encodeWithStorageOwnerDescriptor(a, "docs", .{ .writes = &.{.{ .key = "one", .value = value }} }, descriptor.view());
+                defer a.free(encoded);
+                var accepted: ?u64 = null;
+                {
+                    try server.lockHistoryRaftOwner(.{ .deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s });
+                    defer server.data_raft_mutex.unlock();
+                    try managed.host.http_host.proposeWithReceipt(601, encoded, &accepted);
+                }
+                const deadline = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+                while (sm.appliedIndex(601) < accepted.?) {
+                    if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
+            }
+            const ingress = @import("../api/history_control_operations.zig");
+            const encoded_fence = try std.json.Stringify.valueAlloc(a, route.fence().?, .{});
+            defer a.free(encoded_fence);
+            const ingress_request: ingress.wire.Request = .{ .version = 1, .operation = .recover, .command = .{ .enroll = grant }, .receipt = submitted.entry };
+            const ingress_body = try std.json.Stringify.valueAlloc(a, ingress_request, .{});
+            defer a.free(ingress_body);
+            const ingress_result = try ingress.execute(server.historyControlPort(), a, 601, "docs", ingress_body, .{ .catalog_route_fence_json = encoded_fence });
+            try std.testing.expect(ingress_result.confirmed());
+            try std.testing.expectEqualDeep(submitted.entry, ingress_result.receipt.?);
+            try std.testing.expectEqual(@as(u64, 1), ingress_result.outcome.?.applied.consumer.?.epoch);
+            // A second caller owns no replica. Route its original receipt over
+            // signed HTTP to this actual native Raft leader, without appending.
+            {
+                const secret = "history-routed-runtime-secret-long-enough";
+                const Status = struct {
+                    fn read(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                        return .{ .metadata_group_id = 1, .metrics = .{} };
+                    }
+                    fn listen(listener: *httpx.Server) void {
+                        listener.listen() catch |err| std.debug.panic("history test listener failed: {}", .{err});
+                    }
+                    fn noFetch(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                        return error.UnexpectedHistoryPeerRefresh;
+                    }
+                };
+                const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
+                defer a.destroy(api_server);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_source_plan_control = .{ .ptr = server, .execute_fn = DataServer.sourcePlanControlOperation }, .native_source_plan_observe = .{ .ptr = server, .read_fn = DataServer.sourcePlanObserveOperation }, .native_source_scope_control = .{ .ptr = server, .execute_fn = DataServer.sourceScopeControlOperation }, .native_source_retirement_control = .{ .ptr = server, .execute_fn = DataServer.sourceRetirementControlOperation }, .native_source_scope_observe = .{ .ptr = server, .read_fn = DataServer.sourceScopeObserveOperation }, .native_source_producer_closure_observe = .{ .ptr = server, .read_fn = DataServer.sourceProducerClosureObserveOperation }, .native_source_producer_control = .{ .ptr = server, .execute_fn = DataServer.sourceProducerControlOperation }, .native_legacy_terminal = .{ .ptr = server, .execute_fn = DataServer.legacyTerminalOperation }, .native_legacy_inventory = .{ .ptr = server, .read_fn = DataServer.legacyInventoryOperation }, .native_source_checkpoint_observe = .{ .ptr = server, .read_fn = DataServer.sourceCheckpointObserveOperation }, .native_source_plan_chunk = .{ .ptr = server, .read_fn = DataServer.sourcePlanChunkOperation }, .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_bootstrap_page = .{ .ptr = server, .read_fn = DataServer.historyBootstrapPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                defer api_server.deinit();
+                var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
+                defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
+                try handler.initRuntime(a);
+                var network_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                defer network_io.deinit();
+                var listener = httpx.Server.initWithConfig(a, network_io.io(), .{ .host = "127.0.0.1", .port = 0 });
+                defer listener.deinit();
+                try handler.registerRoutes(&listener);
+                try listener.bind();
+                var task = try std.testing.io.concurrent(Status.listen, .{&listener});
+                defer {
+                    listener.stop();
+                    task.await(std.testing.io);
+                }
+                const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{listener.boundAddress().?.ip4.port});
+                defer a.free(base);
+                var metadata_source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.invalid"}, &.{.{ .ptr = server, .vtable = &.{ .execute = Status.noFetch } }}, std.testing.io);
+                defer metadata_source.deinit();
+                const peers = try a.create(ControlReadGeneration);
+                peers.* = .{ .alloc = a };
+                metadata_source.control_read_generation = peers;
+                const endpoint = try a.dupe(u8, base);
+                peers.nodes.put(a, 1, endpoint) catch |err| {
+                    a.free(endpoint);
+                    return err;
+                };
+                try peers.groups.put(a, 601, .{ .leader = 1 });
+                try peers.groups.getPtr(601).?.nodes.append(a, 1);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const origin = try a.create(DataServer);
+                defer a.destroy(origin);
+                origin.* = .{ .alloc = a, .backend_runtime = runtime.ptr(), .remote_metadata = &metadata_source, .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{ .internal_service_secret = secret, .internal_service_issuer = "history-runtime" }, .query_async_limit = .nothing, .listener_cfg = undefined };
+                defer if (origin.distributed_read_http_executor) |executor| {
+                    executor.deinit();
+                    a.destroy(executor);
+                    origin.distributed_read_http_executor = null;
+                };
+                defer origin.provisioned_storage.deinit();
+                const before_remote = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    break :blk host.raftStatus(601).?.last_index;
+                };
+                const remote_result = try ingress.execute(origin.historyControlPort(), a, 601, "docs", ingress_body, .{ .catalog_route_fence_json = encoded_fence });
+                try std.testing.expect(remote_result.confirmed());
+                try std.testing.expectEqualDeep(submitted.entry, remote_result.receipt.?);
+                try std.testing.expectEqual(@as(u64, 1), remote_result.outcome.?.applied.consumer.?.epoch);
+                const after_remote = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    break :blk host.raftStatus(601).?.last_index;
+                };
+                try std.testing.expectEqual(before_remote, after_remote);
+                const page_contract = @import("../api/history_page_operations.zig");
+                const page_input: page_contract.Request = .{ .version = 1, .request = .{ .reference = ref, .after = .{}, .now_seconds = 100 } };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                var first_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
+                defer first_page.deinit();
+                try std.testing.expectEqual(@as(usize, 1), first_page.events.len);
+                try std.testing.expectEqualStrings("{\"v\":1}", first_page.events[0].after.?);
+                try std.testing.expectEqual(@as(u64, 2), first_page.observed_latest);
+                try std.testing.expect(!first_page.caught_up);
+                var next_page_input = page_input;
+                next_page_input.request.after = first_page.next;
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                var second_page = try origin.historyPagePort().read(a, route.fence().?, "docs", next_page_input, .{});
+                defer second_page.deinit();
+                try std.testing.expectEqualStrings("{\"v\":1}", second_page.events[0].before.?);
+                try std.testing.expectEqualStrings("{\"v\":2}", second_page.events[0].after.?);
+                try std.testing.expect(second_page.caught_up);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                var replay_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
+                defer replay_page.deinit();
+                try std.testing.expectEqualDeep(first_page.events, replay_page.events);
+                // Reads do not ACK; the original page remains replayable.
+                var small_page_input = page_input;
+                small_page_input.request.max_bytes = 1;
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                try std.testing.expectError(error.HistoryTooLarge, origin.historyPagePort().read(a, route.fence().?, "docs", small_page_input, .{}));
+                const missing_snapshot: page_contract.Bootstrap.Request = .{ .version = 1, .request = .{ .reference = ref, .digest = @splat(77), .now_seconds = 100 } };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                try std.testing.expectError(error.HistoryResynchronizationRequired, origin.historyBootstrapPagePort().read(a, route.fence().?, "docs", missing_snapshot, .{}));
+                var remote_input: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .inspect = ref } };
+                const submit_body = try std.json.Stringify.valueAlloc(a, remote_input, .{});
+                defer a.free(submit_body);
+                const Loss = struct {
+                    fn reach(_: *anyopaque, event: DataRequestLifecycleEvent) !void {
+                        if (event.phase == .proposal_accepted) return error.InjectedRemoteHistoryConfirmationLoss;
+                    }
+                };
+                const unknown_remote = blk: {
+                    server.data_request_lifecycle_hook = .{ .ptr = server, .reach_fn = Loss.reach };
+                    defer server.data_request_lifecycle_hook = null;
+                    metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                    break :blk try ingress.execute(origin.historyControlPort(), a, 601, "docs", submit_body, .{ .catalog_route_fence_json = encoded_fence });
+                };
+                try std.testing.expect(!unknown_remote.confirmed());
+                try std.testing.expect(unknown_remote.receipt != null);
+                try std.testing.expectEqual(after_remote + 1, unknown_remote.receipt.?.index);
+                const grant_operations = @import("../api/history_grant_operations.zig");
+                const grant_input: grant_operations.Request = .{ .version = 1, .identity = control.GrantIdentity.fromGrant(grant) };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const actual_grant = try origin.historyGrantPort().read(a, route.fence().?, "docs", grant_input, .{});
+                try std.testing.expectEqual(@as(u64, 1), actual_grant.active.consumer.epoch);
+                var absent_grant = grant_input;
+                absent_grant.identity.consumer = @splat(4);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                try std.testing.expectEqual(@as(u64, 0), (try origin.historyGrantPort().read(a, route.fence().?, "docs", absent_grant, .{})).absent);
+                const resolution_operations = @import("../api/history_resolution_operations.zig");
+                const resolution_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = @splat(91), .owner_fence = @splat(92), .manifest_digest = @splat(93), .commit_version = 94, .minimum_applied_index = 1 };
+                const before_resolution = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    break :blk managed.host.http_host.host.raftStatus(601).?.last_index;
+                };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const remote_resolution = try origin.historyResolutionPort().read(a, route.fence().?, "docs", resolution_input, .{});
+                try remote_resolution.validate(resolution_input.binding());
+                try std.testing.expect(remote_resolution.resolution == null);
+                try std.testing.expect(remote_resolution.cut.index >= before_resolution);
+                {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    try std.testing.expectEqual(before_resolution, managed.host.http_host.host.raftStatus(601).?.last_index);
+                }
+                remote_input.operation = .recover;
+                remote_input.receipt = unknown_remote.receipt;
+                const recover_body = try std.json.Stringify.valueAlloc(a, remote_input, .{});
+                defer a.free(recover_body);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const confirmed_remote = try ingress.execute(origin.historyControlPort(), a, 601, "docs", recover_body, .{ .catalog_route_fence_json = encoded_fence });
+                try std.testing.expect(confirmed_remote.confirmed());
+                try std.testing.expectEqualDeep(unknown_remote.receipt, confirmed_remote.receipt);
+                try std.testing.expectEqual(@as(u64, 1), confirmed_remote.outcome.?.applied.consumer.?.epoch);
+                const recovered_remote_last = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    break :blk host.raftStatus(601).?.last_index;
+                };
+                try std.testing.expectEqual(unknown_remote.receipt.?.index, recovered_remote_last);
+                // Drive an actual second consumer through durable metadata,
+                // signed remote control, native apply and exact recovery.
+                const feed_control = @import("../metadata/changefeed_control.zig");
+                const feed_driver = @import("../metadata/root_control_driver.zig");
+                const feed_fixture = @import("../pg_spool_cleanup_test.zig");
+                const feed_policy = @import("../metadata/root_control_driver_test.zig").Policy;
+                const FeedStore = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
+                const meta_path = try std.fmt.allocPrint(a, "{s}/feed-control-meta", .{root});
+                defer a.free(meta_path);
+                const meta_store = try a.create(FeedStore);
+                defer a.destroy(meta_store);
+                meta_store.* = try FeedStore.init(a, .{ .root_dir = meta_path });
+                defer meta_store.deinit();
+                var feed_svc: feed_fixture.Service = .{ .store = meta_store, .id = @splat(6), .authority = grant.authority };
+                const feed_table: antfly.metadata.table_manager.TableRecord = .{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" };
+                try meta_store.applyStandaloneCommand(feed_svc.metadata_group_id, .{ .upsert_table = feed_table });
+                try feed_svc.mutate(a, .{ .create = .{ .id = feed_svc.id, .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = feed_control.tableBinding(feed_table), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } });
+                {
+                    var discovery_state = try feed_svc.load(a);
+                    defer discovery_state.deinit();
+                    const root_source = origin.historyRootsSource();
+                    var discovered = try root_source.capture(a, discovery_state.value.definition.?, .{});
+                    defer discovered.deinit();
+                    try std.testing.expectEqual(@as(usize, 1), discovered.roots.len);
+                    try std.testing.expectEqual(namespace, discovered.roots[0].namespace);
+                    try std.testing.expectEqualStrings("docs", discovered.roots[0].table_name);
+                    const plans = try discovered.initialPlans(a);
+                    defer a.free(plans);
+                    try feed_svc.mutate(a, .{ .plan_roots = plans });
+                }
+                const DriverPolicy = struct {
+                    source: *RemoteMetadataSource,
+                    roots: @import("../api/history_roots.zig").Source,
+                    base: feed_policy = .{},
+                    pub fn authorizeRoot(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, request: feed_fixture.Request) !void {
+                        return self.base.authorizeRoot(state, ns, request);
+                    }
+                    pub fn validateRoot(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, frozen: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: feed_fixture.Request) !void {
+                        try self.base.validateRoot(state, ns, frozen, table, request);
+                        try self.roots.validate(std.testing.allocator, state, ns, frozen, table, try self.base.context(request));
+                        self.source.control_read_generation_at_ms = self.source.awakeMs();
+                    }
+                    pub fn newAttempt(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, request: feed_fixture.Request) !feed_control.Id {
+                        return self.base.newAttempt(state, ns, request);
+                    }
+                    pub fn context(self: *@This(), request: feed_fixture.Request) !antfly.public_api.operation.RequestContext {
+                        return self.base.context(request);
+                    }
+                };
+                var driver_policy: DriverPolicy = .{ .source = &metadata_source, .roots = origin.historyRootsSource() };
+                {
+                    var feed_state = try feed_svc.load(a);
+                    defer feed_state.deinit();
+                    const plan_input: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .enroll = .{ .namespace = namespace, .authority = feed_state.value.authority, .consumer = feed_state.value.consumerId(), .definition = feed_state.value.definition.?.identity(), .sequence = feed_state.value.roots[0].grant_sequence, .expires_at_seconds = 1000, .policy_revision = 1 } } };
+                    const plan_body = try std.json.Stringify.valueAlloc(a, plan_input, .{});
+                    defer a.free(plan_body);
+                    try feed_driver.prepare(&feed_svc, &driver_policy, a, feed_svc.id, namespace, .{ .command = plan_body, .fence = encoded_fence, .table = "docs" }, feed_fixture.Request{});
+                }
+                feed_svc.lose_ack_at = feed_svc.proposals + 2; // begin succeeds, accepted receipt ACK is lost
+                const accepted_driver = try feed_driver.drive(&feed_svc, &driver_policy, origin.historyControlPort(), a, feed_svc.id, namespace, feed_fixture.Request{});
+                try std.testing.expectEqual(.accepted, accepted_driver.status);
+                try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, accepted_driver.deferred_error.?);
+                const driver_receipt = accepted_driver.acceptance.?.receipt;
+                try std.testing.expectEqual(recovered_remote_last + 1, driver_receipt.index);
+                feed_svc.lose_ack_at = null;
+                meta_store.deinit();
+                meta_store.* = try FeedStore.init(a, .{ .root_dir = meta_path });
+                const settled_driver = try feed_driver.drive(&feed_svc, &driver_policy, origin.historyControlPort(), a, feed_svc.id, namespace, feed_fixture.Request{});
+                try std.testing.expectEqual(.settled, settled_driver.status);
+                try std.testing.expectEqualDeep(driver_receipt, settled_driver.acceptance.?.receipt);
+                try std.testing.expectEqual(@as(u64, 2), settled_driver.settlement.?.effect.enrolled.consumer_epoch);
+                try std.testing.expectEqual(@as(u64, 2), settled_driver.settlement.?.effect.enrolled.start);
+                {
+                    var feed_state = try feed_svc.load(a);
+                    defer feed_state.deinit();
+                    try std.testing.expect(feed_state.value.roots[0].pending_control == null);
+                    try std.testing.expectEqualDeep(settled_driver.settlement.?, feed_state.value.roots[0].last_control.?);
+                }
+                const RoutedFeedHarness = struct {
+                    const Provider = @import("../metadata/native_changefeed_delivery.zig");
+                    const Context = antfly.public_api.operation.RequestContext;
+                    const Policy = struct {
+                        pub fn authorize(_: *@This(), state: feed_control.State, _: Context) !void {
+                            if (state.definition == null or !std.mem.allEqual(u8, &state.definition.?.owner, 1))
+                                return error.Forbidden;
+                        }
+                        pub fn nowSeconds(_: *@This(), _: Context) !u64 {
+                            return 100;
+                        }
+                        pub fn images(_: *@This(), _: std.mem.Allocator, _: feed_control.State, _: anytype, _: []const u8, before: ?std.json.Value, after: ?std.json.Value, _: Context) !Provider.Images {
+                            return .{ .before = .{ .row = before }, .after = .{ .row = after } };
+                        }
+                    };
+                    noinline fn run(allocator: std.mem.Allocator, svc: *feed_fixture.Service, root_source: @import("../api/history_roots.zig").Source) !void {
+                        try svc.mutate(allocator, .{ .seal = .{ .cut = @splat(7) } });
+                        var state = try svc.load(allocator);
+                        defer state.deinit();
+                        var discovered = try root_source.capture(allocator, state.value.definition.?, .{});
+                        defer discovered.deinit();
+                        const Routed = @import("../metadata/native_changefeed_root.zig").Routed;
+                        var root_adapter = try Routed.init(root_source, &discovered);
+                        var policy: Policy = .{};
+                        var provider: Provider.ProviderFor(Routed, Policy) = .{ .root = &root_adapter, .policy = &policy };
+                        const feed_delivery = @import("../metadata/changefeed_delivery.zig");
+                        var pulled = try feed_delivery.pull(svc, &provider, allocator, svc.id, state.value.latest_cursor, .{}, Context{});
+                        defer pulled.deinit();
+                        try std.testing.expectEqualStrings("{\"version\":1,\"events\":[],\"transaction\":null}", pulled.body);
+                        var replayed = try feed_delivery.pull(svc, &provider, allocator, svc.id, state.value.latest_cursor, .{}, Context{});
+                        defer replayed.deinit();
+                        try std.testing.expect(replayed.replayed);
+                        try std.testing.expectEqual(pulled.cursor, replayed.cursor);
+                    }
+                };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                try RoutedFeedHarness.run(a, &feed_svc, origin.historyRootsSource());
+                const final_driver_index = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    break :blk host.raftStatus(601).?.last_index;
+                };
+                try std.testing.expectEqual(driver_receipt.index, final_driver_index);
+                const RecoveryMode = enum { lost_receipt, superseded, not_sent };
+                const DropReply = struct {
+                    target: ingress.Port,
+                    mode: RecoveryMode,
+                    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, frozen: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: ingress.wire.Request, context: antfly.public_api.operation.RequestContext) !ingress.wire.Response {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        if (input.operation == .submit and self.mode == .not_sent) return error.ReadUnavailable;
+                        var result = try self.target.execute(alloc, frozen, table, input, context);
+                        if (input.operation == .submit) switch (self.mode) {
+                            .lost_receipt => return error.ReadUnavailable,
+                            .superseded => result.outcome = null,
+                            .not_sent => unreachable,
+                        };
+                        return result;
+                    }
+                };
+                for ([_]RecoveryMode{ .lost_receipt, .superseded, .not_sent }, 0..) |mode, case_index| {
+                    const recovery_id: feed_control.Id = @splat(@intCast(7 + case_index));
+                    var recovery_svc: feed_fixture.Service = .{ .store = meta_store, .id = recovery_id, .authority = grant.authority };
+                    try recovery_svc.mutate(a, .{ .create = .{ .id = recovery_id, .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = feed_control.tableBinding(feed_table), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } });
+                    try recovery_svc.mutate(a, .{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} });
+                    {
+                        var recovery_state = try recovery_svc.load(a);
+                        defer recovery_state.deinit();
+                        const input: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .enroll = .{ .namespace = namespace, .authority = recovery_state.value.authority, .consumer = recovery_state.value.consumerId(), .definition = recovery_state.value.definition.?.identity(), .sequence = recovery_state.value.roots[0].grant_sequence, .expires_at_seconds = 1000, .policy_revision = 1 } } };
+                        const body = try std.json.Stringify.valueAlloc(a, input, .{});
+                        defer a.free(body);
+                        try feed_driver.prepare(&recovery_svc, &driver_policy, a, recovery_id, namespace, .{ .command = body, .fence = encoded_fence, .table = "docs" }, feed_fixture.Request{});
+                    }
+                    var drop: DropReply = .{ .target = origin.historyControlPort(), .mode = mode };
+                    const attempted = try feed_driver.drive(&recovery_svc, &driver_policy, .{ .ptr = &drop, .execute_fn = DropReply.execute }, a, recovery_id, namespace, feed_fixture.Request{});
+                    try std.testing.expectEqual(@as(@FieldType(feed_driver.Result, "status"), if (mode == .superseded) .accepted else .ambiguous), attempted.status);
+                    if (mode == .superseded) {
+                        // A different legitimate control replaces the one-slot
+                        // native result record, but not the original lease.
+                        _ = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect = ref });
+                        {
+                            var pending_state = try recovery_svc.load(a);
+                            defer pending_state.deinit();
+                            const original = try ingress.wire.decodeRequest(a, pending_state.value.roots[0].pending_control.?.payload.command, namespace);
+                            const entry = attempted.acceptance.?.receipt;
+                            const native_outcome = try server.recoverHistoryControlLocal(a, route.fence().?, "docs", original.command, .{ .term = entry.term, .index = entry.index });
+                            try std.testing.expect(native_outcome == .superseded);
+                        }
+                        const superseded = try feed_driver.drive(&recovery_svc, &driver_policy, origin.historyControlPort(), a, recovery_id, namespace, feed_fixture.Request{});
+                        // The HTTP ambiguity marker deliberately withholds the
+                        // superseded body as confirmation, preserving receipt.
+                        try std.testing.expectEqual(.accepted, superseded.status);
+                        try std.testing.expectEqualDeep(attempted.acceptance.?, superseded.acceptance.?);
+                    }
+                    const before_observation = blk: {
+                        lockAtomic(&server.data_raft_mutex);
+                        defer server.data_raft_mutex.unlock();
+                        break :blk host.raftStatus(601).?.last_index;
+                    };
+                    if (mode == .lost_receipt) {
+                        recovery_svc.lose_ack_at = recovery_svc.proposals + 1;
+                        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, feed_driver.reconcile(&recovery_svc, &driver_policy, origin.historyGrantPort(), a, recovery_id, namespace, feed_fixture.Request{}));
+                        recovery_svc.lose_ack_at = null;
+                        meta_store.deinit();
+                        meta_store.* = try FeedStore.init(a, .{ .root_dir = meta_path });
+                    }
+                    const recovered = try feed_driver.reconcile(&recovery_svc, &driver_policy, origin.historyGrantPort(), a, recovery_id, namespace, feed_fixture.Request{});
+                    try std.testing.expectEqual(@as(@FieldType(feed_driver.Result, "status"), if (mode == .not_sent) .unproven else if (mode == .lost_receipt) .idle else .reconciled), recovered.status);
+                    {
+                        var recovery_state = try recovery_svc.load(a);
+                        defer recovery_state.deinit();
+                        const item = recovery_state.value.roots[0];
+                        try std.testing.expect(item.last_control == null);
+                        if (mode == .not_sent) {
+                            try std.testing.expect(item.pending_control != null);
+                            try std.testing.expectEqual(@as(u64, 0), item.consumer_epoch);
+                            try std.testing.expect(item.last_reconciliation == null);
+                        } else {
+                            try std.testing.expect(item.pending_control == null);
+                            try std.testing.expectEqual(@as(u64, 3 + case_index), item.consumer_epoch);
+                            try std.testing.expectEqual(@as(u64, 2), item.start);
+                            try std.testing.expectEqualDeep(recovered.reconciliation.?, item.last_reconciliation.?);
+                            if (mode == .lost_receipt) try std.testing.expect(item.last_reconciliation.?.original_receipt == null);
+                            if (mode == .superseded) try std.testing.expectEqualDeep(attempted.acceptance.?.receipt, item.last_reconciliation.?.original_receipt.?);
+                        }
+                    }
+                    const after_observation = blk: {
+                        lockAtomic(&server.data_raft_mutex);
+                        defer server.data_raft_mutex.unlock();
+                        break :blk host.raftStatus(601).?.last_index;
+                    };
+                    try std.testing.expectEqual(before_observation, after_observation);
+                    if (mode == .not_sent) {
+                        var original_state = try recovery_svc.load(a);
+                        defer original_state.deinit();
+                        const original_intent = original_state.value.roots[0].pending_control.?;
+                        const original = try ingress.wire.decodeRequest(a, original_intent.payload.command, namespace);
+                        // An active feed cannot discard an unresolved attempt.
+                        try std.testing.expectError(error.ChangefeedConflict, feed_driver.prepareRetirementFence(&recovery_svc, &driver_policy, a, recovery_id, namespace, feed_fixture.Request{}));
+                        try recovery_svc.mutate(a, .close);
+                        try feed_driver.prepareRetirementFence(&recovery_svc, &driver_policy, a, recovery_id, namespace, feed_fixture.Request{});
+                        // This first, distinct fence is itself lost before send.
+                        const missing_fence = try feed_driver.drive(&recovery_svc, &driver_policy, .{ .ptr = &drop, .execute_fn = DropReply.execute }, a, recovery_id, namespace, feed_fixture.Request{});
+                        try std.testing.expectEqual(.ambiguous, missing_fence.status);
+                        const still_absent = try feed_driver.reconcile(&recovery_svc, &driver_policy, origin.historyGrantPort(), a, recovery_id, namespace, feed_fixture.Request{});
+                        try std.testing.expectEqual(.unproven, still_absent.status);
+                        // A new metadata-owned fence keeps the original audit
+                        // identity; it does not redispatch either old attempt.
+                        try feed_driver.prepareRetirementFence(&recovery_svc, &driver_policy, a, recovery_id, namespace, feed_fixture.Request{});
+                        drop.mode = .lost_receipt;
+                        const fence_reply_lost = try feed_driver.drive(&recovery_svc, &driver_policy, .{ .ptr = &drop, .execute_fn = DropReply.execute }, a, recovery_id, namespace, feed_fixture.Request{});
+                        try std.testing.expectEqual(.ambiguous, fence_reply_lost.status);
+                        meta_store.deinit();
+                        meta_store.* = try FeedStore.init(a, .{ .root_dir = meta_path });
+                        const fenced = try feed_driver.reconcile(&recovery_svc, &driver_policy, origin.historyGrantPort(), a, recovery_id, namespace, feed_fixture.Request{});
+                        try std.testing.expectEqual(.reconciled, fenced.status);
+                        try std.testing.expect(fenced.reconciliation.?.effect == .released);
+                        try std.testing.expectEqual(original_intent.sequence, fenced.reconciliation.?.displaced.?.sequence);
+                        try std.testing.expectEqual(original_intent.digest, fenced.reconciliation.?.displaced.?.request_digest);
+                        try std.testing.expect(fenced.reconciliation.?.original_receipt == null);
+                        // Simulate the original packet arriving after cleanup.
+                        // The durable native floor rejects its old grant.
+                        const late_original = try server.submitHistoryControlLocal(a, route.fence().?, "docs", original.command);
+                        try std.testing.expectEqual(.resynchronization, late_original.outcome.?.rejected);
+                        try recovery_svc.mutate(a, .finish_close);
+                        var deleted = try recovery_svc.load(a);
+                        defer deleted.deinit();
+                        try std.testing.expectEqual(feed_control.Phase.deleted, deleted.value.phase);
+                    }
+                }
+                const PublicFeedHarness = struct {
+                    const api = @import("../api/changefeed_public.zig");
+                    const Http = @import("../api/http_server.zig");
+                    const Table = antfly.metadata.table_manager.TableRecord;
+                    const domain = @import("antfly_local_sources").system_catalog_domain;
+                    const FeedCatalog = struct {
+                        table: Table,
+                        logical_name: []const u8 = "feed_docs",
+                    };
+                    fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                        return .{ .metadata_group_id = 1, .metrics = .{} };
+                    }
+                    fn record(raw: *anyopaque, allocator: std.mem.Allocator, name: []const u8) !?Table {
+                        const feed_catalog: *const FeedCatalog = @ptrCast(@alignCast(raw));
+                        if (!std.mem.eql(u8, feed_catalog.table.name, name)) return null;
+                        return try antfly.metadata.table_manager.cloneTable(allocator, feed_catalog.table);
+                    }
+                    fn systemCatalog(raw: *anyopaque, allocator: std.mem.Allocator, _: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+                        const feed_catalog: *const FeedCatalog = @ptrCast(@alignCast(raw));
+                        switch (call) {
+                            .resolve => |target| {
+                                const matched = std.mem.eql(u8, target.table, feed_catalog.logical_name);
+                                const resolved: ?domain.ResolvedTable = if (matched) .fromTable(feed_catalog.table) else null;
+                                return std.json.Stringify.valueAlloc(allocator, resolved, .{});
+                            },
+                            .resolve_many => |input| {
+                                try std.testing.expectEqual(@as(usize, 1), input.storage_names.len);
+                                try std.testing.expectEqualStrings(feed_catalog.table.name, input.storage_names[0]);
+                                const resolved: domain.ResolvedMany = .{ .revision = 1, .tables = &.{}, .logical_names = &.{feed_catalog.logical_name} };
+                                return std.json.Stringify.valueAlloc(allocator, resolved, .{});
+                            },
+                            else => return error.TestUnexpectedResult,
+                        }
+                    }
+                    noinline fn run(allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: Table, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence, snapshot_only: bool) !void {
+                        var auth_storage = antfly.lsm_backend.Backend.init(allocator, .{ .flush_threshold = 1 });
+                        defer auth_storage.close();
+                        var store = try auth_storage.runtimeNamespaceStore(allocator);
+                        defer store.deinit();
+                        var users = antfly.usermgr.StorageUserStore.init(allocator, store);
+                        var access = antfly.usermgr.StorageCasbinAdapter.init(allocator, store);
+                        var manager = try antfly.usermgr.UserManager.init(allocator, users.iface(), try antfly.usermgr.initDefaultEnforcer(allocator, access.iface()));
+                        defer manager.deinit();
+                        var feed_catalog: FeedCatalog = .{ .table = table };
+                        var grant_permission = try antfly.usermgr.Permission.initOwned(allocator, .table, feed_catalog.logical_name, .replicate);
+                        defer grant_permission.deinit(allocator);
+                        var user = try manager.createUser("alice", "test-password", &.{grant_permission});
+                        defer user.deinit(allocator);
+                        const http_api = try allocator.create(Http.ApiHttpServer);
+                        defer allocator.destroy(http_api);
+                        http_api.* = try Http.ApiHttpServer.initWithConfig(allocator, .{ .auth_enabled = true, .user_manager = &manager, .native_history_roots = source, .backend_runtime = node.backend_runtime }, .{
+                            .ptr = &feed_catalog,
+                            .vtable = &.{ .status = status, .table_record = record, .system_catalog = systemCatalog },
+                            .changefeeds = @import("../api/changefeed_metadata.zig").Port.fromService(svc),
+                        }, null, null);
+                        defer http_api.deinit();
+                        const credential: Http.AuthenticatedRequest = .{ .authorization = "Basic YWxpY2U6dGVzdC1wYXNzd29yZA==" };
+                        if (snapshot_only) {
+                            const definition: api.Create = .{ .tables = &.{feed_catalog.logical_name}, .start = .snapshot_then_changes, .include = .rows };
+                            try node.proposeRaftBatchGroupWithLeaderWait(allocator, fence.route.group_id, table.name, .{
+                                .writes = &.{.{ .key = "public-bootstrap-probe", .value = "{\"snapshot_probe\":\"before-cut\"}" }},
+                            }, .{ .discovery = .cached, .allow_remote_forward = false, .write_route_fence = fence }, 5 * std.time.ns_per_s);
+                            const created = try api.create(http_api, allocator, credential, "snapshot-feed", definition, .{});
+                            try std.testing.expectEqualDeep(created, try api.create(http_api, allocator, credential, "snapshot-feed", definition, .{}));
+                            try node.proposeRaftBatchGroupWithLeaderWait(allocator, fence.route.group_id, table.name, .{
+                                .writes = &.{.{ .key = "public-bootstrap-probe", .value = "{\"snapshot_probe\":\"after-cut\"}" }},
+                            }, .{ .discovery = .cached, .allow_remote_forward = false, .write_route_fence = fence }, 5 * std.time.ns_per_s);
+                            var snapshot = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = created.cursor }, .{}, .{});
+                            defer snapshot.deinit();
+                            try std.testing.expect(std.mem.indexOf(u8, snapshot.page.body, "before-cut") != null);
+                            try std.testing.expect(std.mem.indexOf(u8, snapshot.page.body, "after-cut") == null);
+                            try std.testing.expect(std.mem.indexOf(u8, snapshot.page.body, "\"complete\":true") != null);
+                            {
+                                svc.lose_ack_at = svc.proposals + 1;
+                                defer svc.lose_ack_at = null;
+                                try std.testing.expectError(error.MetadataMutationOutcomeUnknown, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{}));
+                            }
+                            const maintenance: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
+                            const metadata_port = http_api.source.changefeeds.?;
+                            try std.testing.expectError(error.Forbidden, api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, .{}));
+                            try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance);
+                            const LostRelease = struct {
+                                fn reach(_: *anyopaque, event: DataRequestLifecycleEvent) !void {
+                                    if (event.phase == .proposal_accepted) return error.InjectedSnapshotReleaseReplyLoss;
+                                }
+                            };
+                            {
+                                node.data_request_lifecycle_hook = .{ .ptr = node, .reach_fn = LostRelease.reach };
+                                defer node.data_request_lifecycle_hook = null;
+                                try std.testing.expectError(error.MetadataMutationOutcomeUnknown, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{}));
+                            }
+                            var ack = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{});
+                            defer ack.deinit();
+                            const bytes = try svc.store.getChangefeedControl(allocator, svc.metadata_group_id, created.id);
+                            defer allocator.free(bytes);
+                            var active = try feed_control.parse(allocator, bytes);
+                            defer active.deinit();
+                            try std.testing.expectEqual(feed_control.Phase.streaming, active.value.phase);
+                            try std.testing.expect(active.value.roots[0].snapshot_released);
+                            var tail = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = ack.acknowledged }, .{}, .{});
+                            defer tail.deinit();
+                            try std.testing.expect(std.mem.indexOf(u8, tail.page.body, "after-cut") != null);
+                            try api.close(http_api, allocator, credential, created.id, .{});
+                            return;
+                        }
+                        const definition: api.Create = .{ .tables = &.{feed_catalog.logical_name} };
+                        const created = try api.create(http_api, allocator, credential, "live-feed", definition, .{});
+                        const repeated = try api.create(http_api, allocator, credential, "live-feed", definition, .{});
+                        try std.testing.expectEqualDeep(created, repeated);
+                        try node.proposeRaftBatchGroupWithLeaderWait(allocator, fence.route.group_id, table.name, .{
+                            .writes = &.{.{ .key = "retained-feed-event", .value = "{\"v\":1}" }},
+                        }, .{ .discovery = .cached, .allow_remote_forward = false, .write_route_fence = fence }, 5 * std.time.ns_per_s);
+                        var pulled = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = created.cursor }, .{}, .{});
+                        defer pulled.deinit();
+                        try std.testing.expect(pulled == .page);
+                        try std.testing.expect(std.mem.indexOf(u8, pulled.page.body, "retained-feed-event") != null);
+                        var ack = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = pulled.page.cursor }, null, .{});
+                        defer ack.deinit();
+                        try std.testing.expectEqual(pulled.page.cursor, ack.acknowledged);
+                        const bytes = try svc.store.getChangefeedControl(allocator, svc.metadata_group_id, created.id);
+                        defer allocator.free(bytes);
+                        var current = try feed_control.parse(allocator, bytes);
+                        defer current.deinit();
+                        const item = current.value.roots[0];
+                        try std.testing.expectEqual(item.start + 1, item.acknowledged.sequence);
+                        try std.testing.expectEqual(item.acknowledged.sequence, item.reclaimed_through);
+                        const before_collect = blk: {
+                            lockAtomic(&node.data_raft_mutex);
+                            defer node.data_raft_mutex.unlock();
+                            break :blk node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index;
+                        };
+                        var repeated_ack = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = pulled.page.cursor }, null, .{});
+                        defer repeated_ack.deinit();
+                        try std.testing.expectEqual(ack.acknowledged, repeated_ack.acknowledged);
+                        {
+                            lockAtomic(&node.data_raft_mutex);
+                            defer node.data_raft_mutex.unlock();
+                            try std.testing.expectEqual(before_collect + 1, node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index);
+                        }
+                        feed_catalog.logical_name = "renamed_docs";
+                        try std.testing.expectError(error.Forbidden, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = ack.acknowledged }, .{}, .{}));
+                        feed_catalog.logical_name = "feed_docs";
+                        try api.close(http_api, allocator, credential, created.id, .{});
+                        try api.close(http_api, allocator, credential, created.id, .{});
+                        const observation = try source.grants.read(allocator, fence, table.name, .{
+                            .version = 1,
+                            .identity = .{
+                                .namespace = item.namespace,
+                                .authority = current.value.authority,
+                                .consumer = current.value.consumerId(),
+                                .definition = current.value.definition.?.identity(),
+                                .sequence = item.grant_sequence,
+                                .policy_revision = current.value.definition.?.tables[0].policy_revision,
+                            },
+                        }, .{});
+                        try std.testing.expect(observation == .retired);
+                        const tombstone = try svc.store.getChangefeedControl(allocator, svc.metadata_group_id, created.id);
+                        defer allocator.free(tombstone);
+                        var deleted = try feed_control.parse(allocator, tombstone);
+                        defer deleted.deinit();
+                        try std.testing.expectEqual(feed_control.Phase.deleted, deleted.value.phase);
+
+                        const expiring = try api.create(http_api, allocator, credential, "expiring-feed", definition, .{});
+                        const metadata_port = http_api.source.changefeeds.?;
+                        const maintenance: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
+                        const active_bytes = try metadata_port.read(allocator, expiring.id, maintenance);
+                        defer allocator.free(active_bytes);
+                        var active_feed = try feed_control.parse(allocator, active_bytes);
+                        defer active_feed.deinit();
+                        const active_state = active_feed.value;
+                        const active_definition = active_state.definition.?;
+                        try metadata_port.mutate(allocator, .{
+                            .id = expiring.id,
+                            .authority = active_state.authority,
+                            .owner = active_definition.owner,
+                            .authorization = active_definition.authorization,
+                            .expected_revision = active_state.revision,
+                            .expected_epoch = active_state.epoch,
+                            .mutation = .{ .expire = expiring.expires_at },
+                        }, maintenance);
+                        for (0..2) |_| try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, expiring.id, maintenance);
+                        const DropCollection = struct {
+                            port: ingress.Port,
+                            calls: usize = 0,
+                            fn execute(raw: *anyopaque, alloc: std.mem.Allocator, selected: antfly.metadata_api.CatalogRouteFence, name: []const u8, input: ingress.wire.Request, request: antfly.public_api.operation.RequestContext) !ingress.wire.Response {
+                                const self: *@This() = @ptrCast(@alignCast(raw));
+                                const response = try self.port.execute(alloc, selected, name, input, request);
+                                if (input.command == .collect) {
+                                    try std.testing.expect(response.confirmed());
+                                    try std.testing.expect(response.outcome.? == .applied);
+                                    self.calls += 1;
+                                    return error.ReadUnavailable;
+                                }
+                                return response;
+                            }
+                        };
+                        var drop_collection: DropCollection = .{ .port = source.controls };
+                        var interrupted = source;
+                        interrupted.controls = .{ .ptr = &drop_collection, .execute_fn = DropCollection.execute };
+                        try std.testing.expectError(error.ReadUnavailable, api.maintainNativeFeed(metadata_port, interrupted, http_api.inferenceIo(), allocator, expiring.id, maintenance));
+                        try std.testing.expectEqual(@as(usize, 1), drop_collection.calls);
+                        {
+                            const pending_bytes = try metadata_port.read(allocator, expiring.id, maintenance);
+                            defer allocator.free(pending_bytes);
+                            var pending = try feed_control.parse(allocator, pending_bytes);
+                            defer pending.deinit();
+                            try std.testing.expect(!pending.value.roots[0].released);
+                            try std.testing.expect(pending.value.roots[0].pending_control != null);
+                        }
+                        try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, expiring.id, maintenance);
+                        const reset_bytes = try metadata_port.read(allocator, expiring.id, maintenance);
+                        defer allocator.free(reset_bytes);
+                        var reset = try feed_control.parse(allocator, reset_bytes);
+                        defer reset.deinit();
+                        try std.testing.expectEqual(feed_control.Phase.reset_required, reset.value.phase);
+                        try std.testing.expectEqual(feed_control.Reset.lease_expired, reset.value.reset_reason);
+                        try std.testing.expect(reset.value.roots[0].released);
+                        const expired_grant = try source.grants.read(allocator, fence, table.name, .{
+                            .version = 1,
+                            .identity = .{
+                                .namespace = active_state.roots[0].namespace,
+                                .authority = active_state.authority,
+                                .consumer = active_state.consumerId(),
+                                .definition = active_definition.identity(),
+                                .sequence = active_state.roots[0].grant_sequence,
+                                .policy_revision = active_definition.tables[0].policy_revision,
+                            },
+                        }, maintenance);
+                        try std.testing.expect(expired_grant == .retired);
+                    }
+                };
+                {
+                    const Worker = struct {
+                        fn run(result: *anyerror!void, allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: antfly.metadata.table_manager.TableRecord, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence) void {
+                            result.* = PublicFeedHarness.run(allocator, svc, source, table, node, fence, false);
+                        }
+                    };
+                    // This fixture supplies one immutable peer generation and
+                    // has no metadata HTTP server. Password checks can exceed
+                    // the production cache TTL within the test workflow.
+                    metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
+                    defer metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                    var outcome: anyerror!void = undefined;
+                    const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Worker.run, .{ &outcome, a, &feed_svc, origin.historyRootsSource(), feed_table, server, route.fence().? });
+                    thread.join();
+                    try outcome;
+                    var pinned = try origin.historyPagePort().read(a, route.fence().?, "docs", .{ .version = 1, .request = .{ .reference = ref, .after = .{}, .now_seconds = 100 } }, .{});
+                    defer pinned.deinit();
+                    try std.testing.expectEqualStrings("{\"v\":1}", pinned.events[0].after.?);
+                }
+
+                {
+                    const Worker = struct {
+                        fn run(result: *anyerror!void, allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: antfly.metadata.table_manager.TableRecord, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence) void {
+                            result.* = PublicFeedHarness.run(allocator, svc, source, table, node, fence, true);
+                        }
+                    };
+                    feed_svc.max_topology_protocol = feed_control.qualified_bootstrap_protocol_version;
+                    metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
+                    defer metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                    var outcome: anyerror!void = undefined;
+                    const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Worker.run, .{ &outcome, a, &feed_svc, origin.historyRootsSource(), feed_table, server, route.fence().? });
+                    thread.join();
+                    try outcome;
+                }
+                // Closing must dispatch retirement cleanup rather than cancel
+                // every prepared command solely because the feed is closed.
+                try feed_svc.mutate(a, .close);
+                {
+                    var closing = try feed_svc.load(a);
+                    defer closing.deinit();
+                    const retire: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .retire = .{ .namespace = namespace, .authority = closing.value.authority, .consumer = closing.value.consumerId(), .definition = closing.value.definition.?.identity(), .sequence = closing.value.authority_sequence, .grant = closing.value.roots[0].grant_sequence } } };
+                    const body = try std.json.Stringify.valueAlloc(a, retire, .{});
+                    defer a.free(body);
+                    try feed_driver.prepare(&feed_svc, &driver_policy, a, feed_svc.id, namespace, .{ .command = body, .fence = encoded_fence, .table = "docs" }, feed_fixture.Request{});
+                }
+                const retired_driver = try feed_driver.drive(&feed_svc, &driver_policy, origin.historyControlPort(), a, feed_svc.id, namespace, feed_fixture.Request{});
+                try std.testing.expectEqual(.settled, retired_driver.status);
+                try std.testing.expect(retired_driver.settlement.?.effect == .retired);
+                try feed_svc.mutate(a, .finish_close);
+                {
+                    var deleted = try feed_svc.load(a);
+                    defer deleted.deinit();
+                    try std.testing.expectEqual(feed_control.Phase.deleted, deleted.value.phase);
+                    try std.testing.expect(deleted.value.roots[0].released);
+                }
+                // Qualify actual protocol-31 admission, native apply and a
+                // positive immutable completion receipt over signed HTTP.
+                const completion_contract = resolution_operations.wire.completion;
+                const CompletionAdmissionFixture = struct {
+                    noinline fn capture(fixture_alloc: std.mem.Allocator, fixture_owner: *antfly.public_api.ProvisionedKernelOwnerSource, fence: antfly.metadata_api.CatalogRouteFence, expected_binding: [32]u8) !antfly.public_api.ProvisionedKernelOwnerSource.CapturedCompletionOwner {
+                        const capture_context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s };
+                        return qualified: while (true) {
+                            try capture_context.ensureActive();
+                            break :qualified fixture_owner.captureCompletionOwnerRouted(fixture_alloc, fence, "docs", expected_binding, capture_context) catch |err| switch (err) {
+                                error.ReadUnavailable, error.StorageReadTemporarilyUnavailable => {
+                                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                                    continue;
+                                },
+                                else => return err,
+                            };
+                        };
+                    }
+                    // Keep the large private batch temporaries off the parent
+                    // HTTP/Raft fixture's already large stack frame.
+                    noinline fn run(fixture_alloc: std.mem.Allocator, fixture_owner: *antfly.public_api.ProvisionedKernelOwnerSource, fence: antfly.metadata_api.CatalogRouteFence, fixture_namespace: [24]u8, expected_binding: [32]u8, fixture_origin: *DataServer, fixture_endpoint: []const u8, fixture_credential: []const u8, fixture_root: []const u8) !@import("../api/completion_plan.zig").Plan {
+                        const fixture_completion = @import("../api/completion_plan.zig").completion;
+                        var changed_binding = expected_binding;
+                        changed_binding[0] ^= 1;
+                        try std.testing.expectError(error.TopologyChanged, fixture_owner.captureCompletionOwnerRouted(fixture_alloc, fence, "docs", changed_binding, .{}));
+                        try std.testing.expectError(error.DeadlineExceeded, fixture_owner.captureCompletionOwnerRouted(fixture_alloc, fence, "docs", expected_binding, .{ .deadline_ns = platform_time.monotonicNs() -| 1 }));
+                        try std.testing.expectError(error.TopologyChanged, fixture_origin.historyOwnerPort().read(fixture_alloc, fence, "docs", .{ .version = 1, .expected_table_binding = changed_binding }, .{}));
+                        const captured = try fixture_origin.historyOwnerPort().read(fixture_alloc, fence, "docs", .{ .version = 1, .expected_table_binding = expected_binding }, .{});
+                        const current_owner = captured.owner;
+                        try std.testing.expect(captured.observation.cut.term > 0 and captured.observation.cut.index > 0);
+                        try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024), captured.observation.retention_limit_bytes);
+                        const txn_id: [16]u8 = @splat(95);
+                        const prepare: antfly.db.types.BatchRequest = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .ordinary_producer = true, .txn_id = txn_id, .topology_epoch = current_owner.topology_epoch, .completion_owner = current_owner } }, .writes = &.{.{ .key = "completion-row", .value = "{\"done\":true}" }} };
+                        const prepare_bytes = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(fixture_alloc, prepare);
+                        defer fixture_alloc.free(prepare_bytes);
+                        const locator = try @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroupScoped(fixture_alloc, "docs", 601, null, null);
+                        defer fixture_alloc.free(locator);
+                        var frozen = try @import("../api/completion_plan.zig").Plan.freeze(fixture_alloc, txn_id, @splat(96), current_owner, &.{.{ .owner = current_owner, .locator = locator, .roles = fixture_completion.Roles.effects, .prepare = prepare }}, platform_time.realtimeNs());
+                        errdefer frozen.deinit();
+                        const plan = frozen.admission;
+                        try plan.requirePreparedInput(fixture_namespace, prepare_bytes);
+                        var client = antfly.public_api.ApiHttpClient.init(fixture_alloc, try fixture_origin.distributedReadExecutor());
+                        _ = client.withInternalServiceAuth(fixture_credential, "history-runtime");
+                        var writer: @import("../api/completion_participant.zig").HttpWriter = .{ .client = &client, .base_uri = fixture_endpoint };
+                        const participant: @import("../api/completion_participant.zig").Port = .{ .writer = writer.writer() };
+                        try participant.submit(fixture_alloc, &frozen, 0, fence, .begin, .{});
+                        try participant.submit(fixture_alloc, &frozen, 0, fence, .prepare, .{});
+                        try participant.submit(fixture_alloc, &frozen, 0, fence, .{ .resolve = .{ .status = .committed, .commit_version = 1001 } }, .{});
+                        const legacy_prepare = try (antfly.db.types.TransactionIntentRequest{ .completion_legacy_producer = true, .completion_owner = current_owner, .writes = &.{.{ .key = "legacy-producer-uncommitted", .value = "{}" }} }).completionBatch(@splat(249), 1000, current_owner.topology_epoch);
+                        var legacy_plan = try @import("../api/completion_plan.zig").Plan.freeze(fixture_alloc, @splat(249), @splat(250), current_owner, &.{.{ .owner = current_owner, .locator = locator, .roles = fixture_completion.Roles.effects, .prepare = legacy_prepare }}, platform_time.realtimeNs());
+                        defer legacy_plan.deinit();
+                        try std.testing.expect(legacy_plan.legacy_producer);
+                        try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(fixture_alloc, try legacy_plan.begin(0)));
+                        try participant.submit(fixture_alloc, &legacy_plan, 0, fence, .begin, .{});
+                        try participant.submit(fixture_alloc, &legacy_plan, 0, fence, .prepare, .{});
+                        try participant.submit(fixture_alloc, &legacy_plan, 0, fence, .{ .resolve = .{ .status = .aborted, .commit_version = 1001 } }, .{});
+                        const row: antfly.db.types.BatchRequest = .{ .source_producer = .ordinary, .timestamp_ns = 1002, .document_version_scheme = .revision_v1, .sync_level = .write, .writes = &.{.{ .key = "producer-envelope-row", .value = "{\"origin\":true}" }} };
+                        try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_row_producer_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(fixture_alloc, row));
+                        _ = (try writer.writer().write(fixture_alloc, .{ .catalog = fence }, 601, "docs", row, .{ .remaining_ms = 5000, .forwards_remaining = 2, .campaign_allowed = false }, .{})) orelse return error.TestUnexpectedResult;
+                        const Fast = struct {
+                            writer: *@import("../api/completion_participant.zig").HttpWriter,
+                            fn unqualified(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: antfly.db.types.BatchRequest) !void {
+                                return error.CatalogRouteFenceRequired;
+                            }
+                            fn routed(ptr: *anyopaque, allocator: std.mem.Allocator, fast_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: antfly.db.types.BatchRequest, cancellation: antfly.db.types.CancellationToken) !void {
+                                const self: *@This() = @ptrCast(@alignCast(ptr));
+                                _ = (try self.writer.writer().write(allocator, .{ .catalog = fast_fence }, fast_fence.route.group_id, table, request, .{ .remaining_ms = 5000, .forwards_remaining = 2, .campaign_allowed = false }, .{ .cancellation = cancellation })) orelse return error.TestUnexpectedResult;
+                            }
+                        };
+                        var fast: Fast = .{ .writer = &writer };
+                        const fast_root = try std.fmt.allocPrint(fixture_alloc, "{s}/producer-fast-client", .{fixture_root});
+                        defer fixture_alloc.free(fast_root);
+                        var fast_source = antfly.public_api.table_writes.ProvisionedTableWriteSource.initWithBackendRuntime(fast_root, fixture_origin.write_source.catalog, fixture_origin.backend_runtime);
+                        defer fast_source.deinit();
+                        _ = fast_source.withRaftBatcher(.{ .ptr = &fast, .vtable = &.{ .batch_group = Fast.unqualified, .batch_group_local = Fast.unqualified, .batch_group_routed_with_cancellation = Fast.routed } });
+                        for ([_]@FieldType(antfly.db.types.BatchRequest, "source_producer"){ .ordinary, .legacy_cdc }) |producer| {
+                            const fast_tables = [_]@import("../api/distributed_txn.zig").TableCommitRequest{.{ .source_producer = producer, .table_name = "docs", .writes = &.{.{ .key = if (producer == .ordinary) "producer-fast-ordinary" else "producer-fast-legacy", .value = "{}" }} }};
+                            const outcome = (try fast_source.source().commitBatch(fixture_alloc, &fast_tables, .write)) orelse return error.TestUnexpectedResult;
+                            try std.testing.expect(outcome == .committed);
+                            try std.testing.expectEqual(@as(usize, 1), outcome.committed.participant_count);
+                            try std.testing.expect(!outcome.committed.propagation_pending);
+                        }
+                        return frozen;
+                    }
+                };
+                var frozen = try CompletionAdmissionFixture.run(a, &owner, route.fence().?, namespace, feed_control.tableBinding(feed_table), origin, base, secret, root);
+                defer frozen.deinit();
+                const plan = frozen.admission;
+                const current_owner = frozen.participants[0].owner;
+                producer_closure_owner = current_owner;
+                const txn_id = plan.transaction_id;
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+
+                const positive_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = txn_id, .owner_fence = current_owner.digest(), .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const positive = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
+                try positive.validate(positive_input.binding());
+                try std.testing.expect(positive.resolution != null);
+                try std.testing.expect(positive.resolution.?.outcome.effects.sequence > 0);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const positive_retry = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
+                try std.testing.expectEqualDeep(positive.resolution, positive_retry.resolution);
+                const decision_wire = @import("antfly_local_sources").storage_history_decision_wire;
+                const decision_query: decision_wire.Query = .{ .owner = current_owner, .transaction_id = txn_id };
+                const decision_input: @import("../api/history_decision_operations.zig").Request = .{ .version = 1, .owner = current_owner, .transaction_id = txn_id, .minimum_applied_index = 1 };
+                const decision_uri = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/601/tables/docs/history/decision-v1", .{base});
+                defer a.free(decision_uri);
+                // Even migration mode must not expose private participant
+                // membership or coordinator records without service authority.
+                var unauthorized_decision = try (try origin.distributedReadExecutor()).execute(a, .{ .method = .POST, .uri = decision_uri, .content_type = "application/json", .body = "{}", .timeout_ms = 1000, .max_response_bytes = 4096 });
+                defer unauthorized_decision.deinit(a);
+                try std.testing.expectEqual(@as(u16, 401), unauthorized_decision.status);
+                var recovered_decision = try origin.historyDecisionPort().read(a, route.fence().?, "docs", decision_input, .{});
+                defer recovered_decision.deinit();
+                try recovered_decision.value.validate(decision_query);
+                const committed = recovered_decision.value.decision orelse return error.TestExpectedRetainedDecision;
+                try std.testing.expectEqual(.committed, committed.record.status);
+                try std.testing.expectEqual(@as(u64, 1000), committed.record.begin_timestamp);
+                try std.testing.expectEqual(@as(u64, 1001), committed.record.commit_version);
+                try std.testing.expect(committed.record.prepared and committed.record.intents_resolved);
+                try std.testing.expectEqual(plan.digest(), committed.admission.digest);
+                try std.testing.expectEqual(current_owner, try committed.admission.admission.recoveryOwner(namespace));
+                // Assemble from the retained native decision/admission, rather
+                // than deriving restart input from the in-memory write plan.
+                var certificate = try resolution_operations.wire.Assembly.init(a, try committed.committedManifest());
+                defer certificate.deinit();
+                try std.testing.expectError(error.SourceOutcomeUnresolved, certificate.encode(a));
+                try std.testing.expect(try certificate.add(positive_input.binding(), positive));
+                try std.testing.expect(try certificate.add(positive_input.binding(), positive_retry));
+                const certificate_bytes = try certificate.encode(a);
+                defer a.free(certificate_bytes);
+                var checked_certificate = try completion_contract.parse(a, certificate_bytes);
+                defer checked_certificate.deinit();
+                try std.testing.expectEqual(@as(usize, 1), checked_certificate.value.certificate.resolutions.len);
+                // Recovery and replay use signed HTTP, preserving the immutable
+                // certificate and its first publication position.
+                var publication_client = antfly.public_api.ApiHttpClient.init(a, try origin.distributedReadExecutor());
+                _ = publication_client.withInternalServiceAuth(secret, "history-runtime");
+                var remote_writer: @import("../api/completion_participant.zig").HttpWriter = .{ .client = &publication_client, .base_uri = base };
+                const remote_participant: @import("../api/completion_participant.zig").Port = .{ .writer = remote_writer.writer() };
+                const RecoveryLane = struct {
+                    pending: ?backend_runtime_mod.Job = null,
+                    submissions: usize = 0,
+                    fn submit(ptr: *anyopaque, job: backend_runtime_mod.Job) !void {
+                        const lane: *@This() = @ptrCast(@alignCast(ptr));
+                        if (lane.pending != null) return error.ResourceBudgetExceeded;
+                        lane.pending = job;
+                        lane.submissions += 1;
+                    }
+                    fn drain(ptr: *anyopaque, _: u64) void {
+                        const lane: *@This() = @ptrCast(@alignCast(ptr));
+                        if (lane.pending) |job| {
+                            lane.pending = null;
+                            job.deinit(job.ptr);
+                        }
+                    }
+                    fn poll(_: *anyopaque, _: usize) !usize {
+                        return 0;
+                    }
+                };
+                var recovery_lane: RecoveryLane = .{};
+                const previous_jobs = runtime.ptr().durable_jobs;
+                runtime.ptr().durable_jobs = .{ .ptr = &recovery_lane, .vtable = &.{ .submit = RecoveryLane.submit, .drain_owner = RecoveryLane.drain, .close_owner = RecoveryLane.drain, .poll = RecoveryLane.poll } };
+                defer runtime.ptr().durable_jobs = previous_jobs;
+                defer RecoveryLane.drain(&recovery_lane, 0);
+                const recovery_request: @import("antfly_local_sources").storage_history_recovery_wire.Request = .{ .owner = current_owner, .transaction_id = txn_id, .admission_digest = plan.digest(), .coordinator_locator = frozen.participant_ids[0], .resolution_timestamp_ns = 2000 };
+                const enqueue_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+                while (true) {
+                    DataServer.enqueueCompletionRecovery(server, recovery_request) catch |err| switch (err) {
+                        error.ReadUnavailable => {
+                            if (platform_time.monotonicNs() >= enqueue_deadline) return error.DeadlineExceeded;
+                            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    break;
+                }
+                try std.testing.expectEqual(@as(usize, 1), recovery_lane.submissions);
+                const deferred = recovery_lane.pending orelse return error.TestUnexpectedResult;
+                recovery_lane.pending = null;
+                defer deferred.deinit(deferred.ptr);
+                const scheduled_job: *DataServer.CompletionRecoveryJob = @ptrCast(@alignCast(deferred.ptr));
+                scheduled_job.term += 1;
+                try std.testing.expectError(error.NotLeader, DataServer.checkCompletionRecoveryLeadership(scheduled_job, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s }));
+                scheduled_job.term -= 1;
+                try deferred.run(deferred.ptr);
+                const scheduled_publication = try server.historyPublicationPort().read(a, route.fence().?, "docs", .{ .version = 1, .owner = current_owner, .transaction_id = txn_id, .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 }, .{});
+                try std.testing.expect(scheduled_publication.publication != null);
+                try std.testing.expectEqual(checked_certificate.value.digest, scheduled_publication.publication.?.digest);
+                var recovery = origin.completionRecovery();
+                recovery.participants = remote_participant;
+                try std.testing.expectEqual(.complete, try recovery.run(a, current_owner, route.fence().?, "docs", txn_id, .{}));
+                try std.testing.expectEqual(.complete, try recovery.run(a, current_owner, route.fence().?, "docs", txn_id, .{}));
+                try server.completionParticipantPort().submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
+                try remote_participant.submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                // An idle root must remain readable after an ordered protocol
+                // barrier, without requiring another document mutation.
+                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version);
+                defer a.free(idle_barrier);
+                const idle_barrier_index = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    var index: ?u64 = null;
+                    try http.proposeWithReceipt(601, idle_barrier, &index);
+                    break :blk index orelse return error.GroupLeaderUnavailable;
+                };
+                const idle_apply_deadline = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+                while (sm.appliedIndex(601) < idle_barrier_index) {
+                    if (platform_time.monotonicNs() >= idle_apply_deadline) return error.Timeout;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
+                const retained_history = @import("antfly_local_sources").storage_committed_history;
+                const publication_query: retained_history.CompletionPublicationQuery = .{ .owner = current_owner, .transaction_id = txn_id, .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
+                const qualified = try origin.historyOwnerPort().read(a, route.fence().?, "docs", .{ .version = 1, .expected_table_binding = current_owner.table_binding }, .{});
+                try std.testing.expectEqual(current_owner, qualified.owner);
+                try std.testing.expect(qualified.observation.cut.index > 0);
+                const publication_input: @import("../api/history_publication_operations.zig").Request = .{ .version = 1, .owner = current_owner, .transaction_id = txn_id, .manifest_digest = publication_query.manifest_digest, .commit_version = 1001, .minimum_applied_index = 1 };
+                const observed_publication = try server.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
+                try observed_publication.validate(publication_query);
+                // Recovery must not manufacture a native write for a no-op.
+                try std.testing.expect(observed_publication.cut.index < idle_barrier_index);
+                const idle_owner = try CompletionAdmissionFixture.capture(a, &owner, route.fence().?, feed_control.tableBinding(feed_table));
+                try std.testing.expectEqualDeep(current_owner, idle_owner.owner);
+                try std.testing.expectEqualDeep(observed_publication.cut, idle_owner.observation.cut);
+                const idle_resolution = try server.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
+                try idle_resolution.validate(positive_input.binding());
+                try std.testing.expectEqualDeep(positive.resolution, idle_resolution.resolution);
+                try std.testing.expect(idle_resolution.cut.index < idle_barrier_index);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                var idle_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
+                defer idle_page.deinit();
+                try std.testing.expectEqualDeep(first_page.events, idle_page.events);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const idle_grant = try origin.historyGrantPort().read(a, route.fence().?, "docs", grant_input, .{});
+                try std.testing.expectEqualDeep(actual_grant, idle_grant);
+                // All recovery operations remain reads: no Raft entry was
+                // submitted to make the native cut catch up with the no-op.
+                {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    try std.testing.expectEqual(idle_barrier_index, host.raftStatus(601).?.last_index);
+                }
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const remote_publication = try origin.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
+                try remote_publication.validate(publication_query);
+                try std.testing.expectEqualDeep(observed_publication.publication, remote_publication.publication);
+                try std.testing.expect(observed_publication.publication != null);
+                try std.testing.expectEqualDeep(checked_certificate.value.digest, observed_publication.publication.?.digest);
+                const retried_publication = try server.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
+                try std.testing.expectEqualDeep(observed_publication.publication, retried_publication.publication);
+                var replaced_publication_query = publication_query;
+                replaced_publication_query.owner.root_generation += 1;
+                try std.testing.expectError(error.TopologyChanged, owner.orderedHistoryPublicationRouted(a, route.fence().?, "docs", replaced_publication_query));
+                var expired_publication_fence = route.fence().?;
+                expired_publication_fence.admission_deadline_ns = platform_time.monotonicNs() -| 1;
+                expired_publication_fence.admission_deadline_io = null;
+                try std.testing.expectError(error.DeadlineExceeded, owner.orderedHistoryPublicationRouted(a, expired_publication_fence, "docs", publication_query));
+                const ExpiredPublicationScope = struct {
+                    fn check(_: *const anyopaque) !void {
+                        return error.DeadlineExceeded;
+                    }
+                    fn cancelled(_: *const anyopaque) bool {
+                        return false;
+                    }
+                };
+                var scoped_publication_fence = route.fence().?;
+                scoped_publication_fence.admission_cancellation = .{ .ptr = &publication_query, .check_fn = ExpiredPublicationScope.check, .is_cancelled_fn = ExpiredPublicationScope.cancelled };
+                try std.testing.expectError(error.DeadlineExceeded, owner.orderedHistoryPublicationRouted(a, scoped_publication_fence, "docs", publication_query));
+                {
+                    const Barrier = antfly.raft.read_gate.ReadSafetyBarrier;
+                    const LatePublicationFence = struct {
+                        inner: Barrier,
+                        validations: usize = 0,
+                        fn wait(ptr: *anyopaque, group: u64, ctx: []const u8) !void {
+                            const self: *@This() = @ptrCast(@alignCast(ptr));
+                            return self.inner.waitReadSafe(group, ctx);
+                        }
+                        fn controlled(ptr: *anyopaque, group: u64, ctx: []const u8, controls: Barrier.Controls) !void {
+                            const self: *@This() = @ptrCast(@alignCast(ptr));
+                            return self.inner.waitReadSafeControlled(group, ctx, controls);
+                        }
+                        fn capture(ptr: *anyopaque, group: u64) !Barrier.FrozenProof {
+                            const self: *@This() = @ptrCast(@alignCast(ptr));
+                            return self.inner.vtable.capture_frozen.?(self.inner.ptr, group);
+                        }
+                        fn validate(ptr: *anyopaque, group: u64, proof: Barrier.FrozenProof, deadline: ?u64, cancellation: antfly.db.types.CancellationToken) !void {
+                            const self: *@This() = @ptrCast(@alignCast(ptr));
+                            try self.inner.vtable.validate_frozen.?(self.inner.ptr, group, proof, deadline, cancellation);
+                            self.validations += 1;
+                            if (self.validations == 2) return error.NotLeader;
+                        }
+                        fn barrier(self: *@This()) Barrier {
+                            return .{ .ptr = self, .vtable = &.{ .wait_read_safe = wait, .wait_read_safe_controlled = controlled, .capture_frozen = capture, .validate_frozen = validate } };
+                        }
+                    };
+                    const original_barrier = server.dataReadSafetyBarrier();
+                    var late_fence: LatePublicationFence = .{ .inner = original_barrier };
+                    _ = owner.withReadSafetyBarrier(late_fence.barrier());
+                    defer _ = owner.withReadSafetyBarrier(original_barrier);
+                    var late_publication_route = route.fence().?;
+                    const late_publication_deadline = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+                    late_publication_route.admission_deadline_ns = late_publication_deadline;
+                    late_publication_route.admission_deadline_io = null;
+                    while (true) {
+                        if (platform_time.monotonicNs() >= late_publication_deadline) return error.Timeout;
+                        late_fence.validations = 0;
+                        _ = owner.orderedHistoryPublicationRouted(a, late_publication_route, "docs", publication_query) catch |err| switch (err) {
+                            error.ReadUnavailable => {
+                                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                                continue;
+                            },
+                            error.NotLeader => break,
+                            else => return err,
+                        };
+                        return error.TestUnexpectedResult;
+                    }
+                    try std.testing.expectEqual(@as(usize, 2), late_fence.validations);
+                }
+                const SourceCompletion = struct {
+                    noinline fn run(source_alloc: std.mem.Allocator, origin_server: *DataServer, source_binding: @import("../api/completion_plan.zig").completion.RoutedOwner, source_fence: antfly.metadata_api.CatalogRouteFence, source_participant: @import("../api/completion_participant.zig").Port, native_owner: anytype, native_server: *DataServer) !void {
+                        const source_plans = @import("../api/completion_plan.zig");
+                        const source_native_types = antfly.db.types;
+                        const source_id: [16]u8 = @splat(116);
+                        const source_purpose: [32]u8 = @splat(117);
+                        const source_prepare = try (source_native_types.TransactionIntentRequest{ .completion_owner = source_binding, .completion_source_purpose = source_purpose, .completion_source_checkpoint = .{ .binding = @splat(121), .purpose = source_purpose, .sequence = 1, .checkpoint = "source:1", .accepted_at_ns = 4001, .receipt_window = 3 } }).completionBatch(source_id, 4000, source_binding.topology_epoch);
+                        const source_locator = try @import("../api/distributed_txn.zig").participantIdForGroup(source_alloc, "docs", source_binding.group_id);
+                        defer source_alloc.free(source_locator);
+                        try std.testing.expectError(error.InvalidSourceAdmission, source_plans.Plan.freeze(source_alloc, source_id, @splat(118), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.guards, .prepare = source_prepare }}, 4001));
+                        var source_plan = source_artifact: {
+                            var original_source_plan = try source_plans.Plan.freeze(source_alloc, source_id, @splat(118), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.checkpoint, .prepare = source_prepare }}, 4001);
+                            defer original_source_plan.deinit();
+                            const frozen_source_bytes = try original_source_plan.encodeFrozen(source_alloc);
+                            defer source_alloc.free(frozen_source_bytes);
+                            break :source_artifact try source_plans.Plan.restoreFrozen(source_alloc, frozen_source_bytes, try source_plans.frozenDigest(frozen_source_bytes));
+                        };
+                        defer source_plan.deinit();
+                        try std.testing.expectEqual(source_purpose, source_plan.source_purpose.?);
+                        try std.testing.expect(source_plan.source_checkpoint);
+                        try std.testing.expect(source_plan.source_checkpoint_receipts);
+                        try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_source_checkpoint_receipts_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(source_alloc, try source_plan.begin(0)));
+                        try source_participant.submit(source_alloc, &source_plan, 0, source_fence, .begin, .{});
+                        const source_query: @import("../api/history_decision_operations.zig").Request = .{ .version = 1, .owner = source_binding, .transaction_id = source_id, .minimum_applied_index = 1 };
+                        var source_pending = try origin_server.historyDecisionPort().read(source_alloc, source_fence, "docs", source_query, .{});
+                        defer source_pending.deinit();
+                        try std.testing.expectEqual(.pending, source_pending.value.decision.?.record.status);
+                        try std.testing.expectEqual(source_purpose, source_pending.value.decision.?.record.source_purpose.?);
+                        try source_participant.submit(source_alloc, &source_plan, 0, source_fence, .prepare, .{});
+                        try source_participant.submit(source_alloc, &source_plan, 0, source_fence, .{ .resolve = .{ .status = .committed, .commit_version = 4002 } }, .{});
+                        var source_recovery = origin_server.completionRecovery();
+                        source_recovery.participants = source_participant;
+                        try std.testing.expectEqual(.complete, try source_recovery.run(source_alloc, source_binding, source_fence, "docs", source_id, .{}));
+                        try std.testing.expectEqual(.complete, try source_recovery.run(source_alloc, source_binding, source_fence, "docs", source_id, .{}));
+                        var source_committed = try origin_server.historyDecisionPort().read(source_alloc, source_fence, "docs", source_query, .{});
+                        defer source_committed.deinit();
+                        try std.testing.expectEqual(.committed, source_committed.value.decision.?.record.status);
+                        try std.testing.expectEqual(source_purpose, source_committed.value.decision.?.record.source_purpose.?);
+                        try source_participant.submitRetained(source_alloc, source_query.binding(), source_committed.value, 0, source_fence, .{ .visibility = .full_index }, .{});
+                        // A committed head rejects a conflicting first sequence.
+                        // An aborted second sequence must leave its predecessor
+                        // available to a different, subsequently committed input.
+                        for ([_]u8{ 122, 124, 126, 128 }) |attempt_id| {
+                            const attempt_purpose: [32]u8 = @splat(attempt_id + 1);
+                            const conflict = attempt_id == 122;
+                            const gap = attempt_id == 124;
+                            const attempt_prepare = try (source_native_types.TransactionIntentRequest{ .completion_owner = source_binding, .completion_source_purpose = attempt_purpose, .completion_source_checkpoint = .{ .binding = @splat(121), .purpose = attempt_purpose, .sequence = if (conflict) 1 else if (gap) 3 else 2, .checkpoint = if (attempt_id == 126) "source:aborted" else "source:2", .expected_checkpoint = if (conflict) null else "source:1", .accepted_at_ns = 4101 + @as(u64, attempt_id), .receipt_window = 3 } }).completionBatch(@splat(attempt_id), 4100 + @as(u64, attempt_id), source_binding.topology_epoch);
+                            var attempt_plan = try source_plans.Plan.freeze(source_alloc, @splat(attempt_id), @splat(attempt_id + 2), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.checkpoint, .prepare = attempt_prepare }}, 4101 + @as(u64, attempt_id));
+                            defer attempt_plan.deinit();
+                            try std.testing.expect(attempt_plan.source_checkpoint);
+                            try source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .begin, .{});
+                            if (conflict or gap) {
+                                try std.testing.expectError(if (gap) error.SourceCheckpointConflict else error.SourcePayloadConflict, source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .prepare, .{}));
+                            } else try source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .prepare, .{});
+                            try source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .{ .resolve = .{ .status = if (attempt_id == 128) .committed else .aborted, .commit_version = 4102 + @as(u64, attempt_id) } }, .{});
+                            origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
+                            const attempt_recovery = try source_recovery.run(source_alloc, source_binding, source_fence, "docs", @splat(attempt_id), .{});
+                            try std.testing.expectEqual(@as(@TypeOf(attempt_recovery), if (attempt_id == 128) .complete else .aborted), attempt_recovery);
+                        }
+                        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
+                        try @import("../api/source_checkpoint_native_test.zig").verify(source_alloc, origin_server.sourceCheckpointObservationPort(), source_fence, .{ .version = 1, .source_owner = source_binding, .transaction_id = source_id, .command = source_prepare.transaction.?.prepare.source_checkpoint.?, .minimum_applied_index = 1 });
+                        try @import("../api/source_scope_native_test.zig").verify(source_alloc, native_owner, source_fence, source_binding);
+                        try @import("../api/source_scope_native_test.zig").verifyRouted(source_alloc, origin_server.sourceScopeObservationPort(), source_fence, source_binding);
+                        try @import("../api/source_scope_native_test.zig").verifyProducerClosureRouted(source_alloc, origin_server.sourceProducerClosureObservationPort(), source_fence, source_binding);
+                        try @import("../api/source_scope_native_test.zig").verifySubmission(source_alloc, origin_server, source_fence, source_binding);
+                        try @import("../api/source_scope_native_test.zig").verifyControlRpc(source_alloc, origin_server.sourceScopeControlPort(), origin_server.sourceScopeObservationPort(), source_fence, source_binding);
+                        try @import("../api/source_scope_native_test.zig").verifyMinimumRecovery(source_alloc, native_server, source_fence, source_binding);
+                        try @import("../api/source_scope_native_test.zig").verifyRetirementSubmission(source_alloc, native_server, origin_server.sourceScopeObservationPort(), source_fence, source_binding);
+                        try @import("../api/source_scope_native_test.zig").verifyRetirementRpc(source_alloc, origin_server.sourceRetirementControlPort(), origin_server.sourceScopeObservationPort(), source_fence, source_binding);
+                    }
+                };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                try SourceCompletion.run(a, origin, current_owner, route.fence().?, remote_participant, server.kernel_owner_source.?, server);
+                const HostedAdmission = struct {
+                    noinline fn run(alloc: std.mem.Allocator, endpoint_uri: []const u8, source_catalog: antfly.public_api.table_catalog.CatalogSource, executor: antfly.common.http.RequestExecutor, root_path: []const u8, credential: []const u8) !void {
+                        const Router = struct {
+                            uri: []const u8,
+                            fn localNode(_: *anyopaque) u64 {
+                                return 0;
+                            }
+                            fn localStatus(_: *anyopaque, _: u64) antfly.raft.host.HostedReplicaStatus {
+                                return .absent;
+                            }
+                            fn leader(_: *anyopaque, group: u64) ?u64 {
+                                return if (group == 601) 1 else null;
+                            }
+                            fn status(_: *anyopaque, _: u64, _: u64) antfly.raft.host.HostedReplicaStatus {
+                                return .active;
+                            }
+                            fn baseUri(ptr: *anyopaque, allocator: std.mem.Allocator, node: u64) !?[]u8 {
+                                if (node != 1) return null;
+                                return try allocator.dupe(u8, (@as(*@This(), @ptrCast(@alignCast(ptr)))).uri);
+                            }
+                            fn router(self: *@This()) @import("../api/table_router.zig").HostedGroupRouter {
+                                return .{ .ptr = self, .vtable = &.{ .local_node_id = localNode, .local_status = localStatus, .group_leader_node_id = leader, .node_status = status, .node_base_uri = baseUri } };
+                            }
+                        };
+                        var hosted_router: Router = .{ .uri = endpoint_uri };
+                        const cache_root = try std.fmt.allocPrint(alloc, "{s}/hosted-completion", .{root_path});
+                        defer alloc.free(cache_root);
+                        defer antfly.public_api.table_writes.closeHostedManagedDbCacheForRoot(cache_root);
+                        var hosted = antfly.public_api.table_writes.HostedProvisionedTableWriteSource.init(cache_root, source_catalog, hosted_router.router(), executor);
+                        _ = hosted.withInternalServiceAuth(credential, "history-runtime").withHistoryPolicyProvisioning(null);
+                        const source = hosted.source();
+                        const input = [_]@import("../api/distributed_txn.zig").TableCommitRequest{.{ .source_producer = .ordinary, .table_name = "docs", .writes = &.{.{ .key = "hosted-completion", .value = "{\"v\":9}" }} }};
+                        const hosted_outcome = (try source.commitTransactionWithId(alloc, @splat(115), 3000, &input, .write)).?;
+                        try std.testing.expect(hosted_outcome == .committed);
+                        try std.testing.expect(!hosted_outcome.committed.propagation_pending);
+                        const retried = (try source.commitTransactionWithId(alloc, @splat(115), 3000, &input, .full_index)).?;
+                        try std.testing.expect(retried == .committed);
+                        try std.testing.expect(!retried.committed.propagation_pending);
+                        try std.testing.expect(!retried.committed.visibility_pending);
+                    }
+                };
+                try HostedAdmission.run(a, base, catalog, try origin.distributedReadExecutor(), root, secret);
+                const PageInput = @import("../api/history_page_operations.zig").Request;
+                var qualified_input: PageInput = .{
+                    .version = 1,
+                    .request = .{ .reference = ref, .after = .{}, .now_seconds = 100, .include_completion = true },
+                };
+                var found_completion = false;
+                for (0..64) |_| {
+                    metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                    var qualified_page = origin.historyPagePort().read(a, route.fence().?, "docs", qualified_input, .{}) catch |err| {
+                        std.debug.print("coordinated frame proof read after sequence {d} failed: {s}\n", .{ qualified_input.request.after.sequence, @errorName(err) });
+                        return err;
+                    };
+                    defer qualified_page.deinit();
+                    const header = qualified_page.header orelse break;
+                    if (std.mem.eql(u8, &header.transaction_id, &@as([16]u8, @splat(115)))) {
+                        try std.testing.expectEqual(.coordinated, header.transaction_scope);
+                        const completion = qualified_page.completion orelse return error.TestUnexpectedResult;
+                        try std.testing.expectEqual(@as(u64, 3001), completion.commit_version);
+                        found_completion = true;
+                        break;
+                    }
+                    qualified_input.request.after = qualified_page.next;
+                }
+                try std.testing.expect(found_completion);
+
+                try SourcePlanHttpFixture.run(a, server, origin, try origin.distributedReadExecutor(), base, secret, route.fence().?, current_owner);
+            }
+            const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
+            try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);
+            const Interrupted = struct {
+                index: ?u64 = null,
+                fn reach(ptr: *anyopaque, event: DataRequestLifecycleEvent) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (event.phase == .proposal_accepted) {
+                        self.index = event.log_index;
+                        return error.InjectedHistoryConfirmationLoss;
+                    }
+                }
+            };
+            var interruption: Interrupted = .{};
+            server.data_request_lifecycle_hook = .{ .ptr = &interruption, .reach_fn = Interrupted.reach };
+            const uncertain = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect = ref });
+            server.data_request_lifecycle_hook = null;
+            try std.testing.expect(uncertain.outcome == null);
+            try std.testing.expectEqual(interruption.index.?, uncertain.entry.index);
+            const recovery_deadline = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+            while (sm.appliedIndex(601) < uncertain.entry.index) {
+                if (platform_time.monotonicNs() >= recovery_deadline) return error.Timeout;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            const previous_last = blk: {
+                lockAtomic(&server.data_raft_mutex);
+                defer server.data_raft_mutex.unlock();
+                break :blk host.raftStatus(601).?.last_index;
+            };
+            const recovered = try server.recoverHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect = ref }, uncertain.entry);
+            try std.testing.expectEqual(@as(u64, 1), recovered.applied.consumer.?.epoch);
+            try std.testing.expectEqual(@as(u64, 0), recovered.applied.consumer.?.acknowledged);
+            const recovered_last = blk: {
+                lockAtomic(&server.data_raft_mutex);
+                defer server.data_raft_mutex.unlock();
+                break :blk host.raftStatus(601).?.last_index;
+            };
+            try std.testing.expectEqual(previous_last, recovered_last);
+            const NormalCompletion = struct {
+                noinline fn run(alloc: std.mem.Allocator, origin_server: *DataServer, value: []const u8, level: antfly.db.types.SyncLevel) !void {
+                    const txn = @import("../api/distributed_txn.zig");
+                    var participant_worker = txn.LocalTableWriteParticipantWorker.init(origin_server.write_source.source());
+                    const outcome = try txn.executeMultiTableCommitWithOptions(alloc, origin_server.write_source.catalog, participant_worker.worker(), @splat(114), 2000, 2001, &.{.{ .source_producer = .legacy_cdc, .table_name = "docs", .writes = &.{.{ .key = "normal-completion", .value = value }} }}, level, null, .{ .completion = .{ .owners = origin_server.historyOwnerPort(), .recovery = origin_server.completionRecovery() } });
+                    try std.testing.expect(outcome == .committed);
+                    try std.testing.expect(!outcome.committed.propagation_pending);
+                    try std.testing.expect(!outcome.committed.visibility_pending);
+                    try std.testing.expect(!outcome.committed.visibility_retry_pending);
+                    try std.testing.expect(!outcome.committed.visibility_repair_required);
+                }
+            };
+            try NormalCompletion.run(a, server, "{\"v\":7}", .write);
+            const normal_last = blk: {
+                lockAtomic(&server.data_raft_mutex);
+                defer server.data_raft_mutex.unlock();
+                break :blk host.raftStatus(601).?.last_index;
+            };
+            try NormalCompletion.run(a, server, "{\"v\":7}", .write);
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, NormalCompletion.run(a, server, "{\"v\":8}", .write));
+            {
+                lockAtomic(&server.data_raft_mutex);
+                defer server.data_raft_mutex.unlock();
+                try std.testing.expectEqual(normal_last, host.raftStatus(601).?.last_index);
+            }
+            for ([_]antfly.db.types.SyncLevel{ .propose, .full_text, .enrichments, .full_index }) |level| {
+                try NormalCompletion.run(a, server, "{\"v\":7}", level);
+            }
+
+            const policy_limit = @import("antfly_local_sources").storage_committed_history.default_limit;
+            const policy_applied = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .configure_policy = .{ .namespace = namespace, .authority = ref.authority, .previous_revision = 0, .revision = 1, .limit = policy_limit } });
+            try std.testing.expectEqual(@as(u64, 1), policy_applied.outcome.?.applied.policy.?.revision);
+            try std.testing.expect(policy_applied.outcome.?.applied.consumer == null);
+            const policy_observed = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect_policy = .{ .namespace = namespace, .authority = ref.authority } });
+            try std.testing.expectEqualDeep(policy_applied.outcome.?.applied.policy, policy_observed.outcome.?.applied.policy);
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            const ClosureHarness = struct {
+                pub fn inventoryRpc(alloc: std.mem.Allocator, node: *DataServer, captured: antfly.metadata_api.CatalogRouteFence, input: @import("source_legacy_inventory_http_wire.zig").Request) !@import("source_legacy_inventory_http_wire.zig").Reply {
+                    return @import("source_legacy_inventory_http_native_test.zig").read(alloc, node, captured, input);
+                }
+                pub fn legacyRpc(alloc: std.mem.Allocator, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence, input: @import("source_legacy_terminal_http_wire.zig").Request) !@import("source_legacy_terminal_http_wire.zig").Reply {
+                    return @import("source_legacy_terminal_http_native_test.zig").submit(alloc, node, fence, input);
+                }
+                pub fn submitRpc(alloc: std.mem.Allocator, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence, original_owner: @import("antfly_local_sources").storage_transaction_completion.RoutedOwner, nonce: u8) !DataServer.SourceProducerClosureSubmission {
+                    const reply = try @import("source_producer_control_native_test.zig").submit(alloc, node, fence, original_owner, nonce);
+                    return .{ .entry = reply.receipt orelse return error.TestExpectedAcceptedProducerReceipt, .outcome = reply.outcome };
+                }
+                pub fn last(node: *DataServer, group: u64) u64 {
+                    lockAtomic(&node.data_raft_mutex);
+                    defer node.data_raft_mutex.unlock();
+                    return node.data_raft.?.host.http_host.host.raftStatus(group).?.last_index;
+                }
+                pub fn applied(node: *DataServer, group: u64) u64 {
+                    return node.data_raft_apply.?.appliedIndex(group);
+                }
+                pub fn documentApplies(node: *DataServer) usize {
+                    return node.data_raft_apply.?.test_faults.document_apply_successes;
+                }
+            };
+            try @import("source_producer_closure_proposal_native_test.zig").run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner, DataRequestLifecycleEvent, ClosureHarness);
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try @import("source_legacy_terminal_proposal_native_test.zig").run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner, DataRequestLifecycleEvent, ClosureHarness);
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+
+            const ClockHarness = struct {
+                noinline fn run(allocator: std.mem.Allocator, node: *DataServer, kernel: *antfly.public_api.ProvisionedKernelOwnerSource, captured: antfly.metadata_api.CatalogRouteFence, consumer: control.Reference) !void {
+                    const group = captured.route.group_id;
+                    var before = try kernel.orderedHistoryPageRouted(allocator, captured, "docs", .{ .reference = consumer, .after = .{}, .now_seconds = 100 });
+                    defer before.deinit();
+                    const earliest = node.dataRaftRealtimeNs();
+                    try node.proposeRaftBatchGroupWithLeaderWait(allocator, group, "docs", .{
+                        .source_producer = .ordinary,
+                        .timestamp_ns = 1000,
+                        .writes = &.{.{ .key = "timestamped-history-row", .value = "{\"clock\":true}" }},
+                    }, .{ .discovery = .cached, .allow_remote_forward = false, .write_route_fence = captured }, 5 * std.time.ns_per_s);
+                    const latest = node.dataRaftRealtimeNs();
+                    var page = try kernel.orderedHistoryPageRouted(allocator, captured, "docs", .{ .reference = consumer, .after = .{ .sequence = before.observed_latest }, .now_seconds = 100 });
+                    defer page.deinit();
+                    try std.testing.expectEqual(@as(usize, 1), page.events.len);
+                    try std.testing.expectEqualStrings("{\"clock\":true}", page.events[0].after.?);
+                    const clock: u64 = @intCast(page.header.?.committed_at_ns);
+                    try std.testing.expect(clock >= earliest and clock <= latest);
+                }
+            };
+            try ClockHarness.run(a, server, &owner, route.fence().?, ref);
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+        }
+
+        test "data raft ordered history table producer capability refuses lossy fallback" {
+            try @import("../api/transaction_producer_routing_test.zig").run(std.testing.allocator);
+        }
+
+        test "data raft ordered history proposal authority fences term membership and missing owners" {
+            try DataServer.validateHistoryProposalAuthority(2, 2, 3, 3, true);
+            try std.testing.expectError(error.GroupLeaderUnavailable, DataServer.validateHistoryProposalAuthority(0, 0, 3, 3, true));
+            try std.testing.expectError(error.GroupLeaderUnavailable, DataServer.validateHistoryProposalAuthority(2, 3, 3, 3, true));
+            try std.testing.expectError(error.GroupLeaderUnavailable, DataServer.validateHistoryProposalAuthority(2, 2, 3, 4, true));
+            try std.testing.expectError(error.GroupLeaderUnavailable, DataServer.validateHistoryProposalAuthority(2, 2, 3, 3, false));
+            var server: DataServer = undefined;
+            server.data_raft = null;
+            try std.testing.expectError(error.ChangefeedCapabilityUnsupported, server.submitHistoryControlLocal(std.testing.allocator, undefined, "docs", .{ .collect = .{ .namespace = @splat(1), .authority = @splat(2) } }));
+        }
+
+        test "data raft ordered history routing requires a known eligible leader" {
+            const a = std.testing.allocator;
+            var peers: ControlReadGeneration = .{ .alloc = a };
+            defer {
+                var groups = peers.groups.valueIterator();
+                while (groups.next()) |group| {
+                    group.nodes.deinit(a);
+                }
+                peers.groups.deinit(a);
+                peers.nodes.deinit(a);
+            }
+            var group: ControlReadGeneration.Group = .{ .leader = 2 };
+            try group.nodes.appendSlice(a, &.{ 1, 2, 3 });
+            try peers.groups.put(a, 601, group);
+            try peers.nodes.put(a, 2, @constCast("http://leader"));
+            try std.testing.expectEqual(@as(u64, 2), try peers.historyControlLeader(601, 1, null, false));
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(602, 1, null, false));
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(601, 2, null, false));
+            // A newer hosted observation wins over an independently cached
+            // peer leader. Missing eligibility never falls back to the old one.
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(601, 1, 3, true));
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(601, 1, null, true));
+            peers.groups.getPtr(601).?.leader = null;
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(601, 1, null, false));
+            try std.testing.expectEqual(@as(u64, 2), try peers.historyControlLeader(601, 1, 2, true));
+            peers.groups.getPtr(601).?.nodes.clearRetainingCapacity();
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(601, 1, 2, true));
+        }
+
+        test "data raft ordered history completion BEGIN cannot use the legacy activation floor" {
+            const version = @import("../common/data_raft_protocol.zig");
+            const request: antfly.db.types.BatchRequest = .{ .transaction = .{ .begin = .{ .txn_id = @splat(1), .begin_timestamp = 1, .created_at_ns = 2, .topology_epoch = 3, .participants = &.{"table2:4:docs:group:7"}, .completion_admission = "{\"admission\":{\"version\":2}}" } } };
+            try std.testing.expectEqual(version.batch_completion_admission_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
+            try std.testing.expect(version.batch_completion_admission_protocol_version <= version.batch_protocol_version);
+            try std.testing.expectError(error.InvalidBatchRequest, data_raft_batch.encode(std.testing.allocator, "docs", request));
+            const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
+            const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 7, .topology_epoch = 3 };
+            const prepare: antfly.db.types.BatchRequest = .{ .timestamp_ns = 10, .document_version_scheme = .revision_v1, .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3, .completion_owner = owner } } };
+            try std.testing.expectEqual(version.batch_completion_admission_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, prepare));
+            const encoded = try data_raft_batch.encode(std.testing.allocator, "docs", prepare);
+            defer std.testing.allocator.free(encoded);
+            var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
+            defer decoded.deinit(std.testing.allocator);
+            try std.testing.expectEqualDeep(owner, decoded.batch.req.transaction.?.prepare.completion_owner.?);
+            const raw = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(std.testing.allocator, prepare);
+            defer std.testing.allocator.free(raw);
+            const normalized = try DataServer.raftBatchRequestForActiveProtocol(prepare, version.batch_completion_admission_protocol_version, 9999);
+            const normalized_raw = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(std.testing.allocator, normalized);
+            defer std.testing.allocator.free(normalized_raw);
+            try std.testing.expectEqualStrings(raw, normalized_raw);
+            var unfrozen = prepare;
+            unfrozen.timestamp_ns = 0;
+            try std.testing.expectError(error.InvalidBatchRequest, DataServer.raftBatchRequestForActiveProtocol(unfrozen, version.batch_completion_admission_protocol_version, 9999));
+            unfrozen = prepare;
+            unfrozen.document_version_scheme = .admit_current;
+            try std.testing.expectError(error.InvalidBatchRequest, DataServer.raftBatchRequestForActiveProtocol(unfrozen, version.batch_completion_admission_protocol_version, 9999));
+        }
+
+        test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {
+            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_completion_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_plan_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_checkpoint_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_checkpoint_receipts_protocol_version }) |required| {
+                const a = std.testing.allocator;
+                const Fake = struct {
+                    versions: [3]u16 = .{ required, required - 1, required },
+                    probes: [3]usize = @splat(0),
+                    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        const index: usize = if (std.mem.startsWith(u8, request.uri, "http://peer-2/")) 0 else if (std.mem.startsWith(u8, request.uri, "http://peer-3/")) 1 else 2;
+                        self.probes[index] += 1;
+                        return .{ .status = 200, .body = try std.fmt.allocPrint(alloc, "{{\"data_raft_batch_protocol_version\":{d}}}", .{self.versions[index]}) };
+                    }
+                };
+                var fake: Fake = .{};
+                var http_host: antfly.raft.HttpHost = undefined;
+                http_host.request_executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } };
+                var raft: antfly.raft.ManagedHttpHostService = undefined;
+                raft.host.http_host = &http_host;
+                var server: DataServer = undefined;
+                server.alloc = a;
+                server.backend_runtime = null;
+                server.data_raft = &raft;
+                server.api_server_cfg = .{};
+                server.data_raft_protocol_capability_mutex = .unlocked;
+                server.data_raft_protocol_capabilities = .empty;
+                defer {
+                    var it = server.data_raft_protocol_capabilities.valueIterator();
+                    while (it.next()) |entry| a.destroy(entry.*);
+                    server.data_raft_protocol_capabilities.deinit(a);
+                }
+                var plan: DataRaftProtocolProbePlan = .{ .routes_complete = true, .conf_state_fingerprint = 123, .peers = &.{ .{ .node_id = 2, .raft_url = "http://peer-2" }, .{ .node_id = 3, .raft_url = "http://peer-3" }, .{ .node_id = 4, .raft_url = "http://peer-4" } } };
+                const mixed = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+                try std.testing.expectEqual(@as(u16, 0), mixed.activatable_version);
+                try std.testing.expectEqual(.unsupported, mixed.failure);
+                try std.testing.expectEqual(@as(u64, 123), mixed.conf_state_fingerprint);
+                try std.testing.expectEqualSlices(usize, &.{ 1, 1, 0 }, &fake.probes);
+                fake.versions[1] = required;
+                const upgraded = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+                try std.testing.expectEqual(required, upgraded.activatable_version);
+                try std.testing.expectEqual(.none, upgraded.failure);
+                try std.testing.expectEqualSlices(usize, &.{ 2, 2, 1 }, &fake.probes);
+                fake.versions[2] = 0;
+                const unknown = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+                try std.testing.expectEqual(@as(u16, 0), unknown.activatable_version);
+                try std.testing.expectEqual(.unavailable, unknown.failure);
+                plan.routes_complete = false;
+                const missing = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+                try std.testing.expectEqual(.unavailable, missing.failure);
+                try std.testing.expectEqualSlices(usize, &.{ 3, 3, 2 }, &fake.probes);
             }
         }
 
@@ -42942,7 +46697,7 @@ fn consumerTests() type {
                 },
             };
             const request: antfly.db.types.BatchRequest = .{ .graph_endpoint_cleanup = true };
-            const required = DataServer.requiredRaftBatchProtocolVersion(request);
+            const required = try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request);
             const deadline = std.math.maxInt(u64);
             const mixed = server.dataRaftBatchProtocolPreflight(alloc, plan, required, deadline, null);
             try std.testing.expectEqual(@as(u16, 0), mixed.activatable_version);
@@ -43042,7 +46797,7 @@ fn consumerTests() type {
             };
             page_request.merge_page.?.digest = pages.commandDigest(page_request);
             const merge_page_protocol = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
-            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, page_request));
             const page_proposal = DataServer.raftBatchRequestForProtocol(page_request, true, 999);
             try std.testing.expectEqual(@as(u64, 0), page_proposal.timestamp_ns);
             const page_bytes = try data_raft_batch.encode(alloc, "docs", page_proposal);
@@ -43052,20 +46807,20 @@ fn consumerTests() type {
             try std.testing.expectEqualDeep(page_request.merge_page.?, page_decoded.batch.req.merge_page.?);
             try std.testing.expectEqualStrings(page_request.writes[0].value, page_decoded.batch.req.writes[0].value);
             page_request.merge_page.?.source.retention = .{ .epoch = 1, .after_sequence = 5 };
-            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, page_request));
             page_request.merge_page.?.digest = pages.commandDigest(page_request);
             const chunks = try pages.RowChunks(antfly.db.types.BatchRequest).init(page_request);
             const chunk = try chunks.requestAt(0);
-            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(chunk));
+            try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, chunk));
             page_request.merge_page.?.next_snapshot_position = .{ .object = 1, .offset = 8, .remaining = 0 };
-            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, page_request));
             const source_request: antfly.db.types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = .{
                 .fence = .{ .transition_id = 1, .attempt = 1, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = .{ .table_id = 4, .shard_id = 2, .range_id = 6 }, .catalog_digest = @splat(1) },
                 .receiver_namespace = .{ .table_id = 4, .shard_id = 3, .range_id = 5 },
                 .consumer_epoch = 1,
                 .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
             } } } };
-            try std.testing.expectEqual(data_raft_batch.source_pin_protocol_version, DataServer.requiredRaftBatchProtocolVersion(source_request));
+            try std.testing.expectEqual(data_raft_batch.source_pin_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, source_request));
             try std.testing.expectEqual(@as(u64, 0), DataServer.materializeRaftBatchTimestamp(source_request, 999).timestamp_ns);
             // Receiver acceptance has an artifact adjunct but no online_source
             // command. It must remain valid across timestamp negotiation and
@@ -43092,7 +46847,7 @@ fn consumerTests() type {
             try inventory.validateRequest(accept_request);
             const accept_proposal = DataServer.raftBatchRequestForProtocol(accept_request, true, 999);
             try std.testing.expectEqual(@as(u64, 0), accept_proposal.timestamp_ns);
-            try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, DataServer.requiredRaftBatchProtocolVersion(accept_proposal));
+            try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, accept_proposal));
             try inventory.validateRequest(accept_proposal);
             const accept_bytes = try data_raft_batch.encode(alloc, "docs", accept_proposal);
             defer alloc.free(accept_bytes);
@@ -43101,8 +46856,8 @@ fn consumerTests() type {
             try inventory.validateRequest(accept_decoded.batch.req);
             try std.testing.expectEqualDeep(accept_proposal.artifact_catalog.?, accept_decoded.batch.req.artifact_catalog.?);
             page_request.merge_page.?.source.integrity = .{ .catalog_digest = @splat(2), .generation_set = @splat(3) };
-            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
-            try std.testing.expectEqual(@as(u16, 12), DataServer.requiredRaftBatchProtocolVersion(.{
+            try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, page_request));
+            try std.testing.expectEqual(@as(u16, 12), try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{
                 .restore_staging = .{ .finish = .{ .scope = @splat(4), .phase = .validated } },
             }));
         }
@@ -46757,6 +50512,74 @@ fn consumerTests() type {
             try SnapshotDeadlineTest.expectUnpublished(&source);
         }
 
+        test "remote metadata changefeed port shares budgets and never fails over uncertain writes" {
+            const a = std.testing.allocator;
+            const feeds = @import("../api/changefeed_metadata.zig");
+            const control = @import("../metadata/changefeed_control.zig");
+            const routes = @import("../metadata/http_routes.zig");
+            const VoprIo = @import("vopr").vopr_io.VoprIo;
+            var clock = try VoprIo.init(.{ .monotonic_ns = std.time.ns_per_s });
+            defer clock.deinit();
+            const Probe = struct {
+                clock: *VoprIo,
+                reads: usize = 0,
+                writes: usize = 0,
+                previous_remaining: ?u64 = null,
+                fn execute(raw: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (std.mem.endsWith(u8, request.uri, routes.Routes.head)) return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(allocator, antfly.metadata_api.MetadataHead{ .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".*, .metadata_epoch = 1 }, .{}) };
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, feeds.path));
+                    var input = try feeds.parseRequest(allocator, request.body);
+                    defer input.deinit();
+                    try std.testing.expectEqual(@as(u64, 77), input.value.metadata_group_id);
+                    const remaining = try std.fmt.parseUnsigned(u64, request.header(routes.routing_remaining_ms_header).?, 10);
+                    try std.testing.expect(remaining > 0 and remaining <= 100);
+                    if (self.previous_remaining) |previous| try std.testing.expect(remaining < previous);
+                    self.previous_remaining = remaining;
+                    self.clock.monotonic_ns += std.time.ns_per_ms;
+                    var result: feeds.Reply = .{ .action = input.value.action, .metadata_group_id = input.value.metadata_group_id, .metadata_incarnation = input.value.metadata_incarnation };
+                    if (input.value.action == .mutate) {
+                        self.writes += 1;
+                        const headers = try allocator.alloc(antfly.common.http.Header, 1);
+                        headers[0] = .{ .name = try allocator.dupe(u8, routes.Routes.raft_mutation_outcome_header), .value = try allocator.dupe(u8, routes.Routes.raft_mutation_outcome_unknown) };
+                        return .{ .status = 503, .headers = headers, .body = try allocator.dupe(u8, "unknown") };
+                    }
+                    self.reads += 1;
+                    if (self.reads == 1) return .{ .status = 503, .body = try allocator.dupe(u8, "not leader") };
+                    if (input.value.action == .authority) {
+                        result.authority = .{ .incarnation = @splat(9), .sequence = 42 };
+                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(allocator, result, .{}) };
+                    }
+                    const state = try control.encode(allocator, .{});
+                    defer allocator.free(state);
+                    result.id = input.value.id;
+                    result.state = state;
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(allocator, result, .{}) };
+                }
+            };
+            var probe: Probe = .{ .clock = &clock };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{ "http://follower.test", "http://leader.test" }, &.{.{ .ptr = &probe, .vtable = &.{ .execute = Probe.execute } }}, clock.io());
+            defer source.deinit();
+            const io = clock.io();
+            const request: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" }, .deadline_ns = std.time.ns_per_s + 100 * std.time.ns_per_ms, .deadline_io = runtime_io_abi.Borrow.init(&io) };
+            const port = source.statusSource().changefeeds.?;
+            try std.testing.expectError(error.Forbidden, port.authority(a, .{}));
+            const stamp = (try port.authority(a, request)).?;
+            try std.testing.expectEqual(@as(u64, 42), stamp.sequence);
+            try std.testing.expectEqual(@as(usize, 2), probe.reads);
+            const state = try port.read(a, @splat(4), request);
+            defer a.free(state);
+            var parsed = try control.parse(a, state);
+            defer parsed.deinit();
+            try std.testing.expectEqual(control.Phase.empty, parsed.value.phase);
+            const write: control.Write = .{ .id = @splat(4), .authority = @splat(9), .owner = @splat(1), .authorization = @splat(2), .expected_revision = 0, .expected_epoch = 0, .mutation = .{ .create = .{ .id = @splat(4), .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = @splat(3), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } } };
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.mutate(a, write, request));
+            try std.testing.expectEqual(@as(usize, 1), probe.writes);
+            clock.monotonic_ns += 200 * std.time.ns_per_ms;
+            try std.testing.expectError(error.DeadlineExceeded, port.authority(a, request));
+            try std.testing.expectEqual(@as(usize, 3), probe.reads);
+        }
+
         test "remote metadata source pins one cluster incarnation across cache invalidation" {
             const first: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
             const foreign: antfly.metadata_api.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
@@ -47768,6 +51591,48 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), stub.calls);
         }
 
+        test "remote metadata deadline publication port binds discovery and does not replay uncertain mutations" {
+            const a = std.testing.allocator;
+            const publication = @import("../metadata/pg_publication.zig");
+            const Stub = struct {
+                calls: usize = 0,
+
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, publication.path));
+                    const input = try std.json.parseFromSlice(publication.Request, alloc, request.body, .{});
+                    defer input.deinit();
+                    try std.testing.expectEqual(@as(u64, 42), input.value.group);
+                    try std.testing.expectEqual(@as([32]u8, @splat(7)), input.value.incarnation);
+                    if (input.value.write != null) return error.MetadataMutationOutcomeUnknown;
+                    const reply: publication.Reply = .{
+                        .group = input.value.group,
+                        .incarnation = input.value.incarnation,
+                        .database = input.value.database,
+                        .name = input.value.name,
+                        .record = .{ .database = input.value.database, .name = input.value.name, .owner = @splat(3), .revision = 9 },
+                    };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, reply, .{}) };
+                }
+            };
+            var stub: Stub = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{ "http://one.test", "http://two.test" }, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, std.testing.io);
+            defer source.deinit();
+            source.cached_head = .{ .metadata_group_id = 42, .metadata_incarnation = @splat(7) };
+            source.cached_head_at_ms = source.awakeMs();
+            const port = source.statusSource().pg_publications orelse return error.TestUnexpectedResult;
+            try std.testing.expectError(error.Forbidden, port.read(port.ptr, a, @splat(2), "feed", .{}));
+            const context: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "pg-publication-maintenance" } };
+            var record = (try port.read(port.ptr, a, @splat(2), "feed", context)).?;
+            defer record.deinit();
+            try std.testing.expectEqualStrings("feed", record.value.name);
+            try std.testing.expectEqual(@as(u64, 9), record.value.revision);
+            const next: publication.Record = .{ .database = @splat(2), .name = "feed", .owner = @splat(3), .revision = 10 };
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.mutate(port.ptr, a, .{ .expected_revision = 9, .next = next }, context));
+            try std.testing.expectEqual(@as(usize, 2), stub.calls);
+        }
+
         test "remote table descriptors prefer ordered peers before legacy fallback" {
             const Stub = struct {
                 modern: bool,
@@ -48524,8 +52389,8 @@ fn implementationTests() type {
             // Main's neutral cleanup semantics require the newer decoder even
             // when the generation-planned command shape itself predates it.
             const cleanup = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
-            try std.testing.expectEqual(cleanup, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true }));
-            try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .deletes = &.{"hub"} }));
+            try std.testing.expectEqual(cleanup, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true }));
+            try std.testing.expectEqual(version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .deletes = &.{"hub"} }));
         }
 
         test "leann replication round requires an attached Raft owner and its protocol version" {
@@ -48533,7 +52398,7 @@ fn implementationTests() type {
             server.data_raft = null;
             try server.runLeannReplicationRound();
             const version = @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
-            try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .leann_record = .{ .index_name = "idx", .record = "L" } }));
+            try std.testing.expectEqual(version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .leann_record = .{ .index_name = "idx", .record = "L" } }));
         }
 
         test "data runtime native FK retirement preserves source ownership and exact cold path" {
@@ -58320,16 +62185,161 @@ test "grouped source protocol dominates coexisting graph envelope features" {
         .catalogs = .{},
         .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = 16 },
     }, .graph_endpoint_cleanup = true };
-    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
     request.artifact_catalog.?.binding.effect_protocol = 17;
-    try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
     request = .{ .group_source = .{ .action = .activate, .artifact = "turns", .definition = .{ .table_incarnation = 1, .configuration = @splat(2) }, .namespace = @splat(1), .backfill = .{ .route = .{ .value = "" } } } };
-    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
     request.group_source.?.action = .activate_catalog;
-    try std.testing.expectEqual(protocol.batch_dense_artifact_flags_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    try std.testing.expectEqual(protocol.batch_dense_artifact_flags_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
     const encoded = try data_raft_batch.encode(std.testing.allocator, "docs", request);
     defer std.testing.allocator.free(encoded);
     var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@TypeOf(request.group_source.?.action).activate_catalog, decoded.batch.req.group_source.?.action);
 }
+
+const SourcePlanHttpFixture = struct {
+    const SourcePlanHttp = @import("source_plan_http_wire.zig");
+    fn post(a2: std.mem.Allocator, executor: antfly.common.http.RequestExecutor, source_plan_endpoint: []const u8, leaf: []const u8, token: []const u8, fence_json: []const u8, value: anytype) !antfly.common.http.HttpResponse {
+        const uri = try std.fmt.allocPrint(a2, "{s}/internal/v1/groups/601/tables/docs/source-plan/{s}", .{ source_plan_endpoint, leaf });
+        defer a2.free(uri);
+        const body = try std.json.Stringify.valueAlloc(a2, value, .{});
+        defer a2.free(body);
+        return executor.execute(a2, .{ .method = .POST, .uri = uri, .body = body, .headers = &.{ .{ .name = "Content-Type", .value = "application/json" }, .{ .name = antfly.metadata_api.catalog_route_fence_header, .value = fence_json }, .{ .name = internal_service_auth.header_name, .value = token } }, .max_response_bytes = 2 * 1024 * 1024, .timeout_ms = 5000 });
+    }
+    fn requestControl(a2: std.mem.Allocator, executor: antfly.common.http.RequestExecutor, source_plan_endpoint: []const u8, token: []const u8, fence_json: []const u8, value: SourcePlanHttp.ControlRequest) !SourcePlanHttp.ControlReply {
+        var response = try post(a2, executor, source_plan_endpoint, "control-v1", token, fence_json, value);
+        defer response.deinit(a2);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        return SourcePlanHttp.decodeControlReply(a2, value, response.body);
+    }
+    fn run(a2: std.mem.Allocator, actual: *DataServer, origin_server: *DataServer, executor: antfly.common.http.RequestExecutor, source_plan_endpoint: []const u8, credential: []const u8, fence: antfly.metadata_api.CatalogRouteFence, original_owner: SourcePlanHttp.Owner) !void {
+        const frozen = @import("../api/completion_plan.zig");
+        const storage = SourcePlanHttp.control.storage;
+        const root_scope = try SourcePlanHttp.entry.rootFor(original_owner);
+        const source_id: [16]u8 = @splat(209);
+        const purpose: [32]u8 = @splat(210);
+        const prepare = try (antfly.db.types.TransactionIntentRequest{ .completion_owner = original_owner, .completion_source_purpose = purpose }).completionBatch(source_id, 5000, original_owner.topology_epoch);
+        const locator = try @import("../api/distributed_txn.zig").participantIdForGroup(a2, "docs", original_owner.group_id);
+        defer a2.free(locator);
+        var input = try frozen.Plan.freeze(a2, source_id, @splat(211), original_owner, &.{.{ .owner = original_owner, .locator = locator, .roles = frozen.completion.Roles.checkpoint, .prepare = prepare }}, 5001);
+        defer input.deinit();
+        const bytes = try input.encodeFrozen(a2);
+        defer a2.free(bytes);
+        try std.testing.expect(bytes.len <= storage.chunk_bytes);
+        const fence_json = try std.json.Stringify.valueAlloc(a2, fence, .{});
+        defer a2.free(fence_json);
+        const token = try internal_service_auth.tokenAlloc(a2, .{ .secret = credential, .issuer = "history-runtime", .subject = "node:source-plan" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        defer a2.free(token);
+        const quota_query: SourcePlanHttp.control.Query = .{ .root = root_scope, .minimum_applied_index = 1 };
+        const quota_input: SourcePlanHttp.ObserveRequest = .{ .version = 1, .source_owner = original_owner, .query = quota_query };
+        var quota_response = try post(a2, executor, source_plan_endpoint, "observe-v1", token, fence_json, quota_input);
+        defer quota_response.deinit(a2);
+        try std.testing.expectEqual(@as(u16, 200), quota_response.status);
+        const quota = try SourcePlanHttp.native.decodeObservation(a2, quota_query, quota_response.body);
+        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
+        const remote_quota = try origin_server.sourcePlanObservePort().read(a2, fence, "docs", quota_input, .{});
+        try std.testing.expectEqualDeep(quota, remote_quota);
+        var checksum: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &checksum, .{});
+        const chunk_hashes = [_][32]u8{storage.chunkDigest(0, bytes)};
+        var attempt: [16]u8 = @splat(1);
+        std.mem.writeInt(u64, attempt[0..8], 1, .big);
+        const spec: storage.Spec = .{ .namespace = storage.namespaceFor(root_scope, quota.quota.epoch), .storage_epoch = quota.quota.epoch, .binding = @splat(212), .domain = storage.domainFor(@splat(212)), .attempt = attempt, .bytes = bytes.len, .checksum = checksum, .plan_digest = try frozen.frozenDigest(bytes), .chunk_hashes = &chunk_hashes };
+        var request: SourcePlanHttp.ControlRequest = .{ .version = 1, .operation = .submit, .source_owner = original_owner, .command = .{ .version = 1, .root = root_scope, .spec = spec, .action = .begin } };
+        const Loss = struct {
+            fn reach(_: *anyopaque, event: DataRequestLifecycleEvent) !void {
+                if (event.phase == .proposal_accepted) return error.SourceOutcomeUnresolved;
+            }
+        };
+        actual.data_request_lifecycle_hook = .{ .ptr = actual, .reach_fn = Loss.reach };
+        const accepted = requestControl(a2, executor, source_plan_endpoint, token, fence_json, request) catch |err| {
+            actual.data_request_lifecycle_hook = null;
+            return err;
+        };
+        actual.data_request_lifecycle_hook = null;
+        try std.testing.expect(accepted.receipt != null and !accepted.confirmed());
+        const before_recover = blk: {
+            lockAtomic(&actual.data_raft_mutex);
+            defer actual.data_raft_mutex.unlock();
+            break :blk actual.data_raft.?.host.http_host.host.raftStatus(601).?.last_index;
+        };
+        request.operation = .recover;
+        request.receipt = accepted.receipt;
+        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
+        const recovered = try origin_server.sourcePlanControlPort().execute(a2, fence, "docs", request, .{});
+        try std.testing.expect(recovered.confirmed() and recovered.outcome.? == .applied);
+        {
+            lockAtomic(&actual.data_raft_mutex);
+            defer actual.data_raft_mutex.unlock();
+            try std.testing.expectEqual(before_recover, actual.data_raft.?.host.http_host.host.raftStatus(601).?.last_index);
+        }
+        request.operation = .submit;
+        request.receipt = null;
+        request.command.action = .seal;
+        const pending = try requestControl(a2, executor, source_plan_endpoint, token, fence_json, request);
+        try std.testing.expect(pending.outcome.? == .rejected and pending.outcome.?.rejected == .pending);
+        var encoded = try SourcePlanHttp.native.Encoded.init(a2, .{ .root = root_scope, .spec = spec, .action = .chunk, .chunk = bytes });
+        defer encoded.deinit();
+        request.command = encoded.command;
+        try std.testing.expect((try requestControl(a2, executor, source_plan_endpoint, token, fence_json, request)).confirmed());
+        request.command = .{ .version = 1, .root = root_scope, .spec = spec, .action = .seal };
+        const sealed = try requestControl(a2, executor, source_plan_endpoint, token, fence_json, request);
+        const seal = sealed.outcome.?.applied.seal.?;
+        const repeated = try requestControl(a2, executor, source_plan_endpoint, token, fence_json, request);
+        try std.testing.expectEqual(seal, repeated.outcome.?.applied.seal.?);
+        const query: SourcePlanHttp.control.Query = .{ .root = root_scope, .spec = spec, .minimum_applied_index = sealed.receipt.?.index };
+        const read: SourcePlanHttp.ChunkRequest = .{ .version = 1, .source_owner = original_owner, .request = .{ .query = query, .seal = seal, .ordinal = 0 } };
+        var read_response = try post(a2, executor, source_plan_endpoint, "chunk-v1", token, fence_json, read);
+        defer read_response.deinit(a2);
+        try std.testing.expectEqual(@as(u16, 200), read_response.status);
+        const owned = try SourcePlanHttp.native.decodeChunkReply(a2, read.request, read_response.body);
+        defer a2.free(owned.bytes);
+        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
+        const remote_owned = try origin_server.sourcePlanChunkPort().read(a2, fence, "docs", read, .{});
+        defer a2.free(remote_owned.bytes);
+        try std.testing.expectEqualSlices(u8, owned.bytes, remote_owned.bytes);
+        var restored = try frozen.Plan.restoreFrozen(a2, owned.bytes, spec.plan_digest);
+        defer restored.deinit();
+        try std.testing.expectEqual(purpose, restored.source_purpose.?);
+        try std.testing.expectEqual(input.admission.digest(), restored.admission.digest());
+        var replaced = original_owner;
+        replaced.table_binding[0] ^= 1;
+        const wrong_query: SourcePlanHttp.control.Query = .{ .root = try SourcePlanHttp.entry.rootFor(replaced), .minimum_applied_index = 1 };
+        var wrong = try post(a2, executor, source_plan_endpoint, "observe-v1", token, fence_json, SourcePlanHttp.ObserveRequest{ .version = 1, .source_owner = replaced, .query = wrong_query });
+        defer wrong.deinit(a2);
+        try std.testing.expectEqual(@as(u16, 409), wrong.status);
+        request.command.action = .fence;
+        try std.testing.expect((try requestControl(a2, executor, source_plan_endpoint, token, fence_json, request)).confirmed());
+        request.command.action = .reclaim;
+        try std.testing.expect((try requestControl(a2, executor, source_plan_endpoint, token, fence_json, request)).outcome.?.applied.reclamation != null);
+        var expired = try post(a2, executor, source_plan_endpoint, "chunk-v1", token, fence_json, read);
+        defer expired.deinit(a2);
+        try std.testing.expectEqual(@as(u16, 409), expired.status);
+        // Exercise the delivery bridge itself with the production routed ports.
+        const Transfer = @import("../api/source_plan_delivery.zig").Transfer;
+        const artifact = @import("../metadata/source_artifact_control.zig");
+        var next_spec = spec;
+        const next_quota = try origin_server.sourcePlanObservePort().read(a2, fence, "docs", quota_input, .{});
+        next_spec.storage_epoch = next_quota.quota.epoch;
+        next_spec.namespace = storage.namespaceFor(root_scope, next_spec.storage_epoch);
+        std.mem.writeInt(u64, next_spec.attempt[0..8], 2, .big);
+        const transfer: Transfer = .{ .owner = original_owner, .fence = fence, .table = "docs", .spec = next_spec, .controls = origin_server.sourcePlanControlPort(), .observations = origin_server.sourcePlanObservePort(), .chunks = origin_server.sourcePlanChunkPort() };
+        var artifact_record: artifact.Record = .{ .reservation = @splat(215), .spec = .{ .namespace = next_spec.namespace, .binding = next_spec.binding, .domain = next_spec.domain, .attempt = next_spec.attempt, .bytes = next_spec.bytes, .checksum = next_spec.checksum, .plan_digest = next_spec.plan_digest } };
+        const bridge_seal_stamp = try transfer.seal(a2, artifact_record, bytes, .{});
+        try std.testing.expectEqual(bridge_seal_stamp, (try transfer.recoverSeal(a2, artifact_record, .{})).?);
+        artifact_record.stamp = bridge_seal_stamp;
+        artifact_record.phase = .sealed;
+        const recovered_bytes = try transfer.load(a2, artifact_record, .{});
+        defer a2.free(recovered_bytes);
+        try std.testing.expectEqualSlices(u8, bytes, recovered_bytes);
+        var recovered_plan = try frozen.Plan.restoreFrozen(a2, recovered_bytes, next_spec.plan_digest);
+        defer recovered_plan.deinit();
+        try std.testing.expectEqual(purpose, recovered_plan.source_purpose.?);
+        artifact_record.phase = .garbage;
+        artifact_record.retirement = @splat(216);
+        try std.testing.expect((try transfer.reclaim(a2, artifact_record, .{})) != null);
+        try @import("../api/source_destination_native_test.zig").verify(a2, origin_server, fence, original_owner);
+    }
+};

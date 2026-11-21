@@ -37,6 +37,7 @@ const replay_reference = @import("db/derived/replay_reference.zig");
 const internal_keys = @import("internal_keys.zig");
 const replay_journal_format = @import("replay_journal_format.zig");
 const retained_effects = @import("retained_effects.zig");
+const committed_history = @import("committed_history.zig");
 const artifact_payload = @import("artifact_payload.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
@@ -618,6 +619,7 @@ pub const DocStore = struct {
     // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
     // this before its commit; an aborted admission merely leaves a safe probe.
     retained_effects_cache: std.atomic.Value(u8) = .init(0),
+    committed_history_cache: std.atomic.Value(u8) = .init(0),
     runtime_store: backend_erased.Store,
     owns_runtime_store: bool,
     owned_lsm_backend: ?lsm_backend.BackendHandle,
@@ -705,6 +707,7 @@ pub const DocStore = struct {
     pub const Txn = struct {
         range_mutation: @import("range_protection.zig").Mutation = .{},
         retained: retained_effects.Capture = .{},
+        history: committed_history.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
@@ -769,6 +772,7 @@ pub const DocStore = struct {
 
         pub fn abort(self: *Txn) void {
             self.retained.deinit(self.alloc);
+            self.history.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
             const reader_owner = self.portable_import_reader_owner;
@@ -802,6 +806,7 @@ pub const DocStore = struct {
                 try self.artifact_inputs.stage(self, self.retained.staged);
                 try self.artifact_footprint.stage(self);
                 try self.document_revisions.stage(self);
+                try self.history.stage(self.alloc, self);
             }
             // NOT an `errdefer self.retained.deinit(...)` (and friends) here:
             // every caller of `commit()` in this codebase already pairs it
@@ -832,6 +837,7 @@ pub const DocStore = struct {
                 session.release();
             }
             self.retained.deinit(self.alloc);
+            self.history.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
             self.* = undefined;
@@ -1022,6 +1028,7 @@ pub const DocStore = struct {
             try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
             try self.artifact_footprint.touch(key, value);
             try self.range_mutation.touch(self, key);
+            try self.history.touch(self.alloc, self, key, value, if (self.columnar_owner) |owner| &owner.committed_history_cache else null);
             try self.artifact_inputs.touch(self.alloc, self, key, value);
             try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
             if (self.mutation_capture) |capture| try capture.touch(key);
@@ -1053,6 +1060,7 @@ pub const DocStore = struct {
             try self.document_revisions.touchValue(self.alloc, key, null);
             try self.artifact_footprint.touch(key, null);
             try self.range_mutation.touch(self, key);
+            try self.history.touch(self.alloc, self, key, null, if (self.columnar_owner) |owner| &owner.committed_history_cache else null);
             try self.artifact_inputs.touch(self.alloc, self, key, null);
             try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
             if (self.mutation_capture) |capture| try capture.touch(key);
@@ -1126,6 +1134,7 @@ pub const DocStore = struct {
     pub const Batch = struct {
         range_mutation: @import("range_protection.zig").Mutation = .{},
         retained: retained_effects.Capture = .{},
+        history: committed_history.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
@@ -1176,6 +1185,8 @@ pub const DocStore = struct {
         pub const BatchTxn = struct {
             range_mutation: *@import("range_protection.zig").Mutation,
             retained: *retained_effects.Capture,
+            history: *committed_history.Capture,
+            history_cache: ?*std.atomic.Value(u8) = null,
             artifact_inputs: *@import("artifact_input_capture.zig").Capture,
             artifact_footprint: *@import("artifact_footprint.zig").Capture,
             document_revisions: *@import("document_mutation_revision.zig").Capture,
@@ -1244,6 +1255,7 @@ pub const DocStore = struct {
                 try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
+                try self.history.touch(self.alloc, self, key, value, self.history_cache);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, value);
@@ -1259,6 +1271,11 @@ pub const DocStore = struct {
             }
 
             fn appendPutChecked(self: @This(), key: []const u8, value: []const u8, retirement_checked: bool) anyerror!void {
+                // Capturing historical values requires a read view. Leave the
+                // unordered append arena once, rather than draining it for
+                // every row while an outbound history consumer is active.
+                try self.history.touch(self.alloc, self, key, value, self.history_cache);
+                if (self.unordered_bulk_append_puts and self.history.enabled) return error.Unsupported;
                 if (std.mem.startsWith(u8, key, internal_keys.graph_endpoint_cleanup_prefix) and self.unordered_bulk_append_puts) return error.Unsupported;
                 try updateGraphOwningTable(self, key, value);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
@@ -1317,6 +1334,7 @@ pub const DocStore = struct {
                 try self.document_revisions.touchValue(self.alloc, key, null);
                 try self.artifact_footprint.touch(key, null);
                 try self.range_mutation.touch(self, key);
+                try self.history.touch(self.alloc, self, key, null, self.history_cache);
                 try self.artifact_inputs.touch(self.alloc, self, key, null);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, null);
@@ -1388,6 +1406,7 @@ pub const DocStore = struct {
 
         pub fn abort(self: *Batch) void {
             self.retained.deinit(self.alloc);
+            self.history.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
             const payload_session = self.payload_session;
@@ -1478,6 +1497,7 @@ pub const DocStore = struct {
                     session.release();
                 }
                 self.batch.retained.deinit(self.batch.alloc);
+                self.batch.history.deinit(self.batch.alloc);
                 self.batch.artifact_inputs.deinit(self.batch.alloc);
                 self.batch.document_revisions.deinit(self.batch.alloc);
                 if (self.bump_columnar_revision) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
@@ -1501,6 +1521,7 @@ pub const DocStore = struct {
                 try self.artifact_inputs.stage(self.asTxn(), self.retained.staged);
                 try self.artifact_footprint.stage(self.asTxn());
                 try self.document_revisions.stage(self.asTxn());
+                try self.history.stage(self.alloc, self.asTxn());
             }
             // NOT an `errdefer` deinit of these three here, matching
             // `Txn.commit`: `backend_erased.Batch.commitStaged` only swaps
@@ -1543,6 +1564,8 @@ pub const DocStore = struct {
             return .{
                 .range_mutation = &self.range_mutation,
                 .retained = &self.retained,
+                .history = &self.history,
+                .history_cache = if (self.columnar_owner) |owner| &owner.committed_history_cache else null,
                 .artifact_inputs = &self.artifact_inputs,
                 .artifact_footprint = &self.artifact_footprint,
                 .document_revisions = &self.document_revisions,
@@ -2617,6 +2640,7 @@ pub const DocStore = struct {
     pub fn finishPortableImportPublication(self: *DocStore) void {
         self.source_certificates.end();
         self.retained_effects_cache.store(0, .release);
+        self.committed_history_cache.store(0, .release);
         std.debug.assert(self.portable_import_reader_state.load(.monotonic) == portable_import_publication_bit);
         self.portable_import_reader_state.store(0, .release);
     }
@@ -2782,7 +2806,7 @@ pub const DocStore = struct {
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
     ) !void {
-        return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null);
+        return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null, 0);
     }
 
     /// Shared preparation for `putBatchWithReplayOnceAndParticipant` and its
@@ -2796,6 +2820,7 @@ pub const DocStore = struct {
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
     ) !Batch {
         const has_owner_job = blk: {
             for (writes) |write| if (internal_keys.isGraphOwnerReplayJobKey(write.key)) break :blk true;
@@ -2807,6 +2832,7 @@ pub const DocStore = struct {
         // so bulk ingestion never needs a foreground whole-store backfill.
         var batch = try self.beginWriteBatchWithOptions(options);
         errdefer batch.abort();
+        batch.history.history_commit_time_ns = history_commit_time_ns;
         if (participant) |observer| try batch.setCommitParticipant(observer);
         var txn = batch.asTxn();
         const graph_bulk = bulk_candidate and !try graphBulkIncomingNeedsDelete(self.alloc, txn, writes);
@@ -2850,8 +2876,9 @@ pub const DocStore = struct {
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
     ) !void {
-        var batch = try self.prepareBatchWithReplayAndParticipant(writes, deletes, replay, options, participant);
+        var batch = try self.prepareBatchWithReplayAndParticipant(writes, deletes, replay, options, participant, history_commit_time_ns);
         errdefer batch.abort();
         try batch.commit();
     }
@@ -2927,10 +2954,11 @@ pub const DocStore = struct {
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
     ) !StagedDocBatch {
         const batch_box = try self.alloc.create(Batch);
         errdefer self.alloc.destroy(batch_box);
-        batch_box.* = try self.prepareBatchWithReplayAndParticipant(writes, deletes, replay, options, participant);
+        batch_box.* = try self.prepareBatchWithReplayAndParticipant(writes, deletes, replay, options, participant, history_commit_time_ns);
         errdefer batch_box.abort();
         const staged = try batch_box.commitStaged();
         return .{
@@ -2955,9 +2983,22 @@ pub const DocStore = struct {
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
     ) !StagedDocBatch {
+        return self.putBatchWithHistoryTimeStaged(io, writes, deletes, replay, options, participant, 0);
+    }
+
+    pub fn putBatchWithHistoryTimeStaged(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
+    ) !StagedDocBatch {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            return self.putBatchWithReplayStagedOnceAndParticipant(writes, deletes, replay, options, participant) catch |err| switch (err) {
+            return self.putBatchWithReplayStagedOnceAndParticipant(writes, deletes, replay, options, participant, history_commit_time_ns) catch |err| switch (err) {
                 error.WriterLocked => {
                     if (attempt >= writer_locked_retry_count) return err;
                     backoffWriterLockRetry(io);
@@ -3003,9 +3044,24 @@ pub const DocStore = struct {
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
     ) !void {
+        return self.putBatchWithHistoryTime(io, writes, deletes, replay, options, participant, 0);
+    }
+
+    /// The caller supplies a native clock sample or a protocol-qualified
+    /// deterministic clock from the ordered entry.
+    pub fn putBatchWithHistoryTime(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
+    ) !void {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, participant) catch |err| switch (err) {
+            self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, participant, history_commit_time_ns) catch |err| switch (err) {
                 error.WriterLocked => {
                     if (attempt >= writer_locked_retry_count) return err;
                     backoffWriterLockRetry(io);
@@ -4529,6 +4585,220 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "docstore committed history captures initial and final images atomically across batches and rollback" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const namespace: committed_history.frame.Namespace = @splat(7);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        try txn.commit();
+    }
+    const a = try internal_keys.documentKeyAlloc(alloc, "a");
+    defer alloc.free(a);
+    const b = try internal_keys.documentKeyAlloc(alloc, "b");
+    defer alloc.free(b);
+    try store.put(a, "original");
+    try store.put(internal_keys.public_schema_json_key, "schema-one");
+    var consumer: committed_history.Consumer = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        consumer = try committed_history.admit(&txn, namespace, @splat(1), committed_history.default_limit, 1000, 1);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(a, "intermediate");
+        try txn.put(a, "replacement");
+        try txn.put(b, "inserted");
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        try txn.put(a, "aborted");
+        txn.abort();
+    }
+    {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(internal_keys.public_schema_json_key, "schema-two");
+        try batch.put(a, "final");
+        try batch.delete(b);
+        batch.history.history_commit_time_ns = 123456789;
+        try batch.commit();
+    }
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(u64, 2), (try committed_history.load(&txn)).?.latest);
+    for (1..3) |sequence| {
+        const descriptor_raw = try scratch.dupe(u8, try txn.get(&committed_history.recordKey(sequence)));
+        const descriptor = try committed_history.frame.Descriptor.decode(descriptor_raw, namespace, sequence);
+        var source = try committed_history.ChunkSource(DocStore.Txn).init(alloc, &txn, descriptor);
+        defer source.deinit();
+        var reader: committed_history.frame.Reader = .{ .descriptor = descriptor, .source = source.source() };
+        const header = try reader.header(scratch);
+        try std.testing.expectEqual(@as(i64, if (sequence == 1) 0 else 123456789), header.value.committed_at_ns);
+        try std.testing.expectEqual(committed_history.frame.TransactionScope.root_local, header.value.transaction_scope);
+        try std.testing.expectEqual(@as(u32, 2), header.count);
+        try std.testing.expectEqualStrings("schema-one", header.value.schema_before.?);
+        try std.testing.expectEqualStrings(if (sequence == 1) "schema-one" else "schema-two", header.value.schema_after.?);
+        const first = (try reader.next(scratch)).?;
+        try std.testing.expectEqualSlices(u8, a, first.key);
+        try std.testing.expectEqualStrings(if (sequence == 1) "original" else "replacement", first.before.?);
+        try std.testing.expectEqualStrings(if (sequence == 1) "replacement" else "final", first.after.?);
+        const second = (try reader.next(scratch)).?;
+        try std.testing.expectEqualSlices(u8, b, second.key);
+        if (sequence == 1) {
+            try std.testing.expect(second.operation() == .insert);
+            try std.testing.expectEqualStrings("inserted", second.after.?);
+        } else {
+            try std.testing.expect(second.operation() == .delete);
+            try std.testing.expectEqualStrings("inserted", second.before.?);
+        }
+        try std.testing.expect((try reader.next(scratch)) == null);
+    }
+    try std.testing.expectEqual(@as(u64, 0), consumer.start);
+}
+
+test "docstore committed history reserves prepared effects before voting and releases with resolution" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const namespace: committed_history.frame.Namespace = @splat(8);
+    var consumer: committed_history.Consumer = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        consumer = try committed_history.admit(&txn, namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
+        try txn.commit();
+    }
+    const primary = try internal_keys.documentKeyAlloc(alloc, "row");
+    defer alloc.free(primary);
+    const intent = "\x00\x00__txn_intents__:" ++ "0123456789abcdef" ++ ":row";
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(intent, "\x00{\"id\":\"row\"}");
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        const state = (try committed_history.load(&txn)).?;
+        try std.testing.expect(state.reserved_bytes > 2 * 1024 * 1024);
+        try std.testing.expectEqual(@as(u64, 0), state.latest);
+    }
+    const filler = try alloc.alloc(u8, 2560 * 1024);
+    defer alloc.free(filler);
+    @memset(filler, 'x');
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.put(primary, filler);
+        try std.testing.expectError(error.HistoryFull, txn.commit());
+    }
+    try std.testing.expectError(error.NotFound, store.get(alloc, primary));
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(primary, "{\"id\":\"row\"}");
+        try txn.delete(intent);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const state = (try committed_history.load(&txn)).?;
+        try std.testing.expectEqual(@as(u64, 0), state.reserved_bytes);
+        try std.testing.expectEqual(@as(u64, 1), state.latest);
+        try std.testing.expect(try committed_history.reclaim(&txn, namespace));
+        try std.testing.expectEqual(@as(u64, 0), (try committed_history.load(&txn)).?.reclaimed);
+        try committed_history.acknowledge(&txn, namespace, consumer.id, consumer.epoch, 0, 1);
+        try std.testing.expect(try committed_history.reclaim(&txn, namespace));
+        try std.testing.expectEqual(@as(u64, 0), (try committed_history.load(&txn)).?.retained_bytes);
+        try std.testing.expectError(error.HistoryResynchronizationRequired, committed_history.read(alloc, &txn, namespace, consumer.id, consumer.epoch, 0));
+        try txn.commit();
+    }
+}
+
+test "docstore committed history consumer epochs fence stale cursors and protect other consumers" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const namespace: committed_history.frame.Namespace = @splat(9);
+    const intent = "\x00\x00__txn_intents__:" ++ "0123456789abcdef" ++ ":row";
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        try txn.commit();
+    }
+    try store.put(intent, "\x00before-enrollment");
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.HistoryPreparedTransactionsPresent, committed_history.admit(&txn, namespace, @splat(1), committed_history.default_limit, 1000, 1));
+    }
+    try store.delete(intent);
+    var first: committed_history.Consumer = undefined;
+    var second: committed_history.Consumer = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        first = try committed_history.admit(&txn, namespace, @splat(1), committed_history.default_limit, 1000, 1);
+        second = try committed_history.admit(&txn, namespace, @splat(2), committed_history.default_limit, 1000, 1);
+        try txn.commit();
+    }
+    const row = try internal_keys.documentKeyAlloc(alloc, "row");
+    defer alloc.free(row);
+    try store.put(row, "event");
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try committed_history.acknowledge(&txn, namespace, first.id, first.epoch, 0, 1);
+        try std.testing.expect(try committed_history.reclaim(&txn, namespace));
+        try std.testing.expectEqual(@as(u64, 0), (try committed_history.load(&txn)).?.reclaimed);
+        try std.testing.expectError(error.HistoryCheckpointConflict, committed_history.acknowledge(&txn, namespace, first.id, first.epoch, 0, 1));
+        try committed_history.release(&txn, namespace, second.id, second.epoch);
+        try std.testing.expect(try committed_history.reclaim(&txn, namespace));
+        try std.testing.expectEqual(@as(u64, 0), (try committed_history.load(&txn)).?.retained_bytes);
+        try committed_history.release(&txn, namespace, first.id, first.epoch);
+        const replacement = try committed_history.admit(&txn, namespace, first.id, committed_history.default_limit, 2000, 2);
+        try std.testing.expect(replacement.epoch > second.epoch);
+        try std.testing.expectEqual(@as(u64, 1), replacement.start);
+        try std.testing.expectError(error.HistoryResynchronizationRequired, committed_history.read(alloc, &txn, namespace, first.id, first.epoch, 1));
+        try std.testing.expectError(error.HistoryResynchronizationRequired, committed_history.read(alloc, &txn, @splat(8), first.id, replacement.epoch, 1));
+        try committed_history.release(&txn, namespace, replacement.id, replacement.epoch);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.put(row, "must-roll-back");
+        try std.testing.expectError(error.HistoryMixedControl, committed_history.admit(&txn, namespace, first.id, committed_history.default_limit, 3000, 3));
+    }
+    const value = try store.get(alloc, row);
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("event", value);
 }
 
 test "docstore put/get/delete" {
@@ -7522,6 +7792,251 @@ test "docstore scoped owned batches pin one generation and release external payl
     try std.testing.expectEqual(@as(u64, 128), after.get_many_sorted_calls - before.get_many_sorted_calls);
     try std.testing.expectEqual(@as(u64, 384), after.get_many_sorted_keys - before.get_many_sorted_keys);
     try std.testing.expect(budget.live < baseline + 64 * 1024);
+}
+
+test "docstore committed history metadata grants fence late enrollment without per consumer tombstones" {
+    const control = @import("history_consumer.zig");
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(a, path, .{});
+    var open = true;
+    defer if (open) store.close();
+    const namespace: control.Namespace = @splat(7);
+    const incarnation: control.Digest = @splat(9);
+    const first: control.Grant = .{ .namespace = namespace, .authority = incarnation, .sequence = 1, .consumer = @splat(1), .definition = @splat(4), .expires_at_seconds = 1000, .policy_revision = 1 };
+    var second = first;
+    second.sequence = 2;
+    second.consumer = @splat(2);
+    var first_native: committed_history.Consumer = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        first_native = try control.enroll(&txn, first);
+        // Simulate a lost enrollment reply: the metadata owner will retire the
+        // original grant without knowing its allocated native consumer epoch.
+        _ = try control.enroll(&txn, second);
+        try txn.commit();
+    }
+    const row = try internal_keys.documentKeyAlloc(a, "retained");
+    defer a.free(row);
+    try store.put(row, "one committed frame");
+    var ref: control.Reference = .{ .namespace = namespace, .authority = incarnation, .consumer = first.consumer, .epoch = first_native.epoch, .grant = first.sequence, .definition = first.definition };
+    const closed_second: control.Retirement = .{ .namespace = namespace, .authority = incarnation, .consumer = second.consumer, .definition = second.definition, .grant = second.sequence, .sequence = 3 };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try control.acknowledge(&txn, ref, 0, 1);
+        // Lost ACK response is idempotent; the other consumer still pins frame 1.
+        try control.acknowledge(&txn, ref, 0, 1);
+        _ = try committed_history.reclaim(&txn, namespace);
+        try std.testing.expectEqual(@as(u64, 0), (try committed_history.load(&txn)).?.reclaimed);
+        try control.retire(&txn, closed_second);
+        try control.retire(&txn, closed_second);
+        _ = try committed_history.reclaim(&txn, namespace);
+        try std.testing.expectEqual(@as(u64, 1), (try committed_history.load(&txn)).?.reclaimed);
+        try control.renew(&txn, ref, 1000, 2000);
+        try control.renew(&txn, ref, 1000, 2000);
+        const retried = try control.enroll(&txn, first);
+        try std.testing.expectEqual(@as(u64, 2000), retried.expires_at_seconds);
+        try std.testing.expectEqual(first_native.epoch, retried.epoch);
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, second));
+        var unknown = second;
+        unknown.consumer = @splat(3);
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, unknown));
+        try std.testing.expectEqual(@as(u64, 3), (try control.load(&txn)).?.floor);
+        try std.testing.expectEqual(@as(u64, 2000), (try control.inspect(&txn, ref)).expires_at_seconds);
+    }
+    // An older surviving consumer is not invalidated by another feed's cleanup.
+    var refreshed = first;
+    refreshed.sequence = 4;
+    refreshed.expires_at_seconds = 2000;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const native = try control.enroll(&txn, refreshed);
+        try std.testing.expectEqual(first_native.epoch, native.epoch);
+        try std.testing.expectEqual(@as(u64, 0), native.start);
+        try std.testing.expectEqual(@as(u64, 1), native.acknowledged);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.HistoryConsumerConflict, control.inspect(&txn, ref));
+        var old_close = closed_second;
+        old_close.consumer = first.consumer;
+        old_close.grant = first.sequence;
+        old_close.sequence = 5;
+        try std.testing.expectError(error.HistoryConsumerConflict, control.retire(&txn, old_close));
+    }
+    ref.grant = refreshed.sequence;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try control.retire(&txn, .{ .namespace = namespace, .authority = incarnation, .consumer = ref.consumer, .definition = ref.definition, .grant = ref.grant, .sequence = 5 });
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u64, 5), (try control.load(&txn)).?.floor);
+        try std.testing.expect(!(try committed_history.load(&txn)).?.active());
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, refreshed));
+    }
+}
+
+test "docstore committed history consumer retirement before enrollment and rollback preserve fencing" {
+    const control = @import("history_consumer.zig");
+    const a = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const namespace: control.Namespace = @splat(7);
+    const grant: control.Grant = .{ .namespace = namespace, .authority = @splat(9), .sequence = 1, .consumer = @splat(1), .definition = @splat(4), .expires_at_seconds = 1000, .policy_revision = 1 };
+    const closed: control.Retirement = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .definition = grant.definition, .grant = 1, .sequence = 2 };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        _ = try control.enroll(&txn, grant);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(?control.State, null), try control.load(&txn));
+        try std.testing.expectEqual(@as(?committed_history.State, null), try committed_history.load(&txn));
+        try control.retire(&txn, closed);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, grant));
+        var newer = grant;
+        newer.sequence = 3;
+        newer.consumer = @splat(2);
+        _ = try control.enroll(&txn, newer);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const persisted = (try control.load(&txn)).?;
+        try std.testing.expectEqual(@as(u64, 2), persisted.floor);
+        try std.testing.expectEqual(@as(?committed_history.State, null), try committed_history.load(&txn));
+        var corrupt = persisted.encode();
+        corrupt[60] ^= 1;
+        try std.testing.expectError(error.HistoryCorrupt, control.State.decode(&corrupt));
+        var wrong = grant;
+        wrong.sequence = 3;
+        wrong.authority = @splat(8);
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, wrong));
+        const row = try internal_keys.documentKeyAlloc(a, "must rollback");
+        defer a.free(row);
+        try txn.put(row, "value");
+        try std.testing.expectError(error.HistoryMixedControl, control.retire(&txn, closed));
+    }
+}
+
+test "docstore source artifact abort reopen and bounded reclamation preserve authority" {
+    const artifact = @import("source_plan_storage.zig");
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(a, path, .{});
+    var open = true;
+    defer if (open) store.close();
+    var root: artifact.Root = .{ .authority = .native, .namespace = @splat(0), .generation = 0, .fence = @splat(4) };
+    std.mem.writeInt(u64, root.namespace[0..8], 1, .big);
+    var frame: [128]u8 = @splat(0);
+    @memcpy(frame[0..4], "AFP1");
+    std.mem.writeInt(u32, frame[4..8], 1, .little);
+    std.mem.writeInt(u64, frame[8..16], 10, .little);
+    std.mem.writeInt(u64, frame[16..24], 11, .little);
+    std.mem.writeInt(u64, frame[24..32], 1, .little);
+    const digest = try artifact.frozenDigest(&frame);
+    @memcpy(frame[32..64], &digest);
+    var checksum: artifact.Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&frame, &checksum, .{});
+    const hashes = [_]artifact.Digest{artifact.chunkDigest(0, &frame)};
+    var attempt: [16]u8 = @splat(1);
+    std.mem.writeInt(u64, attempt[0..8], 1, .big);
+    const spec: artifact.Spec = .{ .namespace = artifact.namespaceFor(root, 1), .storage_epoch = 1, .binding = @splat(2), .domain = artifact.domainFor(@splat(2)), .attempt = attempt, .bytes = frame.len, .checksum = checksum, .plan_digest = digest, .chunk_hashes = &hashes };
+    var position: artifact.Digest = @splat(0);
+    std.mem.writeInt(u64, position[0..8], 1, .little);
+    position[31] = 2;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try artifact.stageBegin(a, &txn, root, spec);
+        try artifact.stageChunk(a, &txn, root, spec, 0, &frame);
+    }
+    var seal: artifact.Digest = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(u16, 0), (try artifact.readQuota(&txn, root)).active);
+        try artifact.stageBegin(a, &txn, root, spec);
+        try artifact.stageChunk(a, &txn, root, spec, 0, &frame);
+        seal = try artifact.stageSeal(a, &txn, root, spec, position);
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const bytes = try artifact.readSealedAlloc(a, &txn, root, spec, seal);
+        defer a.free(bytes);
+        try std.testing.expectEqualSlices(u8, &frame, bytes);
+        std.mem.writeInt(u64, position[0..8], 2, .little);
+        _ = try artifact.stageFence(a, &txn, root, spec, position);
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectError(error.SourceReceiptExpired, artifact.stageBegin(a, &txn, root, spec));
+        try std.testing.expect(try artifact.stageReclaim(a, &txn, root, spec, 1));
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expect(try artifact.reclaimed(&txn, root, spec));
+        try std.testing.expectEqual(@as(u64, 0), (try artifact.readQuota(&txn, root)).reserved);
+        try std.testing.expectError(error.SourceReceiptExpired, artifact.stageBegin(a, &txn, root, spec));
+    }
 }
 
 fn writeLegacyReplayJournal(store: *DocStore) !void {

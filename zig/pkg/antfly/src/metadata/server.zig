@@ -148,6 +148,11 @@ pub const MetadataServer = struct {
     restore_supervisor_owner_id: u64 = 0,
     restore_supervisor_stop: std.atomic.Value(bool) = .init(false),
 
+    fn resolveCdcLakeOptions(raw: *anyopaque, a: std.mem.Allocator, request: @import("replication_backfill.zig").ExternalStreamDestination.Request) !@import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions {
+        const api: *public_api_kernel.ApiHttpServer = @ptrCast(@alignCast(raw));
+        return api.lakeStreamOwnerOptions(.{ .allocator = a, .table = request.table, .request = .{ .deadline_ns = request.deadline_ns } });
+    }
+
     pub fn init(
         alloc: std.mem.Allocator,
         cfg: MetadataServerConfig,
@@ -283,6 +288,8 @@ pub const MetadataServer = struct {
                 },
                 metadata_http_server.AdminSource.fromMetadataHttpService(svc),
             );
+            admin_http_server.changefeed_scan = @import("../api/changefeed_metadata.zig").ScanPort.fromService(svc);
+            admin_http_server.pg_publications = @import("pg_publication.zig").Port.fromService(svc);
             owned_admin_http_server = admin_http_server;
 
             const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(svc);
@@ -411,6 +418,11 @@ pub const MetadataServer = struct {
                 return err;
             };
             owned_public_http_server = public_http_server;
+            if (api_server_cfg.node_config) |node| {
+                const storage = node.storage.artifacts;
+                if (storage.connection != null and storage.bucket != null)
+                    svc.installCdcLakeOwner(.{ .ptr = public_http_server, .resolve = resolveCdcLakeOptions });
+            }
             try public_http_server.attachReplicatedRestoreJobStore(metadataRestoreJobPersistence(svc));
             public_http_server.bindIncomingGraphRoutes(public_read_source.source());
 
@@ -478,6 +490,7 @@ pub const MetadataServer = struct {
 
     pub fn deinitWithDeadline(self: *MetadataServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         self.stopRestoreSupervisor();
+        self.svc.drainCdcJobs();
         if (self.transition_ops_registration) |*registration| registration.deinit();
         self.transition_ops_registration = null;
         if (self.owned_admin_listener) |listener| {
@@ -2002,6 +2015,14 @@ test "metadata server can expose admin listener endpoints" {
     defer snapshot.deinit();
     try std.testing.expectEqual(@as(usize, 1), snapshot.value.tables.len);
     try std.testing.expectEqualStrings("docs", snapshot.value.tables[0].name);
+    const scope_uri = try std.fmt.allocPrint(std.heap.page_allocator, "{s}{s}", .{ admin_base_uri, @import("../api/source_scope_metadata.zig").path });
+    defer std.heap.page_allocator.free(scope_uri);
+    var forged_scope = try executor.executor().execute(std.heap.page_allocator, .{ .method = .POST, .uri = scope_uri, .headers = &.{.{ .name = @import("../api/internal_service_auth.zig").header_name, .value = wrong_service_token }}, .body = "{}", .content_type = "application/json" });
+    defer forged_scope.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 401), forged_scope.status);
+    var scope_client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, executor.executor());
+    _ = scope_client.withInternalServiceAuth("metadata-service-secret-0123456789abcdef", "metadata-node");
+    try @import("source_scope_http_native_test.zig").verify(std.heap.page_allocator, server.svc, &scope_client, admin_base_uri);
 }
 
 test "metadata admin maps retryable authority loss to service unavailable" {

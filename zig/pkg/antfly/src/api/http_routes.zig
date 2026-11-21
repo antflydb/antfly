@@ -20,6 +20,8 @@ pub const sql_max_request_body_bytes: usize = 4 << 20;
 /// Transport admission shared by native and linked-kernel registrars. Resolve
 /// before buffering so a SQL request cannot consume the much larger batch cap.
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
+    if (isInternalSourcePlanPath(path)) return 2 * 1024 * 1024;
+    if (isInternalHistoryControlPath(path) or isInternalHistoryPagePath(path) or isInternalHistoryBootstrapPagePath(path) or isInternalHistoryGrantPath(path) or isInternalHistoryResolutionPath(path) or isInternalHistoryPublicationPath(path) or isInternalHistoryOwnerPath(path) or isInternalHistoryDecisionPath(path)) return 4096;
     if (isInternalDocumentReadPath(path)) return @import("antfly_public_limits").max_document_read_body_bytes;
     if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
     if (privacyMutationBodyLimit(path)) |limit| return limit;
@@ -68,6 +70,53 @@ pub const DocumentReadRequest = struct {
         return decoded;
     }
 };
+pub fn isInternalSourcePlanPath(path: []const u8) bool {
+    const prefix = "/internal/v1/groups/";
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    var pieces = std.mem.splitScalar(u8, path[prefix.len..], '/');
+    if ((pieces.next() orelse return false).len == 0) return false;
+    if (!std.mem.eql(u8, pieces.next() orelse return false, "tables")) return false;
+    if ((pieces.next() orelse return false).len == 0) return false;
+    if (!std.mem.eql(u8, pieces.next() orelse return false, "source-plan")) return false;
+    const leaf = pieces.next() orelse return false;
+    return (std.mem.eql(u8, leaf, "control-v1") or std.mem.eql(u8, leaf, "observe-v1") or std.mem.eql(u8, leaf, "chunk-v1")) and pieces.next() == null;
+}
+
+pub fn isInternalHistoryControlPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "control-v1");
+}
+pub fn isInternalHistoryPagePath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "page-v1");
+}
+pub fn isInternalHistoryBootstrapPagePath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "bootstrap-page-v1");
+}
+pub fn isInternalHistoryResolutionPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "resolution-v1");
+}
+pub fn isInternalHistoryDecisionPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "decision-v1");
+}
+pub fn isInternalHistoryOwnerPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "owner-v1");
+}
+pub fn isInternalHistoryPublicationPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "publication-v1");
+}
+pub fn isInternalHistoryGrantPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "grant-v1");
+}
+fn isInternalHistoryPath(path: []const u8, leaf: []const u8) bool {
+    const prefix = "/internal/v1/groups/";
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    var pieces = std.mem.splitScalar(u8, path[prefix.len..], '/');
+    if ((pieces.next() orelse return false).len == 0) return false;
+    if (!std.mem.eql(u8, pieces.next() orelse return false, "tables")) return false;
+    if ((pieces.next() orelse return false).len == 0) return false;
+    return std.mem.eql(u8, pieces.next() orelse return false, "history") and
+        std.mem.eql(u8, pieces.next() orelse return false, leaf) and pieces.next() == null;
+}
+
 pub fn isInternalDocumentReadPath(path: []const u8) bool {
     const prefix = "/internal/v1/groups/";
     if (!std.mem.startsWith(u8, path, prefix)) return false;
@@ -198,6 +247,25 @@ pub const Routes = struct {
     pub const internal_capabilities = "/internal/v1/capabilities";
     pub const batch_suffix = "/batch";
     pub const routed_batch_suffix = "/batch-routed-v1";
+    pub const source_plan_control_suffix = "/source-plan/control-v1";
+    pub const source_plan_observe_suffix = "/source-plan/observe-v1";
+    pub const source_scope_control_suffix = "/source-scope/control-v1";
+    pub const source_retirement_control_suffix = "/source-retirement/control-v1";
+    pub const source_scope_observe_suffix = "/source-scope/observe-v1";
+    pub const source_producer_closure_observe_suffix = "/source-producers/observe-v1";
+    pub const legacy_inventory_suffix = "/source-producers/legacy-inventory-v1";
+    pub const legacy_terminal_suffix = "/source-producers/legacy-terminal-v1";
+    pub const source_producer_close_suffix = "/source-producers/close-v1";
+    pub const source_checkpoint_observe_suffix = "/source-checkpoint/observe-v1";
+    pub const source_plan_chunk_suffix = "/source-plan/chunk-v1";
+    pub const history_control_suffix = "/history/control-v1";
+    pub const history_page_suffix = "/history/page-v1";
+    pub const history_bootstrap_page_suffix = "/history/bootstrap-page-v1";
+    pub const history_grant_suffix = "/history/grant-v1";
+    pub const history_resolution_suffix = "/history/resolution-v1";
+    pub const history_decision_suffix = "/history/decision-v1";
+    pub const history_owner_suffix = "/history/owner-v1";
+    pub const history_publication_suffix = "/history/publication-v1";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const backup_shard_suffix = "/backup-shard";

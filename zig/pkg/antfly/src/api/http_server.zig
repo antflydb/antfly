@@ -1635,6 +1635,7 @@ pub const ApiHttpServerConfig = struct {
     /// Node-local personal connection owner; never populated by distributed configuration.
     chatgpt: ?*@import("antfly_local_sources").chatgpt_manager.Manager = null,
     pgwire: ?common_config.Config.PgwireConfig = null,
+    pgwire_spool_store: ?@import("../serverless/artifacts/store.zig").ArtifactStore = null,
     restore_validation: ?@import("restore_catalog.zig").ValidationPort = null,
     auth_enabled: bool = false,
     experimental: bool = false,
@@ -1712,6 +1713,28 @@ pub const ApiHttpServerConfig = struct {
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     routed_raft_batch_writer: ?internal_group_operations.RoutedRaftBatchWriter = null,
+    native_source_plan_control: ?@import("source_plan_operations.zig").ControlPort = null,
+    native_source_plan_observe: ?@import("source_plan_operations.zig").ObservePort = null,
+    native_source_scope_control: ?@import("source_scope_control_operations.zig").Port = null,
+    native_source_retirement_control: ?@import("source_retirement_operations.zig").Port = null,
+    native_source_scope_observe: ?@import("source_scope_operations.zig").Port = null,
+    native_source_producer_closure_observe: ?@import("source_producer_closure_operations.zig").Port = null,
+    pgwire_replication: ?@import("sql_pgwire.zig").ReplicationFactory = null,
+    native_legacy_inventory: ?@import("source_legacy_inventory_operations.zig").Port = null,
+    native_legacy_terminal: ?@import("source_legacy_terminal_operations.zig").Port = null,
+    native_source_producer_control: ?@import("source_producer_control_operations.zig").Port = null,
+    native_source_checkpoint_observe: ?@import("source_checkpoint_operations.zig").Port = null,
+    native_source_plan_chunk: ?@import("source_plan_operations.zig").ChunkPort = null,
+    native_history_control: ?@import("history_control_operations.zig").Port = null,
+    native_history_bootstrap_page: ?@import("history_page_operations.zig").Bootstrap.Port = null,
+    native_history_page: ?@import("history_page_operations.zig").Port = null,
+    native_history_grant: ?@import("history_grant_operations.zig").Port = null,
+    native_history_resolution: ?@import("history_resolution_operations.zig").Port = null,
+    native_history_decision: ?@import("history_decision_operations.zig").Port = null,
+    native_history_owner: ?@import("history_owner_operations.zig").Port = null,
+    native_history_publication: ?@import("history_publication_operations.zig").Port = null,
+    /// Internal owner discovery and routed history transport; not public feed capability.
+    native_history_roots: ?@import("history_roots.zig").Source = null,
     /// Borrowed metadata receipt/topology notification generation. It affects
     /// only scheduling; every resumed owner operation revalidates its fences.
     restore_owner_progress_generation: ?*const std.atomic.Value(u64) = null,
@@ -2089,6 +2112,8 @@ pub const StatusSource = struct {
     /// it null; production constructors never assemble it from independent
     /// optional callbacks.
     routing: ?table_catalog.CatalogRoutingSource = null,
+    changefeeds: ?@import("changefeed_metadata.zig").Port = null,
+    pg_publications: ?@import("../metadata/pg_publication.zig").Port = null,
 
     pub const VTable = struct {
         supports_query_definitions: bool = false,
@@ -3224,6 +3249,8 @@ pub const StatusSource = struct {
             .ptr = svc,
             .vtable = &comptime makeHttpServiceVTable(),
             .routing = table_catalog.CatalogSource.fromMetadataHttpService(svc).routingSource() catch unreachable,
+            .changefeeds = @import("changefeed_metadata.zig").Port.fromService(svc),
+            .pg_publications = @import("../metadata/pg_publication.zig").Port.fromService(svc),
         };
     }
 
@@ -3232,6 +3259,8 @@ pub const StatusSource = struct {
             .ptr = svc,
             .vtable = &comptime makeServiceVTable(metadata_service.MetadataService),
             .routing = table_catalog.CatalogSource.fromMetadataService(svc).routingSource() catch unreachable,
+            .changefeeds = @import("changefeed_metadata.zig").Port.fromService(svc),
+            .pg_publications = @import("../metadata/pg_publication.zig").Port.fromService(svc),
         };
     }
 
@@ -5426,6 +5455,10 @@ pub const ApiHttpServer = struct {
         // admitted requests leave sixteen workers of completion headroom.
         requests: @import("httpx").RequestLimit = .{ .capacity = 8, .max_bytes = 64 * 1024 * 1024 },
     };
+    pub fn lakeStreamOwnerOptions(self: *ApiHttpServer, input: @import("lake_source_owner.zig").OptionsInput) !@import("lake_source_owner.zig").Options {
+        return @import("lake_source_owner.zig").options(input.allocator, self, input.table, input.request);
+    }
+
     pub fn lakeProviderTransport(self: *ApiHttpServer) !@import("antfly_local_sources").serverless_object_store_support.Transport {
         platform_sync.lockYielding(&self.lake_transport_mutex);
         defer self.lake_transport_mutex.unlock();
@@ -15080,6 +15113,9 @@ pub const ApiHttpServer = struct {
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        // This is the public serving role. Private/source commands use their
+        // own qualified ingress and cannot acquire ordinary authority here.
+        if ((req.source_producer != .unlabelled and req.source_producer != .ordinary) or req.transaction != null or req.online_source != null) return error.InvalidBatchRequest;
         try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
         self.validateTableWritesAgainstSchemaWithContext(request, table_name, req.writes) catch |err| switch (err) {
@@ -15103,6 +15139,7 @@ pub const ApiHttpServer = struct {
         const txn_writes: []const db_mod.types.TransactionWrite = @ptrCast(req.writes);
         const tables = [_]distributed_txn.TableCommitRequest{.{
             .table_name = table_name,
+            .source_producer = .ordinary,
             .bound_catalog_incarnation = request.bound_catalog_incarnation,
             .commit_requires = req.commit_requires,
             .writes = txn_writes,
@@ -15123,8 +15160,9 @@ pub const ApiHttpServer = struct {
         var retained_preparation: ?@import("antfly_local_sources").api_relational_integrity_commit.Prepared = null;
         defer if (retained_preparation) |*prepared| prepared.deinit();
         const outcome = (self.commitPublicTableBatchWithIntegrity(alloc, source, &tables, req.sync_level, request, &retained_preparation) catch |err| switch (err) {
+            error.ChangefeedCapabilityUnsupported => return error.Unavailable,
             error.UnsupportedCommitRequirement => return error.UnsupportedCommitRequirement,
-            error.CommitRequirementUnavailable => return error.Unavailable,
+            error.CommitRequirementUnavailable => return error.WriteUnavailable,
             error.CommitRequirementTooLarge, error.CommitRequirementFailed => return error.InvalidBatchRequest,
             error.RelationalIndexKeyTooLarge => return error.RelationalIndexKeyTooLarge,
             error.UniqueConstraintViolation => return error.UniqueConstraintViolation,
@@ -30654,7 +30692,7 @@ pub fn resourcePermissionsCurrentlyAllowed(alloc: std.mem.Allocator, authenticat
             break;
         };
     };
-    return manager.permissionsCurrentlyAllowed(identity.username, identity.credential_principal, logical);
+    return manager.permissionsCurrentlyAllowedWithUserInstance(identity.username, identity.credential_principal, logical, identity.user_instance_id);
 }
 
 pub fn tablePermissionCurrentlyAllowed(identity: ?AuthenticatedIdentity, table_name: []const u8, permission_type: usermgr.PermissionType) !bool {
@@ -30680,22 +30718,7 @@ pub fn resourcePermissionCurrentlyAllowed(
         break :logical table_name;
     };
 
-    if (std.mem.startsWith(u8, identity.credential_principal, "api-key:")) {
-        const key_id = identity.credential_principal["api-key:".len..];
-        const current = manager.effectiveApiKeyPermissions(key_id) catch |err| switch (err) {
-            error.ApiKeyNotFound, error.ApiKeyExpired, error.UserNotFound => return false,
-            else => return err,
-        };
-        defer freePermissions(manager.alloc, current);
-        return permissionsAllow(current, resource_type, logical_name, permission_type);
-    }
-
-    return try manager.permissionCurrentlyAllowed(
-        identity.username,
-        resource_type,
-        logical_name,
-        permission_type,
-    );
+    return manager.permissionsCurrentlyAllowedWithUserInstance(identity.username, identity.credential_principal, &.{.{ .resource_type = resource_type, .resource = logical_name, .permission_type = permission_type }}, identity.user_instance_id);
 }
 
 fn storedDestinationAllowedForIdentity(
@@ -31415,7 +31438,7 @@ fn trustedPrincipalPermissionsFromPayload(alloc: std.mem.Allocator, payload: std
             if (entry.key_ptr.len == 0 or std.mem.eql(u8, entry.key_ptr.*, "*") or entry.value_ptr.* != .array) return error.Unauthorized;
             for (entry.value_ptr.array.items) |operation| {
                 const name = jsonStringValue(operation) orelse return error.Unauthorized;
-                if (!std.mem.eql(u8, name, "read") and !std.mem.eql(u8, name, "write") and !std.mem.eql(u8, name, "admin")) return error.Unauthorized;
+                if (!std.mem.eql(u8, name, "read") and !std.mem.eql(u8, name, "write") and !std.mem.eql(u8, name, "admin") and !std.mem.eql(u8, name, "replicate")) return error.Unauthorized;
             }
             try appendTrustedPrincipalPermissionsForTable(alloc, &out, entry.key_ptr.*, entry.value_ptr.array.items);
         }
@@ -31448,6 +31471,8 @@ fn appendTrustedPrincipalPermissionsForTable(
             try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .read));
         } else if (std.mem.eql(u8, operation, "write")) {
             try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .write));
+        } else if (std.mem.eql(u8, operation, "replicate")) {
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .replicate));
         } else if (std.mem.eql(u8, operation, "admin")) {
             try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .admin));
         } else if (std.mem.eql(u8, operation, "*")) {
@@ -31931,6 +31956,7 @@ fn permissionTypeFromOpenApi(value: usermgr_openapi.PermissionType) usermgr.Perm
         .write => .write,
         .curator => .curator,
         .admin => .admin,
+        .replicate => .replicate,
     };
 }
 
@@ -31953,6 +31979,7 @@ fn permissionTypeToOpenApi(value: usermgr.PermissionType) usermgr_openapi.Permis
         .write => .write,
         .curator => .curator,
         .admin => .admin,
+        .replicate => .replicate,
     };
 }
 
@@ -43787,6 +43814,7 @@ test "api http server routes table batches through the batch commit hook" {
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -44300,7 +44328,7 @@ test "api http server serves public transaction commit route" {
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-txn", .{tmp.sub_path});
     defer alloc.free(path);
 
-    var db = try db_mod.DB.open(alloc, path, .{});
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native });
     defer db.close();
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -44414,6 +44442,7 @@ test "api http server surfaces structured participant diagnostics for unavailabl
         fn source(_: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = undefined,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -44531,6 +44560,7 @@ test "api http server surfaces structured decision conflicts for transaction com
         fn source(_: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = undefined,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -44638,6 +44668,7 @@ test "api http server surfaces structured doc identity conflicts for transaction
         fn source(_: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = undefined,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -44747,6 +44778,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
         fn source(_: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = undefined,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -44853,6 +44885,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
         fn source(_: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = undefined,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -60368,6 +60401,7 @@ pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedId
     const value = identity orelse return null;
     var owned = try cloneAuthenticatedIdentity(alloc, value.username, value.credential_principal, value.permissions, value.row_filter, value.metadata_json, value.roles);
     errdefer owned.deinit(alloc);
+    owned.user_instance_id = value.user_instance_id;
     owned.is_internal_service = value.is_internal_service;
     owned.mcp_creation_discovery = value.mcp_creation_discovery;
     owned.live_user_manager = value.live_user_manager;
@@ -63775,7 +63809,7 @@ test "SQL pgwire native replay routing rejection preserves an earlier unknown ex
         }
     };
     var fixture: Rejected = .{};
-    const writes: table_writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Rejected.batch, .commit_transaction_with_id = Rejected.commit } };
+    const writes: table_writes.TableWriteSource = .{ .ptr = &fixture, .supports_transaction_producers = true, .vtable = &.{ .batch = Rejected.batch, .commit_transaction_with_id = Rejected.commit } };
     var server = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, writes);
     defer server.deinit();
     var completion: @import("../pgwire/completion.zig").Completion = .{};
@@ -64771,6 +64805,29 @@ test "system catalog row filter composition rejects oversized tails with bounded
             // The unvisited tail must not affect composition allocations.
             try std.testing.expectEqual(expected, measured.allocated_bytes);
         } else prefix_allocation = measured.allocated_bytes;
+    }
+}
+
+test "trusted principal replication grants are explicit scoped and round trip through public permissions" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"table_operations\":{\"docs\":[\"replicate\"]}}",
+        "{\"tables\":[\"docs\"],\"operations\":[\"replicate\"]}",
+    }) |json| {
+        var payload = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer payload.deinit();
+        const grants = try trustedPrincipalPermissionsFromPayload(a, payload.value.object);
+        defer freePermissions(a, grants);
+        try std.testing.expect(permissionsAllow(grants, .table, "docs", .replicate));
+        try std.testing.expect(!permissionsAllow(grants, .table, "other", .replicate));
+        for ([_]usermgr.PermissionType{ .read, .write, .curator, .admin }) |permission| try std.testing.expect(!permissionsAllow(grants, .table, "docs", permission));
+        const public = try clonePermissionsToOpenApi(a, grants);
+        defer a.free(public);
+        try std.testing.expectEqual(usermgr_openapi.PermissionType.replicate, public[0].type);
+        try std.testing.expectEqual(usermgr.PermissionType.replicate, permissionTypeFromOpenApi(public[0].type));
+        const encoded = try std.json.Stringify.valueAlloc(a, public[0].type, .{});
+        defer a.free(encoded);
+        try std.testing.expectEqualStrings("\"replicate\"", encoded);
     }
 }
 

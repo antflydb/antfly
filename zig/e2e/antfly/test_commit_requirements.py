@@ -74,14 +74,28 @@ def test_direct_gate_commits_extraction_transforms_deletes_and_transactions(
         ), artifacts
 
     assert wait_until(configured, timeout_s=30, interval_s=0.1)
-    first = stateful_api.post(
-        f"/tables/{table}/batch",
-        {
-            "commit_requires": "direct_enrichments",
-            "sync_level": "write",
-            "inserts": {"doc": source("alpha%20beta"), "victim": source("retire")},
-        },
-    )
+    # Catalog publication precedes validation of the physical producer on
+    # each Raft owner. A definite pre-admission rejection can be retried.
+    deadline = time.monotonic() + 30
+    while True:
+        reply = stateful_api.s.post(
+            f"{stateful_api.url}/tables/{table}/batch",
+            json={
+                "commit_requires": "direct_enrichments",
+                "sync_level": "write",
+                "inserts": {"doc": source("alpha%20beta"), "victim": source("retire")},
+            },
+            timeout=15,
+        )
+        if (
+            reply.status_code != 503
+            or reply.text != "write unavailable"
+            or time.monotonic() >= deadline
+        ):
+            reply.raise_for_status()
+            break
+        time.sleep(0.1)
+    first = reply.json()
     assert first["status"].startswith("committed"), first
     assert_extracted("doc")
 

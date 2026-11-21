@@ -484,6 +484,16 @@ pub const StorageOwnerTransactionRecovery = struct {
         ));
     }
 
+    fn enqueueCompletion(ptr: *anyopaque, request: @import("antfly_local_sources").storage_history_recovery_wire.Request) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.enqueue_completion_fn orelse return error.ChangefeedCapabilityUnsupported;
+        try request.validate();
+        const raw = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(raw);
+        if (raw.len > @import("antfly_local_sources").storage_history_recovery_wire.max_bytes) return error.InvalidTxnRecord;
+        try callbackStatus(callback(self.config.callback_ctx, .fromSlice(raw)));
+    }
+
     pub fn dbConfig(self: *StorageOwnerTransactionRecovery) db_mod.transaction_runtime.Config {
         return @import("../storage/server_transaction_recovery.zig").configFor(StorageOwnerTransactionRecovery, self, serverConfig);
     }
@@ -502,6 +512,7 @@ pub const StorageOwnerTransactionRecovery = struct {
             .acknowledge_participant_fn = if (self.config.replicated_metadata != 0) acknowledgeParticipant else null,
             .acknowledge_participants_fn = if (self.config.replicated_metadata != 0 and self.config.acknowledge_participants_fn != null) acknowledgeParticipants else null,
             .cleanup_transaction_fn = if (self.config.replicated_metadata != 0) cleanupTransaction else null,
+            .enqueue_completion_fn = if (self.config.enqueue_completion_fn != null) enqueueCompletion else null,
         };
     }
 };
@@ -2328,6 +2339,41 @@ pub fn metadataApplyStoreProjection(
                 .fk_generation_publication_decision => |input| {
                     const value = handle.store.fkGenerationPublicationDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .changefeed_control => |input| {
+                    const value = handle.store.getChangefeedControl(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .changefeed_authority => {
+                    const value = handle.store.getChangefeedAuthority(a, group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .changefeed_maintenance => |input| {
+                    const value = handle.store.scanChangefeedMaintenance(a, group_id, input.now, input.after) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .source_control => |input| {
+                    const value = handle.store.getSourceControl(a, group_id, input.table_id, input.source_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .legacy_source_intake => |input| {
+                    const value = handle.store.legacyReplicationSourceIntakeAllowed(a, group_id, input.table_id, input.ordinal, input.definition) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .capture_source_scope => |input| {
+                    if (input.metadata_group_id != group_id) break :blk storageOwnerStatusFromError(error.InvalidSourceControl);
+                    var value = handle.store.captureSourceScope(a, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    defer value.deinit(a);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .pg_publication => |input| {
+                    var value = handle.store.getPgPublication(a, group_id, input.database, input.name) catch |err| break :blk storageOwnerStatusFromError(err);
+                    defer if (value) |*parsed| parsed.deinit();
+                    const encoded = if (value) |parsed|
+                        std.json.Stringify.valueAlloc(a, parsed.value, .{}) catch |err| break :blk storageOwnerStatusFromError(err)
+                    else
+                        null;
+                    break :blk metadataProjectionJson(alloc, out_json, encoded);
                 },
                 .fk_generation_publication_source_decision => |input| {
                     const value = handle.store.fkGenerationPublicationSourceDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
@@ -4620,6 +4666,466 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
         .ptr = response.ptr,
         .len = @intCast(response.len),
     };
+    return .ok;
+}
+
+pub fn storageOwnerTimestampedBatchAtRaftEntry(owner: ?*anyopaque, request: *const kernel_owner_abi.TimestampedBatchAtRaftEntryRequest) callconv(.c) kernel_owner_abi.Status {
+    const entry = request.entry;
+    if (entry.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (entry._reserved0 != 0 or entry.raft_term == 0 or entry.raft_index == 0 or request.committed_at_ns <= 0 or
+        entry.request_json.len == 0 or entry.request_json.len > 16 * 1024 * 1024 or
+        !borrowedBytesValid(entry.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, entry.table_name) orelse return .invalid_argument;
+    var parsed = batch_api.parseInternalBatchRequest(handle.alloc, entry.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer parsed.deinit(handle.alloc);
+    handle.db.applyOrderedTimestampedMutation(parsed.req, .{ .term = entry.raft_term, .index = entry.raft_index }, request.committed_at_ns, true) catch |err| {
+        return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    };
+    return .ok;
+}
+
+const source_plan_wire = @import("antfly_local_sources").storage_source_plan_wire;
+const source_plan_control = source_plan_wire.control;
+fn sourcePlanInputStatus(err: anyerror) kernel_owner_abi.Status {
+    return storageOwnerStatusFromError(switch (err) {
+        error.OutOfMemory, error.InvalidSourceAdmission, error.SourcePayloadConflict, error.InvalidSourcePlanWire => err,
+        else => error.InvalidSourcePlanWire,
+    });
+}
+fn sourcePlanResponse(out: *kernel_owner_abi.OwnedBytes, value: anytype) kernel_owner_abi.Status {
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, value, .{}) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+pub fn storageOwnerNativeSourcePlanControl(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > source_plan_wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var decoded = source_plan_wire.decode(handle.alloc, request.request_json.slice()) catch |err| return sourcePlanInputStatus(err);
+    defer decoded.deinit();
+    const result = handle.db.nativeSourcePlanControl(decoded.request) catch |err| return storageOwnerStatusFromError(err);
+    return sourcePlanResponse(out, result);
+}
+pub fn storageOwnerOrderedSourcePlanControl(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.raft_term == 0 or request.raft_index == 0 or request.request_json.len > source_plan_wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var decoded = source_plan_wire.decode(handle.alloc, request.request_json.slice()) catch |err| return sourcePlanInputStatus(err);
+    defer decoded.deinit();
+    const result = handle.db.applyOrderedSourcePlanControl(decoded.request, .{ .term = request.raft_term, .index = request.raft_index }, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    return sourcePlanResponse(out, result);
+}
+fn sourceScopeResponse(out: *kernel_owner_abi.OwnedBytes, command: @import("antfly_local_sources").storage_source_scope_control.Command, entry: @import("antfly_local_sources").storage_source_scope_control.scope.Cut, value: @import("antfly_local_sources").storage_source_scope_ordered.Outcome) kernel_owner_abi.Status {
+    const bytes = @import("antfly_local_sources").storage_source_scope_ordered.encodeOutcome(std.heap.c_allocator, command, entry, value) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+pub fn storageOwnerOrderedSourceScopeControl(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const control = @import("antfly_local_sources").storage_source_scope_control;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.raft_term == 0 or request.raft_index == 0 or request.request_json.len > control.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const command = control.decodeCommand(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    const entry: db_mod.OrderedApplyReceipt = .{ .term = request.raft_term, .index = request.raft_index };
+    const result = handle.db.applyOrderedSourceScopeControl(command, entry, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    return sourceScopeResponse(out, command, .{ .term = entry.term, .index = entry.index }, result);
+}
+pub fn storageOwnerOrderedSourceScopeOutcome(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const ordered = @import("antfly_local_sources").storage_source_scope_ordered;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > ordered.max_recovery_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const recovery = ordered.decodeRecovery(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    const result = handle.db.orderedSourceScopeOutcome(recovery) catch |err| return storageOwnerStatusFromError(err);
+    return sourceScopeResponse(out, recovery.command, recovery.entry, result);
+}
+// Private apply-only boundary: the trusted Raft proposal path must obtain the
+// coordinator observation independently before this command reaches storage.
+// Apply-only: the term/index come from the actual committed Raft entry.
+// This closes producer intake; it does not authorize first-strict activation.
+pub fn storageOwnerOrderedLegacyTerminalResolution(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    const ordered = @import("antfly_local_sources").storage_source_legacy_terminal_ordered;
+    const policy = @import("antfly_local_sources").storage_source_producer_policy;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.raft_term == 0 or request.raft_index == 0 or request.request_json.len == 0 or request.request_json.len > policy.max_legacy_terminal_command_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const command = policy.decodeLegacyTerminalCommand(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    if (command.owner.group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.HistoryResynchronizationRequired);
+    const outcome = handle.db.resolveOrderedClosedLegacyTerminal(command.owner, command.proof, .{ .term = request.raft_term, .index = request.raft_index }) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    const bytes = ordered.encodeOutcome(std.heap.c_allocator, outcome) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub fn storageOwnerOrderedSourceProducerClosure(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const policy = @import("antfly_local_sources").storage_source_producer_policy;
+    const RoutedOwner = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion.RoutedOwner;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.raft_term == 0 or request.raft_index == 0 or request.request_json.len == 0 or request.request_json.len > 8192 or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(RoutedOwner, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return storageOwnerStatusFromError(err);
+    defer parsed.deinit();
+    parsed.value.validate() catch |err| return storageOwnerStatusFromError(err);
+    if (parsed.value.group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.HistoryResynchronizationRequired);
+    const result = handle.db.applyOrderedSourceProducerClosure(parsed.value, .{ .term = request.raft_term, .index = request.raft_index }, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, result, .{}) catch |err| return storageOwnerStatusFromError(err);
+    if (bytes.len > policy.max_bytes) {
+        std.heap.c_allocator.free(bytes);
+        return storageOwnerStatusFromError(error.SourceAdmissionCorrupt);
+    }
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+pub fn storageOwnerOrderedSourceRetirement(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const retirement = @import("antfly_local_sources").storage_source_scope_retirement;
+    const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.raft_term == 0 or request.raft_index == 0 or request.request_json.len > retirement.max_command_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var command = retirement.decodeCommand(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer command.deinit();
+    const result = handle.db.applyOrderedSourceRetirement(command.value, .{ .term = request.raft_term, .index = request.raft_index }, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    const bytes = ordered.encodeOutcome(std.heap.c_allocator, command.value, .{ .term = request.raft_term, .index = request.raft_index }, result) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+pub fn storageOwnerSourceRetirementOutcome(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > ordered.max_query_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var query = ordered.decodeQuery(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer query.deinit();
+    const result = handle.db.orderedSourceRetirementOutcome(query.value) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = ordered.encodeOutcome(std.heap.c_allocator, query.value.command, query.value.entry, result) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+pub fn storageOwnerLegacyRecoveryInventory(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    const inventory = @import("antfly_local_sources").storage_source_legacy_inventory;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len == 0 or request.request_json.len > inventory.max_query_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const query = inventory.decodeQuery(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    if (query.owner.group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.HistoryResynchronizationRequired);
+    var result = handle.db.legacyRecoveryInventory(handle.alloc, query) catch |err| return storageOwnerStatusFromError(err);
+    defer result.deinit(handle.alloc);
+    const bytes = inventory.encodeObservation(std.heap.c_allocator, query, result) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub fn storageOwnerLegacyTerminalOutcome(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    const ordered = @import("antfly_local_sources").storage_source_legacy_terminal_ordered;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len == 0 or request.request_json.len > ordered.max_query_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const query = ordered.decodeQuery(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    if (query.owner.group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.HistoryResynchronizationRequired);
+    const result = handle.db.legacyTerminalOutcome(query) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = ordered.encodeObservation(std.heap.c_allocator, query, result) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub fn storageOwnerSourceProducerClosureObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const wire = @import("antfly_local_sources").storage_source_producer_policy;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len == 0 or request.request_json.len > wire.max_query_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(wire.Query, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return storageOwnerStatusFromError(if (err == error.OutOfMemory) err else error.InvalidSourceAdmission);
+    defer parsed.deinit();
+    if (parsed.value.owner.group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.HistoryResynchronizationRequired);
+    const result = handle.db.sourceProducerClosureObservation(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = wire.encodeObservation(std.heap.c_allocator, parsed.value, result) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+pub fn storageOwnerSourceScopeObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const wire = @import("antfly_local_sources").storage_source_scope_control;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(wire.Query, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return storageOwnerStatusFromError(if (err == error.OutOfMemory) err else error.InvalidSourceAdmission);
+    defer parsed.deinit();
+    const result = handle.db.sourceScopeObservation(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    result.validate(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    return sourcePlanResponse(out, result);
+}
+pub fn storageOwnerSourceCheckpointObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const wire = @import("antfly_local_sources").storage_source_checkpoint_read;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > wire.max_request_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(wire.Request, handle.alloc, request.request_json.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return storageOwnerStatusFromError(if (err == error.OutOfMemory) err else error.InvalidSourceAdmission);
+    defer parsed.deinit();
+    const result = handle.db.sourceCheckpointObservation(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    result.validate(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    return sourcePlanResponse(out, result);
+}
+pub fn storageOwnerSourcePlanObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > source_plan_wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(source_plan_control.Query, handle.alloc, request.request_json.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return sourcePlanInputStatus(err);
+    defer parsed.deinit();
+    const result = handle.db.sourcePlanObservation(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    result.validate(parsed.value) catch return storageOwnerStatusFromError(error.SourceAdmissionCorrupt);
+    return sourcePlanResponse(out, source_plan_wire.ObservationReply{ .version = 1, .query_digest = parsed.value.digest(), .observation = result });
+}
+pub fn storageOwnerSourcePlanChunk(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > source_plan_wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(source_plan_control.ReadRequest, handle.alloc, request.request_json.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return sourcePlanInputStatus(err);
+    defer parsed.deinit();
+    const result = handle.db.sourcePlanChunk(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    defer handle.alloc.free(result.bytes);
+    result.observation.validate(parsed.value.query) catch return storageOwnerStatusFromError(error.SourceAdmissionCorrupt);
+    const encoded = handle.alloc.alloc(u8, std.base64.standard.Encoder.calcSize(result.bytes.len)) catch |err| return storageOwnerStatusFromError(err);
+    defer handle.alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, result.bytes);
+    return sourcePlanResponse(out, source_plan_wire.ChunkReply{ .version = 1, .request_digest = parsed.value.digest(), .observation = result.observation, .chunk_base64 = encoded });
+}
+pub fn storageOwnerOrderedSourcePlanOutcome(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > source_plan_wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(source_plan_wire.Recovery, handle.alloc, request.request_json.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return sourcePlanInputStatus(err);
+    defer parsed.deinit();
+    var decoded = source_plan_wire.fromCommand(handle.alloc, parsed.value.command) catch |err| return sourcePlanInputStatus(err);
+    defer decoded.deinit();
+    const result = handle.db.orderedSourcePlanOutcome(.{ .request = decoded.request, .entry = parsed.value.entry, .minimum_applied_index = parsed.value.minimum_applied_index }) catch |err| return storageOwnerStatusFromError(err);
+    return sourcePlanResponse(out, result);
+}
+
+pub fn storageOwnerOrderedHistoryControlJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.raft_term == 0 or request.raft_index == 0 or request.request_json.len > 4096 or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const Command = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command;
+    var parsed = std.json.parseFromSlice(Command, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    defer parsed.deinit();
+    const outcome = handle.db.applyOrderedHistoryConsumerControl(parsed.value, .{ .term = request.raft_term, .index = request.raft_index }, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    // Response allocation can fail after commit. The durable entry/result
+    // receipt makes a retry of this exact command recover its original result.
+    const response = std.json.Stringify.valueAlloc(std.heap.c_allocator, outcome, .{}) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = response.len };
+    return .ok;
+}
+
+pub fn storageOwnerOrderedHistoryOutcome(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.request_json.len > 4096 or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const ordered = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered;
+    var parsed = std.json.parseFromSlice(ordered.Lookup, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    defer parsed.deinit();
+    const outcome = handle.db.orderedHistoryOutcome(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, outcome, .{}) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub fn storageOwnerHistoryGrant(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_grant_wire;
+    if (request.request_json.len > wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const parsed = wire.decodeRequest(handle.alloc, request.request_json.slice()) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    const observation = switch (parsed.authority) {
+        .native => handle.db.nativeHistoryGrant(parsed.identity) catch |err| return storageOwnerStatusFromError(err),
+        .raft => handle.db.orderedHistoryGrant(parsed.identity, parsed.minimum_applied_index) catch |err| return storageOwnerStatusFromError(err),
+    };
+    const reply = wire.Reply.init(parsed, observation) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, reply, .{}) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub fn storageOwnerHistoryDecision(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const wire = @import("antfly_local_sources").storage_history_decision_wire;
+    if (request.request_json.len > wire.max_request_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const query = wire.decodeQuery(handle.alloc, request.request_json.slice()) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    const bytes = handle.db.historyCompletionDecision(std.heap.c_allocator, query) catch |err| return storageOwnerStatusFromError(err);
+    if (bytes.len > wire.max_reply_bytes) {
+        std.heap.c_allocator.free(bytes);
+        return storageOwnerStatusFromError(error.HistoryCorrupt);
+    }
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub fn storageOwnerHistoryAdmission(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const history = @import("antfly_local_sources").storage_history_admission_wire;
+    if (request.request_json.len > history.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const query = history.decodeQuery(handle.alloc, request.request_json.slice()) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    const reply = handle.db.historyAdmission(query) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, reply, .{}) catch |err| return storageOwnerStatusFromError(err);
+    if (bytes.len > history.max_bytes) {
+        std.heap.c_allocator.free(bytes);
+        return storageOwnerStatusFromError(error.HistoryCorrupt);
+    }
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub fn storageOwnerHistoryPublication(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const history = @import("antfly_local_sources").storage_history_publication_wire;
+    if (request.request_json.len > history.publication_read_max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const query = history.decodeCompletionPublicationQuery(handle.alloc, request.request_json.slice()) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    const reply = handle.db.historyCompletionPublication(handle.alloc, query) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, reply, .{}) catch |err| return storageOwnerStatusFromError(err);
+    if (bytes.len > history.publication_read_max_bytes) {
+        std.heap.c_allocator.free(bytes);
+        return storageOwnerStatusFromError(error.HistoryCorrupt);
+    }
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub fn storageOwnerHistoryResolution(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire;
+    if (request.request_json.len > wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const parsed = wire.decodeRequest(handle.alloc, request.request_json.slice()) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    const reply = handle.db.historyResolution(handle.alloc, parsed) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, reply, .{}) catch |err| return storageOwnerStatusFromError(err);
+    if (bytes.len > wire.max_bytes) {
+        std.heap.c_allocator.free(bytes);
+        return storageOwnerStatusFromError(error.HistoryCorrupt);
+    }
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub fn storageOwnerOrderedHistoryPage(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire;
+    if (request.request_json.len > wire.max_request_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    var parsed = std.json.parseFromSlice(wire.OrderedRead, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    defer parsed.deinit();
+    var page = handle.db.orderedHistoryPage(handle.alloc, parsed.value.request, parsed.value.minimum_applied_index) catch |err| return storageOwnerStatusFromError(err);
+    defer page.deinit();
+    const bytes = wire.encode(std.heap.c_allocator, page, parsed.value.request) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub fn storageOwnerOrderedHistoryBootstrapPage(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.request_json.len > 4096 or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_bootstrap_wire;
+    var parsed = std.json.parseFromSlice(wire.OrderedRead, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    defer parsed.deinit();
+    var page = handle.db.historyBootstrapPage(handle.alloc, parsed.value.request, parsed.value.minimum_applied_index) catch |err| return storageOwnerStatusFromError(err);
+    defer page.deinit();
+    const bytes = wire.encode(std.heap.c_allocator, page, parsed.value.request) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return .ok;
 }
 

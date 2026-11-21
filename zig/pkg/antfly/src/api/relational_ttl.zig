@@ -19,7 +19,8 @@
 //! parent does not starve unrelated expiration in the same scan page.
 const std = @import("std");
 const expiry = @import("../storage/server_coordinated_ttl.zig");
-const catalog = @import("table_catalog.zig");
+const RoutingBudget = @import("table_catalog.zig").RoutingBudget;
+const StatusSource = @import("http_server.zig").StatusSource;
 const reads = @import("antfly_local_sources").api_table_read_source;
 const writes = @import("antfly_local_sources").api_table_write_source;
 const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
@@ -80,7 +81,7 @@ const Authorization = struct {
     }
 };
 
-pub fn expire(alloc: std.mem.Allocator, source: catalog.CatalogSource, reader: reads.TableReadSource, writer: writes.TableWriteSource, request: expiry.Request, cancellation: operation.CancellationToken) !u32 {
+pub fn expire(alloc: std.mem.Allocator, source: StatusSource, reader: reads.TableReadSource, writer: writes.TableWriteSource, request: expiry.Request, cancellation: operation.CancellationToken) !u32 {
     const result = try expireStep(alloc, source, reader, writer, request, cancellation, .{ .max_candidates = 128 });
     if (result.last_error) |err| return err;
     return result.expired;
@@ -108,39 +109,47 @@ pub const StepResult = struct {
 /// root stays visible and is retried on the next native sweep, while later roots
 /// in this page cannot be perpetually starved by it. Durable 2PC resolves any
 /// uncertain commit independently; physical guards make future retries safe.
-pub fn expireStep(alloc: std.mem.Allocator, source: catalog.CatalogSource, reader: reads.TableReadSource, writer: writes.TableWriteSource, request: expiry.Request, cancellation: operation.CancellationToken, options: StepOptions) !StepResult {
+pub fn expireStep(alloc: std.mem.Allocator, source: StatusSource, reader: reads.TableReadSource, writer: writes.TableWriteSource, request: expiry.Request, cancellation: operation.CancellationToken, options: StepOptions) !StepResult {
     var result: StepResult = .{ .next_candidate = options.next_candidate };
     if (options.next_candidate > request.candidates.len or options.max_candidates == 0 or options.budget_ns == 0) return error.InvalidTtlObservation;
     if (options.next_candidate == request.candidates.len) return result;
     if (request.candidates.len > 128 or request.ttl_duration_ns == 0 or request.table_id == 0 or request.group_id == 0)
         return error.InvalidTtlObservation;
-    const budget = source.budget(null);
+    const budget: RoutingBudget = .{ .io = if (source.routing) |routing| routing.io else null };
     const control: operation.RequestContext = .{
         .cancellation = cancellation,
         .principal = .{ .kind = .internal, .subject = "relational-ttl" },
         .deadline_ns = budget.nowNs() +| options.budget_ns,
-        .deadline_io = source.io,
+        .deadline_io = budget.io,
     };
     try control.ensureActive();
-    var snapshot = try (try source.routingSource()).linearizableSnapshot(control.deadline_ns);
-    defer snapshot.deinit();
-    const table = for (snapshot.value.tables) |record| {
+    // The compact routing projection has no TTL policy or FK declarations.
+    var snapshot = (if (source.vtable.linearizable_snapshot != null)
+        try source.linearizableSnapshot(control)
+    else
+        try source.adminSnapshot()) orelse return error.IntegrityCatalogUnavailable;
+    defer source.freeAdminSnapshot(&snapshot);
+    const table = for (snapshot.tables) |record| {
         if (record.table_id == request.table_id) break record;
     } else return error.TableNotFound;
     if (table.restore_backup_id.len != 0 or table.relational_retirement_json.len != 0)
         return error.PreparedGenerationChanged;
-    const range = for (snapshot.value.ranges) |record| {
+    const range = for (snapshot.ranges) |record| {
         if (record.table_id == table.table_id and record.group_id == request.group_id) break record;
     } else return error.KeyOutOfRange;
     var declaration = try schema.parseValidatedTableSchema(alloc, table.schema_json);
     defer declaration.deinit(alloc);
     if (declaration.version != request.schema_version or declaration.ttl_duration_ns != request.ttl_duration_ns or
         !std.mem.eql(u8, declaration.ttl_field, request.ttl_field)) return error.PreparedGenerationChanged;
-    const initial: contract.TableCommitRequest = .{ .table_name = table.name, .relational_schema_version = request.schema_version };
-    if (!try integrity.metadataRequiresCoordination(alloc, snapshot.value.tables, &.{initial})) return error.InvalidTtlObservation;
+    const initial: contract.TableCommitRequest = .{
+        .source_producer = .ordinary,
+        .table_name = table.name,
+        .schema_version = request.schema_version,
+        .relational_schema_version = if (declaration.storage_mode == .relational) request.schema_version else null,
+    };
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const authorization = try Authorization.build(arena.allocator(), snapshot.value.tables, table.name, control);
+    const authorization = try Authorization.build(arena.allocator(), snapshot.tables, table.name, control);
     var authorized = control;
     authorized.table_write_authorization = .{ .ptr = &authorization, .allows = Authorization.allows };
     const commit_control: CommitCancellation = .{ .request = control };
@@ -152,7 +161,7 @@ pub fn expireStep(alloc: std.mem.Allocator, source: catalog.CatalogSource, reade
             return result;
         };
         result.next_candidate = index + 1;
-        if (candidate.row_version == 0 or candidate.row_version != candidate.ttl_timestamp_ns or
+        if (candidate.row_version == 0 or
             std.mem.order(u8, candidate.key, range.start_key) == .lt or
             (if (range.end_key) |end| end.len != 0 and std.mem.order(u8, candidate.key, end) != .lt else false))
             return error.InvalidTtlObservation;
@@ -167,7 +176,7 @@ pub fn expireStep(alloc: std.mem.Allocator, source: catalog.CatalogSource, reade
         var deletion = initial;
         deletion.predicates = &.{predicate};
         deletion.deletes = &.{candidate.key};
-        var prepared = integrity.prepareWithCoverageControlled(alloc, reader, snapshot.value.tables, snapshot.value.ranges, &.{deletion}, authorized) catch |err| switch (err) {
+        var prepared = integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, &.{deletion}, authorized) catch |err| switch (err) {
             error.ForeignKeyReferenced, error.VersionConflict, error.PreparedReadSetChanged => continue,
             else => {
                 result.failedAttempt(err);
@@ -219,17 +228,22 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
             next_txn: u8 = 1,
             inject_refresh: bool = false,
             inject_timeout: bool = false,
-            fn admin(_: *anyopaque) !metadata.AdminSnapshot {
+            fn status(_: *anyopaque) !metadata.MetadataStatus {
                 return error.UnexpectedCall;
             }
-            fn freeAdmin(_: *anyopaque, _: *metadata.AdminSnapshot) void {
-                unreachable;
-            }
-            fn routing(ptr: *anyopaque, _: ?u64) !metadata.CatalogRoutingSnapshot {
+            fn snapshot(ptr: *anyopaque, _: operation.RequestContext) !?metadata.AdminSnapshot {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
-                return .{ .tables = &self.tables, .ranges = &self.ranges };
+                return .{
+                    .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                    .tables = &self.tables,
+                    .ranges = &self.ranges,
+                    .stores = &.{},
+                    .placement_intents = &.{},
+                    .split_transitions = &.{},
+                    .merge_transitions = &.{},
+                };
             }
-            fn freeRouting(_: *anyopaque, _: *metadata.CatalogRoutingSnapshot) void {}
+            fn freeAdmin(_: *anyopaque, _: *metadata.AdminSnapshot) void {}
             fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: types.BatchRequest) !?void {
                 return error.UnexpectedCall;
             }
@@ -280,7 +294,7 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
             }
         };
         var fixture: Fixture = .{ .db = &db, .tables = .{.{ .table_id = 500, .name = "rows", .schema_json = declaration }} };
-        const source: catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.freeAdmin, .routing_snapshot = Fixture.routing, .linearizable_routing_snapshot = Fixture.routing, .free_routing_snapshot = Fixture.freeRouting } };
+        const source: StatusSource = .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .linearizable_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.freeAdmin } };
         var bound = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init("rows", 501, &db, @import("../raft/read_gate.zig").alreadyReadSafeBarrier());
         const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .commit_batch = Fixture.commit } };
         var inserted = try integrity.prepareWithCoverage(alloc, bound.source(), &fixture.tables, &fixture.ranges, &.{.{ .table_name = "rows", .writes = &.{

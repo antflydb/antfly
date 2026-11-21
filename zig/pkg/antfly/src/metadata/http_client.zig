@@ -490,6 +490,131 @@ pub const MetadataHttpClient = struct {
         };
     }
 
+    /// Construct only from a fresh authenticated capture, never from a caller's
+    /// snapshot body. Physical destination ownership and legacy drainage remain
+    /// independent native-owner checks before proposing this private command.
+    pub fn authorizeSourceScopeIntent(self: *MetadataHttpClient, base_uri: []const u8, intent: @import("antfly_local_sources").storage_source_scope_control.Intent, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("antfly_local_sources").storage_source_scope_control.Command {
+        try intent.validate();
+        var snapshot = try self.captureSourceScope(base_uri, .{ .version = 1, .query = .{ .metadata_group_id = intent.owner.metadata_group_id, .metadata_incarnation = intent.owner.metadata_incarnation, .actor_table_id = intent.spec.actor_table_id, .source_id = intent.spec.source_id, .minimum_applied_index = intent.minimum_metadata_index } }, context);
+        defer snapshot.deinit(self.alloc);
+        try snapshot.requireBinding(intent.spec);
+        switch (intent.action) {
+            .bind => try snapshot.requireBind(),
+            .close => try snapshot.requireClose(),
+            .drop => try snapshot.requireDrop(),
+        }
+        try context.ensureActive();
+        const command: @import("antfly_local_sources").storage_source_scope_control.Command = .{ .version = 1, .intent = intent, .metadata_cut = snapshot.cut };
+        try command.validate();
+        return command;
+    }
+
+    pub fn captureSourceScope(self: *MetadataHttpClient, base_uri: []const u8, input: @import("source_scope_wire.zig").Request, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("source_scope_capture.zig").Snapshot {
+        const scopes = @import("../api/source_scope_metadata.zig");
+        try context.ensureActive();
+        if (self.internal_service == null) return error.Unauthorized;
+        const bytes = try scopes.wire.encodeRequest(self.alloc, input);
+        defer self.alloc.free(bytes);
+        const uri = try join(self.alloc, base_uri, scopes.path);
+        defer self.alloc.free(uri);
+        const timeout = @min(@as(u32, 5000), (try context.remainingTimeoutMs()) orelse 5000);
+        var encoded_budget: [20]u8 = undefined;
+        const headers = [_]http_common.RequestHeader{.{ .name = routes.routing_remaining_ms_header, .value = try std.fmt.bufPrint(&encoded_budget, "{d}", .{timeout}) }};
+        var signal = http_common.RequestCancellation.fromToken(context.cancellation);
+        const budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() +| @as(u64, timeout) * std.time.ns_per_ms, .cancellation = &signal };
+        var response = self.executeWithRetryPolicy(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .headers = &headers, .timeout_ms = timeout, .max_response_bytes = scopes.wire.max_reply_bytes, .cancellation = &signal }, budget, .replay_safe) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown, error.MetadataMutationOutcomeUnknown, error.Timeout, error.ConnectionTimedOut, error.ConnectionRefused, error.ConnectionResetByPeer, error.BrokenPipe, error.EndOfStream, error.HttpConnectionClosing => return error.ReadUnavailable,
+            else => return err,
+        };
+        defer response.deinit(self.alloc);
+        try context.ensureActive();
+        if (response.status != 200) return switch (response.status) {
+            400 => error.InvalidSourceControl,
+            401 => error.Unauthorized,
+            403 => error.Forbidden,
+            404, 405, 501 => error.ChangefeedCapabilityUnsupported,
+            409 => error.SourceBindingConflict,
+            else => error.StorageReadTemporarilyUnavailable,
+        };
+        if (response.body.len > scopes.wire.max_reply_bytes) return error.SourceControlCorrupt;
+        var ack_count: usize = 0;
+        for (response.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, scopes.ack_header)) {
+            if (!std.mem.eql(u8, header.value, scopes.ack_value)) return error.SourceControlCorrupt;
+            ack_count += 1;
+        };
+        const media_type = response.header("Content-Type") orelse response.content_type orelse return error.SourceControlCorrupt;
+        if (ack_count != 1 or !std.ascii.eqlIgnoreCase(media_type, "application/json") or response.header(routes.Routes.raft_mutation_outcome_header) != null) return error.SourceControlCorrupt;
+        var snapshot = try scopes.wire.decodeReply(self.alloc, input, response.body);
+        errdefer snapshot.deinit(self.alloc);
+        try context.ensureActive();
+        return snapshot;
+    }
+
+    pub fn accessChangefeedState(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../api/changefeed_metadata.zig").Request, request: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("../api/changefeed_metadata.zig").Reply) {
+        const feeds = @import("../api/changefeed_metadata.zig");
+        try input.validate();
+        const wire_limit: usize = if (input.action == .scan_maintenance) feeds.max_scan_wire_bytes else feeds.max_wire_bytes;
+        const mutates = input.action == .mutate;
+        var parsed = try self.accessFencedCatalog(feeds.Reply, base_uri, feeds.path, wire_limit, mutates, null, input, request);
+        errdefer parsed.deinit();
+        parsed.value.validate(self.alloc, input) catch |err| return if (mutates) error.MetadataMutationOutcomeUnknown else err;
+        return parsed;
+    }
+
+    pub fn accessPgPublication(self: *MetadataHttpClient, base_uri: []const u8, input: @import("pg_publication.zig").Request, request: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("pg_publication.zig").Reply) {
+        const publication = @import("pg_publication.zig");
+        try input.validate();
+        const mutates = input.write != null;
+        var parsed = try self.accessFencedCatalog(publication.Reply, base_uri, publication.path, publication.max_transport_bytes, mutates, error.PgPublicationConflict, input, request);
+        errdefer parsed.deinit();
+        parsed.value.validate(input) catch |err| return if (mutates) error.MetadataMutationOutcomeUnknown else err;
+        return parsed;
+    }
+
+    fn accessFencedCatalog(self: *MetadataHttpClient, comptime Reply: type, base_uri: []const u8, path: []const u8, wire_limit: usize, mutates: bool, conflict: ?anyerror, input: anytype, request: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(Reply) {
+        try request.ensureActive();
+        const bytes = try std.json.Stringify.valueAlloc(self.alloc, input, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(bytes);
+        if (bytes.len > wire_limit) return error.InvalidChangefeed;
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        const timeout = @min(@as(u32, 5000), (try request.remainingTimeoutMs()) orelse 5000);
+        var encoded_budget: [20]u8 = undefined;
+        const headers = [_]http_common.RequestHeader{.{ .name = routes.routing_remaining_ms_header, .value = try std.fmt.bufPrint(&encoded_budget, "{d}", .{timeout}) }};
+        var signal = http_common.RequestCancellation.fromToken(request.cancellation);
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        delivery.markNotSent();
+        // Translate the remaining budget once into the executor's platform
+        // clock. The request's absolute deadline may use a borrowed test clock.
+        const transport_budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() +| @as(u64, timeout) * std.time.ns_per_ms, .cancellation = &signal };
+        var response = self.executeWithRetryPolicy(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .headers = &headers, .timeout_ms = timeout, .max_response_bytes = wire_limit, .cancellation = &signal, .delivery_tracker = &delivery }, transport_budget, .at_most_once) catch |err| {
+            if (mutates and (err == error.ReallocationOutcomeUnknown or err == error.MetadataMutationOutcomeUnknown or delivery.load() != .not_sent)) return error.MetadataMutationOutcomeUnknown;
+            return err;
+        };
+        defer response.deinit(self.alloc);
+        var outcome_count: usize = 0;
+        var outcome: []const u8 = "";
+        for (response.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, routes.Routes.raft_mutation_outcome_header)) {
+                outcome_count += 1;
+                outcome = header.value;
+            }
+        }
+        const committed = outcome_count == 1 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed);
+        const not_proposed = outcome_count == 1 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed);
+        if (mutates and !committed) {
+            if (not_proposed and response.status == 400) return error.InvalidChangefeed;
+            if (not_proposed and response.status == 403) return error.Forbidden;
+            if (not_proposed and response.status == 409 and conflict != null) return conflict.?;
+            return error.MetadataMutationOutcomeUnknown;
+        }
+        if (response.status != 200) return error.StorageReadTemporarilyUnavailable;
+        var parsed = std.json.parseFromSlice(Reply, self.alloc, response.body, .{ .allocate = .alloc_always }) catch |err| return if (mutates) error.MetadataMutationOutcomeUnknown else err;
+        errdefer parsed.deinit();
+        request.ensureActive() catch |err| return if (mutates) error.MetadataMutationOutcomeUnknown else err;
+        return parsed;
+    }
+
     pub fn fetchPrivacyPolicyBinding(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.PrivacyPolicyBinding) {
         const body = try std.json.Stringify.valueAlloc(self.alloc, metadata_api.CatalogTableRoutingSnapshotRequest{ .table_name = table_name }, .{});
         defer self.alloc.free(body);
@@ -4892,6 +5017,55 @@ test "SQL pgwire native metadata RPC preserves explicit submission evidence" {
     try std.testing.expect(submitted);
 }
 
+test "metadata changefeed state transport validates replies and never replays uncertain writes" {
+    const a = std.testing.allocator;
+    const feeds = @import("../api/changefeed_metadata.zig");
+    const Executor = struct {
+        calls: usize = 0,
+        lost_reply: bool = false,
+        outcome: []const u8 = routes.Routes.raft_mutation_outcome_committed,
+        body: []const u8 = "{\"version\":1,\"action\":\"mutate\",\"metadata_group_id\":77,\"metadata_incarnation\":\"11111111111111111111111111111111\"}",
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.lost_reply) return error.Timeout;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, feeds.path));
+            try std.testing.expectEqual(feeds.max_wire_bytes, request.max_response_bytes.?);
+            try std.testing.expect(request.header(routes.routing_remaining_ms_header) != null);
+            var parsed = try feeds.parseRequest(alloc, request.body);
+            defer parsed.deinit();
+            const headers = try alloc.alloc(http_common.Header, 1);
+            headers[0] = .{ .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header), .value = try alloc.dupe(u8, self.outcome) };
+            return .{ .status = 200, .headers = headers, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    const input: feeds.Request = .{ .action = .mutate, .write = "{}", .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".* };
+    var reply = try client.accessChangefeedState("http://metadata.invalid", input, .{});
+    reply.deinit();
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessChangefeedState("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    executor.outcome = routes.Routes.raft_mutation_outcome_committed;
+    executor.body = "{\"version\":1,\"action\":\"authority\",\"metadata_group_id\":77,\"metadata_incarnation\":\"11111111111111111111111111111111\"}";
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessChangefeedState("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 3), executor.calls);
+    var authority = try client.accessChangefeedState("http://metadata.invalid", .{ .action = .authority, .metadata_group_id = input.metadata_group_id, .metadata_incarnation = input.metadata_incarnation }, .{});
+    defer authority.deinit();
+    try std.testing.expect(authority.value.authority == null);
+    try std.testing.expectError(error.InvalidChangefeed, client.accessChangefeedState("http://metadata.invalid", .{ .action = .authority, .id = @splat(1), .metadata_group_id = input.metadata_group_id, .metadata_incarnation = input.metadata_incarnation }, .{}));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    executor.lost_reply = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessChangefeedState("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 5), executor.calls);
+    executor.lost_reply = false;
+    executor.outcome = "";
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessChangefeedState("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 6), executor.calls);
+}
+
 test "metadata.lake index owner projection read negotiates older peers without weakening grants" {
     const a = std.testing.allocator;
     const authority = @import("../system_catalog/setting_authority.zig");
@@ -4920,6 +5094,99 @@ test "metadata.lake index owner projection read negotiates older peers without w
     executor.status = 503;
     executor.body = "NotLeader";
     try std.testing.expectError(error.NotLeader, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
+}
+
+test "metadata source scope HTTP client requires qualified correlated bounded replies" {
+    const a = std.testing.allocator;
+    const scopes = @import("../api/source_scope_metadata.zig");
+    const Fake = struct {
+        const Mode = enum { good, wrong_query, stale_cut, missing_ack, duplicate_ack, marker, wrong_type, lost };
+        mode: Mode = .good,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.mode == .lost) return error.Timeout;
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            try std.testing.expect(request.header(routes.routing_remaining_ms_header) != null);
+            try std.testing.expectEqual(@as(?usize, scopes.wire.max_reply_bytes), request.max_response_bytes);
+            const input = try scopes.wire.decodeRequest(alloc, request.body);
+            var reply: scopes.wire.Reply = .{ .version = 1, .request_digest = input.digest(), .snapshot = .{ .cut = .{ .group_id = input.query.metadata_group_id, .incarnation = input.query.metadata_incarnation, .index = input.query.minimum_applied_index }, .spec = .{ .actor_table_id = input.query.actor_table_id, .source_id = input.query.source_id, .generation = 1, .binding = @splat(3), .checkpoint_owner = .{ .metadata_group_id = input.query.metadata_group_id, .metadata_incarnation = input.query.metadata_incarnation, .namespace = @splat(4), .root_generation = 0, .group_id = 17 } }, .phase = .active, .actor_revision = 1, .live_definition = true, .checkpoint_table = "checkpoint" } };
+            if (self.mode == .wrong_query) reply.request_digest[0] ^= 1;
+            if (self.mode == .stale_cut) reply.snapshot.cut.index -= 1;
+            var headers: std.ArrayList(http_common.Header) = .empty;
+            errdefer {
+                for (headers.items) |h| {
+                    alloc.free(h.name);
+                    alloc.free(h.value);
+                }
+                headers.deinit(alloc);
+            }
+            try headers.append(alloc, .{ .name = try alloc.dupe(u8, "Content-Type"), .value = try alloc.dupe(u8, if (self.mode == .wrong_type) "text/plain" else "application/json") });
+            if (self.mode != .missing_ack) try headers.append(alloc, .{ .name = try alloc.dupe(u8, scopes.ack_header), .value = try alloc.dupe(u8, scopes.ack_value) });
+            if (self.mode == .duplicate_ack) try headers.append(alloc, .{ .name = try alloc.dupe(u8, scopes.ack_header), .value = try alloc.dupe(u8, scopes.ack_value) });
+            if (self.mode == .marker) try headers.append(alloc, .{ .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header), .value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed) });
+            const body = try std.json.Stringify.valueAlloc(alloc, reply, .{});
+            errdefer alloc.free(body);
+            return .{ .status = 200, .headers = try headers.toOwnedSlice(alloc), .body = body };
+        }
+    };
+    var fake: Fake = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    const input: scopes.wire.Request = .{ .version = 1, .query = .{ .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".*, .actor_table_id = 7, .source_id = @splat(2), .minimum_applied_index = 40 } };
+    try std.testing.expectError(error.Unauthorized, client.captureSourceScope("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    _ = client.withInternalServiceAuth("source-scope-metadata-test-secret-long-enough", "source-scope-metadata-test");
+    var result = try client.captureSourceScope("http://metadata.invalid", input, .{});
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings("checkpoint", result.checkpoint_table);
+    for ([_]Fake.Mode{ .wrong_query, .stale_cut, .missing_ack, .duplicate_ack, .marker, .wrong_type, .lost }) |mode| {
+        fake.mode = mode;
+        const before = fake.calls;
+        try std.testing.expectError(if (mode == .lost) error.ReadUnavailable else error.SourceControlCorrupt, client.captureSourceScope("http://metadata.invalid", input, .{}));
+        try std.testing.expectEqual(before + @as(usize, if (mode == .lost) 2 else 1), fake.calls);
+    }
+}
+
+test "metadata pg publication transport validates confirmed writes without retrying a lost reply" {
+    const a = std.testing.allocator;
+    const publication = @import("pg_publication.zig");
+    const Executor = struct {
+        calls: usize = 0,
+        lost: bool = false,
+        body: []const u8,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, publication.path));
+            if (self.lost) return error.Timeout;
+            const headers = try alloc.alloc(http_common.Header, 1);
+            headers[0] = .{
+                .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header),
+                .value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed),
+            };
+            return .{ .status = 200, .headers = headers, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    const next: publication.Record = .{ .database = @splat(2), .name = "docs_pub", .owner = @splat(3), .revision = 2, .members = null };
+    const input: publication.Request = .{ .group = 1, .incarnation = @splat(1), .database = next.database, .name = next.name, .write = .{ .expected_revision = 1, .next = next } };
+    var reply_body: publication.Reply = .{ .group = input.group, .incarnation = input.incarnation, .database = input.database, .name = input.name, .record = next };
+    const body = try std.json.Stringify.valueAlloc(a, reply_body, .{});
+    defer a.free(body);
+    var executor: Executor = .{ .body = body };
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    var result = try client.accessPgPublication("http://metadata.invalid", input, .{});
+    defer result.deinit();
+    try std.testing.expectEqualDeep(next, result.value.record.?);
+    executor.lost = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessPgPublication("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    executor.lost = false;
+    reply_body.record.?.revision = 3;
+    const stale = try std.json.Stringify.valueAlloc(a, reply_body, .{});
+    defer a.free(stale);
+    executor.body = stale;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessPgPublication("http://metadata.invalid", input, .{}));
 }
 
 test "index alias definition conflicts remain definite across metadata forwarding" {

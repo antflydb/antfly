@@ -31,6 +31,37 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_changefeed, .err = error.InvalidChangefeed },
+    .{ .status = .changefeed_corrupt, .err = error.ChangefeedCorrupt },
+    .{ .status = .invalid_source_control, .err = error.InvalidSourceControl },
+    .{ .status = .source_control_corrupt, .err = error.SourceControlCorrupt },
+    .{ .status = .source_binding_conflict, .err = error.SourceBindingConflict },
+    .{ .status = .read_unavailable, .err = error.ReadUnavailable },
+    .{ .status = .source_checkpoint_conflict, .err = error.SourceCheckpointConflict },
+    .{ .status = .source_transaction_identity_conflict, .err = error.SourceTransactionIdentityConflict },
+    .{ .status = .source_already_committed, .err = error.SourceAlreadyCommitted },
+    .{ .status = .unsupported_batch_protocol_version, .err = error.UnsupportedBatchProtocolVersion },
+    .{ .status = .invalid_source_plan_wire, .err = error.InvalidSourcePlanWire },
+    .{ .status = .invalid_source_admission, .err = error.InvalidSourceAdmission },
+    .{ .status = .source_admission_corrupt, .err = error.SourceAdmissionCorrupt },
+    .{ .status = .source_receipt_expired, .err = error.SourceReceiptExpired },
+    .{ .status = .source_pending_work, .err = error.SourcePendingWork },
+    .{ .status = .source_payload_conflict, .err = error.SourcePayloadConflict },
+    .{ .status = .source_admission_backpressure, .err = error.SourceAdmissionBackpressure },
+    .{ .status = .invalid_txn_record, .err = error.InvalidTxnRecord },
+    .{ .status = .source_outcome_unresolved, .err = error.SourceOutcomeUnresolved },
+
+    .{ .status = .changefeed_capability_unsupported, .err = error.ChangefeedCapabilityUnsupported },
+    .{ .status = .history_consumer_conflict, .err = error.HistoryConsumerConflict },
+    .{ .status = .invalid_history_admission, .err = error.InvalidHistoryAdmission },
+    .{ .status = .history_too_large, .err = error.HistoryTooLarge },
+    .{ .status = .history_checkpoint_conflict, .err = error.HistoryCheckpointConflict },
+    .{ .status = .corrupt_ordered_apply_receipt, .err = error.CorruptOrderedApplyReceipt },
+    .{ .status = .history_authority_required, .err = error.HistoryAuthorityRequired },
+    .{ .status = .history_corrupt, .err = error.HistoryCorrupt },
+    .{ .status = .history_resynchronization_required, .err = error.HistoryResynchronizationRequired },
+    .{ .status = .conflicting_ordered_apply_receipt, .err = error.ConflictingOrderedApplyReceipt },
+    .{ .status = .invalid_ordered_apply_receipt, .err = error.InvalidOrderedApplyReceipt },
     .{ .status = .replay_document_not_visible, .err = error.ReplayDocumentNotVisible },
     .{ .status = .storage_descriptor_pressure, .err = error.StorageDescriptorPressure },
     .{ .status = .process_fd_quota_exceeded, .err = error.ProcessFdQuotaExceeded },
@@ -1283,4 +1314,21 @@ test "descriptor pressure preserves actionable identities across storage owners"
         try validateFailureEnvelope(value, &failure, abi.abi_version);
         try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
     }
+}
+
+test "source plan failures preserve exact opaque owner identities" {
+    inline for (.{ error.InvalidSourcePlanWire, error.InvalidSourceAdmission, error.SourceAdmissionCorrupt, error.SourceReceiptExpired, error.SourcePendingWork, error.SourcePayloadConflict, error.SourceAdmissionBackpressure, error.InvalidTxnRecord, error.SourceOutcomeUnresolved, error.UnsupportedBatchProtocolVersion, error.SourceCheckpointConflict, error.SourceTransactionIdentityConflict, error.SourceAlreadyCommitted }) |err| {
+        const value = statusFromError(err);
+        try std.testing.expect(value != .internal);
+        try std.testing.expectError(err, statusToError(value));
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try validateFailureEnvelope(value, &failure, abi.abi_version);
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+    try std.testing.expectEqual(@as(u32, 930), @backingInt(statusFromError(error.InvalidSourcePlanWire)));
+    try std.testing.expectEqual(@as(u32, 938), @backingInt(statusFromError(error.SourceOutcomeUnresolved)));
+    try std.testing.expectEqual(@as(u32, 939), @backingInt(statusFromError(error.UnsupportedBatchProtocolVersion)));
+    try std.testing.expectEqual(@as(u32, 940), @backingInt(statusFromError(error.SourceCheckpointConflict)));
+    try std.testing.expectEqual(@as(u32, 941), @backingInt(statusFromError(error.SourceTransactionIdentityConflict)));
+    try std.testing.expectEqual(@as(u32, 942), @backingInt(statusFromError(error.SourceAlreadyCommitted)));
 }

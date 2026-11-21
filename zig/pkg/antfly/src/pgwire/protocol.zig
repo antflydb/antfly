@@ -21,6 +21,9 @@ pub const backend = @import("backend.zig");
 const values = @import("values.zig");
 const formatting = @import("formatting.zig");
 const commands = @import("session_commands.zig");
+const replication_commands = backend.replication_commands;
+const replication_input = @import("replication_input.zig");
+const pgoutput = backend.pgoutput;
 const settings_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const Spool = @import("cursor_spool.zig").Store;
 const Budget = @import("budget.zig").Budget;
@@ -38,6 +41,11 @@ pub const Limits = struct {
     startup_timeout_ms: u32 = 5000,
     idle_timeout_ms: u32 = 60000,
     statement_timeout_ms: u32 = 30000,
+    replication_timeout_ms: u32 = 60000,
+    replication_keepalive_ms: u32 = 10000,
+    replication_poll_ms: u32 = 50,
+    replication_callback_ms: u32 = 500,
+    replication_write_ms: u32 = 5000,
 };
 
 pub const CancelHooks = struct {
@@ -109,10 +117,13 @@ pub const Session = struct {
     limits: Limits = .{},
     hooks: ?CancelHooks = null,
     identity: ?backend.Identity = null,
+    replication_mode: replication_commands.StartupMode = .normal,
+    replication: ?backend.ReplicationSession = null,
     database: ?[]u8 = null,
     namespace: ?[]u8 = null,
     session_id: ?[]u8 = null,
     status: backend.TransactionStatus = .idle,
+    snapshot_import_allowed: bool = false,
     prepared: std.StringHashMapUnmanaged(Prepared) = .empty,
     // Results borrow their portal allocator until release. Registry growth and
     // removal must never move that allocator.
@@ -141,6 +152,8 @@ pub const Session = struct {
     deadline_changed: std.Io.Event = .unset,
     diagnostic: backend.Diagnostic = .{},
     mutation_ack_pending: bool = false,
+    replication_administration: bool = false,
+    replication_copy_active: bool = false,
     discard_after_reply: bool = false,
     completion_safe: bool = true,
     completion: @import("completion.zig").Completion = .{},
@@ -163,6 +176,10 @@ pub const Session = struct {
         self.savepoints.deinit(self.alloc);
         if (self.catalog_settings) |*state| state.deinit();
         if (self.cursor_budget) |budget| self.alloc.destroy(budget);
+        if (self.replication) |owner| {
+            owner.close(owner.context);
+            self.replication = null;
+        }
         if (self.identity) |identity| {
             self.source.vtable.disconnect(self.source.context, identity, self.session_id);
             if (self.source.vtable.completion_safe) |check| if (!check(self.source.context, identity)) self.addCompletion(self.session_id, null);
@@ -218,14 +235,30 @@ pub const Session = struct {
                 try renew(self.source.context, self.alloc, self.identity.?, payload[0 .. payload.len - 1]);
                 continue;
             }
+            if (self.replication_mode == .logical and tag != 'Q') {
+                try self.sendError("08P01", "logical replication connections require simple query protocol");
+                try self.writer.flush();
+                return error.ProtocolViolation;
+            }
             if (self.skip_until_sync and tag != 'S') continue;
             const timeout = self.statement_timeout orelse self.limits.statement_timeout_ms;
             self.setDeadline(if (timeout == 0) self.limits.statement_timeout_ms else @min(timeout, self.limits.statement_timeout_ms));
             self.diagnostic = .{};
             self.mutation_ack_pending = false;
+            self.replication_administration = false;
             self.dispatch(tag, payload) catch |err| {
+                if (self.replication_copy_active) {
+                    // Cancelled reads may have consumed a partial frontend
+                    // frame. Close after the error, never resume SQL framing
+                    // from an unknown byte boundary or acknowledge delivery.
+                    if (err != error.Canceled and err != error.EndOfStream) {
+                        self.sendError(sqlstate(err), @errorName(err)) catch {};
+                        self.writer.flush() catch {};
+                    }
+                    return err;
+                }
                 const completion_code: []const u8 = if (self.diagnostic.code) |*code| code else sqlstate(err);
-                if (std.mem.eql(u8, completion_code, "40003") and !self.mutation_ack_pending) {
+                if (std.mem.eql(u8, completion_code, "40003") and !self.mutation_ack_pending and !self.replication_administration) {
                     self.completion_safe = false;
                     self.addCompletion(if (self.diagnostic.transaction_id) |*id| id else null, null);
                 }
@@ -252,7 +285,7 @@ pub const Session = struct {
                     self.status = .failed;
                 }
                 if (self.status == .idle) self.finishSqlCursors(false);
-                if (self.mutation_ack_pending) self.diagnostic.set("40003", "mutation committed but its acknowledgement failed; do not replay this statement", self.diagnostic.transaction_id, false);
+                if (self.mutation_ack_pending) self.diagnostic.set("40003", if (self.replication_administration) "replication command committed but acknowledgement failed; inspect slot state" else "mutation committed but its acknowledgement failed; do not replay this statement", self.diagnostic.transaction_id, false);
                 if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), @errorName(err));
                 if (tag == 'Q') try self.ready();
             };
@@ -286,6 +319,7 @@ pub const Session = struct {
                 196608 => {
                     var username: ?[]const u8 = null;
                     var database: ?[]const u8 = null;
+                    var replication_seen = false;
                     while (true) {
                         const key = try cursor.string();
                         if (key.len == 0) break;
@@ -296,6 +330,10 @@ pub const Session = struct {
                         } else if (std.mem.eql(u8, key, "database")) {
                             if (database != null) return error.ProtocolViolation;
                             database = value;
+                        } else if (std.mem.eql(u8, key, "replication")) {
+                            if (replication_seen) return error.ProtocolViolation;
+                            replication_seen = true;
+                            self.replication_mode = try replication_commands.startupMode(value);
                         } else if (std.mem.eql(u8, key, "client_encoding")) {
                             formatting.validateEncoding(value) catch |err| {
                                 self.diagnostic.set("22021", "unsupported startup parameter client_encoding; only UTF8 is supported", null, null);
@@ -341,6 +379,12 @@ pub const Session = struct {
                     // Authenticate first; database is only an untrusted
                     // resolution hint carried to the authorized backend.
                     if (database) |value| self.database = try self.alloc.dupe(u8, value);
+                    if (self.replication_mode == .logical) {
+                        const open = self.source.vtable.open_replication_session orelse return error.UnsupportedReplicationMode;
+                        self.replication = try open(self.source.context, self.alloc, self.identity.?, self.request("", &.{}, &.{}));
+                        const owner = self.replication.?;
+                        try owner.authorize(owner.context, self.alloc, self.request("", &.{}, &.{}), null);
+                    }
                     if (self.hooks) |hooks| try hooks.register(hooks.context, self);
                     try self.message('R', &.{ 0, 0, 0, 0 });
                     if (self.identity.?.renewable) {
@@ -352,7 +396,7 @@ pub const Session = struct {
                             try self.parameterStatus("antfly_session_completion", "12");
                         }
                     }
-                    try self.parameterStatus("server_version", "16.0-antfly");
+                    try self.parameterStatus("server_version", @import("antfly_local_sources").sql_scalar.postgres_compat_version ++ "-antfly");
                     try self.parameterStatus("server_encoding", "UTF8");
                     try self.parameterStatus("client_encoding", "UTF8");
                     inline for (std.meta.tags(formatting.Setting)) |setting| try self.parameterStatus(setting.name(), setting.value());
@@ -377,7 +421,10 @@ pub const Session = struct {
     }
 
     fn effectiveNamespace(self: *const Session) []const u8 {
-        return if (self.namespace_setting) |*value| value.first() else self.namespace orelse "public";
+        if (self.namespace_setting) |*value| {
+            if (value.len != 0) return value.first();
+        }
+        return self.namespace orelse "public";
     }
 
     fn effectiveSearchPath(self: *const Session) ?commands.SearchPath {
@@ -426,6 +473,8 @@ pub const Session = struct {
                 .formatting => |value| if (value.action == .show) try alloc.dupe(backend.Column, &.{.{ .name = value.kind.name(), .type = .string }}) else &.{},
                 .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
                 .catalog => |value| if (value == .show) &.{.{ .name = value.show, .type = .string }} else &.{},
+                .wal_level => &.{.{ .name = "wal_level", .type = .string }},
+                .transaction_snapshot, .transaction_options => &.{},
                 .reset_all => &.{},
                 .discard_all => &.{},
             } };
@@ -564,6 +613,9 @@ pub const Session = struct {
                 .formatting => |value| self.executeFormattingSetting(alloc, value),
                 .client_encoding => |value| self.executeEncodingSetting(alloc, value),
                 .catalog => |value| self.executeCatalogSetting(alloc, statement, value),
+                .wal_level => self.showWalLevel(alloc),
+                .transaction_snapshot => |name| self.importSnapshot(alloc, statement, name),
+                .transaction_options => |options| self.setTransactionOptions(statement, options),
                 .reset_all => self.executeResetAll(),
                 .discard_all => self.executeDiscardAll(),
             };
@@ -596,6 +648,7 @@ pub const Session = struct {
         defer if (self.identity.?.renewable) {
             if (self.source.vtable.pin_completion) |pin| pin(self.source.context, self.alloc, &self.completion);
         };
+        self.snapshot_import_allowed = false;
         var result = try self.source.vtable.execute(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req);
         errdefer result.deinit();
         if (result.mutation_outcome == .committed_pending or result.mutation_outcome == .committed_repair_required or
@@ -619,6 +672,7 @@ pub const Session = struct {
         self.session_id = session;
         self.status = result.transaction_status;
         if (previous_status == .idle and self.status == .in_transaction) {
+            self.snapshot_import_allowed = true;
             try self.settingsState().begin();
             self.timeout_transaction = .{ .before = self.statement_timeout, .committed = self.statement_timeout, .namespace_before = self.namespace_setting, .namespace_committed = self.namespace_setting, .application_before = self.application_name, .application_committed = self.application_name, .lake_before = self.lake_visibility, .lake_committed = self.lake_visibility };
             self.transaction_namespace = try commands.Namespace.init(req.namespace orelse "public");
@@ -672,6 +726,50 @@ pub const Session = struct {
         };
         if (self.status == .idle) self.finishSqlCursors(std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT"));
         return result;
+    }
+
+    fn showWalLevel(self: *Session, alloc: std.mem.Allocator) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        const level = if (self.source.vtable.open_replication_session != null) "logical" else "minimal";
+        const row = try alloc.dupe(std.json.Value, &.{.{ .string = level }});
+        return .{
+            .columns = &.{.{ .name = "wal_level", .type = .string }},
+            .rows = try alloc.dupe([]const std.json.Value, &.{row}),
+            .command_tag = "SHOW",
+            .transaction_status = self.status,
+            .session_id = self.session_id,
+        };
+    }
+
+    fn setTransactionOptions(self: *Session, statement: []const u8, options: backend.TransactionOptions) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        if (self.status != .in_transaction or self.session_id == null) return error.NoActiveSqlTransaction;
+        if (!self.snapshot_import_allowed) return error.ActiveSqlTransaction;
+        const update = self.source.vtable.set_transaction_options orelse return error.UnsupportedSqlExecution;
+        const identity = self.identity orelse return error.AuthenticationFailed;
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        const req = self.request(statement, &.{}, &.{});
+        try req.check();
+        try update(self.source.context, identity, req, options);
+        return .{ .command_tag = "SET", .transaction_status = self.status, .session_id = self.session_id };
+    }
+
+    fn importSnapshot(self: *Session, alloc: std.mem.Allocator, statement: []const u8, name: []const u8) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        if (self.status != .in_transaction or self.session_id == null) return error.NoActiveSqlTransaction;
+        if (!self.snapshot_import_allowed) return error.ActiveSqlTransaction;
+        const attach = self.source.vtable.import_snapshot orelse return error.UnsupportedReplicationOption;
+        const identity = self.identity orelse return error.AuthenticationFailed;
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        const req = self.request(statement, &.{}, &.{});
+        try req.check();
+        try attach(self.source.context, alloc, identity, req, name);
+        self.snapshot_import_allowed = false;
+        return .{ .command_tag = "SET", .transaction_status = self.status, .session_id = self.session_id };
     }
 
     fn executeSearchPathSetting(self: *Session, alloc: std.mem.Allocator, statement: []const u8, setting: commands.SearchPathSetting) !backend.Result {
@@ -918,6 +1016,231 @@ pub const Session = struct {
         self.clearPrepared();
     }
 
+    fn replicationNow(self: *Session) i64 {
+        return @intCast(std.Io.Clock.awake.now(self.io).nanoseconds);
+    }
+    fn replicationDeadline(self: *Session, deadline: i64) void {
+        self.deadline_ns.store(deadline, .release);
+        self.deadline_changed.set(self.io);
+    }
+    fn replicationRequest(self: *Session, statement: []const u8, deadline: i64) backend.Request {
+        var request_value = self.request(statement, &.{}, &.{});
+        request_value.deadline.raw.nanoseconds = @min(deadline, self.replicationNow() +| @as(i64, self.limits.replication_callback_ms) * std.time.ns_per_ms);
+        return request_value;
+    }
+    fn replicationTick(io: std.Io, ms: u32) std.Io.Cancelable!void {
+        try io.sleep(.fromMilliseconds(ms), .awake);
+    }
+    fn replicationWrite(self: *Session, bytes: []const u8, deadline: i64) !void {
+        self.replicationDeadline(@min(deadline, self.replicationNow() +| @as(i64, self.limits.replication_write_ms) * std.time.ns_per_ms));
+        try self.writer.writeAll(bytes);
+        try self.writer.flush();
+        self.replicationDeadline(deadline);
+    }
+    fn replicationKeepalive(self: *Session, a: std.mem.Allocator, end: pgoutput.Lsn, reply: bool, deadline: i64) !void {
+        const bytes = try pgoutput.copyData(a, .{ .keepalive = .{ .end = end, .server_time = try pgoutput.postgresTime(std.Io.Clock.real.now(self.io).nanoseconds), .request_reply = reply } }, self.limits.frame_bytes);
+        defer a.free(bytes);
+        try self.replicationWrite(bytes, deadline);
+    }
+    fn replicationCopy(self: *Session, a: std.mem.Allocator, statement: []const u8, owner: backend.ReplicationSession, command_value: replication_commands.Command) !void {
+        const open = owner.open_stream orelse return error.UnsupportedReplicationMode;
+        const limits = self.limits;
+        if (limits.replication_timeout_ms == 0 or limits.replication_keepalive_ms == 0 or limits.replication_keepalive_ms >= limits.replication_timeout_ms or limits.replication_poll_ms == 0 or limits.replication_callback_ms == 0 or limits.replication_write_ms == 0 or limits.frame_bytes < 31 or limits.frame_bytes > pgoutput.max_message_bytes + 30) return error.InvalidParameter;
+        var deadline = self.replicationNow() +| @as(i64, limits.replication_timeout_ms) * std.time.ns_per_ms;
+        var request_value = self.replicationRequest(statement, deadline);
+        const stream = try open(owner.context, a, request_value, command_value.start);
+        defer stream.close(stream.context);
+        if (@backingInt(stream.initial_lsn) == 0 or @backingInt(stream.resume_lsn) < @backingInt(stream.initial_lsn) or @backingInt(stream.resume_lsn) > @backingInt(stream.initial_end_lsn)) return error.InvalidResult;
+        try owner.authorize(owner.context, a, request_value, command_value);
+        var sent = stream.initial_lsn;
+        var observed_end = stream.initial_end_lsn;
+        var feedback_ceiling = stream.resume_lsn;
+        var last_keepalive = self.replicationNow();
+        const Outcome = union(enum) { input: anyerror!replication_input.Input, tick: std.Io.Cancelable!void };
+        var outcomes: [2]Outcome = undefined;
+        var select = std.Io.Select(Outcome).init(self.io, &outcomes);
+        defer while (select.cancel()) |remaining| switch (remaining) {
+            .input => |result| {
+                var value = result catch continue;
+                value.deinit(self.alloc);
+            },
+            .tick => {},
+        };
+        try select.concurrent(.input, replication_input.read, .{ self.alloc, self.reader, self.identity.?.renewable });
+        try select.concurrent(.tick, replicationTick, .{ self.io, @as(u32, 0) });
+        self.replication_copy_active = true;
+        self.replicationDeadline(deadline);
+        // Text format, no ordinary COPY column descriptors.
+        try self.message('W', &.{ 0, 0, 0 });
+        try self.writer.flush();
+        while (true) {
+            request_value = self.replicationRequest(statement, deadline);
+            try request_value.check();
+            const outcome = try select.await();
+            request_value = self.replicationRequest(statement, deadline);
+            try request_value.check();
+            switch (outcome) {
+                .input => |result| {
+                    var input_value = try result;
+                    defer input_value.deinit(self.alloc);
+                    switch (input_value) {
+                        .done => break,
+                        .terminate => return error.EndOfStream,
+                        .abort => return error.QueryCanceled,
+                        .renew => |bytes| {
+                            const renew = self.source.vtable.refresh orelse return error.Unauthorized;
+                            try renew(self.source.context, self.alloc, self.identity.?, bytes[0 .. bytes.len - 1]);
+                            try owner.authorize(owner.context, a, request_value, command_value);
+                        },
+                        .feedback => |feedback| {
+                            // LSNs are untrusted peer claims. Do not pass a
+                            // future position to a slot which may already have
+                            // reserved a larger, still-unsent transaction.
+                            if (@backingInt(feedback.flushed) > @backingInt(feedback_ceiling) or @backingInt(feedback.written) > @backingInt(feedback_ceiling) or @backingInt(feedback.applied) > @backingInt(feedback_ceiling)) return error.ProtocolViolation;
+                            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                            defer scratch.deinit();
+                            self.replicationDeadline(@intCast(request_value.deadline.raw.nanoseconds));
+                            try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
+                            try stream.feedback(stream.context, scratch.allocator(), request_value, feedback);
+                            try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
+                            deadline = self.replicationNow() +| @as(i64, limits.replication_timeout_ms) * std.time.ns_per_ms;
+                            self.replicationDeadline(deadline);
+                            if (feedback.request_reply) {
+                                try self.replicationKeepalive(scratch.allocator(), sent, false, deadline);
+                                last_keepalive = self.replicationNow();
+                            }
+                        },
+                    }
+                    try select.concurrent(.input, replication_input.read, .{ self.alloc, self.reader, self.identity.?.renewable });
+                },
+                .tick => |result| {
+                    try result;
+                    var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                    defer scratch.deinit();
+                    self.replicationDeadline(@intCast(request_value.deadline.raw.nanoseconds));
+                    try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
+                    var poll = stream.poll(stream.context, scratch.allocator(), request_value, sent, limits.frame_bytes - 30) catch |err| {
+                        if (err == error.ReplicationReadDeferred and !self.cancel_requested.load(.acquire) and self.replicationNow() < deadline) {
+                            // The backend guarantees that this failure moved
+                            // no cursor. Require a fresh authorized read before
+                            // emitting data or a keepalive for this position.
+                            self.replicationDeadline(deadline);
+                            try select.concurrent(.tick, replicationTick, .{ self.io, limits.replication_poll_ms });
+                            continue;
+                        }
+                        std.log.debug("PostgreSQL replication poll failed err={s}", .{@errorName(err)});
+                        return err;
+                    };
+                    defer poll.deinit();
+                    if (@backingInt(poll.end_lsn) < @backingInt(observed_end)) return error.InvalidResult;
+                    observed_end = poll.end_lsn;
+                    try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
+                    self.replicationDeadline(deadline);
+                    if (poll.chunk) |chunk| {
+                        if (@backingInt(chunk.start_lsn) != @backingInt(sent) or chunk.bytes.len == 0 or chunk.bytes.len > limits.frame_bytes - 30) return error.InvalidResult;
+                        const next = std.math.add(u64, @backingInt(sent), chunk.bytes.len) catch return error.InvalidResult;
+                        if (next > @backingInt(observed_end)) return error.InvalidResult;
+                        const bytes = try pgoutput.copyData(scratch.allocator(), .{ .wal = .{ .start = chunk.start_lsn, .end = observed_end, .server_time = try pgoutput.postgresTime(std.Io.Clock.real.now(self.io).nanoseconds), .payload = chunk.bytes } }, limits.frame_bytes);
+                        try self.replicationWrite(bytes, deadline);
+                        sent = @fromBackingInt(next);
+                        if (next > @backingInt(feedback_ceiling)) feedback_ceiling = sent;
+                    }
+                    if (self.replicationNow() - last_keepalive >= @as(i64, limits.replication_keepalive_ms) * std.time.ns_per_ms) {
+                        // Logical clients can acknowledge the keepalive LSN.
+                        // Pending spool bytes are not yet eligible for feedback.
+                        try self.replicationKeepalive(scratch.allocator(), sent, true, deadline);
+                        last_keepalive = self.replicationNow();
+                    }
+                    const elapsed_ms: u32 = @intCast(@min(@as(i64, limits.replication_keepalive_ms), @divTrunc(@max(0, self.replicationNow() - last_keepalive), std.time.ns_per_ms)));
+                    const delay: u32 = if (poll.chunk != null) 0 else @min(limits.replication_poll_ms, @max(1, limits.replication_keepalive_ms - elapsed_ms));
+                    try select.concurrent(.tick, replicationTick, .{ self.io, delay });
+                },
+            }
+        }
+        // The input task returned exactly at CopyDone, so no next-command
+        // bytes were consumed. Cancellation joins only the outstanding timer.
+        while (select.cancel()) |remaining| switch (remaining) {
+            .input => |result| {
+                var value = result catch continue;
+                value.deinit(self.alloc);
+            },
+            .tick => {},
+        };
+        self.replicationDeadline(@min(deadline, self.replicationNow() +| @as(i64, limits.replication_write_ms) * std.time.ns_per_ms));
+        try self.message('c', "");
+        try self.command("COPY 0");
+        try self.command("START_REPLICATION");
+        try self.writer.flush();
+        self.replication_copy_active = false;
+    }
+
+    fn replicationCommand(self: *Session, a: std.mem.Allocator, statement: []const u8, command_value: replication_commands.Command) !void {
+        const owner = self.replication orelse return error.UnsupportedReplicationMode;
+        if (self.status != .idle or self.session_id != null) return error.ActiveSqlTransaction;
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        self.replication_administration = true;
+        const request_value = self.request(statement, &.{}, &.{});
+        try request_value.check();
+        try owner.authorize(owner.context, a, request_value, command_value);
+        if (command_value == .start) {
+            try self.replicationCopy(a, statement, owner, command_value);
+            return;
+        }
+        const mutates = command_value != .identify_system;
+        // Logical slot administration does not create a SQL transaction
+        // completion receipt. The replication owner handles uncertain outcomes.
+        var result = try owner.command(owner.context, a, request_value, command_value);
+        defer result.deinit();
+        self.mutation_ack_pending = mutates and result.mutation_outcome == .committed;
+        const expected: []const u8 = switch (command_value) {
+            .identify_system => "IDENTIFY_SYSTEM",
+            .create_slot => "CREATE_REPLICATION_SLOT",
+            .drop_slot => "DROP_REPLICATION_SLOT",
+            .start => unreachable,
+        };
+        const columns: []const []const u8 = switch (command_value) {
+            .identify_system => &.{ "systemid", "timeline", "xlogpos", "dbname" },
+            .create_slot => &.{ "slot_name", "consistent_point", "snapshot_name", "output_plugin" },
+            .drop_slot => &.{},
+            .start => unreachable,
+        };
+        if (!std.mem.eql(u8, result.command_tag, expected) or result.transaction_status != .idle or result.session_id != null or result.continuation != null or result.transaction_id != null or result.ddl_receipt_json != null or result.rows_affected != 0 or result.columns.len != columns.len or result.rowCount() != @as(usize, if (command_value == .drop_slot) 0 else 1) or (if (mutates) result.mutation_outcome != .committed else result.mutation_outcome != null)) return error.InvalidResult;
+        if (result.columns.len > self.limits.columns or result.rowCount() > self.limits.result_rows) return error.ProgramLimitExceeded;
+        for (result.rows) |row| if (row.len != columns.len) return error.InvalidResult;
+        for (result.columns, columns, 0..) |column, name, index| {
+            const kind: backend.Type = if (command_value == .identify_system and index == 1) .integer else .string;
+            if (!std.mem.eql(u8, column.name, name) or column.type != kind or column.element_type != null or column.numeric_modifier != null) return error.InvalidResult;
+        }
+        if (command_value == .create_slot) {
+            const create = command_value.create_slot;
+            // Administration results are one materialized row. Validate the
+            // exact values that will go on the wire before sending metadata.
+            if (result.cells != null) return error.InvalidResult;
+            const name = try result.cell(a, 0, 0);
+            const point = try result.cell(a, 0, 1);
+            const snapshot = try result.cell(a, 0, 2);
+            const plugin = try result.cell(a, 0, 3);
+            if (name.sql_null or name.value != .string or !std.mem.eql(u8, name.value.string, create.slot)) return error.InvalidResult;
+            if (point.sql_null or point.value != .string) return error.InvalidResult;
+            const lsn = replication_commands.parseLsn(point.value.string) catch return error.InvalidResult;
+            if (@backingInt(lsn) == 0) return error.InvalidResult;
+            if (plugin.sql_null or plugin.value != .string or !std.mem.eql(u8, plugin.value.string, "pgoutput")) return error.InvalidResult;
+            switch (create.snapshot) {
+                .export_snapshot => if (snapshot.sql_null or snapshot.value != .string or snapshot.value.string.len == 0 or std.mem.indexOfScalar(u8, snapshot.value.string, 0) != null) return error.InvalidResult,
+                .use_snapshot, .nothing => if (!snapshot.sql_null) return error.InvalidResult,
+            }
+        }
+        owner.authorize(owner.context, a, request_value, command_value) catch |err| {
+            if (mutates) self.diagnostic.set("40003", "replication command committed; authorization changed before reply; inspect slot state", null, null);
+            return err;
+        };
+        if (result.columns.len != 0) try self.rowDescription(result.columns, &.{});
+        try self.dataResult(result, &.{});
+        try self.complete(result);
+    }
+
     fn dispatch(self: *Session, tag: u8, payload: []const u8) !void {
         var cursor = Cursor{ .bytes = payload };
         switch (tag) {
@@ -932,6 +1255,39 @@ pub const Session = struct {
                 } else {
                     var arena = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena.deinit();
+                    const sql = std.mem.trim(u8, statement, " \t\r\n");
+                    const clear_path = std.ascii.eqlIgnoreCase(sql, "SELECT pg_catalog.set_config('search_path', '', false);");
+                    const directory_mode = std.ascii.eqlIgnoreCase(sql, "SHOW data_directory_mode");
+                    if (self.replication_mode == .logical and self.status == .idle and (clear_path or directory_mode)) {
+                        const owner = self.replication orelse return error.UnsupportedReplicationMode;
+                        const request_value = self.request(statement, &.{}, &.{});
+                        try owner.authorize(owner.context, arena.allocator(), request_value, null);
+                        if (clear_path) self.namespace_setting = .{};
+                        const result: backend.Result = if (clear_path) .{
+                            .columns = &.{.{ .name = "set_config", .type = .string }},
+                            .rows = &.{&.{.{ .string = "" }}},
+                            .command_tag = "SELECT 1",
+                        } else .{
+                            // PostgreSQL tools use this value to set the
+                            // client output umask. Report owner-only access.
+                            .columns = &.{.{ .name = "data_directory_mode", .type = .string }},
+                            .rows = &.{&.{.{ .string = "0700" }}},
+                            .command_tag = "SHOW",
+                        };
+                        try self.rowDescription(result.columns, &.{});
+                        try self.dataResult(result, &.{});
+                        try self.complete(result);
+                        try self.ready();
+                        return;
+                    }
+                    if (replication_commands.recognizes(statement)) {
+                        if (self.replication_mode != .logical) return error.UnsupportedReplicationMode;
+                        var parsed = (try replication_commands.parse(arena.allocator(), statement)) orelse return error.PgReplicationSyntax;
+                        defer parsed.deinit();
+                        try self.replicationCommand(arena.allocator(), statement, parsed.command);
+                        try self.ready();
+                        return;
+                    }
                     if (try self.sessionCommand(arena.allocator(), statement)) {
                         if (self.status == .idle) {
                             self.clearPortals();
@@ -1132,6 +1488,7 @@ pub const Session = struct {
                         req.binding_guard = portal.description.binding_guard;
                         req.setting_epoch = portal.description.setting_epoch;
                         portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
+                        if (portal.stream != null) self.snapshot_import_allowed = false;
                     };
                 }
                 if (portal.stream != null or portal.stream_complete) {
@@ -1316,6 +1673,7 @@ pub const Session = struct {
         req.setting_epoch = description.setting_epoch;
         try req.check();
         const identity = self.identity orelse return error.AuthenticationFailed;
+        self.snapshot_import_allowed = false;
         const stream = if (self.source.vtable.open_stream) |open| try open(self.source.context, self.alloc, identity, req) else null;
         var stream_moved = false;
         defer if (!stream_moved) if (stream) |opened| opened.close(opened.context);
@@ -1703,6 +2061,7 @@ pub const Session = struct {
         req.binding_guard = binding_guard;
         req.setting_epoch = setting_epoch;
         const stream = (try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req)) orelse return false;
+        self.snapshot_import_allowed = false;
         var portal = Portal{
             .arena = std.heap.ArenaAllocator.init(self.alloc),
             .statement = statement,
@@ -1986,8 +2345,26 @@ fn sqlstate(err: anyerror) []const u8 {
         error.DuplicatePortal => "42P03",
         error.DuplicateCursorName => "42P03",
         error.ProtocolViolation => "08P01",
+        error.MetadataMutationOutcomeUnknown, error.CommitDecisionUnknown, error.SourceOutcomeUnresolved => "40003",
+        error.ReplicationSlotActive => "55006",
+        error.ReplicationSlotNotFound => "42704",
+        error.ChangefeedResynchronizationRequired,
+        error.ChangefeedLeaseExpired,
+        error.ChangefeedConflict,
+        error.HistoryResynchronizationRequired,
+        error.HistoryCheckpointConflict,
+        error.HistoryConsumerConflict,
+        error.HistoryAuthorityRequired,
+        error.HistoryPreparedTransactionsPresent,
+        => "55000",
+        error.ChangefeedBackpressure, error.HistoryFull, error.HistoryConsumerLimit => "53300",
+        error.HistoryTooLarge => "54000",
+        error.ChangefeedCapabilityUnsupported => "0A000",
+        error.ActiveSqlTransaction => "25001",
         error.OutOfMemory, error.ProgramLimitExceeded => "54000",
-        error.SyntaxError => "42601",
+        error.SyntaxError, error.PgReplicationSyntax => "42601",
+        error.InvalidReplicationOption, error.DuplicateReplicationOption, error.InvalidReplicationSlotName => "22023",
+        error.UnsupportedReplicationMode, error.UnsupportedReplicationOption => "0A000",
         error.InvalidSqlSyntax => "42601",
         error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => "22023",
         error.UnsupportedReadVisibility => "0A000",

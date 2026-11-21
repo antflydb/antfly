@@ -23,11 +23,15 @@ const Owner = struct {
     manager: auth.UserManager,
 };
 var failure: c_int = 0;
+var random_generation: u64 = 0;
 fn random(_: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
     switch (failure) {
         1 => return error.Canceled,
         2 => return error.EntropyUnavailable,
-        else => @memset(bytes, 42),
+        else => {
+            random_generation += 1;
+            for (bytes, 0..) |*byte, i| byte.* = @truncate(random_generation +% i);
+        },
     }
 }
 const vtable: std.Io.VTable = blk: {
@@ -37,6 +41,7 @@ const vtable: std.Io.VTable = blk: {
 };
 fn create() !*auth.UserManager {
     failure = 0;
+    random_generation = 0;
     const owner = try alloc.create(Owner);
     errdefer alloc.destroy(owner);
     owner.users = auth.MemoryStore.init(alloc);

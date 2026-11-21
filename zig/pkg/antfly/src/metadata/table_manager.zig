@@ -2307,6 +2307,10 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
     const restore_location = try alloc.dupe(u8, "");
     errdefer alloc.free(restore_location);
     return .{
+        .storage = record.storage,
+        .object_storage_generation = record.object_storage_generation,
+        .object_storage_identity = record.object_storage_identity,
+        .routing_storage_binding = @import("antfly_local_sources").common_topology_records.tableStorageBinding(record),
         .table_id = record.table_id,
         .name = name,
         .description = description,
@@ -2320,6 +2324,14 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
         .desired_replica_count = 0,
         .min_ranges = 0,
     };
+}
+
+/// Re-cloning a compact wire snapshot must not manufacture a complete binding
+/// from fields omitted by an older producer. Preserve an absent proof as absent.
+pub fn cloneCompactRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
+    var result = try cloneRoutingTable(alloc, record);
+    result.routing_storage_binding = record.routing_storage_binding;
+    return result;
 }
 
 pub const freeTable = @import("antfly_local_sources").metadata_local_catalog.freeTable;
@@ -2428,12 +2440,33 @@ test "routing clones exclude operational and schema payloads" {
     const table = try cloneRoutingTable(std.testing.allocator, .{
         .table_id = 7,
         .name = "docs",
+        .storage = .{ .engine = .object },
+        .object_storage_generation = 5,
+        .object_storage_identity = @splat(6),
         .schema_json = "large schema",
         .indexes_json = "large indexes",
         .restore_location = "s3://private/restore",
     });
     defer freeTable(std.testing.allocator, table);
     try std.testing.expectEqualStrings("docs", table.name);
+    try std.testing.expectEqual(.object, table.storage.engine);
+    try std.testing.expectEqual(@as(u64, 5), table.object_storage_generation);
+    try std.testing.expectEqual(@as([32]u8, @splat(6)), table.object_storage_identity);
+    try std.testing.expect(table.routing_storage_binding != null);
+    const compact = try cloneCompactRoutingTable(std.testing.allocator, table);
+    defer freeTable(std.testing.allocator, compact);
+    try std.testing.expectEqual(table.routing_storage_binding, compact.routing_storage_binding);
+    var legacy = table;
+    legacy.routing_storage_binding = null;
+    const legacy_compact = try cloneCompactRoutingTable(std.testing.allocator, legacy);
+    defer freeTable(std.testing.allocator, legacy_compact);
+    try std.testing.expect(legacy_compact.routing_storage_binding == null);
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, table, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "s3://private/restore") == null);
+    const ordinary = try std.json.Stringify.valueAlloc(std.testing.allocator, TableRecord{ .table_id = 7, .name = "docs" }, .{});
+    defer std.testing.allocator.free(ordinary);
+    try std.testing.expect(std.mem.indexOf(u8, ordinary, "routing_storage_binding") == null);
     try std.testing.expectEqual(@as(usize, 0), table.schema_json.len);
     try std.testing.expectEqual(@as(usize, 0), table.indexes_json.len);
     try std.testing.expectEqual(@as(usize, 0), table.restore_location.len);

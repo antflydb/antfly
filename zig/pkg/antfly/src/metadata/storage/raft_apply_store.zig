@@ -57,6 +57,9 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
 const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
+const source_control = @import("../source_control.zig");
+const changefeed_control = @import("../changefeed_control.zig");
+const pg_publication = @import("../pg_publication.zig");
 pub const apply_contract = @import("raft_apply_contract.zig");
 const platform_time = @import("antfly_platform").time;
 const restore_staging = @import("../restore_staging.zig");
@@ -6058,6 +6061,9 @@ pub const TransitionCommand = union(enum) {
         node_id: u64,
         group_id: u64,
     },
+    apply_source_control: []const u8,
+    apply_changefeed_control: []const u8,
+    apply_pg_publication: []const u8,
     upsert_replication_source_status: metadata.ReplicationSourceStatusRecord,
     claim_replication_source_cutover: struct {
         expected_replication_sources_json: []const u8,
@@ -6133,7 +6139,7 @@ pub const TransitionCommand = union(enum) {
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .mutate_lake_index_lifecycle => |*command| command.mutation.deinitOwned(alloc),
-            .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
+            .apply_changefeed_control, .apply_pg_publication, .apply_source_control, .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
             .apply_transaction_sessions, .apply_resolver_authority, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_completion_reference, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
@@ -6291,6 +6297,9 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
                 return error.InvalidTableDefinitionReplacement;
             }
         },
+        .apply_source_control => |bytes| try source_control.validateEncodedWrite(bytes),
+        .apply_changefeed_control => |bytes| try changefeed_control.validateEncodedWrite(bytes),
+        .apply_pg_publication => |bytes| try pg_publication.validateEncodedWrite(bytes),
         .mutate_lake_index_lifecycle => |mutation| {
             // Row zero owns composed-query artifacts without a logical table.
             if (mutation.table_id == 0) switch (mutation.mutation) {
@@ -14924,6 +14933,12 @@ pub const RaftApplyStore = struct {
         if (request.cursor_catalog_cut != null and request.cursor_bindings.len == 0) return error.InvalidCatalogMutation;
         if (request.cursor_bindings.len != 0 and (request.cursor_bindings.len > 256 or request.targets.len != 0 or request.storage_names.len != 0 or request.relations.len != 0 or !request.include_source_epoch or request.include_query_definitions or request.name_allocation)) return error.InvalidCatalogMutation;
         if (request.expected_relation_epoch != null and request.relations.len == 0) return error.InvalidCatalogMutation;
+        if (request.publication_database) |database| {
+            try system_catalog.validateName(database);
+            if (!request.include_query_definitions or request.storage_names.len != 0 or request.relations.len != 0 or request.name_allocation)
+                return error.InvalidCatalogMutation;
+            for (request.targets) |target| if (!std.mem.eql(u8, target.database, database)) return error.InvalidCatalogMutation;
+        }
         for (request.relations) |target| try target.validate();
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
@@ -14991,6 +15006,28 @@ pub const RaftApplyStore = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const view: system_catalog_storage.View = .{ .alloc = arena.allocator(), .txn = &txn, .group_id = group_id, .meta = meta };
+        const publication_cut: ?system_catalog.PublicationCatalogCut = if (request.publication_database) |database| blk: {
+            const resource = (try view.lookup(.database, 0, database)) orelse return error.DatabaseNotFound;
+            var buffer: [160]u8 = undefined;
+            const raw_identity = txn.get(try metadataIncarnationKeyForGroup(&buffer, group_id)) catch |err| switch (err) {
+                error.NotFound => return error.MetadataIncarnationUnavailable,
+                else => return err,
+            };
+            const identity = try decodeMetadataIncarnationRecord(raw_identity);
+            const bindings = try alloc.alloc(?[32]u8, tables.len);
+            errdefer alloc.free(bindings);
+            for (tables, bindings) |resolved, *binding| {
+                try context.ensureActive();
+                binding.* = null;
+                if (resolved) |table| {
+                    const record = try decodeTableRecord(arena.allocator(), try txn.get(try tableKeyForGroup(&buffer, group_id, table.table_id)));
+                    if (record.table_id != table.table_id or !std.mem.eql(u8, record.name, table.name)) return error.InvalidCatalogRecord;
+                    binding.* = changefeed_control.tableBinding(record);
+                }
+            }
+            break :blk .{ .metadata_group_id = group_id, .metadata_incarnation = identity.incarnation, .database_id = resource.id, .bindings = bindings };
+        } else null;
+        errdefer if (publication_cut) |cut| alloc.free(cut.bindings);
         const relations = try alloc.alloc(?system_catalog.ResolvedRelation, request.relations.len);
         @memset(relations, null);
         errdefer {
@@ -15027,7 +15064,7 @@ pub const RaftApplyStore = struct {
             }
             slot.* = .{ .owner = owner, .table = table, .logical_table = try alloc.dupe(u8, logical_name) };
         }
-        return .{ .revision = meta.revision, .tables = tables, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names), .source_epoch = source_epoch, .relation_epoch = if (live) |value| value.root.epoch else null, .relations = relations };
+        return .{ .revision = meta.revision, .tables = tables, .publication_cut = publication_cut, .source_epoch = source_epoch, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names), .relation_epoch = if (live) |value| value.root.epoch else null, .relations = relations };
     }
 
     /// Name selection can precede registry adoption. Read the complete source
@@ -15663,6 +15700,272 @@ pub const RaftApplyStore = struct {
         };
         defer alloc.free(encoded);
         return try decodeTableRecord(alloc, encoded);
+    }
+
+    pub fn getPgPublication(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, database: changefeed_control.Digest, name: []const u8) !?std.json.Parsed(pg_publication.Record) {
+        var buffer: [256]u8 = undefined;
+        const raw = self.store.get(a, try pg_publication.key(&buffer, group_id, database, name)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer a.free(raw);
+        var parsed = try pg_publication.parseRecord(a, raw);
+        errdefer parsed.deinit();
+        if (!std.meta.eql(parsed.value.database, database) or !std.mem.eql(u8, parsed.value.name, name))
+            return error.ChangefeedCorrupt;
+        return parsed;
+    }
+
+    fn applyPgPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        var write = try pg_publication.parseWrite(self.alloc, bytes);
+        defer write.deinit();
+        if (write.value.expected_catalog_revision) |revision| {
+            if ((try system_catalog_storage.readMeta(self.alloc, txn, group_id)).revision != revision) return;
+        }
+        const next = write.value.next;
+        var buffer: [256]u8 = undefined;
+        const key = try pg_publication.key(&buffer, group_id, next.database, next.name);
+        var before = if (try stagingGet(txn, key)) |raw| try pg_publication.parseRecord(self.alloc, raw) else null;
+        defer if (before) |*parsed| parsed.deinit();
+        if (before) |parsed| {
+            if (!std.meta.eql(parsed.value.database, next.database) or !std.mem.eql(u8, parsed.value.name, next.name))
+                return error.ChangefeedCorrupt;
+        }
+        if (!write.value.applies(if (before) |parsed| parsed.value else null)) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (next.members) |members| for (members) |member| {
+            var table_buffer: [256]u8 = undefined;
+            const raw = (try stagingGet(txn, try tableKeyForGroup(&table_buffer, group_id, member.table.table_id))) orelse return;
+            const table = try decodeTableRecord(a, raw);
+            if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, table.table_id)) return;
+            if (table.storage.engine != .local or !std.meta.eql(member.table.binding, changefeed_control.tableBinding(table))) return;
+        };
+        const encoded = try std.json.Stringify.valueAlloc(a, next, .{});
+        if (encoded.len > pg_publication.max_wire_bytes) return error.InvalidChangefeed;
+        try txn.put(key, encoded);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+    }
+
+    pub fn getChangefeedControl(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, id: changefeed_control.Id) ![]u8 {
+        var buffer: [256]u8 = undefined;
+        return self.store.get(a, try changefeed_control.keyForGroup(&buffer, group_id, id)) catch |err| switch (err) {
+            error.NotFound => changefeed_control.encode(a, .{}),
+            else => err,
+        };
+    }
+    /// Scan a bounded number of existing state keys in one projection cut.
+    /// Only identity candidates leave this read transaction. The driver must
+    /// reread each identity and use its current CAS revision before mutating.
+    pub fn scanChangefeedMaintenance(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, now: u64, after: ?changefeed_control.Id) !changefeed_control.MaintenanceScan {
+        if (group_id == 0 or now == 0) return error.InvalidChangefeed;
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var prefix_buf: [96]u8 = undefined;
+        const prefix = try changefeed_control.statePrefixForGroup(&prefix_buf, group_id);
+        var key_buf: [128]u8 = undefined;
+        const start = if (after) |id| try changefeed_control.keyForGroup(&key_buf, group_id, id) else prefix;
+        var row = try cursor.seekAtOrAfter(start);
+        if (after != null) if (row) |item| {
+            if (std.mem.eql(u8, item.key, start)) row = try cursor.next();
+        };
+        var scan: changefeed_control.MaintenanceScan = .{ .ids = @splat(@splat(0)) };
+        var last: ?changefeed_control.Id = null;
+        for (0..changefeed_control.MaintenanceScan.limit) |_| {
+            const item = row orelse break;
+            if (!std.mem.startsWith(u8, item.key, prefix)) break;
+            const hex = item.key[prefix.len..];
+            var id: changefeed_control.Id = undefined;
+            if (hex.len != id.len * 2) return error.ChangefeedCorrupt;
+            _ = std.fmt.hexToBytes(&id, hex) catch return error.ChangefeedCorrupt;
+            var parsed = try changefeed_control.parse(a, item.value);
+            defer parsed.deinit();
+            if (!std.mem.eql(u8, &parsed.value.id, &id) or parsed.value.phase == .empty)
+                return error.ChangefeedCorrupt;
+            if (parsed.value.needsMaintenance(now)) {
+                scan.ids[scan.count] = id;
+                scan.count += 1;
+            }
+            last = id;
+            row = try cursor.next();
+        }
+        if (row) |item| if (std.mem.startsWith(u8, item.key, prefix)) {
+            scan.next = last;
+        };
+        return scan;
+    }
+
+    pub fn getChangefeedAuthority(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64) !?changefeed_control.Stamp {
+        var buffer: [256]u8 = undefined;
+        const bytes = self.store.get(a, try changefeed_control.authorityKey(&buffer, group_id)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer a.free(bytes);
+        return try changefeed_control.parseAuthority(a, bytes);
+    }
+    fn applyChangefeedControlTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        var command = try changefeed_control.parseWrite(self.alloc, bytes);
+        defer command.deinit();
+        const write = command.value;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var buffer: [256]u8 = undefined;
+        const key = try a.dupe(u8, try changefeed_control.keyForGroup(&buffer, group_id, write.id));
+        var parsed: ?changefeed_control.Parsed = if (try stagingGet(txn, key)) |raw| try changefeed_control.parse(self.alloc, raw) else null;
+        defer if (parsed) |*value| value.deinit();
+        const before = if (parsed) |value| value.value else changefeed_control.State{};
+        const authority_key = try a.dupe(u8, try changefeed_control.authorityKey(&buffer, group_id));
+        const authority = if (try stagingGet(txn, authority_key)) |raw| try changefeed_control.parseAuthority(a, raw) else null;
+        if (authority) |current| if (!std.mem.eql(u8, &current.incarnation, &write.authority)) return;
+        const sequence = if (authority) |current| std.math.add(u64, current.sequence, 1) catch return error.ChangefeedCorrupt else 1;
+        const next = write.apply(a, before, sequence) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
+        if (next.revision == before.revision) return;
+        // New definitions must bind live table incarnations. Cleanup/reset of
+        // an older feed remains possible after its tables have been retired.
+        if (write.mutation == .create or write.mutation == .restart) {
+            for (next.definition.?.tables) |binding| {
+                const table_bytes = (try stagingGet(txn, try tableKeyForGroup(&buffer, group_id, binding.table_id))) orelse return;
+                const table = try decodeTableRecord(a, table_bytes);
+                if (!std.mem.eql(u8, &binding.binding, &changefeed_control.tableBinding(table))) return;
+            }
+        }
+        try txn.put(key, try changefeed_control.encode(a, next));
+        try txn.put(authority_key, try changefeed_control.encodeAuthority(a, .{ .incarnation = write.authority, .sequence = sequence }));
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+    }
+
+    pub fn getSourceControl(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, source_id: source_control.Digest) ![]u8 {
+        var buffer: [256]u8 = undefined;
+        return self.store.get(a, try source_control.keyForGroup(&buffer, group_id, table_id, source_id)) catch |err| switch (err) {
+            error.NotFound => source_control.encode(a, .{}),
+            else => err,
+        };
+    }
+    /// The caller first establishes metadata ReadIndex. This only decides
+    /// whether an old round may start; it never proves in-flight writers drained.
+    pub fn legacyReplicationSourceIntakeAllowed(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source_control.Digest) !bool {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        return @import("../source_legacy_intake.zig").allowed(a, &txn, group_id, table_id, ordinal, definition);
+    }
+    /// The service establishes ReadIndex before calling. Every captured field,
+    /// including the actual applied index and activated decoder, shares one read.
+    pub fn captureSourceScope(self: *RaftApplyStore, a: std.mem.Allocator, query: @import("../source_scope_capture.zig").Query) !@import("../source_scope_capture.zig").Snapshot {
+        const capture = @import("../source_scope_capture.zig");
+        try query.validate();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const applied = try durableAppliedIndexTxn(&txn, query.metadata_group_id);
+        if (applied < query.minimum_applied_index) return error.ReadUnavailable;
+        var buffer: [256]u8 = undefined;
+        const incarnation_raw = txn.get(try metadataIncarnationKeyForGroup(&buffer, query.metadata_group_id)) catch |err| switch (err) {
+            error.NotFound => return error.InvalidMetadataIncarnation,
+            else => return err,
+        };
+        const incarnation = (try decodeMetadataIncarnationRecord(incarnation_raw)).incarnation;
+        if (!std.meta.eql(incarnation, query.metadata_incarnation)) return error.InvalidMetadataIncarnation;
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const activation_raw = txn.get(try topologyActivationKeyForGroup(&buffer, query.metadata_group_id)) catch |err| switch (err) {
+            error.NotFound => return error.TableTopologyProtocolUpgradeRequired,
+            else => return err,
+        };
+        var activation = try std.json.parseFromSlice(topology_protocol.Activation, temporary, activation_raw, .{ .ignore_unknown_fields = false });
+        defer activation.deinit();
+        if (!std.meta.eql(activation.value.incarnation, incarnation) or activation.value.version > topology_protocol.current_version or activation.value.member_count == 0 or std.mem.allEqual(u8, &activation.value.membership_fingerprint, 0)) return error.TableTopologyProtocolUpgradeRequired;
+        const table_raw = txn.get(try tableKeyForGroup(&buffer, query.metadata_group_id, query.actor_table_id)) catch |err| switch (err) {
+            error.NotFound => return error.SourceBindingConflict,
+            else => return err,
+        };
+        const table = try decodeTableRecord(temporary, table_raw);
+        const state_raw = txn.get(try source_control.keyForGroup(&buffer, query.metadata_group_id, query.actor_table_id, query.source_id)) catch |err| switch (err) {
+            error.NotFound => return error.SourceBindingConflict,
+            else => return err,
+        };
+        var state = try source_control.parse(temporary, state_raw);
+        defer state.deinit();
+        return capture.capture(a, query, applied, incarnation, activation.value.version, state.value, table.replication_sources_json);
+    }
+
+    fn applySourceControlTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        var parsed_write = try source_control.parseWrite(self.alloc, bytes);
+        defer parsed_write.deinit();
+        const write = parsed_write.value;
+        var buffer: [256]u8 = undefined;
+        const table_bytes = (try stagingGet(txn, try tableKeyForGroup(&buffer, group_id, write.table_id))) orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const table = try decodeTableRecord(a, table_bytes);
+        if (!std.mem.eql(u8, &write.expected_catalog_digest, &source_control.digest(table.replication_sources_json))) return;
+        const key = try source_control.keyForGroup(&buffer, group_id, write.table_id, write.source_id);
+        const existing = try stagingGet(txn, key);
+        var parsed_state: ?std.json.Parsed(source_control.State) = if (existing) |raw| try source_control.parse(self.alloc, raw) else null;
+        defer if (parsed_state) |*state| state.deinit();
+        const state = if (parsed_state) |value| value.value else source_control.State{};
+        if (state.revision != write.expected_revision) return;
+        const scope = switch (write.mutation) {
+            .configure, .reseed => |configured| configured,
+            else => state.scope orelse return,
+        };
+        if (state.scope) |prior| {
+            if (!std.mem.eql(u8, &prior.identity(), &write.expected_binding)) return;
+        } else if (write.mutation != .configure or !std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return;
+        switch (write.mutation) {
+            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing => {
+                const definition = source_control.definitionDigest(a, table.replication_sources_json, scope.source_ordinal) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return,
+                };
+                if (!std.mem.eql(u8, &definition, &scope.definition)) return;
+            },
+            // Already accepted work can drain after configuration replacement;
+            // its current catalog CAS and original source binding still fence it.
+            .accept, .commit, .retire, .reject_and_retire, .seal_artifact, .retire_artifact, .reclaim_artifact, .fence_checkpoint, .close => {},
+        }
+        if (write.mutation == .bind_checkpoint) {
+            const authority = write.mutation.bind_checkpoint;
+            if (authority.owner.metadata_group_id != group_id) return;
+            var incarnation_buffer: [160]u8 = undefined;
+            const incarnation_raw = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&incarnation_buffer, group_id))) orelse return;
+            if (!std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(incarnation_raw)).incarnation, &authority.owner.metadata_incarnation)) return;
+        }
+        const next = write.mutation.apply(a, state) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
+        const output = source_control.encode(a, next) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
+        if (existing) |raw| if (std.mem.eql(u8, raw, output)) return;
+        var work_buffer: [256]u8 = undefined;
+        const work_key = try source_control.workKey(&work_buffer, group_id, write.table_id);
+        const work = try stagingGet(txn, work_key);
+        const count = if (work) |value| blk: {
+            if (value.len != 8) return error.InvalidSourceControl;
+            break :blk std.mem.readInt(u64, value[0..8], .little);
+        } else 0;
+        if (source_control.hasWork(state) != source_control.hasWork(next)) {
+            const next_count = if (source_control.hasWork(next))
+                std.math.add(u64, count, 1) catch return error.InvalidSourceControl
+            else
+                std.math.sub(u64, count, 1) catch return error.InvalidSourceControl;
+            var encoded_count: [8]u8 = undefined;
+            std.mem.writeInt(u64, &encoded_count, next_count, .little);
+            try txn.put(work_key, &encoded_count);
+        }
+        try txn.put(key, output);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
     }
 
     pub fn getLakeIndexLifecycle(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
@@ -18964,6 +19267,8 @@ pub const RaftApplyStore = struct {
         reallocation_request_pending,
         catalog_revision,
         lake_source_owner,
+        source_control,
+        changefeeds,
     };
     const MetadataSnapshotKey = union(enum) {
         prefix: MetadataSnapshotKeyFn,
@@ -19003,6 +19308,8 @@ pub const RaftApplyStore = struct {
         .{ .projection = .table, .key = .{ .prefix = tablePrefixForGroup } },
         .{ .projection = .resolver_namespaces, .key = .{ .prefix = resolverNamespacePrefix } },
         .{ .projection = .lake_index_lifecycle, .key = .{ .prefix = lakeIndexLifecyclePrefixForGroup } },
+        .{ .projection = .source_control, .key = .{ .prefix = source_control.prefixForGroup } },
+        .{ .projection = .changefeeds, .key = .{ .prefix = changefeed_control.prefixForGroup } },
         .{ .projection = .lake_source_owner, .key = .{ .prefix = lakeSourceOwnerPrefixForGroup } },
         .{ .projection = .table_transition_fence, .key = .{ .prefix = tableTransitionFencePrefixForGroup } },
         .{ .projection = .schema_progress, .key = .{ .prefix = schemaProgressPrefixForGroup } },
@@ -19082,6 +19389,8 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.placement_version) | metadataSnapshotProjectionBit(.fk_initial_replica_live) | metadataSnapshotProjectionBit(.fk_initial_replica_live_count),
             .advance_resolver_namespace, .apply_resolver_authority => metadataSnapshotProjectionBit(.resolver_namespaces) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.catalog_revision),
             .mutate_lake_index_lifecycle => metadataSnapshotProjectionBit(.lake_index_lifecycle),
+            .apply_source_control => metadataSnapshotProjectionBit(.source_control),
+            .apply_changefeed_control, .apply_pg_publication => metadataSnapshotProjectionBit(.changefeeds),
             .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .apply_table_topology => metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
@@ -21681,6 +21990,9 @@ pub const RaftApplyStore = struct {
             },
             .advance_resolver_namespace => |intent| try self.applyResolverNamespaceAdvanceTxn(txn, group_id, intent),
             .apply_resolver_authority => |bytes| try self.applyResolverAuthorityTxn(txn, group_id, bytes),
+            .apply_source_control => |bytes| try self.applySourceControlTxn(txn, group_id, bytes),
+            .apply_changefeed_control => |bytes| try self.applyChangefeedControlTxn(txn, group_id, bytes),
+            .apply_pg_publication => |bytes| try self.applyPgPublicationTxn(txn, group_id, bytes),
             .mutate_lake_index_lifecycle => |mutation| {
                 try self.applyLakeIndexLifecycleTxn(txn, group_id, mutation.table_id, mutation.expected_revision, mutation.mutation);
             },
@@ -22347,6 +22659,11 @@ pub const RaftApplyStore = struct {
     /// rejection must precede logical unbinding: Raft commits rejected commands
     /// as no-ops, while standalone aborts and exposes the precise policy error.
     fn removeTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64, expected_generation: u64) !void {
+        var source_work_buffer: [256]u8 = undefined;
+        if (try stagingGet(txn, try source_control.workKey(&source_work_buffer, group_id, table_id))) |work| {
+            if (work.len != 8) return error.InvalidSourceControl;
+            if (std.mem.readInt(u64, work[0..8], .little) != 0) return error.TableTransitionActive;
+        }
         if (try self.fkGenerationTableLockedTxn(txn, group_id, table_id)) return error.TableTransitionActive;
         const fence = try self.loadTableTransitionFenceTxn(txn, group_id, table_id);
         if (fence.active()) return error.TableTransitionActive;
@@ -28803,6 +29120,9 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    apply_source_control = 83,
+    apply_changefeed_control = 84,
+    apply_pg_publication = 85,
     apply_sql_completion_reference = 81,
     advance_resolver_namespace = 80,
     apply_transaction_sessions = 82,
@@ -29091,6 +29411,21 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         },
         .apply_resolver_authority => |bytes| {
             try out.append(alloc, @backingInt(TransitionTag.apply_resolver_authority));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_source_control => |bytes| {
+            try source_control.validateEncodedWrite(bytes);
+            try out.append(alloc, @backingInt(TransitionTag.apply_source_control));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_changefeed_control => |bytes| {
+            try changefeed_control.validateEncodedWrite(bytes);
+            try out.append(alloc, @backingInt(TransitionTag.apply_changefeed_control));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_pg_publication => |bytes| {
+            try pg_publication.validateEncodedWrite(bytes);
+            try out.append(alloc, @backingInt(TransitionTag.apply_pg_publication));
             try appendRequiredString(alloc, &out, bytes);
         },
         .mutate_lake_index_lifecycle => |mutation| {
@@ -29581,6 +29916,33 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 .replacement = replacement,
                 .relation_guard = guard,
             } };
+        },
+        .apply_source_control => blk: {
+            const len = try readInt(encoded, &pos, u32);
+            if (len == 0 or len > source_control.max_state_bytes or len > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
+            const bytes = encoded[pos..][0..len];
+            pos += len;
+            if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            try source_control.validateEncodedWrite(bytes);
+            break :blk .{ .apply_source_control = try alloc.dupe(u8, bytes) };
+        },
+        .apply_changefeed_control => blk: {
+            const len = try readInt(encoded, &pos, u32);
+            if (len == 0 or len > changefeed_control.max_state_bytes or len > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
+            const bytes = encoded[pos..][0..len];
+            pos += len;
+            if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            try changefeed_control.validateEncodedWrite(bytes);
+            break :blk .{ .apply_changefeed_control = try alloc.dupe(u8, bytes) };
+        },
+        .apply_pg_publication => blk: {
+            const len = try readInt(encoded, &pos, u32);
+            if (len == 0 or len > pg_publication.max_wire_bytes or len > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
+            const bytes = encoded[pos..][0..len];
+            pos += len;
+            if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            try pg_publication.validateEncodedWrite(bytes);
+            break :blk .{ .apply_pg_publication = try alloc.dupe(u8, bytes) };
         },
         .mutate_lake_index_lifecycle => blk: {
             const table_id = try readInt(encoded, &pos, u64);
@@ -40565,6 +40927,32 @@ test "system catalog publishes names and table topology atomically and fences st
         try std.testing.expect(resolved.tables[1] == null);
         try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(alloc, 21, .{ .targets = &targets, .expected_revision = 1 }));
     }
+    {
+        const incarnation = "01010101010101010101010101010101".*;
+        const targets = [_]system_catalog.Target{ .{ .database = "analytics", .table = "events" }, .{ .database = "analytics", .table = "missing" } };
+        const request: system_catalog.ResolveMany = .{ .targets = &targets, .publication_database = "analytics", .include_query_definitions = true, .expected_revision = 2 };
+        try std.testing.expectError(error.MetadataIncarnationUnavailable, store.resolveSystemCatalogIdentities(alloc, 21, request));
+        try store.applyStandaloneCommand(21, .{ .initialize_metadata_incarnation = incarnation });
+        const resolved = try store.resolveSystemCatalogIdentities(alloc, 21, request);
+        defer resolved.deinit(alloc);
+        const cut = try resolved.requirePublicationCut(request);
+        try std.testing.expectEqual(@as(u64, 21), cut.metadata_group_id);
+        try std.testing.expectEqual(incarnation, cut.metadata_incarnation);
+        try std.testing.expect(cut.database_id != system_catalog.default_database_id and cut.database_id != 0);
+        try std.testing.expectEqual(changefeed_control.tableBinding(table), cut.bindings[0].?);
+        try std.testing.expect(cut.bindings[1] == null);
+        const bytes = try std.json.Stringify.valueAlloc(alloc, resolved, .{});
+        defer alloc.free(bytes);
+        const response = try std.json.parseFromSlice(system_catalog.ResolvedMany, alloc, bytes, .{});
+        defer response.deinit();
+        try std.testing.expectEqual(cut.database_id, (try response.value.requirePublicationCut(request)).database_id);
+        var old_peer = resolved;
+        old_peer.publication_cut = null;
+        try std.testing.expectError(error.TableTopologyUpgradeRequired, old_peer.requirePublicationCut(request));
+        var foreign_database = request;
+        foreign_database.publication_database = "default";
+        try std.testing.expectError(error.InvalidCatalogMutation, store.resolveSystemCatalogIdentities(alloc, 21, foreign_database));
+    }
     // The hot-path response must neither serialize nor allocate the table's
     // potentially large definition. Its allocator budget is independent of it.
     {
@@ -46092,6 +46480,785 @@ test "selected owner readiness durable transition index rebuilds and retires act
     defer a.free(retired);
     try std.testing.expectEqual(@as(usize, 0), retired.len);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.ownerReadinessTransitions(a, 21, request, .{ .deadline_ns = 0 }));
+}
+
+test "metadata source control survives reopen fences catalog and protects table retirement" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-control", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group_id = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{}",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]",
+    };
+    try store.applyStandaloneCommand(group_id, .{ .upsert_table = table });
+    const scope: source_control.Scope = .{
+        .table_id = 7,
+        .source_id = @splat(1),
+        .source_ordinal = 0,
+        .generation = 1,
+        .definition = try source_control.definitionDigest(a, table.replication_sources_json, 0),
+        .provider = @splat(3),
+        .destination = .native,
+        .destination_binding = @splat(7),
+    };
+    var write: source_control.Write = .{
+        .table_id = 7,
+        .source_id = scope.source_id,
+        .expected_revision = 0,
+        .expected_binding = scope.identity(),
+        .expected_catalog_digest = source_control.digest(table.replication_sources_json),
+        .mutation = .{ .configure = scope },
+    };
+    const configured_bytes = try source_control.encodeWrite(ca, write);
+    const frame = try encodeTransitionCommand(ca, .{ .apply_source_control = configured_bytes });
+    var decoded = (try decodeTransitionCommand(a, frame)) orelse return error.TestUnexpectedResult;
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings(configured_bytes, decoded.apply_source_control);
+    try store.applyStandaloneCommand(group_id, decoded);
+    write.expected_revision = 1;
+    const reservation: source_control.Reservation = .{
+        .sequence = 1,
+        .batch_id = "one",
+        .checkpoint = "commit-1",
+        .accepted_at_ns = 100,
+        .payload_digest = @splat(4),
+        .plan_digest = @splat(5),
+        .transaction_id = @splat(6),
+        .destination = .native,
+        .delivery_manifest = "{\"coordinator\":7}",
+    };
+    write.mutation = .{ .reserve = reservation };
+    const reserve_bytes = try source_control.encodeWrite(ca, write);
+    try store.applyStandaloneCommand(group_id, .{ .apply_source_control = reserve_bytes });
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.TableTransitionActive, store.removeTableTxn(&txn, group_id, 7, 0));
+    }
+    store.deinit();
+    store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    const retained = try store.getSourceControl(a, group_id, 7, scope.source_id);
+    defer a.free(retained);
+    var parsed = try source_control.parse(a, retained);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.revision);
+    try std.testing.expectEqualStrings("commit-1", parsed.value.pending.?.checkpoint);
+    var stale = write;
+    stale.expected_revision = 2;
+    stale.expected_catalog_digest = @splat(9);
+    stale.mutation = .{ .accept = .{ .reservation_digest = reservation.identity(scope), .receipt = "native-receipt", .commit_reference = "native-committed" } };
+    try store.applyStandaloneCommand(group_id, .{ .apply_source_control = try source_control.encodeWrite(ca, stale) });
+    const unchanged = try store.getSourceControl(a, group_id, 7, scope.source_id);
+    defer a.free(unchanged);
+    try std.testing.expectEqualStrings(retained, unchanged);
+    stale.expected_catalog_digest = write.expected_catalog_digest;
+    try store.applyStandaloneCommand(group_id, .{ .apply_source_control = try source_control.encodeWrite(ca, stale) });
+    const committed = try store.getSourceControl(a, group_id, 7, scope.source_id);
+    defer a.free(committed);
+    var finished = try source_control.parse(a, committed);
+    defer finished.deinit();
+    try std.testing.expectEqual(@as(u64, 1), finished.value.accepted.sequence);
+    try std.testing.expectEqual(@as(u64, 1), finished.value.committed.sequence);
+    try std.testing.expect(!source_control.hasWork(finished.value));
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var buffer: [256]u8 = undefined;
+        const count = try txn.get(try source_control.workKey(&buffer, group_id, 7));
+        try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, count[0..8], .little));
+    }
+}
+
+test "metadata source control snapshot installs pending source authority and retention work counters" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-control-snapshot", .{tmp.sub_path});
+    defer a.free(source_root);
+    const target_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-control-installed", .{tmp.sub_path});
+    defer a.free(target_root);
+    var source = try RaftApplyStore.init(a, .{ .root_dir = source_root });
+    defer source.deinit();
+    var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+    defer target.deinit();
+    const group_id = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{
+        .table_id = 19,
+        .name = "source-snapshot",
+        .schema_json = "{}",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"orders\"}]",
+    };
+    const scope: source_control.Scope = .{
+        .table_id = table.table_id,
+        .source_id = @splat(2),
+        .source_ordinal = 0,
+        .generation = 1,
+        .provider = @splat(3),
+        .definition = try source_control.definitionDigest(a, table.replication_sources_json, 0),
+        .destination = .native,
+        .destination_binding = @splat(4),
+    };
+    var write: source_control.Write = .{
+        .table_id = table.table_id,
+        .source_id = scope.source_id,
+        .expected_revision = 0,
+        .expected_binding = scope.identity(),
+        .expected_catalog_digest = source_control.digest(table.replication_sources_json),
+        .mutation = .{ .configure = scope },
+    };
+    const table_frame = try encodeTransitionCommand(ca, .{ .upsert_table = table });
+    const configure_frame = try encodeTransitionCommand(ca, .{ .apply_source_control = try source_control.encodeWrite(ca, write) });
+    write.expected_revision = 1;
+    write.mutation = .{ .reserve = .{
+        .sequence = 1,
+        .batch_id = "retained",
+        .checkpoint = "opaque-cp",
+        .accepted_at_ns = 123,
+        .payload_digest = @splat(4),
+        .plan_digest = @splat(5),
+        .transaction_id = @splat(6),
+        .destination = .native,
+        .delivery_manifest = "{\"original_coordinator\":7}",
+        .artifact = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = source_control.artifact_control.domainFor(scope.identity()), .attempt = .{ 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, .bytes = 1024, .checksum = @splat(10), .plan_digest = @splat(11) },
+    } };
+    const reserve_frame = try encodeTransitionCommand(ca, .{ .apply_source_control = try source_control.encodeWrite(ca, write) });
+    const entries = try raft_state_machine.encodeCommittedEntries(ca, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_frame },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = configure_frame },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = reserve_frame },
+    });
+    try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 3, .entries_bytes = entries });
+    var prepared = (try source.snapshotBuilder().prepareSnapshot(group_id, 3)) orelse return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    var materialized = try prepared.materialize(a);
+    defer materialized.deinit(a);
+    const snapshot = switch (materialized) {
+        .bytes => |bytes| bytes,
+        .artifact => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group_id, 3, snapshot));
+    const expected = try source.getSourceControl(a, group_id, table.table_id, scope.source_id);
+    defer a.free(expected);
+    const installed = try target.getSourceControl(a, group_id, table.table_id, scope.source_id);
+    defer a.free(installed);
+    try std.testing.expectEqualStrings(expected, installed);
+    var restored = try source_control.parse(a, installed);
+    defer restored.deinit();
+    try std.testing.expectEqualStrings("opaque-cp", restored.value.pending.?.checkpoint);
+    try std.testing.expectEqual(@as(u64, 1024), restored.value.artifact_control.?.chargedBytes());
+    try std.testing.expectEqual(.reserved, restored.value.artifact_control.?.current.?.phase);
+    try std.testing.expectEqual(@as(u64, 1), restored.value.artifact_control.?.next_token);
+    var txn = try target.store.beginWriteTxn();
+    defer txn.abort();
+    try std.testing.expectError(error.TableTransitionActive, target.removeTableTxn(&txn, group_id, table.table_id, 0));
+}
+
+test "metadata changefeed control PostgreSQL publication CAS preserves database and table incarnations" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/pg-publication", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = "{}" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const member: pg_publication.Member = .{
+        .table = .{ .table_id = 7, .binding = changefeed_control.tableBinding(table), .policy_revision = 1, .contract = .native_relational },
+        .permission_name = "rows",
+        .namespace = "public",
+        .name = "rows",
+        .oid = 42,
+        .identity = .default,
+        .key_columns = &.{"id"},
+    };
+    const database: changefeed_control.Digest = @splat(1);
+    var write: pg_publication.Write = .{
+        .expected_revision = 0,
+        .next = .{ .database = database, .name = "rows_pub", .owner = @splat(2), .revision = 1, .members = &.{member} },
+    };
+    const encoded = try std.json.Stringify.valueAlloc(scratch, write, .{});
+    const frame = try encodeTransitionCommand(scratch, .{ .apply_pg_publication = encoded });
+    var decoded = (try decodeTransitionCommand(a, frame)).?;
+    defer decoded.deinit(a);
+    try store.applyStandaloneCommand(group, decoded);
+    try store.applyStandaloneCommand(group, decoded);
+    {
+        var observed = (try store.getPgPublication(a, group, database, write.next.name)).?;
+        defer observed.deinit();
+        try std.testing.expectEqualDeep(write.next, observed.value);
+        try std.testing.expect((try store.getPgPublication(a, group, @splat(3), write.next.name)) == null);
+    }
+    write.expected_revision = 1;
+    write.next.revision = 2;
+    var wrong = member;
+    wrong.table.binding = @splat(4);
+    write.next.members = &.{wrong};
+    try store.applyStandaloneCommand(group, .{ .apply_pg_publication = try std.json.Stringify.valueAlloc(scratch, write, .{}) });
+    write.next.members = null;
+    try store.applyStandaloneCommand(group, .{ .apply_pg_publication = try std.json.Stringify.valueAlloc(scratch, write, .{}) });
+    store.deinit();
+    store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    try store.applyStandaloneCommand(group, decoded);
+    var dropped = (try store.getPgPublication(a, group, database, write.next.name)).?;
+    defer dropped.deinit();
+    try std.testing.expectEqualDeep(write.next, dropped.value);
+}
+
+test "metadata changefeed control maintenance scan advances over a full ineligible page" {
+    const a = std.testing.allocator;
+    const control = changefeed_control;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/changefeed-maintenance", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .schema_json = "{}" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const definition: control.Definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = control.tableBinding(table), .policy_revision = 1, .contract = .native_document }} };
+    for (1..control.MaintenanceScan.limit + 3) |n| {
+        const id: control.Id = @splat(@as(u8, @intCast(n)));
+        const write: control.Write = .{
+            .id = id,
+            .authority = @splat(9),
+            .owner = definition.owner,
+            .authorization = definition.authorization,
+            .expected_revision = 0,
+            .expected_epoch = 0,
+            .mutation = .{ .create = .{ .id = id, .definition = definition, .now = 100, .expires_at = if (n == control.MaintenanceScan.limit + 1) 200 else 1000 } },
+        };
+        const command = try control.encodeWrite(a, write);
+        defer a.free(command);
+        try store.applyStandaloneCommand(group, .{ .apply_changefeed_control = command });
+    }
+    const first = try store.scanChangefeedMaintenance(a, group, 200, null);
+    try std.testing.expectEqual(@as(usize, 0), first.count);
+    try std.testing.expectEqual(@as(control.Id, @splat(control.MaintenanceScan.limit)), first.next.?);
+    const second = try store.scanChangefeedMaintenance(a, group, 200, first.next);
+    try std.testing.expectEqualSlices(control.Id, &.{@splat(control.MaintenanceScan.limit + 1)}, second.items());
+    try std.testing.expect(second.next == null);
+    const other = try store.scanChangefeedMaintenance(a, group + 1, 200, null);
+    try std.testing.expectEqual(@as(usize, 0), other.count);
+    try std.testing.expect(other.next == null);
+}
+
+test "metadata changefeed control persists cursor debt fences bindings and survives reopen" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/changefeed-control", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .schema_json = "{}" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const definition: changefeed_control.Definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = changefeed_control.tableBinding(table), .policy_revision = 1, .contract = .native_document }} };
+    var write: changefeed_control.Write = .{ .id = @splat(4), .authority = @splat(9), .owner = definition.owner, .authorization = definition.authorization, .expected_revision = 0, .expected_epoch = 0, .mutation = .{ .create = .{ .id = @splat(4), .definition = definition, .now = 100, .expires_at = 1000 } } };
+    const command = try changefeed_control.encodeWrite(scratch, write);
+    const frame_bytes = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = command });
+    var decoded = (try decodeTransitionCommand(a, frame_bytes)) orelse return error.TestUnexpectedResult;
+    defer decoded.deinit(a);
+    try store.applyStandaloneCommand(group, decoded);
+    try std.testing.expectEqual(@as(u64, 1), (try store.getChangefeedAuthority(a, group)).?.sequence);
+    var namespace: changefeed_control.Namespace = @splat(0);
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 1, .big);
+    std.mem.writeInt(u64, namespace[16..24], 1, .big);
+    write.expected_revision = 1;
+    write.expected_epoch = 1;
+    write.mutation = .{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} };
+    var stale = write;
+    stale.owner = @splat(8);
+    try store.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, stale) });
+    try std.testing.expectEqual(@as(u64, 1), (try store.getChangefeedAuthority(a, group)).?.sequence);
+    try store.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 2;
+    write.mutation = .{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = 2, .consumer_epoch = 6, .start = 10 } };
+    try store.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 3;
+    write.mutation = .{ .seal = .{ .cut = @splat(7) } };
+    try store.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    const before_bytes = try store.getChangefeedControl(a, group, write.id);
+    defer a.free(before_bytes);
+    var before = try changefeed_control.parse(a, before_bytes);
+    defer before.deinit();
+    var delivery: changefeed_control.Delivery = .{ .sequence = 1, .before = before.value.latest_cursor, .cursor = @splat(0), .authority = @splat(8), .issued_at = 200, .provider_context = "AQ", .advances = &.{.{ .namespace = namespace, .position = .{ .sequence = 10, .event = 3 } }} };
+    delivery.cursor = delivery.identity(write.id, 1);
+    write.expected_revision = 4;
+    write.mutation = .{ .issue = delivery };
+    try store.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    store.deinit();
+    store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    const recovered_bytes = try store.getChangefeedControl(a, group, write.id);
+    defer a.free(recovered_bytes);
+    var recovered = try changefeed_control.parse(a, recovered_bytes);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u32, 3), recovered.value.roots[0].delivered.event);
+    try std.testing.expectEqual(@as(u32, 0), recovered.value.roots[0].acknowledged.event);
+    try std.testing.expectEqual(@as(usize, 1), recovered.value.cursors.len);
+    try std.testing.expectEqual(@as(u64, 5), (try store.getChangefeedAuthority(a, group)).?.sequence);
+    // A stale write and a new feed bound to a different base cannot advance
+    // either the resource state or its global enrollment authority counter.
+    try store.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    var invalid = definition;
+    invalid.tables = &.{.{ .table_id = 7, .binding = @splat(99), .policy_revision = 1, .contract = .native_document }};
+    const invalid_write: changefeed_control.Write = .{ .id = @splat(5), .authority = @splat(9), .owner = definition.owner, .authorization = definition.authorization, .expected_revision = 0, .expected_epoch = 0, .mutation = .{ .create = .{ .id = @splat(5), .definition = invalid, .now = 100, .expires_at = 1000 } } };
+    try store.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, invalid_write) });
+    try std.testing.expectEqual(@as(u64, 5), (try store.getChangefeedAuthority(a, group)).?.sequence);
+    write.expected_revision = 5;
+    write.mutation = .{ .acknowledge = delivery.cursor };
+    try store.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    const acknowledged_bytes = try store.getChangefeedControl(a, group, write.id);
+    defer a.free(acknowledged_bytes);
+    var acknowledged = try changefeed_control.parse(a, acknowledged_bytes);
+    defer acknowledged.deinit();
+    try std.testing.expectEqual(@as(u32, 3), acknowledged.value.roots[0].acknowledged.event);
+    try std.testing.expectEqualStrings("AQ", try acknowledged.value.contextAt(delivery.cursor));
+    try std.testing.expectEqual(@as(u64, 10), acknowledged.value.roots[0].reclaimed_through);
+    try std.testing.expectEqual(@as(usize, 0), acknowledged.value.cursors.len);
+}
+
+test "metadata changefeed control snapshot preserves enrollment authority and pending cleanup" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/feed-snapshot", .{tmp.sub_path});
+    defer a.free(source_path);
+    const target_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/feed-installed", .{tmp.sub_path});
+    defer a.free(target_path);
+    var source = try RaftApplyStore.init(a, .{ .root_dir = source_path });
+    defer source.deinit();
+    var target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+    defer target.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .schema_json = "{}" };
+    const definition: changefeed_control.Definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = changefeed_control.tableBinding(table), .policy_revision = 1, .contract = .native_document }} };
+    var write: changefeed_control.Write = .{ .id = @splat(4), .authority = @splat(9), .owner = definition.owner, .authorization = definition.authorization, .expected_revision = 0, .expected_epoch = 0, .mutation = .{ .create = .{ .id = @splat(4), .definition = definition, .now = 100, .expires_at = 1000 } } };
+    const table_command = try encodeTransitionCommand(scratch, .{ .upsert_table = table });
+    const create_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 1;
+    write.expected_epoch = 1;
+    write.mutation = .{ .plan_roots = &.{.{ .namespace = .{ 0, 0, 0, 0, 0, 0, 0, 7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, .ownership_epoch = 1 }} };
+    const plan_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 2;
+    const namespace: changefeed_control.Namespace = .{ 0, 0, 0, 0, 0, 0, 0, 7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    write.mutation = .{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = 2, .consumer_epoch = 1, .start = 0 } };
+    const enroll_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 3;
+    write.mutation = .{ .seal = .{ .cut = @splat(7) } };
+    const seal_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    var staged = try (changefeed_control.Mutation{ .create = .{ .id = write.id, .definition = definition, .now = 100, .expires_at = 1000 } }).apply(scratch, .{}, .{ .incarnation = write.authority, .sequence = 1 });
+    staged = try (changefeed_control.Mutation{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} }).apply(scratch, staged, .{ .incarnation = write.authority, .sequence = 2 });
+    staged = try (changefeed_control.Mutation{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = 2, .consumer_epoch = 1, .start = 0 } }).apply(scratch, staged, .{ .incarnation = write.authority, .sequence = 3 });
+    staged = try (changefeed_control.Mutation{ .seal = .{ .cut = @splat(7) } }).apply(scratch, staged, .{ .incarnation = write.authority, .sequence = 4 });
+    var delivery: changefeed_control.Delivery = .{ .sequence = 1, .before = staged.latest_cursor, .cursor = @splat(0), .authority = @splat(8), .issued_at = 200, .provider_context = "AQ", .advances = &.{.{ .namespace = namespace, .position = .{ .event = 1 } }} };
+    delivery.cursor = delivery.identity(write.id, 1);
+    write.expected_revision = 4;
+    write.mutation = .{ .issue = delivery };
+    const issue_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 5;
+    const intent_payload: changefeed_control.root_intent.Payload = .{ .command = "{\"version\":1,\"operation\":\"submit\"}", .fence = "{\"root\":7}", .table = "docs" };
+    write.mutation = .{ .root_control = .{ .namespace = namespace, .operation = .{ .prepare = .{ .ownership_epoch = 1, .grant_sequence = 2, .payload = intent_payload } } } };
+    const prepare_control_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 6;
+    write.mutation = .{ .root_control = .{ .namespace = namespace, .operation = .{ .begin = .{ .sequence = 6, .actor = @splat(3) } } } };
+    const begin_control_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 7;
+    write.mutation = .{ .root_control = .{ .namespace = namespace, .operation = .{ .accepted = .{ .sequence = 6, .actor = @splat(3), .receipt = .{ .term = 9, .index = 700 } } } } };
+    const accepted_control_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 8;
+    write.mutation = .close;
+    const close_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    const entries = try raft_state_machine.encodeCommittedEntries(scratch, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_command },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = create_command },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = plan_command },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = enroll_command },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = seal_command },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = issue_command },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = prepare_control_command },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = begin_control_command },
+        .{ .term = 1, .index = 9, .entry_type = .normal, .data = accepted_control_command },
+        .{ .term = 1, .index = 10, .entry_type = .normal, .data = close_command },
+    });
+    try source.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 10, .entries_bytes = entries });
+    var prepared = (try source.snapshotBuilder().prepareSnapshot(group, 10)) orelse return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    var materialized = try prepared.materialize(a);
+    defer materialized.deinit(a);
+    const snapshot = switch (materialized) {
+        .bytes => |bytes| bytes,
+        .artifact => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group, 10, snapshot));
+    target.deinit();
+    target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+    const expected = try source.getChangefeedControl(a, group, write.id);
+    defer a.free(expected);
+    const installed = try target.getChangefeedControl(a, group, write.id);
+    defer a.free(installed);
+    try std.testing.expectEqualStrings(expected, installed);
+    try std.testing.expectEqual(try source.getChangefeedAuthority(a, group), try target.getChangefeedAuthority(a, group));
+    var parsed = try changefeed_control.parse(a, installed);
+    defer parsed.deinit();
+    try std.testing.expectEqual(changefeed_control.Phase.closing, parsed.value.phase);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.roots.len);
+    try std.testing.expect(!parsed.value.roots[0].released);
+    try std.testing.expectEqualStrings("AQ", parsed.value.latest_provider_context);
+    try std.testing.expectEqualStrings("AQ", parsed.value.cursors[0].provider_context);
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.roots[0].grant_sequence);
+    const pending = parsed.value.roots[0].pending_control.?;
+    try std.testing.expectEqual(.accepted, pending.stage);
+    try std.testing.expectEqual(@as(u64, 6), pending.sequence);
+    try std.testing.expectEqualDeep((changefeed_control.root_intent.Receipt{ .term = 9, .index = 700 }), pending.receipt.?);
+    try std.testing.expectEqualStrings(intent_payload.command, pending.payload.command);
+    try std.testing.expectEqualStrings(intent_payload.fence, pending.payload.fence);
+    const settlement: changefeed_control.root_intent.Settlement = .{ .sequence = pending.sequence, .actor = pending.actor, .receipt = pending.receipt.?, .request_digest = pending.digest, .proof = @splat(8), .effect = .{ .rejected = 5 } };
+    write.expected_revision = parsed.value.revision;
+    write.mutation = .{ .root_control = .{ .namespace = namespace, .operation = .{ .settled = settlement } } };
+    try target.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    target.deinit();
+    target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+    const settled_bytes = try target.getChangefeedControl(a, group, write.id);
+    defer a.free(settled_bytes);
+    var settled = try changefeed_control.parse(a, settled_bytes);
+    defer settled.deinit();
+    try std.testing.expect(settled.value.roots[0].pending_control == null);
+    try std.testing.expect(!settled.value.roots[0].released);
+    try std.testing.expectEqualDeep(settlement, settled.value.roots[0].last_control.?);
+    const authority_before_retry = try target.getChangefeedAuthority(a, group);
+    write.expected_revision = settled.value.revision;
+    try target.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    try std.testing.expectEqualDeep(authority_before_retry, try target.getChangefeedAuthority(a, group));
+    const replayed = try target.getChangefeedControl(a, group, write.id);
+    defer a.free(replayed);
+    try std.testing.expectEqualStrings(settled_bytes, replayed);
+}
+
+test "metadata changefeed control logical slot survives reopen snapshot failover and lost confirmation reply" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/logical-slot", .{tmp.sub_path});
+    defer a.free(path);
+    const target_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/logical-slot-failover", .{tmp.sub_path});
+    defer a.free(target_path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    var target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+    defer target.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const slot = changefeed_control.pg_slot;
+    const id = slot.feedId(@splat(1), "qualified_slot");
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = "{}" };
+    const definition: changefeed_control.Definition = .{ .owner = @splat(1), .authorization = @splat(2), .projection = .rows, .tables = &.{.{ .table_id = 7, .binding = changefeed_control.tableBinding(table), .policy_revision = 1, .contract = .native_relational }} };
+    const Harness = struct {
+        store: *RaftApplyStore,
+        a: std.mem.Allocator,
+        index: u64 = 0,
+        id: changefeed_control.Id,
+        fn apply(self: *@This(), command: TransitionCommand) !void {
+            const bytes = try encodeTransitionCommand(self.a, command);
+            self.index += 1;
+            const entries = try raft_state_machine.encodeCommittedEntries(self.a, &.{.{ .term = 1, .index = self.index, .entry_type = .normal, .data = bytes }});
+            try self.store.snapshotBuilder().applyBatch(.{ .group_id = group_ids.main_metadata_group_id, .commit_index = self.index, .entries_bytes = entries });
+        }
+        fn read(self: *@This()) !changefeed_control.Parsed {
+            return changefeed_control.parse(self.a, try self.store.getChangefeedControl(self.a, group_ids.main_metadata_group_id, self.id));
+        }
+        fn mutate(self: *@This(), mutation: changefeed_control.Mutation) !void {
+            var parsed = try self.read();
+            defer parsed.deinit();
+            const before = parsed.value;
+            const write: changefeed_control.Write = .{ .id = self.id, .authority = @splat(9), .owner = @splat(1), .authorization = @splat(2), .expected_revision = before.revision, .expected_epoch = before.epoch, .mutation = mutation };
+            try self.apply(.{ .apply_changefeed_control = try changefeed_control.encodeWrite(self.a, write) });
+        }
+    };
+    var h: Harness = .{ .store = &store, .a = scratch, .id = id };
+    try h.apply(.{ .upsert_table = table });
+    try h.mutate(.{ .create = .{ .id = id, .definition = definition, .now = 100, .expires_at = 1000 } });
+    var namespace: changefeed_control.Namespace = @splat(0);
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 1, .big);
+    std.mem.writeInt(u64, namespace[16..24], 1, .big);
+    try h.mutate(.{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} });
+    try h.mutate(.{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = 2, .consumer_epoch = 1, .start = 10 } });
+    try h.mutate(.{ .seal = .{ .cut = @splat(7) } });
+    try h.mutate(.{ .slot = .{ .configure = .{ .database = @splat(1), .name = "qualified_slot" } } });
+    try h.mutate(.{ .slot = .{ .acquire = .{ .actor = @splat(2), .expected = 0, .now = 100, .expires = 150 } } });
+    var initial = try h.read();
+    defer initial.deinit();
+    const session = initial.value.slot.?.session.?;
+    var delivery: changefeed_control.Delivery = .{ .sequence = 1, .before = initial.value.latest_cursor, .cursor = @splat(0), .authority = @splat(8), .issued_at = 101, .advances = &.{.{ .namespace = namespace, .position = .{ .sequence = 11 } }} };
+    delivery.cursor = delivery.identity(id, 1);
+    try h.mutate(.{ .issue = delivery });
+    var scope: slot.spool_control.Scope = .{ .namespace = @splat(9), .domain = slot.spool_control.Scope.domainFor(id, 1), .attempt = @splat(7) };
+    std.mem.writeInt(u64, scope.attempt[0..8], 1, .big);
+    const spec: slot.spool_control.Spec = .{ .feed = id, .epoch = 1, .definition = definition.identity(), .projection = @splat(8), .storage = scope.storageIdentity(), .before = delivery.before, .after = delivery.cursor, .completion = @splat(4), .start_lsn = 1, .bytes = 100, .commit_offset = 74, .xid = 42, .commit_time = -1, .wire = @splat(8), .messages = 5 };
+    try h.mutate(.{ .slot = .{ .bind = .{ .session = session, .now = 101, .binding = .{ .publications = &.{"rows_pub"}, .projection = @splat(8) } } } });
+    try h.mutate(.{ .slot = .{ .reserve_spool = .{ .session = session, .now = 102, .id = 1, .scope = scope, .spec = spec } } });
+    // A crash after admission but before any verified manifest publication must
+    // retain the charge and frozen scope without advancing the wire frontier.
+    store.deinit();
+    store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    var reserved = try h.read();
+    defer reserved.deinit();
+    try std.testing.expectEqual(@as(u64, 1), reserved.value.slot.?.next_lsn);
+    try std.testing.expectEqual(.uploading, reserved.value.slot.?.spool.records[0].phase);
+    const charge = reserved.value.slot.?.spool.charged_bytes;
+    try std.testing.expect(charge > 100);
+    try h.mutate(.{ .slot = .{ .begin_spool = .{ .session = session, .now = 102, .id = 1, .token = @splat(7) } } });
+    try h.mutate(.{ .slot = .{ .publish_spool = .{ .session = session, .now = 102, .id = 1, .manifest = @splat(6), .content = @splat(3) } } });
+    store.deinit();
+    store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    var reopened = try h.read();
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 101), reopened.value.slot.?.next_lsn);
+    try std.testing.expectEqual(@as(u64, 1), try reopened.value.slot.?.restartAt(100));
+    const before_retry = reopened.value.revision;
+    try h.mutate(.{ .slot = .{ .publish_spool = .{ .session = session, .now = 103, .id = 1, .manifest = @splat(6), .content = @splat(3) } } });
+    var retry = try h.read();
+    defer retry.deinit();
+    try std.testing.expectEqual(before_retry + 1, retry.value.revision);
+    try std.testing.expectEqual(@as(usize, 1), retry.value.slot.?.entries.len);
+    var prepared = (try store.snapshotBuilder().prepareSnapshot(group, h.index)) orelse return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    var materialized = try prepared.materialize(a);
+    defer materialized.deinit(a);
+    const snapshot = switch (materialized) {
+        .bytes => |bytes| bytes,
+        .artifact => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group, h.index, snapshot));
+    h.store = &target;
+    try h.mutate(.{ .slot = .{ .acquire = .{ .actor = @splat(3), .expected = 1, .now = 150, .expires = 200 } } });
+    var transferred = try h.read();
+    defer transferred.deinit();
+    try std.testing.expectEqual(@as(u64, 2), transferred.value.slot.?.session.?.fence);
+    try std.testing.expectEqual(@as(slot.Digest, @splat(8)), transferred.value.slot.?.spool.records[0].spec.wire);
+    try std.testing.expectEqual(@as(slot.Id, @splat(7)), transferred.value.slot.?.spool.records[0].build.?);
+    const fenced_revision = transferred.value.revision;
+    try h.mutate(.{ .slot = .{ .confirm = .{ .session = session, .now = 151, .flushed = 101 } } });
+    var fenced = try h.read();
+    defer fenced.deinit();
+    try std.testing.expectEqual(fenced_revision, fenced.value.revision);
+    const confirmation: changefeed_control.Mutation = .{ .slot = .{ .confirm = .{ .session = transferred.value.slot.?.session.?, .now = 151, .flushed = 101 } } };
+    try h.mutate(confirmation);
+    // Simulate losing the confirmation response and reopening the new owner.
+    target.deinit();
+    target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+    try h.mutate(confirmation);
+    var confirmed = try h.read();
+    defer confirmed.deinit();
+    try std.testing.expectEqual(@as(u64, 101), confirmed.value.slot.?.confirmed_lsn);
+    try std.testing.expectEqual(@as(u64, 1), confirmed.value.acknowledged_delivery);
+    try std.testing.expectEqual(@as(u64, 11), confirmed.value.roots[0].acknowledged.sequence);
+    try std.testing.expectEqual(@as(u64, 10), confirmed.value.roots[0].reclaimed_through);
+    try std.testing.expectEqual(@as(usize, 0), confirmed.value.slot.?.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), confirmed.value.cursors.len);
+    try std.testing.expectEqual(charge, confirmed.value.slot.?.spool.charged_bytes);
+    try std.testing.expectEqual(.garbage, confirmed.value.slot.?.spool.records[0].phase);
+    try h.mutate(.{ .slot = .{ .checkpoint_spool_cleanup = .{ .id = 1, .storage = spec.storage, .expected = 0, .progress = .{ .revision = 1, .fenced = true, .continuation = "cGFnZQ" } } } });
+    const cleanup_path = try std.fmt.allocPrint(a, "{s}-cleanup-owner", .{target_path});
+    defer a.free(cleanup_path);
+    var cleanup_owner = try RaftApplyStore.init(a, .{ .root_dir = cleanup_path });
+    defer cleanup_owner.deinit();
+    {
+        var checkpoint = (try target.snapshotBuilder().prepareSnapshot(group, h.index)) orelse return error.TestUnexpectedResult;
+        defer checkpoint.deinit();
+        var payload = try checkpoint.materialize(a);
+        defer payload.deinit(a);
+        const bytes = switch (payload) {
+            .bytes => |value| value,
+            .artifact => return error.TestUnexpectedResult,
+        };
+        try std.testing.expect(try cleanup_owner.snapshotBuilder().installSnapshot(a, group, h.index, bytes));
+    }
+    h.store = &cleanup_owner;
+    var cleanup_resumed = try h.read();
+    defer cleanup_resumed.deinit();
+    try std.testing.expectEqualStrings("cGFnZQ", cleanup_resumed.value.slot.?.spool.records[0].cleanup.continuation);
+    try std.testing.expectEqual(charge, cleanup_resumed.value.slot.?.spool.charged_bytes);
+    try h.mutate(.{ .slot = .{ .checkpoint_spool_cleanup = .{ .id = 1, .storage = spec.storage, .expected = 1, .progress = .{ .revision = 2, .fenced = true, .complete = true, .proof = @splat(5) } } } });
+    const reclamation: changefeed_control.Mutation = .{ .slot = .{ .reclaim_spool = .{ .id = 1, .storage = spec.storage, .proof = @splat(5) } } };
+    try h.mutate(reclamation);
+    cleanup_owner.deinit();
+    cleanup_owner = try RaftApplyStore.init(a, .{ .root_dir = cleanup_path });
+    try h.mutate(reclamation);
+    var cleaned = try h.read();
+    defer cleaned.deinit();
+    try std.testing.expectEqual(@as(u64, 0), cleaned.value.slot.?.spool.charged_bytes);
+    try std.testing.expectEqual(@as(u64, 2), cleaned.value.slot.?.spool.next_id);
+    try std.testing.expectEqual(@as(u64, 1), cleaned.value.slot.?.spool.collected_through);
+}
+
+test "metadata source control artifact debt survives reopening and keeps table retention until storage reclamation" {
+    for ([_]bool{ false, true }) |checkpoint_mode| {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-artifact", .{tmp.sub_path});
+        defer a.free(root);
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        var opened = true;
+        defer if (opened) store.deinit();
+        const group = group_ids.main_metadata_group_id;
+        const incarnation = "01010101010101010101010101010101".*;
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+        const table: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .schema_json = "{}", .replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]" };
+        try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+        const scope: source_control.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = try source_control.definitionDigest(a, table.replication_sources_json, 0), .provider = @splat(2), .destination = .native, .destination_binding = @splat(3) };
+        const Actor = struct {
+            a: std.mem.Allocator,
+            store: *RaftApplyStore,
+            group: u64,
+            scope: source_control.Scope,
+            catalog: source_control.Digest,
+            fn read(self: @This()) !std.json.Parsed(source_control.State) {
+                const bytes = try self.store.getSourceControl(self.a, self.group, self.scope.table_id, self.scope.source_id);
+                defer self.a.free(bytes);
+                return source_control.parse(self.a, bytes);
+            }
+            fn apply(self: @This(), mutation: source_control.Mutation) !void {
+                var before = try self.read();
+                defer before.deinit();
+                const bytes = try source_control.encodeWrite(self.a, .{ .table_id = self.scope.table_id, .source_id = self.scope.source_id, .expected_revision = before.value.revision, .expected_binding = self.scope.identity(), .expected_catalog_digest = self.catalog, .mutation = mutation });
+                defer self.a.free(bytes);
+                try self.store.applyStandaloneCommand(self.group, .{ .apply_source_control = bytes });
+            }
+            fn expectWork(self: @This(), expected: u64) !void {
+                var txn = try self.store.store.beginWriteTxn();
+                defer txn.abort();
+                var buffer: [256]u8 = undefined;
+                const count = try txn.get(try source_control.workKey(&buffer, self.group, self.scope.table_id));
+                try std.testing.expectEqual(expected, std.mem.readInt(u64, count[0..8], .little));
+                if (expected != 0) try std.testing.expectError(error.TableTransitionActive, self.store.removeTableTxn(&txn, self.group, self.scope.table_id, 0));
+            }
+        };
+        const actor: Actor = .{ .a = a, .store = &store, .group = group, .scope = scope, .catalog = source_control.digest(table.replication_sources_json) };
+        try actor.apply(.{ .configure = scope });
+        const authority: source_control.checkpoint_authority.Spec = .{ .binding = scope.identity(), .table_name = "checkpoint-owner", .owner = .{ .metadata_group_id = group, .metadata_incarnation = incarnation, .namespace = @splat(1), .table_binding = @splat(5), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } };
+        if (checkpoint_mode) {
+            var foreign = authority;
+            foreign.owner.metadata_incarnation[0] = 'f';
+            try actor.apply(.{ .bind_checkpoint = foreign });
+            var rejected = try actor.read();
+            defer rejected.deinit();
+            try std.testing.expect(rejected.value.checkpoint_authority == null);
+            try actor.apply(.{ .bind_checkpoint = authority });
+            try std.testing.expectEqual(incarnation, (try store.getMetadataIncarnation(group)).?);
+        }
+        const reservation: source_control.Reservation = .{ .sequence = 1, .batch_id = "batch", .checkpoint = "cp1", .accepted_at_ns = 1, .payload_digest = @splat(4), .plan_digest = @splat(5), .transaction_id = @splat(6), .destination = .native, .delivery_manifest = "frozen-reference", .retain_manifest = checkpoint_mode, .artifact = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = source_control.artifact_control.domainFor(scope.identity()), .attempt = .{ 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, .bytes = 1024, .checksum = @splat(10), .plan_digest = @splat(11) } };
+        const id = reservation.identity(scope);
+        try actor.apply(.{ .reserve = reservation });
+        try actor.expectWork(1);
+        try actor.apply(.{ .seal_artifact = .{ .reservation_digest = id, .stamp = @splat(12) } });
+        store.deinit();
+        opened = false;
+        store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        opened = true;
+        var sealed = try actor.read();
+        defer sealed.deinit();
+        try std.testing.expectEqual(.sealed, sealed.value.artifact_control.?.current.?.phase);
+        if (checkpoint_mode) try std.testing.expect(sealed.value.checkpoint_authority.?.sameAuthority(authority));
+        if (checkpoint_mode) {
+            try std.testing.expect(sealed.value.manifest_retention);
+            try std.testing.expectEqualStrings(reservation.delivery_manifest, sealed.value.artifact_control.?.current.?.recovery.?.bytes);
+        } else try std.testing.expect(sealed.value.artifact_control.?.current.?.recovery == null);
+        try std.testing.expectEqual(@as(u64, 1024), sealed.value.artifact_control.?.chargedBytes());
+        try actor.apply(.{ .accept = .{ .reservation_digest = id, .receipt = "native-receipt", .commit_reference = "native-commit" } });
+        if (checkpoint_mode) {
+            const accepted_snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+            defer a.free(accepted_snapshot);
+            const accepted_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-manifest-snapshot", .{tmp.sub_path});
+            defer a.free(accepted_root);
+            var accepted_target = try RaftApplyStore.init(a, .{ .root_dir = accepted_root });
+            defer accepted_target.deinit();
+            try RaftApplyStore.installSnapshotFromRaft(&accepted_target, a, group, 99, accepted_snapshot);
+            const copied: Actor = .{ .a = a, .store = &accepted_target, .group = group, .scope = scope, .catalog = actor.catalog };
+            var accepted_state = try copied.read();
+            defer accepted_state.deinit();
+            try std.testing.expect(accepted_state.value.pending == null);
+            try std.testing.expect(accepted_state.value.manifest_retention);
+            try std.testing.expectEqualStrings(reservation.delivery_manifest, accepted_state.value.artifact_control.?.current.?.recovery.?.bytes);
+        }
+        // Committed source progress does not clear artifact retention debt.
+        try actor.expectWork(1);
+        try actor.apply(.{ .retire_artifact = .{ .reservation_digest = id, .proof = @splat(13), .reason = .committed } });
+        store.deinit();
+        opened = false;
+        store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        opened = true;
+        var garbage = try actor.read();
+        defer garbage.deinit();
+        try std.testing.expectEqual(.garbage, garbage.value.artifact_control.?.current.?.phase);
+        if (checkpoint_mode) try std.testing.expectEqualStrings(reservation.delivery_manifest, garbage.value.artifact_control.?.current.?.recovery.?.bytes);
+        try std.testing.expectEqual(@as(u64, 1024), garbage.value.artifact_control.?.chargedBytes());
+        try actor.expectWork(1);
+        try actor.apply(.{ .reclaim_artifact = .{ .reservation_digest = id, .proof = @splat(14) } });
+        try actor.expectWork(0);
+        var reclaimed = try actor.read();
+        defer reclaimed.deinit();
+        try std.testing.expectEqual(@as(u64, 0), reclaimed.value.artifact_control.?.chargedBytes());
+        try std.testing.expectEqual(id, reclaimed.value.artifact_control.?.last_reclaimed.?.reservation);
+        try actor.apply(.{ .reclaim_artifact = .{ .reservation_digest = id, .proof = @splat(14) } });
+        try actor.expectWork(0);
+        if (checkpoint_mode) {
+            try actor.apply(.{ .retire = .{ .receipt = "qualified-source-retirement" } });
+            try actor.expectWork(1);
+            const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+            defer a.free(snapshot);
+            const target_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-checkpoint-snapshot", .{tmp.sub_path});
+            defer a.free(target_root);
+            var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+            defer target.deinit();
+            try RaftApplyStore.installSnapshotFromRaft(&target, a, group, 100, snapshot);
+            const restored: Actor = .{ .a = a, .store = &target, .group = group, .scope = scope, .catalog = actor.catalog };
+            var retirement = try restored.read();
+            defer retirement.deinit();
+            try std.testing.expect(retirement.value.checkpoint_authority.?.sameAuthority(authority));
+            try std.testing.expect(retirement.value.checkpoint_authority.?.retirement == null);
+            try restored.expectWork(1);
+            try restored.apply(.{ .fence_checkpoint = .{ .authority_digest = authority.digest(), .proof = @splat(17) } });
+            try restored.expectWork(0);
+        }
+    }
+}
+
+test "metadata source control scoped lifecycle pins idle bindings through reopen and snapshot" {
+    try @import("source_scope_mode_test.zig").run(std.testing.allocator);
+}
+
+test "metadata source control scope capture binds one actual applied snapshot and lifecycle phase" {
+    try @import("source_scope_capture_test.zig").run(std.testing.allocator);
 }
 
 test "index alias query projection is persisted and borrowed without retry evidence" {

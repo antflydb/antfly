@@ -116,7 +116,7 @@ pub const CatalogProjectionReader = struct {
             try budget.checkpoint();
             const shared = try alloc.create(SharedSnapshot);
             errdefer alloc.destroy(shared);
-            const routing = try @import("../api/table_catalog.zig").RoutingGeneration.create(alloc, .{
+            const routing = try @import("../api/table_catalog.zig").RoutingGeneration.createFromFullRecords(alloc, .{
                 .metadata_group_id = metadata_group_id,
                 .metadata_incarnation = value.metadata_incarnation,
                 .catalog_revision = value.catalog_revision,
@@ -878,7 +878,7 @@ test "catalog projection point reads materialize namespace execution at the rout
         fn capture(_: *anyopaque, a: std.mem.Allocator, _: u64, _: ?u64) !metadata_storage.CatalogProjectionSnapshot {
             const tables = try a.alloc(metadata_table_manager.TableRecord, 1);
             errdefer a.free(tables);
-            tables[0] = try metadata_table_manager.cloneTable(a, .{ .table_id = 7, .name = "docs", .indexes_json = "{\"projection_only\":true}" });
+            tables[0] = try metadata_table_manager.cloneTable(a, .{ .table_id = 7, .name = "docs", .indexes_json = "{\"projection_only\":true}", .restore_backup_id = "backup-7", .restore_location = "object://private/backup-7" });
             return .{ .metadata_incarnation = null, .catalog_revision = 9, .tables = tables, .ranges = &.{} };
         }
         fn execution(ptr: *anyopaque, a: std.mem.Allocator, group: u64, name: []const u8, revision: u64) ![]u8 {
@@ -907,6 +907,11 @@ test "catalog projection point reads materialize namespace execution at the rout
     defer reader.freeRoutingSnapshot(a, &compact);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try std.testing.expectEqualStrings("", compact.tables[0].indexes_json);
+    const generation = try reader.acquireRoutingGeneration(a, 1, source, null);
+    defer generation.release();
+    const projected = generation.indexed.snapshot.value.tables[0];
+    try std.testing.expectEqual(compact.tables[0].routing_storage_binding.?, projected.routing_storage_binding.?);
+    try std.testing.expectEqualStrings("", projected.restore_location);
     try std.testing.expectEqualStrings("{\"projection_only\":false}", point.tables[0].indexes_json);
 }
 

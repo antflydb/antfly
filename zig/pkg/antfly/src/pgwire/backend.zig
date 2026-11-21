@@ -17,6 +17,14 @@
 //! arena for every describe/execute call; returned slices must use that arena.
 //! Parameters remain typed values, never interpolated into SQL text.
 const std = @import("std");
+pub const replication_commands = @import("replication_commands.zig");
+pub const pgoutput = @import("pgoutput.zig");
+
+const sql_session = @import("antfly_local_sources").sql_session;
+pub const TransactionOptions = struct {
+    isolation: ?sql_session.Isolation = null,
+    mode: ?sql_session.ReadMode = null,
+};
 
 pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown };
 pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
@@ -232,6 +240,11 @@ pub const Backend = struct {
         /// Compare resolved targets across compatible schema versions of a bound portal.
         same_binding_targets: ?*const fn ([]const u8, []const u8) bool = null,
         execute: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Result,
+        /// Attach a qualified cut to the existing SQL transaction. The owner
+        /// checks isolation, prior transaction work and import eligibility.
+        import_snapshot: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, []const u8) anyerror!void = null,
+        /// Change transaction characteristics before any readings or writes.
+        set_transaction_options: ?*const fn (*anyopaque, Identity, Request, TransactionOptions) anyerror!void = null,
         /// Authenticated catalog snapshot for typed dotted-name SET/SHOW/RESET.
         load_settings: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!@import("antfly_local_sources").sql_setting_catalog.RawSnapshot = null,
         validate_namespace: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,
@@ -255,6 +268,11 @@ pub const Backend = struct {
         reserve_completion: ?*const fn (*anyopaque, *@import("completion.zig").Completion, usize) anyerror!void = null,
         pin_completion: ?*const fn (*anyopaque, std.mem.Allocator, *@import("completion.zig").Completion) void = null,
         completion_safe: ?*const fn (*anyopaque, Identity) bool = null,
+        /// Authenticate explicit replication privilege and runtime capability;
+        /// a SQL identity or SELECT grant alone is insufficient. The returned
+        /// owner borrows this connection's identity until close. Missing
+        /// capability refuses logical startup, before any replication command.
+        open_replication_session: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!ReplicationSession = null,
     };
 };
 
@@ -273,3 +291,45 @@ pub const ReadStream = struct {
     validate: ?*const fn (*anyopaque, std.mem.Allocator, Request) anyerror!void = null,
 };
 pub const StreamPage = struct { result: Result, exhausted: bool };
+
+/// Connection-owned replication authority. Each operation must revalidate live
+/// credential, immutable database/table scope and publication/slot ownership.
+/// authorize runs at startup (null command), before execution and before reply.
+/// Commands and results borrow their caller arena. close releases connection
+/// leases/exported snapshots; durable recovery owns ambiguous metadata effects.
+pub const ReplicationSession = struct {
+    context: *anyopaque,
+    authorize: *const fn (*anyopaque, std.mem.Allocator, Request, ?replication_commands.Command) anyerror!void,
+    command: *const fn (*anyopaque, std.mem.Allocator, Request, replication_commands.Command) anyerror!Result,
+    close: *const fn (*anyopaque) void,
+    /// Absent until the owner can retain/spool complete projected transactions
+    /// and map their serialized positions durably. Never opens a SQL cursor.
+    open_stream: ?*const fn (*anyopaque, std.mem.Allocator, Request, replication_commands.Start) anyerror!ReplicationStream = null,
+};
+
+/// All methods run serially on the connection coordinator. poll returns at
+/// most one complete pgoutput message from durable committed spooling at the
+/// exact requested byte frontier; it must not retain an entire transaction in
+/// connection RAM or advance an acknowledgement. No-data returns immediately.
+/// feedback validates the slot fence and maps only complete issued intervals
+/// to durable acknowledgement. close runs after all reader/writer tasks join.
+pub const ReplicationStream = struct {
+    context: *anyopaque,
+    initial_lsn: pgoutput.Lsn,
+    /// Validated reconnect position; it can exceed initial_lsn when replay
+    /// rewinds an interior requested LSN to the transaction's Begin.
+    resume_lsn: pgoutput.Lsn,
+    initial_end_lsn: pgoutput.Lsn,
+    poll: *const fn (*anyopaque, std.mem.Allocator, Request, pgoutput.Lsn, u32) anyerror!ReplicationPoll,
+    feedback: *const fn (*anyopaque, std.mem.Allocator, Request, pgoutput.Feedback) anyerror!void,
+    close: *const fn (*anyopaque) void,
+};
+pub const ReplicationPoll = struct {
+    end_lsn: pgoutput.Lsn,
+    chunk: ?struct { start_lsn: pgoutput.Lsn, bytes: []const u8 } = null,
+    owner: ?struct { context: *anyopaque, release: *const fn (*anyopaque) void } = null,
+    pub fn deinit(self: *@This()) void {
+        if (self.owner) |owner| owner.release(owner.context);
+        self.* = undefined;
+    }
+};

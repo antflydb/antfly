@@ -1014,6 +1014,10 @@ pub const Backend = struct {
         owner: @import("setting_catalog.zig").Owner,
         scope: @import("setting_catalog.zig").Scope,
         overlay: []const @import("setting_catalog.zig").OverlayEntry = &.{},
+        schema_search_path: ?[]const []const u8 = null,
+        snapshot_lsn: ?u64 = null,
+        transaction_xid: ?u64 = null,
+        transaction_timestamp_ns: ?u64 = null,
     } = null,
     /// Authorized, immutable settings captured for this exact statement.
     /// Providers must never populate this from pgwire-local string settings.
@@ -1051,6 +1055,17 @@ pub const Backend = struct {
     /// Every later scan can fork the same owner-issued cut and retain its
     /// route/range proof in the mutation's atomic commit read set.
     dynamic_statement_read_set: bool = false,
+
+    pub fn captureSettings(self: Backend, alloc: std.mem.Allocator) !?@import("setting_catalog.zig").View {
+        const capture = self.setting_capture orelse return null;
+        var view = try @import("setting_catalog.zig").View.capture(alloc, capture.owner, capture.scope, capture.overlay);
+        errdefer view.deinit();
+        if (capture.schema_search_path) |names| try view.setSchemaSearchPath(names);
+        view.snapshot_lsn = capture.snapshot_lsn;
+        view.transaction_xid = capture.transaction_xid;
+        view.transaction_timestamp_ns = capture.transaction_timestamp_ns;
+        return view;
+    }
 
     pub const VTable = struct {
         /// Native opaque identity, generated once before mutation admission.

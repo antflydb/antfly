@@ -138,7 +138,6 @@ pub const guarded_generation_admission_version: u16 = 98;
 pub const bound_create_parent_version: u16 = 99;
 /// Every prospective metadata session owner can recover incarnation-bound staged work.
 pub const bound_session_version: u16 = 100;
-pub const current_version: u16 = bound_session_version;
 
 pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
     const empty: [32]u8 = @splat(0);
@@ -158,6 +157,32 @@ pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelop
 pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
     return @import("antfly_local_sources").api_index_metadata.aliases.uses(a, indexes_json);
 }
+
+/// Version 101 adds source-control reservations and separate accepted/committed frontiers.
+/// Version 103 binds private provider continuations to outbound delivery/ACK cursors.
+/// Version 104 adds fenced logical-slot sessions and atomic LSN/feed confirmation.
+/// Version 105 retains fenced slot spool reservations and cleanup accounting.
+/// Version 106 persists slot spool cleanup checkpoints before capacity release.
+/// Version 107 freezes preflight wire identity and single-use spool build grants.
+/// Version 108 binds publication sets and atomically renews confirmed slot feedback.
+/// Version 109 retains exact pending root-control attempts and their receipts.
+/// Version 110 atomically settles accepted root controls with their metadata effects.
+/// Version 111 reconciles monotonic root effects without inventing command receipts.
+/// Version 112 records distinct retirement-fence attempts for unresolved controls.
+/// Version 113 reserves and seals quota for recoverable source-plan artifacts.
+/// Version 114 binds source checkpoint authority before reservation and retirement.
+/// Version 116 retains frozen source recovery manifests through reclamation.
+/// Version 117 persists the allocated initial position for logical slots.
+/// Version 118 atomically seals the feed cut and initializes its logical slot.
+/// Version 119 fences logical slot drop against an active stream lease.
+/// Version 120 advances empty slot projections without allocating LSNs.
+/// Version 121 coordinates durable PostgreSQL publication changes.
+/// Version 122 binds feed bootstrap completion to the acknowledged snapshot cut.
+/// Version 124 moves a qualified exported PostgreSQL slot to streaming.
+pub const current_version: u16 = 124;
+pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
+pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
+pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;

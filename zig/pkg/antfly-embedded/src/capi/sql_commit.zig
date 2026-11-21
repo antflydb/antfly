@@ -252,6 +252,11 @@ const PreparedDecision = struct { id: h.db_mod.types.TxnId, now: u64 };
 /// Boundary 1 of `commitLocked`. On any error the prepared intents are
 /// abandoned through recovery, and nothing was applied.
 fn prepareDecision(handle: *h.Handle, requests: []const contract.TableCommitRequest, guards: []const GraphGuard, requested_id: ?h.db_mod.types.TxnId) !PreparedDecision {
+    // This is a fresh local SQL/graph admission. Retained recovery never
+    // enters this path and keeps the original transaction's producer class.
+    for (requests) |request| {
+        if ((request.source_producer != .unlabelled and request.source_producer != .ordinary) or request.source_admission != null) return error.SourceTransactionIdentityConflict;
+    }
     try recoverLocked(handle);
     const io = handle.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
     const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
@@ -274,7 +279,7 @@ fn prepareDecision(handle: *h.Handle, requests: []const contract.TableCommitRequ
     // them through recovery (also retried at the next entry if this fails).
     errdefer recoverLocked(handle) catch {};
     // Publish a native durable coordinator before preparing any participant.
-    _ = try handle.db.beginTransactionScoped(id, now, now, names, true, true, null);
+    _ = try handle.db.beginProducerTransactionScoped(id, now, now, names, true, true, null, .ordinary);
     for (requests) |request| {
         const db = try @import("tables.zig").get(handle, request.table_name);
         const proofs = for (guards) |guard| {
@@ -284,8 +289,9 @@ fn prepareDecision(handle: *h.Handle, requests: []const contract.TableCommitRequ
                 request.schema_version != (if (guard.schema_version == 0) @as(?u32, null) else guard.schema_version)) return error.CatalogGenerationChanged;
             break guard.proofs;
         } else if (guards.len != 0 and (request.normalized_graph_rows or request.graph_writes.len != 0 or request.graph_deletes.len != 0)) return error.CatalogGenerationChanged else &.{};
-        if (db != &handle.db) _ = try db.beginTransactionScoped(id, now, now, names, false, true, null);
+        if (db != &handle.db) _ = try db.beginProducerTransactionScoped(id, now, now, names, false, true, null, .ordinary);
         try db.writeTransaction(id, .{
+            .completion_ordinary_producer = true,
             .schema_version = request.schema_version,
             .relational_schema_version = request.relational_schema_version,
             .relational_integrity_generation_set = request.relational_integrity_generation_set,
@@ -349,6 +355,17 @@ fn testPreparedCoordinator(graph: bool) !void {
             const record = try std.json.parseFromSlice(Record, std.testing.allocator, raw, .{});
             defer record.deinit();
             try std.testing.expectEqual(h.transactions_mod.TxnStatus.pending, try self.root.db.getTransactionStatus(record.value.id));
+            var coordinator = try self.root.db.core.initTxnManager();
+            defer coordinator.deinit();
+            try std.testing.expect(try coordinator.isOrdinaryProducer(record.value.id));
+            try std.testing.expect(!try coordinator.isLegacyProducer(record.value.id));
+            for (record.value.tables) |name| {
+                const participant = try tables.get(self.root, name);
+                var manager = try participant.core.initTxnManager();
+                defer manager.deinit();
+                try std.testing.expect(try manager.isOrdinaryProducer(record.value.id));
+                try std.testing.expect(!try manager.isLegacyProducer(record.value.id));
+            }
         }
     };
     var state = State{ .root = root };

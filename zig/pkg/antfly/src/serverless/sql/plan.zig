@@ -151,7 +151,7 @@ pub const Plan = struct {
             if (aggregate.groups.len > 32 or aggregate.specs.len == 0 or aggregate.specs.len > 64 or aggregate.specs.len != aggregate.inputs.len) return error.InvalidSqlDistributedPlan;
             for (aggregate.groups) |column| if (column >= width) return error.InvalidSqlDistributedPlan;
             for (aggregate.specs, aggregate.inputs) |spec, input| {
-                if (spec.distinct or spec.kind == .pattern_set or (input == null and spec.kind != .count)) return error.SqlDistributedJoinUnsupported;
+                if (spec.distinct or spec.kind == .pattern_set or spec.kind == .array_agg or (input == null and spec.kind != .count)) return error.SqlDistributedJoinUnsupported;
                 if (input) |column| if (column >= width) return error.InvalidSqlDistributedPlan;
                 try local.sql_operators.Aggregate.validate(spec.kind, spec.input_type);
             }

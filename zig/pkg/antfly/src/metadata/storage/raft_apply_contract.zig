@@ -267,6 +267,7 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
 }
 
 const store_report_update = @import("../store_report_update.zig");
+const feed = @import("../changefeed_control.zig");
 /// Expected alias-validation rejections retain their identity across the
 /// independently compiled owner boundary without transporting Zig errors.
 pub const TableIndexMutationValidation = @import("index_mutation_validation.zig").Result;
@@ -327,6 +328,13 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_initial_create_status: u64,
     fk_generation_table_locked: u64,
     fk_initial_create_work: u64,
+    changefeed_control: feed.Id,
+    changefeed_authority: void,
+    changefeed_maintenance: struct { now: u64, after: ?feed.Id },
+    source_control: struct { table_id: u64, source_id: [32]u8 },
+    legacy_source_intake: struct { table_id: u64, ordinal: u32, definition: [32]u8 },
+    capture_source_scope: @import("../source_scope_capture.zig").Query,
+    pg_publication: struct { database: feed.Digest, name: []const u8 },
     fk_initial_retirement_page: @import("../fk_initial_retirement_wire.zig").PageRequest,
     store_root_control: @import("../fk_initial_retirement_wire.zig").Control,
     fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,

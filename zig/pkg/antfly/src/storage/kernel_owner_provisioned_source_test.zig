@@ -31,6 +31,209 @@ const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
+test "ordered history routed pages retain real images and discard failed final fences" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 1, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" }},
+        ranges: [1]metadata_table_manager.RangeRecord = .{.{ .group_id = 7, .table_id = 1, .range_id = 7, .start_key = "", .end_key = null }},
+        mode: enum { normal, leader_loss, route_change } = .normal,
+        validations: usize = 0,
+        waits: usize = 0,
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &self.tables, .ranges = &self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn catalog(self: *@This()) table_catalog.CatalogSource {
+            const Routes = table_catalog.TestAdminRoutingAdapter(snapshot, free);
+            return .{ .ptr = self, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = Routes.routingSnapshot, .linearizable_routing_snapshot = Routes.linearizableSnapshot, .free_routing_snapshot = Routes.freeRoutingSnapshot } };
+        }
+        fn wait(ptr: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.waits += 1;
+        }
+        fn capture(_: *anyopaque, _: u64) !read_gate.ReadSafetyBarrier.FrozenProof {
+            return .{ .incarnation = 1, .term = 1, .applied_index = 2 };
+        }
+        fn validate(ptr: *anyopaque, _: u64, _: read_gate.ReadSafetyBarrier.FrozenProof, _: ?u64, _: @import("antfly_cancellation").CancellationToken) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.validations += 1;
+            if (self.validations == 2) switch (self.mode) {
+                .normal => {},
+                .leader_loss => return error.NotLeader,
+                .route_change => self.ranges[0].range_id = 8,
+            };
+        }
+    };
+    var fixture: Fixture = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(a, root, fixture.catalog(), .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.wait, .capture_frozen = Fixture.capture, .validate_frozen = Fixture.validate } });
+    defer owners.deinit();
+    const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = 0, .identity = .{ .table_id = 1, .shard_id = 7, .range_id = 7 }, .schema_json = "{}", .indexes_json = "{}" };
+    const history = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 1, .big);
+    std.mem.writeInt(u64, namespace[8..16], 7, .big);
+    std.mem.writeInt(u64, namespace[16..24], 7, .big);
+    const grant: history.history_consumer.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
+    const capture: history.history_consumer.Command = .{ .capture_bootstrap = .{ .grant = grant, .expires_at_seconds = 500 } };
+    const enrolled = try owners.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 7, "docs", descriptor, capture, 1, 1);
+    // Row apply needs graph replay preparation after the control-only owner.
+    // The progress lane deliberately yields once while replacing that owner.
+    var applied = false;
+    for (0..100) |_| {
+        owners.applyPreparedTimestampedBatchGroupLocalAtRaftEntry(a, 7, "docs", descriptor, .{ .source_producer = .ordinary, .writes = &.{.{ .key = "one", .value = "{\"v\":1}" }} }, 1, 2, 1_700_000_000_000_000_000) catch |err| switch (err) {
+            error.StorageBusy, error.WriterLocked => {
+                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        applied = true;
+        break;
+    }
+    try std.testing.expect(applied);
+    const snapshot = try table_catalog.routedGroupIdSnapshotUntil(a, fixture.catalog(), "docs", 7, null);
+    const fence = snapshot.fence().?;
+    const request: history.history_page.Request = .{ .reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.applied.consumer.?.epoch, .grant = grant.sequence, .definition = grant.definition }, .after = .{}, .now_seconds = 100 };
+    var page = try owners.orderedHistoryPageRouted(a, fence, "docs", request);
+    defer page.deinit();
+    try std.testing.expectEqualStrings("{\"v\":1}", page.events[0].after.?);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_000_000_000), page.header.?.committed_at_ns);
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    const recovery: history.history_ordered.Lookup = .{ .command = capture, .entry = .{ .term = 1, .index = 1 }, .minimum_applied_index = 1 };
+    try std.testing.expectEqualDeep(enrolled, try owners.orderedHistoryOutcomeRouted(a, fence, "docs", recovery));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+
+    fixture.validations = 0;
+    var grant_identity = history.history_consumer.GrantIdentity.fromGrant(grant);
+    grant_identity.include_bootstrap = true;
+    const grant_observation = try owners.orderedHistoryGrantRouted(a, fence, "docs", grant_identity);
+    try std.testing.expectEqualDeep(enrolled.applied.consumer.?, grant_observation.active.consumer);
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    const pin = grant_observation.active.bootstrap.?;
+    const bootstrap: history.history_page.BootstrapRequest = .{ .reference = request.reference, .digest = pin.digest, .now_seconds = 100 };
+    var bootstrap_page = try owners.orderedHistoryBootstrapPageRouted(a, fence, "docs", bootstrap);
+    defer bootstrap_page.deinit();
+    try std.testing.expect(bootstrap_page.done);
+    try std.testing.expectEqual(@as(usize, 0), bootstrap_page.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    const resolution: history.history_resolution_wire.Request = .{ .authority = .raft, .namespace = namespace, .transaction_id = @splat(9), .owner_fence = @splat(4), .manifest_digest = @splat(5), .commit_version = 6, .minimum_applied_index = 1 };
+    const observed_resolution = try owners.orderedHistoryResolutionRouted(a, fence, "docs", resolution);
+    try observed_resolution.validate(resolution);
+    try std.testing.expect(observed_resolution.resolution == null);
+    try std.testing.expectEqual(@as(u64, 2), observed_resolution.cut.index);
+    try std.testing.expectEqual(resolution.digest(), observed_resolution.request_digest);
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+
+    fixture.validations = 0;
+    fixture.mode = .leader_loss;
+    try std.testing.expectError(error.NotLeader, owners.orderedHistoryBootstrapPageRouted(a, fence, "docs", bootstrap));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    try std.testing.expectError(error.NotLeader, owners.orderedHistoryPageRouted(a, fence, "docs", request));
+    fixture.validations = 0;
+    try std.testing.expectError(error.NotLeader, owners.orderedHistoryOutcomeRouted(a, fence, "docs", recovery));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    try std.testing.expectError(error.NotLeader, owners.orderedHistoryGrantRouted(a, fence, "docs", grant_identity));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    try std.testing.expectError(error.NotLeader, owners.orderedHistoryResolutionRouted(a, fence, "docs", resolution));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    fixture.mode = .route_change;
+    try std.testing.expectError(error.TopologyChanged, owners.orderedHistoryPageRouted(a, fence, "docs", request));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    fixture.ranges[0].range_id = 7;
+    try std.testing.expectError(error.TopologyChanged, owners.orderedHistoryOutcomeRouted(a, fence, "docs", recovery));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    fixture.ranges[0].range_id = 7;
+    try std.testing.expectError(error.TopologyChanged, owners.orderedHistoryGrantRouted(a, fence, "docs", grant_identity));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    fixture.ranges[0].range_id = 7;
+    try std.testing.expectError(error.TopologyChanged, owners.orderedHistoryResolutionRouted(a, fence, "docs", resolution));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    try std.testing.expectEqual(@as(usize, 14), fixture.waits);
+    fixture.mode = .normal;
+    fixture.ranges[0].range_id = 7;
+    var future = recovery;
+    future.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owners.orderedHistoryOutcomeRouted(a, fence, "docs", future));
+    var ahead = resolution;
+    ahead.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owners.orderedHistoryResolutionRouted(a, fence, "docs", ahead));
+    ahead = resolution;
+    ahead.namespace[0] ^= 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owners.orderedHistoryResolutionRouted(a, fence, "docs", ahead));
+    ahead = resolution;
+    ahead.authority = .native;
+    ahead.minimum_applied_index = 0;
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, owners.orderedHistoryResolutionRouted(a, fence, "docs", ahead));
+}
+
+test "compiled ordered history control retains native outcomes without catalog reads" {
+    const a = std.testing.allocator;
+    const NoCatalog = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = free, .routing_snapshot = route, .linearizable_routing_snapshot = route, .free_routing_snapshot = freeRoute } };
+        }
+        fn admin(raw: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return error.UnexpectedCatalogRead;
+        }
+        fn route(raw: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return error.UnexpectedCatalogRead;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeRoute(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+    };
+    var no_catalog: NoCatalog = .{};
+    var rejected_response: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_ordered_history_control_json(null, &.{ .version = abi.abi_version - 1 }, &rejected_response));
+    try std.testing.expectEqual(@as(u64, 0), rejected_response.len);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(a, root, no_catalog.iface(), read_gate.alreadyReadSafeBarrier());
+    defer owners.deinit();
+    const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = 0, .identity = .{ .table_id = 7, .shard_id = 11, .range_id = 13 }, .schema_json = "{}", .indexes_json = "{}" };
+    const history = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 11, .big);
+    std.mem.writeInt(u64, namespace[16..24], 13, .big);
+    const grant: history.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
+    const enrolled = try owners.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 7001, "docs", descriptor, .{ .enroll = grant }, 1, 1);
+    try std.testing.expectEqual(@as(u64, 1), enrolled.applied.consumer.?.epoch);
+    const ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.applied.consumer.?.epoch, .grant = grant.sequence, .definition = grant.definition };
+    const invalid_ack: history.Command = .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 100 } };
+    const rejected = try owners.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 7001, "docs", descriptor, invalid_ack, 1, 2);
+    try std.testing.expectEqual(.checkpoint_conflict, rejected.rejected);
+    owners.deinit();
+    owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(a, root, no_catalog.iface(), read_gate.alreadyReadSafeBarrier());
+    try std.testing.expectEqualDeep(rejected, try owners.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 7001, "docs", descriptor, invalid_ack, 1, 2));
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, owners.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 7001, "docs", descriptor, .{ .inspect = ref }, 1, 2));
+    try std.testing.expectEqual(.superseded, try owners.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 7001, "docs", descriptor, .{ .enroll = grant }, 1, 1));
+    const inspected = try owners.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 7001, "docs", descriptor, .{ .inspect = ref }, 1, 3);
+    try std.testing.expectEqual(@as(u64, 0), inspected.applied.consumer.?.acknowledged);
+    try std.testing.expectEqual(@as(usize, 0), no_catalog.calls.load(.acquire));
+}
+
 test "cold warmup reopens transient owners without disturbing resident siblings" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -2386,8 +2386,7 @@ pub const Executor = struct {
             const row: c_int = @intCast(row_idx);
             if (self.pqgetisnull(result, row, 0) != 0 or self.pqgetisnull(result, row, 1) != 0) continue;
             const lsn = try copyCellAlloc(alloc, self.pqgetvalue(result, row, 0), @intCast(self.pqgetlength(result, row, 0)));
-            if (observed_checkpoint) |value| alloc.free(value);
-            observed_checkpoint = lsn;
+            defer alloc.free(lsn);
             const data_hex = self.pqgetvalue(result, row, 1)[0..@intCast(self.pqgetlength(result, row, 1))];
             const data = try decodeByteaHexAlloc(alloc, data_hex);
             defer alloc.free(data);
@@ -2395,9 +2394,11 @@ pub const Executor = struct {
             switch (try parsePgoutputMessageAlloc(alloc, data, &relation_cache)) {
                 .none => {},
                 .begin => {
+                    if (current_txn_first_change_idx != null) return error.InvalidReplicationTransaction;
                     current_txn_first_change_idx = changes.items.len;
                 },
                 .commit => |commit_timestamp_ms| {
+                    if (current_txn_first_change_idx == null) return error.InvalidReplicationTransaction;
                     if (current_txn_first_change_idx) |start_idx| {
                         const computed_lag_ms: u64 = if (commit_timestamp_ms > 0 and poll_now_ms > 0)
                             @intCast(@max(@as(i64, 0), poll_now_ms - @as(i64, @intCast(commit_timestamp_ms))))
@@ -2405,23 +2406,29 @@ pub const Executor = struct {
                             0;
                         for (changes.items[start_idx..]) |*change| {
                             change.commit_timestamp_ms = commit_timestamp_ms;
+                            const committed_checkpoint = try alloc.dupe(u8, lsn);
                             alloc.free(change.checkpoint);
-                            change.checkpoint = try alloc.dupe(u8, lsn);
+                            change.checkpoint = committed_checkpoint;
                         }
                         lag_millis = @max(lag_millis, computed_lag_ms);
                     }
+                    const committed_checkpoint = try alloc.dupe(u8, lsn);
+                    if (observed_checkpoint) |value| alloc.free(value);
+                    observed_checkpoint = committed_checkpoint;
                     current_txn_first_change_idx = null;
                 },
                 .change => |parsed_change| {
                     var change_without_checkpoint = parsed_change;
                     errdefer change_without_checkpoint.deinit(alloc);
-                    alloc.free(change_without_checkpoint.checkpoint);
-                    change_without_checkpoint.checkpoint = try alloc.dupe(u8, lsn);
+                    if (current_txn_first_change_idx == null) return error.InvalidReplicationTransaction;
                     change_without_checkpoint.lag_records = 0;
                     try changes.append(alloc, change_without_checkpoint);
                 },
             }
         }
+        // A source position may only acknowledge complete transactions. Never
+        // publish a BEGIN/row LSN if a provider response ends before COMMIT.
+        if (current_txn_first_change_idx != null) return error.IncompleteReplicationTransaction;
 
         if (rows_len > 0 or changes.items.len > 0) {
             std.log.info(
@@ -4258,6 +4265,7 @@ fn cloneParameterValuesAlloc(alloc: Allocator, args: []const sql.ParameterValue)
 const PgoutputColumn = struct {
     name: []u8,
     data_type: Oid,
+    is_key: bool,
 };
 
 const PgoutputRelation = struct {
@@ -4310,14 +4318,15 @@ fn parsePgoutputMessageAlloc(
         'O' => return .none,
         'Y' => return .none,
         'M' => return .none,
-        'T' => return .none,
+        'T' => return error.UnsupportedReplicationTruncate,
         'R' => {
             const relation_id = try readU32(data, &pos);
             const namespace = try readCStringAlloc(alloc, data, &pos);
             errdefer alloc.free(namespace);
             const relation_name = try readCStringAlloc(alloc, data, &pos);
             errdefer alloc.free(relation_name);
-            _ = try readByte(data, &pos); // replica identity
+            const replica_identity = try readByte(data, &pos);
+            if (replica_identity != 'd' and replica_identity != 'n' and replica_identity != 'f' and replica_identity != 'i') return error.InvalidReplicationSourceRow;
             const column_count = try readU16(data, &pos);
             const columns = try alloc.alloc(PgoutputColumn, column_count);
             var initialized: usize = 0;
@@ -4326,8 +4335,10 @@ fn parsePgoutputMessageAlloc(
                 alloc.free(columns);
             }
             for (0..column_count) |i| {
-                _ = try readByte(data, &pos); // flags
+                const flags = try readByte(data, &pos);
+                if (flags & ~@as(u8, 1) != 0) return error.InvalidReplicationSourceRow;
                 columns[i] = .{
+                    .is_key = flags & 1 != 0,
                     .name = try readCStringAlloc(alloc, data, &pos),
                     .data_type = try readU32(data, &pos),
                 };
@@ -4355,48 +4366,80 @@ fn parsePgoutputMessageAlloc(
         },
         'I' => {
             const relation = relation_cache.get(try readU32(data, &pos)) orelse return error.InvalidReplicationSourceRow;
-            const tuple_tag = try readByte(data, &pos);
-            if (tuple_tag != 'N') return error.InvalidReplicationSourceRow;
-            const row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            if (try readByte(data, &pos) != 'N') return error.InvalidReplicationSourceRow;
+            var row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            errdefer foreign_source.deinitJsonValue(alloc, &row);
+            if (pos != data.len) return error.InvalidReplicationSourceRow;
             return .{ .change = .{
                 .op = .insert,
                 .checkpoint = try alloc.alloc(u8, 0),
                 .row = row,
+                .row_complete = row.object.count() == relation.columns.len,
             } };
         },
         'U' => {
             const relation = relation_cache.get(try readU32(data, &pos)) orelse return error.InvalidReplicationSourceRow;
             var marker = try readByte(data, &pos);
+            var before: ?std.json.Value = null;
+            errdefer if (before) |*value| foreign_source.deinitJsonValue(alloc, value);
+            var before_kind: foreign_source.ReplicationBeforeKind = .none;
             if (marker == 'K' or marker == 'O') {
-                var old_row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
-                foreign_source.deinitJsonValue(alloc, &old_row);
+                before_kind = if (marker == 'K') .key else .full;
+                before = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+                if (marker == 'K') retainPgoutputKeyColumns(alloc, &before.?, relation);
                 marker = try readByte(data, &pos);
             }
             if (marker != 'N') return error.InvalidReplicationSourceRow;
-            const row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            var row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            errdefer foreign_source.deinitJsonValue(alloc, &row);
+            if (pos != data.len) return error.InvalidReplicationSourceRow;
             return .{ .change = .{
                 .op = .update,
                 .checkpoint = try alloc.alloc(u8, 0),
                 .row = row,
+                .before = before,
+                .before_kind = before_kind,
+                .row_complete = row.object.count() == relation.columns.len,
+                .before_complete = before_kind == .full and before.?.object.count() == relation.columns.len,
             } };
         },
         'D' => {
             const relation = relation_cache.get(try readU32(data, &pos)) orelse return error.InvalidReplicationSourceRow;
             const marker = try readByte(data, &pos);
             if (marker != 'K' and marker != 'O') return error.InvalidReplicationSourceRow;
-            const row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            var row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            errdefer foreign_source.deinitJsonValue(alloc, &row);
+            if (marker == 'K') retainPgoutputKeyColumns(alloc, &row, relation);
+            if (pos != data.len) return error.InvalidReplicationSourceRow;
+            const complete = marker == 'O' and row.object.count() == relation.columns.len;
             return .{ .change = .{
                 .op = .delete,
                 .checkpoint = try alloc.alloc(u8, 0),
                 .row = row,
+                .before_kind = if (marker == 'K') .key else .full,
+                .row_complete = complete,
+                .before_complete = complete,
             } };
         },
-        else => return .none,
+        else => return error.UnsupportedReplicationMessage,
+    }
+}
+
+/// Key-tuple NULL placeholders are not historical values of non-key fields.
+fn retainPgoutputKeyColumns(alloc: Allocator, row: *std.json.Value, relation: PgoutputRelation) void {
+    for (relation.columns) |column| {
+        if (column.is_key) continue;
+        if (row.object.fetchOrderedRemove(column.name)) |removed| {
+            alloc.free(@constCast(removed.key));
+            var value = removed.value;
+            foreign_source.deinitJsonValue(alloc, &value);
+        }
     }
 }
 
 fn parsePgoutputTupleAlloc(alloc: Allocator, data: []const u8, pos: *usize, relation: PgoutputRelation) !std.json.Value {
     const column_count = try readU16(data, pos);
+    if (column_count != relation.columns.len) return error.InvalidReplicationSourceRow;
     var object = std.json.ObjectMap.empty;
     errdefer {
         var it = object.iterator();
@@ -4412,7 +4455,10 @@ fn parsePgoutputTupleAlloc(alloc: Allocator, data: []const u8, pos: *usize, rela
         const kind = try readByte(data, pos);
         switch (kind) {
             'n' => {
-                try object.put(alloc, try alloc.dupe(u8, relation.columns[idx].name), .null);
+                const name = try alloc.dupe(u8, relation.columns[idx].name);
+                errdefer alloc.free(name);
+                if (object.contains(name)) return error.InvalidReplicationSourceRow;
+                try object.put(alloc, name, .null);
             },
             'u' => {},
             't', 'b' => {
@@ -4420,24 +4466,12 @@ fn parsePgoutputTupleAlloc(alloc: Allocator, data: []const u8, pos: *usize, rela
                 if (len < 0 or pos.* + @as(usize, @intCast(len)) > data.len) return error.InvalidReplicationSourceRow;
                 const raw = data[pos.* .. pos.* + @as(usize, @intCast(len))];
                 pos.* += @as(usize, @intCast(len));
-                try object.put(
-                    alloc,
-                    try alloc.dupe(u8, relation.columns[idx].name),
-                    try parseLogicalValueAlloc(alloc, relation.columns[idx].data_type, raw, kind == 'b'),
-                );
-            },
-            else => return error.InvalidReplicationSourceRow,
-        }
-    }
-
-    while (idx < column_count) : (idx += 1) {
-        const kind = try readByte(data, pos);
-        switch (kind) {
-            'n', 'u' => {},
-            't', 'b' => {
-                const len = try readI32(data, pos);
-                if (len < 0 or pos.* + @as(usize, @intCast(len)) > data.len) return error.InvalidReplicationSourceRow;
-                pos.* += @as(usize, @intCast(len));
+                var value = try parseLogicalValueAlloc(alloc, relation.columns[idx].data_type, raw, kind == 'b');
+                errdefer foreign_source.deinitJsonValue(alloc, &value);
+                const name = try alloc.dupe(u8, relation.columns[idx].name);
+                errdefer alloc.free(name);
+                if (object.contains(name)) return error.InvalidReplicationSourceRow;
+                try object.put(alloc, name, value);
             },
             else => return error.InvalidReplicationSourceRow,
         }
@@ -5910,6 +5944,14 @@ test "postgres libpq created replication snapshot cloning is allocation-failure 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "postgres libpq parser rejects truncate and unknown effects rather than acknowledging lost mutations" {
+    const alloc = std.testing.allocator;
+    var relations = std.AutoHashMapUnmanaged(u32, PgoutputRelation).empty;
+    defer deinitPgoutputRelationCache(alloc, &relations);
+    try std.testing.expectError(error.UnsupportedReplicationTruncate, parsePgoutputMessageAlloc(alloc, "T", &relations));
+    try std.testing.expectError(error.UnsupportedReplicationMessage, parsePgoutputMessageAlloc(alloc, "?", &relations));
+}
+
 test "postgres libpq parser decodes pgoutput relation and row changes" {
     const alloc = std.testing.allocator;
 
@@ -5967,8 +6009,8 @@ test "postgres libpq parser decodes pgoutput relation and row changes" {
     try Builder.appendCString(&relation_bytes, alloc, "users");
     try relation_bytes.append(alloc, 'd');
     try Builder.appendU16(&relation_bytes, alloc, 3);
-    inline for (.{ .{ "id", TypeOid.int8 }, .{ "name", TypeOid.json }, .{ "tier", TypeOid.boolean } }) |column| {
-        try relation_bytes.append(alloc, 0);
+    inline for (.{ .{ "id", TypeOid.int8 }, .{ "name", TypeOid.json }, .{ "tier", TypeOid.boolean } }, 0..) |column, index| {
+        try relation_bytes.append(alloc, @intFromBool(index == 0));
         try Builder.appendCString(&relation_bytes, alloc, column.@"0");
         try Builder.appendU32(&relation_bytes, alloc, column.@"1");
         try Builder.appendU32(&relation_bytes, alloc, 0);
@@ -6023,6 +6065,46 @@ test "postgres libpq parser decodes pgoutput relation and row changes" {
     try std.testing.expectEqualStrings("la", update.row.?.object.get("name").?.object.get("city").?.string);
     try std.testing.expect(!update.row.?.object.get("tier").?.bool);
 
+    var key_update_bytes = std.ArrayListUnmanaged(u8).empty;
+    defer key_update_bytes.deinit(alloc);
+    try key_update_bytes.append(alloc, 'U');
+    try Builder.appendU32(&key_update_bytes, alloc, 42);
+    try key_update_bytes.append(alloc, 'K');
+    try Builder.appendU16(&key_update_bytes, alloc, 3);
+    try Builder.appendTextTupleValue(&key_update_bytes, alloc, "7");
+    try key_update_bytes.appendSlice(alloc, "nn");
+    try key_update_bytes.append(alloc, 'N');
+    try Builder.appendU16(&key_update_bytes, alloc, 3);
+    try Builder.appendTextTupleValue(&key_update_bytes, alloc, "8");
+    try key_update_bytes.appendSlice(alloc, "un");
+    var key_update = (try parsePgoutputMessageAlloc(alloc, key_update_bytes.items, &relation_cache)).change;
+    defer key_update.deinit(alloc);
+    try std.testing.expectEqual(foreign_source.ReplicationBeforeKind.key, key_update.before_kind);
+    try std.testing.expect(!key_update.before_complete and !key_update.row_complete);
+    try std.testing.expectEqual(@as(i64, 7), key_update.beforeImage().?.object.get("id").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), key_update.beforeImage().?.object.count());
+    try std.testing.expectEqual(@as(i64, 8), key_update.row.?.object.get("id").?.integer);
+    try std.testing.expect(key_update.row.?.object.get("name") == null);
+    try std.testing.expect(key_update.row.?.object.get("tier").? == .null);
+    var full_update_bytes = std.ArrayListUnmanaged(u8).empty;
+    defer full_update_bytes.deinit(alloc);
+    try full_update_bytes.append(alloc, 'U');
+    try Builder.appendU32(&full_update_bytes, alloc, 42);
+    try full_update_bytes.append(alloc, 'O');
+    try Builder.appendU16(&full_update_bytes, alloc, 3);
+    try Builder.appendTextTupleValue(&full_update_bytes, alloc, "7");
+    try Builder.appendTextTupleValue(&full_update_bytes, alloc, "{\"city\":\"la\"}");
+    try full_update_bytes.append(alloc, 'n');
+    try full_update_bytes.appendSlice(alloc, update_bytes.items[5..]);
+    var full_update = (try parsePgoutputMessageAlloc(alloc, full_update_bytes.items, &relation_cache)).change;
+    defer full_update.deinit(alloc);
+    try std.testing.expectEqual(foreign_source.ReplicationBeforeKind.full, full_update.before_kind);
+    try std.testing.expect(full_update.before_complete and full_update.row_complete);
+    try std.testing.expect(full_update.beforeImage().?.object.get("tier").? == .null);
+    try std.testing.expectEqualStrings("la", full_update.beforeImage().?.object.get("name").?.object.get("city").?.string);
+    const malformed_tuple = [_]u8{ 'I', 0, 0, 0, 42, 'N', 0, 2 };
+    try std.testing.expectError(error.InvalidReplicationSourceRow, parsePgoutputMessageAlloc(alloc, &malformed_tuple, &relation_cache));
+
     var delete_bytes = std.ArrayListUnmanaged(u8).empty;
     defer delete_bytes.deinit(alloc);
     try delete_bytes.append(alloc, 'D');
@@ -6039,6 +6121,8 @@ test "postgres libpq parser decodes pgoutput relation and row changes" {
     };
     defer delete.deinit(alloc);
     try std.testing.expectEqual(foreign_source.ReplicationOp.delete, delete.op);
+    try std.testing.expectEqual(foreign_source.ReplicationBeforeKind.full, delete.before_kind);
+    try std.testing.expect(delete.before_complete);
     try std.testing.expectEqual(@as(i64, 7), delete.row.?.object.get("id").?.integer);
 
     var commit_bytes = std.ArrayListUnmanaged(u8).empty;

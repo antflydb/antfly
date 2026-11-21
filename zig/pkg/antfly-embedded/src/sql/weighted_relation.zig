@@ -486,7 +486,7 @@ pub const Plan = struct {
                 if (q.binding.window != null) break :blk false;
                 if (q.binding.aggregate) |aggregate| {
                     if (aggregate.constant_count != 0 or !repeatableScalars(aggregate.input)) break :blk false;
-                    for (aggregate.specs) |spec| if (spec.kind == .pattern_set) break :blk false;
+                    for (aggregate.specs) |spec| if (spec.kind == .pattern_set or spec.kind == .array_agg) break :blk false;
                     for (aggregate.outputs) |program| if (!program.repeatable()) break :blk false;
                     for (aggregate.orders) |program| if (!program.repeatable()) break :blk false;
                     if (aggregate.having) |program| if (!program.repeatable()) break :blk false;

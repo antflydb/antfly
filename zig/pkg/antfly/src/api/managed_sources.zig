@@ -25,6 +25,64 @@ const Input = struct {
     expected_sources_hash: []const u8,
     replication_sources: std.json.Value,
 };
+const Table = @import("../metadata/table_manager.zig").TableRecord;
+const Destination = @import("../metadata/source_control.zig").Destination;
+
+const DestinationContract = struct {
+    version: u8 = 1,
+    adapter: ?Destination = null,
+    input: enum { row_transactions, committed_snapshots, unavailable } = .unavailable,
+    accepted_by: enum { native_transaction, iceberg_ingress, none } = .none,
+    committed_by: enum { native_transaction, iceberg_catalog_snapshot, external_snapshot, none } = .none,
+    committed_history: enum { native_rows_when_enrolled, unavailable } = .unavailable,
+};
+
+const DestinationStatus = struct {
+    contract: DestinationContract = .{},
+    cdc_unsupported_reason: []const u8 = "",
+};
+
+fn destinationStatus(a: A, server: *api.ApiHttpServer, table: Table, hosted_iceberg: bool) !DestinationStatus {
+    const runtime_supported = try server.source.replicationSourcesSupported();
+    const runtime_reason = if (runtime_supported) "" else "The current runtime does not execute managed replication sources.";
+    if (table.storage.engine != .object) return .{
+        .contract = .{
+            .adapter = .native,
+            .input = .row_transactions,
+            .accepted_by = .native_transaction,
+            .committed_by = .native_transaction,
+            .committed_history = if (server.cfg.native_history_roots != null and table.storage.engine == .local) .native_rows_when_enrolled else .unavailable,
+        },
+        .cdc_unsupported_reason = runtime_reason,
+    };
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse
+        return .{ .cdc_unsupported_reason = "The table has no qualified writable Iceberg binding." };
+    defer binding.deinit(a);
+    const external = binding.binding;
+    if (external.format == .iceberg and external.write_policy == .iceberg_writer and external.row_identity != null) {
+        try external.validateSupported();
+        return .{
+            .contract = .{
+                .adapter = .writable_iceberg,
+                .input = .row_transactions,
+                .accepted_by = .iceberg_ingress,
+                .committed_by = .iceberg_catalog_snapshot,
+            },
+            .cdc_unsupported_reason = if (!runtime_supported) runtime_reason else if (server.cfg.deployment_mode == .standalone or hosted_iceberg) "" else "The metadata runtime has no configured Iceberg writer.",
+        };
+    }
+    const committed_snapshot = external.format == .iceberg or
+        (external.format == .parquet and external.object_mutability == .immutable and
+            local.serverless_query_lake_parquet_manifest.isManifest(external.source_uri));
+    return .{
+        .contract = if (committed_snapshot)
+            .{ .input = .committed_snapshots, .committed_by = .external_snapshot }
+        else
+            .{},
+        .cdc_unsupported_reason = "The table has no qualified writable Iceberg binding.",
+    };
+}
+
 pub fn configure(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_id: ?u64, identity: ?api.AuthenticatedIdentity, context: local.api_operation.RequestContext, body: []const u8) ![]u8 {
     if (identity) |value| {
         if (!api.permissionsAllow(value.permissions, .table, physical, .admin) or api.hasEffectiveRowFilter(value, physical)) return error.Forbidden;
@@ -39,16 +97,23 @@ pub fn configure(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_i
     if (table.table_id != parsed.value.table_id or (bound_id != null and bound_id.? != table.table_id)) return error.TableGenerationChanged;
     const hash = sourcesHash(table.replication_sources_json);
     if (!std.mem.eql(u8, &hash, parsed.value.expected_sources_hash)) return error.TableGenerationChanged;
-    // Managed PostgreSQL currently uses the native CDC executor. Object
-    // notifications use lake reconciliation, not a synthetic replication slot.
-    if (table.storage.engine == .object) return error.UnsupportedOperation;
+    const source_count = parsed.value.replication_sources.array.items.len;
+    if (source_count != 0 and table.storage.engine == .object and
+        (try destinationStatus(a, server, table.*, snapshot.status.managed_iceberg_sources)).cdc_unsupported_reason.len != 0)
+        return error.UnsupportedOperation;
     for (parsed.value.replication_sources.array.items) |source| {
         if (source != .object) return error.InvalidCreateTableRequest;
     }
     const raw = try std.json.Stringify.valueAlloc(a, parsed.value.replication_sources, .{});
     defer a.free(raw);
-    const sealed = try authorization.sealReplicationSourcesJsonForPrincipalAlloc(a, raw, physical, api.storedDestinationPrincipal(identity), .{ .manager = server.cfg.user_manager, .auth_enabled = server.cfg.auth_enabled });
+    const authorizer: authorization.Authorizer = .{ .manager = server.cfg.user_manager, .auth_enabled = server.cfg.auth_enabled };
+    const sealed = try authorization.sealReplicationSourcesJsonForPrincipalAlloc(a, raw, physical, api.storedDestinationPrincipal(identity), authorizer);
     defer a.free(sealed);
+    if (table.storage.engine == .object) @import("../metadata/replication_backfill.zig").validateLakeSourceDefinition(a, physical, sealed, source_count, authorizer) catch |err| switch (err) {
+        error.UnsupportedReplicationRoute, error.UnsupportedReplicationSource => return error.UnsupportedOperation,
+        error.InvalidReplicationSourceConfig => return error.InvalidCreateTableRequest,
+        else => return err,
+    };
     var replacement = table.*;
     replacement.replication_sources_json = sealed;
     try server.source.replaceTableDefinition(table.*, replacement);
@@ -60,6 +125,27 @@ pub fn sourcesHash(bytes: []const u8) [64]u8 {
     std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
     return std.fmt.bytesToHex(hash, .lower);
 }
+
+const PublicationProgress = struct {
+    published_generation: ?u64 = null,
+    published_snapshot: ?[]const u8 = null,
+    building_generation: ?u64 = null,
+    failed_generation: ?u64 = null,
+
+    fn fromCatalog(state: local.metadata_lake_index_catalog.State) PublicationProgress {
+        var result: PublicationProgress = .{};
+        if (state.published) |published| {
+            result.published_generation = published.generation;
+            result.published_snapshot = switch (published.base_source) {
+                .external_iceberg, .external_parquet, .external_lance => |snapshot| snapshot.snapshot_id,
+                else => null,
+            };
+        }
+        if (state.pending) |pending| result.building_generation = pending.generation;
+        if (state.failure) |failure| result.failed_generation = failure.generation;
+        return result;
+    }
+};
 
 pub fn status(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_id: ?u64, identity: ?api.AuthenticatedIdentity, context: local.api_operation.RequestContext) ![]u8 {
     if (identity) |value| if (!api.permissionsAllow(value.permissions, .table, physical, .admin) or api.hasEffectiveRowFilter(value, physical)) return error.Forbidden;
@@ -73,20 +159,21 @@ pub fn status(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_id: 
     var progress: std.ArrayList(@import("../metadata/table_manager.zig").ReplicationSourceStatusRecord) = .empty;
     defer progress.deinit(a);
     for (snapshot.replication_source_statuses) |record| if (record.table_id == table.table_id) try progress.append(a, record);
-    // Cluster and standalone (directory-backed and Lite) both run CDC; a
-    // standalone instance bound to an HA hot-standby primary does not, and
-    // must say so rather than reporting itself as configured.
-    const cdc_supported = try server.source.replicationSourcesSupported();
+    const destination = try destinationStatus(a, server, table.*, snapshot.status.managed_iceberg_sources);
+    var publication = if (table.storage.engine == .object)
+        try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json)
+    else
+        null;
+    defer if (publication) |*parsed| parsed.deinit();
     return std.json.Stringify.valueAlloc(a, .{
         .table_id = table.table_id,
         .sources_hash = &hash,
         .replication_sources = sources.value,
         .progress = progress.items,
-        .cdc_supported = cdc_supported,
-        .cdc_unsupported_reason = if (cdc_supported)
-            ""
-        else
-            "replication sources require a cluster; this is a hot-standby catalog",
+        .destination_contract = destination.contract,
+        .index_publication = if (publication) |parsed| PublicationProgress.fromCatalog(parsed.value) else null,
+        .cdc_supported = destination.cdc_unsupported_reason.len == 0,
+        .cdc_unsupported_reason = destination.cdc_unsupported_reason,
     }, .{});
 }
 
@@ -125,6 +212,7 @@ test "lake SQL managed source replacement checks native definition hash and tabl
     const standalone_status = try status(a, &server, "hn", 7, null, .{});
     defer a.free(standalone_status);
     try std.testing.expect(std.mem.indexOf(u8, standalone_status, "\"cdc_supported\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, standalone_status, "\"committed_by\":\"native_transaction\"") != null);
     server.cfg.deployment_mode = .distributed;
     const result = try configure(a, &server, "hn", 7, null, .{}, body);
     defer a.free(result);
@@ -132,4 +220,43 @@ test "lake SQL managed source replacement checks native definition hash and tabl
     const wrong = "{\"table_id\":7,\"expected_sources_hash\":\"stale\",\"replication_sources\":[]}";
     try std.testing.expectError(error.TableGenerationChanged, configure(a, &server, "hn", 7, null, .{}, wrong));
     try std.testing.expectEqual(@as(usize, 1), source.replacements);
+
+    source.table[0].storage.engine = .object;
+    source.table[0].schema_json =
+        \\{"base_source":{"kind":"external","table_id":"hn","uri":"file:///lake","format":"iceberg","write_policy":"iceberg_writer","catalog":{"type":"managed"},"row_identity":{"key_columns":["id"]}}}
+    ;
+    const attach = try std.fmt.allocPrint(
+        a,
+        "{{\"table_id\":7,\"expected_sources_hash\":\"{s}\",\"replication_sources\":[{{\"type\":\"postgres\",\"dsn\":\"test-dsn\",\"postgres_table\":\"source\",\"key_template\":\"id\"}}]}}",
+        .{hash},
+    );
+    defer a.free(attach);
+    try std.testing.expectError(error.UnsupportedOperation, configure(a, &server, "hn", 7, null, .{}, attach));
+    const distributed_iceberg_status = try status(a, &server, "hn", 7, null, .{});
+    defer a.free(distributed_iceberg_status);
+    try std.testing.expect(std.mem.indexOf(u8, distributed_iceberg_status, "\"cdc_supported\":false") != null);
+    server.cfg.deployment_mode = .standalone;
+    const standalone_iceberg_status = try status(a, &server, "hn", 7, null, .{});
+    defer a.free(standalone_iceberg_status);
+    try std.testing.expect(std.mem.indexOf(u8, standalone_iceberg_status, "\"cdc_supported\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, standalone_iceberg_status, "\"accepted_by\":\"iceberg_ingress\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, standalone_iceberg_status, "\"committed_by\":\"iceberg_catalog_snapshot\"") != null);
+    const iceberg_result = try configure(a, &server, "hn", 7, null, .{}, attach);
+    defer a.free(iceberg_result);
+    try std.testing.expectEqual(@as(usize, 2), source.replacements);
+    source.table[0].schema_json =
+        \\{"base_source":{"kind":"external","table_id":"hn","uri":"file:///lake","format":"iceberg"}}
+    ;
+    const failed_publication = try local.metadata_lake_index_catalog.encode(a, .{
+        .generation = 4,
+        .failure = .{ .generation = 4, .desired = @splat(1), .reason = "test writer unavailable", .retry_at_ms = 1 },
+    });
+    defer a.free(failed_publication);
+    source.table[0].lake_index_catalog_json = failed_publication;
+    const external_status = try status(a, &server, "hn", 7, null, .{});
+    defer a.free(external_status);
+    try std.testing.expect(std.mem.indexOf(u8, external_status, "\"input\":\"committed_snapshots\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, external_status, "\"cdc_supported\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, external_status, "\"failed_generation\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, external_status, "\"published_snapshot\":null") != null);
 }

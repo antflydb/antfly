@@ -31,6 +31,8 @@ const metadata_transition_state = @import("transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const tables_api = @import("../api/tables.zig");
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const transaction_contract = @import("antfly_local_sources").api_local_table_writes.distributed_txn;
+const source_effects = @import("antfly_local_sources").api_local_table_writes.source_effects;
 const backend_types = @import("antfly_local_sources").storage_backend_types;
 const secrets = @import("antfly_local_sources").common_secrets;
 const pattern_filter = @import("antfly_local_sources").search_pattern_filter;
@@ -38,12 +40,12 @@ const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
 
 const Allocator = std.mem.Allocator;
-// CDC checkpoints are external resume positions. Only publish progress after
-// the applied row is visible through query/index paths. This level is safe
-// for streaming apply and for any snapshot write outside an open bulk-ingest
-// window, because the embedding/enrichment runtime can always see the write
-// it is asked to wait on.
-const cdc_apply_sync_level = db_mod.types.SyncLevel.full_index;
+// Provider resume progress follows durable destination completion. Derived
+// indexes publish their own frontiers and may be unavailable independently;
+// waiting for them here would retain provider WAL after the rows are committed.
+// requireReplicationCommitComplete still rejects unresolved destination votes
+// and propagation. This level alone does not supply durable retry identity.
+const cdc_apply_sync_level = db_mod.types.SyncLevel.write;
 // Snapshot batches applied *inside* a table's bulk-ingest window
 // (`beginBackfillBulkIngestWindow`..`finishBackfillBulkIngestWindow`) must
 // not request `.full_index`/`.enrichments`. Those levels wait on the
@@ -152,6 +154,7 @@ fn replicationErrorEndsRound(err: anyerror) bool {
 
 fn classifyReplicationError(err: anyerror) []const u8 {
     return switch (err) {
+        error.ReplicationProjectionIncomplete,
         error.ReplicationExactCutoverRequired,
         error.ForeignAuthFailed,
         error.ForeignTableNotFound,
@@ -163,6 +166,10 @@ fn classifyReplicationError(err: anyerror) []const u8 {
         error.UnknownColumn,
         error.InvalidQueryRequest,
         error.UnsupportedReplicationStreaming,
+        error.UnsupportedReplicationTruncate,
+        error.UnsupportedReplicationMessage,
+        error.InvalidReplicationTransaction,
+        error.InvalidReplicationCheckpoint,
         error.StoredDestinationAuthorizationMissing,
         error.StoredDestinationAuthorizationInvalid,
         error.StoredDestinationAuthorizationRevoked,
@@ -178,11 +185,14 @@ pub const BackfillSummary = struct {
     snapshot_complete: bool = false,
 };
 
+const iceberg_snapshot_publish_pending = "iceberg_snapshot_publish_pending";
+
 pub const SnapshotBackfillRunner = struct {
     alloc: Allocator,
     io: std.Io = std.Options.debug_io,
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
+    external_destination: ?ExternalStreamDestination = null,
     secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
     prepared_snapshot_timeout_ns: u64 = default_prepared_snapshot_timeout_ns,
@@ -243,8 +253,13 @@ pub const SnapshotBackfillRunner = struct {
         table: metadata_table_manager.TableRecord,
         source_ordinal: u32,
         start_offset: usize,
-        existing_status: ?metadata_table_manager.ReplicationSourceStatusRecord,
+        existing_status_input: ?metadata_table_manager.ReplicationSourceStatusRecord,
     ) !BackfillSummary {
+        // A sink may replace/free its prior row on the first status update.
+        // Retain every original resume field until the entire run returns.
+        const existing_status: ?metadata_table_manager.ReplicationSourceStatusRecord = if (existing_status_input) |status| try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, status) else null;
+        defer if (existing_status) |status| metadata_table_manager.freeReplicationSourceStatus(self.alloc, status);
+        var lake_publish_pending = if (existing_status) |status| std.mem.eql(u8, status.phase, iceberg_snapshot_publish_pending) else false;
         var progress_offset = start_offset;
         var progress_snapshot_checkpoint = std.ArrayListUnmanaged(u8).empty;
         defer progress_snapshot_checkpoint.deinit(self.alloc);
@@ -290,6 +305,7 @@ pub const SnapshotBackfillRunner = struct {
             source_ordinal,
             start_offset,
             existing_status,
+            &lake_publish_pending,
             &progress_offset,
             &progress_snapshot_checkpoint,
             &progress_cutover_mode,
@@ -305,6 +321,7 @@ pub const SnapshotBackfillRunner = struct {
             &progress_cutover_provider_identity,
         ) catch |err| {
             self.checkpointWork() catch return err;
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer) catch return err;
             defer parsed.deinit(self.alloc);
 
@@ -322,7 +339,7 @@ pub const SnapshotBackfillRunner = struct {
                     progress_publication_name.items
                 else
                     parsed.publication_name,
-                .phase = "failed",
+                .phase = if (lake_publish_pending) iceberg_snapshot_publish_pending else "failed",
                 .checkpoint = if (progress_snapshot_checkpoint.items.len > 0)
                     progress_snapshot_checkpoint.items
                 else
@@ -362,6 +379,7 @@ pub const SnapshotBackfillRunner = struct {
         source_ordinal: u32,
         start_offset: usize,
         existing_status: ?metadata_table_manager.ReplicationSourceStatusRecord,
+        lake_publish_pending: *bool,
         progress_offset: *usize,
         progress_snapshot_checkpoint: *std.ArrayListUnmanaged(u8),
         progress_cutover_mode: *std.ArrayListUnmanaged(u8),
@@ -377,8 +395,45 @@ pub const SnapshotBackfillRunner = struct {
         progress_cutover_provider_identity: *foreign_mod.ExactCutoverIntent.ProviderIdentity,
     ) !BackfillSummary {
         try self.checkpointWork();
+        try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer);
         defer parsed.deinit(self.alloc);
+        var external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
+        defer if (external) |*binding| binding.deinit(self.alloc);
+        const lake_owner = if (external) |binding| blk: {
+            if (binding.binding.format != .iceberg or binding.binding.write_policy != .iceberg_writer or
+                binding.binding.row_identity == null) return error.UnsupportedReplicationRoute;
+            try parsed.validateLakeDestination();
+            const owner = self.external_destination orelse return error.UnsupportedReplicationRoute;
+            const observed = owner.bootstrap_committed orelse return error.UnsupportedReplicationRoute;
+            parsed.require_exact_cutover = true;
+            if (!lake_publish_pending.*) break :blk owner;
+            var status = existing_status orelse return error.UnsupportedReplicationRoute;
+            if (status.table_id != table.table_id or status.source_ordinal != source_ordinal or
+                !exactCutoverIntentOwnsConfig(status, parsed, exactCutoverConfigFingerprint(table.table_id, source_ordinal, parsed)) or
+                !std.mem.eql(u8, status.cutover_mode, cutover_mode_exported_snapshot) or status.prepared_checkpoint.len == 0)
+                return error.UnsupportedReplicationRoute;
+            try callCheckCutoverAuthority(status_sink, table.replication_sources_json, status);
+            if (!try observed(owner.ptr, self.alloc, .{
+                .table = table,
+                .cutover = status,
+                .previous_checkpoint = null,
+                .checkpoint = status.prepared_checkpoint,
+                .changes = &.{},
+                .deadline_ns = try self.workDeadlineNs(),
+            })) return error.SourceOutcomeUnresolved;
+            try self.checkpointWork();
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
+            try callCheckCutoverAuthority(status_sink, table.replication_sources_json, status);
+            status.phase = "cutover_prepared";
+            status.last_error = "";
+            status.failure_class = "";
+            status.consecutive_failures = 0;
+            status.last_success_at_ms = ioNowMillis(self.io);
+            status.updated_at_ms = status.last_success_at_ms;
+            try callUpsertStatus(status_sink, status);
+            return .{ .final_offset = @intCast(status.snapshot_offset), .snapshot_complete = true };
+        } else null;
 
         var resolved_dsn = try secrets.resolveReferenceWithGenerationOwned(self.alloc, self.secret_store, parsed.dsn);
         defer resolved_dsn.deinit(self.alloc);
@@ -556,6 +611,7 @@ pub const SnapshotBackfillRunner = struct {
             alloc: Allocator,
             runner: *SnapshotBackfillRunner,
             status_sink: @TypeOf(status_sink),
+            table: metadata_table_manager.TableRecord,
             expected_replication_sources_json: []const u8,
             expected_authority_id: u64,
             record: metadata_table_manager.ReplicationSourceStatusRecord,
@@ -607,6 +663,7 @@ pub const SnapshotBackfillRunner = struct {
                 // started and an async status write must not manufacture proof.
                 var record = ctx.record;
                 record.cutover_provider_identity = provider_identity;
+                try requireLegacyOwnership(ctx.status_sink, ctx.alloc, ctx.table, ctx.record.source_ordinal);
                 try callClaimCutoverStatusDurable(
                     ctx.status_sink,
                     ctx.expected_replication_sources_json,
@@ -644,6 +701,7 @@ pub const SnapshotBackfillRunner = struct {
             fn check(ptr: *anyopaque) !void {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
                 try ctx.runner.checkpointWork();
+                try requireLegacyOwnership(ctx.status_sink, ctx.alloc, ctx.table, ctx.record.source_ordinal);
                 try callCheckCutoverAuthority(
                     ctx.status_sink,
                     ctx.expected_replication_sources_json,
@@ -674,6 +732,7 @@ pub const SnapshotBackfillRunner = struct {
             .alloc = self.alloc,
             .runner = self,
             .status_sink = status_sink,
+            .table = table,
             .expected_replication_sources_json = table.replication_sources_json,
             .expected_authority_id = if (resume_pending_authority)
                 cutover_authority_id
@@ -810,6 +869,7 @@ pub const SnapshotBackfillRunner = struct {
             effective_publication_name,
         );
         try checkProgressCutoverAuthority(
+            self.alloc,
             status_sink,
             table,
             source_ordinal,
@@ -836,7 +896,7 @@ pub const SnapshotBackfillRunner = struct {
             prepared_checkpoint,
         );
 
-        try callUpsertStatus(status_sink, .{
+        const prepared_status: metadata_table_manager.ReplicationSourceStatusRecord = .{
             .table_id = table.table_id,
             .source_ordinal = source_ordinal,
             .source_kind = parsed.type_name,
@@ -865,7 +925,8 @@ pub const SnapshotBackfillRunner = struct {
             .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
             .cutover_provider_identity = progress_cutover_provider_identity.*,
             .updated_at_ms = ioNowMillis(self.io),
-        });
+        };
+        try callUpsertStatus(status_sink, prepared_status);
         try self.reachLifecycle(
             .provider_prepared,
             table.table_id,
@@ -882,13 +943,19 @@ pub const SnapshotBackfillRunner = struct {
 
         var bulk_ingest_tables: std.ArrayListUnmanaged([]const u8) = .empty;
         defer bulk_ingest_tables.deinit(self.alloc);
-        try beginBackfillBulkIngestWindow(self.alloc, self.write_source, table.name, parsed, &bulk_ingest_tables);
+        if (lake_owner == null) try beginBackfillBulkIngestWindow(self.alloc, self.write_source, table.name, parsed, &bulk_ingest_tables);
+        if (lake_owner != null and (prepared_snapshot == null or effective_start_offset != 0 or snapshot_order_fields.len == 0)) return error.ReplicationExactCutoverRequired;
+        var lake_pages: std.ArrayList([32]u8) = .empty;
+        defer lake_pages.deinit(self.alloc);
+        var lake_bytes: usize = 0;
+        const lake_catalog = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog;
         errdefer abortBackfillBulkIngestWindow(self.write_source, bulk_ingest_tables.items);
 
         var quantum_exhausted = false;
         while (true) {
             try self.checkpointWork();
             try checkProgressCutoverAuthority(
+                self.alloc,
                 status_sink,
                 table,
                 source_ordinal,
@@ -934,6 +1001,7 @@ pub const SnapshotBackfillRunner = struct {
             defer result.deinit(self.alloc);
             try self.checkpointWork();
             try checkProgressCutoverAuthority(
+                self.alloc,
                 status_sink,
                 table,
                 source_ordinal,
@@ -964,10 +1032,30 @@ pub const SnapshotBackfillRunner = struct {
                 );
             }
 
-            if (parsed.has_update_transforms or parsed.has_routes) {
+            if (lake_owner) |owner| {
+                if (result.rows.len > lake_catalog.row_commit.max_bootstrap_rows - summary.final_offset) return error.LakeWriteTooLarge;
+                const stage_page = owner.stage_snapshot_page orelse return error.UnsupportedReplicationRoute;
+                for (result.rows) |row| {
+                    const encoded = try std.json.Stringify.valueAlloc(self.alloc, row, .{});
+                    defer self.alloc.free(encoded);
+                    if (encoded.len > lake_catalog.types.max_commit_bytes - lake_bytes) return error.LakeWriteTooLarge;
+                    lake_bytes += encoded.len;
+                }
+                const page = try stage_page(owner.ptr, self.alloc, .{
+                    .table = table,
+                    .cutover = prepared_status,
+                    .previous_checkpoint = null,
+                    .checkpoint = prepared_checkpoint,
+                    .changes = &.{},
+                    .snapshot_rows = result.rows,
+                    .deadline_ns = try self.workDeadlineNs(),
+                });
+                try lake_pages.append(self.alloc, page);
+            } else if (parsed.has_update_transforms or parsed.has_routes) {
                 for (result.rows) |row| {
                     try self.checkpointWork();
                     try checkProgressCutoverAuthority(
+                        self.alloc,
                         status_sink,
                         table,
                         source_ordinal,
@@ -992,10 +1080,7 @@ pub const SnapshotBackfillRunner = struct {
                 const writes = try rowsToBatchWritesAlloc(self.alloc, result.rows, parsed.key_template);
                 defer freeBatchWritesOwned(self.alloc, writes);
 
-                try applyReplicationBatchRequired(self.alloc, self.write_source, table.name, .{
-                    .writes = writes,
-                    .sync_level = cdc_snapshot_window_sync_level,
-                });
+                try applyReplicationSnapshotRowsRequired(self.alloc, self.write_source, table.name, writes, cdc_snapshot_window_sync_level);
                 try self.checkpointWork();
             }
 
@@ -1017,6 +1102,7 @@ pub const SnapshotBackfillRunner = struct {
             try self.checkpointWork();
 
             try checkProgressCutoverAuthority(
+                self.alloc,
                 status_sink,
                 table,
                 source_ordinal,
@@ -1031,7 +1117,7 @@ pub const SnapshotBackfillRunner = struct {
             summary.rows_applied += result.rows.len;
             summary.batches_applied += 1;
             summary.final_offset += result.rows.len;
-            progress_offset.* = summary.final_offset;
+            if (lake_owner == null) progress_offset.* = summary.final_offset;
             if (next_snapshot_checkpoint) |checkpoint| {
                 try replaceProgressSlice(
                     self.alloc,
@@ -1055,41 +1141,43 @@ pub const SnapshotBackfillRunner = struct {
                 );
             }
 
-            try callUpsertStatus(status_sink, .{
-                .table_id = table.table_id,
-                .source_ordinal = source_ordinal,
-                .source_kind = parsed.type_name,
-                .external_table = parsed.postgres_table,
-                .cutover_mode = cutover_mode,
-                .slot_name = effective_slot_name,
-                .publication_name = effective_publication_name,
-                .phase = phase_snapshot,
-                .checkpoint = progress_snapshot_checkpoint.items,
-                .snapshot_offset = @intCast(summary.final_offset),
-                .prepared_checkpoint = prepared_checkpoint,
-                .stream_checkpoint = "",
-                .last_error = "",
-                .failure_class = "",
-                .lag_records = 0,
-                .lag_millis = 0,
-                .consecutive_failures = 0,
-                .last_source_commit_at_ms = 0,
-                .last_success_at_ms = ioNowMillis(self.io),
-                .last_change_applied_at_ms = ioNowMillis(self.io),
-                .cutover_intent_id = progress_cutover_intent_id.*,
-                .cutover_authority_id = progress_cutover_authority_id.*,
-                .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
-                .cutover_provider_identity = progress_cutover_provider_identity.*,
-                .updated_at_ms = ioNowMillis(self.io),
-            });
-            try self.reachLifecycle(
-                .snapshot_checkpoint_persisted,
-                table.table_id,
-                source_ordinal,
-                @intCast(summary.final_offset),
-                progress_cutover_authority_id.*,
-                progress_snapshot_checkpoint.items,
-            );
+            if (lake_owner == null) {
+                try callUpsertStatus(status_sink, .{
+                    .table_id = table.table_id,
+                    .source_ordinal = source_ordinal,
+                    .source_kind = parsed.type_name,
+                    .external_table = parsed.postgres_table,
+                    .cutover_mode = cutover_mode,
+                    .slot_name = effective_slot_name,
+                    .publication_name = effective_publication_name,
+                    .phase = phase_snapshot,
+                    .checkpoint = progress_snapshot_checkpoint.items,
+                    .snapshot_offset = @intCast(summary.final_offset),
+                    .prepared_checkpoint = prepared_checkpoint,
+                    .stream_checkpoint = "",
+                    .last_error = "",
+                    .failure_class = "",
+                    .lag_records = 0,
+                    .lag_millis = 0,
+                    .consecutive_failures = 0,
+                    .last_source_commit_at_ms = 0,
+                    .last_success_at_ms = ioNowMillis(self.io),
+                    .last_change_applied_at_ms = ioNowMillis(self.io),
+                    .cutover_intent_id = progress_cutover_intent_id.*,
+                    .cutover_authority_id = progress_cutover_authority_id.*,
+                    .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
+                    .cutover_provider_identity = progress_cutover_provider_identity.*,
+                    .updated_at_ms = ioNowMillis(self.io),
+                });
+                try self.reachLifecycle(
+                    .snapshot_checkpoint_persisted,
+                    table.table_id,
+                    source_ordinal,
+                    @intCast(summary.final_offset),
+                    progress_cutover_authority_id.*,
+                    progress_snapshot_checkpoint.items,
+                );
+            }
             try self.checkpointWork();
 
             if (result.rows.len < self.batch_size) break;
@@ -1105,6 +1193,7 @@ pub const SnapshotBackfillRunner = struct {
 
         try self.checkpointWork();
         try checkProgressCutoverAuthority(
+            self.alloc,
             status_sink,
             table,
             source_ordinal,
@@ -1119,6 +1208,7 @@ pub const SnapshotBackfillRunner = struct {
         try finishBackfillBulkIngestWindow(self.alloc, self.write_source, bulk_ingest_tables.items);
         try self.checkpointWork();
         try checkProgressCutoverAuthority(
+            self.alloc,
             status_sink,
             table,
             source_ordinal,
@@ -1132,6 +1222,50 @@ pub const SnapshotBackfillRunner = struct {
         );
         bulk_ingest_tables.clearRetainingCapacity();
         if (quantum_exhausted) return summary;
+
+        if (lake_owner) |owner| {
+            const pending: metadata_table_manager.ReplicationSourceStatusRecord = .{
+                .table_id = table.table_id,
+                .source_ordinal = source_ordinal,
+                .source_kind = parsed.type_name,
+                .external_table = parsed.postgres_table,
+                .cutover_mode = cutover_mode,
+                .slot_name = effective_slot_name,
+                .publication_name = effective_publication_name,
+                .phase = iceberg_snapshot_publish_pending,
+                .checkpoint = progress_snapshot_checkpoint.items,
+                .snapshot_offset = @intCast(summary.final_offset),
+                .prepared_checkpoint = prepared_checkpoint,
+                .cutover_intent_id = progress_cutover_intent_id.*,
+                .cutover_authority_id = progress_cutover_authority_id.*,
+                .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
+                .cutover_provider_identity = progress_cutover_provider_identity.*,
+                .updated_at_ms = ioNowMillis(self.io),
+            };
+            const stage = owner.stage_bootstrap orelse return error.UnsupportedReplicationRoute;
+            var request: ExternalStreamDestination.Request = .{
+                .table = table,
+                .cutover = pending,
+                .previous_checkpoint = null,
+                .checkpoint = prepared_checkpoint,
+                .changes = &.{},
+                .snapshot_chunks = lake_pages.items,
+                .deadline_ns = try self.workDeadlineNs(),
+            };
+            try stage(owner.ptr, self.alloc, request);
+            try self.checkpointWork();
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
+            try callCheckCutoverAuthority(status_sink, table.replication_sources_json, pending);
+            try callUpsertStatus(status_sink, pending);
+            progress_offset.* = summary.final_offset;
+            lake_publish_pending.* = true;
+            request.snapshot_chunks = null;
+            const recover = owner.bootstrap_committed orelse return error.UnsupportedReplicationRoute;
+            if (!try recover(owner.ptr, self.alloc, request)) return error.SourceOutcomeUnresolved;
+            try self.checkpointWork();
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
+            try callCheckCutoverAuthority(status_sink, table.replication_sources_json, pending);
+        }
 
         try callUpsertStatus(status_sink, .{
             .table_id = table.table_id,
@@ -1240,6 +1374,7 @@ fn backfillBulkIngestTableOpened(opened_tables: []const []const u8, table_name: 
 pub const BackfillRoundSummary = struct {
     tables_considered: usize = 0,
     sources_considered: usize = 0,
+    sources_skipped_destination_actor: usize = 0,
     sources_started: usize = 0,
     sources_resumed: usize = 0,
     sources_skipped_complete: usize = 0,
@@ -1264,6 +1399,7 @@ const ReplicationApplySummary = struct {
 pub const StreamingRoundSummary = struct {
     tables_considered: usize = 0,
     sources_considered: usize = 0,
+    sources_skipped_destination_actor: usize = 0,
     sources_started: usize = 0,
     sources_resumed: usize = 0,
     sources_skipped_pending_snapshot: usize = 0,
@@ -1371,6 +1507,33 @@ fn nextCursorAfterYield(
     return .{ .valid = true, .table_id = next_table.table_id, .source_ordinal = 0 };
 }
 
+const LegacyIntake = enum { allowed, destination_actor, unproven };
+fn requireLegacyOwnership(service: anytype, a: Allocator, table: metadata_table_manager.TableRecord, ordinal: u32) !void {
+    switch (try legacyIntake(service, a, table, ordinal)) {
+        .allowed => {},
+        .destination_actor => return error.SourcePendingWork,
+        .unproven => return error.SourceOutcomeUnresolved,
+    }
+}
+fn legacyIntake(service: anytype, a: Allocator, table: metadata_table_manager.TableRecord, ordinal: u32) !LegacyIntake {
+    const Service = switch (@typeInfo(@TypeOf(service))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(service),
+    };
+    // Legacy-only test sinks retain the old interface; production owners
+    // expose the qualified actor-state gate.
+    if (comptime !@hasDecl(Service, "legacyReplicationSourceIntakeAllowed")) return .allowed;
+    const definition = @import("source_control.zig").definitionDigest(a, table.replication_sources_json, ordinal) catch |err| return switch (err) {
+        error.InvalidSourceControl => .unproven,
+        else => err,
+    };
+    const permitted = service.legacyReplicationSourceIntakeAllowed(table.table_id, ordinal, definition) catch |err| return switch (err) {
+        error.SourceAdmissionBackpressure, error.SourceControlCorrupt, error.InvalidSourceControl => .unproven,
+        else => err,
+    };
+    return if (permitted) .allowed else .destination_actor;
+}
+
 pub const SnapshotBackfillCoordinator = struct {
     alloc: Allocator,
     runner: SnapshotBackfillRunner,
@@ -1431,7 +1594,8 @@ pub const SnapshotBackfillCoordinator = struct {
                 self.cursor = .{ .valid = true, .table_id = table.table_id, .source_ordinal = @intCast(range.begin) };
                 return summary;
             }
-            const table_ready = tableReadyForReplication(&readiness_snapshot, table.table_id);
+            const table_ready = (table.storage.engine == .object and self.runner.external_destination != null) or
+                tableReadyForReplication(&readiness_snapshot, table.table_id);
             const has_existing_status = tableHasReplicationSourceStatus(statuses, table.table_id);
             if (!table_ready and !has_existing_status) {
                 if (!is_wrap) std.log.info("metadata cdc snapshot skip table not ready table={s}", .{table.name});
@@ -1447,6 +1611,18 @@ pub const SnapshotBackfillCoordinator = struct {
                 }
                 try self.runner.checkpointWork();
                 summary.sources_considered += 1;
+                switch (try legacyIntake(service, self.alloc, table, @intCast(ordinal))) {
+                    .allowed => {},
+                    .destination_actor => {
+                        summary.sources_skipped_destination_actor += 1;
+                        continue;
+                    },
+                    .unproven => {
+                        summary.sources_failed += 1;
+                        continue;
+                    },
+                }
+
                 const existing = findReplicationSourceStatus(statuses, table.table_id, @intCast(ordinal));
                 const exact_config_replaced = if (existing) |record| blk: {
                     if (record.cutover_authority_id == 0) break :blk false;
@@ -1536,11 +1712,40 @@ pub const SnapshotBackfillCoordinator = struct {
     }
 };
 
+/// Storage-owner port for complete external destination transactions. A
+/// durable admission receipt can survive retry while catalog commitment is
+/// pending. Only commitment authorizes advancing the provider checkpoint.
+pub const ExternalStreamDestination = struct {
+    ptr: *anyopaque,
+    apply: *const fn (*anyopaque, Allocator, Request) anyerror!Outcome,
+    /// Positive catalog evidence for the exact prepared cut. Absence does
+    /// not authorize retiring a slot or replacing a pending admission.
+    bootstrap_committed: ?*const fn (*anyopaque, Allocator, Request) anyerror!bool = null,
+    stage_bootstrap: ?*const fn (*anyopaque, Allocator, Request) anyerror!void = null,
+    stage_snapshot_page: ?*const fn (*anyopaque, Allocator, Request) anyerror![32]u8 = null,
+
+    pub const Outcome = enum { accepted, committed };
+    pub const Request = struct {
+        table: metadata_table_manager.TableRecord,
+        cutover: metadata_table_manager.ReplicationSourceStatusRecord,
+        previous_checkpoint: ?[]const u8,
+        checkpoint: []const u8,
+        changes: []const foreign_mod.ReplicationChange,
+        /// The entire qualified snapshot at the prepared provider cut.
+        /// An empty slice commits a cut with zero visible rows.
+        snapshot_rows: ?[]const std.json.Value = null,
+        /// Ordered page digests supplied only when sealing a completed capture.
+        snapshot_chunks: ?[]const [32]u8 = null,
+        deadline_ns: ?u64,
+    };
+};
+
 pub const StreamingReplicationRunner = struct {
     alloc: Allocator,
     io: std.Io = std.Options.debug_io,
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
+    external_destination: ?ExternalStreamDestination = null,
     secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
     work_permit: ?WorkPermit = null,
@@ -1590,6 +1795,7 @@ pub const StreamingReplicationRunner = struct {
 
         return self.runTableSourceInner(status_sink, table, source_ordinal, snapshot_offset, cutover_mode, resume_checkpoint, existing_status, &progress_checkpoint) catch |err| {
             self.checkpointWork() catch return err;
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer) catch return err;
             defer parsed.deinit(self.alloc);
             const prior_failures = if (existing_status) |status|
@@ -1670,6 +1876,20 @@ pub const StreamingReplicationRunner = struct {
         };
     }
 
+    fn applyExternal(self: *StreamingReplicationRunner, owner: ExternalStreamDestination, table: metadata_table_manager.TableRecord, source_ordinal: u32, status: ?metadata_table_manager.ReplicationSourceStatusRecord, previous: []const u8, checkpoint: []const u8, changes: []const foreign_mod.ReplicationChange) !void {
+        const cutover = status orelse return error.UnsupportedReplicationRoute;
+        if (cutover.cutover_authority_id == 0 or cutover.table_id != table.table_id or cutover.source_ordinal != source_ordinal) return error.UnsupportedReplicationRoute;
+        const outcome = try owner.apply(owner.ptr, self.alloc, .{
+            .table = table,
+            .cutover = cutover,
+            .previous_checkpoint = if (previous.len != 0) previous else null,
+            .checkpoint = checkpoint,
+            .changes = changes,
+            .deadline_ns = try self.workDeadlineNs(),
+        });
+        if (outcome != .committed) return error.SourceOutcomeUnresolved;
+    }
+
     fn runTableSourceInner(
         self: *StreamingReplicationRunner,
         status_sink: anytype,
@@ -1682,8 +1902,18 @@ pub const StreamingReplicationRunner = struct {
         progress_checkpoint: *std.ArrayListUnmanaged(u8),
     ) !StreamSummary {
         try self.checkpointWork();
+        try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer);
         defer parsed.deinit(self.alloc);
+        var binding = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
+        defer if (binding) |*external| external.deinit(self.alloc);
+        const destination = if (binding) |external| blk: {
+            if (external.binding.format != .iceberg or external.binding.write_policy != .iceberg_writer) return error.UnsupportedReplicationRoute;
+            try external.binding.validateSupported();
+            if (external.binding.row_identity == null) return error.UnsupportedReplicationRoute;
+            try parsed.validateLakeDestination();
+            break :blk self.external_destination orelse return error.UnsupportedReplicationRoute;
+        } else null;
 
         var resolved_dsn = try secrets.resolveReferenceWithGenerationOwned(self.alloc, self.secret_store, parsed.dsn);
         defer resolved_dsn.deinit(self.alloc);
@@ -1739,6 +1969,7 @@ pub const StreamingReplicationRunner = struct {
             .{ table.name, source_ordinal, snapshot_offset, if (resume_checkpoint) |value| value.len else 0 },
         );
         try self.checkpointWork();
+        try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
         if (existing_status) |status| {
             try callCheckCutoverAuthority(
                 status_sink,
@@ -1749,6 +1980,7 @@ pub const StreamingReplicationRunner = struct {
         var result = try source.pollChanges(self.alloc, params);
         defer result.deinit(self.alloc);
         try self.checkpointWork();
+        try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
         if (existing_status) |status| {
             try callCheckCutoverAuthority(
                 status_sink,
@@ -1772,7 +2004,9 @@ pub const StreamingReplicationRunner = struct {
         var summary: StreamSummary = .{};
 
         if (result.changes.len == 0) {
-            if (result.checkpoint.len > 0) {
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
+            if (result.checkpoint.len > 0 and !std.mem.eql(u8, result.checkpoint, progress_checkpoint.items)) {
+                if (destination) |owner| try self.applyExternal(owner, table, source_ordinal, existing_status, progress_checkpoint.items, result.checkpoint, &.{});
                 progress_checkpoint.clearRetainingCapacity();
                 try progress_checkpoint.appendSlice(self.alloc, result.checkpoint);
             }
@@ -1832,8 +2066,11 @@ pub const StreamingReplicationRunner = struct {
             return summary;
         }
 
-        for (result.changes) |change| {
+        var transactions: foreign_mod.ReplicationTransactions = .{ .changes = result.changes };
+        while (try transactions.next()) |transaction| {
+            const change = transaction[transaction.len - 1];
             try self.checkpointWork();
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             if (existing_status) |status| {
                 try callCheckCutoverAuthority(
                     status_sink,
@@ -1841,18 +2078,29 @@ pub const StreamingReplicationRunner = struct {
                     status,
                 );
             }
-            // Streaming apply happens outside any bulk-ingest window, so the
-            // enrichment runtime can always see the row being waited on here.
-            const apply_summary = try applyReplicationChange(self.alloc, self.write_source, table.name, change, parsed, cdc_apply_sync_level);
-            try self.reachLifecycle(
-                .stream_change_applied,
-                table.table_id,
-                source_ordinal,
-                @intCast(snapshot_offset),
-                if (existing_status) |status| status.cutover_authority_id else 0,
-                change.checkpoint,
-            );
+            // Advance the provider frontier after complete durable effects;
+            // index visibility is an independent publication obligation.
+            const apply_summary = if (destination) |owner| blk: {
+                try self.applyExternal(owner, table, source_ordinal, existing_status, progress_checkpoint.items, change.checkpoint, transaction);
+                var applied: ReplicationApplySummary = .{};
+                for (transaction) |member| switch (member.op) {
+                    .insert, .update => applied.writes_applied += 1,
+                    .delete => applied.deletes_applied += 1,
+                };
+                break :blk applied;
+            } else try applyReplicationTransaction(self.alloc, self.write_source, table.name, transaction, parsed, cdc_apply_sync_level);
+            for (transaction) |member| {
+                try self.reachLifecycle(
+                    .stream_change_applied,
+                    table.table_id,
+                    source_ordinal,
+                    @intCast(snapshot_offset),
+                    if (existing_status) |status| status.cutover_authority_id else 0,
+                    member.checkpoint,
+                );
+            }
             try self.checkpointWork();
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             if (existing_status) |status| {
                 try callCheckCutoverAuthority(
                     status_sink,
@@ -1867,7 +2115,10 @@ pub const StreamingReplicationRunner = struct {
                 @intCast(@max(@as(i64, 0), @as(i64, @intCast(applied_at_ms)) - @as(i64, @intCast(change.commit_timestamp_ms))))
             else if (result.lag_millis > 0) result.lag_millis else 0;
 
-            summary.changes_applied += 1;
+            // Only the complete source transaction grants a resume frontier.
+            // A rejected atomic group leaves the previous durable checkpoint.
+            // Receipt-based lost-response recovery is a separate admission fence.
+            summary.changes_applied += transaction.len;
             summary.last_checkpoint_len = change.checkpoint.len;
             summary.writes_applied += apply_summary.writes_applied;
             summary.deletes_applied += apply_summary.deletes_applied;
@@ -1982,7 +2233,8 @@ pub const StreamingReplicationCoordinator = struct {
                 self.cursor = .{ .valid = true, .table_id = table.table_id, .source_ordinal = @intCast(range.begin) };
                 return summary;
             }
-            const table_ready = tableReadyForReplication(&readiness_snapshot, table.table_id);
+            const table_ready = (table.storage.engine == .object and self.runner.external_destination != null) or
+                tableReadyForReplication(&readiness_snapshot, table.table_id);
             const status_allows_streaming = tableHasStreamingEligibleStatus(statuses, table.table_id);
             if (!table_ready and !status_allows_streaming) {
                 if (!is_wrap) std.log.info("metadata cdc stream skip table not ready table={s}", .{table.name});
@@ -1998,6 +2250,18 @@ pub const StreamingReplicationCoordinator = struct {
                 }
                 try self.runner.checkpointWork();
                 summary.sources_considered += 1;
+                switch (try legacyIntake(service, self.alloc, table, @intCast(ordinal))) {
+                    .allowed => {},
+                    .destination_actor => {
+                        summary.sources_skipped_destination_actor += 1;
+                        continue;
+                    },
+                    .unproven => {
+                        summary.sources_failed += 1;
+                        continue;
+                    },
+                }
+
                 const existing = findReplicationSourceStatus(statuses, table.table_id, @intCast(ordinal)) orelse {
                     std.log.info(
                         "metadata cdc stream skip pending snapshot table={s} source={d} reason=no_status",
@@ -2117,6 +2381,11 @@ const ParsedReplicationSourceConfig = struct {
     delete_document_on_delete: bool = false,
     has_routes: bool = false,
 
+    fn validateLakeDestination(self: ParsedReplicationSourceConfig) !void {
+        if (self.routes.len != 0 or self.on_update_json != null or self.on_delete_json != null)
+            return error.UnsupportedReplicationRoute;
+    }
+
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.type_name);
         alloc.free(self.dsn);
@@ -2150,6 +2419,15 @@ const ParsedReplicationRouteConfig = struct {
         self.* = undefined;
     }
 };
+
+/// Writable Iceberg owns one PostgreSQL cut and checkpoint per table.
+pub fn validateLakeSourceDefinition(a: Allocator, table_name: []const u8, encoded: []const u8, count: usize, authorizer: stored_destination_authorization.Authorizer) !void {
+    if (count > 1) return error.UnsupportedReplicationRoute;
+    if (count == 0) return;
+    var parsed = try parseReplicationSourceConfig(a, table_name, encoded, 0, authorizer);
+    defer parsed.deinit(a);
+    try parsed.validateLakeDestination();
+}
 
 fn parseReplicationSourceConfig(
     alloc: Allocator,
@@ -2358,15 +2636,25 @@ fn rowsToBatchWritesAlloc(
     return writes;
 }
 
-fn applyReplicationBatchRequired(
+/// Snapshot rows use the same atomic destination contract as stream effects.
+/// Hosted writers therefore qualify/provision every root and finish retained
+/// completion before the snapshot cursor can be persisted. Raw batch fallback
+/// would omit that contract, including for a snapshot spanning multiple roots.
+fn applyReplicationSnapshotRowsRequired(
     alloc: Allocator,
     write_source: table_writes_api.TableWriteSource,
     table_name: []const u8,
-    req: db_mod.types.BatchRequest,
+    writes: []const db_mod.types.BatchWrite,
+    sync_level: db_mod.types.SyncLevel,
 ) !void {
-    if ((try write_source.batch(alloc, table_name, req)) == null) {
-        return error.UnsupportedReplicationRoute;
-    }
+    try requireReplicationCommitComplete(try write_source.commitBatch(alloc, &.{.{ .table_name = table_name, .source_producer = .legacy_cdc, .writes = writes }}, sync_level));
+}
+
+fn requireReplicationCommitComplete(outcome: ?transaction_contract.CommitOutcome) !void {
+    const committed = outcome orelse return error.UnsupportedReplicationRoute;
+    if (committed == .conflict) return error.IntentConflict;
+    const result = committed.committed;
+    if (result.propagation_pending or result.visibility_pending or result.visibility_retry_pending or result.visibility_repair_required) return error.SourceOutcomeUnresolved;
 }
 
 fn applyReplicationChange(
@@ -2377,142 +2665,164 @@ fn applyReplicationChange(
     parsed: ParsedReplicationSourceConfig,
     sync_level: db_mod.types.SyncLevel,
 ) !ReplicationApplySummary {
-    if (parsed.routes.len > 0) {
-        return try applyReplicationChangeRouted(alloc, write_source, change, parsed, sync_level);
-    }
-
-    switch (change.op) {
-        .insert, .update => {
-            const row = change.row orelse return error.InvalidReplicationSourceRow;
-            const key = try renderReplicationChangeKeyAlloc(alloc, change, parsed.key_template);
-            defer alloc.free(key);
-            const transforms = if (parsed.on_update_json) |on_update_json|
-                try resolveConfiguredTransformOpsAlloc(alloc, on_update_json, row)
-            else
-                try autoSetTransformOpsAlloc(alloc, row);
-            defer freeTransformOpsOwned(alloc, transforms);
-            const doc_transforms = [_]db_mod.types.DocumentTransform{.{
-                .key = key,
-                .operations = transforms,
-                .upsert = true,
-            }};
-            try applyReplicationBatchRequired(alloc, write_source, table_name, .{
-                .transforms = doc_transforms[0..],
-                .sync_level = sync_level,
-            });
-            return .{ .writes_applied = 1 };
-        },
-        .delete => {
-            const key = try renderReplicationChangeKeyAlloc(alloc, change, parsed.key_template);
-            defer alloc.free(key);
-            if (parsed.delete_document_on_delete or change.row == null) {
-                const deletes = [_][]const u8{key};
-                try applyReplicationBatchRequired(alloc, write_source, table_name, .{
-                    .deletes = deletes[0..],
-                    .sync_level = sync_level,
-                });
-                return .{ .deletes_applied = 1 };
-            } else {
-                const transforms = if (parsed.on_delete_json) |on_delete_json|
-                    try resolveConfiguredTransformOpsAlloc(alloc, on_delete_json, change.row.?)
-                else if (parsed.on_update_json) |on_update_json|
-                    try deriveUnsetTransformOpsFromUpdateAlloc(alloc, on_update_json, parsed.key_template)
-                else
-                    try autoUnsetTransformOpsAlloc(alloc, change.row.?, parsed.key_template);
-                defer freeTransformOpsOwned(alloc, transforms);
-                const doc_transforms = [_]db_mod.types.DocumentTransform{.{
-                    .key = key,
-                    .operations = transforms,
-                    .upsert = false,
-                }};
-                try applyReplicationBatchRequired(alloc, write_source, table_name, .{
-                    .transforms = doc_transforms[0..],
-                    .sync_level = sync_level,
-                });
-                return .{ .deletes_applied = 1 };
-            }
-        },
-    }
+    return applyReplicationTransaction(alloc, write_source, table_name, &.{change}, parsed, sync_level);
 }
 
-fn applyReplicationChangeRouted(
+/// Compile all final destination effects before the first destination mutation.
+/// A multi-table projection requires the existing atomic commit contract; never
+/// fall back to sequential per-table writes when that capability is absent.
+fn applyReplicationTransaction(
     alloc: Allocator,
     write_source: table_writes_api.TableWriteSource,
-    change: foreign_mod.ReplicationChange,
+    table_name: []const u8,
+    changes: []const foreign_mod.ReplicationChange,
     parsed: ParsedReplicationSourceConfig,
     sync_level: db_mod.types.SyncLevel,
 ) !ReplicationApplySummary {
-    const row = change.row orelse return error.InvalidReplicationSourceRow;
+    var plan = source_effects.Plan.init(alloc, .{});
+    defer plan.deinit();
     var summary: ReplicationApplySummary = .{};
-
-    for (parsed.routes) |route| {
-        const key = try renderRouteChangeKeyAlloc(alloc, change, parsed, route);
-        defer alloc.free(key);
-        if (!(try routeMatchesRow(alloc, route, key, row))) continue;
-
-        switch (change.op) {
-            .insert, .update => {
-                const transforms = if (route.on_update_json) |on_update_json|
-                    try resolveConfiguredTransformOpsAlloc(alloc, on_update_json, row)
-                else
-                    try autoSetTransformOpsAlloc(alloc, row);
-                defer freeTransformOpsOwned(alloc, transforms);
-                const doc_transforms = [_]db_mod.types.DocumentTransform{.{
-                    .key = key,
-                    .operations = transforms,
-                    .upsert = true,
-                }};
-                try applyReplicationBatchRequired(alloc, write_source, route.target_table, .{
-                    .transforms = doc_transforms[0..],
-                    .sync_level = sync_level,
-                });
-                summary.writes_applied += 1;
-            },
-            .delete => {
-                if (route.delete_document_on_delete) {
-                    const deletes = [_][]const u8{key};
-                    try applyReplicationBatchRequired(alloc, write_source, route.target_table, .{
-                        .deletes = deletes[0..],
-                        .sync_level = sync_level,
-                    });
-                    summary.deletes_applied += 1;
-                } else {
-                    const transforms = if (route.on_delete_json) |on_delete_json|
-                        try resolveConfiguredTransformOpsAlloc(alloc, on_delete_json, row)
-                    else if (route.on_update_json) |on_update_json|
-                        try deriveUnsetTransformOpsFromUpdateAlloc(alloc, on_update_json, route.key_template orelse parsed.key_template)
-                    else
-                        try autoUnsetTransformOpsAlloc(alloc, row, route.key_template orelse parsed.key_template);
-                    defer freeTransformOpsOwned(alloc, transforms);
-                    const doc_transforms = [_]db_mod.types.DocumentTransform{.{
-                        .key = key,
-                        .operations = transforms,
-                        .upsert = false,
-                    }};
-                    try applyReplicationBatchRequired(alloc, write_source, route.target_table, .{
-                        .transforms = doc_transforms[0..],
-                        .sync_level = sync_level,
-                    });
-                    summary.deletes_applied += 1;
-                }
-            },
-        }
+    for (changes) |change| {
+        const applied = try compileReplicationChange(alloc, &plan, table_name, change, parsed);
+        summary.writes_applied += applied.writes_applied;
+        summary.deletes_applied += applied.deletes_applied;
     }
-
+    const effects = try plan.finish();
+    if (effects.len == 0) return summary;
+    const requests = try alloc.alloc(transaction_contract.TableCommitRequest, effects.len);
+    defer alloc.free(requests);
+    for (effects, requests) |effect, *request| request.* = .{
+        .table_name = effect.table_name,
+        .source_producer = .legacy_cdc,
+        .transforms = effect.transforms,
+        .deletes = effect.deletes,
+    };
+    try requireReplicationCommitComplete(try write_source.commitBatch(alloc, requests, sync_level));
     return summary;
 }
 
-fn renderRouteChangeKeyAlloc(
+fn compileReplicationChange(
     alloc: Allocator,
+    plan: *source_effects.Plan,
+    table_name: []const u8,
     change: foreign_mod.ReplicationChange,
     parsed: ParsedReplicationSourceConfig,
-    route: ParsedReplicationRouteConfig,
-) ![]u8 {
-    if (route.key_template == null) {
-        return try renderReplicationChangeKeyAlloc(alloc, change, parsed.key_template);
+) !ReplicationApplySummary {
+    var summary: ReplicationApplySummary = .{};
+    if (parsed.routes.len == 0) {
+        return compileReplicationProjection(alloc, plan, change, parsed.key_template, .{
+            .target_table = @constCast(table_name),
+            .on_update_json = parsed.on_update_json,
+            .on_delete_json = parsed.on_delete_json,
+            .delete_document_on_delete = parsed.delete_document_on_delete,
+        });
     }
-    const row = change.row orelse return error.InvalidReplicationSourceRow;
-    return try renderDocumentKeyAlloc(alloc, row, route.key_template.?);
+    for (parsed.routes) |route| {
+        const applied = try compileReplicationProjection(alloc, plan, change, parsed.key_template, route);
+        summary.writes_applied += applied.writes_applied;
+        summary.deletes_applied += applied.deletes_applied;
+    }
+    return summary;
+}
+
+fn compileReplicationProjection(
+    alloc: Allocator,
+    plan: *source_effects.Plan,
+    change: foreign_mod.ReplicationChange,
+    default_key_template: []const u8,
+    route: ParsedReplicationRouteConfig,
+) !ReplicationApplySummary {
+    const key_template = route.key_template orelse default_key_template;
+    var materialized: ?std.json.Value = null;
+    defer if (materialized) |*value| foreign_mod.deinitJsonValue(alloc, value);
+    var row = change.row orelse {
+        if (change.op != .delete or change.key == null) return error.InvalidReplicationSourceRow;
+        if (route.where_json != null) return error.ReplicationProjectionIncomplete;
+        try plan.delete(route.target_table, change.key.?);
+        return .{ .deletes_applied = 1 };
+    };
+    // FULL old images can fill unchanged-TOAST holes without looking up a
+    // later provider row or reverse-mapping an already transformed destination.
+    if (change.op == .update and !change.row_complete and change.before_complete) {
+        const before = change.beforeImage() orelse return error.ReplicationProjectionIncomplete;
+        if (row != .object or before != .object) return error.InvalidReplicationSourceRow;
+        materialized = try cloneJsonValueAllocLocal(alloc, before);
+        var fields = row.object.iterator();
+        while (fields.next()) |field| {
+            if (materialized.?.object.getPtr(field.key_ptr.*)) |existing| {
+                var replacement = try cloneJsonValueAllocLocal(alloc, field.value_ptr.*);
+                errdefer foreign_mod.deinitJsonValue(alloc, &replacement);
+                foreign_mod.deinitJsonValue(alloc, existing);
+                existing.* = replacement;
+            } else {
+                const name = try alloc.dupe(u8, field.key_ptr.*);
+                errdefer alloc.free(name);
+                var value = try cloneJsonValueAllocLocal(alloc, field.value_ptr.*);
+                errdefer foreign_mod.deinitJsonValue(alloc, &value);
+                try materialized.?.object.put(alloc, name, value);
+            }
+        }
+        row = materialized.?;
+    }
+    const key = if (route.key_template == null and change.key != null)
+        try alloc.dupe(u8, change.key.?)
+    else
+        try renderDocumentKeyAlloc(alloc, row, key_template);
+    defer alloc.free(key);
+    if (route.where_json != null and !change.row_complete and materialized == null) return error.ReplicationProjectionIncomplete;
+    if (change.op == .delete) {
+        if (route.where_json != null and !change.before_complete) return error.ReplicationProjectionIncomplete;
+        if (!try routeMatchesRow(alloc, route, key, row)) return .{};
+        try compileReplicationDelete(alloc, plan, route, key_template, key, row, change.before_complete);
+        return .{ .deletes_applied = 1 };
+    }
+    var summary: ReplicationApplySummary = .{};
+    const matches = try routeMatchesRow(alloc, route, key, row);
+    if (change.op == .update) {
+        if (route.where_json != null and !change.before_complete) return error.ReplicationProjectionIncomplete;
+        if (change.beforeImage()) |before| {
+            const old_key = try renderDocumentKeyAlloc(alloc, before, key_template);
+            defer alloc.free(old_key);
+            const moved = !std.mem.eql(u8, old_key, key);
+            if (moved and !change.row_complete and materialized == null) return error.ReplicationProjectionIncomplete;
+            if ((moved or !matches) and try routeMatchesRow(alloc, route, old_key, before)) {
+                try compileReplicationDelete(alloc, plan, route, key_template, old_key, before, change.before_complete);
+                summary.deletes_applied += 1;
+            }
+        }
+    }
+    if (matches) {
+        const ops = if (route.on_update_json) |configured|
+            try resolveConfiguredTransformOpsAlloc(alloc, configured, row)
+        else
+            try autoSetTransformOpsAlloc(alloc, row);
+        defer freeTransformOpsOwned(alloc, ops);
+        try plan.transform(route.target_table, .{ .key = key, .operations = ops, .upsert = true });
+        summary.writes_applied += 1;
+    }
+    return summary;
+}
+
+fn compileReplicationDelete(
+    alloc: Allocator,
+    plan: *source_effects.Plan,
+    route: ParsedReplicationRouteConfig,
+    key_template: []const u8,
+    key: []const u8,
+    row: std.json.Value,
+    complete: bool,
+) !void {
+    if (route.delete_document_on_delete) return plan.delete(route.target_table, key);
+    const ops = if (route.on_delete_json) |configured|
+        try resolveConfiguredTransformOpsAlloc(alloc, configured, row)
+    else if (route.on_update_json) |configured|
+        try deriveUnsetTransformOpsFromUpdateAlloc(alloc, configured, key_template)
+    else blk: {
+        if (!complete) return error.ReplicationProjectionIncomplete;
+        break :blk try autoUnsetTransformOpsAlloc(alloc, row, key_template);
+    };
+    defer freeTransformOpsOwned(alloc, ops);
+    try plan.transform(route.target_table, .{ .key = key, .operations = ops, .upsert = false });
 }
 
 fn routeMatchesRow(
@@ -3213,6 +3523,7 @@ fn callCompleteCutoverRetirementDurable(
 }
 
 fn checkProgressCutoverAuthority(
+    alloc: Allocator,
     status_sink: anytype,
     table: metadata_table_manager.TableRecord,
     source_ordinal: u32,
@@ -3224,6 +3535,7 @@ fn checkProgressCutoverAuthority(
     cutover_config_fingerprint: [cutover_config_fingerprint_len]u8,
     cutover_provider_identity: foreign_mod.ExactCutoverIntent.ProviderIdentity,
 ) !void {
+    try requireLegacyOwnership(status_sink, alloc, table, source_ordinal);
     if (cutover_authority_id == 0) return;
     try callCheckCutoverAuthority(
         status_sink,
@@ -3610,7 +3922,8 @@ test "metadata snapshot backfill stops before apply when its work permit is revo
         .registry = &registry,
         .write_source = .{
             .ptr = &state,
-            .vtable = &.{ .batch = State.batch },
+            .supports_transaction_producers = true,
+            .vtable = &.{ .batch = State.batch, .commit_batch = comptime testSingleTableCommit(State.batch) },
         },
         .work_permit = .{
             .ptr = &state,
@@ -4469,6 +4782,42 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     ));
     try std.testing.expect(final_status.slot_name.len <= postgres_identifier_max_len);
     try std.testing.expect(std.mem.indexOf(u8, final_status.slot_name, "_af_") != null);
+
+    const Lake = struct {
+        fn page(_: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) ![32]u8 {
+            const rows = request.snapshot_rows.?;
+            try std.testing.expectEqual(@as(usize, 1), rows.len);
+            return @splat(if (std.mem.eql(u8, rows[0].object.get("id").?.string, "doc:1")) 1 else 2);
+        }
+        fn stage(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !void {
+            const sink: *StatusSink = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("snapshot", sink.records.items[sink.records.items.len - 1].phase);
+            try std.testing.expectEqualSlices([32]u8, &.{ @splat(1), @splat(2) }, request.snapshot_chunks.?);
+        }
+        fn apply(_: *anyopaque, _: Allocator, _: ExternalStreamDestination.Request) !ExternalStreamDestination.Outcome {
+            return error.UnexpectedBootstrapReplay;
+        }
+        fn observe(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !bool {
+            const sink: *StatusSink = @ptrCast(@alignCast(raw));
+            const pending = sink.records.items[sink.records.items.len - 1];
+            try std.testing.expectEqualStrings(iceberg_snapshot_publish_pending, pending.phase);
+            try std.testing.expectEqualStrings("lsn:exact", request.checkpoint);
+            try std.testing.expect(request.snapshot_rows == null);
+            return true;
+        }
+    };
+    runner.external_destination = .{ .ptr = &status_sink, .apply = Lake.apply, .bootstrap_committed = Lake.observe, .stage_bootstrap = Lake.stage, .stage_snapshot_page = Lake.page };
+    const captured = try runner.runTableSource(&status_sink, .{
+        .table_id = 12,
+        .name = "lake",
+        .schema_json =
+        \\{"base_source":{"kind":"external","table_id":"lake","uri":"file:///lake","format":"iceberg","write_policy":"iceberg_writer","catalog":{"type":"managed"},"row_identity":{"key_columns":["id"]}}}
+        ,
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\"}]",
+    }, 0);
+    try std.testing.expect(captured.snapshot_complete);
+    try std.testing.expectEqual(@as(usize, 2), captured.rows_applied);
+    try std.testing.expectEqualStrings("cutover_prepared", status_sink.records.items[status_sink.records.items.len - 1].phase);
 }
 
 test "metadata replication backfill applies configured update transforms" {
@@ -4740,8 +5089,10 @@ test "metadata replication backfill routes matching snapshot rows to target tabl
         fn source(self: *@This()) table_writes_api.TableWriteSource {
             return .{
                 .ptr = self,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
+                    .commit_batch = comptime testSingleTableCommit(batch),
                     .begin_bulk_ingest = beginBulkIngest,
                     .finish_bulk_ingest = finishBulkIngest,
                     .abort_bulk_ingest = abortBulkIngest,
@@ -5110,6 +5461,17 @@ test "metadata replication backfill coordinator resumes and then skips completed
         alloc: Allocator,
         table: metadata_table_manager.TableRecord,
         statuses: std.ArrayListUnmanaged(metadata_table_manager.ReplicationSourceStatusRecord) = .empty,
+        legacy_allowed: bool = true,
+        legacy_checks: usize = 0,
+        intake_error: ?anyerror = null,
+        pub fn legacyReplicationSourceIntakeAllowed(self: *@This(), table_id: u64, ordinal: u32, definition: @import("source_control.zig").Digest) !bool {
+            try std.testing.expectEqual(self.table.table_id, table_id);
+            try std.testing.expectEqual(@as(u32, 0), ordinal);
+            try std.testing.expectEqualDeep(try @import("source_control.zig").definitionDigest(self.alloc, self.table.replication_sources_json, ordinal), definition);
+            self.legacy_checks += 1;
+            if (self.intake_error) |err| return err;
+            return self.legacy_allowed;
+        }
 
         pub fn deinit(self: *@This()) void {
             for (self.statuses.items) |record| metadata_table_manager.freeReplicationSourceStatus(self.alloc, record);
@@ -5245,6 +5607,32 @@ test "metadata replication backfill coordinator resumes and then skips completed
         },
     };
 
+    service.legacy_allowed = false;
+    const blocked = try coordinator.runRound(&service);
+    try std.testing.expectEqual(@as(usize, 1), blocked.sources_skipped_destination_actor);
+    try std.testing.expectEqual(@as(usize, 0), blocked.sources_completed);
+    try std.testing.expectEqualStrings("snapshot_keyset:[\"doc:1\"]", service.statuses.items[0].checkpoint);
+    var stream = StreamingReplicationCoordinator{ .alloc = alloc, .runner = .{ .alloc = alloc, .registry = &registry, .write_source = write_source.source() } };
+    const stream_blocked = blk: {
+        const prior_phase = service.statuses.items[0].phase;
+        const streaming_phase = try alloc.dupe(u8, "streaming");
+        service.statuses.items[0].phase = streaming_phase;
+        defer {
+            service.statuses.items[0].phase = prior_phase;
+            alloc.free(streaming_phase);
+        }
+        break :blk try stream.runRound(&service);
+    };
+    try std.testing.expectEqual(@as(usize, 1), stream_blocked.sources_skipped_destination_actor);
+    try std.testing.expectEqual(@as(usize, 0), stream_blocked.sources_started);
+    try std.testing.expectEqual(@as(usize, 2), service.legacy_checks);
+    service.intake_error = error.SourceAdmissionBackpressure;
+    const deferred = try coordinator.runRound(&service);
+    try std.testing.expectEqual(@as(usize, 1), deferred.sources_failed);
+    try std.testing.expectEqual(@as(usize, 0), deferred.sources_completed);
+    try std.testing.expectEqualStrings("snapshot_keyset:[\"doc:1\"]", service.statuses.items[0].checkpoint);
+    service.intake_error = null;
+    service.legacy_allowed = true;
     const first = try coordinator.runRound(&service);
     try std.testing.expectEqual(@as(usize, 1), first.tables_considered);
     try std.testing.expectEqual(@as(usize, 1), first.sources_considered);
@@ -5260,6 +5648,33 @@ test "metadata replication backfill coordinator resumes and then skips completed
     try std.testing.expectEqual(@as(usize, 1), second.sources_considered);
     try std.testing.expectEqual(@as(usize, 1), second.sources_skipped_complete);
     try std.testing.expectEqual(@as(usize, 0), second.sources_completed);
+    const Handover = struct {
+        fn reach(ptr: *anyopaque, event: ReplicationLifecycleEvent) !void {
+            const sink: *FakeService = @ptrCast(@alignCast(ptr));
+            if (event.phase == .snapshot_batch_applied) sink.legacy_allowed = false;
+        }
+    };
+    try service.upsertReplicationSourceStatus(.{
+        .table_id = 22,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .external_table = "users",
+        .phase = "snapshot",
+        .checkpoint = "snapshot_keyset:[\"doc:1\"]",
+        .snapshot_offset = 1,
+        .cutover_mode = "exported_snapshot",
+        .prepared_checkpoint = "lsn:resume",
+        .last_error = "",
+        .lag_records = 0,
+        .updated_at_ms = 1,
+    });
+    service.legacy_allowed = true;
+    coordinator.runner.lifecycle_hook = .{ .ptr = &service, .reach_fn = Handover.reach };
+    try std.testing.expectError(error.SourcePendingWork, coordinator.runner.runTableSourceFromStatus(&service, service.table, 0, 1, service.statuses.items[0]));
+    try std.testing.expect(!service.legacy_allowed);
+    try std.testing.expectEqualStrings("snapshot", service.statuses.items[0].phase);
+    try std.testing.expectEqualStrings("snapshot_keyset:[\"doc:1\"]", service.statuses.items[0].checkpoint);
+    try std.testing.expectEqual(@as(u64, 1), service.statuses.items[0].snapshot_offset);
 }
 
 test "metadata replication backfill coordinator continues past one source's retryable failure" {
@@ -6016,8 +6431,10 @@ test "metadata replication backfill production round entry point rotates across 
 
     const write_source = table_writes_api.TableWriteSource{
         .ptr = &AcceptAllWriteSource.sentinel,
+        .supports_transaction_producers = true,
         .vtable = &.{
             .batch = AcceptAllWriteSource.batch,
+            .commit_batch = comptime testSingleTableCommit(AcceptAllWriteSource.batch),
         },
     };
 
@@ -6308,8 +6725,10 @@ test "metadata replication backfill round persists the cursor past a source that
 
     const write_source = table_writes_api.TableWriteSource{
         .ptr = &AcceptAllWriteSource.sentinel,
+        .supports_transaction_producers = true,
         .vtable = &.{
             .batch = AcceptAllWriteSource.batch,
+            .commit_batch = comptime testSingleTableCommit(AcceptAllWriteSource.batch),
         },
     };
 
@@ -6823,7 +7242,8 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
         .registry = &registry,
         .write_source = .{
             .ptr = &NullWriteSource.sentinel,
-            .vtable = &.{ .batch = NullWriteSource.batch },
+            .supports_transaction_producers = true,
+            .vtable = &.{ .batch = NullWriteSource.batch, .commit_batch = comptime testSingleTableCommit(NullWriteSource.batch) },
         },
     };
     const table = metadata_table_manager.TableRecord{
@@ -6920,6 +7340,303 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
     // The provider mismatch is rejected before another durable authority
     // record or any provider mutation.
     try std.testing.expectEqual(@as(usize, 2), status_sink.durable_calls);
+}
+
+/// Adapter for test-only single-table batch spies. Reject multi-table effects
+/// before invoking any spy; actual fan-out fixtures supply commit_batch.
+fn testSingleTableCommit(comptime batch_callback: anytype) @FieldType(table_writes_api.TableWriteSource.VTable, "commit_batch") {
+    return struct {
+        fn commit(ptr: *anyopaque, a: Allocator, tables: []const transaction_contract.TableCommitRequest, sync_level: db_mod.types.SyncLevel) !?transaction_contract.CommitOutcome {
+            if (tables.len != 1) return error.UnsupportedReplicationRoute;
+            const table = tables[0];
+            try std.testing.expectEqual(.legacy_cdc, table.source_producer);
+            _ = (try batch_callback(ptr, a, table.table_name, .{
+                .source_producer = table.source_producer,
+                .writes = table.writes,
+                .deletes = table.deletes,
+                .transforms = table.transforms,
+                .sync_level = sync_level,
+            })) orelse return error.UnsupportedReplicationRoute;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    }.commit;
+}
+
+test "metadata replication stream compiles route leave enter and key changes as one destination transaction" {
+    const a = std.testing.allocator;
+    var before = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":\"old\",\"tier\":\"premium\",\"name\":\"large retained value\"}", .{});
+    defer before.deinit();
+    var after = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":\"new\",\"tier\":\"free\"}", .{});
+    defer after.deinit();
+    var change: foreign_mod.ReplicationChange = .{
+        .op = .update,
+        .checkpoint = @constCast("commit"),
+        .before = before.value,
+        .before_kind = .full,
+        .before_complete = true,
+        .row = after.value,
+        .row_complete = false,
+    };
+    var routes = [_]ParsedReplicationRouteConfig{
+        .{ .target_table = @constCast("premium"), .where_json = @constCast("{\"term\":\"premium\",\"field\":\"tier\"}"), .delete_document_on_delete = true },
+        .{ .target_table = @constCast("free"), .where_json = @constCast("{\"term\":\"free\",\"field\":\"tier\"}"), .delete_document_on_delete = true },
+    };
+    const config: ParsedReplicationSourceConfig = .{
+        .type_name = @constCast("postgres"),
+        .dsn = @constCast("postgres://db"),
+        .postgres_table = @constCast("users"),
+        .key_template = @constCast("id"),
+        .slot_name = @constCast("slot"),
+        .publication_name = @constCast("publication"),
+        .routes = &routes,
+    };
+    const Destination = struct {
+        calls: usize = 0,
+        fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.TestUnexpectedResult;
+        }
+        fn commit(ptr: *anyopaque, _: Allocator, tables: []const transaction_contract.TableCommitRequest, _: db_mod.types.SyncLevel) !?transaction_contract.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), tables.len);
+            for (tables) |table| try std.testing.expectEqual(.legacy_cdc, table.source_producer);
+            try std.testing.expectEqualStrings("premium", tables[0].table_name);
+            try std.testing.expectEqualStrings("old", tables[0].deletes[0]);
+            try std.testing.expectEqualStrings("free", tables[1].table_name);
+            try std.testing.expectEqualStrings("new", tables[1].transforms[0].key);
+            var retained = false;
+            for (tables[1].transforms[0].operations) |op| {
+                if (std.mem.eql(u8, op.path, "name")) {
+                    try std.testing.expectEqualStrings("\"large retained value\"", op.value_json.?);
+                    retained = true;
+                }
+            }
+            try std.testing.expect(retained);
+            return .{ .committed = .{ .participant_count = 2 } };
+        }
+    };
+    var destination: Destination = .{};
+    const writer: table_writes_api.TableWriteSource = .{ .ptr = &destination, .supports_transaction_producers = true, .vtable = &.{ .batch = Destination.batch, .commit_batch = Destination.commit } };
+    const summary = try applyReplicationTransaction(a, writer, "source", &.{change}, config, .write);
+    try std.testing.expectEqual(@as(usize, 1), summary.writes_applied);
+    try std.testing.expectEqual(@as(usize, 1), summary.deletes_applied);
+    try std.testing.expectEqual(@as(usize, 1), destination.calls);
+    const unsupported: table_writes_api.TableWriteSource = .{ .ptr = &destination, .vtable = &.{ .batch = Destination.batch } };
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, applyReplicationTransaction(a, unsupported, "source", &.{change}, config, .write));
+    change.before_complete = false;
+    try std.testing.expectError(error.ReplicationProjectionIncomplete, applyReplicationTransaction(a, writer, "source", &.{change}, config, .write));
+    try std.testing.expectEqual(@as(usize, 1), destination.calls);
+}
+
+test "metadata replication stream rejects a later invalid member without applying a transaction prefix" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/replication-transaction-atomic", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try db_mod.DB.open(a, path, .{});
+    defer db.close();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"count\":0}" },
+        .{ .key = "b", .value = "{\"count\":0}" },
+    } });
+    var source = table_writes_api.BoundTableWriteSource.init("docs", &db);
+    var config = try parseReplicationSourceConfig(a, "docs",
+        \\[{"type":"postgres","dsn":"postgres://db","postgres_table":"users","key_template":"id","on_update":[{"op":"$inc","path":"count","value":"{{amount}}"}]}]
+    , 0, null);
+    defer config.deinit(a);
+    var first = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":\"a\",\"amount\":1}", .{});
+    defer first.deinit();
+    var invalid = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":\"b\",\"amount\":\"invalid numeric operand\"}", .{});
+    defer invalid.deinit();
+    const changes = [_]foreign_mod.ReplicationChange{
+        .{ .op = .insert, .checkpoint = @constCast("commit"), .row = first.value },
+        .{ .op = .insert, .checkpoint = @constCast("commit"), .row = invalid.value },
+    };
+    try std.testing.expectError(error.InvalidArgument, applyReplicationTransaction(a, source.source(), "docs", &changes, config, .write));
+    var result = (try db.lookup(a, "a", .{})).?;
+    defer result.deinit(a);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result.json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("count").?.integer);
+}
+
+test "metadata replication stream resumes complete durable transactions while derived indexes are unavailable" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        const Self = @This();
+        calls: usize = 0,
+        failed: bool = false,
+        polls: usize = 0,
+        resumed: bool = false,
+        external_calls: usize = 0,
+        bootstrap_proven: bool = false,
+
+        fn observeBootstrap(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !bool {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("initial", request.checkpoint);
+            try std.testing.expectEqual(@as(u64, 9), request.cutover.cutover_authority_id);
+            return self.bootstrap_proven;
+        }
+
+        fn external(raw: *anyopaque, _: Allocator, request: ExternalStreamDestination.Request) !ExternalStreamDestination.Outcome {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            self.external_calls += 1;
+            try std.testing.expectEqual(@as(u64, 9), request.cutover.cutover_authority_id);
+            if (self.external_calls == 1) {
+                try std.testing.expectEqualStrings("initial", request.previous_checkpoint.?);
+                try std.testing.expectEqualStrings("first-commit", request.checkpoint);
+                try std.testing.expectEqual(@as(usize, 1), request.changes.len);
+                return .committed;
+            }
+            try std.testing.expectEqualStrings("first-commit", request.previous_checkpoint.?);
+            try std.testing.expectEqualStrings("second-commit", request.checkpoint);
+            try std.testing.expectEqual(@as(usize, 2), request.changes.len);
+            return if (self.external_calls == 2) .accepted else .committed;
+        }
+
+        fn batch(ptr: *anyopaque, _: Allocator, _: []const u8, request: db_mod.types.BatchRequest) !?void {
+            // Model a permanently unavailable derived index. The real stream
+            // runner must still commit rows and persist its provider frontier.
+            if (request.sync_level != .write) return error.EnrichmentWorkerFailed;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (!self.failed and self.calls == 2) {
+                self.failed = true;
+                return error.InjectedDestinationFailure;
+            }
+            return {};
+        }
+
+        const Provider = struct {
+            state: *Self,
+            fn destroy(ptr: *anyopaque, a: Allocator) void {
+                a.destroy(@as(*@This(), @ptrCast(@alignCast(ptr))));
+            }
+            fn query(_: *anyopaque, _: Allocator, _: foreign_mod.QueryParams) !foreign_mod.QueryResult {
+                return .{ .rows = &.{}, .total = 0 };
+            }
+            fn statistics(_: *anyopaque, _: []const u8) !foreign_mod.TableStatistics {
+                return .{};
+            }
+            fn poll(ptr: *anyopaque, a: Allocator, params: foreign_mod.ReplicationPollParams) !foreign_mod.ReplicationPollResult {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.state.polls += 1;
+                const resumed = params.checkpoint != null and std.mem.eql(u8, params.checkpoint.?, "first-commit");
+                self.state.resumed = resumed;
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const changes = try a.alloc(foreign_mod.ReplicationChange, if (resumed) 2 else 3);
+                var initialized: usize = 0;
+                errdefer {
+                    for (changes[0..initialized]) |*change| change.deinit(a);
+                    a.free(changes);
+                }
+                for (changes, 0..) |*change, i| {
+                    const id = i + @as(usize, if (resumed) 1 else 0);
+                    const body = try std.fmt.allocPrint(arena.allocator(), "{{\"id\":\"row-{d}\"}}", .{id});
+                    change.* = .{
+                        .op = .insert,
+                        .checkpoint = try a.dupe(u8, if (id == 0) "first-commit" else "second-commit"),
+                    };
+                    initialized += 1;
+                    change.row = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+                }
+                return .{ .changes = changes };
+            }
+        };
+        fn factory(ptr: *anyopaque, a: Allocator, config: foreign_mod.Config) !foreign_mod.Source {
+            var owned = config;
+            defer owned.deinit(a);
+            const provider = try a.create(Provider);
+            provider.* = .{ .state = @ptrCast(@alignCast(ptr)) };
+            return .{ .ptr = provider, .vtable = &.{ .deinit = Provider.destroy, .query = Provider.query, .statistics = Provider.statistics, .poll_changes = Provider.poll } };
+        }
+    };
+    const Sink = struct {
+        alloc: Allocator,
+        records: std.ArrayListUnmanaged(metadata_table_manager.ReplicationSourceStatusRecord) = .empty,
+        fn upsertReplicationSourceStatus(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+            const owned = try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record);
+            errdefer metadata_table_manager.freeReplicationSourceStatus(self.alloc, owned);
+            try self.records.append(self.alloc, owned);
+        }
+        pub fn replicationSourceAuthorityCurrent(_: *@This(), _: []const u8, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+            try std.testing.expectEqual(@as(u64, 9), record.cutover_authority_id);
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.records.items) |record| metadata_table_manager.freeReplicationSourceStatus(self.alloc, record);
+            self.records.deinit(self.alloc);
+        }
+    };
+    var state: State = .{};
+    var registry: foreign_mod.Registry = .{};
+    defer registry.deinit(alloc);
+    try registry.registerWithContext(alloc, .postgres, &state, State.factory, null);
+    var sink: Sink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var runner: StreamingReplicationRunner = .{
+        .alloc = alloc,
+        .registry = &registry,
+        .write_source = .{ .ptr = &state, .supports_transaction_producers = true, .vtable = &.{ .batch = State.batch, .commit_batch = comptime testSingleTableCommit(State.batch) } },
+    };
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 11,
+        .name = "docs",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\"}]",
+    };
+    try std.testing.expectError(error.InjectedDestinationFailure, runner.runTableSourceFromCheckpoint(&sink, table, 0, 0, "", "initial", null));
+    const failed = sink.records.items[sink.records.items.len - 1];
+    try std.testing.expectEqualStrings("streaming_failed", failed.phase);
+    try std.testing.expectEqualStrings("first-commit", failed.checkpoint);
+    for (sink.records.items) |record| try std.testing.expect(!std.mem.eql(u8, record.checkpoint, "second-commit"));
+    const resumed = try runner.runTableSourceFromCheckpoint(&sink, table, 0, 0, "", failed.checkpoint, null);
+    try std.testing.expect(state.resumed);
+    try std.testing.expectEqual(@as(usize, 2), resumed.changes_applied);
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
+    try std.testing.expectEqualStrings("second-commit", sink.records.items[sink.records.items.len - 1].checkpoint);
+    var external_table = table;
+    external_table.schema_json =
+        \\{"base_source":{"kind":"external","table_id":"lake","uri":"file:///lake","format":"iceberg","write_policy":"iceberg_writer","catalog":{"type":"managed"},"row_identity":{"key_columns":["id"]}}}
+    ;
+    runner.external_destination = .{ .ptr = &state, .apply = State.external };
+    var status = failed;
+    status.cutover_authority_id = 9;
+    try std.testing.expectError(error.SourceOutcomeUnresolved, runner.runTableSourceFromCheckpoint(&sink, external_table, 0, 0, "", "initial", status));
+    const pending = sink.records.items[sink.records.items.len - 1];
+    try std.testing.expectEqualStrings("first-commit", pending.checkpoint);
+    _ = try runner.runTableSourceFromCheckpoint(&sink, external_table, 0, 0, "", pending.checkpoint, pending);
+    try std.testing.expectEqualStrings("second-commit", sink.records.items[sink.records.items.len - 1].checkpoint);
+    try std.testing.expectEqual(@as(usize, 3), state.external_calls);
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
+    var bootstrap_runner: SnapshotBackfillRunner = .{
+        .alloc = alloc,
+        .registry = &registry,
+        .write_source = runner.write_source,
+        .external_destination = .{ .ptr = &state, .apply = State.external, .bootstrap_committed = State.observeBootstrap },
+    };
+    var config = try parseReplicationSourceConfig(alloc, external_table.name, external_table.replication_sources_json, 0, null);
+    defer config.deinit(alloc);
+    var slot: [postgres_identifier_max_len]u8 = undefined;
+    var publication: [postgres_identifier_max_len]u8 = undefined;
+    status.cutover_intent_id = 8;
+    status.cutover_mode = cutover_mode_exported_snapshot;
+    status.phase = iceberg_snapshot_publish_pending;
+    status.external_table = config.postgres_table;
+    status.slot_name = exactCutoverPhysicalResourceName(&slot, config.slot_name, 8, 9);
+    status.publication_name = exactCutoverPhysicalResourceName(&publication, config.publication_name, 8, 9);
+    status.prepared_checkpoint = "initial";
+    status.stream_checkpoint = "";
+    status.cutover_config_fingerprint = exactCutoverConfigFingerprint(table.table_id, 0, config);
+    status.cutover_provider_identity = @splat(7);
+    try std.testing.expectError(error.SourceOutcomeUnresolved, bootstrap_runner.runTableSourceFromStatus(&sink, external_table, 0, 0, status));
+    state.bootstrap_proven = true;
+    const recovered = try bootstrap_runner.runTableSourceFromStatus(&sink, external_table, 0, 0, status);
+    try std.testing.expect(recovered.snapshot_complete);
+    const durable = sink.records.items[sink.records.items.len - 1];
+    try std.testing.expectEqualStrings("cutover_prepared", durable.phase);
+    try std.testing.expectEqualStrings("initial", durable.prepared_checkpoint);
 }
 
 test "metadata replication stream applies insert update and delete through bound write source" {
@@ -7246,16 +7963,23 @@ test "metadata replication stream routes matching rows to target tables" {
             };
             changes[1] = .{
                 .op = .update,
+                .before_kind = .full,
+                .before_complete = true,
+                .before = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"r-2\",\"name\":\"Bob\",\"tier\":\"free\"}", .{}),
                 .checkpoint = try inner_alloc.dupe(u8, "lsn:21"),
                 .row = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"r-2\",\"name\":\"Bob\",\"tier\":\"free\"}", .{}),
             };
             changes[2] = .{
                 .op = .update,
+                .before_kind = .full,
+                .before_complete = true,
+                .before = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"r-3\",\"name\":\"Eve\",\"tier\":\"enterprise\"}", .{}),
                 .checkpoint = try inner_alloc.dupe(u8, "lsn:22"),
                 .row = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"r-3\",\"name\":\"Eve\",\"tier\":\"enterprise\"}", .{}),
             };
             changes[3] = .{
                 .op = .delete,
+                .before_complete = true,
                 .checkpoint = try inner_alloc.dupe(u8, "lsn:23"),
                 .row = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"r-1\",\"name\":\"Alice\",\"tier\":\"premium\"}", .{}),
             };
@@ -7307,8 +8031,10 @@ test "metadata replication stream routes matching rows to target tables" {
         fn source(self: *@This()) table_writes_api.TableWriteSource {
             return .{
                 .ptr = self,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
+                    .commit_batch = comptime testSingleTableCommit(batch),
                 },
             };
         }
@@ -7545,6 +8271,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
 
     const StreamCtx = struct {
         poll_calls: usize = 0,
+        next_checkpoint: []const u8 = "lsn:5",
         checkpoints: std.ArrayListUnmanaged([]u8) = .empty,
 
         pub fn deinit(self: *@This(), inner_alloc: Allocator) void {
@@ -7579,7 +8306,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
                 const changes = try inner_alloc.alloc(foreign_mod.ReplicationChange, 1);
                 changes[0] = .{
                     .op = .insert,
-                    .checkpoint = try inner_alloc.dupe(u8, "lsn:5"),
+                    .checkpoint = try inner_alloc.dupe(u8, self.ctx.next_checkpoint),
                     .row = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"doc:1\",\"name\":\"alpha\"}", .{}),
                 };
                 return .{ .changes = changes, .lag_records = 0 };
@@ -7615,8 +8342,10 @@ test "metadata replication stream coordinator waits for snapshot completion and 
 
     const NullSource = struct {
         var sentinel: u8 = 0;
+        var commits: usize = 0;
 
         fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            commits += 1;
             return {};
         }
     };
@@ -7625,6 +8354,16 @@ test "metadata replication stream coordinator waits for snapshot completion and 
         alloc: Allocator,
         table: metadata_table_manager.TableRecord,
         statuses: std.ArrayListUnmanaged(metadata_table_manager.ReplicationSourceStatusRecord) = .empty,
+        legacy_allowed: bool = true,
+        close_at: ReplicationLifecyclePhase = .stream_polled,
+        upserts: usize = 0,
+        pub fn legacyReplicationSourceIntakeAllowed(self: *@This(), _: u64, _: u32, _: [32]u8) !bool {
+            return self.legacy_allowed;
+        }
+        fn handover(ptr: *anyopaque, event: ReplicationLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (event.phase == self.close_at) self.legacy_allowed = false;
+        }
 
         pub fn deinit(self: *@This()) void {
             for (self.statuses.items) |record| metadata_table_manager.freeReplicationSourceStatus(self.alloc, record);
@@ -7707,6 +8446,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
         }
 
         pub fn upsertReplicationSourceStatus(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+            self.upserts += 1;
             for (self.statuses.items) |*existing| {
                 if (existing.table_id == record.table_id and existing.source_ordinal == record.source_ordinal) {
                     metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing.*);
@@ -7718,6 +8458,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
         }
     };
 
+    NullSource.commits = 0;
     var service: FakeService = .{
         .alloc = alloc,
         .table = .{
@@ -7751,8 +8492,10 @@ test "metadata replication stream coordinator waits for snapshot completion and 
             .registry = &registry,
             .write_source = .{
                 .ptr = &NullSource.sentinel,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = NullSource.batch,
+                    .commit_batch = comptime testSingleTableCommit(NullSource.batch),
                 },
             },
         },
@@ -7780,6 +8523,29 @@ test "metadata replication stream coordinator waits for snapshot completion and 
     try std.testing.expectEqualStrings("lsn:5", stream_ctx.checkpoints.items[1]);
     try std.testing.expectEqualStrings("lsn:prepared", service.statuses.items[0].prepared_checkpoint);
     try std.testing.expectEqualStrings("lsn:5", service.statuses.items[0].stream_checkpoint);
+    coordinator.runner.lifecycle_hook = .{ .ptr = &service, .reach_fn = FakeService.handover };
+    stream_ctx.next_checkpoint = "lsn:6";
+    for ([_]ReplicationLifecyclePhase{ .stream_polled, .stream_change_applied }) |phase| {
+        service.legacy_allowed = true;
+        service.close_at = phase;
+        stream_ctx.poll_calls = 0;
+        const commits_before = NullSource.commits;
+        const upserts_before = service.upserts;
+        try std.testing.expectError(error.SourcePendingWork, coordinator.runner.runTableSourceFromCheckpoint(&service, service.table, 0, 2, "exported_snapshot", "lsn:5", service.statuses.items[0]));
+        try std.testing.expect(!service.legacy_allowed);
+        if (phase == .stream_polled) try std.testing.expectEqual(commits_before, NullSource.commits) else try std.testing.expect(NullSource.commits > commits_before);
+        try std.testing.expectEqual(upserts_before, service.upserts);
+        try std.testing.expectEqualStrings("streaming", service.statuses.items[0].phase);
+        try std.testing.expectEqualStrings("lsn:5", service.statuses.items[0].stream_checkpoint);
+    }
+    service.legacy_allowed = true;
+    service.close_at = .stream_polled;
+    stream_ctx.poll_calls = 1; // The provider's next poll returns no changes.
+    const idle_upserts_before = service.upserts;
+    const idle_commits_before = NullSource.commits;
+    try std.testing.expectError(error.SourcePendingWork, coordinator.runner.runTableSourceFromCheckpoint(&service, service.table, 0, 2, "exported_snapshot", "lsn:5", service.statuses.items[0]));
+    try std.testing.expectEqual(idle_upserts_before, service.upserts);
+    try std.testing.expectEqual(idle_commits_before, NullSource.commits);
 }
 
 test "metadata replication stream coordinator recovers after transient polling failure" {
@@ -7992,8 +8758,10 @@ test "metadata replication stream coordinator recovers after transient polling f
             .registry = &registry,
             .write_source = .{
                 .ptr = &NullSource.sentinel,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = NullSource.batch,
+                    .commit_batch = comptime testSingleTableCommit(NullSource.batch),
                 },
             },
         },
@@ -8250,8 +9018,10 @@ test "metadata replication stream production round entry point rotates across th
         .registry = &registry,
         .write_source = .{
             .ptr = &NullSource.sentinel,
+            .supports_transaction_producers = true,
             .vtable = &.{
                 .batch = NullSource.batch,
+                .commit_batch = comptime testSingleTableCommit(NullSource.batch),
             },
         },
     };
@@ -8486,8 +9256,10 @@ test "metadata replication stream coordinator marks missing slot as terminal fai
             .registry = &registry,
             .write_source = .{
                 .ptr = &NullSource.sentinel,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = NullSource.batch,
+                    .commit_batch = comptime testSingleTableCommit(NullSource.batch),
                 },
             },
         },
@@ -9109,4 +9881,39 @@ fn execPsqlScalarAlloc(alloc: Allocator, dsn: []const u8, sql_text: []const u8) 
         },
     }
     return result.stdout;
+}
+
+test "metadata replication stream snapshot rows require complete atomic destination admission" {
+    const Fake = struct {
+        calls: usize = 0,
+        pending: @FieldType(transaction_contract.CommitOutcome, "committed") = .{ .participant_count = 2 },
+        fn raw(_: *anyopaque, _: Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnexpectedRawSnapshotFallback;
+        }
+        fn commit(ptr: *anyopaque, _: Allocator, tables: []const transaction_contract.TableCommitRequest, sync_level: db_mod.types.SyncLevel) !?transaction_contract.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(.write, sync_level);
+            try std.testing.expectEqual(@as(usize, 1), tables.len);
+            try std.testing.expectEqualStrings("docs", tables[0].table_name);
+            try std.testing.expectEqual(.legacy_cdc, tables[0].source_producer);
+            try std.testing.expectEqual(@as(usize, 2), tables[0].writes.len);
+            try std.testing.expectEqualStrings("one", tables[0].writes[0].key);
+            try std.testing.expectEqualStrings("{\"v\":2}", tables[0].writes[1].value);
+            return .{ .committed = self.pending };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake: Fake = .{};
+    const source: table_writes_api.TableWriteSource = .{ .ptr = &fake, .supports_transaction_producers = true, .vtable = &.{ .batch = Fake.raw, .commit_batch = Fake.commit } };
+    const writes = [_]db_mod.types.BatchWrite{ .{ .key = "one", .value = "{\"v\":1}" }, .{ .key = "two", .value = "{\"v\":2}" } };
+    try applyReplicationSnapshotRowsRequired(a, source, "docs", &writes, .write);
+    inline for (.{ "propagation_pending", "visibility_pending", "visibility_retry_pending", "visibility_repair_required" }) |field| {
+        fake.pending = .{ .participant_count = 2 };
+        @field(fake.pending, field) = true;
+        try std.testing.expectError(error.SourceOutcomeUnresolved, applyReplicationSnapshotRowsRequired(a, source, "docs", &writes, .write));
+    }
+    const unsupported: table_writes_api.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.raw } };
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, applyReplicationSnapshotRowsRequired(a, unsupported, "docs", &writes, .write));
+    try std.testing.expectEqual(@as(usize, 5), fake.calls);
 }

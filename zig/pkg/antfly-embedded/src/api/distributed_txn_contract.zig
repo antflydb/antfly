@@ -41,6 +41,7 @@ pub const status_server_response_reserve_ms: u32 = 50;
 /// Process-local execution context established by the receiving node. This is
 /// never serialized directly across the wire.
 pub const PreDecisionContext = struct {
+    source_producer: @FieldType(db_types.BatchRequest, "source_producer") = .unlabelled,
     route_fence: ?@import("../metadata/catalog_route_contract.zig").CatalogRouteFence = null,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
@@ -58,6 +59,9 @@ pub const TxnStatusRequest = struct {
 };
 
 pub const TableCommitRequest = struct {
+    /// Explicit trusted transaction origin. Older callers remain unlabelled.
+    source_producer: @FieldType(db_types.BatchRequest, "source_producer") = .unlabelled,
+    source_admission: ?@import("../storage/source_admission.zig").Command = null,
     bound_catalog_incarnation: ?[16]u8 = null,
     commit_requires: ?db_types.CommitRequires = null,
     /// Coordinator planning context, retained until cascade expansion finishes.
@@ -87,9 +91,19 @@ pub const TableCommitRequest = struct {
     relational_retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Command = null,
     relational_index_maintenance: ?@import("../storage/db/relational_index_maintenance_contract.zig").Command = null,
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null;
+        return (std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null) or
+            (std.mem.eql(u8, field, "source_producer") and self.source_producer == .unlabelled);
     }
 };
+
+/// One transaction has one origin, including read-only and empty participants.
+/// Mixed/unknown authority cannot be filled in by routing or table identity.
+pub fn transactionProducer(tables: []const TableCommitRequest) !@FieldType(db_types.BatchRequest, "source_producer") {
+    const producer = if (tables.len == 0) .unlabelled else tables[0].source_producer;
+    if (producer == .scoped_source) return error.InvalidSourceAdmission;
+    for (tables) |table| if (table.source_producer != producer) return error.SourceTransactionIdentityConflict;
+    return producer;
+}
 
 pub const CommitConflict = struct {
     table_name: []const u8,

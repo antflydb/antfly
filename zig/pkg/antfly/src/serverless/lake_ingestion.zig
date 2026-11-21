@@ -69,12 +69,29 @@ pub fn destinationFiles(a: A, files: local.serverless_object_store_support.Opene
 pub fn coverage(a: A, table: catalog.types.Table) !u64 {
     var p = try std.json.parseFromSlice(V, a, table.metadata_json, .{});
     defer p.deinit();
-    const properties = try catalog.metadata.get(p.value, "properties");
-    const value = properties.object.get("antfly.wal.coverage") orelse return 0;
+    return propertyCoverage(try catalogProperties(p.value));
+}
+fn catalogProperties(metadata: V) !std.json.ObjectMap {
+    const properties = try catalog.metadata.get(metadata, "properties");
+    if (properties != .object) return error.InvalidLakeMetadata;
+    return properties.object;
+}
+fn propertyCoverage(properties: std.json.ObjectMap) !u64 {
+    const value = properties.get("antfly.wal.coverage") orelse return 0;
     return std.fmt.parseInt(u64, try catalog.metadata.str(value), 10);
 }
+fn requireSourceProperties(a: A, properties: std.json.ObjectMap, batch: Batch) !void {
+    const source = properties.get("antfly.cdc.source") orelse return error.LakeSourceConflict;
+    const epoch = properties.get("antfly.cdc.epoch") orelse return error.LakeSourceConflict;
+    const keys = properties.get("antfly.cdc.key-fields") orelse return error.LakeSourceConflict;
+    const key_definition = try std.json.Stringify.valueAlloc(a, batch.key_fields, .{});
+    defer a.free(key_definition);
+    if (!std.mem.eql(u8, try catalog.metadata.str(source), batch.source) or
+        !std.mem.eql(u8, try catalog.metadata.str(epoch), batch.epoch) or
+        !std.mem.eql(u8, try catalog.metadata.str(keys), key_definition)) return error.LakeSourceConflict;
+}
 fn matchesPrevious(previous: Batch, batch: Batch) bool {
-    return std.mem.eql(u8, previous.source, batch.source) and std.mem.eql(u8, previous.epoch, batch.epoch) and batch.expected_checkpoint != null and std.mem.eql(u8, previous.checkpoint, batch.expected_checkpoint.?);
+    return batch.follows(previous);
 }
 /// The caller must supply a stable complete transaction and opaque source
 /// checkpoint. A stale/out-of-order predecessor is rejected before admission.
@@ -85,7 +102,464 @@ pub fn accept(a: A, binding: Binding, unresolved_options: Options, context: Cont
     if (body.len == 0 or body.len > catalog.types.max_commit_bytes) return error.LakeWriteTooLarge;
     var parsed = try std.json.parseFromSlice(Batch, a, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    const batch = parsed.value;
+    if (parsed.value.bootstrap) return error.InvalidSourceTransaction;
+    return acceptResolvedBatch(a, binding, options, context, parsed.value);
+}
+
+/// Internal capture callers can admit a typed transaction through the same
+/// durable owner, checkpoint, and idempotency checks as /lake/changes.
+pub fn acceptBatch(a: A, binding: Binding, unresolved_options: Options, context: Context, batch: Batch) !u64 {
+    return acceptResolvedBatch(a, binding, try unresolved_options.resolveOwner(a, context), context, batch);
+}
+
+/// Lower one complete pgoutput transaction to the writable Iceberg row
+/// contract. The caller supplies a fenced source epoch and the Iceberg
+/// equality key. The source checkpoint selects the retry identity. The batch
+/// borrows row images and owns its derived fields in the caller’s arena.
+pub fn postgresBatch(a: A, source: []const u8, epoch: []const u8, previous: ?[]const u8, checkpoint: []const u8, keys: []const []const u8, transaction: []const @import("../foreign/source.zig").ReplicationChange) !Batch {
+    const batch_id = try a.dupe(u8, &catalog.types.digestHex(checkpoint));
+    var changes: std.ArrayList(Batch.Change) = .empty;
+    for (transaction) |change| {
+        if (!std.mem.eql(u8, checkpoint, change.checkpoint)) return error.InvalidReplicationCheckpoint;
+        const row = change.row orelse return error.InvalidReplicationSourceRow;
+        switch (change.op) {
+            .delete => try changes.append(a, .{ .op = .delete, .row = try keyImage(a, keys, row) }),
+            .insert, .update => {
+                if (!change.row_complete) return error.ReplicationProjectionIncomplete;
+                if (change.op == .update) {
+                    // A missing before image cannot prove that a separately
+                    // configured Iceberg equality key stayed the same.
+                    const before = change.before orelse return error.ReplicationProjectionIncomplete;
+                    try changes.append(a, .{ .op = .delete, .row = try keyImage(a, keys, before) });
+                }
+                try changes.append(a, .{ .op = .upsert, .row = row });
+            },
+        }
+        if (changes.items.len > max_group_changes) return error.LakeWriteTooLarge;
+    }
+    const batch: Batch = .{ .batch_id = batch_id, .source = source, .epoch = epoch, .checkpoint = checkpoint, .expected_checkpoint = previous, .key_fields = keys, .changes = changes.items };
+    try batch.validate(max_group_changes);
+    return batch;
+}
+
+fn keyImage(a: A, keys: []const []const u8, row: V) !V {
+    if (row != .object) return error.InvalidReplicationSourceRow;
+    var key: std.json.ObjectMap = .empty;
+    for (keys) |name| {
+        const value = row.object.get(name) orelse return error.ReplicationProjectionIncomplete;
+        if (value == .null) return error.ReplicationProjectionIncomplete;
+        try key.put(a, name, value);
+    }
+    return .{ .object = key };
+}
+
+/// The serving owner supplies qualified transport and rechecks the live
+/// table incarnation and PostgreSQL cutover throughout catalog work.
+pub const StreamOwner = struct {
+    const Port = @import("../metadata/replication_backfill.zig").ExternalStreamDestination;
+
+    ptr: *anyopaque,
+    resolve: *const fn (*anyopaque, A, Port.Request) anyerror!Options,
+    check: *const fn (*anyopaque, Port.Request) anyerror!void,
+
+    pub fn port(self: *StreamOwner) Port {
+        return .{ .ptr = self, .apply = apply, .bootstrap_committed = bootstrapCommitted, .stage_bootstrap = stageBootstrap, .stage_snapshot_page = stageSnapshotPage };
+    }
+
+    const Guard = struct {
+        owner: *StreamOwner,
+        request: Port.Request,
+
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *Guard = @ptrCast(@alignCast(raw));
+            try self.owner.check(self.owner.ptr, self.request);
+        }
+    };
+
+    fn apply(raw: *anyopaque, backing: A, request: Port.Request) !Port.Outcome {
+        const self: *StreamOwner = @ptrCast(@alignCast(raw));
+        return self.execute(backing, request, .apply, null);
+    }
+
+    fn bootstrapCommitted(raw: *anyopaque, backing: A, request: Port.Request) !bool {
+        const self: *StreamOwner = @ptrCast(@alignCast(raw));
+        return (try self.execute(backing, request, .observe_bootstrap, null)) == .committed;
+    }
+
+    fn stageBootstrap(raw: *anyopaque, backing: A, request: Port.Request) !void {
+        const self: *StreamOwner = @ptrCast(@alignCast(raw));
+        _ = try self.execute(backing, request, .stage_bootstrap, null);
+    }
+
+    fn stageSnapshotPage(raw: *anyopaque, backing: A, request: Port.Request) ![32]u8 {
+        const self: *StreamOwner = @ptrCast(@alignCast(raw));
+        var digest: [32]u8 = undefined;
+        _ = try self.execute(backing, request, .stage_page, &digest);
+        return digest;
+    }
+
+    fn execute(self: *StreamOwner, backing: A, request: Port.Request, mode: enum { apply, observe_bootstrap, stage_bootstrap, stage_page }, page_digest: ?*[32]u8) !Port.Outcome {
+        if (request.table.table_id == 0 or request.table.table_id != request.cutover.table_id or request.cutover.cutover_authority_id == 0) return error.UnsupportedReplicationRoute;
+        var arena = std.heap.ArenaAllocator.init(backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var guard: Guard = .{ .owner = self, .request = request };
+        const context: Context = .{ .deadline_ns = request.deadline_ns, .checkpoint = .{ .ptr = &guard, .check = Guard.checkpoint } };
+        try context.ensureActive();
+        var bound = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, request.table.schema_json)) orelse return error.UnsupportedReplicationRoute;
+        defer bound.deinit(a);
+        try bound.binding.validateSupported();
+        if (bound.binding.format != .iceberg or bound.binding.write_policy != .iceberg_writer) return error.UnsupportedReplicationRoute;
+        const identity = bound.binding.row_identity orelse return error.UnsupportedReplicationRoute;
+        const options = try self.resolve(self.ptr, a, request);
+        if (options.catalog_table_id != request.table.table_id or options.catalog_generation != request.table.object_storage_generation) return error.CatalogGenerationChanged;
+        const source = try std.fmt.allocPrint(a, "postgres:{d}:{d}", .{ request.table.table_id, request.cutover.source_ordinal });
+        const epoch = try std.fmt.allocPrint(a, "{d}", .{request.cutover.cutover_authority_id});
+        if (mode == .observe_bootstrap) {
+            if (request.checkpoint.len == 0 or !std.mem.eql(u8, request.checkpoint, request.cutover.prepared_checkpoint)) return error.InvalidReplicationCheckpoint;
+            var current = try configured.executeLakeCatalogAlloc(a, bound.binding, options, context, .load);
+            defer current.deinit(a);
+            const properties = try catalogProperties(try catalog.metadata.parse(a, current.table.metadata_json));
+            const covered = try propertyCoverage(properties);
+            const marker = properties.get("antfly.cdc.bootstrap-cut") orelse {
+                if (covered != 0) return .accepted;
+                const outcome = try recoverPendingBootstrap(a, bound.binding, options, context, source, epoch, request.checkpoint, identity.key_columns);
+                return if (outcome) .committed else .accepted;
+            };
+            if (!std.mem.eql(u8, try catalog.metadata.str(marker), request.checkpoint) or covered == 0) return .accepted;
+            try requireSourceProperties(a, properties, .{
+                .batch_id = "",
+                .source = source,
+                .epoch = epoch,
+                .checkpoint = request.checkpoint,
+                .key_fields = identity.key_columns,
+                .changes = &.{},
+            });
+            const bootstrap = try bootstrapIdentity(a, source, epoch, request.checkpoint, identity.key_columns);
+            retireBootstrapStage(a, bound.binding, options, context, bootstrap);
+            try context.ensureActive();
+            return .committed;
+        }
+        if (mode == .stage_page or request.snapshot_chunks != null) {
+            if (request.previous_checkpoint != null or request.changes.len != 0 or request.checkpoint.len == 0 or
+                !std.mem.eql(u8, request.checkpoint, request.cutover.prepared_checkpoint)) return error.InvalidReplicationCheckpoint;
+            const snapshot = try bootstrapIdentity(a, source, epoch, request.checkpoint, identity.key_columns);
+            if (mode == .stage_page) {
+                if (request.snapshot_chunks != null) return error.InvalidReplicationCheckpoint;
+                const rows = request.snapshot_rows orelse return error.InvalidReplicationCheckpoint;
+                page_digest.?.* = try writeBootstrapPage(a, bound.binding, options, context, snapshot, rows);
+            } else {
+                if (mode != .stage_bootstrap or request.snapshot_rows != null) return error.InvalidReplicationCheckpoint;
+                try sealBootstrapPages(a, bound.binding, options, context, snapshot, request.snapshot_chunks.?, request.cutover.snapshot_offset);
+            }
+            return .accepted;
+        }
+        if (mode == .stage_bootstrap and request.snapshot_rows == null) return error.InvalidReplicationCheckpoint;
+        const batch = if (request.snapshot_rows) |rows| blk: {
+            if (request.previous_checkpoint != null or request.changes.len != 0 or
+                !std.mem.eql(u8, request.checkpoint, request.cutover.prepared_checkpoint)) return error.InvalidReplicationCheckpoint;
+            if (rows.len > catalog.row_commit.max_bootstrap_rows) return error.LakeWriteTooLarge;
+            const changes = try a.alloc(Batch.Change, rows.len);
+            for (rows, changes) |row, *change| change.* = .{ .op = .upsert, .row = row };
+            var snapshot = try bootstrapIdentity(a, source, epoch, request.checkpoint, identity.key_columns);
+            snapshot.changes = changes;
+            try snapshot.validate(catalog.row_commit.max_bootstrap_rows);
+            break :blk snapshot;
+        } else blk: {
+            const previous = request.previous_checkpoint orelse return error.InvalidReplicationCheckpoint;
+            break :blk try postgresBatch(a, source, epoch, previous, request.checkpoint, identity.key_columns, request.changes);
+        };
+        if (mode == .stage_bootstrap) {
+            try writeBootstrapStage(a, bound.binding, options, context, batch);
+            return .accepted;
+        }
+        const outcome = try applyBatch(a, bound.binding, options, context, batch);
+        if (outcome.committed and batch.bootstrap) retireBootstrapStage(a, bound.binding, options, context, batch);
+        return if (outcome.committed) .committed else .accepted;
+    }
+};
+
+fn bootstrapIdentity(a: A, source: []const u8, epoch: []const u8, checkpoint: []const u8, keys: []const []const u8) !Batch {
+    return .{
+        .batch_id = try std.fmt.allocPrint(a, "antfly-bootstrap-{s}", .{&catalog.types.digestHex(checkpoint)}),
+        .source = source,
+        .epoch = epoch,
+        .checkpoint = checkpoint,
+        .key_fields = keys,
+        .changes = &.{},
+        .bootstrap = true,
+    };
+}
+
+// The committed cut and WAL receipt are sufficient for recovery once the
+// stage is retired. Cleanup failure must not change the committed outcome.
+fn retireBootstrapStage(a: A, binding: Binding, options: Options, context: Context, batch: Batch) void {
+    removeBootstrapStage(a, binding, options, context, batch) catch |err|
+        std.log.warn("Iceberg bootstrap stage retirement deferred table_id={d} err={s}", .{ options.catalog_table_id, @errorName(err) });
+}
+
+fn removeBootstrapStage(a: A, binding: Binding, options: Options, context: Context, batch: Batch) !void {
+    try context.ensureActive();
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    const stage = try bootstrapStageKey(a, base, batch);
+    const manifest = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
+    var client = opened.client;
+    const cancellation = catalog.types.contextCancellation(&context);
+    var root = client.getObject(opened.bucket, manifest, .{ .max_response_bytes = max_bootstrap_manifest_bytes, .cancellation = cancellation }) catch |err| switch (err) {
+        error.NotFound, error.ObjectNotFound, error.FileNotFound => {
+            try removeBootstrapObject(&opened, context, stage);
+            return;
+        },
+        else => return err,
+    };
+    defer root.deinit(client.allocator);
+    const pages = try std.json.parseFromSliceLeaky([]const [32]u8, a, root.body, .{});
+    if (pages.len > max_bootstrap_pages) return error.LakeWriteTooLarge;
+    for (pages) |digest| {
+        const page = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
+        try removeBootstrapObject(&opened, context, page);
+    }
+    try removeBootstrapObject(&opened, context, manifest);
+}
+
+fn removeBootstrapObject(opened: *local.serverless_object_store_support.OpenedObjectStore, context: Context, key: []const u8) !void {
+    var client = opened.client;
+    const cancellation = catalog.types.contextCancellation(&context);
+    var current = client.statObjectWithOptions(opened.bucket, key, .{ .cancellation = cancellation }) catch |err| switch (err) {
+        error.NotFound, error.ObjectNotFound, error.FileNotFound => return,
+        else => return err,
+    };
+    defer current.deinit(client.allocator);
+    try context.ensureActive();
+    client.compareAndDelete(opened.bucket, key, current.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = cancellation }) catch |err| switch (err) {
+        error.NotFound, error.ObjectNotFound, error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn bootstrapStageKey(a: A, base: []const u8, batch: Batch) ![]u8 {
+    // WAL initialization owns its prefix and rejects pre-existing objects.
+    return std.fmt.allocPrint(a, "{s}-bootstrap/{s}.json", .{ base, &std.fmt.bytesToHex(try batch.identity(a), .lower) });
+}
+
+const max_bootstrap_pages = 1024;
+// Each digest is a JSON array of 32 decimal bytes, with commas and brackets.
+const max_bootstrap_manifest_bytes = 2 + max_bootstrap_pages * (32 * 4 + 2);
+
+fn writeBootstrapPage(a: A, binding: Binding, options: Options, context: Context, batch: Batch, rows: []const V) ![32]u8 {
+    if (rows.len == 0 or rows.len > max_group_changes) return error.LakeWriteTooLarge;
+    const bytes = try std.json.Stringify.valueAlloc(a, rows, .{});
+    if (bytes.len > catalog.types.max_commit_bytes) return error.LakeWriteTooLarge;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    const stage = try bootstrapStageKey(a, base, batch);
+    const page = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
+    try writeImmutableBootstrap(&opened, context, page, bytes);
+    return digest;
+}
+
+fn sealBootstrapPages(a: A, binding: Binding, options: Options, context: Context, batch: Batch, pages: []const [32]u8, expected_rows: u64) !void {
+    if (pages.len > max_bootstrap_pages) return error.LakeWriteTooLarge;
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    const stage = try bootstrapStageKey(a, base, batch);
+    const manifest = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
+    var client = opened.client;
+    var total_bytes: usize = 0;
+    var total_rows: usize = 0;
+    for (pages) |digest| {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var page = try readBootstrapPage(scratch.allocator(), &client, opened.bucket, context, stage, digest, catalog.types.max_commit_bytes - total_bytes);
+        defer page.deinit(client.allocator);
+        if (page.body.len > catalog.types.max_commit_bytes - total_bytes) return error.LakeWriteTooLarge;
+        total_bytes += page.body.len;
+        const rows = try std.json.parseFromSliceLeaky([]const V, scratch.allocator(), page.body, .{});
+        if (rows.len == 0 or rows.len > max_group_changes or rows.len > catalog.row_commit.max_bootstrap_rows - total_rows)
+            return error.InvalidReplicationCheckpoint;
+        total_rows += rows.len;
+    }
+    if (total_rows != expected_rows) return error.InvalidReplicationCheckpoint;
+    const bytes = try std.json.Stringify.valueAlloc(a, pages, .{});
+    try writeImmutableBootstrap(&opened, context, manifest, bytes);
+}
+
+fn readBootstrapPage(a: A, client: *@import("objectstore").Client, bucket: []const u8, context: Context, stage: []const u8, digest: [32]u8, remaining_bytes: usize) !@import("objectstore").GetResult {
+    try context.ensureActive();
+    if (remaining_bytes == 0) return error.LakeWriteTooLarge;
+    const key = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
+    defer a.free(key);
+    var page = client.getObject(bucket, key, .{ .max_response_bytes = remaining_bytes, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
+        error.ResponseTooLarge => return error.LakeWriteTooLarge,
+        else => return err,
+    };
+    errdefer page.deinit(client.allocator);
+    var actual: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(page.body, &actual, .{});
+    if (!std.mem.eql(u8, &digest, &actual)) return error.ArtifactIntegrityMismatch;
+    return page;
+}
+
+fn readBootstrapPages(a: A, opened: *local.serverless_object_store_support.OpenedObjectStore, context: Context, stage: []const u8, expected: Batch) !?Batch {
+    var client = opened.client;
+    const cancellation = catalog.types.contextCancellation(&context);
+    const manifest = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
+    var root = client.getObject(opened.bucket, manifest, .{ .max_response_bytes = max_bootstrap_manifest_bytes, .cancellation = cancellation }) catch |err| switch (err) {
+        error.NotFound, error.ObjectNotFound, error.FileNotFound => return null,
+        else => return err,
+    };
+    defer root.deinit(client.allocator);
+    const pages = try std.json.parseFromSliceLeaky([]const [32]u8, a, root.body, .{});
+    if (pages.len > max_bootstrap_pages) return error.LakeWriteTooLarge;
+    var changes: std.ArrayList(Batch.Change) = .empty;
+    var total_bytes: usize = 0;
+    for (pages) |digest| {
+        var page = try readBootstrapPage(a, &client, opened.bucket, context, stage, digest, catalog.types.max_commit_bytes - total_bytes);
+        defer page.deinit(client.allocator);
+        if (page.body.len > catalog.types.max_commit_bytes - total_bytes) return error.LakeWriteTooLarge;
+        total_bytes += page.body.len;
+        const rows = try std.json.parseFromSliceLeaky([]const V, a, page.body, .{ .allocate = .alloc_always });
+        if (rows.len > catalog.row_commit.max_bootstrap_rows - changes.items.len) return error.LakeWriteTooLarge;
+        for (rows) |row| try changes.append(a, .{ .op = .upsert, .row = row });
+    }
+    var batch = expected;
+    batch.changes = changes.items;
+    try batch.validate(catalog.row_commit.max_bootstrap_rows);
+    return batch;
+}
+
+fn writeBootstrapStage(a: A, binding: Binding, options: Options, context: Context, batch: Batch) !void {
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    const key = try bootstrapStageKey(a, base, batch);
+    const bytes = try std.json.Stringify.valueAlloc(a, batch, .{});
+    if (bytes.len > catalog.types.max_commit_bytes) return error.LakeWriteTooLarge;
+    try writeImmutableBootstrap(&opened, context, key, bytes);
+}
+
+fn writeImmutableBootstrap(opened: *local.serverless_object_store_support.OpenedObjectStore, context: Context, key: []const u8, bytes: []const u8) !void {
+    var client = opened.client;
+    try context.ensureActive();
+    var stored = client.putObject(opened.bucket, key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
+        error.PreconditionFailed, error.ObjectAlreadyExists => {
+            var existing = client.getObject(opened.bucket, key, .{ .max_response_bytes = bytes.len, .cancellation = catalog.types.contextCancellation(&context) }) catch |read_err| switch (read_err) {
+                error.ResponseTooLarge => return error.WalIdempotencyConflict,
+                else => return read_err,
+            };
+            defer existing.deinit(client.allocator);
+            if (!std.mem.eql(u8, bytes, existing.body)) return error.WalIdempotencyConflict;
+            return context.ensureActive();
+        },
+        else => return err,
+    };
+    defer stored.deinit(client.allocator);
+    try context.ensureActive();
+}
+
+/// Resume only the first admitted bootstrap for the requested incarnation.
+fn recoverPendingBootstrap(a: A, binding: Binding, unresolved: Options, context: Context, source: []const u8, epoch: []const u8, checkpoint: []const u8, keys: []const []const u8) !bool {
+    const options = try unresolved.resolveOwner(a, context);
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    defer a.free(base);
+    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
+    const expected = try bootstrapIdentity(a, source, epoch, checkpoint, keys);
+    const record = try store.next(a, 0);
+    const bytes = if (record) |accepted| accepted.payload else blk: {
+        var client = opened.client;
+        const key = try bootstrapStageKey(a, base, expected);
+        if (try readBootstrapPages(a, &opened, context, key, expected)) |assembled| {
+            break :blk try std.json.Stringify.valueAlloc(a, assembled, .{});
+        }
+        var staged = client.getObject(opened.bucket, key, .{ .max_response_bytes = catalog.types.max_commit_bytes, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
+            error.NotFound, error.ObjectNotFound, error.FileNotFound => return false,
+            else => return err,
+        };
+        defer staged.deinit(client.allocator);
+        break :blk try a.dupe(u8, staged.body);
+    };
+    const batch = try std.json.parseFromSliceLeaky(Batch, a, bytes, .{});
+    if (!batch.bootstrap or batch.expected_checkpoint != null or
+        !std.mem.eql(u8, batch.batch_id, expected.batch_id) or !std.mem.eql(u8, batch.source, source) or
+        !std.mem.eql(u8, batch.epoch, epoch) or !std.mem.eql(u8, batch.checkpoint, checkpoint) or
+        !keyFieldsEqual(batch.key_fields, keys)) return false;
+    if (record) |accepted| {
+        const observed = (try observeBatch(a, binding, options, context, batch)) orelse return error.LakeWalCoverageGap;
+        if (observed.accepted_sequence != accepted.lsn) return error.LakeWalCoverageGap;
+    }
+    const outcome = try applyBatch(a, binding, options, context, batch);
+    if (record) |accepted| if (outcome.accepted_sequence != accepted.lsn) return error.LakeWalCoverageGap;
+    if (outcome.committed) retireBootstrapStage(a, binding, options, context, batch);
+    return outcome.committed;
+}
+
+pub const BatchOutcome = struct {
+    accepted_sequence: u64,
+    committed: bool,
+};
+
+/// Admit an exact batch and give the existing durable catalog worker one
+/// bounded opportunity to commit it. A retry reconciles the original WAL
+/// receipt and catalog intent. Callers may checkpoint only a committed result.
+pub fn applyBatch(a: A, binding: Binding, unresolved_options: Options, context: Context, batch: Batch) !BatchOutcome {
+    const options = try unresolved_options.resolveOwner(a, context);
+    const sequence = try acceptResolvedBatch(a, binding, options, context, batch);
+    const observed = (try observeBatch(a, binding, options, context, batch)) orelse return error.LakeWalCoverageGap;
+    if (observed.accepted_sequence != sequence) return error.LakeWalCoverageGap;
+    if (observed.committed) return observed;
+
+    _ = try drain(a, binding, options, context);
+    const refreshed = (try observeBatch(a, binding, options, context, batch)) orelse return error.LakeWalCoverageGap;
+    if (refreshed.accepted_sequence != sequence) return error.LakeWalCoverageGap;
+    return refreshed;
+}
+
+/// Resolve an exact admission from durable WAL identity and confirm whether
+/// the catalog has committed its sequence. Absence never advances progress.
+pub fn observeBatch(a: A, binding: Binding, unresolved_options: Options, context: Context, batch: Batch) !?BatchOutcome {
+    const options = try unresolved_options.resolveOwner(a, context);
+    const payload = try std.json.Stringify.valueAlloc(a, batch, .{});
+    defer a.free(payload);
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    defer a.free(base);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
+    const accepted = (try observedSequence(arena.allocator(), store, batch, payload)) orelse return null;
+    var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
+    defer current.deinit(a);
+    const metadata = try catalog.metadata.parse(arena.allocator(), current.table.metadata_json);
+    const properties = try catalogProperties(metadata);
+    const covered = try propertyCoverage(properties);
+    if (covered >= accepted) {
+        try requireSourceProperties(arena.allocator(), properties, batch);
+        if (covered == accepted) {
+            const checkpoint = properties.get("antfly.cdc.checkpoint") orelse return error.LakeCheckpointConflict;
+            if (!std.mem.eql(u8, try catalog.metadata.str(checkpoint), batch.checkpoint)) return error.LakeCheckpointConflict;
+        }
+    }
+    try context.ensureActive();
+    return .{ .accepted_sequence = accepted, .committed = covered >= accepted };
+}
+
+fn observedSequence(a: A, store: wal.Store, batch: Batch, payload: []const u8) !?u64 {
+    const operation_id = &std.fmt.bytesToHex(try batch.identity(a), .lower);
+    var admission = try store.beginAdmission(a, operation_id, payload);
+    defer admission.deinit();
+    return admission.observation.accepted;
+}
+
+fn acceptResolvedBatch(a: A, binding: Binding, options: Options, context: Context, batch: Batch) !u64 {
     const payload = try std.json.Stringify.valueAlloc(a, batch, .{});
     defer a.free(payload);
     var opened = try openQueue(a, binding, options);
@@ -96,8 +570,7 @@ pub fn accept(a: A, binding: Binding, unresolved_options: Options, context: Cont
     defer queue_arena.deinit();
     const scratch = queue_arena.allocator();
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
-    const identity = try std.json.Stringify.valueAlloc(scratch, .{ batch.source, batch.epoch, batch.batch_id }, .{});
-    const operation_id = &catalog.types.digestHex(identity);
+    const operation_id = &std.fmt.bytesToHex(try batch.identity(scratch), .lower);
     var admission = try store.beginAdmission(scratch, operation_id, payload);
     defer admission.deinit();
     if (admission.observation.accepted) |accepted| {
@@ -122,16 +595,11 @@ pub fn accept(a: A, binding: Binding, unresolved_options: Options, context: Cont
     } else {
         var metadata = try std.json.parseFromSlice(V, a, current.table.metadata_json, .{});
         defer metadata.deinit();
-        const props = (try catalog.metadata.get(metadata.value, "properties")).object;
+        const props = try catalogProperties(metadata.value);
         const checkpoint = props.get("antfly.cdc.checkpoint");
         if ((checkpoint == null) != (batch.expected_checkpoint == null)) return error.LakeCheckpointConflict;
         if (checkpoint) |v| if (!std.mem.eql(u8, try catalog.metadata.str(v), batch.expected_checkpoint.?)) return error.LakeCheckpointConflict;
-        if (props.get("antfly.cdc.source")) |source| {
-            const key_definition = try std.json.Stringify.valueAlloc(scratch, batch.key_fields, .{});
-            if (!std.mem.eql(u8, try catalog.metadata.str(source), batch.source) or
-                !std.mem.eql(u8, try catalog.metadata.str(props.get("antfly.cdc.epoch").?), batch.epoch) or
-                !std.mem.eql(u8, try catalog.metadata.str(props.get("antfly.cdc.key-fields").?), key_definition)) return error.LakeSourceConflict;
-        }
+        if (props.contains("antfly.cdc.source")) try requireSourceProperties(scratch, props, batch);
     }
     try context.ensureActive();
     const accepted = try admission.append(covered);
@@ -147,6 +615,8 @@ fn keyFieldsEqual(left: []const []const u8, right: []const []const u8) bool {
 /// transactions; a group never exceeds the Parquet writer's row limit.
 pub const max_group_changes: usize = catalog.parquet_writer.max_rows;
 pub const max_group_payload_bytes: usize = 8 * 1024 * 1024;
+/// Checkpoint-only records consume no row budget; bound their work separately.
+pub const max_group_records: usize = 1024;
 
 /// A contiguous accepted WAL suffix folded into one source transaction.
 pub const Group = struct { batch: Batch, first_lsn: u64, last_lsn: u64, records: usize };
@@ -163,10 +633,10 @@ const GroupBuilder = struct {
     }
     fn full(self: GroupBuilder, max_changes: usize, max_bytes: usize) bool {
         const count = if (self.result.records == 1) self.result.batch.changes.len else self.changes.items.len;
-        return count >= max_changes or self.bytes >= max_bytes;
+        return self.result.records >= max_group_records or count >= max_changes or self.bytes >= max_bytes;
     }
     fn add(self: *GroupBuilder, a: A, record: wal.Record, max_changes: usize, max_bytes: usize) !bool {
-        if (self.full(max_changes, max_bytes) or record.lsn != self.result.last_lsn + 1) return false;
+        if (self.result.batch.bootstrap or self.full(max_changes, max_bytes) or record.lsn != self.result.last_lsn + 1) return false;
         if (record.payload.len > max_bytes - self.bytes) return false;
         const next = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{ .allocate = .alloc_always });
         const count = if (self.result.records == 1) self.result.batch.changes.len else self.changes.items.len;
@@ -582,7 +1052,13 @@ test "external lake filesystem WAL group commit folds pending transactions into 
         "{\"batch_id\":\"b4\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"3\",\"checkpoint\":\"4\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":3}}]}",
         "{\"batch_id\":\"b5\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"4\",\"checkpoint\":\"5\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":4}}]}",
     };
+    const retry = try std.json.parseFromSliceLeaky(Batch, a, payloads[1], .{});
+    try std.testing.expectEqual(@as(?BatchOutcome, null), try observeBatch(a, binding, options, .{}, retry));
     for (payloads, 1..) |payload, lsn| try std.testing.expectEqual(@as(u64, lsn), try accept(a, binding, options, .{}, payload));
+    try std.testing.expectEqual(BatchOutcome{ .accepted_sequence = 2, .committed = false }, (try observeBatch(a, binding, options, .{}, retry)).?);
+    var changed = retry;
+    changed.checkpoint = "different";
+    try std.testing.expectError(error.WalIdempotencyConflict, observeBatch(a, binding, options, .{}, changed));
     // Four changes fit: b1..b3 fold into one snapshot; b4 would exceed the limit.
     try std.testing.expect(try drainBounded(a, binding, options, .{}, 4, max_group_payload_bytes));
     const first = try managed.load(a);
@@ -618,7 +1094,50 @@ test "external lake filesystem WAL group commit folds pending transactions into 
     try std.testing.expectEqual(@as(u64, 7), try coverage(a, try managed.load(a)));
     try std.testing.expect(!try drain(a, binding, options, .{}));
     // The exact original requests stay receipts after their group publishes.
-    try std.testing.expectEqual(@as(u64, 2), try accept(a, binding, options, .{}, payloads[1]));
+    try std.testing.expectEqual(@as(u64, 2), try acceptBatch(a, binding, options, .{}, retry));
+    try std.testing.expectEqual(BatchOutcome{ .accepted_sequence = 2, .committed = true }, (try observeBatch(a, binding, options, .{}, retry)).?);
+    // Empty polls use the same WAL admission and catalog commit path. They
+    // advance coverage without manufacturing data/delete files or losing rows.
+    const polls = [_][]const u8{
+        "{\"batch_id\":\"poll-1\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"5\",\"checkpoint\":\"7\",\"key_fields\":[\"id\"],\"changes\":[]}",
+        "{\"batch_id\":\"poll-2\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"7\",\"checkpoint\":\"8\",\"key_fields\":[\"id\"],\"changes\":[]}",
+    };
+    for (polls, 8..) |payload, lsn| try std.testing.expectEqual(@as(u64, lsn), try accept(a, binding, options, .{}, payload));
+    try std.testing.expect(try drain(a, binding, options, .{}));
+    try std.testing.expect(!try drain(a, binding, options, .{}));
+    const polled = try managed.load(a);
+    try std.testing.expectEqual(@as(u64, 9), try coverage(a, polled));
+    const polled_root = try catalog.metadata.parse(a, polled.metadata_json);
+    try std.testing.expectEqualStrings("8", try catalog.metadata.str(try catalog.metadata.get(try catalog.metadata.get(polled_root, "properties"), "antfly.cdc.checkpoint")));
+    const checkpoint = try a.dupe(u8, "postgres-next");
+    const before = try std.json.parseFromSliceLeaky(V, a, "{\"id\":4,\"body\":\"before\"}", .{});
+    const after = try std.json.parseFromSliceLeaky(V, a, "{\"id\":6,\"body\":\"after\"}", .{});
+    const update: @import("../foreign/source.zig").ReplicationChange = .{ .op = .update, .checkpoint = checkpoint, .before = before, .before_kind = .full, .row = after };
+    const captured = try postgresBatch(a, "s", "1", "8", checkpoint, &.{"id"}, &.{update});
+    try std.testing.expectEqual(@as(usize, 2), captured.changes.len);
+    try std.testing.expectEqual(.delete, captured.changes[0].op);
+    try std.testing.expectEqual(@as(i64, 4), captured.changes[0].row.object.get("id").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), captured.changes[0].row.object.count());
+    try std.testing.expectEqual(.upsert, captured.changes[1].op);
+    try std.testing.expectEqual(@as(i64, 6), captured.changes[1].row.object.get("id").?.integer);
+    try std.testing.expectError(error.InvalidReplicationCheckpoint, postgresBatch(a, "s", "1", "8", "wrong", &.{"id"}, &.{update}));
+    var incomplete = update;
+    incomplete.row_complete = false;
+    try std.testing.expectError(error.ReplicationProjectionIncomplete, postgresBatch(a, "s", "1", "8", checkpoint, &.{"id"}, &.{incomplete}));
+    const committed: BatchOutcome = .{ .accepted_sequence = 10, .committed = true };
+    try std.testing.expectEqual(committed, try applyBatch(a, binding, options, .{}, captured));
+    try std.testing.expectEqual(committed, try applyBatch(a, binding, options, .{}, captured));
+    try std.testing.expectEqual(@as(u64, 10), try watermark(a, binding, options, .{}));
+    const polled_snapshots = (try catalog.metadata.get(polled_root, "snapshots")).array.items;
+    const before_poll = polled_snapshots[polled_snapshots.len - 2];
+    const after_poll = polled_snapshots[polled_snapshots.len - 1];
+    var before_list = try local.serverless_external_source_mod.iceberg_avro.parseManifestListAlloc(alloc, try catalog.row_commit.read(a, files, try catalog.metadata.str(try catalog.metadata.get(before_poll, "manifest-list"))));
+    defer before_list.deinit(alloc);
+    var after_list = try local.serverless_external_source_mod.iceberg_avro.parseManifestListAlloc(alloc, try catalog.row_commit.read(a, files, try catalog.metadata.str(try catalog.metadata.get(after_poll, "manifest-list"))));
+    defer after_list.deinit(alloc);
+    try std.testing.expectEqual(before_list.entries.len, after_list.entries.len);
+    for (before_list.entries, after_list.entries) |before_entry, after_entry| try std.testing.expectEqualStrings(before_entry.manifest_path, after_entry.manifest_path);
+    try std.testing.expectEqual(@as(u64, 8), try accept(a, binding, options, .{}, polls[0]));
 }
 
 test "external lake WAL group reader stops before hydrating a bounded pending suffix" {
@@ -775,4 +1294,140 @@ test "external lake WAL group yields an owned prefix on root expiry without swal
     var corrupted = try delay.reader(a, &indexed, 1, .{});
     defer corrupted.deinit();
     try std.testing.expectError(error.ArtifactIntegrityMismatch, readGroup(a, &corrupted, max_group_changes, max_group_payload_bytes));
+}
+
+test "external lake WAL grouping bounds checkpoint-only records independently of rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const records = try a.alloc(wal.Record, max_group_records + 1);
+    for (records, 0..) |*record, i| {
+        const batch: Batch = .{ .batch_id = try std.fmt.allocPrint(a, "poll-{d}", .{i}), .source = "s", .epoch = "1", .checkpoint = try std.fmt.allocPrint(a, "{d}", .{i + 1}), .expected_checkpoint = if (i == 0) null else try std.fmt.allocPrint(a, "{d}", .{i}), .key_fields = &.{"id"}, .changes = &.{} };
+        record.* = .{ .lsn = i + 1, .operation_id = batch.batch_id, .payload = try std.json.Stringify.valueAlloc(a, batch, .{}) };
+    }
+    const folded = try group(a, records, max_group_changes, max_group_payload_bytes);
+    try std.testing.expectEqual(max_group_records, folded.records);
+    try std.testing.expectEqual(@as(u64, max_group_records), folded.last_lsn);
+    try std.testing.expectEqual(@as(usize, 0), folded.batch.changes.len);
+    try folded.batch.validate(0);
+    const tail = try group(a, records[max_group_records..], max_group_changes, max_group_payload_bytes);
+    try std.testing.expectEqual(@as(usize, 1), tail.records);
+    try std.testing.expect(tail.batch.follows(folded.batch));
+}
+
+test "external lake filesystem WAL applies the managed PostgreSQL stream owner port" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-wal-postgres-owner");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+
+    const uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()});
+    const schema = try std.json.Stringify.valueAlloc(a, .{ .base_source = .{
+        .kind = "external",
+        .table_id = "events",
+        .uri = uri,
+        .format = "iceberg",
+        .write_policy = "iceberg_writer",
+        .catalog = .{ .type = "managed" },
+        .row_identity = .{ .key_columns = .{"id"} },
+    } }, .{});
+    var bound = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer bound.deinit(a);
+    const options: Options = .{ .node_config = &config, .catalog_table_id = 9, .catalog_generation = 4 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, bound.binding, options);
+    defer opened.deinit();
+    var managed: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = uri };
+    _ = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+
+    const Fixture = struct {
+        options: Options,
+        authority: u64 = 12,
+        checks: usize = 0,
+        fn resolve(raw: *anyopaque, _: A, _: StreamOwner.Port.Request) !Options {
+            return (@as(*@This(), @ptrCast(@alignCast(raw)))).options;
+        }
+        fn check(raw: *anyopaque, request: StreamOwner.Port.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.authority != request.cutover.cutover_authority_id) return error.ReplicationCutoverAuthorityLost;
+        }
+    };
+    var fixture: Fixture = .{ .options = options };
+    var owner: StreamOwner = .{ .ptr = &fixture, .resolve = Fixture.resolve, .check = Fixture.check };
+    const port = owner.port();
+    var checkpoint = [_]u8{'1'};
+    const row = try std.json.parseFromSliceLeaky(V, a, "{\"id\":1}", .{});
+    var request: StreamOwner.Port.Request = .{
+        .table = .{ .table_id = 9, .name = "events", .schema_json = schema, .object_storage_generation = 4 },
+        .cutover = .{ .table_id = 9, .source_ordinal = 2, .source_kind = "postgres", .cutover_authority_id = 12, .prepared_checkpoint = "cut" },
+        .previous_checkpoint = "cut",
+        .checkpoint = &checkpoint,
+        .changes = &.{.{ .op = .insert, .checkpoint = &checkpoint, .row = row }},
+        .deadline_ns = null,
+    };
+    var unbootstrapped = request;
+    unbootstrapped.previous_checkpoint = null;
+    try std.testing.expectError(error.InvalidReplicationCheckpoint, port.apply(port.ptr, alloc, unbootstrapped));
+    var snapshot = request;
+    snapshot.changes = &.{};
+    snapshot.snapshot_rows = &.{};
+    snapshot.previous_checkpoint = null;
+    try std.testing.expectError(error.InvalidReplicationCheckpoint, port.apply(port.ptr, alloc, snapshot));
+    snapshot.checkpoint = "cut";
+    const initial_row = try std.json.parseFromSliceLeaky(V, a, "{\"id\":2}", .{});
+    snapshot.snapshot_rows = &.{initial_row};
+    var recovery = snapshot;
+    recovery.snapshot_rows = null;
+    try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    const digest = try port.stage_snapshot_page.?(port.ptr, alloc, snapshot);
+    try std.testing.expectEqual(digest, try port.stage_snapshot_page.?(port.ptr, alloc, snapshot));
+    try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    var seal = snapshot;
+    seal.snapshot_rows = null;
+    seal.snapshot_chunks = &.{@splat(0)};
+    try std.testing.expectError(error.FileNotFound, port.stage_bootstrap.?(port.ptr, alloc, seal));
+    seal.snapshot_chunks = &.{digest};
+    try std.testing.expectError(error.InvalidReplicationCheckpoint, port.stage_bootstrap.?(port.ptr, alloc, seal));
+    seal.cutover.snapshot_offset = 1;
+    try port.stage_bootstrap.?(port.ptr, alloc, seal);
+    var queue = try openQueue(a, bound.binding, options);
+    defer queue.deinit();
+    const queue_prefix = try prefix(a, queue.prefix, bound.binding, options);
+    const stage = try bootstrapStageKey(a, queue_prefix, try bootstrapIdentity(a, "postgres:9:2", "12", "cut", &.{"id"}));
+    const staged_key = try std.fmt.allocPrint(a, "{s}.manifest", .{stage});
+    const page_key = try std.fmt.allocPrint(a, "{s}.pages/{s}", .{ stage, &std.fmt.bytesToHex(digest, .lower) });
+    try std.testing.expectError(error.LakeWriteTooLarge, readBootstrapPage(a, &queue.client, queue.bucket, .{}, stage, digest, 1));
+    var staged_object = try queue.client.statObject(queue.bucket, staged_key);
+    staged_object.deinit(queue.client.allocator);
+    try std.testing.expectEqual(@as(u64, 0), try watermark(a, bound.binding, options, .{}));
+    try std.testing.expectEqual(@as(u64, 0), try coverage(a, try managed.load(a)));
+    var wrong_cut = recovery;
+    wrong_cut.checkpoint = "other";
+    wrong_cut.cutover.prepared_checkpoint = "other";
+    try std.testing.expect(!try port.bootstrap_committed.?(port.ptr, alloc, wrong_cut));
+    try std.testing.expectEqual(@as(u64, 0), try coverage(a, try managed.load(a)));
+    staged_object = try queue.client.statObject(queue.bucket, staged_key);
+    staged_object.deinit(queue.client.allocator);
+    try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    try std.testing.expectError(error.FileNotFound, queue.client.statObject(queue.bucket, staged_key));
+    try std.testing.expectError(error.FileNotFound, queue.client.statObject(queue.bucket, page_key));
+    try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, snapshot));
+    try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));
+    try std.testing.expect(fixture.checks > 1);
+    try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, request));
+    try std.testing.expectEqual(.committed, try port.apply(port.ptr, alloc, snapshot));
+    request.table.object_storage_generation += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, port.apply(port.ptr, alloc, request));
+    fixture.authority += 1;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, port.apply(port.ptr, alloc, request));
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    fixture.authority -= 1;
+    try std.testing.expect(try port.bootstrap_committed.?(port.ptr, alloc, recovery));
+    try std.testing.expectEqual(@as(u64, 2), try watermark(a, bound.binding, options, .{}));
 }

@@ -366,12 +366,22 @@ pub const RoutingGeneration = struct {
     indexed: RoutingSession,
 
     pub fn create(alloc: std.mem.Allocator, snapshot: metadata_api.CatalogRoutingSnapshot, budget: RoutingBudget) !*RoutingGeneration {
+        return createProjected(alloc, snapshot, budget, .compact);
+    }
+
+    /// Only authoritative local metadata captures may derive a binding from
+    /// the full record. Compact snapshots may have omitted its input fields.
+    pub fn createFromFullRecords(alloc: std.mem.Allocator, snapshot: metadata_api.CatalogRoutingSnapshot, budget: RoutingBudget) !*RoutingGeneration {
+        return createProjected(alloc, snapshot, budget, .full);
+    }
+
+    fn createProjected(alloc: std.mem.Allocator, snapshot: metadata_api.CatalogRoutingSnapshot, budget: RoutingBudget, comptime records: RoutingRecordSource) !*RoutingGeneration {
         const self = try alloc.create(RoutingGeneration);
         errdefer alloc.destroy(self);
         self.* = .{ .alloc = alloc, .indexed = undefined };
         const owned = OwnedRoutingSnapshot{
             .source = .{ .ptr = self, .snapshot = unsupportedRoutingSnapshot, .free_snapshot = freeSnapshot },
-            .value = try cloneRoutingSnapshot(alloc, snapshot, budget),
+            .value = try cloneRoutingSnapshot(alloc, snapshot, budget, records),
         };
         self.indexed = try RoutingSession.initOwned(alloc, emptyCatalogSource(), owned, false, budget);
         return self;
@@ -741,7 +751,7 @@ pub const RoutingSession = struct {
     fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         const self = cast(ptr);
         try self.base.budget(deadline_ns).checkpoint();
-        return try cloneRoutingSnapshot(self.alloc, self.snapshot.value, self.base.budget(deadline_ns));
+        return try cloneRoutingSnapshot(self.alloc, self.snapshot.value, self.base.budget(deadline_ns), .compact);
     }
 
     fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -918,10 +928,13 @@ pub const RoutingSession = struct {
     }
 };
 
+const RoutingRecordSource = enum { full, compact };
+
 fn cloneRoutingSnapshot(
     alloc: std.mem.Allocator,
     source: metadata_api.CatalogRoutingSnapshot,
     budget: RoutingBudget,
+    comptime records: RoutingRecordSource,
 ) !metadata_api.CatalogRoutingSnapshot {
     try budget.checkpoint();
     const tables = try alloc.alloc(metadata_table_manager.TableRecord, source.tables.len);
@@ -932,7 +945,10 @@ fn cloneRoutingSnapshot(
     }
     for (source.tables, 0..) |table, index| {
         try budget.checkpointIndex(index);
-        tables[index] = try metadata_table_manager.cloneRoutingTable(alloc, table);
+        tables[index] = switch (records) {
+            .full => try metadata_table_manager.cloneRoutingTable(alloc, table),
+            .compact => try metadata_table_manager.cloneCompactRoutingTable(alloc, table),
+        };
         table_count = index + 1;
     }
 

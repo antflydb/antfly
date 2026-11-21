@@ -19,6 +19,26 @@ const backend = @import("backend.zig");
 
 const Mock = struct {
     describes: usize = 0,
+    replication_enabled: bool = false,
+    replication_denied: bool = false,
+    replication_revoke_after_command: bool = false,
+    replication_unknown: bool = false,
+    replication_error: ?anyerror = null,
+    replication_opens: usize = 0,
+    replication_closes: usize = 0,
+    replication_checks: usize = 0,
+    invalid_slot_reply: enum { none, name, lsn, snapshot, plugin } = .none,
+    replication_commands: usize = 0,
+    replication_stream_enabled: bool = false,
+    replication_stream_opens: usize = 0,
+    replication_stream_closes: usize = 0,
+    replication_polls: usize = 0,
+    replication_feedbacks: usize = 0,
+    replication_ack: u64 = 0,
+    replication_live_chunks: usize = 0,
+    replication_revoke_after_poll: bool = false,
+    replication_defer_first_poll: bool = false,
+    replication_wait_for_feedback: bool = false,
     catalog_rebind: bool = false,
     cached_rename: bool = false,
     probe_change_at: ?usize = null,
@@ -112,9 +132,110 @@ const Mock = struct {
         }
     }
 
+    const source_tables: [2][2]backend.Backend.VTable = blk: {
+        var tables: [2][2]backend.Backend.VTable = undefined;
+        for (0..2) |native_index| for (0..2) |replication_index| {
+            tables[native_index][replication_index] = .{
+                .native_parameters = native_index == 1,
+                .authenticate = authenticate,
+                .refresh = refresh,
+                .describe = describe,
+                .description_current = descriptionCurrent,
+                .execute = Mock.execute,
+                .load_settings = loadSettings,
+                .validate_namespace = validateNamespace,
+                .evaluate_parameters = evaluateParameters,
+                .fail_transaction = failTransaction,
+                .open_stream = openStream,
+                .disconnect = disconnect,
+                .open_replication_session = if (replication_index == 1) openReplication else null,
+            };
+        };
+        break :blk tables;
+    };
     fn source(self: *Mock) backend.Backend {
-        if (self.native_parameters) return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .refresh = refresh, .describe = describe, .description_current = descriptionCurrent, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .refresh = refresh, .describe = describe, .description_current = descriptionCurrent, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &source_tables[@intFromBool(self.native_parameters)][@intFromBool(self.replication_enabled)] };
+    }
+    fn openReplication(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.ReplicationSession {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_opens += 1;
+        if (self.replication_denied) return error.Forbidden;
+        return .{ .context = self, .authorize = replicationAuthorize, .command = replicationCommand, .close = replicationClose, .open_stream = if (self.replication_stream_enabled) replicationStreamOpen else null };
+    }
+    fn replicationStreamOpen(raw: *anyopaque, _: std.mem.Allocator, request: backend.Request, start: backend.replication_commands.Start) !backend.ReplicationStream {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_stream_opens += 1;
+        const resume_position = @max(@as(u64, 1), @backingInt(start.position));
+        if (resume_position > 48) return error.ChangefeedResynchronizationRequired;
+        return .{ .context = self, .initial_lsn = @fromBackingInt(if (resume_position == 48) @as(u64, 48) else @as(u64, 1)), .resume_lsn = @fromBackingInt(resume_position), .initial_end_lsn = @fromBackingInt(48), .poll = replicationPoll, .feedback = replicationFeedback, .close = replicationStreamClose };
+    }
+    fn replicationPoll(raw: *anyopaque, a: std.mem.Allocator, request: backend.Request, after: backend.pgoutput.Lsn, maximum: u32) !backend.ReplicationPoll {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_polls += 1;
+        if (self.replication_defer_first_poll and self.replication_polls == 1) return error.ReplicationReadDeferred;
+        if (self.replication_revoke_after_poll) self.replication_denied = true;
+        const offset = @backingInt(after);
+        if (self.replication_wait_for_feedback and self.replication_feedbacks == 0) return .{ .end_lsn = @fromBackingInt(48) };
+        if (offset == 48) return .{ .end_lsn = @fromBackingInt(48) };
+        const bytes = if (offset == 1) try backend.pgoutput.encode(a, .{ .begin = .{ .final_lsn = @fromBackingInt(22), .commit_time = 0, .xid = 42 } }, maximum) else if (offset == 22) try backend.pgoutput.encode(a, .{ .commit = .{ .commit_lsn = @fromBackingInt(22), .end_lsn = @fromBackingInt(48), .commit_time = 0 } }, maximum) else return error.TestUnexpectedResult;
+        self.replication_live_chunks += 1;
+        return .{ .end_lsn = @fromBackingInt(48), .chunk = .{ .start_lsn = after, .bytes = bytes }, .owner = .{ .context = self, .release = replicationChunkRelease } };
+    }
+    fn replicationChunkRelease(raw: *anyopaque) void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        self.replication_live_chunks -= 1;
+    }
+    fn replicationFeedback(raw: *anyopaque, _: std.mem.Allocator, request: backend.Request, feedback: backend.pgoutput.Feedback) !void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_feedbacks += 1;
+        // The real slot authority rounds to complete issued transactions;
+        // transport alone must never acknowledge a partial transaction.
+        if (@backingInt(feedback.flushed) == 48) self.replication_ack = 48;
+    }
+    fn replicationStreamClose(raw: *anyopaque) void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.replication_live_chunks == 0);
+        self.replication_stream_closes += 1;
+    }
+    fn replicationAuthorize(raw: *anyopaque, _: std.mem.Allocator, request: backend.Request, _: ?backend.replication_commands.Command) !void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_checks += 1;
+        if (self.replication_denied or (self.replication_revoke_after_command and self.replication_commands != 0)) return error.Forbidden;
+    }
+    fn replicationClose(raw: *anyopaque) void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        self.replication_closes += 1;
+    }
+    fn replicationCommand(raw: *anyopaque, a: std.mem.Allocator, request: backend.Request, command: backend.replication_commands.Command) !backend.Result {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_commands += 1;
+        if (self.replication_unknown) return error.MetadataMutationOutcomeUnknown;
+        if (self.replication_error) |err| {
+            self.replication_error = null;
+            return err;
+        }
+        const rows = try a.alloc([]const std.json.Value, if (command == .drop_slot) 0 else 1);
+        if (command == .identify_system) {
+            rows[0] = try a.dupe(std.json.Value, &.{ .{ .string = "123456789" }, .{ .integer = 1 }, .{ .string = "0/1" }, .{ .string = request.database orelse "db" } });
+            return .{ .columns = &.{ .{ .name = "systemid", .type = .string }, .{ .name = "timeline", .type = .integer }, .{ .name = "xlogpos", .type = .string }, .{ .name = "dbname", .type = .string } }, .rows = rows, .command_tag = "IDENTIFY_SYSTEM" };
+        }
+        if (command == .create_slot) {
+            rows[0] = try a.dupe(std.json.Value, &.{
+                .{ .string = if (self.invalid_slot_reply == .name) "other-slot" else command.create_slot.slot },
+                .{ .string = if (self.invalid_slot_reply == .lsn) "0/0" else "0/1" },
+                if (command.create_slot.snapshot == .export_snapshot and self.invalid_slot_reply != .snapshot) .{ .string = "snapshot-fixture" } else .null,
+                .{ .string = if (self.invalid_slot_reply == .plugin) "other-plugin" else "pgoutput" },
+            });
+            return .{ .columns = &.{ .{ .name = "slot_name", .type = .string }, .{ .name = "consistent_point", .type = .string }, .{ .name = "snapshot_name", .type = .string }, .{ .name = "output_plugin", .type = .string } }, .rows = rows, .command_tag = "CREATE_REPLICATION_SLOT", .mutation_outcome = .committed };
+        }
+        if (command != .drop_slot) return error.TestUnexpectedResult;
+        return .{ .columns = &.{}, .rows = rows, .command_tag = "DROP_REPLICATION_SLOT", .mutation_outcome = .committed };
     }
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -2775,6 +2896,470 @@ test "pgwire producer capacity rejects execution before backend and preserves ro
     try std.testing.expectEqual(@as(usize, 1), mock.executions);
     try std.testing.expect(!session.completion.unknown);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "54000") != null);
+}
+
+test "pgwire logical startup authenticates and dispatches replication administration outside SQL" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+    try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput EXPORT_SNAPSHOT\x00");
+    try frame(&input.writer, 'Q', "DROP_REPLICATION_SLOT s WAIT\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.authentications);
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_opens);
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+    try std.testing.expectEqual(@as(usize, 7), mock.replication_checks);
+    try std.testing.expectEqual(@as(usize, 3), mock.replication_commands);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "snapshot-fixture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "CREATE_REPLICATION_SLOT") != null);
+}
+test "pgwire logical slot creation withholds mismatched slot results" {
+    for ([_]@FieldType(Mock, "invalid_slot_reply"){ .name, .lsn, .snapshot, .plugin }) |invalid| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput EXPORT_SNAPSHOT\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .replication_enabled = true, .invalid_slot_reply = invalid };
+        var out = try run(&mock, input.written(), .{});
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_commands);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "CREATE_REPLICATION_SLOT") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "40003") != null);
+    }
+}
+
+test "pgwire logical startup requires backend capability and explicit live authorization" {
+    for ([_]bool{ false, true }) |enabled| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        var mock: Mock = .{ .replication_enabled = enabled, .replication_denied = true };
+        if (enabled) try std.testing.expectError(error.Forbidden, run(&mock, input.written(), .{})) else try std.testing.expectError(error.UnsupportedReplicationMode, run(&mock, input.written(), .{}));
+        try std.testing.expectEqual(@as(usize, 1), mock.authentications);
+        try std.testing.expectEqual(@as(usize, 0), mock.replication_commands);
+        try std.testing.expectEqual(@as(usize, 1), mock.releases);
+    }
+}
+test "pgwire logical mode rejects extended messages and never sends START to SQL or administration" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '1', publication_names 'p')\x00");
+    try frame(&input.writer, 'Q', "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '2', publication_names 'p')\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_commands);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "0A000") != null);
+    input.writer.end = 0;
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'P', "\x00SELECT 1\x00\x00\x00");
+    mock = .{ .replication_enabled = true };
+    try std.testing.expectError(error.ProtocolViolation, run(&mock, input.written(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+    try std.testing.expectEqual(@as(usize, 0), mock.describes);
+}
+test "pgwire replication results recheck authorization and uncertain slots do not become SQL completion work" {
+    for ([_]bool{ false, true }) |unknown| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .replication_enabled = true, .replication_unknown = unknown, .replication_revoke_after_command = !unknown };
+        var out = try run(&mock, input.written(), .{});
+        defer out.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "40003") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "snapshot-fixture") == null);
+        try std.testing.expect(mock.completion_safe_after_run);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_commands);
+    }
+}
+test "pgwire replication owner failures preserve actionable SQLSTATEs without replay or SQL completion debt" {
+    const Case = struct { failure: anyerror, code: []const u8 };
+    for ([_]Case{
+        .{ .failure = error.ChangefeedCapabilityUnsupported, .code = "0A000" },
+        .{ .failure = error.ChangefeedResynchronizationRequired, .code = "55000" },
+        .{ .failure = error.ChangefeedLeaseExpired, .code = "55000" },
+        .{ .failure = error.ChangefeedConflict, .code = "55000" },
+        .{ .failure = error.HistoryResynchronizationRequired, .code = "55000" },
+        .{ .failure = error.HistoryCheckpointConflict, .code = "55000" },
+        .{ .failure = error.HistoryConsumerConflict, .code = "55000" },
+        .{ .failure = error.HistoryAuthorityRequired, .code = "55000" },
+        .{ .failure = error.HistoryPreparedTransactionsPresent, .code = "55000" },
+        .{ .failure = error.ChangefeedBackpressure, .code = "53300" },
+        .{ .failure = error.HistoryFull, .code = "53300" },
+        .{ .failure = error.HistoryConsumerLimit, .code = "53300" },
+        .{ .failure = error.HistoryTooLarge, .code = "54000" },
+        .{ .failure = error.MetadataMutationOutcomeUnknown, .code = "40003" },
+        .{ .failure = error.CommitDecisionUnknown, .code = "40003" },
+        .{ .failure = error.SourceOutcomeUnresolved, .code = "40003" },
+        // Corruption remains an internal error, never a retry/capacity signal.
+        .{ .failure = error.HistoryCorrupt, .code = "XX000" },
+    }) |case| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput\x00");
+        // A subsequent read-only command can inspect state after uncertainty.
+        try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .replication_enabled = true, .replication_error = case.failure };
+        var out = try run(&mock, input.written(), .{});
+        defer out.deinit();
+        var expected: [7]u8 = undefined;
+        expected[0] = 'C';
+        @memcpy(expected[1..6], case.code);
+        expected[6] = 0;
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), &expected) != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), @errorName(case.failure)) != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "snapshot-fixture") == null);
+        try std.testing.expectEqual(@as(usize, 2), mock.replication_commands);
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+        try std.testing.expect(mock.completion_safe_after_run);
+    }
+}
+
+test "pgwire replication commands require logical startup while false preserves ordinary SQL" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00false\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+    try frame(&input.writer, 'Q', "SELECT 1\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 0), mock.replication_opens);
+    try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "0A000") != null);
+}
+
+test "pgwire failed logical authorization closes the opened owner before releasing identity" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    var mock: Mock = .{ .replication_enabled = true, .replication_revoke_after_command = true, .replication_commands = 1 };
+    try std.testing.expectError(error.Forbidden, run(&mock, input.written(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_opens);
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+    try std.testing.expectEqual(@as(usize, 1), mock.releases);
+}
+test "pgwire malformed replication command cannot fall back to SQL and duplicate startup is rejected" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM/**/\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "42601") != null);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expectEqual(@as(usize, 0), mock.replication_commands);
+    input.writer.end = 0;
+    try startupOptions(&input.writer, "replication\x00database\x00replication\x00false\x00");
+    mock = .{ .replication_enabled = true };
+    try std.testing.expectError(error.ProtocolViolation, run(&mock, input.written(), .{}));
+    try std.testing.expectEqual(@as(usize, 0), mock.authentications);
+}
+
+const ReplicationWireFrame = struct {
+    tag: u8,
+    bytes: []u8,
+    fn deinit(self: *@This()) void {
+        std.testing.allocator.free(self.bytes);
+    }
+};
+fn replicationRead(reader: *std.Io.Reader) !ReplicationWireFrame {
+    const tag = try reader.takeByte();
+    const length = try reader.takeInt(u32, .big);
+    if (length < 4 or length > 1024 * 1024) return error.ProtocolViolation;
+    return .{ .tag = tag, .bytes = try reader.readAlloc(std.testing.allocator, length - 4) };
+}
+fn replicationClientStart(stream: std.Io.net.Stream, reader: *std.Io.Reader) !struct { pid: i32, key: i32 } {
+    const value = try replicationClientStartAt(stream, reader, "0/0");
+    return .{ .pid = value.pid, .key = value.key };
+}
+fn replicationClientStartAt(stream: std.Io.net.Stream, reader: *std.Io.Reader, position: []const u8) !struct { pid: i32, key: i32 } {
+    var bytes: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer bytes.deinit();
+    try startupOptions(&bytes.writer, "replication\x00database\x00");
+    var writer = stream.writer(std.testing.io, &.{});
+    try writer.interface.writeAll(bytes.written());
+    try writer.interface.flush();
+    var key: struct { pid: i32, key: i32 } = .{ .pid = 0, .key = 0 };
+    while (true) {
+        var response = try replicationRead(reader);
+        defer response.deinit();
+        if (response.tag == 'E') return error.TestUnexpectedResult;
+        if (response.tag == 'K') key = .{ .pid = std.mem.readInt(i32, response.bytes[0..4], .big), .key = std.mem.readInt(i32, response.bytes[4..8], .big) };
+        if (response.tag == 'Z') break;
+    }
+    const query = try std.fmt.allocPrint(std.testing.allocator, "START_REPLICATION SLOT s LOGICAL {s} (proto_version '1', publication_names 'p')\x00", .{position});
+    defer std.testing.allocator.free(query);
+    try frame(&writer.interface, 'Q', query);
+    try writer.interface.flush();
+    var response = try replicationRead(reader);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u8, 'W'), response.tag);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, response.bytes);
+    return .{ .pid = key.pid, .key = key.key };
+}
+fn replicationStatus(writer: *std.Io.Writer, lsn: u64, reply: bool) !void {
+    var bytes: [34]u8 = @splat(0);
+    bytes[0] = 'r';
+    std.mem.writeInt(u64, bytes[1..9], lsn, .big);
+    std.mem.writeInt(u64, bytes[9..17], lsn, .big);
+    std.mem.writeInt(u64, bytes[17..25], lsn, .big);
+    bytes[33] = @intFromBool(reply);
+    try frame(writer, 'd', &bytes);
+}
+const replication_test_limits: protocol.Limits = .{ .idle_timeout_ms = 1000, .startup_timeout_ms = 3000, .statement_timeout_ms = 3000, .replication_timeout_ms = 3000, .replication_keepalive_ms = 50, .replication_poll_ms = 5, .replication_callback_ms = 1000, .replication_write_ms = 1000 };
+test "pgwire CopyBoth sends committed messages accepts duplex feedback and preserves following commands" {
+    for ([_]bool{ false, true }) |acknowledge| {
+        var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .renewable_auth = true, .replication_defer_first_poll = true };
+        var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = replication_test_limits });
+        defer listener.deinit();
+        const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+        defer socket.close(std.testing.io);
+        var buffer: [1024]u8 = undefined;
+        var reader = socket.reader(std.testing.io, &buffer);
+        _ = try replicationClientStart(socket, &reader.interface);
+        var received: usize = 0;
+        while (received < 2) {
+            var response = try replicationRead(&reader.interface);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u8, 'd'), response.tag);
+            if (response.bytes[0] != 'w') continue;
+            try std.testing.expectEqual(@as(u64, 48), std.mem.readInt(u64, response.bytes[9..17], .big));
+            try std.testing.expectEqual(@as(u8, if (received == 0) 'B' else 'C'), response.bytes[25]);
+            received += 1;
+        }
+        var writer = socket.writer(std.testing.io, &.{});
+        try frame(&writer.interface, 'p', "renewed\x00");
+        if (acknowledge) {
+            try replicationStatus(&writer.interface, 48, true);
+            try writer.interface.flush();
+            while (true) {
+                var response = try replicationRead(&reader.interface);
+                defer response.deinit();
+                try std.testing.expectEqual(@as(u8, 'd'), response.tag);
+                if (response.bytes[0] == 'k' and response.bytes[17] == 0) break;
+            }
+        }
+        try frame(&writer.interface, 'c', "");
+        try frame(&writer.interface, 'Q', "IDENTIFY_SYSTEM\x00");
+        try writer.interface.flush();
+        var ready: usize = 0;
+        var completions: usize = 0;
+        while (ready < 2) {
+            var response = try replicationRead(&reader.interface);
+            defer response.deinit();
+            try std.testing.expect(response.tag != 'E');
+            if (response.tag == 'Z') ready += 1;
+            if (response.tag == 'C') completions += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), completions);
+        try frame(&writer.interface, 'X', "");
+        try writer.interface.flush();
+        listener.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_opens);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.replication_live_chunks);
+        try std.testing.expect(mock.replication_polls >= 3);
+        try std.testing.expectEqual(@as(u64, if (acknowledge) 48 else 0), mock.replication_ack);
+        try std.testing.expectEqual(@as(usize, if (acknowledge) 1 else 0), mock.replication_feedbacks);
+        try std.testing.expectEqual(@as(usize, 1), mock.renewals);
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    }
+}
+test "pgwire CopyBoth rejects future feedback and authorization revocation before payload" {
+    for ([_]bool{ false, true }) |revoke| {
+        var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .replication_revoke_after_poll = revoke };
+        var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = replication_test_limits });
+        defer listener.deinit();
+        const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+        defer socket.close(std.testing.io);
+        var buffer: [1024]u8 = undefined;
+        var reader = socket.reader(std.testing.io, &buffer);
+        _ = try replicationClientStart(socket, &reader.interface);
+        if (!revoke) {
+            var writer = socket.writer(std.testing.io, &.{});
+            try replicationStatus(&writer.interface, 10000, false);
+            try writer.interface.flush();
+        }
+        while (true) {
+            var response = try replicationRead(&reader.interface);
+            defer response.deinit();
+            if (response.tag == 'E') {
+                try std.testing.expect(std.mem.indexOf(u8, response.bytes, if (revoke) "42501" else "08P01") != null);
+                break;
+            }
+            if (revoke) return error.TestUnexpectedResult;
+        }
+        listener.deinit();
+        try std.testing.expectEqual(@as(u64, 0), mock.replication_ack);
+        try std.testing.expectEqual(@as(usize, 0), mock.replication_feedbacks);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.replication_live_chunks);
+    }
+}
+
+fn replicationDrainTransaction(reader: *std.Io.Reader) !void {
+    while (true) {
+        var response = try replicationRead(reader);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u8, 'd'), response.tag);
+        if (response.bytes[0] == 'w' and response.bytes[25] == 'C') return;
+    }
+}
+test "pgwire CopyBoth idle keepalives cannot extend a silent consumer deadline" {
+    var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true };
+    var limits = replication_test_limits;
+    limits.replication_timeout_ms = 1200;
+    limits.replication_keepalive_ms = 200;
+    // Waiting for a new poll must not spend the callback's own execution
+    // budget. Keepalive scheduling also precedes a longer poll interval.
+    limits.replication_callback_ms = 100;
+    limits.replication_poll_ms = 350;
+    var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = limits });
+    defer listener.deinit();
+    const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+    defer socket.close(std.testing.io);
+    var buffer: [1024]u8 = undefined;
+    var reader = socket.reader(std.testing.io, &buffer);
+    _ = try replicationClientStart(socket, &reader.interface);
+    try replicationDrainTransaction(&reader.interface);
+    var keepalive = try replicationRead(&reader.interface);
+    defer keepalive.deinit();
+    try std.testing.expectEqual(@as(u8, 'd'), keepalive.tag);
+    try std.testing.expectEqual(@as(u8, 'k'), keepalive.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 1), keepalive.bytes[17]);
+    while (true) {
+        var response = replicationRead(&reader.interface) catch |err| switch (err) {
+            error.EndOfStream, error.ReadFailed => break,
+            else => return err,
+        };
+        defer response.deinit();
+        if (response.tag == 'E') break;
+        try std.testing.expectEqual(@as(u8, 'd'), response.tag);
+        try std.testing.expectEqual(@as(u8, 'k'), response.bytes[0]);
+    }
+    listener.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_closes);
+    try std.testing.expectEqual(@as(usize, 0), mock.replication_feedbacks);
+    try std.testing.expectEqual(@as(u64, 0), mock.replication_ack);
+}
+test "pgwire CopyBoth cancel and shutdown join reader before releasing stream and credential" {
+    for ([_]bool{ false, true }) |cancel| {
+        var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true };
+        var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = replication_test_limits });
+        defer listener.deinit();
+        const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+        defer socket.close(std.testing.io);
+        var buffer: [1024]u8 = undefined;
+        var reader = socket.reader(std.testing.io, &buffer);
+        const key = try replicationClientStart(socket, &reader.interface);
+        try replicationDrainTransaction(&reader.interface);
+        if (cancel) {
+            try sendCancel(listener.address(), key.pid, key.key);
+            while (true) {
+                var response = try replicationRead(&reader.interface);
+                defer response.deinit();
+                if (response.tag == 'E') {
+                    try std.testing.expect(std.mem.indexOf(u8, response.bytes, "57014") != null);
+                    break;
+                }
+            }
+        }
+        listener.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.replication_live_chunks);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+        try std.testing.expectEqual(@as(usize, 1), mock.releases);
+        try std.testing.expectEqual(@as(u64, 0), mock.replication_ack);
+    }
+}
+
+test "pgwire CopyBoth validated reconnect feedback can precede rewound transaction replay" {
+    var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .replication_wait_for_feedback = true };
+    var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = replication_test_limits });
+    defer listener.deinit();
+    const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+    defer socket.close(std.testing.io);
+    var buffer: [1024]u8 = undefined;
+    var reader = socket.reader(std.testing.io, &buffer);
+    // 0/16 is inside the retained transaction. Its backend-approved rewind
+    // starts at Begin, while old durable client feedback may still say 0/16.
+    _ = try replicationClientStartAt(socket, &reader.interface, "0/16");
+    var writer = socket.writer(std.testing.io, &.{});
+    try replicationStatus(&writer.interface, 22, true);
+    try writer.interface.flush();
+    try replicationDrainTransaction(&reader.interface);
+    try frame(&writer.interface, 'c', "");
+    try writer.interface.flush();
+    while (true) {
+        var response = try replicationRead(&reader.interface);
+        defer response.deinit();
+        try std.testing.expect(response.tag != 'E');
+        if (response.tag == 'Z') break;
+    }
+    listener.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_feedbacks);
+    try std.testing.expectEqual(@as(u64, 0), mock.replication_ack);
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_closes);
+}
+
+test "pgwire snapshot imports dispatch only inside the current transaction" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn attach(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request, name: []const u8) !void {
+            const mock: *Mock = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", request.session_id.?);
+            try std.testing.expectEqualStrings("qualified-snapshot", name);
+            try request.check();
+            mock.setting_stream_opens += 1;
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "SET TRANSACTION SNAPSHOT 'qualified-snapshot'\x00");
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "SET TRANSACTION SNAPSHOT 'qualified-snapshot'\x00");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "SELECT 1\x00");
+    try frame(&input.writer, 'Q', "SET TRANSACTION SNAPSHOT 'qualified-snapshot'\x00");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var source = mock.source();
+    var vtable = source.vtable.*;
+    vtable.import_snapshot = Fixture.attach;
+    source.vtable = &vtable;
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    var session: protocol.Session = .{ .alloc = a, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
+    defer session.deinit();
+    try session.run();
+    try std.testing.expectEqual(@as(usize, 1), mock.setting_stream_opens);
+    try std.testing.expectEqual(@as(usize, 5), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "25001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "25P01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "SET\x00") != null);
 }
 
 test "pgwire setting-dependent portal retains its catalog incarnation across fresh descriptions" {

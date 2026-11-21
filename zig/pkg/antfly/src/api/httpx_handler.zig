@@ -363,6 +363,292 @@ fn requiresInternalServicePrincipal(path: []const u8) bool {
     return in_internal_namespace and !standby_exempt;
 }
 
+test "history grant ingress operation contracts" {
+    _ = @import("history_grant_operations.zig");
+    _ = @import("history_resolution_operations.zig");
+    _ = @import("history_publication_operations.zig");
+    _ = @import("history_owner_operations.zig");
+    _ = @import("history_decision_operations.zig");
+}
+
+test "history page ingress operation contracts" {
+    _ = @import("history_page_operations.zig");
+}
+
+test "history control ingress operation contracts" {
+    _ = @import("history_control_operations.zig");
+}
+
+test "history control ingress HTTP preserves recovery receipts and unknown failures" {
+    const a = std.testing.allocator;
+    const operations = @import("history_control_operations.zig");
+    const Fake = struct {
+        const Mode = enum { rejected, unknown, malformed, busy };
+        mode: Mode = .rejected,
+        calls: usize = 0,
+        fn run(ptr: *anyopaque, _: std.mem.Allocator, _: metadata_api.CatalogRouteFence, _: []const u8, input: operations.wire.Request, _: @import("antfly_local_sources").api_operation.RequestContext) !operations.wire.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return switch (self.mode) {
+                .rejected => .{ .version = 1, .receipt = input.receipt orelse .{ .term = 2, .index = 3 }, .outcome = .{ .rejected = .checkpoint_conflict } },
+                .unknown => error.RaftBatchWriteOutcomeUnknown,
+                .malformed => .{ .version = 1, .outcome = .superseded },
+                .busy => error.StorageBusy,
+            };
+        }
+    };
+    var fake: Fake = .{};
+    var source: AuthStatusSource = .{};
+    const secret = "history-control-service-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "history-test", .internal_service_accept_legacy_unauthenticated = true, .native_history_control = .{ .ptr = &fake, .execute_fn = Fake.run } }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    const path = "/internal/v1/groups/17/tables/docs/history/control-v1";
+    try std.testing.expect(requiresInternalServicePrincipal(path));
+    try std.testing.expectEqual(@as(?usize, operations.wire.max_bytes), @import("http_routes.zig").publicPostBodyLimit(path));
+    try std.testing.expect(@import("http_routes.zig").publicPostBodyLimit(path ++ "/extra") == null);
+    const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    const encoded_fence = try std.json.Stringify.valueAlloc(a, fence, .{});
+    defer a.free(encoded_fence);
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 17, .big);
+    std.mem.writeInt(u64, namespace[16..24], 19, .big);
+    const input: operations.wire.Request = .{ .version = 1, .operation = .recover, .receipt = .{ .term = 2, .index = 3 }, .command = .{ .collect = .{ .namespace = namespace, .authority = @splat(2) } } };
+    const body = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(body);
+    const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "17" }, .{ .name = "table_name", .value = "docs" } };
+    {
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        request.body = body;
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        context.params = &params;
+        var response = try handler.internalHistoryControl(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    }
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    for ([_]Fake.Mode{ .rejected, .unknown, .malformed, .busy }) |mode| {
+        fake.mode = mode;
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        request.body = body;
+        try request.setHeader(metadata_api.catalog_route_fence_header, encoded_fence);
+        try request.setHeader(internal_service_auth.header_name, token);
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        context.params = &params;
+        var response = try handler.internalHistoryControl(&context);
+        defer response.deinit();
+        const expected: u16 = switch (mode) {
+            .rejected, .unknown => 200,
+            .malformed => 500,
+            .busy => 503,
+        };
+        try std.testing.expectEqual(expected, response.status.code);
+        if (mode == .rejected) {
+            const decoded = try operations.wire.decodeResponse(a, response.body.?, input);
+            try std.testing.expect(decoded.confirmed());
+            try std.testing.expectEqual(.checkpoint_conflict, decoded.outcome.?.rejected);
+            try std.testing.expect(response.header(internal_batch_forwarding.outcome_header) == null);
+        } else {
+            try std.testing.expectEqualStrings(internal_batch_forwarding.outcome_unknown_v1, response.header(internal_batch_forwarding.outcome_header).?);
+            if (mode == .unknown) {
+                const decoded = try operations.wire.decodeResponse(a, response.body.?, input);
+                try std.testing.expectEqualDeep(input.receipt, decoded.receipt);
+                try std.testing.expect(!decoded.confirmed());
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+}
+
+test "source plan HTTP preserves authentication recovery and unknown outcomes" {
+    const a = std.testing.allocator;
+    const operations = @import("source_plan_operations.zig");
+    const Fake = struct {
+        const Mode = enum { rejected, unknown, malformed, busy };
+        mode: Mode = .rejected,
+        calls: usize = 0,
+        fn run(ptr: *anyopaque, allocator: std.mem.Allocator, _: metadata_api.CatalogRouteFence, _: []const u8, input: operations.wire.ControlRequest, _: @import("antfly_local_sources").api_operation.RequestContext) !operations.wire.ControlReply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return switch (self.mode) {
+                .rejected => .{ .request_digest = try input.digest(allocator), .receipt = input.receipt orelse .{ .term = 2, .index = 3 }, .outcome = .{ .rejected = .conflict } },
+                .unknown => error.RaftBatchWriteOutcomeUnknown,
+                .malformed => .{ .request_digest = @splat(0), .outcome = .superseded },
+                .busy => error.StorageBusy,
+            };
+        }
+    };
+    var fake: Fake = .{};
+    var source: AuthStatusSource = .{};
+    const secret = "source-plan-service-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "history-test", .internal_service_accept_legacy_unauthenticated = true, .native_source_plan_control = .{ .ptr = &fake, .execute_fn = Fake.run } }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    const path = "/internal/v1/groups/17/tables/docs/source-plan/control-v1";
+    try std.testing.expect(requiresInternalServicePrincipal(path));
+    try std.testing.expectEqual(@as(?usize, operations.wire.max_bytes), @import("http_routes.zig").publicPostBodyLimit(path));
+    try std.testing.expect(@import("http_routes.zig").publicPostBodyLimit(path ++ "/extra") == null);
+    var fixture = try operations.wire.test_support.Fixture.init();
+    const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = fixture.source_owner.metadata_incarnation, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    const encoded_fence = try std.json.Stringify.valueAlloc(a, fence, .{});
+    defer a.free(encoded_fence);
+    var input = try fixture.begin();
+    input.operation = .recover;
+    input.receipt = .{ .term = 2, .index = 3 };
+    const body = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(body);
+    const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "17" }, .{ .name = "table_name", .value = "docs" } };
+    {
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        request.body = body;
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        context.params = &params;
+        var response = try handler.internalSourcePlanControl(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    }
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    for ([_]Fake.Mode{ .rejected, .unknown, .malformed, .busy }) |mode| {
+        fake.mode = mode;
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        request.body = body;
+        try request.setHeader(metadata_api.catalog_route_fence_header, encoded_fence);
+        try request.setHeader(internal_service_auth.header_name, token);
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        context.params = &params;
+        var response = try handler.internalSourcePlanControl(&context);
+        defer response.deinit();
+        const expected: u16 = switch (mode) {
+            .rejected, .unknown => 200,
+            .malformed, .busy => 503,
+        };
+        try std.testing.expectEqual(expected, response.status.code);
+        if (mode == .rejected) {
+            var parsed = try std.json.parseFromSlice(operations.wire.ControlReply, a, response.body.?, .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            const decoded = parsed.value;
+            try decoded.validate(input, try input.digest(a));
+            try std.testing.expect(decoded.confirmed());
+            try std.testing.expectEqual(.conflict, decoded.outcome.?.rejected);
+            try std.testing.expect(response.header(internal_batch_forwarding.outcome_header) == null);
+        } else {
+            try std.testing.expectEqualStrings(internal_batch_forwarding.outcome_unknown_v1, response.header(internal_batch_forwarding.outcome_header).?);
+            if (mode == .unknown) {
+                var parsed = try std.json.parseFromSlice(operations.wire.ControlReply, a, response.body.?, .{ .ignore_unknown_fields = false });
+                defer parsed.deinit();
+                const decoded = parsed.value;
+                try decoded.validate(input, try input.digest(a));
+                try std.testing.expectEqualDeep(input.receipt, decoded.receipt);
+                try std.testing.expect(!decoded.confirmed());
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+}
+
+test "history control ingress mounted route rejects unsigned migration traffic" {
+    const a = std.testing.allocator;
+    var source: AuthStatusSource = .{};
+    const secret = "history-control-mounted-test-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "history-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api_server);
+    defer server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(a, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    for ([_][]const u8{ "control-v1", "page-v1", "bootstrap-page-v1", "grant-v1", "resolution-v1", "publication-v1" }) |leaf| {
+        const url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/history/{s}", .{ base, leaf });
+        defer a.free(url);
+        var unsigned = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+        defer unsigned.deinit();
+        try std.testing.expectEqual(@as(u16, 401), unsigned.status.code);
+        const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token } };
+        var authenticated = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &headers, 20);
+        defer authenticated.deinit();
+        try std.testing.expectEqual(@as(u16, 400), authenticated.status.code);
+    }
+}
+
+test "history control ingress completion batches reject unsigned migration traffic" {
+    const a = std.testing.allocator;
+    var source: AuthStatusSource = .{};
+    const secret = "completion-batch-migration-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "history-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api_server);
+    defer server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(a, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/batch-routed-v1", .{base});
+    defer a.free(url);
+    const body = try batch_api.encodeBatchRequest(a, .{ .timestamp_ns = 1, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = @splat(3), .topology_epoch = 1, .completion_owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } } } });
+    defer a.free(body);
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    const unsigned_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_batch_forwarding.remaining_ms_header, "1000" }, .{ internal_batch_forwarding.forwards_remaining_header, "0" }, .{ internal_batch_forwarding.campaign_allowed_header, "false" } };
+    var unsigned = try requestWithRetry(&client, client_io.io(), .POST, url, body, &unsigned_headers, 20);
+    defer unsigned.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unsigned.status.code);
+    const signed_headers = unsigned_headers ++ [_][2][]const u8{.{ internal_service_auth.header_name, token }};
+    var signed = try requestWithRetry(&client, client_io.io(), .POST, url, body, &signed_headers, 20);
+    defer signed.deinit();
+    // Reaches the configured writer boundary, which is deliberately absent.
+    try std.testing.expectEqual(@as(u16, 503), signed.status.code);
+    // The older endpoint also decodes canonical private batches. Completion
+    // commands cannot use its optional migration allowance to bypass auth.
+    const legacy_url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/batch", .{base});
+    defer a.free(legacy_url);
+    var legacy_unsigned = try requestWithRetry(&client, client_io.io(), .POST, legacy_url, body, &.{.{ "content-type", "application/json" }}, 20);
+    defer legacy_unsigned.deinit();
+    try std.testing.expectEqual(@as(u16, 401), legacy_unsigned.status.code);
+}
+
+test "internal capabilities advertise only the serving history apply profile" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .GET, "http://127.0.0.1/internal/v1/capabilities");
+    defer request.deinit();
+    var context = httpx.Context.init(a, std.testing.io, &request);
+    defer context.deinit();
+    // Capability serving does not depend on a particular hosted table/root.
+    var handler: AntflyApiHandler = undefined;
+    var response = try handler.internalCapabilities(&context);
+    defer response.deinit();
+    const Parsed = struct { data_raft_batch_protocol_version: u16, catalog_route_fence_protocol_version: u16 };
+    var parsed = try std.json.parseFromSlice(Parsed, a, response.body.?, .{});
+    defer parsed.deinit();
+    const protocol = @import("../common/data_raft_protocol.zig");
+    try std.testing.expectEqual(protocol.batch_protocol_version, protocol.maximumForHistoryApply(true));
+    try std.testing.expect(protocol.maximumForHistoryApply(false) < protocol.batch_history_control_protocol_version);
+    const expected = if (@import("storage_source_options").control_only) protocol.batch_protocol_version else protocol.batch_history_control_protocol_version - 1;
+    try std.testing.expectEqual(expected, parsed.value.data_raft_batch_protocol_version);
+    try std.testing.expectEqual(metadata_api.catalog_route_fence_protocol_current, parsed.value.catalog_route_fence_protocol_version);
+}
+
 test "internal namespace requires a service principal except hot standby" {
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1"));
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1/capabilities"));
@@ -1546,6 +1832,12 @@ pub const AntflyApiHandler = struct {
             try self.registerProbes(server);
         }
 
+        try server.post("/db/v1/changefeeds", httpx.Handler.bind(self, createChangefeed));
+        try server.get("/db/v1/changefeeds/:feed_id", httpx.Handler.bind(self, inspectChangefeed));
+        try server.delete("/db/v1/changefeeds/:feed_id", httpx.Handler.bind(self, closeChangefeed));
+        try server.get("/db/v1/changefeeds/:feed_id/events", httpx.Handler.bind(self, pullChangefeed));
+        try server.post("/db/v1/changefeeds/:feed_id/ack", httpx.Handler.bind(self, acknowledgeChangefeed));
+
         const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*", routes.memory_mcp_v1, routes.memory_mcp_v1_agent };
         const mcp_handler = httpx.Handler.bind(self, mcpRoute);
         inline for (mcp_paths) |path| {
@@ -1622,7 +1914,55 @@ pub const AntflyApiHandler = struct {
         const group_prefix = routes.internal_groups_prefix ++ ":group_id";
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit"))
+            try server.postWithBodyLimit(table_prefix ++ routes.source_retirement_control_suffix, @import("source_retirement_operations.zig").wire.max_request_bytes, httpx.Handler.bind(self, internalSourceRetirementControl))
+        else
+            try server.post(table_prefix ++ routes.source_retirement_control_suffix, httpx.Handler.bind(self, internalSourceRetirementControl));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit"))
+            try server.postWithBodyLimit(table_prefix ++ routes.source_scope_control_suffix, @import("source_scope_control_operations.zig").wire.max_request_bytes, httpx.Handler.bind(self, internalSourceScopeControl))
+        else
+            try server.post(table_prefix ++ routes.source_scope_control_suffix, httpx.Handler.bind(self, internalSourceScopeControl));
+        inline for (.{
+            .{ routes.source_plan_control_suffix, internalSourcePlanControl },
+            .{ routes.source_plan_observe_suffix, internalSourcePlanObserve },
+            .{ routes.source_scope_observe_suffix, internalSourceScopeObserve },
+            .{ routes.source_producer_closure_observe_suffix, internalSourceProducerClosureObserve },
+            .{ routes.source_producer_close_suffix, internalSourceProducerClose },
+            .{ routes.legacy_terminal_suffix, internalLegacyTerminal },
+            .{ routes.legacy_inventory_suffix, internalLegacyInventory },
+            .{ routes.source_checkpoint_observe_suffix, internalSourceCheckpointObserve },
+            .{ routes.source_plan_chunk_suffix, internalSourcePlanChunk },
+        }) |route| {
+            if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit"))
+                try server.postWithBodyLimit(table_prefix ++ route[0], @import("source_plan_operations.zig").wire.max_bytes, httpx.Handler.bind(self, route[1]))
+            else
+                try server.post(table_prefix ++ route[0], httpx.Handler.bind(self, route[1]));
+        }
         try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_control_suffix, @import("history_control_operations.zig").wire.max_bytes, httpx.Handler.bind(self, internalHistoryControl));
+        } else try server.post(table_prefix ++ routes.history_control_suffix, httpx.Handler.bind(self, internalHistoryControl));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_page_suffix, @import("history_page_operations.zig").max_request_bytes, httpx.Handler.bind(self, internalHistoryPage));
+        } else try server.post(table_prefix ++ routes.history_page_suffix, httpx.Handler.bind(self, internalHistoryPage));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_bootstrap_page_suffix, @import("history_page_operations.zig").max_bootstrap_request_bytes, httpx.Handler.bind(self, internalHistoryBootstrapPage));
+        } else try server.post(table_prefix ++ routes.history_bootstrap_page_suffix, httpx.Handler.bind(self, internalHistoryBootstrapPage));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_grant_suffix, @import("history_grant_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryGrant));
+        } else try server.post(table_prefix ++ routes.history_grant_suffix, httpx.Handler.bind(self, internalHistoryGrant));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_resolution_suffix, @import("history_resolution_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryResolution));
+        } else try server.post(table_prefix ++ routes.history_resolution_suffix, httpx.Handler.bind(self, internalHistoryResolution));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_decision_suffix, @import("history_decision_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryDecision));
+        } else try server.post(table_prefix ++ routes.history_decision_suffix, httpx.Handler.bind(self, internalHistoryDecision));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_owner_suffix, @import("history_owner_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryOwner));
+        } else try server.post(table_prefix ++ routes.history_owner_suffix, httpx.Handler.bind(self, internalHistoryOwner));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_publication_suffix, @import("history_publication_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryPublication));
+        } else try server.post(table_prefix ++ routes.history_publication_suffix, httpx.Handler.bind(self, internalHistoryPublication));
         try self.registerInternalSqlRoutes(server);
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
@@ -3645,6 +3985,12 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 500, "internal server error"),
         };
         defer input.deinit(ctx.allocator);
+        if (batch_api.requiresCompletionProtocol(input.req)) {
+            const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+            var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+            defer identity.deinit(self.api_server.alloc);
+            if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        }
         if (input.req.relational_topology) |command| if (command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement)
             return textResponse(ctx, 403, "parent activation requires owner-local metadata proof");
         const result = self.internalGroupOperations().batch(
@@ -3698,6 +4044,8 @@ pub const AntflyApiHandler = struct {
         // A Raft apply can reject validation after proposal. Preserve its typed
         // reason, without claiming the operation was never proposed. The
         // coordinator still has to establish an authoritative abort.
+        if (@import("source_transaction_errors.zig").classify(err)) |reason|
+            return textResponse(ctx, @import("source_transaction_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_row_errors.zig").classify(err)) |reason|
             return textResponse(ctx, @import("relational_row_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_integrity_errors.zig").classify(err)) |reason|
@@ -3711,9 +4059,342 @@ pub const AntflyApiHandler = struct {
         return textResponse(ctx, 429, "RetainedEffectsFull");
     }
 
+    fn internalHistoryDecision(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_decision_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyDecisionFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyDecisionFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyDecisionFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyDecisionFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "history decision request exceeds byte limit");
+        var result = operations.execute(self.api_server.cfg.native_history_decision, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyDecisionFailure(ctx, err);
+        defer result.deinit();
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result.value);
+    }
+    fn historyDecisionFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        try ctx.setHeader("Cache-Control", "no-store");
+        const failure = @import("history_decision_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalHistoryOwner(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_owner_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyOwnerFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyOwnerFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyOwnerFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyOwnerFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "history owner request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_history_owner, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyOwnerFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn historyOwnerFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        try ctx.setHeader("Cache-Control", "no-store");
+        const failure = @import("history_owner_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalHistoryPublication(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_publication_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "history publication request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_history_publication, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyPublicationFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn historyPublicationFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        try ctx.setHeader("Cache-Control", "no-store");
+        const failure = @import("history_publication_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalHistoryResolution(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_resolution_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "history resolution request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_history_resolution, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyResolutionFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn historyResolutionFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        const failure = @import("history_resolution_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalHistoryGrant(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_grant_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return historyGrantFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyGrantFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "history grant request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_history_grant, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyGrantFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn historyGrantFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        const failure = @import("history_grant_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalHistoryPage(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalHistoryPageFor(ctx, false);
+    }
+
+    fn internalHistoryBootstrapPage(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalHistoryPageFor(ctx, true);
+    }
+
+    fn internalHistoryPageFor(self: *AntflyApiHandler, ctx: *httpx.Context, comptime bootstrap: bool) !httpx.Response {
+        const operations = @import("history_page_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return historyPageFailure(ctx, error.InvalidHistoryPageRequest);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyPageFailure(ctx, error.InvalidHistoryPageRequest);
+        if (body.len > (if (bootstrap) operations.max_bootstrap_request_bytes else operations.max_request_bytes)) return textResponse(ctx, 413, "history page request exceeds byte limit");
+        const context = operationContext(ctx, null);
+        const encoded = (if (bootstrap)
+            operations.Bootstrap.execute(self.api_server.cfg.native_history_bootstrap_page, ctx.allocator, params.group_id, params.table_name, body, context)
+        else
+            operations.execute(self.api_server.cfg.native_history_page, ctx.allocator, params.group_id, params.table_name, body, context)) catch |err| return historyPageFailure(ctx, err);
+        errdefer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/octet-stream");
+        try ctx.setHeader("Cache-Control", "no-store");
+        _ = ctx.response.bodyOwned(ctx.allocator, encoded);
+        return ctx.response.build();
+    }
+
+    fn historyPageFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        const failure = @import("history_page_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalHistoryControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        // Retention mutations never accept unsigned rolling-upgrade traffic.
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid history control path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("history_control_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing history control request");
+        if (body.len > operations.wire.max_bytes) return textResponse(ctx, 413, "history control exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_history_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| {
+            if (err == error.InvalidHistoryControlResponse) {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+                return textResponse(ctx, 500, "invalid history control response");
+            }
+            const status: u16 = switch (err) {
+                error.ChangefeedCapabilityUnsupported => 501,
+                error.TopologyChanged, error.HistoryResynchronizationRequired, error.HistoryConsumerConflict, error.ConflictingOrderedApplyReceipt => 409,
+                error.GroupLeaderUnavailable, error.LeaderUnavailable, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadUnavailable, error.ResourceBudgetExceeded, error.Canceled, error.Cancelled, error.DeadlineExceeded, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout => 503,
+                error.InvalidCatalogRouteFence, error.InvalidHistoryControlWire, error.InvalidCatalogRouteFenceProtocol, error.UnsupportedCatalogRouteFence, error.MissingField, error.UnknownField, error.DuplicateField, error.UnexpectedToken, error.SyntaxError, error.Overflow => 400,
+                else => 500,
+            };
+            // Callback errors cannot prove whether a proposal was accepted.
+            // Recovery always uses the original receipt, never an automatic retry.
+            try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+            return textResponse(ctx, status, "history control unavailable");
+        };
+        if (!result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        return ctx.json(result);
+    }
+
+    fn sourcePlanError(ctx: *httpx.Context, err: anyerror, mutation: bool) !httpx.Response {
+        if (mutation) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const status: u16 = switch (err) {
+            error.ChangefeedCapabilityUnsupported => 501,
+            error.TopologyChanged, error.HistoryResynchronizationRequired, error.SourceReceiptExpired, error.SourcePayloadConflict, error.SourceCheckpointConflict, error.SourceBindingConflict, error.ConflictingOrderedApplyReceipt => 409,
+            error.GroupLeaderUnavailable, error.LeaderUnavailable, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadUnavailable, error.ResourceBudgetExceeded, error.Canceled, error.Cancelled, error.DeadlineExceeded, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout, error.SourcePendingWork, error.SourceOutcomeUnresolved => 503,
+            error.InvalidCatalogRouteFence, error.InvalidSourcePlanWire, error.InvalidSourceAdmission, error.InvalidTxnRecord, error.InvalidCatalogRouteFenceProtocol, error.UnsupportedCatalogRouteFence, error.MissingField, error.UnknownField, error.DuplicateField, error.UnexpectedToken, error.SyntaxError, error.Overflow => 400,
+            else => 500,
+        };
+        return textResponse(ctx, status, "source plan operation unavailable");
+    }
+    fn internalSourcePlanControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .control);
+    }
+    fn internalSourceScopeControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid source scope path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_scope_control_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing source scope request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "source scope request exceeds byte limit");
+        const input = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        const mutation = input.operation == .submit;
+        const result = operations.execute(self.api_server.cfg.native_source_scope_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, mutation);
+        if (mutation and !result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, mutation);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalSourceRetirementControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid source retirement path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_retirement_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing source retirement request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "source retirement request exceeds byte limit");
+        var decoded = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        defer decoded.deinit();
+        const input = decoded.value;
+        const mutation = input.operation == .submit;
+        var result = operations.execute(self.api_server.cfg.native_source_retirement_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, mutation);
+        defer result.deinit();
+        if (mutation and !result.value.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result.value) catch |err| return sourcePlanError(ctx, err, mutation);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalSourceProducerClose(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid producer close path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_producer_control_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing producer close request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "producer close request exceeds byte limit");
+        const input = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        const result = operations.execute(self.api_server.cfg.native_source_producer_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
+        if (result.outcome == null) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, true);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalLegacyInventory(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid legacy inventory path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_legacy_inventory_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing legacy inventory request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "legacy inventory request exceeds byte limit");
+        const input = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        var result = operations.execute(self.api_server.cfg.native_legacy_inventory, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
+        defer result.deinit(ctx.allocator);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, true);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalLegacyTerminal(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid legacy terminal path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_legacy_terminal_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing legacy terminal request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "legacy terminal request exceeds byte limit");
+        const input = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        const result = operations.execute(self.api_server.cfg.native_legacy_terminal, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
+        if (result.outcome == null) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, true);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalSourceProducerClosureObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .producer_closure);
+    }
+    fn internalSourceScopeObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .scope);
+    }
+    fn internalSourceCheckpointObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .checkpoint);
+    }
+    fn internalSourcePlanObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .observe);
+    }
+    fn internalSourcePlanChunk(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .chunk);
+    }
+    fn internalSourcePlan(self: *AntflyApiHandler, ctx: *httpx.Context, comptime kind: enum { control, observe, chunk, checkpoint, scope, producer_closure }) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid source plan path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_plan_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing source plan request");
+        const maximum = if (kind == .producer_closure) @import("source_producer_closure_operations.zig").wire.max_query_bytes else if (kind == .scope) @import("source_scope_operations.zig").wire.max_bytes else if (kind == .checkpoint) @import("source_checkpoint_operations.zig").wire.max_request_bytes else operations.wire.max_bytes;
+        if (body.len > maximum) return textResponse(ctx, 413, "source recovery request exceeds byte limit");
+        switch (kind) {
+            .control => {
+                const result = operations.executeControl(self.api_server.cfg.native_source_plan_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
+                if (!result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+                return ctx.json(result);
+            },
+            .producer_closure => return ctx.json(@import("source_producer_closure_operations.zig").execute(self.api_server.cfg.native_source_producer_closure_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
+            .scope => return ctx.json(@import("source_scope_operations.zig").execute(self.api_server.cfg.native_source_scope_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
+            .checkpoint => return ctx.json(@import("source_checkpoint_operations.zig").execute(self.api_server.cfg.native_source_checkpoint_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
+            .observe => return ctx.json(operations.executeObserve(self.api_server.cfg.native_source_plan_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
+            .chunk => {
+                const result = operations.executeChunk(self.api_server.cfg.native_source_plan_chunk, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false);
+                defer ctx.allocator.free(result.chunk_base64);
+                return ctx.json(result);
+            },
+        }
+    }
+
     fn internalCapabilities(_: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return ctx.json(.{
-            .data_raft_batch_protocol_version = internal_batch_forwarding.raft_batch_protocol_version,
+            .data_raft_batch_protocol_version = @import("../common/data_raft_protocol.zig").maximumForHistoryApply(@import("storage_source_options").control_only),
             .catalog_route_fence_protocol_version = metadata_api.catalog_route_fence_protocol_current,
         });
     }
@@ -4109,6 +4790,14 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 500, "internal server error"),
         };
         defer input.deinit(ctx.allocator);
+        if (batch_api.requiresCompletionProtocol(input.req)) {
+            // Completion v2 has no released unauthenticated transport. The
+            // legacy rolling-upgrade allowance must not grant this authority.
+            const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+            var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+            defer identity.deinit(self.api_server.alloc);
+            if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        }
         if (input.req.relational_topology) |command| if (command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement)
             return textResponse(ctx, 403, "parent activation requires owner-local metadata proof");
         const result = self.internalGroupOperations().routedBatch(
@@ -4181,6 +4870,8 @@ pub const AntflyApiHandler = struct {
         err: internal_group_operations.Error,
         phase: InternalTxnPhase,
     ) !httpx.Response {
+        if (@import("source_transaction_errors.zig").classify(err)) |reason|
+            return textResponse(ctx, @import("source_transaction_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_row_errors.zig").classify(err)) |reason|
             return textResponse(ctx, @import("relational_row_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_integrity_errors.zig").classify(err)) |relational_error|
@@ -4226,8 +4917,14 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         var input = distributed_txn.parseTxnBeginRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnBeginRequest(ctx.allocator, &input);
-        self.internalGroupOperations().txnBegin(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+        self.internalGroupOperations().txnBegin(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err| {
+            if (err == error.DecisionConflict and input.source_producer != .unlabelled) {
+                const proof = try distributed_txn.encodeProducerBeginConflict(ctx.allocator, input);
+                defer ctx.allocator.free(proof);
+                return textResponse(ctx, 409, proof);
+            }
             return internalTxnErrorResponse(ctx, err, .begin);
+        };
         return ctx.json(struct {}{});
     }
 
@@ -4299,6 +4996,116 @@ pub const AntflyApiHandler = struct {
     // ---------------------------------------------------------------
     // Authentication helper
     // ---------------------------------------------------------------
+
+    fn createChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const api = @import("changefeed_public.zig");
+        const key = ctx.header("Idempotency-Key") orelse return jsonErrorResponse(ctx, 400, "missing changefeed idempotency key");
+        const bytes = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing changefeed definition");
+        if (bytes.len > 8192) return jsonErrorResponse(ctx, 400, "invalid changefeed definition");
+        const parsed = std.json.parseFromSlice(api.Create, ctx.allocator, bytes, .{ .parse_numbers = false }) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed definition");
+        defer parsed.deinit();
+        const result = api.create(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, key, parsed.value, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        try ctx.setHeader("cache-control", "no-store");
+        _ = ctx.status(201);
+        return ctx.json(.{
+            .id = std.fmt.bytesToHex(result.id, .lower),
+            .cursor = std.fmt.bytesToHex(result.cursor, .lower),
+            .expires_at = result.expires_at,
+        });
+    }
+
+    fn inspectChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const id = feedId(ctx) orelse return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        const progress = @import("changefeed_public.zig").inspect(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, id, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        try ctx.setHeader("cache-control", "no-store");
+        return ctx.json(progress);
+    }
+
+    fn feedId(ctx: *httpx.Context) ?@import("../metadata/changefeed_control.zig").Id {
+        var id: @import("../metadata/changefeed_control.zig").Id = undefined;
+        const raw = ctx.param("feed_id") orelse return null;
+        if (raw.len != id.len * 2) return null;
+        _ = std.fmt.hexToBytes(&id, raw) catch return null;
+        return id;
+    }
+
+    fn closeChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const api = @import("changefeed_public.zig");
+        const id = feedId(ctx) orelse return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        api.close(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, id, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        try ctx.setHeader("cache-control", "no-store");
+        return ctx.status(204).text("");
+    }
+
+    fn pullChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const feed = @import("../metadata/changefeed_delivery.zig");
+        var limits: feed.Limits = .{};
+        if (ctx.query("limit")) |value| limits.events = std.fmt.parseInt(u32, value, 10) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed limit");
+        if (ctx.query("max_bytes")) |value| limits.bytes = std.fmt.parseInt(u32, value, 10) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed byte limit");
+        return self.changefeedRequest(ctx, ctx.query("after") orelse "", limits);
+    }
+
+    fn acknowledgeChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const bytes = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing changefeed checkpoint");
+        if (bytes.len > 256) return jsonErrorResponse(ctx, 400, "invalid changefeed checkpoint");
+        const parsed = std.json.parseFromSlice(struct { cursor: []const u8 }, ctx.allocator, bytes, .{}) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed checkpoint");
+        defer parsed.deinit();
+        return self.changefeedRequest(ctx, parsed.value.cursor, null);
+    }
+
+    fn changefeedRequest(self: *AntflyApiHandler, ctx: *httpx.Context, cursor: []const u8, limits: ?@import("../metadata/changefeed_delivery.zig").Limits) !httpx.Response {
+        const api = @import("changefeed_public.zig");
+        var selection: api.Selection = undefined;
+        const id = ctx.param("feed_id") orelse "";
+        if (id.len != selection.id.len * 2) return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        if (cursor.len != selection.after.len * 2) return jsonErrorResponse(ctx, 400, "invalid changefeed cursor");
+        _ = std.fmt.hexToBytes(&selection.id, id) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        _ = std.fmt.hexToBytes(&selection.after, cursor) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed cursor");
+        var result = api.execute(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, selection, limits, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        defer result.deinit();
+        try ctx.setHeader("cache-control", "no-store");
+        return switch (result) {
+            .page => |page| blk: {
+                const latest = std.fmt.bytesToHex(page.cursor, .lower);
+                try ctx.setHeader("Antfly-Changefeed-Cursor", &latest);
+                var body = try ctx.allocator.dupe(u8, page.body);
+                errdefer ctx.allocator.free(body);
+                break :blk try ownedJsonResponse(ctx, 200, &body, ctx.allocator);
+            },
+            .acknowledged => |checkpoint| ctx.json(.{ .cursor = std.fmt.bytesToHex(checkpoint, .lower) }),
+        };
+    }
+
+    fn changefeedError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        switch (err) {
+            error.Forbidden, error.Unauthorized, error.UserNotFound, error.ApiKeyExpired, error.ApiKeyNotFound => return jsonErrorResponse(ctx, 403, "changefeed access denied"),
+            error.InvalidChangefeed => return jsonErrorResponse(ctx, 400, "invalid changefeed request"),
+            error.ChangefeedResynchronizationRequired, error.ChangefeedCursorExpired, error.ChangefeedLeaseExpired, error.HistoryResynchronizationRequired, error.TopologyChanged => return jsonErrorResponse(ctx, 409, "changefeed_resynchronization_required"),
+            error.ChangefeedConflict, error.MetadataMutationOutcomeUnknown => return jsonErrorResponse(ctx, 409, "changefeed_retry_required"),
+            error.ChangefeedBackpressure, error.HistoryTooLarge => return jsonErrorResponse(ctx, 429, "changefeed_backpressure"),
+            error.ChangefeedCapabilityUnsupported => return jsonErrorResponse(ctx, 501, "changefeed_capability_unsupported"),
+            error.ReadUnavailable, error.ReadIndexTimeout, error.StorageReadTemporarilyUnavailable, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DeadlineExceeded => return jsonErrorResponse(ctx, 503, "changefeed_unavailable"),
+            else => return err,
+        }
+    }
 
     fn authenticate(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
         if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null and
@@ -5465,6 +6272,7 @@ pub const AntflyApiHandler = struct {
             .transaction => source.commitTransactionWithCancellation(alloc, prepared.tables, commit_req.sync_level, commit_request.cancellation),
             .multi_batch => source.commitBatchWithCancellation(alloc, prepared.tables, commit_req.sync_level, commit_request.cancellation),
         }) catch |err| switch (err) {
+            error.ChangefeedCapabilityUnsupported => return textResponse(ctx, 503, "transaction capability unavailable"),
             error.TransactionTooLarge => return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
             error.InvalidBatchRequest,
             error.InvalidArgument,
@@ -6305,6 +7113,7 @@ pub const AntflyApiHandler = struct {
             session.sync_level,
             commit_request.cancellation,
         ) catch |err| rejected: {
+            if (err == error.ChangefeedCapabilityUnsupported) return textResponse(ctx, 503, "transaction capability unavailable; retry this transaction id");
             const rejection = transactions_api.classifyCommitRejection(session, err);
             if (rejection == .ambiguous) return textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying");
             if (rejection == .fresh) {
@@ -12835,6 +13644,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -13101,7 +13911,7 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
         next_commit_error: ?anyerror = error.EnrichmentWaitCanceled,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
-            return .{ .ptr = self, .vtable = &.{
+            return .{ .ptr = self, .supports_transaction_producers = true, .vtable = &.{
                 .batch = batch,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
@@ -18781,6 +19591,159 @@ test "httpx hidden handoff receipt rejects public caller even in legacy internal
     }
 }
 
+test "httpx source scope control refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-scope/control-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalSourceScopeControl(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx source producer closure observe refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-producers/observe-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalSourceProducerClosureObserve(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx source producer control refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-producers/close-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalSourceProducerClose(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx source legacy terminal refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-producers/legacy-terminal-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalLegacyTerminal(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx source legacy inventory refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-producers/legacy-inventory-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalLegacyInventory(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx changefeed create requires an idempotency key and authenticated credential" {
+    const a = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(a, .{}, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    for ([_]?[]const u8{ null, "request-1" }, [_]u16{ 400, 403 }) |key, expected| {
+        var request = try httpx.Request.init(a, .POST, "http://node/db/v1/changefeeds");
+        defer request.deinit();
+        if (key) |value| try request.setHeader("Idempotency-Key", value);
+        request.body = "{\"tables\":[\"docs\"]}";
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.createChangefeed(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(expected, response.status.code);
+    }
+}
+
+test "httpx changefeed pull rejects short cursors and requires authentication for valid cursors" {
+    const a = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(a, .{}, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    for ([_][]const u8{ "ab", "abababababababababababababababababababababababababababababababab" }, [_]u16{ 400, 403 }) |cursor, expected| {
+        const url = try std.fmt.allocPrint(a, "http://node/db/v1/changefeeds/{s}/events?after={s}", .{ "01010101010101010101010101010101", cursor });
+        defer a.free(url);
+        var request = try httpx.Request.init(a, .GET, url);
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        const params = [_]httpx.RouteParam{.{ .name = "feed_id", .value = "01010101010101010101010101010101" }};
+        ctx.params = &params;
+        var response = try handler.pullChangefeed(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(expected, response.status.code);
+    }
+}
+
+test "httpx source scope control reports phase conflict and unresolved results conservatively" {
+    inline for (.{ .{ error.SourceBindingConflict, @as(u16, 409) }, .{ error.SourcePendingWork, @as(u16, 503) }, .{ error.SourceOutcomeUnresolved, @as(u16, 503) } }) |case| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/internal/v1/groups/7/tables/rows/source-scope/control-v1");
+        defer request.deinit();
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try AntflyApiHandler.sourcePlanError(&ctx, case[0], true);
+        defer response.deinit();
+        try std.testing.expectEqual(case[1], response.status.code);
+        try std.testing.expectEqualStrings(internal_batch_forwarding.outcome_unknown_v1, response.headers.get(internal_batch_forwarding.outcome_header).?);
+    }
+}
+
 test "httpx FK source control rejects missing service token in legacy internal mode" {
     const alloc = std.testing.allocator;
     var source = AuthStatusSource{};
@@ -22955,4 +23918,24 @@ test "distributed SQL API control routes authenticate cancellation and share ter
     var response = try server.router.find(.POST, transport.result_path, &params).?.handler.invoke(&ctx);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 409), response.status.code);
+}
+
+test "httpx source scope retirement control refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-retirement/control-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalSourceRetirementControl(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
 }

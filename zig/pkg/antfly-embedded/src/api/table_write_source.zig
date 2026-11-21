@@ -23,6 +23,14 @@ const db_mod = struct {
     pub const TextMemoryAttributionStats = @import("../storage/db/text_memory_stats.zig").TextMemoryAttributionStats;
 };
 const backend_types = @import("../storage/backend_types.zig");
+pub const history_consumer = @import("../storage/history_consumer.zig");
+pub const history_grant_wire = @import("../storage/history_grant_wire.zig");
+pub const history_resolution_wire = @import("../storage/history_resolution_wire.zig");
+pub const history_ordered = @import("../storage/history_ordered.zig");
+pub const history_bootstrap_wire = @import("../storage/history_bootstrap_wire.zig");
+pub const history_page = @import("../storage/history_page.zig");
+pub const history_page_wire = @import("../storage/history_page_wire.zig");
+pub const changefeed_projection = @import("../common/changefeed_projection.zig");
 const table_create_contract = @import("table_create_contract.zig");
 const backup_contract = @import("backup_contract.zig");
 const distributed_txn = @import("distributed_txn_contract.zig");
@@ -80,6 +88,11 @@ pub const TableWriteSource = struct {
     /// Transaction-ID commits enforce owner-routed range guards atomically
     /// with primary writes, including read-only guard participants.
     supports_sql_range_guards: bool = false,
+    /// Understood on supported transaction shapes; unsupported shapes fail
+    /// explicitly rather than dropping an origin in a legacy fallback.
+    supports_transaction_producers: bool = false,
+    /// Reviewed BEGIN/PREPARE callbacks preserve explicit native origin.
+    supports_transaction_producer_phases: bool = false,
 
     pub const VTable = struct {
         activate_range_tracking: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("operation.zig").RequestContext) anyerror!void = null,
@@ -645,6 +658,17 @@ pub const TableWriteSource = struct {
             index_json: ?[]const u8,
             stamp: metadata_api.CatalogMutationStamp,
         ) anyerror!?void = null,
+        /// Missing capability is unsupported; a null result means the original
+        /// destination has authoritatively found no admission.
+        admit_source_transaction: ?*const fn (*anyopaque, std.mem.Allocator, distributed_txn.TableCommitRequest, db_mod.types.CancellationToken) anyerror!distributed_txn.CommitOutcome = null,
+        native_source_admission_namespace: ?*const fn (*anyopaque) anyerror![24]u8 = null,
+        resolve_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command, db_mod.types.SyncLevel, db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome = null,
+        release_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command) anyerror!void = null,
+        retire_source_attempt: ?*const fn (*anyopaque, @import("../storage/source_admission.zig").Command) anyerror![@import("../storage/source_admission.zig").fence_size]u8 = null,
+        /// Private native owner capabilities. Appended to preserve callback
+        /// offsets for existing consumers; missing capability is unsupported.
+        native_history_consumer_control: ?*const fn (*anyopaque, history_consumer.Command) anyerror!history_consumer.Result = null,
+        native_history_page: ?*const fn (*anyopaque, std.mem.Allocator, history_page.Request) anyerror!history_page.Page = null,
     };
 
     pub fn activateRangeTracking(self: TableWriteSource, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
@@ -652,6 +676,42 @@ pub const TableWriteSource = struct {
         return BoundaryAbi.call("activate_range_tracking", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, context });
     }
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn admitSourceTransaction(self: TableWriteSource, alloc: std.mem.Allocator, table: distributed_txn.TableCommitRequest, cancellation: db_mod.types.CancellationToken) !distributed_txn.CommitOutcome {
+        if (table.source_producer != .unlabelled) return error.SourceTransactionIdentityConflict;
+        const callback = self.vtable.admit_source_transaction orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("admit_source_transaction", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, cancellation });
+    }
+
+    pub fn retireSourceAttempt(self: TableWriteSource, command: @import("../storage/source_admission.zig").Command) ![@import("../storage/source_admission.zig").fence_size]u8 {
+        const callback = self.vtable.retire_source_attempt orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("retire_source_attempt", self.boundary_dispatch, callback, .{ self.ptr, command });
+    }
+
+    pub fn nativeHistoryConsumerControl(self: TableWriteSource, command: history_consumer.Command) !history_consumer.Result {
+        const callback = self.vtable.native_history_consumer_control orelse return error.ChangefeedCapabilityUnsupported;
+        return BoundaryAbi.call("native_history_consumer_control", self.boundary_dispatch, callback, .{ self.ptr, command });
+    }
+
+    pub fn nativeHistoryPage(self: TableWriteSource, allocator: std.mem.Allocator, request: history_page.Request) !history_page.Page {
+        const callback = self.vtable.native_history_page orelse return error.ChangefeedCapabilityUnsupported;
+        return BoundaryAbi.call("native_history_page", self.boundary_dispatch, callback, .{ self.ptr, allocator, request });
+    }
+
+    pub fn nativeSourceAdmissionNamespace(self: TableWriteSource) ![24]u8 {
+        const callback = self.vtable.native_source_admission_namespace orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("native_source_admission_namespace", self.boundary_dispatch, callback, .{self.ptr});
+    }
+
+    pub fn resolveSourceAdmission(self: TableWriteSource, alloc: std.mem.Allocator, original_table_name: []const u8, command: @import("../storage/source_admission.zig").Command, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+        const callback = self.vtable.resolve_source_admission orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("resolve_source_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, original_table_name, command, sync_level, cancellation });
+    }
+
+    pub fn releaseSourceAdmission(self: TableWriteSource, alloc: std.mem.Allocator, original_table_name: []const u8, command: @import("../storage/source_admission.zig").Command) !void {
+        const callback = self.vtable.release_source_admission orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("release_source_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, original_table_name, command });
+    }
 
     pub fn batch(
         self: TableWriteSource,
@@ -919,14 +979,26 @@ pub const TableWriteSource = struct {
         fn_ptr(self.ptr, table_name);
     }
 
+    fn transactionProducer(self: TableWriteSource, tables: []const distributed_txn.TableCommitRequest) !@FieldType(db_mod.types.BatchRequest, "source_producer") {
+        const producer = try distributed_txn.transactionProducer(tables);
+        if (producer != .unlabelled and !self.supports_transaction_producers) return error.ChangefeedCapabilityUnsupported;
+        return producer;
+    }
+
+    fn producerOutcome(producer: @FieldType(db_mod.types.BatchRequest, "source_producer"), outcome: ?distributed_txn.CommitOutcome) !?distributed_txn.CommitOutcome {
+        if (producer != .unlabelled and outcome == null) return error.ChangefeedCapabilityUnsupported;
+        return outcome;
+    }
+
     pub fn commitTransaction(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        const fn_ptr = self.vtable.commit_transaction orelse return null;
-        return try BoundaryAbi.call("commit_transaction", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level });
+        const producer = try self.transactionProducer(tables);
+        const fn_ptr = self.vtable.commit_transaction orelse return producerOutcome(producer, null);
+        return producerOutcome(producer, try BoundaryAbi.call("commit_transaction", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level }));
     }
 
     pub fn commitTransactionWithCancellation(
@@ -936,9 +1008,10 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const producer = try self.transactionProducer(tables);
         const fn_ptr = self.vtable.commit_transaction_with_cancellation orelse
             return try self.commitTransaction(alloc, tables, sync_level);
-        return try BoundaryAbi.call("commit_transaction_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level, cancellation });
+        return producerOutcome(producer, try BoundaryAbi.call("commit_transaction_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level, cancellation }));
     }
 
     pub fn commitBatch(
@@ -947,8 +1020,9 @@ pub const TableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        const fn_ptr = self.vtable.commit_batch orelse self.vtable.commit_transaction orelse return null;
-        return try BoundaryAbi.call("commit_batch", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level });
+        const producer = try self.transactionProducer(tables);
+        const fn_ptr = self.vtable.commit_batch orelse self.vtable.commit_transaction orelse return producerOutcome(producer, null);
+        return producerOutcome(producer, try BoundaryAbi.call("commit_batch", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level }));
     }
 
     pub fn commitBatchWithCancellation(
@@ -958,9 +1032,10 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const producer = try self.transactionProducer(tables);
         const fn_ptr = self.vtable.commit_batch_with_cancellation orelse
             return try self.commitBatch(alloc, tables, sync_level);
-        return try BoundaryAbi.call("commit_batch_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level, cancellation });
+        return producerOutcome(producer, try BoundaryAbi.call("commit_batch_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level, cancellation }));
     }
 
     pub fn commitTransactionWithId(
@@ -971,8 +1046,9 @@ pub const TableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        const fn_ptr = self.vtable.commit_transaction_with_id orelse return null;
-        return try BoundaryAbi.call("commit_transaction_with_id", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level });
+        const producer = try self.transactionProducer(tables);
+        const fn_ptr = self.vtable.commit_transaction_with_id orelse return producerOutcome(producer, null);
+        return producerOutcome(producer, try BoundaryAbi.call("commit_transaction_with_id", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level }));
     }
 
     pub fn commitTransactionWithIdAndCancellation(
@@ -984,9 +1060,10 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const producer = try self.transactionProducer(tables);
         const fn_ptr = self.vtable.commit_transaction_with_id_with_cancellation orelse
             return try self.commitTransactionWithId(alloc, txn_id, begin_timestamp, tables, sync_level);
-        return try BoundaryAbi.call("commit_transaction_with_id_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation });
+        return producerOutcome(producer, try BoundaryAbi.call("commit_transaction_with_id_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation }));
     }
 
     pub fn acknowledgeTransactionCommit(
@@ -1050,6 +1127,7 @@ pub const TableWriteSource = struct {
         topology_epoch: u64,
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
+        if ((req.completion_ordinary_producer or req.completion_legacy_producer) and !self.supports_transaction_producer_phases) return error.ChangefeedCapabilityUnsupported;
         const fn_ptr = self.vtable.txn_prepare_group_local orelse return null;
         return try BoundaryAbi.call("txn_prepare_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, topology_epoch, req });
     }
@@ -1066,6 +1144,8 @@ pub const TableWriteSource = struct {
         participants: []const []const u8,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
+        if (context.source_producer == .scoped_source) return error.InvalidSourceAdmission;
+        if (context.source_producer != .unlabelled and (!self.supports_transaction_producer_phases or self.vtable.txn_begin_group_local_with_pre_decision_context == null)) return error.ChangefeedCapabilityUnsupported;
         const fn_ptr = self.vtable.txn_begin_group_local_with_pre_decision_context orelse
             return try self.txnBeginGroupLocal(alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
         return try BoundaryAbi.call("txn_begin_group_local_with_pre_decision_context", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants, context });
@@ -1081,6 +1161,7 @@ pub const TableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
+        if ((req.completion_ordinary_producer or req.completion_legacy_producer) and !self.supports_transaction_producer_phases) return error.ChangefeedCapabilityUnsupported;
         if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
         if (context.route_fence != null and self.vtable.txn_prepare_group_local_with_pre_decision_context == null) return error.CatalogRouteFenceUnsupported;
         const fn_ptr = self.vtable.txn_prepare_group_local_with_pre_decision_context orelse

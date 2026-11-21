@@ -18,6 +18,7 @@
 
 test {
     _ = @import("storage/kernel_owner_handoff_reopen_test.zig");
+    _ = @import("storage/kernel_owner_legacy_terminal_test.zig");
 }
 
 pub const antfly_sources = @import("source_owner_storage.zig");

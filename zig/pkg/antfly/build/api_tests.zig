@@ -389,6 +389,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_api_auth_default_filters = [_][]const u8{
         "trusted principal table operations",
+        "trusted principal replication grants",
         "storage migration job observation preserves admitted and unpublished catalog state",
         "storage migration command admission fences delayed starts across handlers",
         "api http server requires auth on public routes when enabled",
@@ -478,6 +479,57 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("antfly-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
+    const completion_owner_tests = b.addTest(.{
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{ "completion live owner", "routing clones exclude operational and schema payloads" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("completion-owner-admission-test", "Verify authoritative current completion owner capture and deadlines").dependOn(&b.addRunArtifact(completion_owner_tests).step);
+    const completion_begin_tests = b.addTest(.{
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{"completion begin wire"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("completion-begin-wire-test", "Verify frozen completion BEGIN encoding and downgrade rejection").dependOn(&b.addRunArtifact(completion_begin_tests).step);
+    const source_checkpoint_read_filters = &.{"source checkpoint observation"};
+    const source_checkpoint_read_tests = b.addTest(.{
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = source_checkpoint_read_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("source-checkpoint-read-test", "Verify qualified read-only native checkpoint recovery and strict evidence")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, source_checkpoint_read_tests, source_checkpoint_read_filters).step);
+    const source_authority_filters = &.{ "source checkpoint authority", "metadata.source_control.", "metadata.source_delivery." };
+    const source_authority_tests = b.addTest(.{
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api HTTP runtime discovery"}, source_authority_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("source-checkpoint-authority-test", "Verify persistent checkpoint binding and confirmed metadata before admission").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, source_authority_tests, source_authority_filters).step);
+    const api_kernel_abi_filters = &.{ "API kernel", "API imported runtime capability" };
+    const api_kernel_abi_tests = b.addTest(.{
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api HTTP runtime discovery"}, api_kernel_abi_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("api-kernel-abi-test", "Verify API callback layout and rejection of incompatible contexts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, api_kernel_abi_tests, api_kernel_abi_filters).step);
+    const source_plan_http_filters = &.{"source plan HTTP"};
+    const source_plan_http_tests = b.addTest(.{
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api HTTP runtime discovery"}, source_plan_http_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("source-plan-http-test", "Verify authenticated bounded source plan ingress and uncertainty contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, source_plan_http_tests, source_plan_http_filters).step);
+    const history_capability_filters = &.{ "internal capabilities advertise only the serving history apply profile", "internal namespace requires a service principal except hot standby", "source plan HTTP", "history control ingress", "history control client", "history page ingress", "history page client", "history grant ingress", "history grant client", "history resolution ingress", "history resolution client", "history publication ingress", "history publication client", "history owner ingress", "history owner client", "history decision ingress", "history decision client" };
+    const history_capability_tests = b.addTest(.{
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api HTTP runtime discovery"}, history_capability_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const history_capability_run = addFilteredTestRunArtifactWithRuntimeFilters(b, history_capability_tests, history_capability_filters);
+    b.step("history-serving-capability-test", "Verify serving-profile retention protocol advertisement and internal authentication boundary").dependOn(&history_capability_run.step);
+    b.step("history-retained-rpc-test", "Verify bounded retained-history control/page RPC and service authentication").dependOn(&history_capability_run.step);
+    lib_api_auth_test_step.dependOn(&history_capability_run.step);
     const alias_http_tests = b.addTest(.{
         .name = "index-alias-http-tests",
         .root_module = options.api_http_runtime_test_mod,
@@ -1035,6 +1087,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     write_implementation_imports.runtime = @import("lake_execution_tests.zig").sourceImports(b, antfly_imports);
     write_implementation_imports.configure(b, write_implementation_module, true, true);
     write_implementation_module.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const native_history_root_tests = b.addTest(.{ .root_module = write_implementation_module, .filters = &.{"provisioned native history root"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("provisioned-native-history-test", "Verify provisioned native history identity, resident leases and writer reopen").dependOn(&b.addRunArtifact(native_history_root_tests).step);
+    const ordered_history_tests = b.addTest(.{ .root_module = write_implementation_module, .filters = &.{ "ordered history consumer", "history page wire", "history grant wire" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("ordered-history-consumer-test", "Verify atomic Raft retention outcomes, replay, rejection and reopen").dependOn(&b.addRunArtifact(ordered_history_tests).step);
     const api_table_reads_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
         .target = target,
@@ -1123,6 +1179,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "compiled table write boundary transports cancellation and committed failure identity",
             "pre-decision context deadline has typed admission provenance",
             "bound stable single-group transaction retry does not reapply transforms",
+            "bound source admission survives receipt eviction and restart without repeating transforms",
             "bound single-group batch reports prepared intent conflicts",
             "provisioned predicate-only batch validates matching and stale versions",
             "provisioned single-group commit preserves transaction graph transform contract",
@@ -1823,7 +1880,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("cypher-transaction-contract-test", "Verify graph transaction staging, receipts and principal identity").dependOn(&addFilteredTestRunArtifact(b, cypher_transaction_contract_tests).step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
-        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids" },
+        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids", "SQL transaction options update only the untouched owner session" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
@@ -1875,6 +1932,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
         .filters = &.{
             "restore staging private provisioning",
+            "provisioned native history root",
+            "ordered history consumer",
             "provisioned table write source drop table",
             "provisioned table drop cache drain",
             "provisioned writer cache starts DB workers after stable entry installation",
@@ -2109,6 +2168,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     }, write_implementation_tests);
     const run_api_table_writes_production_regression_tests = api_table_writes_production_regression_tests.run(b);
+    const source_admission_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-source-admission-tests",
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{ "bound source admission", "bound stable single-group transaction retry" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    }, write_implementation_tests);
+    b.step("source-admission-test", "Verify durable source receipts through native transaction admission").dependOn(&source_admission_tests.run(b).step);
+    const native_source_plan_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "native-source-plan-control-tests",
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{"native source plan control"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    }, write_implementation_tests);
+    b.step("native-source-plan-control-test", "Verify source artifact commands through the actual native engine boundary").dependOn(&native_source_plan_tests.run(b).step);
+    const native_history_consumer_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "native-history-consumer-tests",
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{"native history consumer control"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    }, write_implementation_tests);
+    b.step("native-history-consumer-test", "Verify durable root consumer control through the native engine boundary")
+        .dependOn(&native_history_consumer_tests.run(b).step);
     const restore_provisioning_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-restore-provisioning-tests",
         .root_module = api_table_writes_docid_test_mod,

@@ -24,6 +24,249 @@ const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
+test "compiled ordered history grant observations preserve scope and survive reopen" {
+    const a = std.testing.allocator;
+    const source = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+    const control = source.history_consumer;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const options: abi.OpenRequest = .{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 11, .identity_range_id = 13, .schema_json = .fromSlice("{}"), .indexes_json = .fromSlice("{}") };
+    var owner = try client.Owner.open(options);
+    var opened = true;
+    defer if (opened) owner.deinit();
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 11, .big);
+    std.mem.writeInt(u64, namespace[16..24], 13, .big);
+    const admission_wire = @import("antfly_local_sources").storage_history_admission_wire;
+    const admission_query: admission_wire.Query = .{ .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(3), .root_generation = 0, .group_id = 7001, .topology_epoch = 1 } };
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, owner.historyAdmission(a, "docs", admission_query));
+    var grant: control.Grant = .{ .namespace = namespace, .authority = @splat(1), .consumer = @splat(2), .definition = @splat(3), .sequence = 1, .expires_at_seconds = 1000, .policy_revision = 1 };
+    const identity = control.GrantIdentity.fromGrant(grant);
+    try std.testing.expectError(error.InvalidHistoryAdmission, owner.orderedHistoryGrant(a, "docs", identity, 0));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.orderedHistoryGrant(a, "docs", identity, 1));
+    var invalid = grant;
+    invalid.limit = 1;
+    const invalid_json = try std.json.Stringify.valueAlloc(a, control.Command{ .enroll = invalid }, .{});
+    defer a.free(invalid_json);
+    var rejected = try owner.orderedHistoryControlJson("docs", invalid_json, 1, 1);
+    rejected.deinit();
+    try std.testing.expectEqual(.unbound, try owner.orderedHistoryGrant(a, "docs", identity, 1));
+    const enrollment = try std.json.Stringify.valueAlloc(a, control.Command{ .enroll = grant }, .{});
+    defer a.free(enrollment);
+    var enrolled = try owner.orderedHistoryControlJson("docs", enrollment, 1, 2);
+    enrolled.deinit();
+    const active = try owner.orderedHistoryGrant(a, "docs", identity, 2);
+    const decision_wire = @import("antfly_local_sources").storage_history_decision_wire;
+    const decision_query: decision_wire.Query = .{ .owner = admission_query.owner, .transaction_id = @splat(89), .minimum_applied_index = 2 };
+    var absent_decision = try owner.historyDecision(a, "docs", decision_query);
+    defer absent_decision.deinit();
+    try std.testing.expect(absent_decision.value.decision == null);
+    try std.testing.expectEqual(@as(u64, 2), absent_decision.value.cut.index);
+    var lagged_decision = decision_query;
+    lagged_decision.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.historyDecision(a, "docs", lagged_decision));
+    lagged_decision = decision_query;
+    lagged_decision.owner.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owner.historyDecision(a, "docs", lagged_decision));
+    const qualified_admission = try owner.historyAdmission(a, "docs", admission_query);
+    try qualified_admission.validate(admission_query);
+    try std.testing.expectEqual(@as(u64, 1), qualified_admission.cut.term);
+    try std.testing.expectEqual(@as(u64, 2), qualified_admission.cut.index);
+    try std.testing.expectEqual(grant.limit, qualified_admission.retention_limit_bytes);
+    try std.testing.expectEqualDeep(qualified_admission, try owner.historyAdmission(a, "docs", admission_query));
+    var changed_admission = admission_query;
+    changed_admission.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.historyAdmission(a, "docs", changed_admission));
+    changed_admission = admission_query;
+    changed_admission.owner.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owner.historyAdmission(a, "docs", changed_admission));
+    changed_admission = admission_query;
+    changed_admission.owner.namespace[0] ^= 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owner.historyAdmission(a, "docs", changed_admission));
+    try std.testing.expectEqual(@as(u64, 1), active.active.consumer.epoch);
+    const resolution_request: source.history_resolution_wire.Request = .{ .authority = .raft, .namespace = namespace, .transaction_id = @splat(9), .owner_fence = @splat(4), .manifest_digest = @splat(5), .commit_version = 6, .minimum_applied_index = 2 };
+    const absent_resolution = try owner.historyResolution(a, "docs", resolution_request);
+    try std.testing.expect(absent_resolution.resolution == null);
+    try std.testing.expectEqual(@as(u64, 2), absent_resolution.cut.index);
+    const history = @import("antfly_local_sources").storage_committed_history;
+    const publication_query: history.CompletionPublicationQuery = .{ .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = 0, .group_id = 7001, .topology_epoch = 1 }, .transaction_id = @splat(9), .manifest_digest = @splat(5), .commit_version = 6, .minimum_applied_index = 2 };
+    const absent_publication = try owner.historyPublication(a, "docs", publication_query);
+    try absent_publication.validate(publication_query);
+    try std.testing.expect(absent_publication.publication == null);
+    try std.testing.expectEqual(@as(u64, 2), absent_publication.cut.index);
+    var invalid_publication = publication_query;
+    invalid_publication.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.historyPublication(a, "docs", invalid_publication));
+    invalid_publication = publication_query;
+    invalid_publication.owner.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owner.historyPublication(a, "docs", invalid_publication));
+    var ahead_resolution = resolution_request;
+    ahead_resolution.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.historyResolution(a, "docs", ahead_resolution));
+    ahead_resolution = resolution_request;
+    ahead_resolution.namespace[0] ^= 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owner.historyResolution(a, "docs", ahead_resolution));
+    ahead_resolution = resolution_request;
+    ahead_resolution.authority = .native;
+    ahead_resolution.minimum_applied_index = 0;
+    try std.testing.expectError(error.OnlineSourceScopeChanged, owner.historyResolution(a, "docs", ahead_resolution));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, owner.nativeHistoryGrant(a, "docs", identity));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.orderedHistoryGrant(a, "docs", identity, 3));
+    var wrong = identity;
+    wrong.consumer = @splat(4);
+    try std.testing.expectEqual(@as(u64, 0), (try owner.orderedHistoryGrant(a, "docs", wrong, 2)).absent);
+    wrong = identity;
+    wrong.sequence += 1;
+    try std.testing.expectEqual(@as(u64, 1), (try owner.orderedHistoryGrant(a, "docs", wrong, 2)).other_grant.grant);
+    wrong = identity;
+    wrong.namespace[0] ^= 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owner.orderedHistoryGrant(a, "docs", wrong, 2));
+    wrong = identity;
+    wrong.policy_revision += 1;
+    try std.testing.expectError(error.HistoryConsumerConflict, owner.orderedHistoryGrant(a, "docs", wrong, 2));
+    owner.deinit();
+    opened = false;
+    owner = try client.Owner.open(options);
+    opened = true;
+    try std.testing.expectEqualDeep(active, try owner.orderedHistoryGrant(a, "docs", identity, 2));
+    try std.testing.expectEqualDeep(qualified_admission, try owner.historyAdmission(a, "docs", admission_query));
+    try std.testing.expectEqualDeep(absent_resolution, try owner.historyResolution(a, "docs", resolution_request));
+    try std.testing.expectEqualDeep(absent_publication, try owner.historyPublication(a, "docs", publication_query));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.orderedHistoryGrant(a, "docs", identity, 3));
+    const retired: control.Command = .{ .retire = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .definition = grant.definition, .sequence = 2, .grant = 1 } };
+    const retirement = try std.json.Stringify.valueAlloc(a, retired, .{});
+    defer a.free(retirement);
+    var closed = try owner.orderedHistoryControlJson("docs", retirement, 1, 3);
+    closed.deinit();
+    try std.testing.expectEqual(@as(u64, 2), (try owner.orderedHistoryGrant(a, "docs", identity, 3)).retired);
+    grant.sequence = 3;
+    try std.testing.expectEqual(@as(u64, 2), (try owner.orderedHistoryGrant(a, "docs", control.GrantIdentity.fromGrant(grant), 3)).absent);
+    const recovered = try owner.orderedHistoryOutcome(a, "docs", .{ .command = retired, .entry = .{ .term = 1, .index = 3 }, .minimum_applied_index = 3 });
+    try std.testing.expect(recovered == .applied);
+    var response: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_history_admission(owner.handle, &.{ .version = abi.abi_version - 1 }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_history_admission(owner.handle, &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_history_publication(owner.handle, &.{ .version = abi.abi_version - 1 }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_history_publication(owner.handle, &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_history_grant(owner.handle, &.{ .version = abi.abi_version - 1 }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_history_resolution(owner.handle, &.{ .version = abi.abi_version - 1 }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_history_resolution(owner.handle, &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_history_grant(owner.handle, &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    const native_path = try std.fmt.allocPrint(a, "{s}/standalone", .{path});
+    defer a.free(native_path);
+    var native_options = options;
+    native_options.path = .fromSlice(native_path);
+    native_options.online_source_authority = 2;
+    var native = try client.Owner.open(native_options);
+    defer native.deinit();
+    // An unused root has no durable document namespace yet. A read cannot
+    // provision it from the open request or manufacture an unbound grant.
+    try std.testing.expectError(error.HistoryResynchronizationRequired, native.nativeHistoryGrant(a, "docs", identity));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, native.orderedHistoryGrant(a, "docs", identity, 1));
+}
+
+test "compiled ordered history pages preserve cut bounds and owned images across reopen" {
+    const a = std.testing.allocator;
+    const source = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const options: abi.OpenRequest = .{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 11, .identity_range_id = 13, .schema_json = .fromSlice("{}"), .indexes_json = .fromSlice("{}") };
+    var owner = try client.Owner.open(options);
+    var owner_open = true;
+    defer if (owner_open) owner.deinit();
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 11, .big);
+    std.mem.writeInt(u64, namespace[16..24], 13, .big);
+    const grant: source.history_consumer.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
+    const enrollment = try std.json.Stringify.valueAlloc(a, source.history_consumer.Command{ .enroll = grant }, .{});
+    defer a.free(enrollment);
+    var enrolled = try owner.orderedHistoryControlJson("docs", enrollment, 1, 1);
+    enrolled.deinit();
+    var lookup: source.history_ordered.Lookup = .{ .command = .{ .enroll = grant }, .entry = .{ .term = 1, .index = 1 }, .minimum_applied_index = 1 };
+    const original = try owner.orderedHistoryOutcome(a, "docs", lookup);
+    try std.testing.expectEqual(@as(u64, 1), original.applied.consumer.?.epoch);
+
+    const mutation = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(a, .{ .writes = &.{.{ .key = "one", .value = "{\"v\":1}" }} });
+    defer a.free(mutation);
+    var written = try applyRaftEntryEventually(&owner, "docs", mutation, 1, 2);
+    written.deinit();
+    lookup.minimum_applied_index = 2;
+    try std.testing.expectEqualDeep(original, try owner.orderedHistoryOutcome(a, "docs", lookup));
+    var wrong = lookup;
+    wrong.command.enroll.sequence += 1;
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, owner.orderedHistoryOutcome(a, "docs", wrong));
+    wrong = lookup;
+    wrong.entry.term += 1;
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, owner.orderedHistoryOutcome(a, "docs", wrong));
+    wrong = lookup;
+    wrong.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.orderedHistoryOutcome(a, "docs", wrong));
+    wrong = lookup;
+    wrong.entry.index = 3;
+    try std.testing.expectError(error.InvalidHistoryAdmission, owner.orderedHistoryOutcome(a, "docs", wrong));
+
+    const request: source.history_page.Request = .{ .reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = 1, .grant = grant.sequence, .definition = grant.definition }, .after = .{}, .now_seconds = 100 };
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.orderedHistoryPage(a, "docs", request, 3));
+    try std.testing.expectError(error.InvalidHistoryAdmission, owner.orderedHistoryPage(a, "docs", request, 0));
+    var small = request;
+    small.max_bytes = 1;
+    try std.testing.expectError(error.HistoryTooLarge, owner.orderedHistoryPage(a, "docs", small, 2));
+    var expired = request;
+    expired.now_seconds = grant.expires_at_seconds;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owner.orderedHistoryPage(a, "docs", expired, 2));
+    var page = try owner.orderedHistoryPage(a, "docs", request, 2);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.events.len);
+    try std.testing.expectEqualStrings("{\"v\":1}", page.events[0].after.?);
+    owner.deinit();
+    owner_open = false;
+    owner = try client.Owner.open(options);
+    owner_open = true;
+    try std.testing.expectEqualStrings("{\"v\":1}", page.events[0].after.?);
+    var replay = try owner.orderedHistoryPage(a, "docs", request, 2);
+    defer replay.deinit();
+    try std.testing.expectEqualDeep(page.header, replay.header);
+    try std.testing.expectEqualDeep(page.events, replay.events);
+    try std.testing.expectEqualDeep(page.next, replay.next);
+    try std.testing.expectEqualDeep(original, try owner.orderedHistoryOutcome(a, "docs", lookup));
+    // Recovery itself never advances the native entry marker.
+    wrong = lookup;
+    wrong.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.orderedHistoryOutcome(a, "docs", wrong));
+    const rejected_command: source.history_consumer.Command = .{ .acknowledge = .{ .reference = request.reference, .previous = 0, .next = 99 } };
+    const rejected_json = try std.json.Stringify.valueAlloc(a, rejected_command, .{});
+    defer a.free(rejected_json);
+    var rejected = try owner.orderedHistoryControlJson("docs", rejected_json, 1, 3);
+    rejected.deinit();
+    const recovered_rejection = try owner.orderedHistoryOutcome(a, "docs", .{ .command = rejected_command, .entry = .{ .term = 1, .index = 3 }, .minimum_applied_index = 3 });
+    try std.testing.expectEqual(.checkpoint_conflict, recovered_rejection.rejected);
+    lookup.minimum_applied_index = 3;
+    try std.testing.expectEqual(.superseded, try owner.orderedHistoryOutcome(a, "docs", lookup));
+
+    var response: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_ordered_history_page(owner.handle, &.{ .version = abi.abi_version - 1 }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_ordered_history_outcome(owner.handle, &.{ .version = abi.abi_version - 1 }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_history_page(owner.handle, &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+}
+
 test "borrowed document batches cross compiled owner without payload ownership transfer" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4881,4 +5124,341 @@ test "selected owner readiness compiled projections retain independent query con
         try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_projection(store.handle, &.{ .kind = .system_catalog, .group_id = group, .key = .fromSlice(bytes), .control = .{ .version = invalid_control_version } }, &rejected));
         try std.testing.expect(rejected.ptr == null);
     }
+}
+
+test "compiled metadata owner projects changefeed and source control reads" {
+    const a = std.testing.allocator;
+    const feed = @import("../metadata/changefeed_control.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    const group = 7304;
+
+    const encoded = try store.getChangefeedControl(a, group, @splat(1));
+    defer a.free(encoded);
+    var state = try feed.parse(a, encoded);
+    defer state.deinit();
+    try std.testing.expectEqual(.empty, state.value.phase);
+    try std.testing.expectEqual(null, try store.getChangefeedAuthority(a, group));
+    const page = try store.scanChangefeedMaintenance(a, group, 1, null);
+    try std.testing.expectEqual(@as(usize, 0), page.items().len);
+    try std.testing.expectEqual(null, page.next);
+    try std.testing.expectError(error.InvalidChangefeed, store.scanChangefeedMaintenance(a, group, 0, null));
+    try std.testing.expectEqual(null, try store.getPgPublication(a, group, @splat(1), "absent"));
+    const source_control = @import("../metadata/source_control.zig");
+    const source_bytes = try store.getSourceControl(a, group, 7, @splat(1));
+    defer a.free(source_bytes);
+    var source_state = try source_control.parse(a, source_bytes);
+    defer source_state.deinit();
+    try std.testing.expectEqual(@as(u64, 0), source_state.value.revision);
+    try std.testing.expect(try store.legacyReplicationSourceIntakeAllowed(a, group, 7, 0, @splat(1)));
+    try std.testing.expectError(error.ReadUnavailable, store.captureSourceScope(a, .{
+        .metadata_group_id = group,
+        .metadata_incarnation = @splat('1'),
+        .actor_table_id = 7,
+        .source_id = @splat(1),
+        .minimum_applied_index = 1,
+    }));
+}
+
+test "compiled ordered history completion scheduling crosses the native maintenance callback" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const wire = local.storage_history_recovery_wire;
+    const Frozen = @import("../api/completion_plan.zig");
+    const Recorder = struct {
+        claimed: std.atomic.Value(bool) = .init(false),
+        ready: std.atomic.Value(bool) = .init(false),
+        valid: bool = false,
+        owner: ?@FieldType(wire.Request, "owner") = null,
+        transaction_id: [16]u8 = @splat(0),
+        digest: [32]u8 = @splat(0),
+        fn enqueue(ptr: ?*anyopaque, raw: abi.BorrowedBytes) callconv(.c) abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (self.claimed.swap(true, .acq_rel)) return .ok;
+            defer self.ready.store(true, .release);
+            var parsed = wire.decode(std.heap.page_allocator, raw.slice()) catch return .invalid_argument;
+            defer parsed.deinit();
+            self.owner = parsed.value.owner;
+            self.transaction_id = parsed.value.transaction_id;
+            self.digest = parsed.value.admission_digest;
+            self.valid = parsed.value.resolution_timestamp_ns > 0 and std.mem.eql(u8, parsed.value.coordinator_locator, "table2:00000004:docs:7001");
+            return .ok;
+        }
+        fn resolve(_: ?*anyopaque, _: *const abi.TxnId, _: abi.BorrowedBytes, _: abi.TxnStatus, _: u64) callconv(.c) abi.Status {
+            return .invalid_argument;
+        }
+        fn owns(_: ?*anyopaque, _: abi.BorrowedBytes) callconv(.c) u8 {
+            return 1;
+        }
+        fn ack(_: ?*anyopaque, _: *const abi.TxnId, _: abi.BorrowedBytes, _: abi.BorrowedBytes) callconv(.c) abi.Status {
+            return .invalid_argument;
+        }
+        fn cleanup(_: ?*anyopaque, _: *const abi.TxnId, _: abi.BorrowedBytes, _: u64, _: u64) callconv(.c) abi.Status {
+            return .invalid_argument;
+        }
+    };
+    var recorder: Recorder = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 11, .identity_range_id = 13, .schema_json = .fromSlice("{}"), .indexes_json = .fromSlice("{}"), .transaction_recovery = .{ .enabled = 1, .replicated_metadata = 1, .interval_ms = 1, .callback_ctx = &recorder, .owner_id = .fromSlice("completion-native-test"), .resolve_participant_fn = Recorder.resolve, .owns_recovery_fn = Recorder.owns, .acknowledge_participant_fn = Recorder.ack, .cleanup_transaction_fn = Recorder.cleanup, .enqueue_completion_fn = Recorder.enqueue } });
+    defer owner.deinit();
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 11, .big);
+    std.mem.writeInt(u64, namespace[16..24], 13, .big);
+    const control = local.api_local_table_writes.table_write_source.history_consumer;
+    const command: control.Command = .{ .enroll = .{ .namespace = namespace, .authority = @splat(1), .consumer = @splat(2), .definition = @splat(3), .sequence = 1, .expires_at_seconds = 1000, .policy_revision = 1 } };
+    const json = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(json);
+    var enrolled = try owner.orderedHistoryControlJson("docs", json, 1, 1);
+    enrolled.deinit();
+    const binding: Frozen.completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(4), .root_generation = 0, .group_id = 7001, .topology_epoch = 1 };
+    const id: [16]u8 = @splat(5);
+    var plan = try Frozen.Plan.freeze(a, id, @splat(6), binding, &.{.{ .owner = binding, .locator = "table2:00000004:docs:7001", .roles = Frozen.completion.Roles.guards, .prepare = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 1, .completion_owner = binding } } } }}, 1001);
+    defer plan.deinit();
+    const begin = try local.api_internal_batch.encodeBatchRequest(a, try plan.begin(0));
+    defer a.free(begin);
+    var begun = try owner.replicatedBatchAtRaftEntryJson("docs", begin, 1, 2);
+    begun.deinit();
+    const deadline = @import("antfly_platform").time.monotonicNs() + 6 * std.time.ns_per_s;
+    while (!recorder.ready.load(.acquire)) {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(recorder.valid);
+    try std.testing.expectEqual(binding, recorder.owner.?);
+    try std.testing.expectEqual(id, recorder.transaction_id);
+    try std.testing.expectEqual(plan.admission.digest(), recorder.digest);
+    try std.testing.expectEqual(abi.TxnStatus.pending, try owner.transactionStatus("docs", id));
+}
+
+test "compiled ordered history root policy captures without consumers and fences legacy admission" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const source = local.api_local_table_writes.table_write_source;
+    const control = source.history_consumer;
+    const Fixture = struct {
+        fn command(alloc: std.mem.Allocator, owner: *client.Owner, index: *u64, value: control.Command) !source.history_ordered.Outcome {
+            const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            defer alloc.free(bytes);
+            index.* += 1;
+            var applied = try owner.orderedHistoryControlJson("docs", bytes, 1, index.*);
+            applied.deinit();
+            return owner.orderedHistoryOutcome(alloc, "docs", .{ .command = value, .entry = .{ .term = 1, .index = index.* }, .minimum_applied_index = index.* });
+        }
+        fn batch(alloc: std.mem.Allocator, owner: *client.Owner, index: *u64, value: local.storage_db_selected_root.db.types.BatchRequest) !void {
+            const bytes = try local.api_internal_batch.encodeBatchRequest(alloc, value);
+            defer alloc.free(bytes);
+            index.* += 1;
+            var applied = try applyRaftEntryEventually(owner, "docs", bytes, 1, index.*);
+            applied.deinit();
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const options: abi.OpenRequest = .{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 11, .identity_range_id = 13, .schema_json = .fromSlice("{}"), .indexes_json = .fromSlice("{}") };
+    var owner = try client.Owner.open(options);
+    var live = true;
+    defer if (live) owner.deinit();
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 11, .big);
+    std.mem.writeInt(u64, namespace[16..24], 13, .big);
+    var index: u64 = 0;
+    const first: local.storage_committed_history.Policy = .{ .namespace = namespace, .authority = @splat(1), .previous_revision = 0, .revision = 1, .limit = 16 * 1024 * 1024 };
+    try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .begin = .{ .txn_id = @splat(41), .begin_timestamp = 10, .created_at_ns = 11, .topology_epoch = 1, .participants = &.{"table2:00000004:docs:7001"} } } });
+    try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(41), .topology_epoch = 1 } }, .writes = &.{.{ .key = "legacy", .value = "{\"v\":1}" }} });
+    try std.testing.expectEqual(.prepared_transactions, (try Fixture.command(a, &owner, &index, .{ .configure_policy = first })).rejected);
+    try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .resolve = .{ .txn_id = @splat(41), .status = .aborted, .commit_version = 20 } } });
+    try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .begin = .{ .txn_id = @splat(42), .begin_timestamp = 30, .created_at_ns = 31, .topology_epoch = 1, .participants = &.{"table2:00000004:docs:7001"} } } });
+    const configured = try Fixture.command(a, &owner, &index, .{ .configure_policy = first });
+    try std.testing.expect(configured.applied.consumer == null);
+    try std.testing.expectEqual(@as(u64, 1), configured.applied.policy.?.revision);
+    try std.testing.expectEqual(first.limit, configured.applied.policy.?.limit);
+    const routed_owner: source.history_resolution_wire.completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(3), .root_generation = 0, .group_id = 7001, .topology_epoch = 1 };
+    const qualified = try owner.historyAdmission(a, "docs", .{ .owner = routed_owner });
+    try std.testing.expectEqual(first.limit, qualified.retention_limit_bytes);
+    const completion = source.history_resolution_wire.completion;
+    const legacy_admission: completion.Admission = .{ .version = 2, .transaction_id = @splat(44), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = routed_owner.digest(), .participants = &.{.{ .namespace = namespace, .owner_fence = routed_owner.digest(), .roles = completion.Roles.effects, .input_digest = @splat(8), .locator = "table2:00000004:docs:7001" }} };
+    const legacy_plan = try completion.encodeAdmission(a, legacy_admission);
+    defer a.free(legacy_plan);
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, Fixture.batch(a, &owner, &index, .{ .transaction = .{ .begin = .{ .txn_id = legacy_admission.transaction_id, .begin_timestamp = 60, .created_at_ns = 61, .topology_epoch = 1, .participants = &.{"table2:00000004:docs:7001"}, .retain_terminal = true, .completion_owner = routed_owner, .completion_admission = legacy_plan } } }));
+
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, Fixture.batch(a, &owner, &index, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(42), .topology_epoch = 1 } }, .writes = &.{.{ .key = "legacy", .value = "{\"v\":2}" }} }));
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, Fixture.batch(a, &owner, &index, .{ .transaction = .{ .begin = .{ .txn_id = @splat(43), .begin_timestamp = 40, .created_at_ns = 41, .topology_epoch = 1, .participants = &.{"table2:00000004:docs:7001"} } } }));
+    try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .resolve = .{ .txn_id = @splat(42), .status = .aborted, .commit_version = 50 } } });
+    const large = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(large);
+    @memset(large, 'x');
+    const image = try std.fmt.allocPrint(a, "{{\"blob\":\"{s}\"}}", .{large});
+    defer a.free(image);
+    try Fixture.batch(a, &owner, &index, .{ .writes = &.{.{ .key = "row", .value = image }} });
+    try std.testing.expectEqualDeep(configured, try Fixture.command(a, &owner, &index, .{ .configure_policy = first }));
+    var changed = first;
+    changed.limit += 1;
+    try std.testing.expectEqual(.checkpoint_conflict, (try Fixture.command(a, &owner, &index, .{ .configure_policy = changed })).rejected);
+    changed = first;
+    changed.previous_revision = 1;
+    changed.revision = 2;
+    changed.limit = 4 * 1024 * 1024;
+    try std.testing.expectEqual(.full, (try Fixture.command(a, &owner, &index, .{ .configure_policy = changed })).rejected);
+    changed.limit = 2 * first.limit;
+    const upgraded = try Fixture.command(a, &owner, &index, .{ .configure_policy = changed });
+    const upgrade_index = index;
+    try std.testing.expectEqual(@as(u64, 2), upgraded.applied.policy.?.revision);
+    owner.deinit();
+    live = false;
+    owner = try client.Owner.open(options);
+    live = true;
+    try std.testing.expectEqualDeep(upgraded, try owner.orderedHistoryOutcome(a, "docs", .{ .command = .{ .configure_policy = changed }, .entry = .{ .term = 1, .index = upgrade_index }, .minimum_applied_index = upgrade_index }));
+    try std.testing.expectEqualDeep(upgraded, try Fixture.command(a, &owner, &index, .{ .inspect_policy = .{ .namespace = namespace, .authority = first.authority } }));
+    var grant: control.Grant = .{ .namespace = namespace, .authority = first.authority, .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 17, .limit = changed.limit };
+    const enrolled = (try Fixture.command(a, &owner, &index, .{ .enroll = grant })).applied.consumer.?;
+    try std.testing.expectEqual(@as(u64, 1), enrolled.epoch);
+    try std.testing.expectEqual(@as(u64, 1), enrolled.start);
+    // Lease authorization generation is independent of the root retention
+    // configuration revision, but remains immutable for this actual lease.
+    try std.testing.expectEqual(@as(u64, 17), enrolled.policy_revision);
+    var changed_authorization = grant;
+    changed_authorization.policy_revision = 18;
+    try std.testing.expectEqual(.consumer_conflict, (try Fixture.command(a, &owner, &index, .{ .enroll = changed_authorization })).rejected);
+    const retained_policy = try Fixture.command(a, &owner, &index, .{ .inspect_policy = .{ .namespace = namespace, .authority = first.authority } });
+    try std.testing.expectEqual(@as(u64, 2), retained_policy.applied.policy.?.revision);
+
+    try Fixture.batch(a, &owner, &index, .{ .writes = &.{.{ .key = "row", .value = "{\"v\":2}" }} });
+    var page = try owner.orderedHistoryPage(a, "docs", .{ .reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.epoch, .grant = grant.sequence, .definition = grant.definition }, .after = .{ .sequence = 1 }, .now_seconds = 100, .max_bytes = 16 * 1024 * 1024 }, index);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.events.len);
+    try std.testing.expect(std.mem.eql(u8, image, page.events[0].before.?));
+    try std.testing.expectEqualStrings("{\"v\":2}", page.events[0].after.?);
+    _ = try Fixture.command(a, &owner, &index, .{ .retire = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .definition = grant.definition, .grant = 1, .sequence = 2 } });
+    try Fixture.batch(a, &owner, &index, .{ .writes = &.{.{ .key = "row", .value = "{\"v\":3}" }} });
+    grant.sequence = 3;
+    grant.consumer = @splat(4);
+    const reenrolled = (try Fixture.command(a, &owner, &index, .{ .enroll = grant })).applied.consumer.?;
+    try std.testing.expectEqual(@as(u64, 2), reenrolled.epoch);
+    try std.testing.expectEqual(@as(u64, 3), reenrolled.start);
+}
+
+test "compiled source plan opaque transport retains sealed binary and exact ordered outcomes" {
+    const a = std.testing.allocator;
+    const wire = @import("antfly_local_sources").storage_source_plan_wire;
+    const control = wire.control;
+    const storage = control.storage;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const options: abi.OpenRequest = .{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 11, .identity_range_id = 13, .schema_json = .fromSlice("{}"), .indexes_json = .fromSlice("{}") };
+    var owner = try client.Owner.open(options);
+    var opened = true;
+    defer if (opened) owner.deinit();
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 11, .big);
+    std.mem.writeInt(u64, namespace[16..24], 13, .big);
+    const root: storage.Root = .{ .authority = .raft, .namespace = namespace, .generation = 0, .fence = @splat(2) };
+    var frame: [128]u8 = @splat(255);
+    @memcpy(frame[0..4], "AFP1");
+    std.mem.writeInt(u32, frame[4..8], 1, .little);
+    std.mem.writeInt(u64, frame[8..16], 10, .little);
+    std.mem.writeInt(u64, frame[16..24], 11, .little);
+    std.mem.writeInt(u64, frame[24..32], 1, .little);
+    const plan_digest = try storage.frozenDigest(&frame);
+    @memcpy(frame[32..64], &plan_digest);
+    var checksum: storage.Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&frame, &checksum, .{});
+    const hashes = [_]storage.Digest{storage.chunkDigest(0, &frame)};
+    var attempt: [16]u8 = @splat(1);
+    std.mem.writeInt(u64, attempt[0..8], 1, .big);
+    const spec: storage.Spec = .{ .namespace = storage.namespaceFor(root, 1), .storage_epoch = 1, .binding = @splat(3), .domain = storage.domainFor(@splat(3)), .attempt = attempt, .bytes = frame.len, .checksum = checksum, .plan_digest = plan_digest, .chunk_hashes = &hashes };
+    var command: control.Request = .{ .root = root, .spec = spec, .action = .begin };
+    const Helper = struct {
+        fn apply(alloc: std.mem.Allocator, target: *client.Owner, request: control.Request, index: u64) !control.Outcome {
+            const encoded = try wire.encode(alloc, request);
+            defer alloc.free(encoded);
+            var response = try target.orderedSourcePlanControlJson("docs", encoded, 1, index);
+            defer response.deinit();
+            var parsed = try std.json.parseFromSlice(control.Outcome, alloc, response.bytes(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });
+            defer parsed.deinit();
+            return parsed.value;
+        }
+    };
+    try std.testing.expectError(error.InvalidSourcePlanWire, owner.sourcePlanJson(.native_control, "docs", "{}"));
+    try std.testing.expectError(error.InvalidSourcePlanWire, owner.sourcePlanJson(.observation, "docs", "{}"));
+    try std.testing.expectError(error.InvalidSourcePlanWire, owner.sourcePlanJson(.chunk, "docs", "{}"));
+    try std.testing.expectError(error.InvalidSourcePlanWire, owner.sourcePlanJson(.outcome, "docs", "{}"));
+    var rejected_bytes: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_ordered_source_plan_control(null, &.{ .version = abi.abi_version - 1 }, &rejected_bytes));
+    try std.testing.expect((try Helper.apply(a, &owner, command, 1)) == .applied);
+    command.action = .seal;
+    const rejected = try Helper.apply(a, &owner, command, 2);
+    try std.testing.expect(rejected == .rejected and rejected.rejected == .pending);
+    var recovery_command = try wire.Encoded.init(a, command);
+    defer recovery_command.deinit();
+    const recovery = try std.json.Stringify.valueAlloc(a, wire.Recovery{ .command = recovery_command.command, .entry = .{ .term = 1, .index = 2 }, .minimum_applied_index = 2 }, .{});
+    defer a.free(recovery);
+    {
+        var response = try owner.sourcePlanJson(.outcome, "docs", recovery);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(control.Outcome, a, response.bytes(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualDeep(rejected, parsed.value);
+    }
+    command.action = .chunk;
+    command.chunk = &frame;
+    try std.testing.expect((try Helper.apply(a, &owner, command, 3)) == .applied);
+    command.action = .seal;
+    command.chunk = "";
+    const sealed = try Helper.apply(a, &owner, command, 4);
+    try std.testing.expectEqualDeep(sealed, try Helper.apply(a, &owner, command, 4));
+    const seal = sealed.applied.seal.?;
+    owner.deinit();
+    opened = false;
+    owner = try client.Owner.open(options);
+    opened = true;
+    const query: control.Query = .{ .root = root, .spec = spec, .minimum_applied_index = 4 };
+    const query_json = try std.json.Stringify.valueAlloc(a, query, .{});
+    defer a.free(query_json);
+    {
+        var response = try owner.sourcePlanJson(.observation, "docs", query_json);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(wire.ObservationReply, a, response.bytes(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(seal, parsed.value.observation.status.?.seal.?);
+        try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, parsed.value.observation.cut[8..16], .little));
+    }
+    const read_json = try std.json.Stringify.valueAlloc(a, control.ReadRequest{ .query = query, .seal = seal, .ordinal = 0 }, .{});
+    defer a.free(read_json);
+    {
+        var response = try owner.sourcePlanJson(.chunk, "docs", read_json);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(wire.ChunkReply, a, response.bytes(), .{});
+        defer parsed.deinit();
+        var decoded: [128]u8 = undefined;
+        try std.base64.standard.Decoder.decode(&decoded, parsed.value.chunk_base64);
+        try std.testing.expectEqualSlices(u8, &frame, &decoded);
+        try std.testing.expectEqual(seal, parsed.value.observation.status.?.seal.?);
+    }
+    const typed_observation = try owner.sourcePlanObservation(a, "docs", query);
+    try std.testing.expectEqual(seal, typed_observation.status.?.seal.?);
+    const typed_chunk = try owner.sourcePlanChunk(a, "docs", .{ .query = query, .seal = seal, .ordinal = 0 });
+    defer a.free(typed_chunk.bytes);
+    try std.testing.expectEqualSlices(u8, &frame, typed_chunk.bytes);
+    command.action = .fence;
+    try std.testing.expect((try Helper.apply(a, &owner, command, 5)) == .applied);
+    command.action = .reclaim;
+    try std.testing.expect((try Helper.apply(a, &owner, command, 6)).applied.reclamation != null);
+    try std.testing.expectError(error.SourceReceiptExpired, owner.sourcePlanJson(.chunk, "docs", read_json));
+    command.action = .begin;
+    const expired = try Helper.apply(a, &owner, command, 7);
+    try std.testing.expect(expired == .rejected and expired.rejected == .expired);
 }

@@ -592,6 +592,13 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn timestampedBatchAtRaftEntry(self: *Owner, table: []const u8, batch_json: []const u8, term: u64, index: u64, committed_at_ns: i64) !void {
+        try statusToError(abi.antfly_storage_owner_timestamped_batch_at_raft_entry(self.handle, &.{
+            .entry = .{ .table_name = .fromSlice(table), .request_json = .fromSlice(batch_json), .raft_term = term, .raft_index = index },
+            .committed_at_ns = committed_at_ns,
+        }));
+    }
+
     pub fn replicatedBatchAtRaftEntryJson(
         self: *Owner,
         table_name: []const u8,
@@ -612,6 +619,301 @@ pub const Owner = struct {
             &response.buffer,
         ));
         return response;
+    }
+
+    pub fn orderedSourcePlanControlJson(self: *Owner, table_name: []const u8, command_json: []const u8, raft_term: u64, raft_index: u64) !Response {
+        if (raft_term == 0 or raft_index == 0 or command_json.len > @import("antfly_local_sources").storage_source_plan_wire.max_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_ordered_source_plan_control(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(command_json), .raft_term = raft_term, .raft_index = raft_index }, &response.buffer));
+        return response;
+    }
+    pub fn sourcePlanJson(self: *Owner, comptime operation: enum { native_control, observation, chunk, outcome }, table_name: []const u8, request_json: []const u8) !Response {
+        if (request_json.len > @import("antfly_local_sources").storage_source_plan_wire.max_bytes) return error.InvalidArgument;
+        const function = comptime switch (operation) {
+            .native_control => abi.antfly_storage_owner_native_source_plan_control,
+            .observation => abi.antfly_storage_owner_source_plan_observation,
+            .chunk => abi.antfly_storage_owner_source_plan_chunk,
+            .outcome => abi.antfly_storage_owner_ordered_source_plan_outcome,
+        };
+        var response: Response = .{};
+        try statusToError(function(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(request_json) }, &response.buffer));
+        return response;
+    }
+
+    pub fn sourcePlanOutcome(self: *Owner, a: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_source_plan_wire.Recovery) !@import("antfly_local_sources").storage_source_plan_control.Outcome {
+        const json = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(json);
+        var response = try self.sourcePlanJson(.outcome, table_name, json);
+        defer response.deinit();
+        if (response.bytes().len > 4096) return error.InvalidSourcePlanWire;
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_source_plan_control.Outcome, a, response.bytes(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    pub fn orderedSourceScopeControl(self: *Owner, a: std.mem.Allocator, table: []const u8, command: @import("antfly_local_sources").storage_source_scope_control.Command, term: u64, index: u64) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
+        const ordered = @import("antfly_local_sources").storage_source_scope_ordered;
+        if (term == 0 or index == 0) return error.InvalidSourceAdmission;
+        const bytes = try ordered.control.encodeCommand(a, command);
+        defer a.free(bytes);
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_ordered_source_scope_control(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes), .raft_term = term, .raft_index = index }, &response.buffer));
+        defer response.deinit();
+        return ordered.decodeOutcome(a, response.bytes(), command, .{ .term = term, .index = index });
+    }
+    pub fn sourceScopeOutcome(self: *Owner, a: std.mem.Allocator, table: []const u8, recovery: @import("antfly_local_sources").storage_source_scope_ordered.Recovery) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
+        const ordered = @import("antfly_local_sources").storage_source_scope_ordered;
+        try recovery.validate();
+        const bytes = try std.json.Stringify.valueAlloc(a, recovery, .{});
+        defer a.free(bytes);
+        if (bytes.len > ordered.max_recovery_bytes) return error.InvalidSourceAdmission;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_ordered_source_scope_outcome(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes) }, &response.buffer));
+        defer response.deinit();
+        return ordered.decodeOutcome(a, response.bytes(), recovery.command, recovery.entry);
+    }
+
+    pub fn orderedLegacyTerminalResolution(self: *Owner, a: std.mem.Allocator, table: []const u8, command: @import("antfly_local_sources").storage_source_producer_policy.LegacyTerminalCommand, term: u64, index: u64) !@import("antfly_local_sources").storage_source_legacy_terminal_ordered.Outcome {
+        const policy = @import("antfly_local_sources").storage_source_producer_policy;
+        if (term == 0 or index == 0) return error.InvalidSourceAdmission;
+        const bytes = try policy.encodeLegacyTerminalCommand(a, command);
+        defer a.free(bytes);
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_ordered_legacy_terminal_resolution(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes), .raft_term = term, .raft_index = index }, &response.buffer));
+        return @import("antfly_local_sources").storage_source_legacy_terminal_ordered.decodeOutcome(a, response.bytes());
+    }
+
+    pub fn orderedSourceProducerClosure(self: *Owner, a: std.mem.Allocator, table: []const u8, owner: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion.RoutedOwner, term: u64, index: u64) !@import("antfly_local_sources").storage_source_producer_policy.Closure {
+        const policy = @import("antfly_local_sources").storage_source_producer_policy;
+        const scope = @import("antfly_local_sources").storage_source_scope;
+        try owner.validate();
+        if (term == 0 or index == 0) return error.InvalidSourceAdmission;
+        const bytes = try std.json.Stringify.valueAlloc(a, owner, .{});
+        defer a.free(bytes);
+        if (bytes.len > 8192) return error.InvalidSourceAdmission;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_ordered_source_producer_closure(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes), .raft_term = term, .raft_index = index }, &response.buffer));
+        defer response.deinit();
+        if (response.bytes().len == 0 or response.bytes().len > policy.max_bytes) return error.SourceOutcomeUnresolved;
+        var parsed = std.json.parseFromSlice(policy.Closure, a, response.bytes(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.SourceOutcomeUnresolved;
+        defer parsed.deinit();
+        const result = parsed.value;
+        try result.validate();
+        if (!std.meta.eql(result.root, try scope.Basis.fromOwner(owner)) or result.first_closed_at.index > index or result.first_closed_at.term > term or (result.first_closed_at.index == index and result.first_closed_at.term != term)) return error.SourceOutcomeUnresolved;
+        return result;
+    }
+
+    pub fn orderedSourceRetirement(self: *Owner, a: std.mem.Allocator, table: []const u8, command: @import("antfly_local_sources").storage_source_scope_retirement.Command, term: u64, index: u64) !@import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery {
+        const retirement = @import("antfly_local_sources").storage_source_scope_retirement;
+        const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;
+        if (term == 0 or index == 0) return error.InvalidSourceAdmission;
+        const bytes = try retirement.encodeCommand(a, command);
+        defer a.free(bytes);
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_ordered_source_retirement(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes), .raft_term = term, .raft_index = index }, &response.buffer));
+        defer response.deinit();
+        return ordered.decodeOutcome(a, response.bytes(), command, .{ .term = term, .index = index });
+    }
+    pub fn sourceRetirementOutcome(self: *Owner, a: std.mem.Allocator, table: []const u8, query: @import("antfly_local_sources").storage_source_scope_retirement_ordered.Query) !@import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery {
+        const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;
+        const bytes = try ordered.encodeQuery(a, query);
+        defer a.free(bytes);
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_source_retirement_outcome(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes) }, &response.buffer));
+        defer response.deinit();
+        return ordered.decodeOutcome(a, response.bytes(), query.command, query.entry);
+    }
+
+    pub fn legacyRecoveryInventory(self: *Owner, a: std.mem.Allocator, table: []const u8, query: @import("antfly_local_sources").storage_source_legacy_inventory.Query) !@import("antfly_local_sources").storage_source_legacy_inventory.Observation {
+        const inventory = @import("antfly_local_sources").storage_source_legacy_inventory;
+        const bytes = try inventory.encodeQuery(a, query);
+        defer a.free(bytes);
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_legacy_recovery_inventory(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes) }, &response.buffer));
+        return inventory.decodeObservation(a, response.bytes(), query);
+    }
+
+    pub fn legacyTerminalOutcome(self: *Owner, a: std.mem.Allocator, table: []const u8, query: @import("antfly_local_sources").storage_source_legacy_terminal_ordered.Query) !@import("antfly_local_sources").storage_source_legacy_terminal_ordered.Observation {
+        const ordered = @import("antfly_local_sources").storage_source_legacy_terminal_ordered;
+        const bytes = try ordered.encodeQuery(a, query);
+        defer a.free(bytes);
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_legacy_terminal_outcome(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes) }, &response.buffer));
+        return ordered.decodeObservation(a, response.bytes(), query);
+    }
+
+    pub fn sourceProducerClosureObservation(self: *Owner, a: std.mem.Allocator, table: []const u8, query: @import("antfly_local_sources").storage_source_producer_policy.Query) !@import("antfly_local_sources").storage_source_producer_policy.Observation {
+        const wire = @import("antfly_local_sources").storage_source_producer_policy;
+        try query.validate();
+        const json = try std.json.Stringify.valueAlloc(a, query, .{});
+        defer a.free(json);
+        if (json.len > wire.max_query_bytes) return error.InvalidSourceAdmission;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_source_producer_closure_observation(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(json) }, &response.buffer));
+        defer response.deinit();
+        return wire.decodeObservation(a, response.bytes(), query);
+    }
+    pub fn sourceScopeObservation(self: *Owner, a: std.mem.Allocator, table: []const u8, input: @import("antfly_local_sources").storage_source_scope_control.Query) !@import("antfly_local_sources").storage_source_scope_control.Observation {
+        const wire = @import("antfly_local_sources").storage_source_scope_control;
+        try input.validate();
+        const json = try std.json.Stringify.valueAlloc(a, input, .{});
+        defer a.free(json);
+        if (json.len > wire.max_bytes) return error.InvalidSourceAdmission;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_source_scope_observation(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(json) }, &response.buffer));
+        defer response.deinit();
+        return wire.decodeObservation(a, response.bytes(), input);
+    }
+    pub fn sourceCheckpointObservation(self: *Owner, a: std.mem.Allocator, table: []const u8, input: @import("antfly_local_sources").storage_source_checkpoint_read.Request) !@import("antfly_local_sources").storage_source_checkpoint_read.Reply {
+        const wire = @import("antfly_local_sources").storage_source_checkpoint_read;
+        try input.validate();
+        const json = try std.json.Stringify.valueAlloc(a, input, .{});
+        defer a.free(json);
+        if (json.len > wire.max_request_bytes) return error.InvalidSourceAdmission;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_source_checkpoint_observation(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(json) }, &response.buffer));
+        defer response.deinit();
+        return wire.decodeReply(a, input, response.bytes());
+    }
+    pub fn sourcePlanObservation(self: *Owner, a: std.mem.Allocator, table_name: []const u8, query: @import("antfly_local_sources").storage_source_plan_control.Query) !@import("antfly_local_sources").storage_source_plan_control.Observation {
+        const wire = @import("antfly_local_sources").storage_source_plan_wire;
+        try query.validate();
+        const json = try std.json.Stringify.valueAlloc(a, query, .{});
+        defer a.free(json);
+        var response = try self.sourcePlanJson(.observation, table_name, json);
+        defer response.deinit();
+        return wire.decodeObservation(a, query, response.bytes());
+    }
+    pub fn sourcePlanChunk(self: *Owner, a: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_source_plan_control.ReadRequest) !@import("antfly_local_sources").storage_source_plan_control.Read {
+        const wire = @import("antfly_local_sources").storage_source_plan_wire;
+        try request.validate();
+        const json = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(json);
+        var response = try self.sourcePlanJson(.chunk, table_name, json);
+        defer response.deinit();
+        return wire.decodeChunkReply(a, request, response.bytes());
+    }
+
+    pub fn orderedHistoryControlJson(self: *Owner, table_name: []const u8, command_json: []const u8, raft_term: u64, raft_index: u64) !Response {
+        if (raft_term == 0 or raft_index == 0 or command_json.len > 4096) return error.InvalidArgument;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_ordered_history_control_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(command_json),
+            .raft_term = raft_term,
+            .raft_index = raft_index,
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeHistoryGrant(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantIdentity) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation {
+        return self.historyGrant(alloc, table_name, .{ .version = 1, .authority = .native, .identity = identity });
+    }
+    pub fn orderedHistoryGrant(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantIdentity, minimum_applied_index: u64) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation {
+        return self.historyGrant(alloc, table_name, .{ .version = 1, .authority = .raft, .identity = identity, .minimum_applied_index = minimum_applied_index });
+    }
+    fn historyGrant(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_grant_wire.Request) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation {
+        const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_grant_wire;
+        try request.validate();
+        const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(json);
+        if (json.len > wire.max_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_history_grant(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        return (try wire.decodeReply(alloc, response.bytes(), request)).observation;
+    }
+
+    pub fn historyDecision(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, query: @import("antfly_local_sources").storage_history_decision_wire.Query) !@import("antfly_local_sources").storage_history_decision_wire.OwnedReply {
+        const wire = @import("antfly_local_sources").storage_history_decision_wire;
+        try query.validate();
+        const json = try std.json.Stringify.valueAlloc(alloc, query, .{});
+        defer alloc.free(json);
+        if (json.len > wire.max_request_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_history_decision(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        return wire.decodeReply(alloc, response.bytes(), query);
+    }
+
+    pub fn historyAdmission(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, query: @import("antfly_local_sources").storage_history_admission_wire.Query) !@import("antfly_local_sources").storage_history_admission_wire.Reply {
+        const wire = @import("antfly_local_sources").storage_history_admission_wire;
+        try query.validate();
+        const json = try std.json.Stringify.valueAlloc(alloc, query, .{});
+        defer alloc.free(json);
+        if (json.len > wire.max_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_history_admission(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        return wire.decodeReply(alloc, response.bytes(), query);
+    }
+
+    pub fn historyPublication(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, query: @import("antfly_local_sources").storage_history_publication_wire.CompletionPublicationQuery) !@import("antfly_local_sources").storage_history_publication_wire.CompletionPublicationObservation {
+        const history = @import("antfly_local_sources").storage_history_publication_wire;
+        try query.validate();
+        const json = try std.json.Stringify.valueAlloc(alloc, query, .{});
+        defer alloc.free(json);
+        if (json.len > history.publication_read_max_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_history_publication(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        return history.decodeCompletionPublicationObservation(alloc, response.bytes(), query);
+    }
+
+    pub fn historyResolution(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.Request) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.Reply {
+        const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire;
+        try request.validate();
+        const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(json);
+        if (json.len > wire.max_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_history_resolution(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        return wire.decodeReply(alloc, response.bytes(), request);
+    }
+
+    pub fn orderedHistoryOutcome(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, lookup: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Lookup) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome {
+        const ordered = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered;
+        const json = try std.json.Stringify.valueAlloc(alloc, lookup, .{});
+        defer alloc.free(json);
+        if (json.len > 4096) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_ordered_history_outcome(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        if (response.bytes().len > 4096) return error.HistoryCorrupt;
+        var parsed = try std.json.parseFromSlice(ordered.Outcome, alloc, response.bytes(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    /// Decode into caller-owned page storage before releasing the ABI buffer.
+    pub fn orderedHistoryPage(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.Request, minimum_applied_index: u64) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.Page {
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire;
+        const json = try std.json.Stringify.valueAlloc(alloc, wire.OrderedRead{ .request = request, .minimum_applied_index = minimum_applied_index }, .{});
+        defer alloc.free(json);
+        if (json.len > 4096) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_ordered_history_page(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        if (response.bytes().len > wire.max_bytes) return error.HistoryCorrupt;
+        return wire.decode(alloc, response.bytes(), request);
+    }
+
+    pub fn orderedHistoryBootstrapPage(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.BootstrapRequest, minimum_applied_index: u64) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.BootstrapPage {
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_bootstrap_wire;
+        const json = try std.json.Stringify.valueAlloc(alloc, wire.OrderedRead{ .request = request, .minimum_applied_index = minimum_applied_index }, .{});
+        defer alloc.free(json);
+        if (json.len > 4096) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_ordered_history_bootstrap_page(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        if (response.bytes().len > wire.max_bytes) return error.HistoryCorrupt;
+        return wire.decode(alloc, response.bytes(), request);
     }
 
     pub fn nativeFkGenerationControlJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {

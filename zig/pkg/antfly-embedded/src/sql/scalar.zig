@@ -24,6 +24,32 @@ const json_order = @import("json_order.zig");
 const setting_catalog = @import("setting_catalog.zig");
 const Allocator = std.mem.Allocator;
 const Json = std.json.Value;
+pub const postgres_compat_version = "16.0";
+const postgres_version_banner = "PostgreSQL " ++ postgres_compat_version ++ " compatibility (Antfly)";
+fn scopeField(name: []const u8) ?enum { database, principal } {
+    if (std.mem.eql(u8, name, "$current_user")) return .principal;
+    if (std.mem.eql(u8, name, "current_database") or std.mem.eql(u8, name, "$current_catalog")) return .database;
+    return null;
+}
+
+/// Stable OID for the session's projected PostgreSQL role.
+pub fn postgresRoleOid(principal: []const u8) u32 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(principal, &digest, .{});
+    return 16384 + std.mem.readInt(u32, digest[0..4], .little) % (std.math.maxInt(u32) - 16384);
+}
+
+fn pgHasRole(name: []const u8) bool {
+    return std.mem.eql(u8, name, "pg_has_role");
+}
+
+fn validatePgHasRole(args: []const *const ast.Scalar) !void {
+    if (args.len != 3 or args[2].* != .literal or args[2].literal != .string) return error.SqlUndefinedFunction;
+    const mode = args[2].literal.string;
+    if (!std.ascii.eqlIgnoreCase(mode, "MEMBER") and !std.ascii.eqlIgnoreCase(mode, "USAGE") and !std.ascii.eqlIgnoreCase(mode, "SET"))
+        return error.SqlUndefinedFunction;
+}
+
 pub const PatternSet = struct {
     ptr: *anyopaque,
     count: usize,
@@ -255,7 +281,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin, @"$array_subscript", @"$series_step", current_schemas, pg_current_wal_lsn, pg_current_xact_id, pg_get_expr, @"$current_timestamp" };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -358,7 +384,17 @@ pub fn validateTypedInstructions(instructions: []const Instruction, root: u32, o
                         if (instruction.type.kind != .array) return error.InvalidSqlProgram;
                     },
                     .@"$array", .string_to_array => if (instruction.type.kind != .array) return error.InvalidSqlProgram,
+                    .@"$array_subscript" => {
+                        const array_type = instructions[op.args[0]].type;
+                        const element = array_type.element_type orelse return error.InvalidSqlProgram;
+                        if (array_type.kind != .array or instruction.type.kind != arrayScalarType(element) or instruction.type.element_type != element) return error.InvalidSqlProgram;
+                        for (op.args[1..]) |ordinal| try requireInstructionKind(instructions[ordinal].type, .integer);
+                    },
                     .array_position => if (op.args.len == 3) try requireInstructionKind(instructions[op.args[2]].type, .integer),
+                    .@"$series_step" => {
+                        try requireInstructionKind(instruction.type, .integer);
+                        for (op.args) |ordinal| try requireInstructionKind(instructions[ordinal].type, .integer);
+                    },
                     .is_missing => if (instruction.type.kind != .boolean) return error.InvalidSqlProgram,
                     .value_identity => if (instruction.type.kind != .string) return error.InvalidSqlProgram,
                     else => {},
@@ -708,6 +744,11 @@ pub const Program = struct {
                 .date_trunc,
                 .to_timestamp,
                 .current_setting,
+                .current_schemas,
+                .pg_current_wal_lsn,
+                .pg_current_xact_id,
+                .@"$current_timestamp",
+                .pg_get_expr,
                 .@"$single",
                 .trunc,
                 .sign,
@@ -736,6 +777,8 @@ pub const Program = struct {
                 .array_length,
                 .array_lower,
                 .array_upper,
+                .@"$array_subscript",
+                .@"$series_step",
                 .@"$array_pattern_quantified",
                 .@"$contains",
                 .@"$overlaps",
@@ -2102,6 +2145,16 @@ fn mixedNumberQuantified(value: arrays.Value, probe: arrays.Element, op: arrays.
 fn uuidTextOperand(expression: *const ast.Scalar) bool {
     return expression.* == .literal and expression.literal == .string;
 }
+fn booleanLiteralSide(op: ast.Scalar.Binary, left: *const ast.Scalar, right: *const ast.Scalar, left_type: Type, right_type: Type) ?enum { left, right } {
+    switch (op) {
+        .eq, .neq, .lt, .lte, .gt, .gte, .is_distinct, .is_not_distinct => {},
+        else => return null,
+    }
+    if (left_type.kind == .boolean and right.* == .literal and right.literal == .string) return .right;
+    if (right_type.kind == .boolean and left.* == .literal and left.literal == .string) return .left;
+    return null;
+}
+
 fn common(left: Type, right: Type) !Type {
     if (left.kind == .array or right.kind == .array) {
         const chosen = if (left.kind == .array) left else right;
@@ -2364,6 +2417,58 @@ test "SQL PostgreSQL array search transforms unwind every allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
+test "SQL pg_get_expr reads catalog expression text and propagates nulls" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "pg_catalog.pg_get_expr(NULL, 1259) IS NULL AND pg_get_expr('42', NULL) IS NULL AND pg_get_expr('42', 1259) = '42'", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+    try std.testing.expect(!value.sql_null and value.value.bool);
+}
+
+test "SQL pg_is_in_recovery evaluates as a boolean on Antfly" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "pg_is_in_recovery() OR pg_catalog.PG_IS_IN_RECOVERY()", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    const result = try program.evaluate(a, &.{}, &.{}, .{});
+    try std.testing.expect(!result.sql_null and !result.value.bool);
+
+    var invalid = try @import("compiler.zig").compileScalar(a, "pg_is_in_recovery(true)", .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.SqlUndefinedFunction, bind(a, invalid.expression, &.{}, &.{}, .{}));
+}
+
+test "SQL array subscripts select typed cells using PostgreSQL bounds" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a,
+        \\ ('[0:1]={first,second}'::text[])[0] = 'first'
+        \\ AND ARRAY[[1,2],[3,4]][2][1] = 3
+        \\ AND ARRAY[1][2] IS NULL
+        \\ AND ARRAY[1][NULL] IS NULL
+        \\ AND ARRAY[NULL,1][1] IS NULL
+        \\ AND (NULL::int[])[1] IS NULL
+    , .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+    try std.testing.expect(!result.sql_null and result.value.bool);
+
+    var typed = try @import("compiler.zig").compileScalar(a, "a[$1]", .{});
+    defer typed.deinit();
+    var typed_program = try bindTyped(a, typed.expression, &.{.{ .name = "a", .type = .array, .element_type = .int16 }}, &.{}, .{});
+    defer typed_program.deinit();
+    try std.testing.expectEqual(arrays.ElementType.int16, typed_program.output_type.element_type.?);
+    try std.testing.expectEqual(arrays.ElementType.int32, typed_program.parameter_descriptors[0].element_type.?);
+}
+
 test "SQL PostgreSQL array search prepared frames keep input widths and bounded hot lookup" {
     const a = std.testing.allocator;
     var compiled = try @import("compiler.zig").compileScalar(a, "array_replace($1,$2,$3)", .{});
@@ -2539,17 +2644,21 @@ pub fn validateFunctionArity(function: Function, count: usize) !void {
         return;
     }
     const valid = switch (function) {
-        .value_identity, .is_missing => count == 1,
+        .value_identity, .is_missing, .current_schemas => count == 1,
+        .pg_current_wal_lsn, .pg_current_xact_id => count == 0,
+        .pg_get_expr => count == 2,
+        .@"$current_timestamp" => count == 1,
         .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
-        .array_replace, .date_bin => count == 3,
+        .array_replace, .date_bin, .@"$series_step" => count == 3,
         .@"$like_escape" => count == 4,
         .@"$contains", .@"$overlaps", .jsonb_exists, .jsonb_exists_any, .jsonb_exists_all => count == 2,
         .array_to_string => count == 2 or count == 3,
         .string_to_array => count == 2 or count == 3,
         .jsonb_set => count == 3 or count == 4,
         .@"$array" => true,
+        .@"$array_subscript" => count >= 2 and count <= arrays.max_rank + 1,
         .@"$array_quantified" => count == 4,
         .cardinality, .array_ndims, .jsonb_array_length, .initcap => count == 1,
         .array_length, .array_lower, .array_upper => count == 2,
@@ -2725,6 +2834,9 @@ const Binder = struct {
                     if (right.kind != null and right.kind != .string and right.kind != .integer) return error.SqlTypeMismatch;
                     break :blk .{ .kind = if (binary.op == .json_get) .json else .string };
                 }
+                const distinct = binary.op == .is_distinct or binary.op == .is_not_distinct;
+                if (booleanLiteralSide(binary.op, binary.left, binary.right, left, right) != null)
+                    break :blk .{ .kind = .boolean, .element_type = .boolean, .nullable = !distinct and (left.nullable or right.nullable) };
                 const merged = try common(left, right);
                 switch (binary.op) {
                     .add, .subtract, .multiply, .divide, .modulo => {
@@ -2749,6 +2861,43 @@ const Binder = struct {
                     if (call.args.len == 0) return error.InvalidSqlParameters;
                     for (call.args) |arg| _ = try self.infer(arg, depth + 1);
                     break :blk .{ .kind = .integer, .nullable = false };
+                }
+                if (std.mem.eql(u8, call.name, "$current_timestamp")) {
+                    if (call.args.len != 1 or call.args[0].* != .literal or call.args[0].literal != .integer or
+                        call.args[0].literal.integer < 0 or call.args[0].literal.integer > 6) return error.InvalidSqlProgram;
+                    break :blk .{ .kind = .datetime, .nullable = false };
+                }
+                if (std.mem.eql(u8, call.name, "pg_get_expr")) {
+                    if (call.args.len != 2) return error.SqlUndefinedFunction;
+                    const expression_type = try self.infer(call.args[0], depth + 1);
+                    const relation_type = try self.infer(call.args[1], depth + 1);
+                    if ((expression_type.kind != null and expression_type.kind != .string) or
+                        (relation_type.kind != null and relation_type.kind != .integer)) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .string, .element_type = .text, .nullable = true };
+                }
+                if (std.mem.eql(u8, call.name, "pg_current_xact_id")) {
+                    if (call.args.len != 0) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .number, .element_type = .numeric, .nullable = false };
+                }
+                if (std.mem.eql(u8, call.name, "pg_current_wal_lsn") or std.mem.eql(u8, call.name, "pg_last_wal_receive_lsn")) {
+                    if (call.args.len != 0) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .string, .element_type = .text, .nullable = std.mem.eql(u8, call.name, "pg_last_wal_receive_lsn") };
+                }
+                if (std.mem.eql(u8, call.name, "pg_is_in_recovery")) {
+                    if (call.args.len != 0) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .boolean, .element_type = .boolean, .nullable = false };
+                }
+                if (std.mem.eql(u8, call.name, "version") or scopeField(call.name) != null) {
+                    if (call.args.len != 0) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .string, .element_type = .text, .nullable = false };
+                }
+                if (pgHasRole(call.name)) {
+                    try validatePgHasRole(call.args);
+                    const user = try self.infer(call.args[0], depth + 1);
+                    const role = try self.infer(call.args[1], depth + 1);
+                    if ((user.kind != null and user.kind != .string) or (role.kind != null and role.kind != .string and role.kind != .integer))
+                        return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .boolean, .element_type = .boolean, .nullable = user.nullable or role.nullable };
                 }
                 const function = try functionId(call.name);
                 try validateFunctionArity(function, call.args.len);
@@ -2841,6 +2990,28 @@ const Binder = struct {
                         }
                     }
                     break :blk .{ .kind = .array, .nullable = false, .element_type = kind, .numeric_modifier = try self.commonModifier(call.args, depth) };
+                }
+                if (function == .current_schemas) {
+                    const include_implicit = try self.infer(call.args[0], depth + 1);
+                    if (include_implicit.kind != null and include_implicit.kind != .boolean) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .array, .element_type = .text, .nullable = include_implicit.nullable };
+                }
+                if (function == .@"$series_step") {
+                    for (call.args) |arg| {
+                        const input = try self.infer(arg, depth + 1);
+                        if (input.kind != null and input.kind != .integer) return error.SqlTypeMismatch;
+                    }
+                    break :blk .{ .kind = .integer, .element_type = .int64, .nullable = true };
+                }
+                if (function == .@"$array_subscript") {
+                    const input = try self.infer(call.args[0], depth + 1);
+                    if (input.kind != .array) return error.SqlTypeMismatch;
+                    const element = input.element_type orelse return error.SqlTypeMismatch;
+                    for (call.args[1..]) |arg| {
+                        const index = try self.infer(arg, depth + 1);
+                        if (index.kind != null and index.kind != .integer) return error.SqlTypeMismatch;
+                    }
+                    break :blk .{ .kind = arrayScalarType(element), .element_type = element, .nullable = true, .numeric_modifier = input.numeric_modifier };
                 }
                 if (function == .@"$array_quantified" or function == .cardinality or function == .array_ndims or function == .array_length or function == .array_lower or function == .array_upper) {
                     const array_index: usize = if (function == .@"$array_quantified") 1 else 0;
@@ -3174,6 +3345,16 @@ const Binder = struct {
                 if (binary.op == .json_get or binary.op == .json_text) break :blk .{ .binary = .{ .op = binary.op, .left = try self.compile(binary.left, .json, depth + 1), .right = try self.compile(binary.right, .string, depth + 1) } };
                 const left_type = try self.infer(binary.left, depth + 1);
                 const right_type = try self.infer(binary.right, depth + 1);
+                if (booleanLiteralSide(binary.op, binary.left, binary.right, left_type, right_type)) |which| {
+                    const literal = if (which == .left) binary.left else binary.right;
+                    const cast = try self.alloc.create(ast.Scalar);
+                    cast.* = .{ .cast = .{ .operand = literal, .type = .boolean, .element_type = .boolean } };
+                    break :blk .{ .binary = .{
+                        .op = binary.op,
+                        .left = try self.compile(if (which == .left) cast else binary.left, .boolean, depth + 1),
+                        .right = try self.compile(if (which == .right) cast else binary.right, .boolean, depth + 1),
+                    } };
+                }
                 var merged = try common(left_type, right_type);
                 // PostgreSQL's mixed NUMERIC/real operators use float8;
                 // CASE/COALESCE and array common types still select real.
@@ -3209,6 +3390,46 @@ const Binder = struct {
                     self.parameters = validator.parameters;
                     self.parameter_count = validator.parameter_count;
                     break :blk .{ .literal = .{ .integer = 1 } };
+                }
+                if (std.mem.eql(u8, call.name, "version"))
+                    break :blk .{ .literal = .{ .string = postgres_version_banner } };
+                // Antfly's distributed storage recovery is independent of
+                // PostgreSQL physical standby mode, which pgwire never enters.
+                if (std.mem.eql(u8, call.name, "pg_is_in_recovery"))
+                    break :blk .{ .literal = .{ .bool = false } };
+                if (std.mem.eql(u8, call.name, "pg_last_wal_receive_lsn"))
+                    break :blk .{ .literal = .null };
+                if (std.mem.eql(u8, call.name, "pg_get_expr")) {
+                    const first = try self.compile(call.args[0], .string, depth + 1);
+                    const second = try self.compile(call.args[1], .integer, depth + 1);
+                    // The compatibility catalog uses SQL text for adbin.
+                    // Retain strict NULL propagation for a missing definition.
+                    const args = try self.alloc.dupe(u32, &.{ first, second });
+                    break :blk .{ .call = .{ .function = .pg_get_expr, .args = args } };
+                }
+                if (scopeField(call.name)) |field| {
+                    if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
+                    const view = self.settings orelse return error.SettingCatalogUnavailable;
+                    const value = switch (field) {
+                        .database => view.scope.database,
+                        .principal => view.scope.principal,
+                    };
+                    break :blk .{ .literal = .{ .string = try self.alloc.dupe(u8, value) } };
+                }
+                if (pgHasRole(call.name)) {
+                    const principal = if (self.allow_unresolved) "" else (self.settings orelse return error.SettingCatalogUnavailable).scope.principal;
+                    const role = try self.infer(call.args[1], depth + 1);
+                    const name_literal = try self.alloc.create(ast.Scalar);
+                    name_literal.* = .{ .literal = .{ .string = try self.alloc.dupe(u8, principal) } };
+                    const role_literal = try self.alloc.create(ast.Scalar);
+                    role_literal.* = if (role.kind == .integer) .{ .literal = .{ .integer = postgresRoleOid(principal) } } else name_literal.*;
+                    const is_user = try self.alloc.create(ast.Scalar);
+                    is_user.* = .{ .binary = .{ .op = .eq, .left = call.args[0], .right = name_literal } };
+                    const is_role = try self.alloc.create(ast.Scalar);
+                    is_role.* = .{ .binary = .{ .op = .eq, .left = call.args[1], .right = role_literal } };
+                    const membership = try self.alloc.create(ast.Scalar);
+                    membership.* = .{ .binary = .{ .op = .@"and", .left = is_user, .right = is_role } };
+                    return self.compile(membership, expected, depth + 1);
                 }
                 const function = try functionId(call.name);
                 if (function == .current_setting) {
@@ -3279,6 +3500,8 @@ const Binder = struct {
                 const nested_constructor = function == .@"$array" and self.arrayChildren(call.args);
                 for (call.args, args, 0..) |arg, *out, i| {
                     const desired: ?ast.ColumnType = switch (function) {
+                        .@"$current_timestamp" => .integer,
+                        .current_schemas => .boolean,
                         .@"$like_escape" => if (i == 3) .boolean else .string,
                         .string_to_array => .string,
                         .jsonb_exists => if (i == 0) .json else .string,
@@ -3288,7 +3511,7 @@ const Binder = struct {
                         .array_to_string => if (i == 0) .array else .string,
                         .@"$array" => if (nested_constructor) .array else arrayScalarType(kind.element_type orelse return error.InvalidSqlProgram),
                         .@"$array_quantified" => if (i == 0) (if ((try self.infer(arg, depth + 1)).kind == .number) .number else arrayScalarType((try self.infer(call.args[1], depth + 1)).element_type.?)) else if (i == 1) .array else if (i == 2) .integer else .boolean,
-                        .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) .array else .integer,
+                        .cardinality, .array_ndims, .array_length, .array_lower, .array_upper, .@"$array_subscript" => if (i == 0) .array else .integer,
                         .ai_decide, .ai_choice, .ai_score, .ai_probability => if ((try self.infer(arg, depth + 1)).kind == .json) .json else .string,
                         .@"$single" => if (i == 0) kind.kind else .integer,
                         .@"$pattern_quantified" => if (i == 0) .string else if (i == 1) .json else .boolean,
@@ -3350,9 +3573,10 @@ const Binder = struct {
                         // NUMERIC into real[]'s element type changes equality;
                         // only an unknown probe adopts the array domain.
                         .@"$array_quantified" => if (i == 0 and actual.kind != null) null else if (i < 2) (try self.infer(call.args[1], depth + 1)).element_type else if (i == 2) .int32 else .boolean,
+                        .current_schemas => .boolean,
                         .nullif => if (actual.kind != null) null else kind.element_type,
                         .@"$array_pattern_quantified" => if (i < 2) .text else .boolean,
-                        .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
+                        .cardinality, .array_ndims, .array_length, .array_lower, .array_upper, .@"$array_subscript" => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
                         else => if (kind.kind == .array or desired == kind.kind) kind.element_type else null,
                     };
                     out.* = try self.compileArrayContext(arg, desired, element_context, depth + 1);
@@ -4089,6 +4313,81 @@ const Evaluator = struct {
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
                         };
                         break :blk if (accepted) |value| Datum.json(.{ .bool = value }) else .{};
+                    },
+                    .pg_get_expr => {
+                        const expression_value = try self.runDatum(call.args[0], depth + 1);
+                        const relation = try self.runDatum(call.args[1], depth + 1);
+                        break :blk if (relation.sql_null) .{} else expression_value;
+                    },
+                    .@"$current_timestamp" => {
+                        const view = self.program.settings orelse return error.SettingCatalogUnavailable;
+                        const ns = view.transaction_timestamp_ns orelse return error.SettingCatalogUnavailable;
+                        const precision = try self.runDatum(call.args[0], depth + 1);
+                        if (precision.sql_null or precision.value != .integer or precision.value.integer < 0 or precision.value.integer > 6)
+                            return error.InvalidSqlProgram;
+                        const units = [_]u64{ 1_000_000_000, 100_000_000, 10_000_000, 1_000_000, 100_000, 10_000, 1_000 };
+                        const unit = units[@intCast(precision.value.integer)];
+                        const rounded = ((@as(u128, ns) + unit / 2) / unit) * unit;
+                        break :blk Datum.json(.{ .string = try datetime.formatDateTimeSignedNsAlloc(self.alloc, @intCast(rounded)) });
+                    },
+                    .pg_current_xact_id => {
+                        const view = self.program.settings orelse return error.NoActiveSqlTransaction;
+                        const xid = view.transaction_xid orelse return error.NoActiveSqlTransaction;
+                        var buffer: [20]u8 = undefined;
+                        const text = std.fmt.bufPrint(&buffer, "{d}", .{xid}) catch unreachable;
+                        var work = self.workBudget();
+                        break :blk try numericTextLeaky(self.alloc, text, &work);
+                    },
+                    .pg_current_wal_lsn => {
+                        const view = self.program.settings orelse return error.SqlSnapshotLsnUnavailable;
+                        const lsn = view.snapshot_lsn orelse return error.SqlSnapshotLsnUnavailable;
+                        break :blk Datum.json(.{ .string = try std.fmt.allocPrint(self.alloc, "{X}/{X}", .{ lsn >> 32, lsn & 0xffffffff }) });
+                    },
+                    .current_schemas => {
+                        const implicit = try self.runDatum(call.args[0], depth + 1);
+                        if (implicit.sql_null) break :blk .{};
+                        if (implicit.value != .bool) return error.SqlTypeMismatch;
+                        const view = self.program.settings orelse return error.SettingCatalogUnavailable;
+                        const names = view.schema_search_path orelse return error.SettingCatalogUnavailable;
+                        const add_catalog = implicit.value.bool and for (names) |name| {
+                            if (std.mem.eql(u8, name, "pg_catalog")) break false;
+                        } else true;
+                        const offset: usize = @intFromBool(add_catalog);
+                        const elements = try self.alloc.alloc(arrays.Element, names.len + offset);
+                        if (add_catalog) elements[0] = Datum.json(.{ .string = "pg_catalog" });
+                        for (names, elements[offset..]) |name, *element| element.* = Datum.json(.{ .string = try self.alloc.dupe(u8, name) });
+                        const shape = try self.alloc.alloc(arrays.Dimension, @intFromBool(elements.len != 0));
+                        if (shape.len != 0) shape[0] = .{ .length = @intCast(elements.len) };
+                        const result_array = try self.alloc.create(arrays.Value);
+                        var work = self.workBudget();
+                        result_array.* = try arrays.Value.initWithBudget(.text, shape, elements, .{ .bytes = self.limits.output_bytes }, &work);
+                        break :blk Datum.typedArray(result_array);
+                    },
+                    .@"$series_step" => {
+                        const start = try self.runDatum(call.args[0], depth + 1);
+                        const stop = try self.runDatum(call.args[1], depth + 1);
+                        const step = try self.runDatum(call.args[2], depth + 1);
+                        if (start.sql_null or stop.sql_null or step.sql_null) break :blk .{};
+                        if (step.value != .integer) return error.SqlTypeMismatch;
+                        if (step.value.integer == 0) return error.SqlZeroSeriesStep;
+                        break :blk step;
+                    },
+                    .@"$array_subscript" => {
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        var indices: [arrays.max_rank]i32 = undefined;
+                        var null_index = false;
+                        for (call.args[1..], indices[0 .. call.args.len - 1]) |argument, *subscript| {
+                            const value = try self.runDatum(argument, depth + 1);
+                            if (value.sql_null) {
+                                null_index = true;
+                            } else {
+                                if (value.value != .integer) return error.SqlTypeMismatch;
+                                subscript.* = std.math.cast(i32, value.value.integer) orelse return error.SqlNumericOutOfRange;
+                            }
+                        }
+                        if (input.sql_null or null_index) break :blk .{};
+                        const array = input.array orelse return error.SqlTypeMismatch;
+                        break :blk array.at(indices[0 .. call.args.len - 1]) orelse .{};
                     },
                     .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => {
                         const input = try self.runDatum(call.args[0], depth + 1);

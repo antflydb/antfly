@@ -29,6 +29,38 @@ pub const Limits = struct {
     max_insert_rows: usize = 1_000,
 };
 
+pub const PostgresInputProcedure = enum {
+    array_in,
+    boolin,
+    int8in,
+    int2in,
+    int4in,
+    textin,
+    float4in,
+    float8in,
+    varcharin,
+    timestamptz_in,
+    numeric_in,
+    uuid_in,
+    jsonb_in,
+};
+
+/// Relation identities exposed by the PostgreSQL compatibility catalog.
+pub const PostgresCatalogRelation = enum(u32) {
+    pg_class = 1259,
+    pg_description = 2609,
+    pg_attribute = 1249,
+    pg_index = 2610,
+    pg_attrdef = 2604,
+    pg_type = 1247,
+    pg_namespace = 2615,
+    pg_publication = 6104,
+    pg_enum = 3501,
+    pg_auth_members = 1261,
+    pg_roles = 12000,
+    pg_replication_slots = 12001,
+};
+
 pub const Error = std.mem.Allocator.Error || error{
     InvalidSqlSyntax,
     UnsupportedSqlShape,
@@ -50,7 +82,12 @@ pub const Compiled = struct {
     arena: std.heap.ArenaAllocator,
     statement: ast.Statement,
     parameter_count: u32,
+    /// The statement binds settings or identity from the authorized SQL scope.
     uses_current_setting: bool = false,
+    uses_current_schemas: bool = false,
+    uses_snapshot_lsn: bool = false,
+    uses_transaction_xid: bool = false,
+    uses_transaction_timestamp: bool = false,
 
     pub fn deinit(self: *Compiled) void {
         self.arena.deinit();
@@ -130,7 +167,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
     const statement = try parser.statement();
     _ = parser.take(.semicolon);
     if (parser.pos != tokens.items.len) return parser.fail(error.UnsupportedSqlShape, "unexpected trailing SQL; only one supported statement is allowed");
-    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting };
+    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_current_schemas = parser.uses_current_schemas, .uses_snapshot_lsn = parser.uses_snapshot_lsn, .uses_transaction_xid = parser.uses_transaction_xid, .uses_transaction_timestamp = parser.uses_transaction_timestamp };
 }
 
 fn lexicalError(kind: lexer.LexErrorKind) Error {
@@ -266,6 +303,27 @@ test "compiler treats TIMESTAMPTZ quoted literals as typed datetime casts" {
     try std.testing.expectEqualStrings("2025-01-01T01:30:00+01:30", expression.cast.operand.literal.string);
 }
 
+test "compiler resolves PostgreSQL catalog relation regclass literals" {
+    var compiled = try compile(std.testing.allocator, "INSERT INTO identifiers (oid) VALUES ('PG_CLASS'::regclass), (CAST('pg_catalog.pg_description' AS pg_catalog.regclass)), (NULL::regclass)", .{});
+    defer compiled.deinit();
+    const values = compiled.statement.insert.rows;
+    try std.testing.expectEqual(@as(i64, 1259), values[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 2609), values[1][0].integer);
+    try std.testing.expectEqual(ast.ColumnType.integer, compiled.statement.insert.expressions[2][0].?.cast.type);
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, compile(std.testing.allocator, "SELECT 'public.pg_class'::regclass", .{}));
+}
+
+test "compiler resolves built-in input procedure regproc literals" {
+    var compiled = try compile(std.testing.allocator, "INSERT INTO types (input) VALUES ('ARRAY_IN'::regproc), (CAST('pg_catalog.textin' AS pg_catalog.regproc)), (NULL::regproc)", .{});
+    defer compiled.deinit();
+    const values = compiled.statement.insert.rows;
+
+    try std.testing.expectEqualStrings("array_in", values[0][0].string);
+    try std.testing.expectEqualStrings("textin", values[1][0].string);
+    try std.testing.expectEqual(ast.ColumnType.string, compiled.statement.insert.expressions[2][0].?.cast.type);
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, compile(std.testing.allocator, "SELECT 'missing'::regproc", .{}));
+}
+
 const Parser = struct {
     alloc: std.mem.Allocator,
     tokens: []const token.Token,
@@ -276,6 +334,10 @@ const Parser = struct {
     node_count: usize = 0,
     parameter_count: u32 = 0,
     uses_current_setting: bool = false,
+    uses_current_schemas: bool = false,
+    uses_snapshot_lsn: bool = false,
+    uses_transaction_xid: bool = false,
+    uses_transaction_timestamp: bool = false,
     relation_depth: usize = 0,
 
     fn fail(self: *Parser, err: Error, message: []const u8) Error {
@@ -458,6 +520,21 @@ const Parser = struct {
         }
     }
 
+    fn qualifiedCatalogFunction(self: *const Parser) bool {
+        if (self.pos + 3 >= self.tokens.len) return false;
+        const schema = self.tokens[self.pos];
+        const function = self.tokens[self.pos + 2];
+        if (schema.kind != .identifier or self.tokens[self.pos + 1].kind != .dot or
+            function.kind != .identifier or self.tokens[self.pos + 3].kind != .lparen) return false;
+        const matches = struct {
+            fn name(t: token.Token, expected: []const u8) bool {
+                return if (t.owned) std.mem.eql(u8, t.text, expected) else std.ascii.eqlIgnoreCase(t.text, expected);
+            }
+        }.name;
+        if (matches(schema, "information_schema")) return matches(function, "_pg_expandarray");
+        return matches(schema, "pg_catalog") and (matches(function, "current_schemas") or matches(function, "pg_is_in_recovery") or matches(function, "pg_current_wal_lsn") or matches(function, "pg_last_wal_receive_lsn") or matches(function, "pg_current_xact_id") or matches(function, "pg_get_expr"));
+    }
+
     fn scalar(self: *Parser, depth: usize, minimum: u8) Error!*const ast.Scalar {
         if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL scalar nesting budget exceeded");
         if (self.peek(.lbracket)) return self.fail(error.InvalidSqlSyntax, "bare array brackets require ARRAY constructor context");
@@ -504,9 +581,21 @@ const Parser = struct {
             try self.expect(.lparen);
             const operand = try self.scalar(depth + 1, 0);
             try self.expectKeyword(.as);
-            const kind = try self.castType();
+            left = try self.explicitCast(operand);
             try self.expect(.rparen);
-            left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
+        } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 2 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen and (self.tokens[self.pos + 2].isKeyword(.select) or self.tokens[self.pos + 2].isKeyword(.with))) {
+            self.pos += 2;
+            self.relation_depth += 1;
+            defer self.relation_depth -= 1;
+            if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
+            const nested = try self.statement();
+            if (nested != .select) return self.fail(error.InvalidSqlSyntax, "ARRAY subquery requires SELECT");
+            const query = try self.alloc.create(ast.Select);
+            query.* = nested.select;
+            try self.singleColumnSubquery(query.*);
+            query.required_output_columns = 1;
+            try self.expect(.rparen);
+            left = try self.scalarNode(.{ .call = .{ .name = "$array_subquery", .args = &.{}, .subquery = query } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
             self.pos += 1;
             left = try self.arrayConstructor(depth + 1);
@@ -533,13 +622,38 @@ const Parser = struct {
             const negative = self.take(.minus);
             if (!negative) try self.expect(.plus);
             left = try self.scalarNode(.{ .unary = .{ .op = if (negative) .negative else .positive, .operand = try self.scalar(depth + 1, 7) } });
-        } else if (self.peek(.identifier) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen) {
+        } else if (self.ddlWord("current_timestamp")) {
+            self.uses_current_setting = true;
+            self.uses_transaction_timestamp = true;
+            const precision: i64 = if (self.take(.lparen)) precision: {
+                const parsed = try self.value();
+                if (parsed != .integer or parsed.integer < 0 or parsed.integer > 6)
+                    return self.fail(error.SqlInvalidParameterValue, "CURRENT_TIMESTAMP precision must be 0..6");
+                try self.expect(.rparen);
+                break :precision parsed.integer;
+            } else 6;
+            const argument = try self.scalarNode(.{ .literal = .{ .integer = precision } });
+            left = try self.scalarNode(.{ .call = .{ .name = "$current_timestamp", .args = try self.alloc.dupe(*const ast.Scalar, &.{argument}) } });
+        } else if ((self.peek(.identifier) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen) or self.qualifiedCatalogFunction()) {
+            if (self.qualifiedCatalogFunction()) self.pos += 2;
             const function = self.tokens[self.pos];
             self.pos += 2;
             const name_value = try self.alloc.dupe(u8, function.text);
             if (!function.owned) _ = std.ascii.lowerString(name_value, name_value);
             if (std.mem.startsWith(u8, name_value, "$")) return self.fail(error.UnsupportedSqlShape, "compiler-owned helper functions cannot be called from SQL");
-            if (std.mem.eql(u8, name_value, "current_setting")) self.uses_current_setting = true;
+            if (std.mem.eql(u8, name_value, "current_setting") or std.mem.eql(u8, name_value, "current_database") or std.mem.eql(u8, name_value, "pg_has_role")) self.uses_current_setting = true;
+            if (std.mem.eql(u8, name_value, "current_schemas")) {
+                self.uses_current_setting = true;
+                self.uses_current_schemas = true;
+            }
+            if (std.mem.eql(u8, name_value, "pg_current_wal_lsn")) {
+                self.uses_current_setting = true;
+                self.uses_snapshot_lsn = true;
+            }
+            if (std.mem.eql(u8, name_value, "pg_current_xact_id")) {
+                self.uses_current_setting = true;
+                self.uses_transaction_xid = true;
+            }
             var args: std.ArrayList(*const ast.Scalar) = .empty;
             const distinct = self.keyword(.distinct);
             const star = self.take(.star);
@@ -603,7 +717,13 @@ const Parser = struct {
             const row = !function.owned and std.mem.eql(u8, name_value, "row");
             if (row and (distinct or star or filter != null or window_spec != null or within_group != null)) return self.fail(error.InvalidSqlSyntax, "ROW constructor does not accept aggregate modifiers");
             if (row and args.items.len > 256) return self.fail(error.SqlLimitExceeded, "row expression exceeds column limit");
-            left = try self.scalarNode(.{ .call = .{ .name = if (row) "$row" else name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec, .within_group = within_group } });
+            left = try self.scalarNode(.{ .call = .{ .name = if (row) "$row" else if (std.mem.eql(u8, name_value, "_pg_expandarray")) "$pg_expandarray" else name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec, .within_group = within_group } });
+        } else if (self.ddlWord("current_user")) {
+            self.uses_current_setting = true;
+            left = try self.scalarNode(.{ .call = .{ .name = "$current_user", .args = &.{} } });
+        } else if (self.ddlWord("current_catalog")) {
+            self.uses_current_setting = true;
+            left = try self.scalarNode(.{ .call = .{ .name = "$current_catalog", .args = &.{} } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].isKeyword(.null) and !self.tokens[self.pos].isKeyword(.true) and !self.tokens[self.pos].isKeyword(.false)) {
             left = try self.scalarNode(.{ .column = try self.field() });
         } else left = try self.scalarNode(.{ .literal = try self.value() });
@@ -688,11 +808,31 @@ const Parser = struct {
                     continue;
                 }
             }
+            if (self.take(.dot)) {
+                const label = try self.identifier();
+                if (!std.mem.eql(u8, label, "x") and !std.mem.eql(u8, label, "n"))
+                    return self.fail(error.UnsupportedSqlShape, "unsupported expanded-array record field");
+                const key = try self.scalarNode(.{ .literal = .{ .string = label } });
+                const field_value = try self.scalarNode(.{ .binary = .{ .op = .json_text, .left = left, .right = key } });
+                left = try self.scalarNode(.{ .cast = .{ .operand = field_value, .type = .integer, .element_type = .int64 } });
+                continue;
+            }
+            if (self.take(.lbracket)) {
+                var args: std.ArrayList(*const ast.Scalar) = .empty;
+                try args.append(self.alloc, left);
+                while (true) {
+                    if (args.items.len > @import("array_value.zig").max_rank) return self.fail(error.SqlLimitExceeded, "array subscript rank exceeds supported limit");
+                    try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                    try self.expect(.rbracket);
+                    if (!self.take(.lbracket)) break;
+                }
+                left = try self.scalarNode(.{ .call = .{ .name = "$array_subscript", .args = try args.toOwnedSlice(self.alloc) } });
+                continue;
+            }
             if (self.peek(.colon_colon)) {
                 if (minimum > 8) break;
                 self.pos += 1;
-                const kind = try self.castType();
-                left = try self.scalarNode(.{ .cast = .{ .operand = left, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
+                left = try self.explicitCast(left);
                 continue;
             }
             // PostgreSQL's postfix spellings share the ordinary IS NULL
@@ -977,7 +1117,91 @@ const Parser = struct {
     }
 
     fn select(self: *Parser) Error!ast.Select {
-        return self.selectFinish(try self.selectCore());
+        if (!self.keyword(.distinct)) return self.selectFinish(try self.selectCore());
+        if (!self.keyword(.on)) return self.fail(error.UnsupportedSqlShape, "SELECT DISTINCT requires a distinct projection operator");
+        try self.expect(.lparen);
+        var keys: std.ArrayList(*const ast.Scalar) = .empty;
+        while (true) {
+            try keys.append(self.alloc, try self.scalar(0, 0));
+            if (!self.take(.comma)) break;
+        }
+        try self.expect(.rparen);
+        return self.lowerDistinctOn(try self.selectFinish(try self.selectCore()), keys.items);
+    }
+
+    /// Choose the first row of each distinct partition with the existing
+    /// ordered window operator. Apply pagination after selecting those rows.
+    fn lowerDistinctOn(self: *Parser, source: ast.Select, keys: []const *const ast.Scalar) Error!ast.Select {
+        if (source.columns.len == 0 or source.set_operation != null) return self.fail(error.UnsupportedSqlShape, "DISTINCT ON requires explicit result columns");
+        for (source.columns) |column| if (column.wildcard) return self.fail(error.UnsupportedSqlShape, "DISTINCT ON requires explicit result columns");
+        const normalized = @import("order_aliases.zig").normalize(self.alloc, source) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AmbiguousSqlColumn => return self.fail(error.InvalidSqlSyntax, "ambiguous DISTINCT ON order label"),
+            else => return self.fail(error.SqlLimitExceeded, "DISTINCT ON order budget exceeded"),
+        };
+        const inner_columns = try self.alloc.alloc(ast.Projection, source.columns.len + source.order_by.len + 1);
+        const outer_columns = try self.alloc.alloc(ast.Projection, source.columns.len);
+        for (source.columns, outer_columns, 0..) |column, *outer, i| {
+            const label = try std.fmt.allocPrint(self.alloc, "$project_{d}", .{i});
+            inner_columns[i] = column;
+            inner_columns[i].alias = label;
+            const last = std.mem.lastIndexOfScalar(u8, column.field, 0);
+            outer.* = .{ .field = label, .alias = column.alias orelse if (column.field.len == 0) "?column?" else column.field[(if (last) |end| end + 1 else 0)..] };
+        }
+
+        const window_order = try self.alloc.dupe(ast.Order, normalized.order_by);
+        const outer_order = try self.alloc.dupe(ast.Order, normalized.order_by);
+        const matched = try self.alloc.alloc(bool, keys.len);
+        @memset(matched, false);
+        var passed_prefix = false;
+        for (window_order, outer_order, 0..) |*inner, *outer, i| {
+            const expression = if (inner.position) |ordinal| blk: {
+                if (ordinal > source.columns.len) return self.fail(error.InvalidSqlSyntax, "DISTINCT ON order position exceeds projection");
+                const column = source.columns[ordinal - 1];
+                break :blk column.expression orelse try self.scalarNode(.{ .column = column.field });
+            } else inner.expression.?;
+            const same = @import("aggregate_binding.zig").same;
+            var key_order = false;
+            for (keys, matched) |key, *found| if (same(key, expression)) {
+                key_order = true;
+                found.* = true;
+            };
+            if (!key_order) {
+                for (matched) |found| if (!found) return self.fail(error.InvalidSqlSyntax, "DISTINCT ON expressions must match initial ORDER BY keys");
+                passed_prefix = true;
+            } else if (passed_prefix) return self.fail(error.InvalidSqlSyntax, "DISTINCT ON expressions must match initial ORDER BY keys");
+            inner.position = null;
+            inner.field = "";
+            inner.expression = expression;
+            const label = try std.fmt.allocPrint(self.alloc, "$sort_{d}", .{i});
+            inner_columns[source.columns.len + i] = .{ .expression = expression, .alias = label };
+            outer.position = null;
+            outer.field = label;
+            outer.expression = null;
+        }
+        const rank_name = "$distinct_rank";
+        inner_columns[inner_columns.len - 1] = .{ .alias = rank_name, .expression = try self.scalarNode(.{ .call = .{
+            .name = "row_number",
+            .args = &.{},
+            .window = .{ .partition = keys, .order = window_order },
+        } }) };
+        const inner = try self.alloc.create(ast.Select);
+        inner.* = source;
+        inner.columns = inner_columns;
+        inner.order_by = &.{};
+        inner.limit = null;
+        inner.offset = null;
+        const rank = try self.scalarNode(.{ .column = rank_name });
+        const first = try self.scalarNode(.{ .literal = .{ .integer = 1 } });
+        return .{
+            .source = try self.relationNode(.{ .derived = .{ .query = inner, .alias = "$distinct_source" } }),
+            .columns = outer_columns,
+            .predicate = try self.predicateNode(.{ .scalar = try self.scalarNode(.{ .binary = .{ .op = .eq, .left = rank, .right = first } }) }),
+            .order_by = outer_order,
+            .order_aliases_expanded = true,
+            .limit = source.limit,
+            .offset = source.offset,
+        };
     }
 
     // VALUES shares the flat, bounded row-source representation used by
@@ -1086,6 +1310,69 @@ const Parser = struct {
         return left;
     }
 
+    fn expandArrayProjection(self: *Parser, columns: []ast.Projection, source: *const ast.Relation, filter: ?*const ast.Predicate) Error!?*const ast.Relation {
+        const same = @import("aggregate_binding.zig").same;
+        var input: ?*const ast.Scalar = null;
+        const alias = "$expanded_array";
+        const ordinal_name = alias ++ "\x00n";
+        var bound_ordinal: ?*const ast.Scalar = null;
+        for (columns) |*projection| {
+            const expression = projection.expression orelse continue;
+            // The parser lowers a parenthesized .x/.n selection to a
+            // typed JSON field read. A whole record remains JSON.
+            const selector = if (expression.* == .cast and expression.cast.type == .integer and
+                expression.cast.operand.* == .binary and expression.cast.operand.binary.op == .json_text)
+                expression.cast.operand.binary
+            else
+                null;
+            const call = if (selector) |selection| selection.left else expression;
+            if (call.* != .call or !std.mem.eql(u8, call.call.name, "$pg_expandarray")) continue;
+            if (call.call.args.len != 1 or call.call.window != null or call.call.distinct or call.call.star or call.call.filter != null or call.call.within_group != null)
+                return self.fail(error.UnsupportedSqlShape, "expected one array argument");
+            const array = call.call.args[0];
+            if (input) |prior| if (!same(prior, array))
+                return self.fail(error.UnsupportedSqlShape, "independent expanded arrays in one projection are unsupported");
+            input = array;
+            const ordinal = if (bound_ordinal) |bound| bound else create: {
+                const bound = try self.scalarNode(.{ .column = ordinal_name });
+                bound_ordinal = bound;
+                break :create bound;
+            };
+            const field_name = if (selector) |selection| label: {
+                if (selection.right.* != .literal or selection.right.literal != .string)
+                    return self.fail(error.UnsupportedSqlShape, "expected a named expanded-array field");
+                break :label selection.right.literal.string;
+            } else null;
+            if (field_name != null and std.mem.eql(u8, field_name.?, "n")) {
+                projection.expression = ordinal;
+                continue;
+            }
+            const one = try self.scalarNode(.{ .literal = .{ .integer = 1 } });
+            const lower = try self.scalarNode(.{ .call = .{ .name = "array_lower", .args = try self.alloc.dupe(*const ast.Scalar, &.{ array, one }) } });
+            const offset = try self.scalarNode(.{ .binary = .{ .op = .subtract, .left = ordinal, .right = one } });
+            const index = try self.scalarNode(.{ .binary = .{ .op = .add, .left = lower, .right = offset } });
+            const cell = try self.scalarNode(.{ .call = .{ .name = "$array_subscript", .args = try self.alloc.dupe(*const ast.Scalar, &.{ array, index }) } });
+            if (field_name != null) {
+                projection.expression = cell;
+            } else {
+                const x = try self.scalarNode(.{ .literal = .{ .string = "x" } });
+                const n = try self.scalarNode(.{ .literal = .{ .string = "n" } });
+                projection.expression = try self.scalarNode(.{ .call = .{ .name = "jsonb_build_object", .args = try self.alloc.dupe(*const ast.Scalar, &.{ x, cell, n, ordinal }) } });
+            }
+        }
+        const array = input orelse return null;
+        // Filter the input before opening a per-row array producer.
+        const base = if (filter) |predicate_| blk: {
+            const selected = try self.alloc.create(ast.Select);
+            selected.* = .{ .source = source, .predicate = predicate_ };
+            break :blk try self.relationNode(.{ .derived = .{ .query = selected, .alias = "$expanded_input", .preserve_scope = true } });
+        } else source;
+        const one = try self.scalarNode(.{ .literal = .{ .integer = 1 } });
+        const count = try self.scalarNode(.{ .call = .{ .name = "cardinality", .args = try self.alloc.dupe(*const ast.Scalar, &.{array}) } });
+        const series = try self.seriesRelation(one, count, one, alias, "n", true);
+        return try self.relationNode(.{ .join = .{ .kind = .cross, .left = base, .right = series } });
+    }
+
     fn selectCore(self: *Parser) Error!ast.Select {
         var columns = std.ArrayList(ast.Projection).empty;
         while (true) {
@@ -1100,6 +1387,7 @@ const Parser = struct {
         const simple = source != null and source.?.* == .table and source.?.table.alias == null and source.?.table.search == null;
         const table = if (simple) source.?.table.name else null;
         const filter = try self.where();
+        const expanded = if (source) |relation_source| try self.expandArrayProjection(columns.items, relation_source, filter) else null;
         var group_by: std.ArrayList(*const ast.Scalar) = .empty;
         if (self.keyword(.group)) {
             try self.expectKeyword(.by);
@@ -1118,7 +1406,9 @@ const Parser = struct {
             try windows.append(self.alloc, .{ .name = window_name, .window = try self.window(0) });
             if (!self.take(.comma)) break;
         };
-        var result = ast.Select{ .table = table, .source = if (simple) null else source, .columns = try columns.toOwnedSlice(self.alloc), .predicate = filter, .group_by = try group_by.toOwnedSlice(self.alloc), .having = having, .windows = try windows.toOwnedSlice(self.alloc) };
+        if (expanded != null and (group_by.items.len != 0 or having != null or windows.items.len != 0 or columns.items.len == 0))
+            return self.fail(error.UnsupportedSqlShape, "expanded arrays require explicit ungrouped projections");
+        var result = ast.Select{ .table = if (expanded == null) table else null, .source = expanded orelse (if (simple) null else source), .columns = try columns.toOwnedSlice(self.alloc), .predicate = if (expanded == null) filter else null, .group_by = try group_by.toOwnedSlice(self.alloc), .having = having, .windows = try windows.toOwnedSlice(self.alloc) };
         try @import("window_names.zig").resolveCore(self.alloc, &result, self.limits.max_depth);
         return result;
     }
@@ -1230,6 +1520,73 @@ const Parser = struct {
         return null;
     }
 
+    fn seriesSelect(self: *Parser, values: [3]*const ast.Scalar, source: ?*const ast.Relation) Error!*const ast.Select {
+        const zero = try self.scalarNode(.{ .literal = .{ .integer = 0 } });
+        const positive = try self.scalarNode(.{ .binary = .{ .op = .gt, .left = values[2], .right = zero } });
+        const negative = try self.scalarNode(.{ .binary = .{ .op = .lt, .left = values[2], .right = zero } });
+        const below = try self.scalarNode(.{ .binary = .{ .op = .lte, .left = values[0], .right = values[1] } });
+        const above = try self.scalarNode(.{ .binary = .{ .op = .gte, .left = values[0], .right = values[1] } });
+        const ascending = try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = positive, .right = below } });
+        const descending = try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = negative, .right = above } });
+        const bound = try self.scalarNode(.{ .binary = .{ .op = .@"or", .left = ascending, .right = descending } });
+        try self.checkScalarDepth(bound, 0);
+        const columns = try self.alloc.alloc(ast.Projection, values.len);
+        for (columns, values) |*column, expression| column.* = .{ .expression = expression };
+        const result = try self.alloc.create(ast.Select);
+        result.* = .{ .columns = columns, .source = source, .predicate = try self.predicateNode(.{ .scalar = bound }) };
+        return result;
+    }
+
+    fn integerSeries(self: *Parser, lateral: bool) Error!*const ast.Relation {
+        const start = try self.scalar(0, 0);
+        try self.expect(.comma);
+        const stop = try self.scalar(0, 0);
+        const step = if (self.take(.comma)) try self.scalar(0, 0) else try self.scalarNode(.{ .literal = .{ .integer = 1 } });
+        try self.expect(.rparen);
+        const alias = (try self.sourceAlias()) orelse "generate_series";
+        const label = if (self.take(.lparen)) blk: {
+            const name_value = try self.identifier();
+            try self.expect(.rparen);
+            break :blk name_value;
+        } else alias;
+
+        return self.seriesRelation(start, stop, step, alias, label, lateral);
+    }
+
+    fn seriesRelation(self: *Parser, start: *const ast.Scalar, stop: *const ast.Scalar, step: *const ast.Scalar, alias: []const u8, label: []const u8, lateral: bool) Error!*const ast.Relation {
+        const columns: []const []const u8 = &.{ "$series_value", "$series_stop", "$series_step" };
+        const relation_value = try self.relationNode(.{ .table = .{ .name = .{ .table = "$integer_series" } } });
+        var inputs: [3]*const ast.Scalar = undefined;
+        for (&inputs, [_]*const ast.Scalar{ start, stop, step }) |*input, arg| {
+            input.* = try self.scalarNode(.{ .cast = .{ .operand = arg, .type = .integer, .element_type = .int64 } });
+        }
+        inputs[2] = try self.scalarNode(.{ .call = .{ .name = "$series_step", .args = try self.alloc.dupe(*const ast.Scalar, &inputs) } });
+        var seed_values: [3]*const ast.Scalar = undefined;
+        var current: [3]*const ast.Scalar = undefined;
+        for (&seed_values, &current, columns, inputs) |*seed_value, *cell, column, input| {
+            seed_value.* = try self.scalarNode(.{ .cast = .{ .operand = input, .type = .number, .element_type = .numeric } });
+            cell.* = try self.scalarNode(.{ .column = column });
+        }
+        // Exact arithmetic allows the terminating candidate to exceed bigint
+        // without overflow. Only candidates within the bigint bounds emit.
+        const next = try self.scalarNode(.{ .binary = .{ .op = .add, .left = current[0], .right = current[2] } });
+        const recursive = try self.alloc.create(ast.Select);
+        recursive.* = .{ .set_operation = .{
+            .kind = .@"union",
+            .all = true,
+            .left = try self.seriesSelect(seed_values, null),
+            .right = try self.seriesSelect(.{ next, current[1], current[2] }, relation_value),
+        } };
+        const query = try self.alloc.create(ast.Select);
+        const output = try self.scalarNode(.{ .cast = .{ .operand = current[0], .type = .integer, .element_type = .int64 } });
+        query.* = .{
+            .source = relation_value,
+            .columns = try self.alloc.dupe(ast.Projection, &.{.{ .alias = label, .expression = output }}),
+            .ctes = try self.alloc.dupe(ast.Cte, &.{.{ .name = "$integer_series", .columns = columns, .query = recursive, .recursive = true }}),
+        };
+        return self.relationNode(.{ .derived = .{ .query = query, .alias = alias, .lateral = lateral } });
+    }
+
     fn relationAtom(self: *Parser) Error!*const ast.Relation {
         const lateral = self.keyword(.lateral);
         if (self.take(.lparen)) {
@@ -1253,8 +1610,10 @@ const Parser = struct {
             query.* = statement_value.select;
             return self.relationNode(.{ .derived = .{ .query = query, .alias = alias, .columns = try names.toOwnedSlice(self.alloc), .lateral = lateral } });
         }
-        if (lateral) return self.fail(error.InvalidSqlSyntax, "LATERAL requires a derived query");
         const name_value = try self.tableReferenceName();
+        if (name_value.database == null and (name_value.namespace == null or std.mem.eql(u8, name_value.namespace.?, "pg_catalog")) and std.mem.eql(u8, name_value.table, "generate_series") and self.take(.lparen))
+            return self.integerSeries(lateral);
+        if (lateral) return self.fail(error.InvalidSqlSyntax, "LATERAL requires a derived query");
         if (name_value.database == null and name_value.namespace == null and std.mem.eql(u8, name_value.table, "graph_table") and self.take(.lparen)) {
             const graph_name = try self.tableReferenceName();
             try self.expectKeyword(.match);
@@ -1337,11 +1696,26 @@ const Parser = struct {
             depth += 1;
             if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL join nesting limit exceeded");
             const right = try self.relationAtom();
+            var using_columns: std.ArrayList([]const u8) = .empty;
             const condition = if (kind == .cross) null else blk: {
+                if (self.keyword(.using)) {
+                    try self.expect(.lparen);
+                    var seen: std.StringHashMapUnmanaged(void) = .empty;
+                    while (true) {
+                        try self.node();
+                        const column = try self.identifier();
+                        const entry = try seen.getOrPut(self.alloc, column);
+                        if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate JOIN USING column");
+                        try using_columns.append(self.alloc, column);
+                        if (!self.take(.comma)) break;
+                    }
+                    try self.expect(.rparen);
+                    break :blk null;
+                }
                 try self.expectKeyword(.on);
                 break :blk try self.scalar(0, 0);
             };
-            left = try self.relationNode(.{ .join = .{ .kind = kind, .left = left, .right = right, .condition = condition } });
+            left = try self.relationNode(.{ .join = .{ .kind = kind, .left = left, .right = right, .condition = condition, .using_columns = try using_columns.toOwnedSlice(self.alloc) } });
         }
         return left;
     }
@@ -1734,7 +2108,11 @@ const Parser = struct {
         // Keep the original PostgreSQL function/CASE label before lowering
         // replaces expressions with internal columns or aggregate slots.
         const label = alias orelse switch (expression.*) {
-            .call => |call| if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
+            .call => |call| blk: {
+                if (std.mem.eql(u8, call.name, "$regex_operator")) break :blk "?column?";
+                if (std.mem.eql(u8, call.name, "$current_user") or std.mem.eql(u8, call.name, "$current_catalog")) break :blk call.name[1..];
+                break :blk if (std.mem.startsWith(u8, call.name, "$")) null else call.name;
+            },
             .case_when => "case",
             else => null,
         };
@@ -1773,6 +2151,59 @@ const Parser = struct {
         const scale = if (count == 2) casts.integerText(arguments[1], .int32) catch |err| return self.fail(if (err == error.SqlNumericOutOfRange) error.SqlNumericOutOfRange else error.SqlInvalidTextRepresentation, "invalid NUMERIC scale") else 0;
         if (precision < 1 or precision > 1000 or scale < -1000 or scale > 1000) return self.fail(error.SqlInvalidParameterValue, "NUMERIC precision must be 1..1000 and scale -1000..1000");
         return .{ .precision = @intCast(precision), .scale = @intCast(scale) };
+    }
+
+    fn explicitCast(self: *Parser, operand: *const ast.Scalar) Error!*const ast.Scalar {
+        const start = self.pos;
+        const qualified = self.ddlWord("pg_catalog");
+        if ((!qualified or self.take(.dot)) and self.ddlWord("regproc")) {
+            // pg_type exposes input procedures by name. Resolve the same
+            // known symbols here so clients can compare typinput to regproc.
+            if (operand.* != .literal) return self.fail(error.UnsupportedSqlShape, "expected a literal input procedure name");
+            if (operand.literal == .null) return self.scalarNode(.{ .cast = .{ .operand = operand, .type = .string } });
+            if (operand.literal != .string) return self.fail(error.UnsupportedSqlShape, "expected a literal input procedure name");
+            const spelling = operand.literal.string;
+            const prefix = "pg_catalog.";
+            const symbol = if (std.ascii.startsWithIgnoreCase(spelling, prefix)) spelling[prefix.len..] else spelling;
+            inline for (std.meta.tags(PostgresInputProcedure)) |procedure| {
+                if (std.ascii.eqlIgnoreCase(symbol, @tagName(procedure))) return self.scalarNode(.{ .literal = .{ .string = @tagName(procedure) } });
+            }
+            return self.fail(error.SqlInvalidTextRepresentation, "unknown built-in input procedure");
+        }
+        self.pos = start;
+        const class_qualified = self.ddlWord("pg_catalog");
+        if ((!class_qualified or self.take(.dot)) and self.ddlWord("regclass")) {
+            if (operand.* != .literal) return self.fail(error.UnsupportedSqlShape, "expected a literal catalog relation name");
+            if (operand.literal == .null) return self.scalarNode(.{ .cast = .{ .operand = operand, .type = .integer } });
+            if (operand.literal != .string) return self.fail(error.UnsupportedSqlShape, "expected a literal catalog relation name");
+            const spelling = operand.literal.string;
+            const prefix = "pg_catalog.";
+            const symbol = if (std.ascii.startsWithIgnoreCase(spelling, prefix)) spelling[prefix.len..] else spelling;
+            inline for (std.meta.tags(PostgresCatalogRelation)) |catalog_relation| {
+                if (std.ascii.eqlIgnoreCase(symbol, @tagName(catalog_relation))) return self.scalarNode(.{ .literal = .{ .integer = @backingInt(catalog_relation) } });
+            }
+            return self.fail(error.SqlInvalidTextRepresentation, "unknown PostgreSQL catalog relation");
+        }
+        self.pos = start;
+        const xid_qualified = self.ddlWord("pg_catalog");
+        if ((!xid_qualified or self.take(.dot)) and self.ddlWord("xid8")) {
+            if (operand.* != .literal) return self.fail(error.UnsupportedSqlShape, "expected a literal xid8");
+            if (operand.literal == .null) return self.scalarNode(.{ .cast = .{ .operand = operand, .type = .number, .element_type = .numeric } });
+            const spelling = switch (operand.literal) {
+                .string => |value_| std.mem.trim(u8, value_, " \t\r\n"),
+                .numeric => |value_| value_,
+                .integer => |value_| try std.fmt.allocPrint(self.alloc, "{d}", .{value_}),
+                else => return self.fail(error.UnsupportedSqlShape, "expected a literal xid8"),
+            };
+            const digits = if (spelling.len > 0 and spelling[0] == '+') spelling[1..] else spelling;
+            if (digits.len == 0) return self.fail(error.SqlInvalidTextRepresentation, "expected an unsigned decimal transaction ID");
+            for (digits) |char| if (!std.ascii.isDigit(char)) return self.fail(error.SqlInvalidTextRepresentation, "expected an unsigned decimal transaction ID");
+            const xid = std.fmt.parseInt(u64, digits, 10) catch return self.fail(error.SqlNumericOutOfRange, "xid8 exceeds unsigned 64-bit range");
+            return self.scalarNode(.{ .literal = .{ .numeric = try std.fmt.allocPrint(self.alloc, "{d}", .{xid}) } });
+        }
+        self.pos = start;
+        const kind = try self.castType();
+        return self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
     }
 
     fn castType(self: *Parser) Error!CastType {
@@ -2065,6 +2496,11 @@ const Parser = struct {
                     try self.expectKeyword(.default);
                     ddl.schema_change = .{ .drop_default = column_name };
                 }
+            } else if (kind == .table and self.ddlWord("REPLICA")) {
+                if (!self.ddlWord("IDENTITY")) return self.fail(error.InvalidSqlSyntax, "expected REPLICA IDENTITY");
+                const mode: @FieldType(ast.SchemaChange, "replica_identity") = if (self.keyword(.default)) .default else if (self.ddlWord("FULL")) .full else return self.fail(error.UnsupportedSqlShape, "supported replica identity modes are DEFAULT and FULL");
+                ddl.action = .alter_schema;
+                ddl.schema_change = .{ .replica_identity = mode };
             } else if (kind == .table and self.ddlWord("VALIDATE")) {
                 try self.expectKeyword(.constraint);
                 ddl.action = .alter_schema;
@@ -2235,6 +2671,7 @@ const Parser = struct {
             },
             .cast => |part| try self.persistentExpression(part.operand, generated),
             .call => |part| {
+                if (std.mem.eql(u8, part.name, "current_schemas") or std.mem.eql(u8, part.name, "pg_current_wal_lsn") or std.mem.eql(u8, part.name, "pg_current_xact_id") or std.mem.eql(u8, part.name, "$current_timestamp")) return self.fail(error.UnsupportedSqlShape, "schema expressions cannot capture session state");
                 if (part.subquery != null or part.star or part.distinct or part.filter != null or part.window != null or part.within_group != null)
                     return self.fail(error.UnsupportedSqlShape, "subqueries, aggregates and windows are not allowed in schema expressions");
                 for (part.args) |arg| try self.persistentExpression(arg, generated);

@@ -564,6 +564,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    pgwire_test_mod.addImport("antfly_hash", hash_mod);
+
     // Isolated image/hash benchmarks own a fixed ReleaseFast profile.
     const hash_bench_mod = if (optimize == .fast) hash_mod else b.createModule(.{
         .root_source_file = b.path("lib/hash/src/mod.zig"),

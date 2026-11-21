@@ -173,21 +173,71 @@ pub const ReplicationOp = enum {
     delete,
 };
 
+pub const ReplicationBeforeKind = enum { none, key, full };
+
 pub const ReplicationChange = struct {
     op: ReplicationOp,
+    /// Complete source transaction's resume position. All changes in one
+    /// transaction carry the same checkpoint and must be returned contiguously.
+    /// A destination must not acknowledge this position after only one member.
     checkpoint: []u8,
     row: ?std.json.Value = null,
+    /// Update old images are owned here. Delete old images remain in row.
+    before: ?std.json.Value = null,
+    before_kind: ReplicationBeforeKind = .none,
+    /// Absent unchanged TOAST fields differ from SQL NULL.
+    row_complete: bool = true,
+    before_complete: bool = false,
     key: ?[]u8 = null,
     lag_records: u64 = 0,
     commit_timestamp_ms: u64 = 0,
 
+    pub fn beforeImage(self: @This()) ?std.json.Value {
+        return if (self.op == .delete) self.row else self.before;
+    }
+
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.checkpoint);
         if (self.row) |*row| deinitJsonValue(alloc, row);
+        if (self.before) |*row| deinitJsonValue(alloc, row);
         if (self.key) |key| alloc.free(key);
         self.* = undefined;
     }
 };
+
+/// Borrowed complete transaction groups. Offsets are opaque: equality groups
+/// members; lexical/numeric comparisons cannot establish source order.
+pub const ReplicationTransactions = struct {
+    changes: []const ReplicationChange,
+    position: usize = 0,
+
+    pub fn next(self: *@This()) !?[]const ReplicationChange {
+        if (self.position == self.changes.len) return null;
+        const start = self.position;
+        const checkpoint = self.changes[start].checkpoint;
+        if (checkpoint.len == 0) return error.InvalidReplicationCheckpoint;
+        var end = start + 1;
+        while (end < self.changes.len and std.mem.eql(u8, checkpoint, self.changes[end].checkpoint)) : (end += 1) {}
+        self.position = end;
+        return self.changes[start..end];
+    }
+};
+
+test "replication transactions group opaque checkpoints without advancing past partial apply" {
+    var first = [_]u8{'z'};
+    var second = [_]u8{'a'};
+    const changes = [_]ReplicationChange{
+        .{ .op = .insert, .checkpoint = &first },
+        .{ .op = .update, .checkpoint = &first },
+        .{ .op = .delete, .checkpoint = &second },
+    };
+    var transactions: ReplicationTransactions = .{ .changes = &changes };
+    try std.testing.expectEqual(@as(usize, 2), (try transactions.next()).?.len);
+    try std.testing.expectEqual(@as(usize, 1), (try transactions.next()).?.len);
+    try std.testing.expect((try transactions.next()) == null);
+    var invalid: ReplicationTransactions = .{ .changes = &.{.{ .op = .insert, .checkpoint = &.{} }} };
+    try std.testing.expectError(error.InvalidReplicationCheckpoint, invalid.next());
+}
 
 /// Synchronous durability barrier invoked after the provider inspects the
 /// physical slot, but before it deletes or creates persistent provider state.

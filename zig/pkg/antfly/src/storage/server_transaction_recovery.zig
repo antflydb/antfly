@@ -140,9 +140,62 @@ fn runRecoveryPageWithConfig(
     defer alloc.free(page.items);
     summary.next_scan_after = page.next_after;
 
+    var legacy_records: std.ArrayList(transactions_mod.TxnSummary) = .empty;
+    defer legacy_records.deinit(alloc);
+    if (!config.replicated_metadata) try legacy_records.ensureTotalCapacity(alloc, page.items.len);
+    var completion_scanned: u64 = 0;
+    var last_visited = after;
     transaction: for (page.items) |txn| {
+        defer last_visited = txn.txn_id;
         summary.recovery.scanned_records += 1;
+        if (try manager.getCompletionAdmission(alloc, txn.txn_id)) |saved| {
+            completion_scanned += 1;
+            var retained = saved;
+            defer retained.deinit();
+            const admission = retained.value.admission;
+            // Never pass completion work through the unfenced legacy resolver.
+            if (!txn.coordinator_known or !txn.coordinator) continue;
+            if (admission.version != 3) {
+                summary.recovery.deferred_unresolved += 1;
+                continue;
+            }
+            const coordinator = try admission.member(admission.coordinator_namespace);
+            if (config.owns_recovery_fn) |owns| if (!owns(config.resolver_ctx.?, coordinator.locator)) continue;
+            const enqueue = config.enqueue_completion_fn orelse {
+                summary.recovery.deferred_unresolved += 1;
+                continue;
+            };
+            summary.notification_attempts += 1;
+            enqueue(config.resolver_ctx.?, .{
+                .owner = try admission.recoveryOwner(admission.coordinator_namespace),
+                .transaction_id = txn.txn_id,
+                .admission_digest = retained.value.digest,
+                .coordinator_locator = coordinator.locator,
+                .abort_before_ns = if (txn.source_purpose == null) now_ns -| config.cutoff_ns else 0,
+                .resolution_timestamp_ns = now_ns,
+            }) catch |err| {
+                summary.notification_failures += 1;
+                summary.recovery.deferred_unresolved += 1;
+                switch (err) {
+                    error.ResourceBudgetExceeded, error.OutOfMemory, error.ReadUnavailable, error.NotLeader, error.Canceled, error.Cancelled, error.DeadlineExceeded => {
+                        // Resume at the first unscheduled record after capacity
+                        // recovers; never let a full prefix starve this member.
+                        summary.next_scan_after = last_visited;
+                        break :transaction;
+                    },
+                    else => continue :transaction,
+                }
+            };
+            summary.notification_successes += 1;
+            summary.recovery.deferred_unresolved += 1;
+            continue;
+        }
+        if (!config.replicated_metadata) legacy_records.appendAssumeCapacity(txn);
         if (txn.status == .pending) {
+            if (txn.source_purpose != null) {
+                summary.recovery.kept_recent_pending += 1;
+                continue;
+            }
             const cutoff = now_ns -| config.cutoff_ns;
             if (txn.coordinator_known and txn.coordinator and txn.created_at > 0 and txn.created_at < cutoff) {
                 const participants = try manager.getParticipants(alloc, txn.txn_id);
@@ -267,8 +320,9 @@ fn runRecoveryPageWithConfig(
     if (config.replicated_metadata) return summary;
 
     const cutoff = now_ns -| config.cutoff_ns;
+    const completion_deferred = summary.recovery.deferred_unresolved;
     summary.recovery = try manager.recoverTransactionSummariesWithExtraBatchHooksAndOptions(
-        page.items,
+        legacy_records.items,
         cutoff,
         now_ns,
         config.resolution_extra_hooks,
@@ -277,6 +331,8 @@ fn runRecoveryPageWithConfig(
             .retained_cutoff_timestamp = now_ns -| config.retained_terminal_ns,
         },
     );
+    summary.recovery.scanned_records += completion_scanned;
+    summary.recovery.deferred_unresolved += completion_deferred;
     return summary;
 }
 
@@ -551,6 +607,42 @@ test "transaction recovery runtime recoverOnce works with lsm backend store" {
     });
     try std.testing.expectEqual(@as(u64, 1), stats.auto_aborted);
     try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
+}
+
+test "transaction recovery never presumes abort for source-owned reservations" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(a, .{ .name = "source-recovery" });
+    defer runtime_store.deinit();
+    var manager = try transactions_mod.TxnManager.init(a, &runtime_store);
+    defer manager.deinit();
+    const unprepared: transactions_mod.TxnId = @splat(12);
+    const prepared: transactions_mod.TxnId = @splat(13);
+    for ([_]transactions_mod.TxnId{ unprepared, prepared }, 0..) |id, index| {
+        const proof: [32]u8 = @splat(@intCast(7 + index));
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10_000, 1_000, &.{"docs:0"}, true, true, .{ .source_purpose = proof });
+        if (index != 0) try manager.writeIntentsExtraBatch(id, &.{.{ .key = "a", .value = "source" }}, &.{}, .{ .source_purpose = proof });
+    }
+    const ordinary: transactions_mod.TxnId = @splat(14);
+    try manager.initTransaction(ordinary, 1_000);
+    const Recorder = struct {
+        calls: usize = 0,
+        fn resolve(ptr: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+    };
+    var recorder: Recorder = .{};
+    var clock: platform_clock.ManualClock = .{};
+    clock.setRealtimeNs(5_000);
+    const stats = try recoverOnce(a, &runtime_store, .{ .enabled = true, .cutoff_ns = 3_000, .clock = clock.clock(), .resolver_ctx = &recorder, .resolve_participant_fn = Recorder.resolve });
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.auto_aborted);
+    try std.testing.expectEqual(@as(u64, 2), stats.kept_recent_pending);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(unprepared));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(prepared));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(ordinary));
 }
 
 test "transaction recovery delegates stale coordinator abort to replicated resolver" {
@@ -1037,3 +1129,76 @@ pub const test_support = if (builtin.is_test) struct {
         return OwnedServerRuntime.owner(runtime.external.?.ptr).runtime.config;
     }
 } else struct {};
+
+test "transaction recovery completion enqueue preserves retained ownership and never uses legacy resolver" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const completion = transactions_mod.completion;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try local.storage_docstore.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const namespace: [24]u8 = @splat(1);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&local.storage_internal_keys.identity_namespace_key, &namespace);
+        try local.storage_source_authority.bind(&txn, .raft, namespace);
+        _ = try local.storage_committed_history.admit(&txn, namespace, @splat(2), 4 * 1024 * 1024, 1000, 1);
+        try txn.commit();
+    }
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(3), .root_generation = 4, .group_id = 9, .topology_epoch = 5 };
+    const members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = owner.digest(), .roles = completion.Roles.guards, .input_digest = @splat(6), .locator = "coordinator", .routed_owner = owner }};
+    const admission: completion.Admission = .{ .version = 3, .transaction_id = @splat(7), .admission_digest = @splat(8), .coordinator_namespace = namespace, .coordinator_fence = owner.digest(), .participants = &members };
+    var manager = try transactions_mod.TxnManager.init(a, &store);
+    defer manager.deinit();
+    try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+    const Recorder = struct {
+        enqueued: usize = 0,
+        legacy: usize = 0,
+        owns: bool = true,
+        request: ?local.storage_history_recovery_wire.Request = null,
+        fn enqueue(ptr: *anyopaque, request: local.storage_history_recovery_wire.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try request.validate();
+            self.enqueued += 1;
+            // Only scalar fields are inspected after the borrowed callback.
+            self.request = request;
+        }
+        fn resolve(ptr: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.legacy += 1;
+        }
+        fn ownsRecovery(ptr: *anyopaque, _: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.owns;
+        }
+        fn ack(_: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: []const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn cleanup(_: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: u64, _: u64) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var recorder: Recorder = .{};
+    var clock = platform_clock.ManualClock{};
+    clock.setRealtimeNs(5000);
+    var config: Config = .{ .enabled = true, .replicated_metadata = true, .cutoff_ns = 1000, .clock = clock.clock(), .resolver_ctx = &recorder, .resolve_participant_fn = Recorder.resolve, .owns_recovery_fn = Recorder.ownsRecovery, .acknowledge_participant_fn = Recorder.ack, .cleanup_transaction_fn = Recorder.cleanup, .enqueue_completion_fn = Recorder.enqueue };
+    const stats = try recoverOnce(a, &store, config);
+    try std.testing.expectEqual(@as(usize, 1), recorder.enqueued);
+    try std.testing.expectEqual(owner, recorder.request.?.owner);
+    try std.testing.expectEqual(admission.digest(), recorder.request.?.admission_digest);
+    try std.testing.expectEqual(@as(u64, 4000), recorder.request.?.abort_before_ns);
+    try std.testing.expectEqual(@as(u64, 0), stats.cleaned_records);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(admission.transaction_id));
+    recorder.owns = false;
+    _ = try recoverOnce(a, &store, config);
+    try std.testing.expectEqual(@as(usize, 1), recorder.enqueued);
+    recorder.owns = true;
+    config.enqueue_completion_fn = null;
+    _ = try recoverOnce(a, &store, config);
+    config.replicated_metadata = false;
+    _ = try recoverOnce(a, &store, config);
+    try std.testing.expectEqual(@as(usize, 0), recorder.legacy);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(admission.transaction_id));
+}

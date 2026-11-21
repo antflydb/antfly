@@ -30,6 +30,10 @@ const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const restore_staging = @import("../metadata/restore_staging.zig");
 const physical_metadata = @import("../metadata/storage/raft_apply_store.zig");
+const feed = @import("../metadata/changefeed_control.zig");
+const source = @import("../metadata/source_control.zig");
+const source_scope = @import("../metadata/source_scope_capture.zig");
+const publication = @import("../metadata/pg_publication.zig");
 const sql_settings = @import("antfly_local_sources").system_catalog_settings;
 const sql_policies = @import("antfly_local_sources").system_catalog_policies;
 const fk_generation_publication = @import("../metadata/fk_generation_publication.zig");
@@ -672,6 +676,36 @@ pub const RaftApplyStore = struct {
     pub fn fkInitialParentDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.DecisionRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_parent_decision = request });
     }
+    pub fn getChangefeedControl(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, id: feed.Id) ![]u8 {
+        return self.catalogProjection([]u8, a, group_id, .{ .changefeed_control = id });
+    }
+
+    pub fn getChangefeedAuthority(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64) !?feed.Stamp {
+        return self.catalogProjection(?feed.Stamp, a, group_id, .{ .changefeed_authority = {} });
+    }
+
+    pub fn scanChangefeedMaintenance(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, now: u64, after: ?feed.Id) !feed.MaintenanceScan {
+        return self.catalogProjection(feed.MaintenanceScan, a, group_id, .{ .changefeed_maintenance = .{ .now = now, .after = after } });
+    }
+
+    pub fn getSourceControl(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, source_id: source.Digest) ![]u8 {
+        return self.catalogProjection([]u8, a, group_id, .{ .source_control = .{ .table_id = table_id, .source_id = source_id } });
+    }
+
+    pub fn legacyReplicationSourceIntakeAllowed(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source.Digest) !bool {
+        return self.catalogProjection(bool, a, group_id, .{ .legacy_source_intake = .{ .table_id = table_id, .ordinal = ordinal, .definition = definition } });
+    }
+
+    pub fn captureSourceScope(self: *RaftApplyStore, a: std.mem.Allocator, query: source_scope.Query) !source_scope.Snapshot {
+        return self.catalogProjection(source_scope.Snapshot, a, query.metadata_group_id, .{ .capture_source_scope = query });
+    }
+
+    pub fn getPgPublication(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, database: feed.Digest, name: []const u8) !?std.json.Parsed(publication.Record) {
+        const bytes = try self.catalogProjection(?[]u8, a, group_id, .{ .pg_publication = .{ .database = database, .name = name } }) orelse return null;
+        defer a.free(bytes);
+        return try publication.parseRecord(a, bytes);
+    }
+
     fn catalogProjection(self: *RaftApplyStore, comptime T: type, alloc: std.mem.Allocator, group_id: u64, request: contract.CatalogProjectionRequest) !T {
         const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
         defer alloc.free(bytes);

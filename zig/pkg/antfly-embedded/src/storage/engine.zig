@@ -291,6 +291,10 @@ pub const VTable = struct {
     runPrimaryLsmMaintenanceStepBestEffort: *const fn (self: *DB) Outcome(bool),
     runDueLsmObsoleteReclaimUntilIdle: *const fn (self: *DB, max_steps: usize) Outcome(usize),
     applyOrderedCommittedMutation: *const fn (self: *DB, request: types.BatchRequest, identity: db.OrderedApplyReceipt, bypass_write_gate: bool) Outcome(void),
+    applyOrderedTimestampedMutation: *const fn (*DB, types.BatchRequest, db.OrderedApplyReceipt, i64, bool) Outcome(void),
+    applyOrderedCommittedMutationWithProducer: *const fn (*DB, types.BatchRequest, @import("source_producer_policy.zig").Producer, db.OrderedApplyReceipt, bool) Outcome(void),
+    resolveOrderedClosedLegacyTerminal: *const fn (*DB, @import("transaction_completion.zig").RoutedOwner, @import("transactions.zig").LegacyTerminalResolution, db.OrderedApplyReceipt) Outcome(@import("source_legacy_terminal_ordered.zig").Outcome),
+    applyOrderedSourceProducerClosure: *const fn (*DB, @import("transaction_completion.zig").RoutedOwner, db.OrderedApplyReceipt, bool) Outcome(@import("source_producer_policy.zig").Closure),
     recoverOrderedSourceAdmission: *const fn (self: *DB, request: types.BatchRequest, identity: db.OrderedApplyReceipt, bypass_write_gate: bool) Outcome(void),
     batchNativeFkGenerationApply: *const fn (self: *DB, req: types.BatchRequest) Outcome(void),
     pinTransferablePrimarySnapshot: *const fn (self: *DB) Outcome(DB.TransferablePrimarySnapshot),
@@ -332,10 +336,26 @@ pub const VTable = struct {
     installPublishedChildSchema: *const fn (self: *DB, alloc: std.mem.Allocator, schema_json: []const u8, publication: DB.PublishedChildSchema) Outcome(void),
     beginTransactionWithIdAndParticipantsCreatedAtAndRole: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool) Outcome(@import("transactions.zig").TxnId),
     beginTransactionScoped: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) Outcome(@import("transactions.zig").TxnId),
+    beginProducerTransactionScoped: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, producer: @import("source_producer_policy.zig").Producer) Outcome(@import("transactions.zig").TxnId),
+    beginReplicatedSourceCompletionTransaction: *const fn (self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: db.OrderedApplyReceipt, purpose: [32]u8) Outcome(@import("transactions.zig").TxnId),
+    beginReplicatedScopedSourceCompletionTransaction: *const fn (self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: db.OrderedApplyReceipt, purpose: [32]u8, scope: @import("source_scope.zig").Reference) Outcome(@import("transactions.zig").TxnId),
+    resolveReplicatedSourceCompletionTransactionAtOrderedReceipt: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("transaction_completion.zig").RoutedOwner, purpose: [32]u8) Outcome(void),
+    resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("transaction_completion.zig").RoutedOwner, purpose: [32]u8, scope: @import("source_scope.zig").Reference) Outcome(void),
+    beginReplicatedCompletionTransaction: *const fn (self: *DB, encoded_plan: []const u8, owner: ?@import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) Outcome(@import("transactions.zig").TxnId),
+    beginReplicatedOrdinaryCompletionTransaction: *const fn (self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) Outcome(@import("transactions.zig").TxnId),
+
+    beginReplicatedLegacyCompletionTransaction: *const fn (self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) Outcome(@import("transactions.zig").TxnId),
     beginReplicatedTransactionScoped: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8) Outcome(@import("transactions.zig").TxnId),
+    beginReplicatedProducerTransactionScoped: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8, producer: @import("source_producer_policy.zig").Producer) Outcome(@import("transactions.zig").TxnId),
     writeIntents: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, intents: []const @import("transactions.zig").WriteIntent, predicates: []const @import("transactions.zig").VersionPredicate) Outcome(void),
     writeTransaction: *const fn (self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) Outcome(void),
+    resolveSourceTransaction: *const fn (self: *DB, command: @import("source_admission.zig").Command, status: @import("transactions.zig").TxnStatus, sync_level: types.SyncLevel, cancellation: types.CancellationToken) Outcome(void),
+    retireSourceAttempt: *const fn (self: *DB, command: @import("source_admission.zig").Command) Outcome([@import("source_admission.zig").fence_size]u8),
+    beginSourceTransaction: *const fn (self: *DB, command: @import("source_admission.zig").Command, created_at_ns: u64, participants: []const []const u8) Outcome(types.TxnId),
+    nativeSourceAdmissionNamespace: *const fn (self: *DB) Outcome([24]u8),
+    sourceAdmissionStatus: *const fn (self: *DB, command: @import("source_admission.zig").Command) Outcome(@import("source_admission.zig").Status),
     resolveTransactionIntentsWithSyncLevelAndCancellation: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, sync_level: types.SyncLevel, visibility_cancellation: types.CancellationToken) Outcome(void),
+    resolveReplicatedCompletionTransactionAtOrderedReceipt: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, completion_owner: @import("transaction_completion.zig").RoutedOwner) Outcome(void),
     resolveReplicatedTransactionAtOrderedReceipt: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, sync_level: types.SyncLevel, visibility_cancellation: types.CancellationToken, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8) Outcome(void),
     relationalTopologyIdentity: *const fn (self: *DB) Outcome(DB.RelationalTopologyIdentity),
     relationalHandoffManifest: *const fn (self: *DB, alloc: std.mem.Allocator, source: @import("db/relational_integrity_topology.zig").Fence, destination: @import("db/relational_integrity_topology.zig").Fence, lower: []const u8, upper: []const u8, primary_sequence: u64) Outcome(@import("db/relational_integrity_handoff.zig").Manifest),
@@ -541,6 +561,34 @@ pub const VTable = struct {
     runBackgroundMaintenanceWithCancellation: *const fn (*DB, types.CancellationToken) Outcome(bool),
     registry: *const fn () Outcome(*anyopaque),
     writeValidateGroupedSourceBatch: *const fn (std.mem.Allocator, *DB, []const types.BatchWrite, []const []const u8, []const types.DocumentTransform) Outcome(void),
+    nativeSourcePlanControl: *const fn (*DB, @import("source_plan_control.zig").Request) Outcome(@import("source_plan_storage.zig").Status),
+    applyOrderedSourcePlanControl: *const fn (*DB, @import("source_plan_control.zig").Request, types.OrderedApplyReceipt, bool) Outcome(@import("source_plan_control.zig").Outcome),
+    applyOrderedSourceScopeControl: *const fn (*DB, @import("source_scope_control.zig").Command, types.OrderedApplyReceipt, bool) Outcome(@import("source_scope_ordered.zig").Outcome),
+    orderedSourceScopeOutcome: *const fn (*DB, @import("source_scope_ordered.zig").Recovery) Outcome(@import("source_scope_ordered.zig").Outcome),
+    applyOrderedSourceRetirement: *const fn (*DB, @import("source_scope_retirement.zig").Command, types.OrderedApplyReceipt, bool) Outcome(@import("source_scope_retirement_ordered.zig").Recovery),
+    orderedSourceRetirementOutcome: *const fn (*DB, @import("source_scope_retirement_ordered.zig").Query) Outcome(@import("source_scope_retirement_ordered.zig").Recovery),
+    legacyRecoveryInventory: *const fn (*DB, Allocator, @import("source_legacy_inventory.zig").Query) Outcome(@import("source_legacy_inventory.zig").Observation),
+    legacyTerminalOutcome: *const fn (*DB, @import("source_legacy_terminal_ordered.zig").Query) Outcome(@import("source_legacy_terminal_ordered.zig").Observation),
+    sourceProducerClosureObservation: *const fn (*DB, @import("source_producer_policy.zig").Query) Outcome(@import("source_producer_policy.zig").Observation),
+    sourceScopeObservation: *const fn (*DB, @import("source_scope_control.zig").Query) Outcome(@import("source_scope_control.zig").Observation),
+    sourceCheckpointObservation: *const fn (*DB, @import("source_checkpoint_read.zig").Request) Outcome(@import("source_checkpoint_read.zig").Reply),
+    sourcePlanObservation: *const fn (*DB, @import("source_plan_control.zig").Query) Outcome(@import("source_plan_control.zig").Observation),
+    sourcePlanChunk: *const fn (*DB, std.mem.Allocator, @import("source_plan_control.zig").ReadRequest) Outcome(@import("source_plan_control.zig").Read),
+    orderedSourcePlanOutcome: *const fn (*DB, @import("source_plan_control.zig").Recovery) Outcome(@import("source_plan_control.zig").Outcome),
+    nativeHistoryConsumerControl: *const fn (self: *DB, command: @import("history_consumer.zig").Command) Outcome(@import("history_consumer.zig").Result),
+    nativeHistoryPage: *const fn (self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request) Outcome(@import("history_page.zig").Page),
+    provisionNativeHistoryAuthority: *const fn (self: *DB, expected_namespace: [24]u8) Outcome(void),
+    applyOrderedHistoryConsumerControl: *const fn (*DB, @import("history_consumer.zig").Command, types.OrderedApplyReceipt, bool) Outcome(@import("history_ordered.zig").Outcome),
+    historyBootstrapPage: *const fn (*DB, std.mem.Allocator, @import("history_page.zig").BootstrapRequest, ?u64) Outcome(@import("history_page.zig").BootstrapPage),
+    orderedHistoryPage: *const fn (*DB, std.mem.Allocator, @import("history_page.zig").Request, u64) Outcome(@import("history_page.zig").Page),
+    orderedHistoryOutcome: *const fn (*DB, std.mem.Allocator, @import("history_ordered.zig").Lookup) Outcome(@import("history_ordered.zig").Outcome),
+    nativeHistoryGrant: *const fn (*DB, @import("history_consumer.zig").GrantIdentity) Outcome(@import("history_consumer.zig").GrantObservation),
+    orderedHistoryGrant: *const fn (*DB, @import("history_consumer.zig").GrantIdentity, u64) Outcome(@import("history_consumer.zig").GrantObservation),
+    publishReplicatedCompletionCertificate: *const fn (*DB, []const u8, @import("transaction_completion.zig").RoutedOwner, types.OrderedApplyReceipt) Outcome(@import("committed_history.zig").CompletionPublication),
+    historyCompletionDecision: *const fn (*DB, Allocator, @import("history_decision_wire.zig").Query) Outcome([]u8),
+    historyAdmission: *const fn (*DB, @import("history_admission_wire.zig").Query) Outcome(@import("history_admission_wire.zig").Reply),
+    historyCompletionPublication: *const fn (*DB, Allocator, @import("committed_history.zig").CompletionPublicationQuery) Outcome(@import("committed_history.zig").CompletionPublicationObservation),
+    historyResolution: *const fn (*DB, Allocator, @import("history_resolution_wire.zig").Request) Outcome(@import("history_resolution_wire.zig").Reply),
 };
 pub const Boundary = callback.Boundary(VTable);
 pub const FieldLayout = extern struct { name: [*:0]const u8, type_name: [*:0]const u8, offset: usize, size: usize, alignment: usize };
@@ -556,7 +604,31 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     };
     return &Holder.fields;
 }
-pub const descriptor_version: u32 = 42;
+/// Version 49 changes the by-value history command/result contract with root
+/// policy variants and typed policy observations. Older engines must not be
+/// called with the new union tags or enlarged result layout.
+/// Version 50 adds source-purpose completion methods and changes the by-value
+/// transaction intent/mutation layouts. Version 49 callers cannot share it.
+/// Version 51 adds native/ordered frozen source-plan control and qualified reads.
+/// Version 52 adds source-global checkpoint BEGIN/PREPARE contracts.
+/// Version 53 adds bounded checkpoint receipt-window command layouts.
+/// Version 54 adds qualified source checkpoint observations.
+/// Version 56 adds qualified source-scope registry observations.
+/// Version 57 adds physical ordered source-scope controls and outcome recovery.
+/// Version 58 adds ordered source attempt retirement and exact outcome recovery.
+/// Version 59 adds physical-root producer closure and trusted classification.
+/// Version 60 requires producer closure on transaction-record mutation.
+/// Version 61 retains immutable ordinary transaction producer provenance.
+/// Version 62 adds explicitly classified ordinary completion BEGIN.
+/// Version 63 preserves row producer provenance through primary materialization.
+/// Version 64 retains immutable legacy completion transaction origin.
+/// Version 65 adds native and applying-entry non-history producer BEGIN.
+/// Version 66 adds snapshot-bound producer closure observations.
+/// Version 67 adds original terminal legacy resolution under physical closure.
+/// Version 68 returns atomically retained legacy resolution outcomes.
+/// Version 69 adds snapshot-bound read-only legacy recovery outcomes.
+/// Version 74 combines committed history with staged producer durability.
+pub const descriptor_version: u32 = 74;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

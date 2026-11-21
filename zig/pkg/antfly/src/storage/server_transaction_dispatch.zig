@@ -87,12 +87,47 @@ pub fn applyReplicatedTransactionMutationInternal(
                 if (std.mem.eql(u8, participant, local_participant)) local_present = true;
             }
             if (!local_present) return error.InvalidBatchRequest;
+            if (begin.completion_admission) |raw| {
+                try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
+                const entry = raft_entry orelse return error.ChangefeedCapabilityUnsupported;
+                const binding = begin.completion_owner orelse return error.InvalidHistoryAdmission;
+                if (binding.group_id != group_id) return error.TopologyChanged;
+                try @import("antfly_local_sources").api_internal_batch.validateCompletionBegin(alloc, raw, begin.txn_id, begin.participants, binding, begin.topology_epoch);
+                const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
+                var plan = try completion.parseAdmission(alloc, raw);
+                defer plan.deinit();
+                const member = try plan.value.admission.member(binding.namespace);
+                if (!std.mem.eql(u8, member.locator, local_participant)) return error.InvalidParticipant;
+                if (begin.source_purpose) |purpose| {
+                    if (!begin.retain_terminal) return error.InvalidBatchRequest;
+                    if (begin.source_scope) |scope|
+                        _ = try db.beginReplicatedScopedSourceCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, entry, purpose, scope)
+                    else
+                        _ = try db.beginReplicatedSourceCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, entry, purpose);
+                } else if (begin.legacy_producer)
+                    _ = try db.beginReplicatedLegacyCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry)
+                else if (begin.ordinary_producer)
+                    _ = try db.beginReplicatedOrdinaryCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry)
+                else
+                    _ = try db.beginReplicatedCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry);
+                return;
+            }
             const coordinator = std.mem.eql(u8, begin.participants[0], local_participant);
             const local_only = [_][]const u8{local_participant};
             // Only the coordinator owns the full participant fan-out. A
             // follower tracks itself, making successful cleanup O(N) rather
             // than every participant retrying every other participant.
             const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
+            if (begin.ordinary_producer or begin.legacy_producer) {
+                try @import("antfly_local_sources").api_internal_batch.validateProducerBeginControlRequest(req);
+                if (begin.ordinary_producer and begin.legacy_producer) return error.InvalidBatchRequest;
+                const producer: @import("antfly_local_sources").storage_source_producer_policy.Producer = if (begin.ordinary_producer) .ordinary else .legacy_cdc;
+                if (raft_entry) |entry|
+                    _ = try db.beginReplicatedProducerTransactionScoped(begin.txn_id, begin.begin_timestamp, begin.created_at_ns, durable_participants, coordinator, begin.retain_terminal, entry, req.restore_staging_scope, producer)
+                else
+                    _ = try db.beginProducerTransactionScoped(begin.txn_id, begin.begin_timestamp, begin.created_at_ns, durable_participants, coordinator, begin.retain_terminal, req.restore_staging_scope, producer);
+                return;
+            }
             if (raft_entry) |entry|
                 _ = try db.beginReplicatedTransactionScoped(
                     begin.txn_id,
@@ -116,7 +151,19 @@ pub fn applyReplicatedTransactionMutationInternal(
                 );
         },
         .prepare => |prepare| {
+            const wire = @import("antfly_local_sources").api_internal_batch;
+            const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
+            const encoded_input = try wire.completionPrepareInput(alloc, req);
+            defer alloc.free(encoded_input);
+            const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(db.core.identity_namespace);
             const intents: db_mod.types.TransactionIntentRequest = .{
+                .completion_ordinary_producer = prepare.ordinary_producer,
+                .completion_legacy_producer = prepare.legacy_producer,
+                .completion_owner = prepare.completion_owner,
+                .completion_source_purpose = prepare.source_purpose,
+                .completion_source_scope = prepare.source_scope,
+                .completion_source_checkpoint = prepare.source_checkpoint,
+                .completion_input_digest = completion.preparedInputDigest(namespace, encoded_input),
                 .commit_requires = req.commit_requires,
                 .prepared_enrichments_json = req.prepared_enrichments_json,
                 .document_version_scheme = req.document_version_scheme,
@@ -160,6 +207,17 @@ pub fn applyReplicatedTransactionMutationInternal(
                     transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
                     else => return err,
                 };
+                if (resolve.completion_owner) |binding| {
+                    try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
+                    if (req.restore_staging_scope != null or binding.group_id != group_id) return error.TopologyChanged;
+                    if (resolve.source_purpose) |purpose| {
+                        if (resolve.source_scope) |scope|
+                            try db.resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding, purpose, scope)
+                        else
+                            try db.resolveReplicatedSourceCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding, purpose);
+                    } else try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding);
+                    return;
+                }
                 try db.resolveReplicatedTransactionAtOrderedReceipt(
                     resolve.txn_id,
                     resolve.status,
@@ -173,6 +231,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                     if (defer_coordinator_ack) null else local_participant,
                 );
             } else {
+                if (resolve.completion_owner != null) return error.ChangefeedCapabilityUnsupported;
                 try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
                     resolve.txn_id,
                     resolve.status,
@@ -191,6 +250,12 @@ pub fn applyReplicatedTransactionMutationInternal(
                     };
                 }
             }
+        },
+        .publish_completion => |publication| {
+            try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
+            const entry = raft_entry orelse return error.ChangefeedCapabilityUnsupported;
+            if (publication.completion_owner.group_id != group_id) return error.TopologyChanged;
+            _ = try db.publishReplicatedCompletionCertificate(publication.certificate, publication.completion_owner, entry);
         },
         .acknowledge => |ack| (if (raft_entry) |entry|
             db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(ack.txn_id, ack.participant, entry)

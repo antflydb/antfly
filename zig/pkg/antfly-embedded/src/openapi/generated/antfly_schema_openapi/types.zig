@@ -1730,6 +1730,8 @@ pub const TableSchema = struct {
     /// Physical document index order. Fields must have sortable scalar mappings. Changing the order requires rebuilding physical coverage. Relational tables use relational_indexes instead.
     index_sort: ?[]const std.json.Value = null,
     storage_mode: ?TableStorageMode = null,
+    /// PostgreSQL logical replication identity for native relational tables. Default uses the primary key. Full emits the complete old row.
+    replica_identity: ?[]const u8 = null,
     /// External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables.
     base_source: ?ExternalLakeTableSource = null,
     /// Immutable typed expressions applied only to absent columns on new writes, never explicit null. Defaults cannot reference columns. A column cannot have both a default and a generated expression. Omission or [] declares none. Relational tables only.
@@ -1764,6 +1766,7 @@ pub const TableSchema = struct {
         .{ "version", "version", true },
         .{ "index_sort", "index_sort", true },
         .{ "storage_mode", "storage_mode", true },
+        .{ "replica_identity", "replica_identity", true },
         .{ "base_source", "base_source", true },
         .{ "column_defaults", "column_defaults", true },
         .{ "generated_columns", "generated_columns", true },
@@ -1800,6 +1803,10 @@ pub const TableSchema = struct {
         }
         if (self.storage_mode) |value| {
             try jw.objectField("storage_mode");
+            try jw.write(value);
+        }
+        if (self.replica_identity) |value| {
+            try jw.objectField("replica_identity");
             try jw.write(value);
         }
         if (self.base_source) |value| {

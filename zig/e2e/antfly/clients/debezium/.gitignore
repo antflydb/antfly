@@ -1,0 +1,5 @@
+target/
+.local/
+__pycache__/
+!src/main/
+!src/main/**

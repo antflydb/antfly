@@ -721,6 +721,111 @@ test "SQL materialized relation replay spills once and shares a single statement
     }
 }
 
+test "SQL _pg_expandarray expands a shared projection in key order" {
+    const a = std.testing.allocator;
+    var fixture: SetTestBackend = .{};
+    const sql = "SELECT r.id, r.n, (r.keys).x AS x FROM " ++
+        "(SELECT s.id, (information_schema._pg_expandarray(s.a)).n AS n, " ++
+        "information_schema._pg_expandarray(s.a) AS keys " ++
+        "FROM (VALUES (1,'[0:1]={2,1}'::smallint[]),(2,ARRAY[7]::smallint[]),(3,ARRAY[]::smallint[])) s(id,a) " ++
+        "WHERE s.id <> 2) r ORDER BY r.id,r.n";
+    var compiled = try @import("compiler.zig").compile(a, sql, .{});
+    defer compiled.deinit();
+    var result = try @import("runtime.zig").execute(a, fixture.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    const actual = try std.json.Stringify.valueAlloc(a, result.output.rows, .{});
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("[[\"1\",\"1\",\"2\"],[\"1\",\"2\",\"1\"]]", actual);
+}
+
+test "SQL generate_series accepts expression bounds and alias columns" {
+    const allocator = std.testing.allocator;
+    var backend: SetTestBackend = .{};
+    const Case = struct { sql: []const u8, expected: []const i64 };
+    for ([_]Case{
+        .{ .sql = "SELECT s.r FROM generate_series(1, array_upper(ARRAY['public','misc'], 1)) AS s(r) ORDER BY s.r", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT n FROM pg_catalog.generate_series(5, 0, -2) AS n ORDER BY n DESC", .expected = &.{ 5, 3, 1 } },
+        .{ .sql = "SELECT generate_series FROM generate_series(2, 1)", .expected = &.{} },
+        .{ .sql = "SELECT generate_series FROM generate_series(NULL, 1, 0)", .expected = &.{} },
+        .{ .sql = "SELECT generate_series FROM generate_series(9223372036854775807, 9223372036854775807)", .expected = &.{9223372036854775807} },
+    }) |case| {
+        errdefer std.debug.print("generate_series SQL failed: {s}\n", .{case.sql});
+        var compiled = try @import("compiler.zig").compile(allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.expected.len, result.output.rows.len);
+        for (result.output.rows, case.expected) |row, value| try std.testing.expectEqual(value, try std.fmt.parseInt(i64, row[0].string, 10));
+    }
+    var zero = try @import("compiler.zig").compile(allocator, "SELECT n FROM generate_series(2, 1, 0) AS n", .{});
+    defer zero.deinit();
+    try std.testing.expectError(error.SqlZeroSeriesStep, @import("runtime.zig").execute(allocator, backend.backend(), &zero, &.{}, .{}));
+}
+
+test "SQL array_agg retains scalar types, duplicates, and nulls" {
+    const a = std.testing.allocator;
+    var backend: SetTestBackend = .{};
+    var spill: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &backend, .checkpoint = SetTestBackend.checkpoint };
+    defer spill.deinit();
+    const Case = struct { sql: []const u8, expected: []const u8 };
+    for ([_]Case{
+        .{ .sql = "SELECT a.items[1], a.items[2], a.items[3] FROM (SELECT array_agg(t.label) AS items FROM (VALUES ('a'),(NULL),('a')) t(label)) a", .expected = "[[\"a\",null,\"a\"]]" },
+        .{ .sql = "SELECT array_agg(n) IS NULL FROM (SELECT 1 AS n WHERE false) t", .expected = "[[true]]" },
+        .{ .sql = "SELECT e.id, e.labels[1] FROM (SELECT t.enumtypid AS id, array_agg(t.enumlabel) AS labels FROM (VALUES (3,'label')) t(enumtypid,enumlabel) GROUP BY id) e", .expected = "[[\"3\",\"label\"]]" },
+    }) |case| {
+        var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
+        defer compiled.deinit();
+        for ([_]bool{ false, true }) |use_spill| {
+            var source = backend.backend();
+            source.spill_manager = if (use_spill) &spill else null;
+            var result = try @import("runtime.zig").execute(a, source, &compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            const json = try std.json.Stringify.valueAlloc(a, result.output.rows, .{});
+            defer a.free(json);
+            try std.testing.expectEqualStrings(case.expected, json);
+        }
+    }
+}
+
+test "SQL derived GROUP BY resolves output aliases after source fields" {
+    const a = std.testing.allocator;
+    var backend: SetTestBackend = .{};
+    for ([_][]const u8{
+        "SELECT e.id, e.label_count FROM (SELECT t.enumtypid AS id, count(t.enumlabel) AS label_count FROM (VALUES (3,'label')) t(enumtypid,enumlabel) GROUP BY id) e",
+        "SELECT e.id, e.label_count FROM (SELECT t.enumtypid AS id, count(t.enumlabel) AS label_count FROM (VALUES (3,'label')) t(enumtypid,enumlabel) GROUP BY t.enumtypid) e",
+    }) |sql| {
+        var compiled = try @import("compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(a, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("3", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("1", result.output.rows[0][1].string);
+    }
+}
+
+test "SQL JOIN USING merges shared keys and preserves qualified inputs" {
+    const allocator = std.testing.allocator;
+    var backend: SetTestBackend = .{};
+    const Case = struct { sql: []const u8, rows: []const u8 };
+    for ([_]Case{
+        .{ .sql = "SELECT * FROM (VALUES (1,'left'),(2,'match')) l(k,a) FULL JOIN (VALUES (2,'exact'),(3,'right')) r(k,b) USING (k) ORDER BY k", .rows = "[[\"1\",\"left\",null],[\"2\",\"match\",\"exact\"],[\"3\",null,\"right\"]]" },
+        .{ .sql = "SELECT k,l.*,r.* FROM (VALUES (1,'left')) l(k,a) RIGHT JOIN (VALUES (2,'right')) r(k,b) USING (k)", .rows = "[[\"2\",null,null,\"2\",\"right\"]]" },
+        .{ .sql = "SELECT k, a FROM (VALUES (1,'keep'),(2,'drop')) l(k,a) JOIN (VALUES (1),(2)) r(k) USING (k) JOIN (VALUES (1),(3)) t(k) USING (k)", .rows = "[[\"1\",\"keep\"]]" },
+        .{ .sql = "SELECT * FROM (VALUES (1,2,'left')) l(a,b,x) JOIN (VALUES (1,2,'right'),(1,3,'drop')) r(a,b,y) USING (b,a)", .rows = "[[\"2\",\"1\",\"left\",\"right\"]]" },
+        .{ .sql = "SELECT count(*) FROM (VALUES (NULL::integer)) l(k) JOIN (VALUES (NULL::integer)) r(k) USING (k)", .rows = "[[\"0\"]]" },
+    }) |case| {
+        errdefer std.debug.print("JOIN USING SQL failed: {s}\n", .{case.sql});
+        var compiled = try @import("compiler.zig").compile(allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(allocator, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        const rows = try std.json.Stringify.valueAlloc(allocator, result.output.rows, .{});
+        defer allocator.free(rows);
+        try std.testing.expectEqualStrings(case.rows, rows);
+    }
+}
+
 test "SQL set operations preserve multiplicities precedence and output ordering" {
     const runtime = @import("runtime.zig");
     const compiler = @import("compiler.zig");

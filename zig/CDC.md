@@ -1,6 +1,6 @@
 # CDC
 
-This document describes the Postgres replication-source / CDC subsystem in
+This document describes inbound PostgreSQL CDC and outbound logical replication in
 `antfly-zig`.
 
 It is intentionally narrower than query-time `foreign_sources`.
@@ -13,6 +13,130 @@ authenticated commit hooks, and managed archive publication is described in
 [Lake ingestion, change capture, and publication](../docs/plans/lake-ingestion-and-publication.md).
 It builds on this subsystem's canonical apply, metadata ownership, and durable
 checkpoint contracts; it does not imply those additional source APIs exist today.
+
+## Outbound PostgreSQL logical replication
+
+A native data node can serve a configured Antfly publication over pgwire. The
+slot binds to that publication at creation. It retains whole committed
+transactions in `pgoutput` format and advances retention after durable client
+feedback. A slot can cover multiple native relational tables and up to 128
+history roots. Coordinated transactions become visible only after all their
+published participants can be emitted under one Begin and Commit. Clients can
+start with `NOEXPORT_SNAPSHOT` or create a slot with `EXPORT_SNAPSHOT` and adopt
+its initial LSN after importing the coherent cut in a repeatable-read SQL
+transaction.
+
+Stock `psql` and `pg_recvlogical` 18.6 use `pgoutput` protocol version 1 in the
+end-to-end suite. Single-table and two-table cases cover feedback, restart,
+resume, and slot drop. The exported-snapshot cases read pre-cut rows using
+`psql` and verify that `pg_recvlogical` receives the post-cut changes. The
+two-table cases also exercise transaction rollback and rollback to savepoint.
+Changing replica identity invalidates the old slot binding and returns a
+resynchronization error before streaming. Schema changes require the
+publication and slot to be created for the new relation definition.
+Publications advertise `pubtruncate=false`. Antfly SQL TRUNCATE replaces the
+table generation and invalidates the previous binding.
+Run these cases from the `zig` directory.
+
+```sh
+ANTFLY_BIN="$PWD/zig-out/bin/antfly" uv run --project e2e/antfly pytest e2e/antfly/test_pgwire_replication.py
+```
+
+The stock Debezium 3.3.0.Final connector with pgjdbc 42.7.7 passed initial
+snapshot, streaming, graceful reconnect, and crash recovery on a native Antfly
+table. The qualified deployment used one metadata node, one data node, and
+a dedicated local spool. The qualification driver and exact deployment details
+are recorded in the [Debezium README](e2e/antfly/clients/debezium/README.md).
+
+Provision a dedicated mounted directory for the slot spool. Every data node
+serving the publication or reclaiming its spool must see the same files and
+fencing inventory. The filesystem must provide cross-node advisory locking,
+atomic rename, and durable file and directory synchronization. Keep the volume
+mounted at the configured path while these nodes are active.
+
+```sh
+antfly storage provision-pgwire-spool /srv/antfly/pgwire-spool
+```
+
+Use the returned namespace in each participating data node's config.
+
+```json
+{
+  "pgwire": {
+    "enabled": true,
+    "replication_publication": "changes",
+    "replication_spool": {
+      "directory": "/srv/antfly/pgwire-spool",
+      "namespace": "<64 hexadecimal digits returned by provisioning>"
+    }
+  }
+}
+```
+
+Keep the namespace and the fencing inventory with the spool volume. At startup,
+a missing or different spool incarnation prevents the node from serving that
+configuration. A replacement spool requires resynchronizing consumers that were
+bound to the original incarnation.
+
+## Public HTTP changefeeds
+
+Create an authorized feed with `POST /db/v1/changefeeds` and an
+`Idempotency-Key` header. The definition selects native document or relational tables,
+`start`, `include`, and an optional lease. `start` accepts `now` and
+`snapshot_then_changes`. Use optional per-table selectors to limit row payloads
+and match exact scalar values.
+
+```json
+{
+  "tables": ["orders"],
+  "start": "snapshot_then_changes",
+  "include": "rows",
+  "selectors": [{
+    "table": "orders",
+    "fields": ["status", "total"],
+    "predicates": [{"field": "region", "value": "eu"}]
+  }]
+}
+```
+
+A selector table name matches an entry in `tables`. Each selector supports up to
+64 top-level fields and 16 exact predicates. All predicates must match. Field
+selection applies to the payload after authorization and predicate matching.
+The feed evaluates both historical row images. Committed row events include
+inserts, updates, and deletes. Predicated feeds also report `enter` and `leave`
+when an update changes whether the row matches. Delivery is at least once. Use `event_id` for
+deduplication and the transaction completion marker before applying a whole
+transaction.
+
+Read `GET /db/v1/changefeeds/{id}/events?after={cursor}` and advance using
+`Antfly-Changefeed-Cursor`. Acknowledge successfully applied pages with
+`POST /db/v1/changefeeds/{id}/ack` and a JSON `cursor`. Get the acknowledged
+cursor, current phase, outstanding delivery count and expiry with
+`GET /db/v1/changefeeds/{id}`. The outstanding count measures deliveries
+already issued to the client. Delete the feed to release its retention grants.
+Expired or invalidated cuts require resynchronization. Each read rechecks
+current authorization.
+
+## Retained HTTP feed benchmark
+
+From the `zig` directory, run the isolated fixture against a local binary.
+
+```sh
+uv run --project e2e/antfly python e2e/antfly/bench_changefeed.py zig-out/bin/antfly --rows 32 --batch-size 8 --fanout 0 2 4
+```
+
+A macOS arm64 debug run with one metadata node, one data node, and one table
+root gave the following results. At each nonzero fan-out, one consumer stayed
+offline until both servers restarted. Active consumers pulled and acknowledged
+each batch serially. Lag includes the pull and durable acknowledgement. The
+replica allocation column measures whole replica directory growth during the
+workload. The no-feed baseline provides a comparison for the retention cost.
+
+| Consumers | Write rows/s | Write and deliver rows/s | Median batch ACK lag | Replica growth | Restart | Offline catch-up |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 38.3 | 38.3 | — | 104 KiB | — | — |
+| 2 | 38.7 | 2.11 | 3.58 s | 312 KiB | 1.40 s | 14.39 s |
+| 4 | 38.9 | 0.73 | 7.20 s | 352 KiB | 1.64 s | 14.34 s |
 
 ## Metadata substrate
 
@@ -170,6 +294,33 @@ Real Postgres CDC E2E coverage exists in `e2e/antfly/test_cdc.py` for:
   cutover path.
 
 ## Provider-neutral lake transaction ingress
+
+The complete row-transaction envelope lives in
+`pkg/antfly-embedded/src/storage/source_transaction.zig`, independently of
+Iceberg. The Iceberg row writer aliases that type and continues to own typed
+schema validation. Its retry identity retains the existing source/epoch/batch
+hash, so extracting the contract does not change durable queue identities.
+
+PostgreSQL poll results expose complete committed transactions. All rows in
+one transaction share an opaque source checkpoint. Native destinations admit
+the transaction through their canonical write path. Writable Iceberg
+destinations admit it through the lake ingress and resolve the catalog commit
+before advancing the durable source checkpoint. On a distributed cluster, the
+metadata leader uses the configured shared S3 or GCS artifact lane for that
+ingress. Configure the same artifact store on metadata and serving nodes.
+Each writable Iceberg table owns one PostgreSQL source cut and checkpoint. A retry uses the
+same source epoch, transaction identity, and checkpoint. Unsupported mutation
+messages, including inbound TRUNCATE, stop progress before the checkpoint.
+
+A native destination can separately expose retained committed history through
+the public changefeed API and eligible relational tables through pgoutput.
+Writable Iceberg reports its ingress and catalog commit capability. External
+read-only Iceberg attachments report committed snapshots as their change
+authority. Index publication is a separate milestone across these contracts.
+The managed-source status reports the durable published generation and its
+base snapshot alongside pending or failed index generations.
+See [destination integration](https://github.com/antflydb/antfly/issues/1698)
+and [committed history and changefeeds](https://github.com/antflydb/antfly/issues/1639).
 
 Writable native Iceberg tables also accept complete provider-neutral CDC
 transactions at `POST /db/v1/tables/{tableName}/lake/changes`. This push boundary

@@ -37,6 +37,9 @@ const tracing = @import("../tracing/antfly_trace_writer.zig");
 const stderr_writer = @import("../tracing/stderr_writer.zig");
 const ttl = @import("ttl.zig");
 const retained_effects = @import("retained_effects.zig");
+pub const completion = @import("transaction_completion.zig");
+const source_scope = @import("source_scope.zig");
+const completion_admission_prefix = completion.admission_prefix;
 const wal_trace = @import("write_amplification_trace.zig");
 
 // ============================================================================
@@ -84,7 +87,7 @@ pub const max_read_guards_per_transaction = 65_536;
 // mutation; resolution retires both. Historical immutable schemas remain
 // usable after a new active epoch is published and after participant restart.
 const schema_leases_prefix = "\x00\x00__txn_schema_leases__:";
-const records_prefix = "\x00\x00__txn_records__:";
+const records_prefix = completion.record_prefix;
 const participants_prefix = "\x00\x00__txn_participants__:";
 const participant_index_prefix = "\x00\x00__txn_participant_index_v1__:";
 const resolved_index_prefix = "\x00\x00__txn_resolved_index_v1__:";
@@ -98,11 +101,7 @@ const hot_standby_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
 
 pub const TxnId = [16]u8;
 
-pub const TxnStatus = enum(u8) {
-    pending = 0,
-    committed = 1,
-    aborted = 2,
-};
+pub const TxnStatus = @import("source_legacy_inventory.zig").Status;
 
 pub const WriteIntent = struct {
     key: []const u8,
@@ -119,25 +118,7 @@ pub const WriteIntent = struct {
     retained_artifact_keys: u64 = 0,
 };
 
-pub const IntentValue = struct {
-    value: ?[]const u8,
-    prepared_row: ?[]const u8 = null,
-
-    pub fn decode(bytes: []const u8) !IntentValue {
-        if (bytes.len == 0) return error.InvalidTxnRecord;
-        return switch (bytes[0]) {
-            0 => .{ .value = bytes[1..] },
-            1 => if (bytes.len == 1) .{ .value = null } else error.InvalidTxnRecord,
-            2 => blk: {
-                if (bytes.len < 5) return error.InvalidTxnRecord;
-                const length = std.mem.readInt(u32, bytes[1..5], .little);
-                if (length > bytes.len - 5 or length == bytes.len - 5) return error.InvalidTxnRecord;
-                break :blk .{ .value = bytes[5..][0..length], .prepared_row = bytes[5 + length ..] };
-            },
-            else => error.InvalidTxnRecord,
-        };
-    }
-};
+pub const IntentValue = @import("transaction_intent_value.zig").Value;
 
 /// Admission counts retained input/AROW bytes and per-row commit metadata.
 /// Transient parsing and preparation allocations are independently charged by
@@ -156,16 +137,7 @@ pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
 /// derived index/vector writes. AROW metadata replacement preserves length.
 /// Document numbers retain their exact source spelling. Only special-field
 /// stripping serializes JSON; count its exact output with a bounded writer.
-fn isRawMetadataIntentKey(key: []const u8) bool {
-    return range_protection.counterBucket(key) != null or
-        range_protection.indexCounterDigest(key) != null or
-        std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_generation_retirement") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
-        @import("db/relational_index_maintenance_contract.zig").isControlKey(key);
-}
+const isRawMetadataIntentKey = @import("transaction_metadata_keys.zig").isRawMetadataKey;
 
 fn isRawMetadataPredicateKey(key: []const u8) bool {
     return isRawMetadataIntentKey(key) or
@@ -182,24 +154,7 @@ fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
     if (isRawMetadataIntentKey(intent.key)) return 0;
     var payload: u64 = if (intent.prepared_row) |row| row.len else if (intent.value) |value| value.len else 0;
     if (intent.prepared_row == null) if (intent.value) |value| {
-        // No escaped property name and no special spelling means the mapper
-        // borrows original bytes; do not parse or allocate on that common path.
-        if (std.mem.indexOf(u8, value, "_edges") != null or std.mem.indexOf(u8, value, "_embeddings") != null or std.mem.indexOfScalar(u8, value, '\\') != null) {
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{ .parse_numbers = false }) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidTxnRecord,
-            };
-            defer parsed.deinit();
-            if (parsed.value == .object) {
-                var buffer: [1024]u8 = undefined;
-                var counter = std.Io.Writer.Discarding.init(&buffer);
-                try std.json.Stringify.value(parsed.value, .{}, &counter.writer);
-                // Native DB removes special/vector fields, while the generic
-                // transaction manager can preserve raw document bytes. Cover
-                // both authorities; removing fields never grows this encoding.
-                payload = @max(payload, counter.fullCount());
-            }
-        }
+        payload = try @import("transaction_intent_value.zig").documentImageBytes(alloc, value);
     };
     const primary = std.math.add(u64, 16 + 2 + internal_keys.encodedComponentLen(intent.key), payload) catch return error.TransactionTooLarge;
     return std.math.add(u64, primary, intent.retained_artifact_bytes) catch error.TransactionTooLarge;
@@ -286,6 +241,7 @@ pub const TxnError = error{
     DecisionConflict,
     TxnNotFound,
     InvalidTxnRecord,
+    SourceTransactionIdentityConflict,
 };
 
 pub const RecoveryStats = struct {
@@ -308,6 +264,10 @@ pub const RecoveryOptions = struct {
 };
 
 pub const TxnSummary = struct {
+    ordinary_producer: bool = false,
+    legacy_producer: bool = false,
+    source_scope: ?source_scope.Reference = null,
+    source_purpose: ?[32]u8 = null,
     txn_id: TxnId,
     status: TxnStatus,
     begin_timestamp: u64,
@@ -328,7 +288,23 @@ pub const TxnSummaryPage = struct {
     next_after: ?TxnId,
 };
 
+const SourceRetirement = struct {
+    command: @import("source_scope_retirement.zig").Command,
+    cut: source_scope.Cut,
+    already_fenced: bool,
+};
+
+/// Internal recovery of an already durable terminal decision. This can never
+/// decide pending work: the native writer rechecks the exact original record.
+pub const LegacyTerminalResolution = @import("source_producer_policy.zig").LegacyTerminalResolution;
 pub const ResolutionExtraBatch = struct {
+    source_scope_cut: ?source_scope.Cut = null,
+    /// Private ordered retirement receipt, staged after scope resolution in the
+    /// same writer, including terminal retries without row mutations.
+    source_retirement: ?SourceRetirement = null,
+    source_scope: ?source_scope.Reference = null,
+    completion_owner: ?completion.RoutedOwner = null,
+    source_purpose: ?[32]u8 = null,
     /// Borrowed through this resolution attempt. Terminal-decision retries do
     /// not attach it: they must never re-certify already applied row effects.
     commit_participant: ?@import("commit_participant.zig").Participant = null,
@@ -367,6 +343,17 @@ pub const ResolutionExtraBatch = struct {
 const prepared_enrichments_prefix = "\x00\x00__txn_prepared_enrichments__:";
 
 pub const MutationExtraBatch = struct {
+    /// Trusted native ingress only. Never inferred on a replay of an old BEGIN.
+    ordinary_producer: bool = false,
+    legacy_producer: bool = false,
+    source_scope: ?source_scope.Reference = null,
+    completion_owner: ?completion.RoutedOwner = null,
+    /// Computed by trusted private PREPARE dispatch over the complete original
+    /// canonical input. Never supplied directly by public mutation JSON.
+    completion_input_digest: ?[32]u8 = null,
+    /// Immutable source-command fingerprint installed with BEGIN and required
+    /// by PREPARE. Ordinary sessions cannot adopt a source transaction ID.
+    source_purpose: ?[32]u8 = null,
     prepared_enrichments_json: ?[]const u8 = null,
     document_revisions: ?bool = null,
     writes: []const docstore.KVPair = &.{},
@@ -435,6 +422,8 @@ pub const ReplayAppend = struct {
 };
 
 pub const IntentBatch = struct {
+    ordinary_producer: bool = false,
+    legacy_producer: bool = false,
     prepared_enrichments_json: ?[]u8 = null,
     document_revisions: bool = false,
     writes: []docstore.KVPair = &.{},
@@ -468,6 +457,10 @@ pub const IntentBatch = struct {
 };
 
 const TxnRecord = struct {
+    ordinary_producer: bool = false,
+    legacy_producer: bool = false,
+    source_scope: ?source_scope.Reference = null,
+    source_purpose: ?[32]u8 = null,
     document_revisions: bool = false,
     status: TxnStatus,
     begin_timestamp: u64,
@@ -517,6 +510,10 @@ const txn_record_v4_size = 51;
 const txn_record_v5_size = 52;
 const txn_record_v6_size = 53;
 const txn_record_v7_size = 54;
+const txn_record_v8_size = 87;
+const txn_record_v9_size = txn_record_v8_size + source_scope.Reference.encoded_len;
+// Separate exact-size encoding keeps every older record unclassified.
+const txn_record_v10_size = txn_record_v7_size + 1;
 
 // ============================================================================
 // TxnManager
@@ -595,6 +592,104 @@ pub const TxnManager = struct {
 
     pub fn initTransactionWithParticipants(self: *TxnManager, txn_id: TxnId, timestamp: u64, participants: []const []const u8) !void {
         try self.initTransactionWithParticipantsCreatedAt(txn_id, timestamp, timestamp, participants);
+    }
+
+    /// Trusted coordinator admission. The original physical plan and BEGIN
+    /// commit in one native batch, including the caller's Raft replay marker.
+    /// This does not enable outbound completion until retention credits,
+    /// participant resolution and certificate propagation are qualified.
+    pub fn initTransactionWithCompletionAdmission(self: *TxnManager, admission: completion.Admission, timestamp: u64, created_at: u64, retain_terminal: bool, extra: MutationExtraBatch) !void {
+        return self.initCompletionAdmission(admission, timestamp, created_at, retain_terminal, true, extra);
+    }
+
+    pub fn initParticipantWithCompletionAdmission(self: *TxnManager, admission: completion.Admission, timestamp: u64, created_at: u64, retain_terminal: bool, extra: MutationExtraBatch) !void {
+        {
+            var probe = try self.store.beginProbe();
+            defer probe.abort();
+            _ = (try @import("committed_history.zig").load(&probe)) orelse return error.HistoryResynchronizationRequired;
+        }
+        return self.initCompletionAdmission(admission, timestamp, created_at, retain_terminal, false, extra);
+    }
+
+    fn initCompletionAdmission(self: *TxnManager, admission: completion.Admission, timestamp: u64, created_at: u64, retain_terminal: bool, coordinator: bool, extra: MutationExtraBatch) !void {
+        try admission.validate();
+        if (admission.version < 3 and try self.keyExists(@import("committed_history.zig").policy_key)) return error.ChangefeedCapabilityUnsupported;
+        const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
+        defer self.alloc.free(namespace);
+        if (namespace.len != 24 or coordinator != std.mem.eql(u8, namespace, &admission.coordinator_namespace)) return TxnError.DecisionConflict;
+        _ = try admission.member(namespace[0..24].*);
+        const key = makeSidecarKey(completion_admission_prefix, admission.transaction_id);
+        for (extra.writes) |write| if (std.mem.eql(u8, write.key, &key)) return error.InvalidTxnRecord;
+        for (extra.deletes) |deleted| if (std.mem.eql(u8, deleted, &key)) return error.InvalidTxnRecord;
+        const existing_record = self.loadTransactionRecord(admission.transaction_id) catch |err| switch (err) {
+            TxnError.TxnNotFound => null,
+            else => return err,
+        };
+        if (existing_record == null and try self.keyExists(&completion.resolutionKey(admission.transaction_id))) return TxnError.DecisionConflict;
+        if (try self.getCompletionAdmission(self.alloc, admission.transaction_id)) |saved| {
+            var owned = saved;
+            defer owned.deinit();
+            if (existing_record == null or !std.mem.eql(u8, &owned.value.digest, &admission.digest())) return TxnError.DecisionConflict;
+        } else if (existing_record != null) return TxnError.DecisionConflict;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var members: std.ArrayList([]const u8) = .empty;
+        var unique: std.StringHashMapUnmanaged(void) = .empty;
+        const owner = try admission.member(admission.coordinator_namespace);
+        try members.append(scratch, owner.locator);
+        for (admission.participants) |participant| {
+            const member = try unique.getOrPut(scratch, participant.locator);
+            if (member.found_existing) return error.InvalidParticipant;
+            if (coordinator and !std.mem.eql(u8, &participant.namespace, &admission.coordinator_namespace)) try members.append(scratch, participant.locator);
+        }
+        // Preserve the original encoding as well as its logical identity. A
+        // serializer upgrade must not reprice credits or break pending retry.
+        const encoded = if (existing_record != null) try self.getAlloc(scratch, &key) else try completion.encodeAdmission(scratch, admission);
+        var writes: std.ArrayList(docstore.KVPair) = .empty;
+        try writes.appendSlice(scratch, extra.writes);
+        try writes.append(scratch, .{ .key = &key, .value = encoded });
+        var with_admission = extra;
+        with_admission.writes = writes.items;
+        try self.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(admission.transaction_id, timestamp, created_at, members.items, coordinator, retain_terminal, with_admission);
+    }
+
+    pub fn getCompletionAdmission(self: *TxnManager, a: Allocator, txn_id: TxnId) !?std.json.Parsed(completion.AdmissionEnvelope) {
+        const key = makeSidecarKey(completion_admission_prefix, txn_id);
+        const bytes = self.getAlloc(a, &key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer a.free(bytes);
+        var parsed = try completion.parseAdmission(a, bytes);
+        errdefer parsed.deinit();
+        if (!std.mem.eql(u8, &parsed.value.admission.transaction_id, &txn_id)) return error.InvalidTxnRecord;
+        const record = try self.loadTransactionRecord(txn_id);
+        if (!record.coordinator_known) return error.InvalidTxnRecord;
+        const namespace = try self.getAlloc(a, &internal_keys.identity_namespace_key);
+        defer a.free(namespace);
+        if (namespace.len != 24 or record.coordinator != std.mem.eql(u8, namespace, &parsed.value.admission.coordinator_namespace)) return TxnError.DecisionConflict;
+        _ = try parsed.value.admission.member(namespace[0..24].*);
+        return parsed;
+    }
+
+    pub fn getCompletionResolution(self: *TxnManager, a: Allocator, txn_id: TxnId) !?std.json.Parsed(completion.ResolutionEnvelope) {
+        var plan = (try self.getCompletionAdmission(a, txn_id)) orelse return null;
+        defer plan.deinit();
+        const record = try self.loadTransactionRecord(txn_id);
+        if (record.status != .committed or !record.prepared_known or !record.prepared or !record.intents_resolved_known or !record.intents_resolved) return error.SourceOutcomeUnresolved;
+        const manifest = try plan.value.admission.manifest(record.commit_version);
+        const raw = self.getAlloc(a, &completion.resolutionKey(txn_id)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer a.free(raw);
+        var parsed = try completion.parseResolution(a, manifest, raw);
+        errdefer parsed.deinit();
+        const namespace = try self.getAlloc(a, &internal_keys.identity_namespace_key);
+        defer a.free(namespace);
+        if (!std.mem.eql(u8, namespace, &parsed.value.resolution.namespace)) return error.InvalidTxnRecord;
+        return parsed;
     }
 
     pub fn initTransactionWithParticipantsCreatedAt(
@@ -695,12 +790,42 @@ pub const TxnManager = struct {
         retain_terminal: bool,
         extra_batch: MutationExtraBatch,
     ) !backend_erased.Ticket {
+        if (try self.keyExists(@import("committed_history.zig").policy_key)) {
+            const completion_key = makeSidecarKey(completion_admission_prefix, txn_id);
+            var qualified = try self.keyExists(&completion_key);
+            for (extra_batch.writes) |write| if (std.mem.eql(u8, write.key, &completion_key)) {
+                qualified = true;
+            };
+            if (!qualified) return error.ChangefeedCapabilityUnsupported;
+        }
+        if ((extra_batch.ordinary_producer and extra_batch.legacy_producer) or ((extra_batch.ordinary_producer or extra_batch.legacy_producer) and (extra_batch.source_purpose != null or extra_batch.source_scope != null))) return error.SourceTransactionIdentityConflict;
+        if (extra_batch.source_purpose) |purpose| if (std.mem.allEqual(u8, &purpose, 0)) return error.SourceTransactionIdentityConflict;
+        if (extra_batch.source_scope) |scope| {
+            try scope.validate();
+            if (extra_batch.source_purpose == null or !retain_terminal) return error.SourceTransactionIdentityConflict;
+        }
         const key = makeRecordKey(txn_id);
         const existing = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
             TxnError.TxnNotFound => null,
             else => return err,
         };
         if (existing) |record| {
+            const completion_key = makeSidecarKey(completion_admission_prefix, txn_id);
+            const frozen = self.getAlloc(self.alloc, &completion_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (frozen) |bytes| self.alloc.free(bytes);
+            if (frozen) |bytes| {
+                var supplied = false;
+                for (extra_batch.writes) |write| if (std.mem.eql(u8, write.key, &completion_key)) {
+                    if (supplied or !std.mem.eql(u8, write.value, bytes)) return TxnError.DecisionConflict;
+                    supplied = true;
+                };
+                if (!supplied) return TxnError.DecisionConflict;
+                for (extra_batch.deletes) |deleted| if (std.mem.eql(u8, deleted, &completion_key)) return TxnError.DecisionConflict;
+            }
+            if (record.ordinary_producer != extra_batch.ordinary_producer or record.legacy_producer != extra_batch.legacy_producer or !samePurpose(record.source_purpose, extra_batch.source_purpose) or !sameSourceScope(record.source_scope, extra_batch.source_scope)) return error.SourceTransactionIdentityConflict;
             if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
             if (record.coordinator_known and record.coordinator != coordinator) return TxnError.DecisionConflict;
             if (record.retain_terminal_known and record.retain_terminal != retain_terminal) return TxnError.DecisionConflict;
@@ -727,6 +852,10 @@ pub const TxnManager = struct {
             return try self.applyMutationExtraBatchStaged(extra_batch);
         }
         const record = TxnRecord{
+            .ordinary_producer = extra_batch.ordinary_producer,
+            .legacy_producer = extra_batch.legacy_producer,
+            .source_purpose = extra_batch.source_purpose,
+            .source_scope = extra_batch.source_scope,
             .status = .pending,
             .begin_timestamp = timestamp,
             .commit_version = 0,
@@ -778,6 +907,51 @@ pub const TxnManager = struct {
         try self.writeIntentsExtraBatch(txn_id, intents, predicates, .{});
     }
 
+    /// A true result means the original prepared images are already durable.
+    /// Check before materializing transforms/defaults on a retry. Null denotes
+    /// an ordinary or legacy transaction, never a v2 prepare authorization.
+    pub fn completionPrepareStatus(self: *TxnManager, txn_id: TxnId, input_digest: ?[32]u8, source_purpose: ?[32]u8, owner: ?completion.RoutedOwner) !?bool {
+        return self.completionPrepareScopedStatus(txn_id, input_digest, source_purpose, owner, null);
+    }
+
+    pub fn completionPrepareScopedStatus(self: *TxnManager, txn_id: TxnId, input_digest: ?[32]u8, source_purpose: ?[32]u8, owner: ?completion.RoutedOwner, scope: ?source_scope.Reference) !?bool {
+        return self.completionPrepareProducerStatus(txn_id, input_digest, source_purpose, owner, scope, false, false);
+    }
+
+    pub fn completionPrepareProducerStatus(self: *TxnManager, txn_id: TxnId, input_digest: ?[32]u8, source_purpose: ?[32]u8, owner: ?completion.RoutedOwner, scope: ?source_scope.Reference, ordinary_producer: bool, legacy_producer: bool) !?bool {
+        var frozen = (try self.getCompletionAdmission(self.alloc, txn_id)) orelse {
+            if (owner != null) return error.SourceTransactionIdentityConflict;
+            if (ordinary_producer or legacy_producer) {
+                const record = try self.loadTransactionRecord(txn_id);
+                if (record.ordinary_producer != ordinary_producer or record.legacy_producer != legacy_producer) return error.SourceTransactionIdentityConflict;
+            }
+            return null;
+        };
+        defer frozen.deinit();
+        const plan = frozen.value.admission;
+        if (plan.version < 3 and try self.keyExists(@import("committed_history.zig").policy_key)) return error.ChangefeedCapabilityUnsupported;
+        if (plan.version < 2) {
+            if (input_digest != null or owner != null) return error.ChangefeedCapabilityUnsupported;
+            return null;
+        }
+        const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
+        defer self.alloc.free(namespace);
+        if (namespace.len != 24) return error.InvalidTxnRecord;
+        const member = try plan.member(namespace[0..24].*);
+        const supplied = input_digest orelse return error.SourceTransactionIdentityConflict;
+        if (!std.mem.eql(u8, &supplied, &member.input_digest.?)) return error.SourceTransactionIdentityConflict;
+        const binding = owner orelse return error.InvalidHistoryAdmission;
+        if (!std.mem.eql(u8, &binding.namespace, namespace)) return error.HistoryResynchronizationRequired;
+        try plan.requireRoutedOwner(binding);
+        var probe = try self.store.beginProbe();
+        defer probe.abort();
+        try @import("committed_history.zig").requireCompletionReservation(&probe, namespace[0..24].*, plan);
+        const record = try self.loadTransactionRecord(txn_id);
+        if (record.ordinary_producer != ordinary_producer or record.legacy_producer != legacy_producer or !samePurpose(record.source_purpose, source_purpose) or !sameSourceScope(record.source_scope, scope)) return error.SourceTransactionIdentityConflict;
+        if (record.status != .pending) return TxnError.DecisionConflict;
+        return record.prepared_known and record.prepared;
+    }
+
     pub fn writeIntentsExtraBatch(
         self: *TxnManager,
         txn_id: TxnId,
@@ -815,6 +989,31 @@ pub const TxnManager = struct {
         for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
+        if (record.ordinary_producer != extra_batch.ordinary_producer or record.legacy_producer != extra_batch.legacy_producer or !samePurpose(record.source_purpose, extra_batch.source_purpose) or !sameSourceScope(record.source_scope, extra_batch.source_scope)) return error.SourceTransactionIdentityConflict;
+        if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+            var frozen = saved;
+            defer frozen.deinit();
+            const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
+            defer self.alloc.free(namespace);
+            if (namespace.len != 24) return error.InvalidTxnRecord;
+            if (frozen.value.admission.version < 3 and try self.keyExists(@import("committed_history.zig").policy_key)) return error.ChangefeedCapabilityUnsupported;
+            const participant = try frozen.value.admission.member(namespace[0..24].*);
+            if (frozen.value.admission.version >= 2) {
+                const supplied = extra_batch.completion_input_digest orelse return error.SourceTransactionIdentityConflict;
+                if (!std.mem.eql(u8, &supplied, &participant.input_digest.?)) return error.SourceTransactionIdentityConflict;
+                const binding = extra_batch.completion_owner orelse return error.InvalidHistoryAdmission;
+                if (!std.mem.eql(u8, &binding.namespace, namespace)) return error.HistoryResynchronizationRequired;
+                try frozen.value.admission.requireRoutedOwner(binding);
+            } else if (extra_batch.completion_input_digest != null or extra_batch.completion_owner != null) return error.ChangefeedCapabilityUnsupported;
+            for (intents) |intent| if (@import("source_checkpoint.zig").isKey(intent.key) and (record.source_purpose == null or participant.roles & completion.Roles.checkpoint == 0)) return error.InvalidParticipant;
+            if (participant.roles & completion.Roles.effects == 0) {
+                if (extra_batch.graph_sources.len != 0) return error.InvalidParticipant;
+                for (intents) |intent| if (participant.roles & completion.Roles.checkpoint == 0 or !isRawMetadataIntentKey(intent.key)) return error.InvalidParticipant;
+            }
+            var probe = try self.store.beginProbe();
+            defer probe.abort();
+            try @import("committed_history.zig").requireCompletionReservation(&probe, namespace[0..24].*, frozen.value.admission);
+        } else if (extra_batch.completion_owner != null) return error.SourceTransactionIdentityConflict else if (try self.keyExists(@import("committed_history.zig").policy_key)) return error.ChangefeedCapabilityUnsupported;
         const first_prepare = record.prepared_known and !record.prepared and record.intent_revision == 0;
         if (!first_prepare and extra_batch.prepared_enrichments_json == null) {
             if (try self.loadPreparedEnrichments(self.alloc, txn_id)) |packet| {
@@ -836,6 +1035,16 @@ pub const TxnManager = struct {
         defer if (previous_lease) |value| self.alloc.free(value);
         if (previous_lease) |value| if (extra_batch.schema_binding != null and !std.mem.eql(u8, value, &schema_lease_value))
             return error.SchemaInUse;
+
+        if (record.source_purpose != null and record.prepared) {
+            // A source PREPARE is one complete immutable final write set, not
+            // an incremental session. Never re-evaluate its old read guards or
+            // replace its retained rows after the durable vote.
+            if (extra_batch.document_revisions) |revisions| if (revisions != record.document_revisions) return error.SourcePayloadConflict;
+            try self.requireSamePreparedSourceIntents(txn_id, intents);
+            if (extra_batch.writes.len != 0 or extra_batch.deletes.len != 0) return error.SourcePayloadConflict;
+            return backend_erased.Ticket.alreadyDurable();
+        }
 
         // Emit CheckPredicates before checks: TLA+ spec models this as an
         // always-succeeding snapshot step; WriteIntentFails detects conflicts.
@@ -1070,12 +1279,85 @@ pub const TxnManager = struct {
         return ticket;
     }
 
+    /// Trusted ordered retirement after an independent qualified coordinator
+    /// read. The DB caller must hold the physical owner's apply fence throughout.
+    /// Missing local BEGIN fences the bounded scope floor; it never fabricates
+    /// a local transaction outcome or allocates per-attempt tombstones.
+    pub fn retireScopedSourceAttempt(self: *TxnManager, command: @import("source_scope_retirement.zig").Command, applied: source_scope.Cut, marker_writes: []const docstore.KVPair) !@import("source_scope_retirement.zig").Reply {
+        const retirement = @import("source_scope_retirement.zig");
+        const proof = try command.proof();
+        if (applied.term == 0 or applied.index == 0) return error.InvalidSourceAdmission;
+        const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
+        defer self.alloc.free(namespace);
+        if (!std.mem.eql(u8, namespace, &proof.root.namespace)) return error.HistoryResynchronizationRequired;
+        const existing = self.loadTransactionRecord(proof.slot.transaction_id) catch |err| switch (err) {
+            TxnError.TxnNotFound => null,
+            else => return err,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        if (existing) |record| {
+            if (!sameSourceScope(record.source_scope, proof.slot.reference) or !samePurpose(record.source_purpose, proof.slot.source_purpose) or record.begin_timestamp != command.observation.decision.?.record.begin_timestamp) return error.SourceTransactionIdentityConflict;
+            if (record.status == .committed) return error.DecisionConflict;
+            var admission = (try self.getCompletionAdmission(self.alloc, proof.slot.transaction_id)) orelse return error.SourceOutcomeUnresolved;
+            defer admission.deinit();
+            if (!std.mem.eql(u8, &admission.value.digest, &proof.slot.admission_digest)) return error.SourceTransactionIdentityConflict;
+            const member = try admission.value.admission.member(proof.root.namespace);
+            _ = try self.resolveIntentsWithExtraBatch(proof.slot.transaction_id, .aborted, command.observation.decision.?.record.finalized_at_ns, .{
+                .completion_owner = command.intent.owner,
+                .source_purpose = proof.slot.source_purpose,
+                .source_scope = proof.slot.reference,
+                .source_scope_cut = applied,
+                .source_retirement = .{ .command = command, .cut = applied, .already_fenced = record.status != .pending and record.intents_resolved_known and record.intents_resolved },
+                .resolved_participant = member.locator,
+                .completion_writes = marker_writes,
+            });
+            var probe = try self.store.beginProbe();
+            defer probe.abort();
+            return switch (try @import("source_scope_retirement_ordered.zig").replay(arena.allocator(), &probe, command, applied)) {
+                .applied => |reply| reply,
+                .rejected, .superseded => error.SourceOutcomeUnresolved,
+            };
+        }
+        var batch = try self.store.beginBatch();
+        errdefer batch.abort();
+        const reply = try retirement.applyUnenlisted(arena.allocator(), &batch, command, applied);
+        try @import("source_scope_retirement_ordered.zig").stage(arena.allocator(), &batch, command, reply);
+        for (marker_writes) |write| try batch.put(write.key, write.value);
+        try batch.commit();
+        return reply;
+    }
+
     /// Resolve intents: commit applies them to real keys, abort deletes them.
     /// Conflicting terminal decisions return `TxnError.DecisionConflict`; callers
     /// should treat that as a protocol inconsistency / torn-state signal rather
     /// than a retryable OCC conflict.
     pub fn resolveIntents(self: *TxnManager, txn_id: TxnId, status: TxnStatus, timestamp: u64) !void {
         _ = try self.resolveIntentsWithExtraBatch(txn_id, status, timestamp, .{});
+    }
+
+    /// Resume only an original, already durable terminal decision after
+    /// producer closure. Callers cannot choose COMMIT/ABORT or its version.
+    /// Pending coordinator decisions require a separate qualified protocol.
+    pub fn resolveClosedLegacyTerminal(self: *TxnManager, proof: LegacyTerminalResolution, extra: ResolutionExtraBatch) !ResolutionOutcome {
+        if (extra.source_retirement != null or extra.source_scope != null or extra.source_purpose != null) return error.InvalidSourceAdmission;
+        const decision = try self.closedLegacyTerminalDecision(proof);
+        const staged = try self.resolveIntentsWithExtraBatchStagedAndLegacy(proof.transaction_id, decision.status, decision.timestamp, extra, proof);
+        if (staged.ticket) |ticket| try ticket.wait();
+        return staged.outcome;
+    }
+
+    pub const LegacyTerminalDecision = struct { status: TxnStatus, timestamp: u64 };
+    pub fn closedLegacyTerminalDecision(self: *TxnManager, proof: LegacyTerminalResolution) !LegacyTerminalDecision {
+        try proof.validate();
+        var read = try self.store.beginRead();
+        defer read.abort();
+        _ = (try @import("source_producer_policy.zig").Store.read(self.alloc, &read, proof.root)) orelse return error.SourcePendingWork;
+        const raw = read.get(&makeRecordKey(proof.transaction_id)) catch |err| return if (err == error.NotFound) error.TxnNotFound else err;
+        if (!std.mem.eql(u8, &completion.bytesDigest(raw), &proof.record_digest)) return error.SourceTransactionIdentityConflict;
+        const record = try decodeRecord(raw);
+        if (record.status == .pending or record.ordinary_producer or record.source_scope != null or record.finalized_at == 0 or (record.status == .committed and record.commit_version == 0)) return error.SourceOutcomeUnresolved;
+        return .{ .status = record.status, .timestamp = if (record.status == .committed) record.commit_version else record.finalized_at };
     }
 
     /// Blocking convenience wrapper over `resolveIntentsWithExtraBatchStaged`:
@@ -1116,9 +1398,34 @@ pub const TxnManager = struct {
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
     ) !StagedResolutionOutcome {
+        return self.resolveIntentsWithExtraBatchStagedAndLegacy(txn_id, status, timestamp, extra_batch, null);
+    }
+
+    pub fn resolveIntentsWithExtraBatchStagedAndLegacy(
+        self: *TxnManager,
+        txn_id: TxnId,
+        status: TxnStatus,
+        timestamp: u64,
+        extra_batch: ResolutionExtraBatch,
+        legacy_terminal: ?LegacyTerminalResolution,
+    ) !StagedResolutionOutcome {
+        if (legacy_terminal != null and (extra_batch.source_retirement != null or extra_batch.source_scope != null or extra_batch.source_purpose != null)) return error.InvalidSourceAdmission;
+        if (extra_batch.source_retirement) |ordered| {
+            const proof = try ordered.command.proof();
+            if (status != .aborted or !std.mem.eql(u8, &txn_id, &proof.slot.transaction_id) or !sameSourceScope(extra_batch.source_scope, proof.slot.reference) or !samePurpose(extra_batch.source_purpose, proof.slot.source_purpose) or extra_batch.completion_owner == null or !std.meta.eql(extra_batch.completion_owner.?, ordered.command.intent.owner) or extra_batch.source_scope_cut == null or !std.meta.eql(extra_batch.source_scope_cut.?, ordered.cut)) return error.SourceTransactionIdentityConflict;
+        }
         const rec_key = makeRecordKey(txn_id);
+        const completion_request_key = completion.requestKey(txn_id);
+        var completion_request: [124]u8 = undefined;
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var record = try self.loadTransactionRecord(txn_id);
+        if (record.status == .pending or extra_batch.source_purpose != null or extra_batch.source_scope != null or record.source_scope != null) {
+            if (!samePurpose(record.source_purpose, extra_batch.source_purpose) or !sameSourceScope(record.source_scope, extra_batch.source_scope)) return error.SourceTransactionIdentityConflict;
+        }
+        if (record.status == .pending and status == .committed and (!record.prepared_known or !record.prepared)) {
+            const plan_key = makeSidecarKey(completion_admission_prefix, txn_id);
+            if (record.source_purpose != null or try self.keyExists(&plan_key)) return error.SourceOutcomeUnresolved;
+        }
         var resolved_participant_key: [resolved_participants_prefix.len + 16]u8 = undefined;
         var resolved_participant_value: ?[]u8 = null;
         defer if (resolved_participant_value) |value| self.alloc.free(value);
@@ -1132,13 +1439,37 @@ pub const TxnManager = struct {
                     break;
                 }
             }
+            var durable_participant = participant;
+            if (!enlisted and record.coordinator_known and !record.coordinator and extra_batch.completion_owner != null) {
+                // Completion followers retain the original coordinator as their
+                // one durable recovery obligation. A qualified local resolution
+                // discharges that obligation after local intents drain. Preserve
+                // the persisted participant list and its legacy retry identity.
+                if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+                    var admission = saved;
+                    defer admission.deinit();
+                    if (admission.value.admission.version == 3) {
+                        const owner = extra_batch.completion_owner.?;
+                        try admission.value.admission.requireRoutedOwner(owner);
+                        const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
+                        defer self.alloc.free(namespace);
+                        if (!std.mem.eql(u8, namespace, &owner.namespace)) return error.InvalidParticipant;
+                        const local = try admission.value.admission.member(owner.namespace);
+                        const coordinator = try admission.value.admission.member(admission.value.admission.coordinator_namespace);
+                        if (participants.len == 1 and std.mem.eql(u8, participants[0], coordinator.locator) and std.mem.eql(u8, participant, local.locator)) {
+                            durable_participant = participants[0];
+                            enlisted = true;
+                        }
+                    }
+                }
+            }
             if (!enlisted) return error.InvalidParticipant;
 
             const resolved = try self.getResolvedParticipants(self.alloc, txn_id);
             defer freeParticipantList(self.alloc, resolved);
             var already_resolved = false;
             for (resolved) |existing| {
-                if (std.mem.eql(u8, existing, participant)) {
+                if (std.mem.eql(u8, existing, durable_participant)) {
                     already_resolved = true;
                     break;
                 }
@@ -1147,7 +1478,7 @@ pub const TxnManager = struct {
                 const next = try self.alloc.alloc([]const u8, resolved.len + 1);
                 defer self.alloc.free(next);
                 for (resolved, 0..) |existing, i| next[i] = existing;
-                next[resolved.len] = participant;
+                next[resolved.len] = durable_participant;
                 resolved_participant_key = makeSidecarKey(resolved_participants_prefix, txn_id);
                 resolved_participant_value = try encodeParticipantList(self.alloc, next);
             }
@@ -1177,8 +1508,8 @@ pub const TxnManager = struct {
             if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             }
-            const ticket: ?backend_erased.Ticket = if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0)
-                try self.applyBatchStaged(completion_writes.items, extra_batch.completion_deletes, null, null, null)
+            const ticket: ?backend_erased.Ticket = if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0 or extra_batch.source_retirement != null or legacy_terminal != null)
+                try self.applyBatchStagedWithHistory(completion_writes.items, extra_batch.completion_deletes, null, null, null, null, extra_batch.source_retirement, legacy_terminal)
             else
                 null;
             return .{ .outcome = .{
@@ -1239,7 +1570,7 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &prepared_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            const ticket = try self.applyBatchStaged(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null);
+            const ticket = try self.applyBatchStagedWithHistory(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, extra_batch.source_scope_cut, extra_batch.source_retirement, legacy_terminal);
             return .{ .outcome = .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -1384,8 +1715,18 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
 
+        if (status == .committed) {
+            if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+                var plan = saved;
+                defer plan.deinit();
+                const request: completion.ResolutionRequest = .{ .transaction_id = txn_id, .admission_digest = plan.value.digest, .commit_version = record.commit_version, .record_digest = completion.bytesDigest(rec_val) };
+                completion_request = try request.encode();
+                try writes.append(self.alloc, .{ .key = &completion_request_key, .value = &completion_request });
+            }
+        }
+
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        const ticket = try self.applyBatchStaged(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null);
+        const ticket = try self.applyBatchStagedWithHistory(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, extra_batch.source_scope_cut, extra_batch.source_retirement, legacy_terminal);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -1450,7 +1791,7 @@ pub const TxnManager = struct {
                 writes_initialized += 1;
             }
         }
-        return .{ .prepared_enrichments_json = prepared_json, .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
+        return .{ .ordinary_producer = record.ordinary_producer, .legacy_producer = record.legacy_producer, .prepared_enrichments_json = prepared_json, .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
     }
 
     pub fn loadPreparedEnrichments(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?[]u8 {
@@ -1483,6 +1824,56 @@ pub const TxnManager = struct {
         // relational epoch binding. They also fence a storage-mode switch.
         const entry = (try cursor.seekAtOrAfter(intents_prefix)) orelse return false;
         return std.mem.startsWith(u8, entry.key, intents_prefix);
+    }
+
+    /// Private migration work discovery. Each page uses one read snapshot,
+    /// including the immutable physical closure. Pagination is not a coherent
+    /// all-record cut and an empty page is never a drainage certificate.
+    pub const LegacyRecoveryItem = @import("source_legacy_inventory.zig").Item;
+    pub const LegacyRecoveryPage = @import("source_legacy_inventory.zig").Page;
+    pub fn legacyRecoveryPage(self: *TxnManager, alloc: Allocator, root: source_scope.Basis, after: ?TxnId, max_records: usize) !LegacyRecoveryPage {
+        if (max_records == 0 or max_records > 256) return error.InvalidSourceAdmission;
+        var read = try self.store.beginRead();
+        defer read.abort();
+        return legacyRecoveryPageInRead(alloc, &read, root, after, max_records);
+    }
+
+    /// Reuse the caller's read snapshot so physical authority, applied marker,
+    /// closure and inspected records cannot come from different cuts.
+    pub fn legacyRecoveryPageInRead(alloc: Allocator, read: anytype, root: source_scope.Basis, after: ?TxnId, max_records: usize) !LegacyRecoveryPage {
+        if (max_records == 0 or max_records > @import("source_legacy_inventory.zig").max_records) return error.InvalidSourceAdmission;
+        const closure = (try @import("source_producer_policy.zig").Store.read(alloc, read, root)) orelse return error.SourcePendingWork;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var items: std.ArrayListUnmanaged(LegacyRecoveryItem) = .empty;
+        errdefer items.deinit(alloc);
+        var scanned: usize = 0;
+        var bytes: usize = 0;
+        var last = after;
+        const start = if (after) |id| makeRecordKey(id) else makeRecordKey(@splat(0));
+        var entry = try cursor.seekAtOrAfter(if (after != null) &start else records_prefix);
+        if (after != null) if (entry) |kv| {
+            if (std.mem.eql(u8, kv.key, &start)) entry = try cursor.next();
+        };
+        while (entry) |kv| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, records_prefix)) break;
+            if (kv.key.len != records_prefix.len + 16) return error.InvalidTxnRecord;
+            // Bound inspected bytes as well as returned items. Oversized or
+            // corrupt records fail closed rather than being skipped forever.
+            if (kv.value.len > 4096) return error.InvalidTxnRecord;
+            if (scanned == max_records or bytes + kv.key.len + kv.value.len > 1024 * 1024) {
+                return .{ .closure = closure, .items = try items.toOwnedSlice(alloc), .scanned_records = scanned, .next_after = last, .reached_end = false };
+            }
+            const record = try decodeRecord(kv.value);
+            scanned += 1;
+            bytes += kv.key.len + kv.value.len;
+            const id: TxnId = kv.key[records_prefix.len..][0..16].*;
+            last = id;
+            if (record.ordinary_producer or record.source_scope != null) continue;
+            if (record.status != .pending and record.intents_resolved_known and record.intents_resolved) continue;
+            try items.append(alloc, .{ .transaction_id = id, .record_digest = completion.bytesDigest(kv.value), .status = record.status, .prepared = record.prepared, .prepared_known = record.prepared_known, .coordinator = record.coordinator, .coordinator_known = record.coordinator_known, .intents_resolved = record.intents_resolved, .intents_resolved_known = record.intents_resolved_known });
+        }
+        return .{ .closure = closure, .items = try items.toOwnedSlice(alloc), .scanned_records = scanned, .next_after = last, .reached_end = true };
     }
 
     pub fn hasIntents(self: *TxnManager, txn_id: TxnId) !bool {
@@ -1652,6 +2043,8 @@ pub const TxnManager = struct {
         var read = try self.store.beginRead();
         defer read.abort();
 
+        if (try @import("source_plan_storage.zig").hasRetainedArtifacts(&read)) return true;
+
         // Resolution normally removes intents and HA outboxes atomically before
         // a transaction becomes quiescent. Check the global prefixes once rather
         // than opening an intent cursor for every retained terminal record.
@@ -1744,6 +2137,10 @@ pub const TxnManager = struct {
             const record = try decodeRecord(record_entry.value);
             const txn_id = record_entry.key[records_prefix.len..][0..16].*;
             try items.append(alloc, .{
+                .ordinary_producer = record.ordinary_producer,
+                .legacy_producer = record.legacy_producer,
+                .source_purpose = record.source_purpose,
+                .source_scope = record.source_scope,
                 .txn_id = txn_id,
                 .status = record.status,
                 .begin_timestamp = record.begin_timestamp,
@@ -2001,6 +2398,12 @@ pub const TxnManager = struct {
             stats.scanned_records += 1;
 
             if (summary.status == .pending) {
+                if (summary.source_purpose != null) {
+                    // Source-control recovery owns this original reservation;
+                    // elapsed time cannot invalidate an acknowledged source vote.
+                    stats.kept_recent_pending += 1;
+                    continue;
+                }
                 if (summary.created_at > 0 and summary.created_at < cutoff_timestamp) {
                     if (!options.presume_abort_distributed) {
                         const participants = try self.getParticipants(self.alloc, txn_id);
@@ -2499,6 +2902,51 @@ pub const TxnManager = struct {
         return key;
     }
 
+    pub fn requireUnpreparedSource(self: *TxnManager, txn_id: TxnId, purpose: [32]u8) !void {
+        const record = try self.loadTransactionRecord(txn_id);
+        if (!samePurpose(record.source_purpose, purpose)) return error.SourceTransactionIdentityConflict;
+        if (record.status != .pending or !record.prepared_known or record.prepared or record.intent_revision != 0) return error.SourcePendingWork;
+    }
+
+    pub fn isLegacyProducer(self: *TxnManager, txn_id: TxnId) !bool {
+        return (try self.loadTransactionRecord(txn_id)).legacy_producer;
+    }
+
+    pub fn isOrdinaryProducer(self: *TxnManager, txn_id: TxnId) !bool {
+        return (try self.loadTransactionRecord(txn_id)).ordinary_producer;
+    }
+
+    pub fn getSourceScope(self: *TxnManager, txn_id: TxnId) !?source_scope.Reference {
+        return (try self.loadTransactionRecord(txn_id)).source_scope;
+    }
+
+    pub fn getSourcePurpose(self: *TxnManager, txn_id: TxnId) !?[32]u8 {
+        return (try self.loadTransactionRecord(txn_id)).source_purpose;
+    }
+
+    pub fn requireSourcePurpose(self: *TxnManager, txn_id: TxnId, purpose: [32]u8) !void {
+        const record = try self.loadTransactionRecord(txn_id);
+        if (!samePurpose(record.source_purpose, purpose)) return error.SourceTransactionIdentityConflict;
+    }
+
+    fn requireSamePreparedSourceIntents(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent) !void {
+        var incoming = std.StringHashMapUnmanaged(WriteIntent).empty;
+        defer incoming.deinit(self.alloc);
+        for (intents) |intent| try incoming.put(self.alloc, intent.key, intent);
+        var previous = try self.collectIntentBatch(self.alloc, txn_id);
+        defer previous.deinit(self.alloc);
+        const entries = previous.owned_entries orelse {
+            if (incoming.count() != 0) return error.SourcePayloadConflict;
+            return;
+        };
+        if (entries.len != incoming.count()) return error.SourcePayloadConflict;
+        for (entries) |entry| {
+            const value = try IntentValue.decode(entry.value);
+            const next = incoming.get(entry.key[intents_prefix.len + 17 ..]) orelse return error.SourcePayloadConflict;
+            if (!sameBytes(value.value, next.value) or !sameBytes(value.prepared_row, next.prepared_row)) return error.SourcePayloadConflict;
+        }
+    }
+
     fn loadTransactionRecord(self: *TxnManager, txn_id: TxnId) !TxnRecord {
         const key = makeRecordKey(txn_id);
         const val = self.getAlloc(self.alloc, &key) catch |err| switch (err) {
@@ -2516,7 +2964,9 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, if (record.document_revisions) txn_record_v7_size else txn_record_v6_size);
+        if ((record.ordinary_producer and record.legacy_producer) or ((record.ordinary_producer or record.legacy_producer) and (record.source_purpose != null or record.source_scope != null))) return error.InvalidTxnRecord;
+        if (record.source_scope != null and (record.source_purpose == null or !record.retain_terminal)) return error.InvalidTxnRecord;
+        const buf = try self.alloc.alloc(u8, if (record.ordinary_producer or record.legacy_producer) txn_record_v10_size else if (record.source_scope != null) txn_record_v9_size else if (record.source_purpose != null) txn_record_v8_size else if (record.document_revisions) txn_record_v7_size else txn_record_v6_size);
         buf[0] = @backingInt(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -2528,7 +2978,17 @@ pub const TxnManager = struct {
         buf[50] = @intFromBool(record.coordinator);
         buf[51] = @intFromBool(record.retain_terminal);
         buf[52] = @intFromBool(record.intents_resolved);
-        if (record.document_revisions) buf[53] = 1;
+        if (record.ordinary_producer or record.legacy_producer) {
+            buf[53] = @intFromBool(record.document_revisions);
+            // v10 ordinary remains byte-for-byte stable. Protocol 44 adds
+            // v11 legacy discriminator 2, rejected by earlier decoders.
+            buf[54] = if (record.ordinary_producer) 1 else 2;
+        } else if (record.source_purpose) |purpose| {
+            buf[53] = @intFromBool(record.document_revisions);
+            buf[54] = if (record.source_scope != null) 2 else 1; // scoped or legacy source delivery
+            @memcpy(buf[55..87], &purpose);
+            if (record.source_scope) |scope| @memcpy(buf[87..txn_record_v9_size], &try scope.encode());
+        } else if (record.document_revisions) buf[53] = 1;
         return buf;
     }
 
@@ -2555,6 +3015,35 @@ pub const TxnManager = struct {
         retained_cutoff_timestamp: u64,
         extra_batch: MutationExtraBatch,
     ) !bool {
+        return self.cleanupTransactionMetadataWithRetirement(txn_id, cutoff_timestamp, retained_cutoff_timestamp, extra_batch, null);
+    }
+
+    /// A closed source grant has its own persistent retry fence. Its aborted
+    /// journal can be pruned immediately, after all intents/outboxes/ACK debt
+    /// drain, instead of accumulating one retained record per replan attempt.
+    pub fn cleanupRetiredSourceAttempt(self: *TxnManager, command: @import("source_admission.zig").Command) !bool {
+        try command.validate();
+        {
+            var probe = try self.store.beginProbe();
+            defer probe.abort();
+            const fence = (try @import("source_admission.zig").loadFence(&probe, command)) orelse return error.SourcePendingWork;
+            if (fence.table_id != command.table_id or !std.mem.eql(u8, &fence.binding, &command.binding())) return error.SourceBindingConflict;
+            if (fence.sequence < command.source_sequence) return error.SourcePendingWork;
+            if (fence.sequence == command.source_sequence and (fence.closed_through < command.attempt or
+                !std.mem.eql(u8, &fence.logical_identity, &command.logicalIdentity()) or
+                !std.mem.eql(u8, &fence.input_digest, &command.inputFingerprint()))) return error.SourcePendingWork;
+        }
+        return self.cleanupTransactionMetadataWithRetirement(command.transactionId(), 0, 0, .{}, command.fingerprint());
+    }
+
+    fn cleanupTransactionMetadataWithRetirement(
+        self: *TxnManager,
+        txn_id: TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+        extra_batch: MutationExtraBatch,
+        retired_source: ?[32]u8,
+    ) !bool {
         const record = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
             TxnError.TxnNotFound => {
                 try self.applyMutationExtraBatch(extra_batch);
@@ -2562,6 +3051,10 @@ pub const TxnManager = struct {
             },
             else => return err,
         };
+        if (retired_source) |purpose| {
+            if (!samePurpose(record.source_purpose, purpose)) return error.SourceTransactionIdentityConflict;
+            if (record.status != .aborted) return error.SourcePendingWork;
+        }
         const has_intents = if (record.intents_resolved_known and record.intents_resolved)
             false
         else
@@ -2570,8 +3063,37 @@ pub const TxnManager = struct {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
+        if (record.status == .committed) {
+            if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+                var frozen = saved;
+                defer frozen.deinit();
+                // Publication/retention handoff must explicitly retire this
+                // debt. Ordinary terminal-record age is not completion proof.
+                try self.applyMutationExtraBatch(extra_batch);
+                return false;
+            }
+        }
         const cutoff = if (record.retain_terminal) retained_cutoff_timestamp else cutoff_timestamp;
-        if (record.finalized_at >= cutoff) {
+        if (retired_source == null and record.finalized_at >= cutoff) {
+            if (record.status == .aborted) {
+                if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+                    var frozen = saved;
+                    defer frozen.deinit();
+                    const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
+                    defer freeParticipantList(self.alloc, unresolved);
+                    if (unresolved.len == 0) {
+                        // Retain the terminal retry fence, but an all-aborted
+                        // cohort needs no future committed certificate.
+                        const plan_key = makeSidecarKey(completion_admission_prefix, txn_id);
+                        var deletes: std.ArrayList([]const u8) = .empty;
+                        defer deletes.deinit(self.alloc);
+                        try deletes.appendSlice(self.alloc, extra_batch.deletes);
+                        try deletes.append(self.alloc, &plan_key);
+                        try self.applyBatch(extra_batch.writes, deletes.items, null);
+                        return false;
+                    }
+                }
+            }
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
@@ -2743,6 +3265,11 @@ pub const TxnManager = struct {
         txn_id: TxnId,
         extra_batch: MutationExtraBatch,
     ) !void {
+        if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+            var frozen = saved;
+            defer frozen.deinit();
+            if ((try self.loadTransactionRecord(txn_id)).status != .aborted) return TxnError.DecisionConflict;
+        }
         const record_key = makeRecordKey(txn_id);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
@@ -2754,6 +3281,8 @@ pub const TxnManager = struct {
         defer deletes.deinit(self.alloc);
         const admission_key = makeSidecarKey(intent_admission_prefix, txn_id);
         try deletes.append(self.alloc, &admission_key);
+        const completion_admission_key = makeSidecarKey(completion_admission_prefix, txn_id);
+        try deletes.append(self.alloc, &completion_admission_key);
         try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &hot_standby_batch_key, &hot_standby_replay_key, &intent_keys_key, &schema_lease_key });
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         const member_prefix = makeSidecarKey(participant_index_prefix, txn_id);
@@ -2860,10 +3389,139 @@ pub const TxnManager = struct {
     /// the hosted LSM backend, returns an already-durable ticket from the
     /// ordinary blocking commit, so this never changes behavior there.
     fn applyBatchStaged(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !backend_erased.Ticket {
+        return self.applyBatchStagedWithHistory(writes, deletes, replay, reservation, participant, null, null, null);
+    }
+
+    fn applyBatchStagedWithHistory(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, scope_cut: ?source_scope.Cut, source_retirement: ?SourceRetirement, legacy_terminal: ?LegacyTerminalResolution) !backend_erased.Ticket {
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
+        var scope_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer scope_arena.deinit();
+        // Producer closure and transaction admission share this exact native
+        // writer. Metadata-only ACK/cleanup does not create new row authority.
+        const producer_policy = @import("source_producer_policy.zig");
+        const producer_closed = try producer_policy.Store.readStored(scope_arena.allocator(), &batch);
+        if (legacy_terminal) |proof| {
+            // Terminal retries can stage only markers/receipts, with no record
+            // replacement in writes. Their authority must still be checked in
+            // this exact native writer, including a concurrent GC/reuse race.
+            try proof.validate();
+            const closed = producer_closed orelse return error.SourcePendingWork;
+            if (!std.meta.eql(closed.root, proof.root)) return error.SourceTransactionIdentityConflict;
+            const raw = batch.get(&makeRecordKey(proof.transaction_id)) catch |err| return if (err == error.NotFound) error.TxnNotFound else err;
+            if (!std.mem.eql(u8, &completion.bytesDigest(raw), &proof.record_digest)) return error.SourceTransactionIdentityConflict;
+            const original = try decodeRecord(raw);
+            if (original.status == .pending or original.ordinary_producer or original.source_scope != null or original.finalized_at == 0 or (original.status == .committed and original.commit_version == 0)) return error.SourceOutcomeUnresolved;
+        }
+        // Scope state and the retained record/effects share this physical commit.
+        // Inspect original records before staging any replacement record bytes.
+        for (writes) |write| {
+            if (write.key.len != records_prefix.len + 16 or !std.mem.startsWith(u8, write.key, records_prefix)) continue;
+            const next_record = try decodeRecord(write.value);
+            const previous_bytes = batch.get(write.key) catch |err| switch (@as(anyerror, err)) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (previous_bytes) |bytes| {
+                const previous = try decodeRecord(bytes);
+                if (previous.ordinary_producer != next_record.ordinary_producer or previous.legacy_producer != next_record.legacy_producer) return error.SourceTransactionIdentityConflict;
+            }
+            if (producer_closed != null) {
+                // Plain/legacy records cannot acquire authority after closure.
+                if (next_record.source_scope == null and !next_record.ordinary_producer) {
+                    const proof = legacy_terminal orelse return error.SourcePendingWork;
+                    const id: TxnId = write.key[records_prefix.len..][0..16].*;
+                    if (!std.mem.eql(u8, &id, &proof.transaction_id) or !std.meta.eql(producer_closed.?.root, proof.root)) return error.SourceTransactionIdentityConflict;
+                    const original_bytes = previous_bytes orelse return error.SourceOutcomeUnresolved;
+                    if (!std.mem.eql(u8, &completion.bytesDigest(original_bytes), &proof.record_digest)) return error.SourceTransactionIdentityConflict;
+                    var original = try decodeRecord(original_bytes);
+                    if (original.status == .pending or original.ordinary_producer or original.source_scope != null or original.finalized_at == 0 or (original.status == .committed and original.commit_version == 0)) return error.SourceOutcomeUnresolved;
+                    // Resolution may retire intents and advance only their
+                    // replay marker, preserving every original decision field.
+                    original.intents_resolved = next_record.intents_resolved;
+                    original.intents_resolved_known = next_record.intents_resolved_known;
+                    original.replay_sequence = next_record.replay_sequence;
+                    if (!std.meta.eql(original, next_record) or !next_record.intents_resolved_known or !next_record.intents_resolved) return error.SourceTransactionIdentityConflict;
+                }
+                if (next_record.ordinary_producer) {
+                    const id: TxnId = write.key[records_prefix.len..][0..16].*;
+                    const admission_key = makeSidecarKey(completion_admission_prefix, id);
+                    var supplied: ?[]const u8 = null;
+                    for (writes) |candidate| if (std.mem.eql(u8, candidate.key, &admission_key)) {
+                        if (supplied != null) return error.InvalidTxnRecord;
+                        supplied = candidate.value;
+                    };
+                    var parsed = try completion.parseAdmission(scope_arena.allocator(), supplied orelse try batch.get(&admission_key));
+                    defer parsed.deinit();
+                    const admission = parsed.value.admission;
+                    if (admission.version != 3 or !std.mem.eql(u8, &admission.transaction_id, &id)) return error.InvalidTxnRecord;
+                    const namespace = try batch.get(&internal_keys.identity_namespace_key);
+                    if (namespace.len != 24) return error.InvalidTxnRecord;
+                    const member = try admission.member(namespace[0..24].*);
+                    if (next_record.coordinator != std.mem.eql(u8, namespace, &admission.coordinator_namespace)) return error.InvalidParticipant;
+                    try producer_policy.Store.require(scope_arena.allocator(), &batch, try source_scope.Basis.fromOwner(member.routed_owner.?), .ordinary);
+                }
+            }
+            if (next_record.legacy_producer and previous_bytes == null) try source_scope.Store.requireLegacyAllowed(scope_arena.allocator(), &batch);
+            if (write.value.len == txn_record_v8_size) {
+                const legacy = try decodeRecord(write.value);
+                if (legacy.status == .pending and legacy.source_purpose != null) {
+                    const exists = blk: {
+                        _ = batch.get(write.key) catch |err| switch (@as(anyerror, err)) {
+                            error.NotFound => break :blk false,
+                            else => return err,
+                        };
+                        break :blk true;
+                    };
+                    if (!exists) try source_scope.Store.requireLegacyAllowed(scope_arena.allocator(), &batch);
+                }
+                continue;
+            }
+            if (write.value.len != txn_record_v9_size) continue;
+            const next = try decodeRecord(write.value);
+            const reference = next.source_scope orelse return error.InvalidTxnRecord;
+            const prior_bytes = batch.get(write.key) catch |err| switch (@as(anyerror, err)) {
+                error.NotFound => null,
+                else => return err,
+            };
+            const prior = if (prior_bytes) |bytes| try decodeRecord(bytes) else null;
+            if (prior) |old| {
+                if (!sameSourceScope(old.source_scope, next.source_scope) or !samePurpose(old.source_purpose, next.source_purpose)) return error.SourceTransactionIdentityConflict;
+                if (old.status != .pending and old.intents_resolved_known and old.intents_resolved) continue;
+            }
+            const id: TxnId = write.key[records_prefix.len..][0..16].*;
+            const admission_key = makeSidecarKey(completion_admission_prefix, id);
+            var admission_bytes: ?[]const u8 = null;
+            for (writes) |candidate| if (std.mem.eql(u8, candidate.key, &admission_key)) {
+                if (admission_bytes != null) return error.InvalidTxnRecord;
+                admission_bytes = candidate.value;
+            };
+            const retained = admission_bytes orelse try batch.get(&admission_key);
+            var parsed = try completion.parseAdmission(scope_arena.allocator(), retained);
+            defer parsed.deinit();
+            const admission = parsed.value.admission;
+            if (admission.version != 3 or !std.mem.eql(u8, &admission.transaction_id, &id)) return error.InvalidTxnRecord;
+            const namespace = try batch.get(&internal_keys.identity_namespace_key);
+            if (namespace.len != 24) return error.InvalidTxnRecord;
+            const member = try admission.member(namespace[0..24].*);
+            const coordinator = try admission.member(admission.coordinator_namespace);
+            if (coordinator.roles & completion.Roles.checkpoint == 0 or next.coordinator != std.mem.eql(u8, namespace, &admission.coordinator_namespace)) return error.InvalidParticipant;
+            const root = try source_scope.Basis.fromOwner(member.routed_owner.?);
+            try producer_policy.Store.require(scope_arena.allocator(), &batch, root, .scoped_source);
+            const coordinator_root = try source_scope.Basis.fromOwner(coordinator.routed_owner.?);
+            const slot: source_scope.Slot = .{ .reference = reference, .transaction_id = id, .source_purpose = next.source_purpose.?, .admission_digest = parsed.value.digest };
+            if (prior == null) {
+                if (next.status != .pending or next.prepared) return error.InvalidTxnRecord;
+                try source_scope.Store.enter(scope_arena.allocator(), &batch, root, slot, coordinator_root);
+            } else if (next.status == .pending) {
+                if (next.prepared and !prior.?.prepared) try source_scope.Store.prepareAllowed(scope_arena.allocator(), &batch, root, slot);
+            } else {
+                if (!next.intents_resolved_known or !next.intents_resolved) return error.SourceOutcomeUnresolved;
+                try source_scope.Store.finish(scope_arena.allocator(), &batch, root, slot, next.status == .committed, scope_cut orelse return error.InvalidSourceAdmission);
+            }
+        }
         for (deletes) |key| {
             batch.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -2872,6 +3530,11 @@ pub const TxnManager = struct {
         }
         for (writes) |kv| {
             try batch.put(kv.key, kv.value);
+        }
+        if (source_retirement) |ordered| {
+            const ordered_retirement = @import("source_scope_retirement_ordered.zig");
+            const reply = try ordered_retirement.resolvedReply(scope_arena.allocator(), &batch, ordered.command, ordered.cut, ordered.already_fenced);
+            try ordered_retirement.stage(scope_arena.allocator(), &batch, ordered.command, reply);
         }
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
         return try batch.commitStaged();
@@ -3204,7 +3867,77 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
     };
 }
 
+fn sameSourceScope(left: ?source_scope.Reference, right: ?source_scope.Reference) bool {
+    return std.meta.eql(left, right);
+}
+
+fn samePurpose(left: ?[32]u8, right: ?[32]u8) bool {
+    if (left) |value| return right != null and std.mem.eql(u8, &value, &right.?);
+    return right == null;
+}
+fn sameBytes(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left) |value| return right != null and std.mem.eql(u8, value, right.?);
+    return right == null;
+}
+
+/// Shared with the final history capture stage; it must inspect the staged
+/// record using the actual record codec rather than duplicating byte offsets.
+pub fn requireCompletionResolvedRecord(raw: []const u8, commit_version: u64) !void {
+    const record = try decodeRecord(raw);
+    if (record.status != .committed or record.commit_version != commit_version or !record.prepared_known or !record.prepared or !record.intents_resolved_known or !record.intents_resolved) return error.SourceOutcomeUnresolved;
+}
+
+/// Decode the coordinator record with its canonical codec. Only retained,
+/// explicitly owned completion records qualify for restart decision recovery.
+pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_wire.zig").Record {
+    const record = try decodeRecord(raw);
+    if (!record.coordinator_known or !record.coordinator or !record.retain_terminal_known or !record.retain_terminal or !record.prepared_known or (record.status != .pending and !record.intents_resolved_known)) return error.InvalidTxnRecord;
+    const result: @import("history_decision_wire.zig").Record = .{
+        .status = switch (record.status) {
+            .pending => .pending,
+            .committed => .committed,
+            .aborted => .aborted,
+        },
+        .begin_timestamp = record.begin_timestamp,
+        .created_at_ns = record.created_at,
+        .commit_version = record.commit_version,
+        .finalized_at_ns = record.finalized_at,
+        .prepared = record.prepared,
+        .intents_resolved = record.intents_resolved,
+        .digest = completion.bytesDigest(raw),
+        .source_purpose = record.source_purpose,
+        .source_scope = record.source_scope,
+    };
+    try result.validate();
+    return result;
+}
+
 fn decodeRecord(raw: []const u8) !TxnRecord {
+    if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return error.InvalidTxnRecord;
+    if (raw.len == txn_record_v10_size) {
+        if (raw[53] > 1 or (raw[54] != 1 and raw[54] != 2)) return error.InvalidTxnRecord;
+        var record = try decodeRecord(raw[0..txn_record_v6_size]);
+        record.ordinary_producer = raw[54] == 1;
+        record.legacy_producer = raw[54] == 2;
+        record.document_revisions = raw[53] == 1;
+        return record;
+    }
+    if (raw.len == txn_record_v9_size) {
+        if (raw[53] > 1 or raw[54] != 2 or std.mem.allEqual(u8, raw[55..87], 0)) return error.InvalidTxnRecord;
+        var record = try decodeRecord(raw[0..txn_record_v6_size]);
+        if (!record.retain_terminal) return error.InvalidTxnRecord;
+        record.document_revisions = raw[53] == 1;
+        record.source_purpose = raw[55..87].*;
+        record.source_scope = source_scope.Reference.decode(raw[87..]) catch return error.InvalidTxnRecord;
+        return record;
+    }
+    if (raw.len == txn_record_v8_size) {
+        if (raw[53] > 1 or raw[54] != 1 or std.mem.allEqual(u8, raw[55..87], 0)) return error.InvalidTxnRecord;
+        var record = try decodeRecord(raw[0..txn_record_v6_size]);
+        record.document_revisions = raw[53] == 1;
+        record.source_purpose = raw[55..87].*;
+        return record;
+    }
     if (raw.len == txn_record_v7_size) {
         if (raw[53] != 1) return error.InvalidTxnRecord;
         var record = try decodeRecord(raw[0..txn_record_v6_size]);
@@ -3431,6 +4164,515 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "committed history completion admission freezes the coordinator plan with begin and survives reopen" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "completion-admission");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    const namespace: completion.Namespace = @splat(1);
+    const members = [_]completion.Participant{
+        .{ .namespace = namespace, .owner_fence = @splat(2), .roles = completion.Roles.effects, .locator = "original-writer" },
+        .{ .namespace = @splat(3), .owner_fence = @splat(4), .roles = completion.Roles.guards, .locator = "original-guard" },
+    };
+    const admission: completion.Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = @splat(2), .participants = &members };
+    const marker_key = "\x00\x00__completion_test_marker";
+    var receipt_digest: completion.Digest = @splat(0);
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        {
+            const history = @import("committed_history.zig");
+            var bind = try store.beginWriteTxn();
+            errdefer bind.abort();
+            try bind.put(&internal_keys.identity_namespace_key, &namespace);
+            try @import("source_authority.zig").bind(&bind, .native, namespace);
+            try bind.commit();
+            var enroll = try store.beginWriteTxn();
+            errdefer enroll.abort();
+            const consumer = try history.admit(&enroll, namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
+            try enroll.commit();
+            var release = try store.beginWriteTxn();
+            errdefer release.abort();
+            try history.release(&release, namespace, consumer.id, consumer.epoch);
+            try release.commit();
+        }
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{ .writes = &.{.{ .key = marker_key, .value = "first-begin" }} });
+        try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{ .writes = &.{.{ .key = marker_key, .value = "confirmed-retry" }} });
+        const plan_key = makeSidecarKey(completion_admission_prefix, admission.transaction_id);
+        const plan_bytes = try manager.getAlloc(a, &plan_key);
+        defer a.free(plan_bytes);
+        const original_encoding = try std.fmt.allocPrint(a, "{s}\n ", .{plan_bytes});
+        defer a.free(original_encoding);
+        try store.put(&plan_key, original_encoding);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        var saved = (try manager.getCompletionAdmission(a, admission.transaction_id)).?;
+        defer saved.deinit();
+        try std.testing.expectEqual(admission.digest(), saved.value.digest);
+        try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+        const plan_key = makeSidecarKey(completion_admission_prefix, admission.transaction_id);
+        const original_encoding = try manager.getAlloc(a, &plan_key);
+        defer a.free(original_encoding);
+        try std.testing.expect(std.mem.endsWith(u8, original_encoding, "\n "));
+        const marker = try manager.getAlloc(a, marker_key);
+        defer a.free(marker);
+        try std.testing.expectEqualStrings("confirmed-retry", marker);
+        const record = try manager.loadTransactionRecord(admission.transaction_id);
+        try std.testing.expect(record.coordinator and record.retain_terminal);
+        try std.testing.expectEqual(@as(u64, 10), record.begin_timestamp);
+        const plan_members = try manager.getParticipants(a, admission.transaction_id);
+        defer freeParticipantList(a, plan_members);
+        try std.testing.expectEqual(@as(usize, 2), plan_members.len);
+        try std.testing.expectError(TxnError.DecisionConflict, manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(admission.transaction_id, 10, 11, &.{ "original-writer", "original-guard" }, true, true));
+        var changed = admission;
+        changed.admission_digest[0] ^= 1;
+        try std.testing.expectError(TxnError.DecisionConflict, manager.initTransactionWithCompletionAdmission(changed, 10, 11, true, .{}));
+        changed = admission;
+        changed.coordinator_namespace = members[1].namespace;
+        changed.coordinator_fence = members[1].owner_fence;
+        try std.testing.expectError(TxnError.DecisionConflict, manager.initTransactionWithCompletionAdmission(changed, 10, 11, true, .{}));
+        const legacy_id: TxnId = @splat(8);
+        try manager.initTransaction(legacy_id, 10);
+        changed = admission;
+        changed.transaction_id = legacy_id;
+        try std.testing.expectError(TxnError.DecisionConflict, manager.initTransactionWithCompletionAdmission(changed, 10, 11, true, .{}));
+        try std.testing.expectError(error.SourceOutcomeUnresolved, manager.resolveIntents(admission.transaction_id, .committed, 20));
+        try manager.writeIntents(admission.transaction_id, &.{}, &.{});
+        try manager.resolveIntents(admission.transaction_id, .committed, 20);
+        {
+            var receipt = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+            defer receipt.deinit();
+            try std.testing.expectEqual(std.meta.Tag(completion.Outcome).no_effect, std.meta.activeTag(receipt.value.resolution.outcome));
+            try std.testing.expectEqual(@as(u8, 2), receipt.value.resolution.source_position[31]);
+            receipt_digest = receipt.value.digest;
+        }
+        try manager.resolveIntents(admission.transaction_id, .committed, 99);
+        try std.testing.expectError(error.NotFound, manager.getAlloc(a, &completion.requestKey(admission.transaction_id)));
+        try manager.markParticipantsResolvedExtraBatch(admission.transaction_id, &.{ "original-writer", "original-guard" }, .{});
+        try std.testing.expect(!(try manager.cleanupTransactionMetadataIfEligible(admission.transaction_id, std.math.maxInt(u64), std.math.maxInt(u64))));
+        var retained = (try manager.getCompletionAdmission(a, admission.transaction_id)).?;
+        defer retained.deinit();
+        try std.testing.expectEqual(admission.digest(), retained.value.digest);
+        const committed_manifest = try retained.value.admission.manifest(20);
+        try std.testing.expectEqual(@as(u64, 20), committed_manifest.commit_version);
+        try std.testing.expectError(error.InvalidTxnRecord, retained.value.admission.manifest(0));
+        var aborted = admission;
+        aborted.transaction_id = @splat(9);
+        try manager.initTransactionWithCompletionAdmission(aborted, 30, 31, true, .{});
+        try manager.resolveIntents(aborted.transaction_id, .aborted, 0);
+        try manager.markParticipantsResolvedExtraBatch(aborted.transaction_id, &.{ "original-writer", "original-guard" }, .{});
+        try std.testing.expect(try manager.cleanupTransactionMetadataIfEligible(aborted.transaction_id, std.math.maxInt(u64), std.math.maxInt(u64)));
+        try std.testing.expect((try manager.getCompletionAdmission(a, aborted.transaction_id)) == null);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        var receipt = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+        defer receipt.deinit();
+        try std.testing.expectEqual(receipt_digest, receipt.value.digest);
+        try std.testing.expectEqual(@as(u64, 20), receipt.value.resolution.commit_version);
+        {
+            const wire = @import("history_resolution_wire.zig");
+            var shadow_gc = try store.beginWriteTxn();
+            defer shadow_gc.abort();
+            try shadow_gc.delete(&makeRecordKey(admission.transaction_id));
+            try shadow_gc.delete(&(completion.admission_prefix.* ++ admission.transaction_id));
+            const current = (try @import("source_authority.zig").load(&shadow_gc)).?;
+            const request: wire.Request = .{ .authority = .native, .namespace = namespace, .transaction_id = admission.transaction_id, .owner_fence = admission.coordinator_fence, .manifest_digest = receipt.value.resolution.manifest_digest, .commit_version = 20 };
+            const historical = try wire.read(a, &shadow_gc, request, .{ .native_sequence = current.sequence });
+            try std.testing.expectEqualDeep(receipt.value.resolution, historical.resolution.?);
+        }
+    }
+}
+
+test "committed history completion admission credits survive resolution and reject full begin atomically" {
+    const history = @import("committed_history.zig");
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "completion-credits");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    const namespace: completion.Namespace = @splat(17);
+    const members = [_]completion.Participant{
+        .{ .namespace = namespace, .owner_fence = @splat(2), .roles = completion.Roles.effects, .locator = "writer" },
+        .{ .namespace = @splat(19), .owner_fence = @splat(4), .roles = completion.Roles.guards, .locator = "guard" },
+    };
+    const admission: completion.Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = @splat(2), .participants = &members };
+    const encoded = try completion.encodeAdmission(a, admission);
+    defer a.free(encoded);
+    const credit = try admission.reservationBytes(encoded.len);
+    var receipt_digest: completion.Digest = @splat(0);
+    const State = struct {
+        fn read(store: *DocStore) !history.State {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            return (try history.load(&txn)).?;
+        }
+    };
+    for (0..2) |phase| {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        if (phase == 0) {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(&internal_keys.identity_namespace_key, &namespace);
+            try @import("source_authority.zig").bind(&txn, .native, namespace);
+            try txn.commit();
+            var enrollment = try store.beginWriteTxn();
+            errdefer enrollment.abort();
+            const consumer = try history.admit(&enrollment, namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
+            try enrollment.commit();
+            try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            try manager.writeIntents(admission.transaction_id, &.{.{ .key = "row", .value = "after" }}, &.{});
+            try std.testing.expect((try State.read(&store)).reserved_bytes > credit);
+            const prepared = try State.read(&store);
+            const record_key = makeRecordKey(admission.transaction_id);
+            try std.testing.expectError(error.InvalidTxnRecord, manager.resolveIntentsWithExtraBatch(admission.transaction_id, .committed, 20, .{ .completion_writes = &.{.{ .key = &record_key, .value = "invalid-staged-record" }} }));
+            try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(admission.transaction_id));
+            try std.testing.expectEqualDeep(prepared, try State.read(&store));
+            const primary = try internal_keys.documentKeyAlloc(a, "row");
+            defer a.free(primary);
+            try std.testing.expectError(error.NotFound, manager.getAlloc(a, primary));
+            try std.testing.expectError(error.NotFound, manager.getAlloc(a, &history.recordKey(1)));
+            try std.testing.expectError(error.NotFound, manager.getAlloc(a, &completion.resolutionKey(admission.transaction_id)));
+            try manager.resolveIntents(admission.transaction_id, .committed, 20);
+            {
+                var receipt = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+                defer receipt.deinit();
+                const effects = receipt.value.resolution.outcome.effects;
+                const descriptor = try manager.getAlloc(a, &history.recordKey(effects.sequence));
+                defer a.free(descriptor);
+                try std.testing.expectEqual(completion.bytesDigest(descriptor), effects.frame_digest);
+                try std.testing.expectEqual(@as(u64, 1), effects.sequence);
+                receipt_digest = receipt.value.digest;
+            }
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            var release = try store.beginWriteTxn();
+            errdefer release.abort();
+            try history.release(&release, namespace, consumer.id, consumer.epoch);
+            try release.commit();
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+        } else {
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            {
+                var late = try store.beginWriteTxn();
+                defer late.abort();
+                try std.testing.expectError(error.HistoryPreparedTransactionsPresent, history.admit(&late, namespace, @splat(2), 4 * 1024 * 1024, 1000, 1));
+            }
+            var aborted = admission;
+            aborted.transaction_id = @splat(8);
+            try manager.initTransactionWithCompletionAdmission(aborted, 30, 31, true, .{});
+            try std.testing.expect((try State.read(&store)).reserved_bytes > credit);
+            try manager.resolveIntents(aborted.transaction_id, .aborted, 0);
+            try std.testing.expect(!(try manager.cleanupTransactionMetadataIfEligible(aborted.transaction_id, 0, 0)));
+            {
+                var unresolved_plan = (try manager.getCompletionAdmission(a, aborted.transaction_id)).?;
+                defer unresolved_plan.deinit();
+                try std.testing.expectEqual(aborted.digest(), unresolved_plan.value.digest);
+            }
+            try std.testing.expect((try State.read(&store)).reserved_bytes > credit);
+            try manager.markParticipantsResolvedExtraBatch(aborted.transaction_id, &.{ "writer", "guard" }, .{});
+            try std.testing.expect(!(try manager.cleanupTransactionMetadataIfEligible(aborted.transaction_id, 0, 0)));
+            try std.testing.expect((try manager.getCompletionAdmission(a, aborted.transaction_id)) == null);
+            try std.testing.expectEqual(TxnStatus.aborted, (try manager.loadTransactionRecord(aborted.transaction_id)).status);
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            try std.testing.expect(try manager.cleanupTransactionMetadataIfEligible(aborted.transaction_id, std.math.maxInt(u64), std.math.maxInt(u64)));
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            const before_fill = try State.read(&store);
+            const available = before_fill.limit - before_fill.retained_bytes - before_fill.reserved_bytes;
+            const payload = try a.alloc(u8, @intCast(available - 2048));
+            defer a.free(payload);
+            @memset(payload, 'x');
+            const physical = try internal_keys.documentKeyAlloc(a, "large");
+            defer a.free(physical);
+            try store.put(physical, payload);
+            const full = try State.read(&store);
+            var rejected = admission;
+            rejected.transaction_id = @splat(7);
+            const marker = "\x00\x00__completion_quota_test_marker";
+            try std.testing.expectError(error.HistoryFull, manager.initTransactionWithCompletionAdmission(rejected, 40, 41, true, .{ .writes = &.{.{ .key = marker, .value = "must-not-commit" }} }));
+            try std.testing.expect((try manager.getCompletionAdmission(a, rejected.transaction_id)) == null);
+            try std.testing.expectError(TxnError.TxnNotFound, manager.loadTransactionRecord(rejected.transaction_id));
+            try std.testing.expectError(error.NotFound, manager.getAlloc(a, marker));
+            try std.testing.expectEqualDeep(full, try State.read(&store));
+            var receipt = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+            defer receipt.deinit();
+            try std.testing.expectEqual(receipt_digest, receipt.value.digest);
+        }
+    }
+}
+
+test "committed history completion admission binds guard participant votes and original recovery owner" {
+    const history = @import("committed_history.zig");
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "completion-participant");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    const namespace: completion.Namespace = @splat(20);
+    const members = [_]completion.Participant{
+        .{ .namespace = namespace, .owner_fence = @splat(2), .roles = completion.Roles.guards, .locator = "guard" },
+        .{ .namespace = @splat(40), .owner_fence = @splat(4), .roles = completion.Roles.checkpoint, .locator = "coordinator" },
+    };
+    const admission: completion.Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = @splat(40), .coordinator_fence = @splat(4), .participants = &members };
+    var credit: u64 = 0;
+    for (0..2) |phase| {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        if (phase == 0) {
+            var bind = try store.beginWriteTxn();
+            errdefer bind.abort();
+            try bind.put(&internal_keys.identity_namespace_key, &namespace);
+            try @import("source_authority.zig").bind(&bind, .native, namespace);
+            try bind.commit();
+            try std.testing.expectError(error.HistoryResynchronizationRequired, manager.initParticipantWithCompletionAdmission(admission, 10, 11, true, .{}));
+            try std.testing.expectError(TxnError.TxnNotFound, manager.loadTransactionRecord(admission.transaction_id));
+            var enroll = try store.beginWriteTxn();
+            errdefer enroll.abort();
+            const consumer = try history.admit(&enroll, namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
+            try enroll.commit();
+            var release = try store.beginWriteTxn();
+            errdefer release.abort();
+            try history.release(&release, namespace, consumer.id, consumer.epoch);
+            try release.commit();
+            try manager.initParticipantWithCompletionAdmission(admission, 10, 11, true, .{});
+            try std.testing.expect(!(try manager.loadTransactionRecord(admission.transaction_id)).coordinator);
+            try std.testing.expectError(error.SourceOutcomeUnresolved, manager.resolveIntents(admission.transaction_id, .committed, 20));
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                const state = (try history.load(&read)).?;
+                try std.testing.expect(!state.active());
+                credit = state.reserved_bytes;
+                try std.testing.expect(credit > 0);
+            }
+            try std.testing.expectError(error.InvalidParticipant, manager.writeIntents(admission.transaction_id, &.{.{ .key = "row", .value = "must-not-write" }}, &.{}));
+            try std.testing.expect(!(try manager.loadTransactionRecord(admission.transaction_id)).prepared);
+            try manager.writeIntents(admission.transaction_id, &.{}, &.{.{ .key = "row", .expected_version = 0 }});
+        } else {
+            var plan = (try manager.getCompletionAdmission(a, admission.transaction_id)).?;
+            defer plan.deinit();
+            try std.testing.expectEqual(admission.digest(), plan.value.digest);
+            const owners = try manager.getParticipants(a, admission.transaction_id);
+            defer freeParticipantList(a, owners);
+            try std.testing.expectEqual(@as(usize, 1), owners.len);
+            try std.testing.expectEqualStrings("coordinator", owners[0]);
+            const record = try manager.loadTransactionRecord(admission.transaction_id);
+            try std.testing.expect(record.prepared and !record.coordinator);
+            _ = try manager.recoverTransactions(1000, 2000);
+            try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(admission.transaction_id));
+            try manager.resolveIntents(admission.transaction_id, .committed, 20);
+            var receipt = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+            defer receipt.deinit();
+            try std.testing.expectEqual(std.meta.Tag(completion.Outcome).no_effect, std.meta.activeTag(receipt.value.resolution.outcome));
+            try std.testing.expectEqual(namespace, receipt.value.resolution.namespace);
+            try std.testing.expect(std.mem.readInt(u64, receipt.value.resolution.source_position[0..8], .little) > 0);
+            const receipt_key = completion.resolutionKey(admission.transaction_id);
+            const original = try manager.getAlloc(a, &receipt_key);
+            defer a.free(original);
+            const manifest = try admission.manifest(20);
+            var foreign = receipt.value.resolution;
+            foreign.namespace = admission.coordinator_namespace;
+            foreign.owner_fence = admission.coordinator_fence;
+            foreign.outcome = .{ .no_effect = completion.noEffectProof(manifest, foreign.namespace, foreign.source_position) };
+            const encoded_foreign = try completion.encodeResolution(a, manifest, foreign);
+            defer a.free(encoded_foreign);
+            try store.put(&receipt_key, encoded_foreign);
+            try std.testing.expectError(error.InvalidTxnRecord, manager.getCompletionResolution(a, admission.transaction_id));
+            try store.put(&receipt_key, original);
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(credit, (try history.load(&read)).?.reserved_bytes);
+            try std.testing.expectEqual(@as(u64, 0), (try history.load(&read)).?.latest);
+        }
+    }
+    const coordinator_path = try tempTestPath(a, "completion-original-owner");
+    defer a.free(coordinator_path);
+    defer cleanupTestDir(coordinator_path);
+    var backend = try lsm_backend.Backend.open(a, coordinator_path, .{ .flush_threshold_bytes = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    try store.put(&internal_keys.identity_namespace_key, &admission.coordinator_namespace);
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+    const recovery = try manager.getParticipants(a, admission.transaction_id);
+    defer freeParticipantList(a, recovery);
+    try std.testing.expectEqualStrings("coordinator", recovery[0]);
+    try std.testing.expectEqualStrings("guard", recovery[1]);
+}
+
+test "committed history completion admission raft resolution requires applying cut and preserves original receipt" {
+    const history = @import("committed_history.zig");
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const namespace: completion.Namespace = @splat(33);
+    {
+        var bind = try store.beginWriteTxn();
+        errdefer bind.abort();
+        try bind.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&bind, .raft, namespace);
+        try bind.commit();
+        var enroll = try store.beginWriteTxn();
+        errdefer enroll.abort();
+        _ = try history.admit(&enroll, namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
+        try enroll.commit();
+    }
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = 0, .group_id = 3, .topology_epoch = 4 };
+    const input_digest = completion.preparedInputDigest(namespace, "guard-only-input");
+    const members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = owner.digest(), .roles = completion.Roles.guards, .locator = "coordinator", .input_digest = input_digest }};
+    const admission: completion.Admission = .{ .version = 2, .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = owner.digest(), .participants = &members };
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.writeIntents(admission.transaction_id, &.{}, &.{}));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.writeIntentsExtraBatch(admission.transaction_id, &.{}, &.{}, .{ .completion_input_digest = @splat(7), .completion_owner = owner }));
+    try std.testing.expectEqual(@as(?bool, false), try manager.completionPrepareStatus(admission.transaction_id, input_digest, null, owner));
+    try manager.writeIntentsExtraBatch(admission.transaction_id, &.{}, &.{}, .{ .completion_input_digest = input_digest, .completion_owner = owner });
+    try std.testing.expectEqual(@as(?bool, true), try manager.completionPrepareStatus(admission.transaction_id, input_digest, null, owner));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.completionPrepareStatus(admission.transaction_id, input_digest, @splat(8), owner));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.completionPrepareStatus(admission.transaction_id, null, null, owner));
+    try std.testing.expectError(error.HistoryAuthorityRequired, manager.resolveIntents(admission.transaction_id, .committed, 20));
+    try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(admission.transaction_id));
+    try std.testing.expectError(error.NotFound, manager.getAlloc(a, &completion.requestKey(admission.transaction_id)));
+    try std.testing.expectError(error.SourceOutcomeUnresolved, manager.getCompletionResolution(a, admission.transaction_id));
+    var marker: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, marker[0..8], 2, .little);
+    std.mem.writeInt(u64, marker[8..16], 3, .little);
+    _ = try manager.resolveIntentsWithExtraBatch(admission.transaction_id, .committed, 20, .{ .writes = &.{.{ .key = &internal_keys.ordered_document_applied_entry_key, .value = &marker }} });
+    var first = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+    defer first.deinit();
+    try std.testing.expectEqual(std.meta.Tag(completion.Outcome).no_effect, std.meta.activeTag(first.value.resolution.outcome));
+    try std.testing.expectEqual(@as(u8, 1), first.value.resolution.source_position[31]);
+    try std.testing.expectEqualSlices(u8, &marker, first.value.resolution.source_position[0..16]);
+    std.mem.writeInt(u64, marker[8..16], 4, .little);
+    _ = try manager.resolveIntentsWithExtraBatch(admission.transaction_id, .committed, 99, .{ .completion_writes = &.{.{ .key = &internal_keys.ordered_document_applied_entry_key, .value = &marker }} });
+    var replayed = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+    defer replayed.deinit();
+    try std.testing.expectEqual(first.value.digest, replayed.value.digest);
+    const applied = try manager.getAlloc(a, &internal_keys.ordered_document_applied_entry_key);
+    defer a.free(applied);
+    try std.testing.expectEqualSlices(u8, &marker, applied);
+    try std.testing.expectEqual(@as(u64, 20), replayed.value.resolution.commit_version);
+}
+
+test "committed history transaction reservations survive reopen and committed recovery emits one original transaction" {
+    const history = @import("committed_history.zig");
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-committed-history");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(77);
+    const namespace: history.frame.Namespace = @splat(6);
+    const physical = try internal_keys.documentKeyAlloc(alloc, "row");
+    defer alloc.free(physical);
+    var consumer: history.Consumer = undefined;
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(&internal_keys.identity_namespace_key, &namespace);
+            try @import("source_authority.zig").bind(&txn, .native, namespace);
+            try txn.commit();
+        }
+        try store.put(physical, "before");
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            consumer = try history.admit(&txn, namespace, @splat(1), history.default_limit, 1000, 1);
+            try txn.commit();
+        }
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.initTransaction(id, 1);
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = "after" }}, &.{});
+        try manager.writeIntents(id, &.{ .{ .key = "row", .value = "replacement" }, .{ .key = "row", .value = "after" } }, &.{});
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const state = (try history.load(&read)).?;
+        try std.testing.expect(state.reserved_bytes > 2 * 1024 * 1024);
+        try std.testing.expectEqual(@as(u64, 0), state.latest);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.resolveIntents(id, .committed, 1234);
+        try manager.resolveIntents(id, .committed, 1234);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const state = (try history.load(&read)).?;
+        try std.testing.expectEqual(@as(u64, 0), state.reserved_bytes);
+        try std.testing.expectEqual(@as(u64, 1), state.latest);
+        try std.testing.expectEqualStrings("after", try read.get(physical));
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const descriptor = (try history.read(scratch, &read, namespace, consumer.id, consumer.epoch, 0)).?;
+        var source = try history.ChunkSource(DocStore.Txn).init(alloc, &read, descriptor);
+        defer source.deinit();
+        var reader: history.frame.Reader = .{ .descriptor = descriptor, .source = source.source() };
+        const header = try reader.header(scratch);
+        try std.testing.expectEqual(history.frame.TransactionScope.coordinated, header.value.transaction_scope);
+        try std.testing.expectEqualSlices(u8, &id, &header.value.transaction_id);
+        const effect = (try reader.next(scratch)).?;
+        try std.testing.expectEqualStrings("before", effect.before.?);
+        try std.testing.expectEqualStrings("after", effect.after.?);
+        try std.testing.expect((try reader.next(scratch)) == null);
+        const later_id: TxnId = @splat(78);
+        try manager.initTransaction(later_id, 2);
+        try manager.writeIntents(later_id, &.{.{ .key = "row", .value = "after-release" }}, &.{});
+        {
+            var control = try store.beginWriteTxn();
+            errdefer control.abort();
+            try history.release(&control, namespace, consumer.id, consumer.epoch);
+            try control.commit();
+        }
+        try manager.resolveIntents(later_id, .committed, 1235);
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        const final_state = (try history.load(&current)).?;
+        try std.testing.expect(!final_state.active());
+        try std.testing.expectEqual(@as(u64, 0), final_state.reserved_bytes);
+        try std.testing.expectEqual(@as(u64, 2), final_state.latest);
+        try std.testing.expectEqualStrings("after-release", try current.get(physical));
+    }
+}
 
 test "retained transaction reservations survive LSM reopen and guarantee committed resolution at quota" {
     const alloc = std.testing.allocator;
@@ -3993,6 +5235,125 @@ test "transaction intent snapshot owns one payload copy and retirement reads onl
     });
     try std.testing.expect(!try mgr.hasSchemaLeases());
     try std.testing.expect(!try mgr.hasIntents(txn_id));
+}
+
+test "transaction source purpose fences sessions freezes prepared intents and survives recovery" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-source-purpose");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var mgr = try TxnManager.init(a, &store);
+    defer mgr.deinit();
+    const txn_id: TxnId = @splat(12);
+    const proof: [32]u8 = @splat(7);
+    const extra: MutationExtraBatch = .{ .source_purpose = proof };
+    try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(txn_id, 10_000, 1_000, &.{"docs:0"}, true, true, extra);
+    try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(txn_id, 10_000, 9_000, &.{"docs:0"}, true, true, extra);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.initTransactionWithParticipantsCreatedAtRoleAndRetention(txn_id, 10_000, 1_000, &.{"docs:0"}, true, true));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(txn_id, 10_000, 1_000, &.{"docs:0"}, true, true, .{ .source_purpose = @splat(8) }));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.writeIntents(txn_id, &.{.{ .key = "a", .value = "session" }}, &.{}));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.resolveIntents(txn_id, .aborted, 11_000));
+    try std.testing.expectError(error.SourceOutcomeUnresolved, mgr.resolveIntentsWithExtraBatch(txn_id, .committed, 11_000, .{ .source_purpose = proof }));
+    const effects = [_]WriteIntent{ .{ .key = "a", .value = "source" }, .{ .key = "b", .value = null } };
+    try mgr.writeIntentsExtraBatch(txn_id, &effects, &.{}, extra);
+    var first = try mgr.collectIntentBatch(a, txn_id);
+    defer first.deinit(a);
+    // Equivalent final intent sets may arrive in another order. The original
+    // durable vote, schema lease and reservation revision remain unchanged.
+    try mgr.writeIntentsExtraBatch(txn_id, &.{ effects[1], effects[0] }, &.{}, extra);
+    try std.testing.expectError(error.SourcePayloadConflict, mgr.writeIntentsExtraBatch(txn_id, &.{effects[0]}, &.{}, extra));
+    try std.testing.expectError(error.SourcePayloadConflict, mgr.writeIntentsExtraBatch(txn_id, &.{ effects[0], .{ .key = "b", .value = "changed" } }, &.{}, extra));
+    try std.testing.expectError(error.SourcePayloadConflict, mgr.writeIntentsExtraBatch(txn_id, &.{ effects[0], effects[1], .{ .key = "c", .value = "added" } }, &.{}, extra));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.writeIntents(txn_id, &effects, &.{}));
+    var unchanged = try mgr.collectIntentBatch(a, txn_id);
+    defer unchanged.deinit(a);
+    try std.testing.expectEqual(first.revision, unchanged.revision);
+    const stats = try mgr.recoverTransactions(20_000, 30_000);
+    try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
+    try std.testing.expectEqual(@as(u64, 1), stats.kept_recent_pending);
+    const summaries = try mgr.listTransactions(a);
+    defer a.free(summaries);
+    try std.testing.expectEqual(proof, summaries[0].source_purpose.?);
+    const raw = try mgr.getAlloc(a, &makeRecordKey(txn_id));
+    defer a.free(raw);
+    try std.testing.expectEqual(@as(usize, txn_record_v8_size), raw.len);
+    try std.testing.expectEqual(proof, (try decodeRecord(raw)).source_purpose.?);
+    try std.testing.expectEqual(proof, (try completionCoordinatorRecord(raw)).source_purpose.?);
+    const malformed = try a.dupe(u8, raw);
+    defer a.free(malformed);
+    malformed[54] = 2;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(malformed));
+    @memcpy(malformed, raw);
+    malformed[53] = 2;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(malformed));
+    @memcpy(malformed, raw);
+    malformed[0] = 255;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(malformed));
+    @memcpy(malformed, raw);
+    @memset(malformed[55..87], 0);
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(malformed));
+    mgr.deinit();
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    mgr = try TxnManager.init(a, &store);
+    try mgr.requireSourcePurpose(txn_id, proof);
+    const reopened_raw = try mgr.getAlloc(a, &makeRecordKey(txn_id));
+    defer a.free(reopened_raw);
+    try std.testing.expectEqual(proof, (try completionCoordinatorRecord(reopened_raw)).source_purpose.?);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.resolveIntents(txn_id, .committed, 11_000));
+    _ = try mgr.resolveIntentsWithExtraBatch(txn_id, .committed, 11_000, .{ .source_purpose = proof });
+    const stored_value = try getVisibleDocRuntime(&mgr.store, a, "a");
+    defer a.free(stored_value);
+    try std.testing.expectEqualStrings("source", stored_value);
+    try std.testing.expectEqual(TxnStatus.committed, try mgr.getTransactionStatus(txn_id));
+    const ordinary: TxnId = @splat(13);
+    try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetention(ordinary, 10_000, 1_000, &.{"docs:0"}, true, true);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(ordinary, 10_000, 1_000, &.{"docs:0"}, true, true, extra));
+    const legacy = try mgr.getAlloc(a, &makeRecordKey(ordinary));
+    defer a.free(legacy);
+    try std.testing.expectEqual(@as(usize, txn_record_v6_size), legacy.len);
+    try std.testing.expect((try decodeRecord(legacy)).source_purpose == null);
+}
+
+test "transaction retired source cleanup requires a permanent fence and preserves ordinary records" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-retired-source-cleanup");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var mgr = try TxnManager.init(a, &store);
+    defer mgr.deinit();
+    const admission = @import("source_admission.zig");
+    const command: admission.Command = .{ .table_id = 7, .generation = 1, .source = "source", .epoch = "epoch", .definition_digest = @splat(1), .batch_id = "batch", .source_sequence = 1, .checkpoint = "cp", .payload_digest = @splat(2), .participant_digest = @splat(3), .accepted_at_ns = std.math.maxInt(u64) - 1 };
+    const id = command.transactionId();
+    try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, command.accepted_at_ns, 1_000, &.{"docs:0"}, true, true, .{ .source_purpose = command.fingerprint() });
+    try std.testing.expectError(error.SourcePendingWork, mgr.cleanupRetiredSourceAttempt(command));
+    const fence = blk: {
+        var probe = try mgr.store.beginProbe();
+        defer probe.abort();
+        break :blk try admission.planAttemptRetirement(&probe, 7, command);
+    };
+    const fence_key = admission.fenceKey(command);
+    try mgr.putValue(&fence_key, &fence.encode());
+    try std.testing.expectError(error.SourcePendingWork, mgr.cleanupRetiredSourceAttempt(command));
+    _ = try mgr.resolveIntentsWithExtraBatch(id, .aborted, std.math.maxInt(u64), .{ .source_purpose = command.fingerprint(), .resolved_participant = "docs:0" });
+    // Ordinary retry retention cannot collect this maximum-timestamp record.
+    try std.testing.expect(!try mgr.cleanupTransactionMetadataIfEligible(id, std.math.maxInt(u64), std.math.maxInt(u64)));
+    try std.testing.expect(try mgr.cleanupRetiredSourceAttempt(command));
+    try std.testing.expectError(error.TxnNotFound, mgr.getTransactionStatus(id));
+    {
+        var probe = try mgr.store.beginProbe();
+        defer probe.abort();
+        try std.testing.expectError(error.SourceAttemptRetired, admission.requireAttemptAllowed(&probe, command));
+    }
+    try mgr.initTransaction(id, 100);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.cleanupRetiredSourceAttempt(command));
+    try std.testing.expectEqual(TxnStatus.pending, try mgr.getTransactionStatus(id));
 }
 
 test "transaction protocol fences begin prepare snapshot and idempotent resolution" {
@@ -5305,4 +6666,452 @@ test "time series source language reserves signed source slots before voting" {
     try std.testing.expectEqual(legacy + 16, try retainedIntentBytesForLanguage(std.testing.allocator, intent, true));
     const deleted: WriteIntent = .{ .key = "row", .value = null };
     try std.testing.expectEqual(try retainedIntentBytes(std.testing.allocator, deleted), try retainedIntentBytesForLanguage(std.testing.allocator, deleted, true));
+}
+
+test "committed history completion admission v3 durably retains every original recovery owner" {
+    const history = @import("committed_history.zig");
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const namespace: completion.Namespace = @splat(33);
+    {
+        var bind = try store.beginWriteTxn();
+        errdefer bind.abort();
+        try bind.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&bind, .raft, namespace);
+        _ = try history.admit(&bind, namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
+        try bind.commit();
+    }
+    const coordinator: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = 7, .group_id = 3, .topology_epoch = 4 };
+    var follower = coordinator;
+    follower.namespace = @splat(34);
+    follower.group_id = 5;
+    follower.root_generation = 8;
+    const members = [_]completion.Participant{
+        .{ .namespace = coordinator.namespace, .owner_fence = coordinator.digest(), .roles = completion.Roles.guards, .locator = "coordinator", .input_digest = @splat(3), .routed_owner = coordinator },
+        .{ .namespace = follower.namespace, .owner_fence = follower.digest(), .roles = completion.Roles.checkpoint, .locator = "checkpoint", .input_digest = @splat(4), .routed_owner = follower },
+    };
+    const admission: completion.Admission = .{ .version = 3, .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = coordinator.digest(), .participants = &members };
+    {
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+    }
+    var reopened = try TxnManager.init(a, &store);
+    defer reopened.deinit();
+    var saved = (try reopened.getCompletionAdmission(a, admission.transaction_id)) orelse return error.TestExpectedRetainedAdmission;
+    defer saved.deinit();
+    try std.testing.expectEqual(admission.digest(), saved.value.digest);
+    try std.testing.expectEqual(coordinator, try saved.value.admission.recoveryOwner(coordinator.namespace));
+    try std.testing.expectEqual(follower, try saved.value.admission.recoveryOwner(follower.namespace));
+    try reopened.initTransactionWithCompletionAdmission(saved.value.admission, 10, 11, true, .{});
+    follower.root_generation += 1;
+    try std.testing.expectError(error.TopologyChanged, saved.value.admission.requireRoutedOwner(follower));
+    try std.testing.expectEqual(TxnStatus.pending, try reopened.getTransactionStatus(admission.transaction_id));
+    const key = completion.record_prefix.* ++ admission.transaction_id;
+    const pending_raw = try reopened.getAlloc(a, &key);
+    defer a.free(pending_raw);
+    const pending = try completionCoordinatorRecord(pending_raw);
+    try std.testing.expectEqual(.pending, pending.status);
+    try std.testing.expect(!pending.prepared and !pending.intents_resolved);
+    try std.testing.expectEqual(@as(u64, 0), pending.commit_version);
+    _ = try reopened.resolveIntentsWithExtraBatch(admission.transaction_id, .aborted, 30, .{});
+    const aborted_raw = try reopened.getAlloc(a, &key);
+    defer a.free(aborted_raw);
+    const aborted = try completionCoordinatorRecord(aborted_raw);
+    try std.testing.expectEqual(.aborted, aborted.status);
+    try std.testing.expectEqual(@as(u64, 0), aborted.commit_version);
+    try std.testing.expectEqual(@as(u64, 30), aborted.finalized_at_ns);
+    try std.testing.expect(aborted.intents_resolved);
+}
+
+test "transaction source purpose scoped reference survives restart and fences stale attempts" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-source-scope");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(31);
+    const purpose: [32]u8 = @splat(32);
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 2, .topology_epoch = 1 };
+    const root = try source_scope.Basis.fromOwner(owner);
+    const spec: source_scope.Spec = .{ .actor_table_id = 3, .source_id = @splat(33), .generation = 2, .binding = @splat(34), .checkpoint_owner = root };
+    const scope: source_scope.Reference = .{ .domain = spec.domain(), .binding = spec.binding, .generation = 2, .token = 3, .sequence = 1 };
+    const members = [_]completion.Participant{.{ .namespace = owner.namespace, .owner_fence = owner.digest(), .roles = completion.Roles.effects | completion.Roles.checkpoint, .locator = "docs:0", .input_digest = @splat(35), .routed_owner = owner }};
+    const admission: completion.Admission = .{ .version = 3, .transaction_id = id, .admission_digest = @splat(36), .coordinator_namespace = owner.namespace, .coordinator_fence = owner.digest(), .participants = &members };
+    const extra: MutationExtraBatch = .{ .source_purpose = purpose, .source_scope = scope, .completion_owner = owner, .completion_input_digest = members[0].input_digest };
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var mgr = try TxnManager.init(a, &store);
+        defer mgr.deinit();
+        {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var bind = try store.beginWriteTxn();
+            errdefer bind.abort();
+            try bind.put(&internal_keys.identity_namespace_key, &owner.namespace);
+            try @import("source_authority.zig").bind(&bind, .native, owner.namespace);
+            try bind.commit();
+            var enroll = try store.beginWriteTxn();
+            errdefer enroll.abort();
+            const history = @import("committed_history.zig");
+            const consumer = try history.admit(&enroll, owner.namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
+            try enroll.commit();
+            var release = try store.beginWriteTxn();
+            errdefer release.abort();
+            try history.release(&release, owner.namespace, consumer.id, consumer.epoch);
+            _ = try source_scope.Store.bind(arena.allocator(), &release, root, spec, .{ .group_id = 1, .incarnation = root.metadata_incarnation, .index = 10 });
+            try release.commit();
+        }
+        var legacy_admission = admission;
+        legacy_admission.transaction_id = @splat(40);
+        try std.testing.expectError(error.SourceCheckpointConflict, mgr.initTransactionWithCompletionAdmission(legacy_admission, 10_000, 1_000, true, .{ .source_purpose = purpose }));
+        try std.testing.expectError(error.TxnNotFound, mgr.getTransactionStatus(legacy_admission.transaction_id));
+        var unbound_admission = admission;
+        unbound_admission.transaction_id = @splat(41);
+        var unbound_extra = extra;
+        unbound_extra.source_scope.?.domain = @splat(42);
+        try std.testing.expectError(error.SourceCheckpointConflict, mgr.initTransactionWithCompletionAdmission(unbound_admission, 10_000, 1_000, true, unbound_extra));
+        try std.testing.expectError(error.TxnNotFound, mgr.getTransactionStatus(unbound_admission.transaction_id));
+        try std.testing.expectError(error.NotFound, store.get(a, &makeSidecarKey(completion_admission_prefix, unbound_admission.transaction_id)));
+        try mgr.initTransactionWithCompletionAdmission(admission, 10_000, 1_000, true, extra);
+        try mgr.initTransactionWithCompletionAdmission(admission, 10_000, 2_000, true, extra);
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.initTransactionWithCompletionAdmission(admission, 10_000, 1_000, true, .{ .source_purpose = purpose }));
+        var changed = extra;
+        changed.source_scope.?.token += 1;
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.initTransactionWithCompletionAdmission(admission, 10_000, 1_000, true, changed));
+        try mgr.writeIntentsExtraBatch(id, &.{.{ .key = "a", .value = "scoped" }}, &.{}, extra);
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.writeIntentsExtraBatch(id, &.{.{ .key = "a", .value = "stale" }}, &.{}, changed));
+        const raw = try mgr.getAlloc(a, &makeRecordKey(id));
+        defer a.free(raw);
+        try std.testing.expectEqual(@as(usize, txn_record_v9_size), raw.len);
+        try std.testing.expectEqualDeep(scope, (try decodeRecord(raw)).source_scope.?);
+        try std.testing.expectEqualDeep(scope, (try completionCoordinatorRecord(raw)).source_scope.?);
+        const corrupt = try a.dupe(u8, raw);
+        defer a.free(corrupt);
+        corrupt[54] = 1;
+        try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(corrupt));
+        @memcpy(corrupt, raw);
+        @memset(corrupt[87..119], 0);
+        try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(corrupt));
+        @memcpy(corrupt, raw);
+        corrupt[51] = 0;
+        try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(corrupt));
+    }
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var mgr = try TxnManager.init(a, &store);
+        defer mgr.deinit();
+        const summaries = try mgr.listTransactions(a);
+        defer a.free(summaries);
+        try std.testing.expectEqualDeep(scope, summaries[0].source_scope.?);
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.resolveIntentsWithExtraBatch(id, .aborted, 11_000, .{ .source_purpose = purpose }));
+        var changed = scope;
+        changed.generation += 1;
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.resolveIntentsWithExtraBatch(id, .aborted, 11_000, .{ .source_purpose = purpose, .source_scope = changed }));
+        {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var closing = try store.beginWriteTxn();
+            errdefer closing.abort();
+            const closed = try source_scope.Store.close(arena.allocator(), &closing, root, spec.domain(), spec, .{ .group_id = 1, .incarnation = root.metadata_incarnation, .index = 11 }, .{ .term = 1, .index = 20 });
+            try std.testing.expectEqual(source_scope.Phase.closing, closed.phase);
+            try closing.commit();
+        }
+        // An already durable prepare remains idempotent, but no new decision
+        // can turn this closing coordinator into a committed source attempt.
+        try mgr.writeIntentsExtraBatch(id, &.{.{ .key = "a", .value = "scoped" }}, &.{}, extra);
+        try std.testing.expectError(error.SourceCheckpointConflict, mgr.resolveIntentsWithExtraBatch(id, .committed, 11_000, .{ .source_purpose = purpose, .source_scope = scope, .completion_owner = owner, .source_scope_cut = .{ .term = 1, .index = 21 } }));
+        try std.testing.expectEqual(TxnStatus.pending, try mgr.getTransactionStatus(id));
+        try std.testing.expect(try mgr.hasIntents(id));
+        try std.testing.expectError(error.InvalidSourceAdmission, mgr.resolveIntentsWithExtraBatch(id, .aborted, 11_000, .{ .source_purpose = purpose, .source_scope = scope, .completion_owner = owner }));
+        try std.testing.expectEqual(TxnStatus.pending, try mgr.getTransactionStatus(id));
+        _ = try mgr.resolveIntentsWithExtraBatch(id, .aborted, 11_000, .{ .source_purpose = purpose, .source_scope = scope, .completion_owner = owner, .source_scope_cut = .{ .term = 1, .index = 21 } });
+        {
+            var probe = try store.beginReadTxn();
+            defer probe.abort();
+            const closed = (try source_scope.Store.readRecord(a, &probe, spec.domain())).?;
+            try std.testing.expectEqual(source_scope.Phase.closed, closed.phase);
+            try std.testing.expect(closed.slot == null);
+            try std.testing.expectEqual(scope.token, closed.closed_through_token);
+            try std.testing.expectEqualDeep(source_scope.Cut{ .term = 1, .index = 21 }, closed.closed_at.?);
+        }
+
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.resolveIntentsWithExtraBatch(id, .aborted, 11_000, .{}));
+        const raw = try mgr.getAlloc(a, &makeRecordKey(id));
+        defer a.free(raw);
+        try std.testing.expectEqualDeep(scope, (try decodeRecord(raw)).source_scope.?);
+        try std.testing.expectEqual(TxnStatus.aborted, (try decodeRecord(raw)).status);
+        var other_spec = spec;
+        other_spec.source_id = @splat(45);
+        other_spec.binding = @splat(46);
+        var other_admission = admission;
+        other_admission.transaction_id = @splat(44);
+        var other_extra = extra;
+        other_extra.source_scope.?.domain = other_spec.domain();
+        other_extra.source_scope.?.binding = other_spec.binding;
+        other_extra.source_scope.?.token = 1;
+        {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var bind = try store.beginWriteTxn();
+            errdefer bind.abort();
+            _ = try source_scope.Store.bind(arena.allocator(), &bind, root, other_spec, .{ .group_id = 1, .incarnation = root.metadata_incarnation, .index = 12 });
+            try bind.commit();
+        }
+        try mgr.initTransactionWithCompletionAdmission(other_admission, 12_000, 2_000, true, other_extra);
+        {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var closing = try store.beginWriteTxn();
+            errdefer closing.abort();
+            _ = try source_scope.Store.close(arena.allocator(), &closing, root, other_spec.domain(), other_spec, .{ .group_id = 1, .incarnation = root.metadata_incarnation, .index = 13 }, .{ .term = 1, .index = 23 });
+            try closing.commit();
+        }
+        try std.testing.expectError(error.SourceCheckpointConflict, mgr.writeIntentsExtraBatch(other_admission.transaction_id, &.{.{ .key = "other", .value = "blocked" }}, &.{}, other_extra));
+        try std.testing.expect(!(try mgr.loadTransactionRecord(other_admission.transaction_id)).prepared);
+        try std.testing.expect(!try mgr.hasIntents(other_admission.transaction_id));
+        _ = try mgr.resolveIntentsWithExtraBatch(other_admission.transaction_id, .aborted, 13_000, .{ .source_purpose = purpose, .source_scope = other_extra.source_scope, .completion_owner = owner, .source_scope_cut = .{ .term = 1, .index = 24 } });
+    }
+}
+
+test "transaction source purpose retirement fences delayed BEGIN across real store reopen" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-source-retirement");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    try @import("source_scope_retirement_native_test.zig").run(a, path);
+}
+
+test "transaction source purpose ordinary provenance is explicit immutable and rejects corrupt encodings" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-ordinary-producer");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    const id: TxnId = @splat(240);
+    const extra: MutationExtraBatch = .{ .ordinary_producer = true };
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 11, &.{}, true, true, extra);
+    const raw = try manager.getAlloc(a, &makeRecordKey(id));
+    defer a.free(raw);
+    try std.testing.expectEqual(@as(usize, txn_record_v10_size), raw.len);
+    try std.testing.expect((try decodeRecord(raw)).ordinary_producer);
+    try std.testing.expect(!(try decodeRecord(raw[0..txn_record_v6_size])).ordinary_producer);
+    const corrupt = try a.dupe(u8, raw);
+    defer a.free(corrupt);
+    corrupt[54] = 0;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(corrupt));
+    corrupt[54] = 2;
+    try std.testing.expect((try decodeRecord(corrupt)).legacy_producer);
+    try std.testing.expect(!(try decodeRecord(corrupt)).ordinary_producer);
+    corrupt[54] = 3;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(corrupt));
+    corrupt[54] = 1;
+    corrupt[53] = 2;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(corrupt));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 10, 11, &.{}, true, true));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.writeIntentsExtraBatch(id, &.{}, &.{}, .{}));
+    try manager.writeIntentsExtraBatch(id, &.{}, &.{}, extra);
+    _ = try manager.resolveIntentsWithExtraBatch(id, .aborted, 20, .{});
+    try std.testing.expect((try manager.loadTransactionRecord(id)).ordinary_producer);
+    const legacy: TxnId = @splat(241);
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(legacy, 10, 11, &.{}, true, true);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(legacy, 10, 11, &.{}, true, true, extra));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(@splat(242), 10, 11, &.{}, true, true, .{ .ordinary_producer = true, .source_purpose = @splat(1) }));
+}
+
+test "transaction source purpose closed legacy recovery inventory is bounded and survives reopen" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-legacy-inventory");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 2, .topology_epoch = 1 };
+    const root = try source_scope.Basis.fromOwner(owner);
+    const policy = @import("source_producer_policy.zig");
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try std.testing.expectError(error.SourcePendingWork, manager.legacyRecoveryPage(a, root, null, 1));
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(@splat(1), 10, 11, &.{}, true, true, .{ .ordinary_producer = true });
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(@splat(2), 10, 11, &.{}, true, true, .{ .legacy_producer = true });
+        try manager.writeIntentsExtraBatch(@splat(2), &.{.{ .key = "legacy-row", .value = "{}" }}, &.{}, .{ .legacy_producer = true });
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(@splat(3), 10, 11, &.{}, true, true);
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(@splat(4), 10, 11, &.{}, true, true);
+        _ = try manager.resolveIntentsWithExtraBatch(@splat(4), .aborted, 20, .{});
+        // Historic terminal records without a resolution bit, and terminal
+        // decisions with unresolved intents, must both remain discoverable.
+        const terminal = try manager.getAlloc(a, &makeRecordKey(@splat(4)));
+        defer a.free(terminal);
+        try manager.putValue(&makeRecordKey(@splat(5)), terminal[0..txn_record_v5_size]);
+        const unresolved = try a.dupe(u8, terminal);
+        defer a.free(unresolved);
+        unresolved[52] = 0;
+        try manager.putValue(&makeRecordKey(@splat(6)), unresolved);
+        var batch = try store.beginWriteTxn();
+        errdefer batch.abort();
+        _ = try policy.Store.close(a, &batch, root, .{ .term = 1, .index = 7 });
+        try batch.commit();
+    }
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    try std.testing.expectError(error.InvalidSourceAdmission, manager.legacyRecoveryPage(a, root, null, 0));
+    try std.testing.expectError(error.InvalidSourceAdmission, manager.legacyRecoveryPage(a, root, null, 257));
+    var wrong = root;
+    wrong.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, manager.legacyRecoveryPage(a, wrong, null, 1));
+    var first = try manager.legacyRecoveryPage(a, root, null, 1);
+    defer first.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), first.items.len);
+    try std.testing.expectEqual(@as(usize, 1), first.scanned_records);
+    try std.testing.expect(!first.reached_end);
+    try std.testing.expectEqualDeep(@as(TxnId, @splat(1)), first.next_after.?);
+    var second = try manager.legacyRecoveryPage(a, root, first.next_after, 1);
+    defer second.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), second.items.len);
+    try std.testing.expectEqualDeep(@as(TxnId, @splat(2)), second.items[0].transaction_id);
+    try std.testing.expect(second.items[0].prepared);
+    const raw = try manager.getAlloc(a, &makeRecordKey(@splat(2)));
+    defer a.free(raw);
+    try std.testing.expectEqualDeep(completion.bytesDigest(raw), second.items[0].record_digest);
+    var third = try manager.legacyRecoveryPage(a, root, second.next_after, 256);
+    defer third.deinit(a);
+    try std.testing.expect(third.reached_end);
+    try std.testing.expectEqual(@as(usize, 4), third.scanned_records);
+    try std.testing.expectEqual(@as(usize, 3), third.items.len);
+    try std.testing.expectEqualDeep(@as(TxnId, @splat(3)), third.items[0].transaction_id);
+    try std.testing.expectEqualDeep(@as(TxnId, @splat(5)), third.items[1].transaction_id);
+    try std.testing.expect(!third.items[1].intents_resolved_known);
+    try std.testing.expectEqualDeep(@as(TxnId, @splat(6)), third.items[2].transaction_id);
+    try std.testing.expect(third.items[2].intents_resolved_known and !third.items[2].intents_resolved);
+    // Discovery cannot authorize either terminal decision through closed ingress.
+    try std.testing.expectError(error.SourcePendingWork, manager.resolveIntentsWithExtraBatch(@splat(2), .aborted, 30, .{}));
+    try std.testing.expect(try manager.hasIntents(@splat(2)));
+    var all = try manager.legacyRecoveryPage(a, root, null, 256);
+    defer all.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), all.items.len);
+    try std.testing.expectEqual(@as(u64, 7), all.closure.first_closed_at.index);
+    try manager.putValue(&makeRecordKey(@splat(3)), "corrupt");
+    try std.testing.expectError(error.InvalidTxnRecord, manager.legacyRecoveryPage(a, root, null, 256));
+    try manager.putValue(&makeRecordKey(@splat(3)), raw);
+    // A malformed short key sorts before every full transaction ID. The
+    // initial cursor must inspect the prefix itself rather than prefix+zero.
+    try manager.putValue(records_prefix, raw);
+    try std.testing.expectError(error.InvalidTxnRecord, manager.legacyRecoveryPage(a, root, null, 256));
+}
+
+test "transaction source purpose closed legacy terminal recovery preserves original decisions and effects" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-legacy-terminal");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 2, .topology_epoch = 1 };
+    const root = try source_scope.Basis.fromOwner(owner);
+    const policy = @import("source_producer_policy.zig");
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        for ([_]u8{ 1, 2, 3 }) |byte| {
+            const id: TxnId = @splat(byte);
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 10, 11, &.{}, true, true);
+            if (byte == 1) continue;
+            try manager.writeIntents(id, &.{.{ .key = if (byte == 2) "commit-row" else "abort-row", .value = "original" }}, &.{});
+            // Fixture models the historic crash window: original decision
+            // persisted, prepared intents not yet retired.
+            var record = try manager.loadTransactionRecord(id);
+            record.status = if (byte == 2) .committed else .aborted;
+            record.commit_version = if (byte == 2) 30 else 0;
+            record.finalized_at = 31;
+            const encoded = try manager.encodeRecord(record);
+            defer a.free(encoded);
+            try manager.putValue(&makeRecordKey(id), if (byte == 3) encoded[0..txn_record_v5_size] else encoded);
+        }
+        var batch = try store.beginWriteTxn();
+        errdefer batch.abort();
+        _ = try policy.Store.close(a, &batch, root, .{ .term = 1, .index = 7 });
+        try batch.commit();
+    }
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    var page = try manager.legacyRecoveryPage(a, root, null, 256);
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), page.items.len);
+    try std.testing.expect(!page.items[2].intents_resolved_known);
+    const pending: LegacyTerminalResolution = .{ .root = root, .transaction_id = page.items[0].transaction_id, .record_digest = page.items[0].record_digest };
+    try std.testing.expectError(error.SourceOutcomeUnresolved, manager.resolveClosedLegacyTerminal(pending, .{}));
+    var commit: LegacyTerminalResolution = .{ .root = root, .transaction_id = page.items[1].transaction_id, .record_digest = page.items[1].record_digest };
+    var absent = commit;
+    absent.transaction_id = @splat(239);
+    try std.testing.expectError(error.TxnNotFound, manager.resolveClosedLegacyTerminal(absent, .{}));
+    var forged = commit;
+    forged.record_digest[0] ^= 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveClosedLegacyTerminal(forged, .{}));
+    forged = commit;
+    forged.root.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, manager.resolveClosedLegacyTerminal(forged, .{}));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveIntentsWithExtraBatchInternal(commit.transaction_id, .committed, 30, .{}, forged));
+    forged = commit;
+    forged.record_digest[0] ^= 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveIntentsWithExtraBatchInternal(commit.transaction_id, .committed, 30, .{}, forged));
+    try std.testing.expectError(error.DecisionConflict, manager.resolveIntentsWithExtraBatchInternal(commit.transaction_id, .aborted, 99, .{}, commit));
+    try std.testing.expectError(error.SourcePendingWork, manager.resolveIntentsWithExtraBatch(commit.transaction_id, .committed, 30, .{}));
+    try std.testing.expect(try manager.hasIntents(commit.transaction_id));
+    _ = try manager.resolveClosedLegacyTerminal(commit, .{});
+    const commit_key = try internal_keys.documentKeyAlloc(a, "commit-row");
+    defer a.free(commit_key);
+    const abort_key = try internal_keys.documentKeyAlloc(a, "abort-row");
+    defer a.free(abort_key);
+    const value = try manager.getAlloc(a, commit_key);
+    defer a.free(value);
+    try std.testing.expectEqualStrings("original", value);
+    const resolved = try manager.loadTransactionRecord(commit.transaction_id);
+    try std.testing.expectEqual(TxnStatus.committed, resolved.status);
+    try std.testing.expectEqual(@as(u64, 30), resolved.commit_version);
+    try std.testing.expectEqual(@as(u64, 31), resolved.finalized_at);
+    try std.testing.expect(resolved.intents_resolved and !try manager.hasIntents(commit.transaction_id));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveClosedLegacyTerminal(commit, .{}));
+    // Re-read current state for an explicit idempotent terminal retry. It must
+    // not reapply the original row over a newer value.
+    const resolved_bytes = try manager.getAlloc(a, &makeRecordKey(commit.transaction_id));
+    defer a.free(resolved_bytes);
+    const metadata_marker = "\x00\x00__metadata__:legacy_terminal_atomic_test";
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.applyBatchStagedWithHistory(&.{.{ .key = metadata_marker, .value = "stale" }}, &.{}, null, null, null, null, null, commit));
+    try std.testing.expectError(error.NotFound, manager.getAlloc(a, metadata_marker));
+    try std.testing.expectError(error.TxnNotFound, manager.applyBatchStagedWithHistory(&.{.{ .key = metadata_marker, .value = "absent" }}, &.{}, null, null, null, null, null, absent));
+    try std.testing.expectError(error.NotFound, manager.getAlloc(a, metadata_marker));
+    commit.record_digest = completion.bytesDigest(resolved_bytes);
+    try manager.putValue(commit_key, "newer");
+    try std.testing.expect(!(try manager.resolveClosedLegacyTerminal(commit, .{ .completion_writes = &.{.{ .key = metadata_marker, .value = "current" }} })).applied);
+    const marked = try manager.getAlloc(a, metadata_marker);
+    defer a.free(marked);
+    try std.testing.expectEqualStrings("current", marked);
+    const newer = try manager.getAlloc(a, commit_key);
+    defer a.free(newer);
+    try std.testing.expectEqualStrings("newer", newer);
+    const abort: LegacyTerminalResolution = .{ .root = root, .transaction_id = page.items[2].transaction_id, .record_digest = page.items[2].record_digest };
+    _ = try manager.resolveClosedLegacyTerminal(abort, .{});
+    try std.testing.expectError(error.NotFound, manager.getAlloc(a, abort_key));
+    try std.testing.expect(!try manager.hasIntents(abort.transaction_id));
+    var remaining = try manager.legacyRecoveryPage(a, root, null, 256);
+    defer remaining.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), remaining.items.len);
+    try std.testing.expectEqualDeep(pending.transaction_id, remaining.items[0].transaction_id);
 }

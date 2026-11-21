@@ -13,10 +13,601 @@ servers:
   - url: /internal/v1
     description: Node-local internal API
 tags:
+  - name: source-metadata-recovery
+    description: Private qualified metadata source lifecycle observations.
+  - name: source-plan-staging
+    description: Private frozen-input ownership, bounded native staging and recovery.
+  - name: retained-history
+    description: Private native retained-history ownership and receipt recovery.
   - name: standby-replication
     x-displayName: Hot Standby Replication
     description: Runtime-to-runtime hot-standby replication protocol.
 paths:
+  /catalog/source-scope-capture-v1:
+    {"post":{"tags":["source-metadata-recovery"],"operationId":"captureNativeSourceMetadataScope","summary":"Capture a native source lifecycle through metadata ReadIndex","description":"Private metadata-node endpoint, bounded to 2 KiB request and 8 KiB reply. Authenticated service credentials remain mandatory in migration mode. Requires a shared remaining routing budget. The metadata service obtains ReadIndex, reads actor/configuration/authority at one applied snapshot, and revalidates cluster identity. Reply correlation, an acknowledgement header and numeric cuts do not independently create binding, retirement, legacy-drain or transaction-outcome authority. Read retries share one bounded deadline and cannot propose a mutation.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"X-Antfly-Routing-Remaining-Ms","in":"header","required":true,"schema":{"type":"integer","minimum":1,"maximum":5000}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceMetadataCaptureRequest"}}}},"responses":{"200":{"description":"Qualified correlated snapshot; validate the binding and lifecycle phase before using it.","headers":{"X-Antfly-Source-Scope-Capture":{"required":true,"schema":{"type":"string","enum":["read-index-v1"]}}},"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceMetadataCaptureReply"}}}},"400":{"description":"Invalid query or routing budget.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid service credential.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Internal service authority required.","content":{"text/plain":{"schema":{"type":"string"}}}},"408":{"description":"Capture cancelled; no snapshot returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Metadata incarnation or source binding changed.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 2 KiB.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt or inconsistent captured state.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Metadata leader, readiness or source authority unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}},"504":{"description":"Shared deadline exhausted; no snapshot returned.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /groups/{group_id}/tables/{table_name}/source-plan/control-v1:
+    {"post":{"tags":["source-plan-staging"],"operationId":"controlNativeSourcePlan","summary":"Stage or retire a frozen source plan","description":"Trusted node-to-node operation, bounded to 2 MiB request JSON. Requires an internal service principal and an independently validated immutable catalog route fence. Submit requires durable all-applying-member protocol floor 36. Effects or deterministic rejection commit with the ordinary Raft marker. Recovery is a separate read-only operation. A successful HTTP status is not proof of input ownership or permission to advance a source checkpoint. Ambiguous responses never authorize mutation retry.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"group_id","in":"path","required":true,"schema":{"type":"integer","format":"uint64","minimum":1}},{"name":"table_name","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":1024}},{"name":"X-Antfly-Catalog-Route-Fence","in":"header","required":true,"description":"Immutable catalog route fence. Receiver independently validates current metadata/table incarnation, group and physical generation; the supplied source_owner must match.","schema":{"type":"string","minLength":1,"maxLength":16384}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourcePlanControlRequest"}}}},"responses":{"200":{"description":"Bounded typed response; validate request binding and evidence before advancing progress.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourcePlanControlReply"}}}},"400":{"description":"Malformed command, owner, route fence or read request.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid internal service authority.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Principal is not an internal service.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Original owner, upload or receipt conflicts, or input was fenced/reclaimed.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 2 MiB.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt evidence or malformed internal response; no partial bytes are returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"501":{"description":"Serving profile or applying members cannot support the native source-plan contract.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Leader, routing, deadline, quorum or storage admission unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /groups/{group_id}/tables/{table_name}/source-retirement/control-v1:
+    {"post":{"tags":["source-retirement"],"operationId":"controlNativeSourceRetirement","summary":"Submit coordinator-authorized source retirement intent or recover its exact receipt","description":"Private authenticated internal-service RPC. Submit accepts only an original intent and coordinator locator; the leader independently obtains fresh qualified coordinator ReadIndex evidence for resolved positive ABORT before activated data profile 41 proposal. Caller observations are accepted only for exact read-only recovery. Request limit 16798720 bytes; reply limit 16802816 bytes includes the bounded original admission. Every reply correlates the full request and nonce. Ambiguous submissions preserve any known exact command and entry, with null outcome; never blindly retry. Local fencing proves no global source ACK, publication, or all-owner retirement.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"group_id","in":"path","required":true,"schema":{"type":"integer","format":"uint64","minimum":1}},{"name":"table_name","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":1024}},{"name":"X-Antfly-Catalog-Route-Fence","in":"header","required":true,"description":"Immutable catalog route fence. Receiver independently validates current metadata/table incarnation, group and physical generation; the supplied source_owner must match.","schema":{"type":"string","minLength":1,"maxLength":16384}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceRetirementRequest"}}}},"responses":{"200":{"description":"Correlated result; validate the exact request, owner, command and receipt. A known rejection is not application. An outcome-unknown marker clears confirmation but must preserve any valid known command/receipt.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceRetirementReply"}}}},"400":{"description":"Malformed command, owner, route fence or read request.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid internal service authority.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Principal is not an internal service.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Original owner, source binding, receipt profile or complete scope command conflicts, or retained history requires resynchronization.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 16798720 bytes.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt evidence or malformed internal response; no partial bytes are returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"501":{"description":"Serving profile or applying members cannot support the native source-plan contract.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Leader, routing, deadline, quorum or storage admission unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /groups/{group_id}/tables/{table_name}/source-scope/control-v1:
+    {"post":{"tags":["source-scope-control"],"operationId":"controlNativeSourceScope","summary":"Submit a metadata-authorized lifecycle intent or recover its exact receipt","description":"Private authenticated service RPC. Request JSON is bounded to 16 KiB and reply JSON to 24 KiB. Submit accepts only an intent and fresh request_id; the leader independently captures signed ReadIndex metadata authority and uses activated data profile 40. Recovery is read-only, preserves the exact original command/entry and honors minimum_applied_index; it never reauthorizes or resubmits. Known accepted responses preserve the captured command and receipt even when outcome is unknown. Superseded or unknown results authorize no blind transport replay, row transaction outcome or all-owner fencing. First strict activation still requires independently proven legacy-worker handover.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"group_id","in":"path","required":true,"schema":{"type":"integer","format":"uint64","minimum":1}},{"name":"table_name","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":1024}},{"name":"X-Antfly-Catalog-Route-Fence","in":"header","required":true,"description":"Immutable catalog route fence. Receiver independently validates current metadata/table incarnation, group and physical generation; the supplied source_owner must match.","schema":{"type":"string","minLength":1,"maxLength":16384}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceScopeControlRequest"}}}},"responses":{"200":{"description":"Correlated result; validate the exact request, owner, command and receipt. A known rejection is not application. An outcome-unknown marker clears confirmation but must preserve any valid known command/receipt.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceScopeControlReply"}}}},"400":{"description":"Malformed command, owner, route fence or read request.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid internal service authority.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Principal is not an internal service.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Original owner, source binding, receipt profile or complete scope command conflicts, or retained history requires resynchronization.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 16 KiB.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt evidence or malformed internal response; no partial bytes are returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"501":{"description":"Serving profile or applying members cannot support the native source-plan contract.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Leader, routing, deadline, quorum or storage admission unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /groups/{group_id}/tables/{table_name}/source-producers/legacy-inventory-v1:
+    {"post":{"tags":["source-producer-control"],"operationId":"readNativeLegacyInventory","summary":"Read bounded original legacy work at a qualified physical cut","description":"Private authenticated RPC. Request limit 8192 bytes; reply limit 270336 bytes. Requires complete catalog and physical owner fencing plus a fresh nonzero request_id. Fresh frozen quorum ReadIndex precedes one native snapshot of authority, applied marker, immutable closure and canonical transaction records. Inspect at most 256 records and 1 MiB of record data per page; omitted ordinary/scoped/resolved records consume credit. Resume after the last inspected ID. Reply digest binds nonce, cursor, owner, record bound and minimum cut. Pages may observe different cuts. Empty/reached_end is not a coherent all-record/all-root drainage certificate. Chooses no pending decision, appends no command, and authorizes no strict activation, source ACK or retention release.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"group_id","in":"path","required":true,"schema":{"type":"integer","format":"uint64","minimum":1}},{"name":"table_name","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":1024}},{"name":"X-Antfly-Catalog-Route-Fence","in":"header","required":true,"description":"Immutable catalog route fence. Receiver independently validates current metadata/table incarnation, group and physical generation; the supplied source_owner must match.","schema":{"type":"string","minLength":1,"maxLength":16384}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeLegacyInventoryRequest"}}}},"responses":{"200":{"description":"Correlated bounded page. Validate digest, owner, closure and actual read cut. Caller owns decoded items. Empty/end pages grant no drainage authority.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeLegacyInventoryReply"}}}},"400":{"description":"Malformed command, owner, route fence or read request.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid internal service authority.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Principal is not an internal service.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Original owner, source binding, receipt profile or complete scope command conflicts, or retained history requires resynchronization.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 8192 bytes.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt evidence or malformed internal response; no partial bytes are returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"501":{"description":"Serving profile or applying members do not support activated original-terminal recovery.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Leader, routing, deadline, quorum or storage admission unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /groups/{group_id}/tables/{table_name}/source-producers/legacy-terminal-v1:
+    {"post":{"tags":["source-producer-control"],"operationId":"controlNativeLegacyTerminal","summary":"Submit original terminal legacy recovery or read its exact outcome","description":"Private authenticated internal-service RPC. Request JSON is bounded to 16384 bytes; reply JSON to 12288 bytes. Submit carries a fresh nonzero request_id and complete original owner/record proof, with null receipt and zero minimum_applied_index. The leader independently qualifies persisted producer closure, current ownership and all-applying-member protocol 47 before proposal. It cannot choose a pending COMMIT/ABORT. Recovery carries the exact command and accepted entry, requires minimum_applied_index at least that entry, establishes fresh ReadIndex and never appends a barrier or command. Replies bind the entire request and nonce. Accepted positions survive lost confirmation but do not prove commitment. Applied/rejected outcomes are exact local command evidence; superseded/null outcomes authorize no blind replay. This provides no global drainage, strict activation, source ACK, retention release or public feed position.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"group_id","in":"path","required":true,"schema":{"type":"integer","format":"uint64","minimum":1}},{"name":"table_name","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":1024}},{"name":"X-Antfly-Catalog-Route-Fence","in":"header","required":true,"description":"Immutable catalog route fence. Receiver independently validates current metadata/table incarnation, group and physical generation; the supplied source_owner must match.","schema":{"type":"string","minLength":1,"maxLength":16384}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeLegacyTerminalRequest"}}}},"responses":{"200":{"description":"Correlated accepted position and optional qualified exact local outcome. Validate request_digest, command, owner, entry and actual cut. Outcome-unknown markers or late cancellation clear confirmation while preserving valid accepted positions. An applied ABORT is original intent retirement, not a new row commit.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeLegacyTerminalReply"}}}},"400":{"description":"Malformed command, owner, route fence or read request.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid internal service authority.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Principal is not an internal service.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Original owner, source binding, receipt profile or complete scope command conflicts, or retained history requires resynchronization.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 16384 bytes.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt evidence or malformed internal response; no partial bytes are returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"501":{"description":"Serving profile or applying members do not support activated original-terminal recovery.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Leader, routing, deadline, quorum or storage admission unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /groups/{group_id}/tables/{table_name}/source-producers/close-v1:
+    {"post":{"tags":["source-producer-control"],"operationId":"closeNativeSourceProducers","summary":"Submit one owner-fenced cumulative producer intake closure","description":"Private authenticated internal-service mutation. Request/reply limits are 4096/12288 bytes. Caller supplies only a fresh correlation nonce and the original complete physical owner, with a catalog route fence. The leader independently checks current ownership, term, membership and durable protocol-46 activation before one closure proposal. Receipt is accepted proposal identity, not confirmation of commitment. Outcome is a fresh ReadIndex-qualified current closure observation at or beyond that index, not an original command or row-transaction outcome. Lost confirmation preserves any valid receipt; never blindly retry this RPC. Recover state through source-producers/observe-v1. Cumulative intake closure is not old-transaction drainage, source checkpoint acknowledgement, all-owner fencing or first-strict activation.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"group_id","in":"path","required":true,"schema":{"type":"integer","format":"uint64","minimum":1}},{"name":"table_name","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":1024}},{"name":"X-Antfly-Catalog-Route-Fence","in":"header","required":true,"description":"Immutable catalog route fence. Receiver independently validates current metadata/table incarnation, group and physical generation; the supplied source_owner must match.","schema":{"type":"string","minLength":1,"maxLength":16384}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceProducerCloseRequest"}}}},"responses":{"200":{"description":"Request-correlated accepted position and optional qualified current state. Null outcome remains unknown. A positive closure state does not certify original proposal commitment or drainage.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceProducerCloseReply"}}}},"400":{"description":"Malformed command, owner, route fence or read request.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid internal service authority.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Principal is not an internal service.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Original owner, source binding, receipt profile or complete scope command conflicts, or retained history requires resynchronization.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 8 KiB.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt evidence or malformed internal response; no partial bytes are returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"501":{"description":"Serving profile or applying members cannot support the native source-plan contract.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Leader, routing, deadline, quorum or storage admission unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /groups/{group_id}/tables/{table_name}/source-producers/observe-v1:
+    {"post":{"tags":["source-producer-recovery"],"operationId":"observeNativeSourceProducerClosure","summary":"Read physical producer intake closure at a qualified native cut","description":"Private read-only internal-service RPC. Request JSON is bounded to 4096 bytes and reply to 8192 bytes. Requires the full original physical owner and current catalog route fence. The owner independently captures and revalidates leader ReadIndex, catalog/table incarnation, namespace and root generation around the native snapshot. Returns actual apply cut and optional immutable first closure cut. Absence is not a transaction outcome or replay grant; closure is not a drainage certificate, source acknowledgement, all-owner fence or first-strict activation. No document batch or mutation is submitted.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"group_id","in":"path","required":true,"schema":{"type":"integer","format":"uint64","minimum":1}},{"name":"table_name","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":1024}},{"name":"X-Antfly-Catalog-Route-Fence","in":"header","required":true,"description":"Immutable catalog route fence. Receiver independently validates current metadata/table incarnation, group and physical generation; the supplied source_owner must match.","schema":{"type":"string","minLength":1,"maxLength":16384}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceProducerClosureQuery"}}}},"responses":{"200":{"description":"Qualified bounded state observation, not confirmation of an original mutation. Validate the owner, minimum actual apply cut and immutable closure basis.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceProducerClosureObservation"}}}},"400":{"description":"Malformed command, owner, route fence or read request.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid internal service authority.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Principal is not an internal service.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Original owner, source binding, receipt profile or complete scope command conflicts, or retained history requires resynchronization.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 8 KiB.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt evidence or malformed internal response; no partial bytes are returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"501":{"description":"Serving profile or applying members cannot support the native source-plan contract.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Leader, routing, deadline, quorum or storage admission unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /groups/{group_id}/tables/{table_name}/source-scope/observe-v1:
+    {"post":{"tags":["source-scope-recovery"],"operationId":"observeNativeSourceScope","summary":"Read bounded source scope state at a qualified native cut","description":"Private read-only recovery, bounded to 8 KiB request JSON and 8 KiB reply. Requires an internal service principal, current catalog route fence and the complete original physical owner. Establish and revalidate leader ReadIndex and physical owner; actual apply cut, registry header and domain record are read from one native snapshot. Scope absence proves no transaction outcome, legacy worker drainage, global fencing or replay authority. Closed scopes retain their first actual close cut and root metadata floors survive domain cleanup.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"group_id","in":"path","required":true,"schema":{"type":"integer","format":"uint64","minimum":1}},{"name":"table_name","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":1024}},{"name":"X-Antfly-Catalog-Route-Fence","in":"header","required":true,"description":"Immutable catalog route fence. Receiver independently validates current metadata/table incarnation, group and physical generation; the supplied source_owner must match.","schema":{"type":"string","minLength":1,"maxLength":16384}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceScopeQuery"}}}},"responses":{"200":{"description":"Bounded typed response; validate request binding and evidence before advancing progress.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceScopeObservation"}}}},"400":{"description":"Malformed command, owner, route fence or read request.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid internal service authority.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Principal is not an internal service.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Original owner, source binding, receipt profile or complete scope command conflicts, or retained history requires resynchronization.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 8 KiB.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt evidence or malformed internal response; no partial bytes are returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"501":{"description":"Serving profile or applying members cannot support the native source-plan contract.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Leader, routing, deadline, quorum or storage admission unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /groups/{group_id}/tables/{table_name}/source-checkpoint/observe-v1:
+    {"post":{"tags":["source-checkpoint-recovery"],"operationId":"observeNativeSourceCheckpoint","summary":"Read bounded retained source checkpoint receipts at a qualified native cut","description":"Private read-only recovery, bounded to 16 KiB request JSON and 8 KiB reply. Requires an internal service principal, current catalog route fence and the complete original checkpoint owner. Establish and revalidate leader ReadIndex and physical owner; head and retained receipt are read from one native snapshot. A receipt proves only local checkpoint commitment, not complete participant publication, source acknowledgment or cleanup authority. Absent evidence is unproven and never permits mutation replay or replan. Expired receipt windows require explicit resynchronization.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"group_id","in":"path","required":true,"schema":{"type":"integer","format":"uint64","minimum":1}},{"name":"table_name","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":1024}},{"name":"X-Antfly-Catalog-Route-Fence","in":"header","required":true,"description":"Immutable catalog route fence. Receiver independently validates current metadata/table incarnation, group and physical generation; the supplied source_owner must match.","schema":{"type":"string","minLength":1,"maxLength":16384}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceCheckpointReadRequest"}}}},"responses":{"200":{"description":"Bounded typed response; validate request binding and evidence before advancing progress.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourceCheckpointReadReply"}}}},"400":{"description":"Malformed command, owner, route fence or read request.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid internal service authority.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Principal is not an internal service.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Original owner, source binding, receipt profile or complete checkpoint command conflicts, or retained history requires resynchronization.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 16 KiB.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt evidence or malformed internal response; no partial bytes are returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"501":{"description":"Serving profile or applying members cannot support the native source-plan contract.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Leader, routing, deadline, quorum or storage admission unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /groups/{group_id}/tables/{table_name}/source-plan/observe-v1:
+    {"post":{"tags":["source-plan-staging"],"operationId":"observeNativeSourcePlan","summary":"Observe root quota and frozen upload status","description":"Trusted node-to-node operation, bounded to 2 MiB request JSON. Requires an internal service principal and an independently validated immutable catalog route fence. Establish and revalidate the original owner under a leader ReadIndex. Quota, status and actual native cut come from one snapshot. Evidence must bind the exact root/spec and requested minimum cut; unsealed presence cannot certify sealed input.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"group_id","in":"path","required":true,"schema":{"type":"integer","format":"uint64","minimum":1}},{"name":"table_name","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":1024}},{"name":"X-Antfly-Catalog-Route-Fence","in":"header","required":true,"description":"Immutable catalog route fence. Receiver independently validates current metadata/table incarnation, group and physical generation; the supplied source_owner must match.","schema":{"type":"string","minLength":1,"maxLength":16384}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourcePlanObserveRequest"}}}},"responses":{"200":{"description":"Bounded typed response; validate request binding and evidence before advancing progress.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourcePlanObservationReply"}}}},"400":{"description":"Malformed command, owner, route fence or read request.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid internal service authority.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Principal is not an internal service.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Original owner, upload or receipt conflicts, or input was fenced/reclaimed.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 2 MiB.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt evidence or malformed internal response; no partial bytes are returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"501":{"description":"Serving profile or applying members cannot support the native source-plan contract.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Leader, routing, deadline, quorum or storage admission unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /groups/{group_id}/tables/{table_name}/source-plan/chunk-v1:
+    {"post":{"tags":["source-plan-staging"],"operationId":"readNativeSourcePlanChunk","summary":"Read one authenticated sealed source-plan chunk","description":"Trusted node-to-node operation, bounded to 2 MiB request JSON. Requires an internal service principal and an independently validated immutable catalog route fence. Read at most 1 MiB of sealed input under the same qualified owner/cut as its status. Return no bytes for fenced or reclaimed work. Decoder validates the request digest, seal, exact decoded size and ordinal hash. These private positions are not public feed cursors or PostgreSQL LSNs.","security":[{"InternalServicePrincipal":[]}],"parameters":[{"name":"group_id","in":"path","required":true,"schema":{"type":"integer","format":"uint64","minimum":1}},{"name":"table_name","in":"path","required":true,"schema":{"type":"string","minLength":1,"maxLength":1024}},{"name":"X-Antfly-Catalog-Route-Fence","in":"header","required":true,"description":"Immutable catalog route fence. Receiver independently validates current metadata/table incarnation, group and physical generation; the supplied source_owner must match.","schema":{"type":"string","minLength":1,"maxLength":16384}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourcePlanChunkRequest"}}}},"responses":{"200":{"description":"Bounded typed response; validate request binding and evidence before advancing progress.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/NativeSourcePlanChunkReply"}}}},"400":{"description":"Malformed command, owner, route fence or read request.","content":{"text/plain":{"schema":{"type":"string"}}}},"401":{"description":"Missing or invalid internal service authority.","content":{"text/plain":{"schema":{"type":"string"}}}},"403":{"description":"Principal is not an internal service.","content":{"text/plain":{"schema":{"type":"string"}}}},"409":{"description":"Original owner, upload or receipt conflicts, or input was fenced/reclaimed.","content":{"text/plain":{"schema":{"type":"string"}}}},"413":{"description":"Request exceeds 2 MiB.","content":{"text/plain":{"schema":{"type":"string"}}}},"500":{"description":"Corrupt evidence or malformed internal response; no partial bytes are returned.","content":{"text/plain":{"schema":{"type":"string"}}}},"501":{"description":"Serving profile or applying members cannot support the native source-plan contract.","content":{"text/plain":{"schema":{"type":"string"}}}},"503":{"description":"Leader, routing, deadline, quorum or storage admission unavailable.","content":{"text/plain":{"schema":{"type":"string"}}}}}}}
+  /catalog/changefeed-state-v1:
+    post:
+      tags: [retained-history]
+      operationId: accessInternalChangefeedState
+      summary: Read or mutate durable private changefeed ownership state
+      description: |
+        Signed service-only metadata capability, including during migration.
+        Never expose this operation as a public feed API. Reads and authority
+        discovery establish a linearizable metadata barrier. Mutations preserve
+        the state machine's revision, owner epoch and authority fences and are
+        attempted at most once. An uncertain response cannot certify non-commit;
+        reconcile by reading durable state before making another decision.
+        The routing remaining-time header carries one shared relative budget.
+        Bodies are limited to 50335744 bytes to accommodate JSON escaping of an
+        encoded state or write of at most 8388608 bytes. Unknown fields, mixed
+        action fields and unsupported wire versions are rejected before dispatch.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - in: header
+          name: X-Antfly-Routing-Remaining-Ms
+          required: true
+          schema: {type: integer, minimum: 1, maximum: 5000}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InternalChangefeedStateRequest'}
+      responses:
+        '200':
+          description: Action-bound result; a mutation reply confirms durable success
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/InternalChangefeedStateReply'}
+        '400': {description: Invalid bounded request}
+        '403': {description: Authenticated service required}
+        '409': {description: Known revision or authority conflict}
+        '413': {description: Request exceeds wire bounds}
+        '503':
+          description: Unavailable or uncertain mutation; inspect the outcome header
+          headers:
+            X-Antfly-Raft-Mutation-Outcome:
+              schema: {type: string, enum: [not-proposed-v1, not-applied-v1, unknown-v1, committed-v1]}
+        '504': {description: Shared deadline exhausted; mutation may have committed}
+  /groups/{group_id}/tables/{table_name}/history/decision-v1:
+    post:
+      tags: [retained-history]
+      operationId: readNativeHistoryCoordinatorDecision
+      summary: Read the retained coordinator decision and original participant admission
+      description: |
+        Signed service-only read, including during legacy migration. Reads the
+        coordinator record and retained admission v3 from one native snapshot
+        after ReadIndex, under the complete original physical owner and catalog
+        route fence. Validates the owner and quorum before and after the read.
+        The reply binds the request and actual persisted native cut and owns all
+        retained original participant identities. A null decision is unproven
+        absence; pending and aborted records cannot yield a committed manifest.
+        The read cannot authorize replay, presume-abort, checkpoint advancement
+        or retention release. One original relative deadline bounds all work.
+        Requests are limited to 4096 bytes and replies to 16781312 bytes.
+        Membership and record metadata are private service information.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 16384}
+        - name: X-Antfly-Catalog-Route-Deadline-Ms
+          in: header
+          required: true
+          schema: {type: integer, minimum: 1, maximum: 5000}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryDecisionRequest'}
+      responses:
+        '200':
+          description: Request-bound coordinator record, original admission and actual native cut.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionReply'}
+        '400':
+          description: Invalid request or catalog fence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionError'}
+        '401':
+          description: Missing or invalid signed service authority.
+        '403':
+          description: Internal service authority required.
+        '409':
+          description: Retention scope or topology conflicts; inspect the typed code.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionError'}
+        '413':
+          description: Request exceeds the 4096 byte admission limit.
+        '500':
+          description: Corrupt history or internal owner failure.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionError'}
+        '501':
+          description: Unsupported native owner profile.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionError'}
+        '503':
+          description: Leader, routing, deadline or storage admission is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionError'}
+  /groups/{group_id}/tables/{table_name}/history/owner-v1:
+    post:
+      tags: [retained-history]
+      operationId: captureNativeHistoryOwner
+      summary: Qualify the current native history participant owner
+      description: |
+        Signed service-only bounded read, including during legacy migration.
+        Captures the current participant owner under the original catalog route
+        fence and expected table binding, establishes ReadIndex, and qualifies
+        retained committed history at an actual positive persisted native cut.
+        Validates owner and catalog identity before and after the read. The
+        observation binds the returned owner and minimum applied index of one.
+        Qualification does not reserve retention, vote, accept a transaction,
+        advance a source checkpoint, or authorize replay. One shared routing
+        deadline bounds all work. Request and response are limited to 4096 bytes.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 16384}
+        - name: X-Antfly-Catalog-Route-Deadline-Ms
+          in: header
+          required: true
+          schema: {type: integer, minimum: 1, maximum: 5000}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryOwnerRequest'}
+      responses:
+        '200':
+          description: Qualified current owner and request-bound actual native storage cut.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryOwnerReply'}
+        '400':
+          description: Invalid request or catalog fence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '401':
+          description: Missing or invalid signed service authority.
+        '403':
+          description: Internal service authority required.
+        '409':
+          description: Retention scope or topology conflicts; inspect the typed code.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '413':
+          description: Request exceeds the 4096 byte admission limit.
+        '500':
+          description: Corrupt history or internal owner failure.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '501':
+          description: Unsupported native owner profile.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '503':
+          description: Leader, routing, deadline or storage admission is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+  /groups/{group_id}/tables/{table_name}/history/publication-v1:
+    post:
+      tags: [retained-history]
+      operationId: readNativeTransactionCompletionPublication
+      summary: Read retained complete-certificate publication at its original owner
+      description: |
+        Signed service-only read, including during legacy migration. Requires the
+        complete original owner context, an immutable catalog route fence and one
+        shared relative routing budget. The serving owner establishes ReadIndex
+        and validates frozen owner/catalog identity before and after the native
+        snapshot read. Replies bind the exact logical request and actual persisted
+        cut, and retain the certificate's immutable first publication position.
+        A null publication is unproven absence and cannot authorize effect replay,
+        checkpoint advancement or retention release. This read does not mutate
+        publication, consumer state or the applied marker. Both bodies are bounded
+        to 4096 bytes. Independent GC still requires its retention authorization.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 16384}
+        - name: X-Antfly-Catalog-Route-Deadline-Ms
+          in: header
+          required: true
+          schema: {type: integer, minimum: 1, maximum: 5000}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryPublicationRequest'}
+      responses:
+        '200':
+          description: Request-bound local resolution and actual storage cut; null is unproven absence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationReply'}
+        '400':
+          description: Invalid request or catalog fence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '401':
+          description: Missing or invalid signed service authority.
+        '403':
+          description: Internal service authority required.
+        '409':
+          description: Retention scope or topology conflicts; inspect the typed code.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '413':
+          description: Request exceeds the 4096 byte admission limit.
+        '500':
+          description: Corrupt receipt or internal owner failure.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '501':
+          description: Unsupported native owner profile.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '503':
+          description: Leader, routing, deadline or storage admission is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+  /groups/{group_id}/tables/{table_name}/history/resolution-v1:
+    post:
+      tags: [retained-history]
+      operationId: readNativeTransactionCompletionResolution
+      summary: Read an immutable participant completion receipt at a qualified cut
+      description: |
+        Signed service-only read, including during legacy migration. Requires an
+        immutable catalog route fence and one shared relative routing budget.
+        The owner establishes a current leader ReadIndex and validates frozen
+        owner and catalog identity before and after reading the receipt and
+        persisted applied cut in one storage snapshot. Replies bind the exact
+        logical request, retaining the actual observed cut. The original owner
+        fence identifies the frozen transaction participant, not today's leader.
+        A null resolution is unproven absence, never a zero-effect certificate
+        or permission to replay an uncertain mutation. A positive resolution
+        authenticates local effects or positive no-effect evidence; it does not
+        certify global completion without every frozen manifest participant.
+        HTTP accepts only raft authority, a positive minimum_applied_index and
+        minimum_native_sequence zero. Both bodies are limited to 4096 bytes.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 16384}
+        - name: X-Antfly-Catalog-Route-Deadline-Ms
+          in: header
+          required: true
+          schema: {type: integer, minimum: 1, maximum: 5000}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryResolutionRequest'}
+      responses:
+        '200':
+          description: Request-bound local resolution and actual storage cut; null is unproven absence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionReply'}
+        '400':
+          description: Invalid request or catalog fence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionError'}
+        '401':
+          description: Missing or invalid signed service authority.
+        '403':
+          description: Internal service authority required.
+        '409':
+          description: Retention scope or topology conflicts; inspect the typed code.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionError'}
+        '413':
+          description: Request exceeds the 4096 byte admission limit.
+        '500':
+          description: Corrupt receipt or internal owner failure.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionError'}
+        '501':
+          description: Unsupported native owner profile.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionError'}
+        '503':
+          description: Leader, routing, deadline or storage admission is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionError'}
+  /groups/{group_id}/tables/{table_name}/history/grant-v1:
+    post:
+      tags: [retained-history]
+      operationId: observeNativeRetainedHistoryGrant
+      summary: Observe retained consumer admission without proposing a command
+      description: |
+        Signed service-only read, including during legacy migration. Requires an
+        immutable catalog route fence. The owner establishes a current leader
+        ReadIndex and validates its frozen owner/route before and after reading.
+        Returns actual authority/floor/lease state at that cut without binding,
+        enrollment, renewal, ACK, collection or receipt mutation. Unbound/absent
+        are observations, not reservations or proof that an in-flight command
+        can never commit. An observation is never a command receipt or ACK grant.
+        Responses bind the exact identity to the private raft read contract
+        (wire version 1, raft authority, minimum applied index 1); the receiver
+        internally requires the stronger current ReadIndex cut.
+        Request and response bodies are each limited to 4096 bytes.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 16384}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryGrantRequest'}
+      responses:
+        '200':
+          description: Request-bound current grant observation, never a mutation confirmation.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantReply'}
+        '400':
+          description: Invalid request or catalog fence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantError'}
+        '401':
+          description: Missing or invalid signed service authority.
+        '403':
+          description: Internal service authority required.
+        '409':
+          description: Retention scope, consumer policy or topology conflicts; inspect the typed code.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantError'}
+        '413':
+          description: Request exceeds the 4096 byte admission limit.
+        '500':
+          description: Corrupt observation or internal owner failure.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantError'}
+        '501':
+          description: Unsupported native owner profile.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantError'}
+        '503':
+          description: Leader, routing, deadline or storage admission is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantError'}
+  /groups/{group_id}/tables/{table_name}/history/page-v1:
+    post:
+      tags: [retained-history]
+      operationId: readNativeRetainedHistoryPage
+      summary: Read one bounded retained native frame page
+      description: |
+        Trusted node-to-node read, requiring signed service authority even in
+        legacy migration mode and an immutable catalog route fence. The owner
+        obtains ReadIndex and validates the current leader and route before and
+        after reading the native history transaction. This operation neither
+        acknowledges history nor certifies a distributed transaction's outcome.
+        Binary HPG1 binds namespace, consumer/grant, position, timestamp and all
+        page budgets to the response metadata and historical tuple images.
+        The response is at most 96 + request.max_bytes bytes. A page never
+        substitutes current rows for retained before/after images. These private
+        positions are not public changefeed cursors or PostgreSQL LSNs.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 16384}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryPageRequest'}
+      responses:
+        '200':
+          description: Request-bound HPG1 binary page; returning a page never advances retention.
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '400':
+          description: Invalid request, bounds or catalog fence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
+        '401':
+          description: Missing or invalid service authority.
+        '403':
+          description: The authenticated principal is not an internal service.
+        '409':
+          description: Topology changed or the retained scope requires resynchronization; inspect the typed code.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
+        '413':
+          description: Request exceeds the 4096 byte admission limit.
+        '422':
+          description: The next retained event requires a larger explicit page budget.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
+        '500':
+          description: Corrupt retained page or an unclassified owner failure; never return partial rows.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
+        '501':
+          description: Unsupported native owner profile.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
+        '503':
+          description: Leader, routing, deadline or storage admission is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
+  /groups/{group_id}/tables/{table_name}/history/control-v1:
+    post:
+      tags: [retained-history]
+      operationId: controlNativeRetainedHistory
+      summary: Submit a native retention control or recover its exact result
+      description: |
+        Trusted node-to-node operation, bounded to 4096 request and response bytes.
+        Requires a service principal and an immutable catalog route fence. Submit
+        and recovery are distinct; recovery never proposes the command again.
+        A 200 response is not permission to ACK: null or superseded outcomes are
+        unconfirmed, and a known rejection is not a successful mutation. A lost
+        response is ambiguous and must not cause automatic re-proposal.
+        These private Raft receipts are not public feed cursors or PostgreSQL LSNs.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          description: Serialized immutable catalog route fence, including metadata and table incarnation and exact group/range identity. The receiver validates it against current authoritative routing.
+          schema: {type: string, minLength: 1, maxLength: 16384}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryControlRequest'}
+      responses:
+        '200':
+          description: Bounded typed result; inspect receipt and outcome before advancing any progress.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryControlResponse'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing or invalid internal service authority.
+        '403':
+          description: The authenticated principal is not an internal service.
+        '409':
+          description: Route, table incarnation, history scope or original receipt conflicts.
+        '413':
+          description: Request exceeds the private control byte limit.
+        '501':
+          description: This serving profile does not support native retained-history controls.
+        '503':
+          description: Leader, routing or storage admission is temporarily unavailable; admission outcome headers distinguish known not-proposed from ambiguous outcomes.
   /standby/replication/identify:
     get:
       tags: [standby-replication]
@@ -102,6 +693,12 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
 components:
+  securitySchemes:
+    InternalServicePrincipal:
+      type: apiKey
+      in: header
+      name: X-Antfly-Trusted-Principal
+      description: Deployment-scoped authenticated service-principal envelope; an ordinary user credential cannot authorize this operation.
   responses:
     BadRequest:
       description: Invalid internal replication request.
@@ -122,6 +719,918 @@ components:
           schema:
             type: string
   schemas:
+    NativeSourcePlanRoot:
+      {"type":"object","additionalProperties":false,"properties":{"authority":{"type":"string","enum":["raft"]},"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"generation":{"type":"integer","format":"uint64","minimum":0},"fence":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["authority","namespace","generation","fence"],"description":"Exact physical root. Fence is the canonical digest of the original routed source_owner; a supplied digest establishes no authority by itself. Generation zero is valid."}
+    NativeSourceCheckpointAuthority:
+      {"type":"object","additionalProperties":false,"description":"Durable source-journal checkpoint authority, metadata protocol 103. Bind before the first source reservation; later batches reuse this full owner independently of row routing. Retirement proof must be supplied by qualified native fencing before reseeding; this record alone does not create or migrate a storage authority.","properties":{"binding":{"$ref":"#/components/schemas/NativeHistoryDigest"},"table_name":{"type":"string","minLength":1,"maxLength":255},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"retirement":{"allOf":[{"$ref":"#/components/schemas/NativeHistoryDigest"}],"nullable":true}},"required":["binding","table_name","owner"]}
+    NativeSourceMetadataCaptureQuery:
+      {"type":"object","additionalProperties":false,"description":"Exact native source actor and metadata incarnation. The service must establish ReadIndex and capture at an actual applied index at or beyond the requested minimum.","properties":{"metadata_group_id":{"type":"integer","format":"uint64","minimum":1},"metadata_incarnation":{"type":"array","minItems":32,"maxItems":32,"items":{"type":"integer","minimum":0,"maximum":255}},"actor_table_id":{"type":"integer","format":"uint64","minimum":1},"source_id":{"$ref":"#/components/schemas/NativeHistoryDigest"},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1}},"required":["metadata_group_id","metadata_incarnation","actor_table_id","source_id","minimum_applied_index"]}
+    NativeSourceMetadataCaptureRequest:
+      {"type":"object","additionalProperties":false,"description":"Private read-only metadata capture. Requires an independently authenticated internal service and shared routing budget.","properties":{"version":{"type":"integer","enum":[1]},"query":{"$ref":"#/components/schemas/NativeSourceMetadataCaptureQuery"}},"required":["version","query"]}
+    NativeSourceMetadataCapturePending:
+      {"type":"object","additionalProperties":false,"description":"Retained original pending identity. Metadata delivery-plan digest and frozen artifact-plan digest are distinct; neither grants transaction outcome or replay authority.","properties":{"reference":{"$ref":"#/components/schemas/NativeSourceScopeReference"},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"purpose":{"$ref":"#/components/schemas/NativeHistoryDigest"},"reservation":{"$ref":"#/components/schemas/NativeHistoryDigest"},"plan_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"artifact_plan_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["reference","transaction_id","purpose","reservation","plan_digest","artifact_plan_digest"]}
+    NativeSourceMetadataCaptureSnapshot:
+      {"type":"object","additionalProperties":false,"description":"One actual applied metadata snapshot. Binding uses active/live definition; close uses closing or retired; drop uses retired. The trusted destination must independently obtain this capture, compare its exact binding and qualify its own physical root. These bytes alone certify no physical fencing, global outcome or legacy-worker drainage.","properties":{"cut":{"$ref":"#/components/schemas/NativeSourceScopeMetadataCut"},"spec":{"$ref":"#/components/schemas/NativeSourceScopeSpec"},"phase":{"type":"string","enum":["active","closing","retired"]},"actor_revision":{"type":"integer","format":"uint64","minimum":1},"live_definition":{"type":"boolean"},"checkpoint_table":{"type":"string","minLength":1,"maxLength":255},"pending":{"allOf":[{"$ref":"#/components/schemas/NativeSourceMetadataCapturePending"}],"nullable":true}},"required":["cut","spec","phase","actor_revision","live_definition","checkpoint_table"]}
+    NativeSourceMetadataCaptureReply:
+      {"type":"object","additionalProperties":false,"description":"Correlated read-only reply, bounded to 8 KiB. The service revalidates metadata identity before returning and the client withholds inconsistent or cancelled replies.","properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"snapshot":{"$ref":"#/components/schemas/NativeSourceMetadataCaptureSnapshot"}},"required":["version","request_digest","snapshot"]}
+    NativeSourceScopeBasis:
+      {"type":"object","additionalProperties":false,"description":"Immutable physical owner basis; schema/topology leases are qualified separately. All metadata indices in a registry share this metadata group/incarnation.","properties":{"metadata_group_id":{"type":"integer","format":"uint64","minimum":1},"metadata_incarnation":{"type":"array","minItems":32,"maxItems":32,"items":{"type":"integer","minimum":0,"maximum":255}},"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"root_generation":{"type":"integer","format":"uint64","minimum":0},"group_id":{"type":"integer","format":"uint64","minimum":1}},"required":["metadata_group_id","metadata_incarnation","namespace","root_generation","group_id"]}
+    NativeSourceScopeSpec:
+      {"type":"object","additionalProperties":false,"description":"Private protocol-39 source scope registration. Domain derives from actor_table_id/source_id and stays stable across generations. Binding authenticates one immutable source configuration. A source may target roots different from its actor table or checkpoint authority.","properties":{"actor_table_id":{"type":"integer","format":"uint64","minimum":1},"source_id":{"$ref":"#/components/schemas/NativeHistoryDigest"},"generation":{"type":"integer","format":"uint64","minimum":1},"binding":{"$ref":"#/components/schemas/NativeHistoryDigest"},"checkpoint_owner":{"$ref":"#/components/schemas/NativeSourceScopeBasis"}},"required":["actor_table_id","source_id","generation","binding","checkpoint_owner"]}
+    NativeSourceScopeReference:
+      {"type":"object","additionalProperties":false,"description":"Frozen protocol-39 BEGIN/PREPARE reference. Token is the positive source upload/attempt token; sequence is the logical source sequence. Native local retirement floors prevent delayed BEGIN after transaction metadata GC. A reference alone grants no authority.","properties":{"domain":{"$ref":"#/components/schemas/NativeHistoryDigest"},"binding":{"$ref":"#/components/schemas/NativeHistoryDigest"},"generation":{"type":"integer","format":"uint64","minimum":1},"token":{"type":"integer","format":"uint64","minimum":1},"sequence":{"type":"integer","format":"uint64","minimum":1}},"required":["domain","binding","generation","token","sequence"]}
+    NativeSourceScopeMetadataCut:
+      {"type":"object","additionalProperties":false,"description":"Qualified metadata actor/configuration cut, not a caller-supplied lease. The trusted control owner must independently capture active/closing/retired actor state at this same cut. Native monotonic floors reject stale bind after cleanup.","properties":{"group_id":{"type":"integer","format":"uint64","minimum":1},"incarnation":{"type":"array","minItems":32,"maxItems":32,"items":{"type":"integer","minimum":0,"maximum":255}},"index":{"type":"integer","format":"uint64","minimum":1}},"required":["group_id","incarnation","index"]}
+    NativeSourceScopeAction:
+      {"oneOf":[{"type":"object","additionalProperties":false,"properties":{"bind":{"type":"object","additionalProperties":false,"properties":{},"required":[]}},"required":["bind"]},{"type":"object","additionalProperties":false,"properties":{"close":{"type":"object","additionalProperties":false,"properties":{},"required":[]}},"required":["close"]},{"type":"object","additionalProperties":false,"properties":{"drop":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"}},"required":["drop"]}]}
+    NativeSourceScopeControlIntent:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"spec":{"$ref":"#/components/schemas/NativeSourceScopeSpec"},"minimum_metadata_index":{"type":"integer","format":"uint64","minimum":1},"action":{"$ref":"#/components/schemas/NativeSourceScopeAction"}},"required":["version","owner","spec","minimum_metadata_index","action"],"description":"Private scope lifecycle intent. The control owner independently reads metadata at or beyond the minimum index, verifies the exact binding and active/closing/retired actor phase, and qualifies the physical destination owner. No caller-supplied lifecycle state or drain flag grants authority."}
+    NativeSourceScopeControlCommand:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"intent":{"$ref":"#/components/schemas/NativeSourceScopeControlIntent"},"metadata_cut":{"$ref":"#/components/schemas/NativeSourceScopeMetadataCut"}},"required":["version","intent","metadata_cut"],"description":"Trusted ordered command constructed from an independently qualified metadata read. Never accepted as new-write HTTP authorization. Read-only receipt recovery may carry its exact original command. Scope mutation and the actual apply marker commit atomically. First strict admission also requires independently verified legacy worker handover and transaction drainage."}
+    NativeLegacyInventoryItem:
+      {"type":"object","additionalProperties":false,"properties":{"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"record_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"status":{"type":"string","enum":["pending","committed","aborted"]},"prepared":{"type":"boolean"},"prepared_known":{"type":"boolean"},"coordinator":{"type":"boolean"},"coordinator_known":{"type":"boolean"},"intents_resolved":{"type":"boolean"},"intents_resolved_known":{"type":"boolean"}},"required":["transaction_id","record_digest","status","prepared","prepared_known","coordinator","coordinator_known","intents_resolved","intents_resolved_known"]}
+    NativeLegacyInventoryQuery:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"after":{"allOf":[{"$ref":"#/components/schemas/NativeHistoryConsumerId"}],"nullable":true},"max_records":{"type":"integer","minimum":1,"maximum":256},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1}},"required":["version","owner","after","max_records","minimum_applied_index"]}
+    NativeLegacyInventoryPage:
+      {"type":"object","additionalProperties":false,"properties":{"closure":{"$ref":"#/components/schemas/NativeSourceProducerClosureState"},"items":{"type":"array","maxItems":256,"items":{"$ref":"#/components/schemas/NativeLegacyInventoryItem"}},"scanned_records":{"type":"integer","minimum":0,"maximum":256},"next_after":{"allOf":[{"$ref":"#/components/schemas/NativeHistoryConsumerId"}],"nullable":true},"reached_end":{"type":"boolean"}},"required":["closure","items","scanned_records","next_after","reached_end"]}
+    NativeLegacyInventoryObservation:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"cut":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"page":{"$ref":"#/components/schemas/NativeLegacyInventoryPage"}},"required":["version","owner","cut","page"]}
+    NativeLegacyInventoryRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"query":{"$ref":"#/components/schemas/NativeLegacyInventoryQuery"}},"required":["version","request_id","query"]}
+    NativeLegacyInventoryReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"observation":{"$ref":"#/components/schemas/NativeLegacyInventoryObservation"}},"required":["version","request_digest","observation"]}
+    NativeLegacyTerminalProof:
+      {"type":"object","additionalProperties":false,"properties":{"root":{"$ref":"#/components/schemas/NativeSourceScopeBasis"},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"record_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["root","transaction_id","record_digest"],"description":"Exact original terminal record binding; no chosen outcome or drain claim."}
+    NativeLegacyTerminalCommand:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"proof":{"$ref":"#/components/schemas/NativeLegacyTerminalProof"}},"required":["version","owner","proof"],"description":"Trusted native recovery derives the original decision/version from the matching durable terminal record. It never decides pending work."}
+    NativeLegacyTerminalDecision:
+      {"type":"object","additionalProperties":false,"properties":{"kind":{"type":"string","enum":["committed","aborted"]},"timestamp":{"type":"integer","format":"uint64","minimum":1}},"required":["kind","timestamp"],"description":"Original commit version or ABORT finalization timestamp; not a new commit clock or PostgreSQL LSN."}
+    NativeLegacyTerminalOutcome:
+      {"oneOf":[{"type":"object","additionalProperties":false,"properties":{"applied":{"$ref":"#/components/schemas/NativeLegacyTerminalDecision"}},"required":["applied"]},{"type":"object","additionalProperties":false,"properties":{"rejected":{"type":"string","enum":["invalid","pending","unresolved","conflict","not_found","scope_changed"]}},"required":["rejected"]},{"type":"object","additionalProperties":false,"properties":{"superseded":{"type":"object","additionalProperties":false}},"required":["superseded"]}],"description":"One bounded checksummed exact-command receipt per root, atomically retained with effects or deterministic rejection and actual marker. Supersession confirms neither success nor failure."}
+    NativeLegacyTerminalObservation:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"command_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"entry":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"cut":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"outcome":{"$ref":"#/components/schemas/NativeLegacyTerminalOutcome"}},"required":["version","owner","command_digest","entry","cut","outcome"],"description":"Fresh ownership/ReadIndex qualified observation. Native closure, receipt and actual cut come from one snapshot."}
+    NativeLegacyTerminalRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"operation":{"type":"string","enum":["submit","recover"]},"request_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"command":{"$ref":"#/components/schemas/NativeLegacyTerminalCommand"},"receipt":{"allOf":[{"$ref":"#/components/schemas/NativeHistoryPublicationCut"}],"nullable":true},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":0}},"required":["version","operation","request_id","owner","command","receipt","minimum_applied_index"],"description":"Submit: null receipt and zero minimum. Recover: exact accepted receipt and minimum at least its index. Nonzero request_id is correlation only, never retry permission. Owner must equal command.owner."}
+    NativeLegacyTerminalReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"receipt":{"allOf":[{"$ref":"#/components/schemas/NativeHistoryPublicationCut"}],"nullable":true},"outcome":{"allOf":[{"$ref":"#/components/schemas/NativeLegacyTerminalObservation"}],"nullable":true}},"required":["version","request_digest","receipt","outcome"],"description":"Full-request correlation. Recovery always preserves its original accepted entry. Valid accepted positions survive unknown confirmation; absent or superseded outcomes authorize no mutation replay or source ACK."}
+    NativeSourceProducerCloseRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_id":{"type":"array","minItems":16,"maxItems":16,"items":{"type":"integer","minimum":0,"maximum":255},"description":"Fresh nonzero per-attempt correlation nonce; never a transaction identity or retry authorization."},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"}},"required":["version","request_id","owner"]}
+    NativeSourceProducerCloseReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"receipt":{"allOf":[{"$ref":"#/components/schemas/NativeHistoryPublicationCut"}],"nullable":true,"description":"Accepted proposal term/index only; it may remain uncommitted or be overwritten."},"outcome":{"allOf":[{"$ref":"#/components/schemas/NativeSourceProducerClosureObservation"}],"nullable":true,"description":"Qualified current closure state at or beyond the accepted index. Not an original command outcome, source ACK or drainage certificate."}},"required":["version","request_digest","receipt","outcome"]}
+    NativeSourceProducerClosureQuery:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1}},"required":["version","owner","minimum_applied_index"],"description":"Read-only physical producer-intake closure query. Requires current catalog ownership and leader ReadIndex; a nonzero minimum is a read bound, never an acknowledgement."}
+    NativeSourceProducerClosureState:
+      {"type":"object","additionalProperties":false,"description":"Immutable cumulative intake closure for one original physical root. This cut proves no old transaction drainage, global source ACK, or first-strict activation.","properties":{"version":{"type":"integer","enum":[1]},"root":{"$ref":"#/components/schemas/NativeSourceScopeBasis"},"first_closed_at":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"}},"required":["version","root","first_closed_at"]}
+    NativeSourceProducerClosureObservation:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"cut":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"closure":{"allOf":[{"$ref":"#/components/schemas/NativeSourceProducerClosureState"}],"nullable":true}},"required":["version","owner","cut","closure"],"description":"One native snapshot of actual applied cut and optional producer intake closure. Absence grants no transaction outcome, replay, drainage or source activation authority. Validate the complete owner and minimum cut; source/checkpoint/feed/LSN positions remain distinct."}
+    NativeSourceScopeQuery:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"domain":{"$ref":"#/components/schemas/NativeHistoryDigest"},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1}},"required":["version","owner","domain","minimum_applied_index"],"description":"ReadIndex-qualified physical-root scope observation. Absence is not an outcome or replay grant."}
+    NativeSourceScopeHeader:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"root":{"$ref":"#/components/schemas/NativeSourceScopeBasis"},"metadata_floor":{"type":"integer","format":"uint64","minimum":0},"domains":{"type":"integer","format":"uint16","minimum":0,"maximum":1024},"strict":{"type":"boolean"}},"required":["version","root","metadata_floor","domains","strict"],"description":"Bounded physical-root registry. The monotonic metadata floor and strict admission survive deletion of the last domain; no unbounded generation tombstones are retained."}
+    NativeSourceScopeSlot:
+      {"type":"object","additionalProperties":false,"properties":{"reference":{"$ref":"#/components/schemas/NativeSourceScopeReference"},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"source_purpose":{"$ref":"#/components/schemas/NativeHistoryDigest"},"admission_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["reference","transaction_id","source_purpose","admission_digest"]}
+    NativeSourceScopeRecord:
+      {"type":"object","additionalProperties":false,"properties":{"spec":{"$ref":"#/components/schemas/NativeSourceScopeSpec"},"bound_metadata_index":{"type":"integer","format":"uint64","minimum":1},"phase":{"type":"string","enum":["active","closing","closed"]},"closed_through_token":{"type":"integer","format":"uint64","minimum":0},"last_committed_sequence":{"type":"integer","format":"uint64","minimum":0},"last_committed_token":{"type":"integer","format":"uint64","minimum":0},"slot":{"allOf":[{"$ref":"#/components/schemas/NativeSourceScopeSlot"}],"nullable":true},"close_metadata_index":{"type":"integer","format":"uint64","minimum":0},"closed_at":{"allOf":[{"$ref":"#/components/schemas/NativeHistoryPublicationCut"}],"nullable":true}},"required":["spec","bound_metadata_index","phase","closed_through_token","last_committed_sequence","last_committed_token","slot","close_metadata_index","closed_at"],"description":"One current generation and at most one attempt slot per source domain. Closing prevents new admission and prepares while original decisions drain. Closed records retain their first actual ordered close cut."}
+    NativeSourceScopeObservation:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"domain":{"$ref":"#/components/schemas/NativeHistoryDigest"},"cut":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"header":{"$ref":"#/components/schemas/NativeSourceScopeHeader"},"record":{"allOf":[{"$ref":"#/components/schemas/NativeSourceScopeRecord"}],"nullable":true}},"required":["version","owner","domain","cut","header","record"],"description":"One qualified physical-root snapshot. A local closure receipt does not prove all-owner fencing, global commit, publication, or safe metadata retirement."}
+    NativeSourceScopeOutcome:
+      {"oneOf":[{"type":"object","additionalProperties":false,"description":"Exact local apply observation.","properties":{"applied":{"$ref":"#/components/schemas/NativeSourceScopeObservation"}},"required":["applied"]},{"type":"object","additionalProperties":false,"description":"Deterministic rejected control. Storage corruption and transient storage failures must not be converted to this result.","properties":{"rejected":{"type":"string","enum":["invalid","scope_changed","pending","conflict","backpressure"]}},"required":["rejected"]},{"type":"object","additionalProperties":false,"description":"Receipt absent or superseded. Requires a qualified live scope observation; proves neither success nor failure and never authorizes blind replay.","properties":{"superseded":{"type":"object","additionalProperties":false}},"required":["superseded"]}],"description":"Bounded latest-control replay aid, one receipt per physical root. Persist in the same transaction as scope mutation or deterministic rejection and actual ordered apply marker. Not a global all-owner fencing certificate."}
+    NativeSourceScopeRecovery:
+      {"type":"object","additionalProperties":false,"description":"Private qualified receipt recovery. Minimum applied index must cover the original entry; the serving owner independently establishes ReadIndex and physical-root identity before reading the bounded receipt.","properties":{"command":{"$ref":"#/components/schemas/NativeSourceScopeControlCommand"},"entry":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1}},"required":["command","entry","minimum_applied_index"]}
+    NativeSourceScopeControlRequest:
+      {"type":"object","additionalProperties":false,"description":"Private lifecycle RPC contract, at most 16 KiB. A fresh nonzero request_id correlates one RPC attempt and grants no replay or transaction outcome authority. submit requires intent and null/absent recovery; the receiving leader independently captures fresh signed metadata authority. recover requires recovery and null/absent intent, and only reads the exact prior command/entry. Caller metadata cuts are never accepted as new-write authorization. First strict activation remains gated on independently proven legacy-worker handover.","properties":{"version":{"type":"integer","enum":[1]},"request_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"operation":{"type":"string","enum":["submit","recover"]},"intent":{"allOf":[{"$ref":"#/components/schemas/NativeSourceScopeControlIntent"}],"nullable":true},"recovery":{"allOf":[{"$ref":"#/components/schemas/NativeSourceScopeRecovery"}],"nullable":true}},"required":["version","request_id","operation"]}
+    NativeSourceScopeControlReply:
+      {"type":"object","additionalProperties":false,"description":"Private correlated reply, at most 24 KiB. request_digest binds the entire request including request_id and operation. An unknown submit may have null command/receipt/outcome; never replay from that state. Every known accepted entry carries both its exact freshly captured command and positive receipt, even if outcome is null. Recovery preserves its exact original command and entry; changing the metadata cut is not recovery. A superseded receipt confirms neither success nor failure. A known rejection is not an applied effect. Applied evidence must match command, action, physical owner and actual ordered cut. One root receipt proves no all-owner fencing or row transaction outcome.","properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"command":{"allOf":[{"$ref":"#/components/schemas/NativeSourceScopeControlCommand"}],"nullable":true},"receipt":{"allOf":[{"$ref":"#/components/schemas/NativeHistoryPublicationCut"}],"nullable":true},"outcome":{"allOf":[{"$ref":"#/components/schemas/NativeSourceScopeOutcome"}],"nullable":true}},"required":["version","request_digest"]}
+    NativeSourceRetirementRecovery:
+      {"type":"object","additionalProperties":false,"description":"Read-only exact retirement recovery. Minimum must cover the entry. Entire original command including coordinator read cut is immutable.","properties":{"command":{"$ref":"#/components/schemas/NativeSourceScopeAbortCommand"},"entry":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1}},"required":["command","entry","minimum_applied_index"]}
+    NativeSourceRetirementOutcome:
+      {"oneOf":[{"type":"object","additionalProperties":false,"description":"Local retirement committed with the actual apply marker.","properties":{"applied":{"$ref":"#/components/schemas/NativeSourceScopeAbortReply"}},"required":["applied"]},{"type":"object","additionalProperties":false,"description":"Definite local rejection committed with its apply marker.","properties":{"rejected":{"type":"string","enum":["invalid","scope_changed","conflict","expired","pending","backpressure"]}},"required":["rejected"]},{"type":"object","additionalProperties":false,"description":"No exact retained outcome; never infer success or failure.","properties":{"superseded":{"type":"object","additionalProperties":false}},"required":["superseded"]}]}
+    NativeSourceRetirementRequest:
+      {"type":"object","additionalProperties":false,"description":"At most 16798720 bytes. Nonzero fresh request_id. Submit requires intent and coordinator_locator with null recovery; no caller observation is accepted. Recover requires recovery with null intent/locator and is strictly read-only.","properties":{"version":{"type":"integer","enum":[1]},"request_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"operation":{"type":"string","enum":["submit","recover"]},"intent":{"allOf":[{"$ref":"#/components/schemas/NativeSourceScopeAbortIntent"}],"nullable":true},"coordinator_locator":{"type":"string","nullable":true,"minLength":1,"maxLength":1024},"recovery":{"allOf":[{"$ref":"#/components/schemas/NativeSourceRetirementRecovery"}],"nullable":true}},"required":["version","request_id","operation"]}
+    NativeSourceRetirementReply:
+      {"type":"object","additionalProperties":false,"description":"At most 16802816 bytes. Full-request SHA-256 correlation. Command may survive an ambiguous submission without known entry; outcome then must be null. Known entry requires exact command. Recovery preserves original command and entry. Unknown/superseded authorize no retry, source ACK, retention release or global outcome.","properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"command":{"allOf":[{"$ref":"#/components/schemas/NativeSourceScopeAbortCommand"}],"nullable":true},"receipt":{"allOf":[{"$ref":"#/components/schemas/NativeHistoryPublicationCut"}],"nullable":true},"outcome":{"allOf":[{"$ref":"#/components/schemas/NativeSourceRetirementOutcome"}],"nullable":true}},"required":["version","request_digest"]}
+    NativeSourceScopeAbortIntent:
+      {"type":"object","additionalProperties":false,"description":"Private original-owner retirement intent. The receiving control owner must independently read the named coordinator through qualified ReadIndex; caller-supplied absence, a digest, or an outcome body is never abort authority.","properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"coordinator":{"$ref":"#/components/schemas/NativeHistoryDecisionRequest"},"reference":{"$ref":"#/components/schemas/NativeSourceScopeReference"},"source_purpose":{"$ref":"#/components/schemas/NativeHistoryDigest"},"admission_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["version","owner","coordinator","reference","source_purpose","admission_digest"]}
+    NativeSourceScopeAbortCommand:
+      {"type":"object","additionalProperties":false,"description":"Trusted ordered reducer command constructed only after an independent qualified coordinator read. Requires the retained original scoped ABORT and original participant membership. Never accept this command body as self-authenticating public or private HTTP evidence.","properties":{"version":{"type":"integer","enum":[1]},"intent":{"$ref":"#/components/schemas/NativeSourceScopeAbortIntent"},"observation":{"$ref":"#/components/schemas/NativeHistoryDecisionReply"}},"required":["version","intent","observation"]}
+    NativeSourceScopeAbortReply:
+      {"type":"object","additionalProperties":false,"description":"Local attempt fencing receipt, not a global commit, publication or all-owner ACK. The applying root atomically advances its bounded token floor before emitting this receipt; delayed BEGIN remains rejected after transaction record cleanup.","properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"coordinator_record_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"cut":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"closed_through_token":{"type":"integer","format":"uint64","minimum":1},"disposition":{"type":"string","enum":["fenced","already_fenced"]}},"required":["version","request_digest","coordinator_record_digest","cut","closed_through_token","disposition"]}
+    NativeSourceCheckpointReadRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"source_owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"command":{"$ref":"#/components/schemas/NativeSourceCheckpointCommand"},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1}},"required":["version","source_owner","transaction_id","command","minimum_applied_index"]}
+    NativeSourceCheckpointReadReply:
+      {"type":"object","additionalProperties":false,"description":"Request-bound observation. Head and receipt are canonical base64 of checksummed SCP1/SCP2 records, at most 1196 decoded bytes each; validate complete command identity and retention window. Absence is unproven. No coordinator decision, completion, replan, source ACK or reclamation authority is implied.","properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"cut":{"type":"object","additionalProperties":false,"properties":{"term":{"type":"integer","format":"uint64","minimum":1},"index":{"type":"integer","format":"uint64","minimum":1}},"required":["term","index"]},"disposition":{"type":"string","enum":["absent","committed","expired"]},"head":{"type":"string","format":"byte","nullable":true,"maxLength":1596},"receipt":{"type":"string","format":"byte","nullable":true,"maxLength":1596}},"required":["version","request_digest","cut","disposition"]}
+    NativeSourceCheckpointCommand:
+      {"type":"object","additionalProperties":false,"description":"Private canonical prepare_source_checkpoint_v1 payload, admitted only with data-Raft protocol 37. This command is included in frozen PREPARE input and is never accepted from public batch JSON. The named checkpoint participant predicates on the previous head and commits the new head with transaction resolution. Physical checkpoint authority is routed and frozen separately; binding is the immutable logical source scope. Receipt-window commands use prepare_source_checkpoint_v2 and data-Raft protocol 38; matching BEGIN uses begin_source_checkpoint_v2 before any participant admission. A positive immutable receipt_window retains exactly that many sequence slots, each with the complete command digest; omitted or zero retains legacy protocol-37 behavior. Window changes require a new source binding, never reinterpretation of existing history.","properties":{"binding":{"$ref":"#/components/schemas/NativeHistoryDigest"},"purpose":{"$ref":"#/components/schemas/NativeHistoryDigest"},"sequence":{"type":"integer","format":"uint64","minimum":1},"checkpoint":{"type":"string","minLength":1,"maxLength":1024},"expected_checkpoint":{"type":"string","nullable":true,"minLength":1,"maxLength":1024},"accepted_at_ns":{"type":"integer","format":"uint64","minimum":1},"receipt_window":{"type":"integer","format":"uint32","minimum":0,"maximum":65536,"default":0}},"required":["binding","purpose","sequence","checkpoint","accepted_at_ns"]}
+    NativeSourcePlanSpec:
+      {"type":"object","additionalProperties":false,"properties":{"namespace":{"$ref":"#/components/schemas/NativeHistoryDigest"},"storage_epoch":{"type":"integer","format":"uint64","minimum":1},"binding":{"$ref":"#/components/schemas/NativeHistoryDigest"},"domain":{"$ref":"#/components/schemas/NativeHistoryDigest"},"attempt":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"bytes":{"type":"integer","format":"uint64","minimum":64,"maximum":83890240},"checksum":{"$ref":"#/components/schemas/NativeHistoryDigest"},"plan_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"chunk_hashes":{"type":"array","minItems":1,"maxItems":81,"items":{"$ref":"#/components/schemas/NativeHistoryDigest"}}},"required":["namespace","storage_epoch","binding","domain","attempt","bytes","checksum","plan_digest","chunk_hashes"],"description":"Immutable native upload grant. Namespace binds root and storage epoch; domain binds the source binding. Attempt contains a positive big-endian upload token and nonzero nonce. Storage epoch must be less than maximum uint64. Whole-object checksum, frozen-plan digest and ordered chunk hashes are distinct authenticated identities. No age expiry is implied."}
+    NativeSourcePlanCommand:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"root":{"$ref":"#/components/schemas/NativeSourcePlanRoot"},"spec":{"$ref":"#/components/schemas/NativeSourcePlanSpec"},"action":{"type":"string","enum":["begin","chunk","seal","fence","reclaim"]},"ordinal":{"type":"integer","minimum":0,"maximum":80,"default":0},"chunk_base64":{"type":"string","format":"byte","maxLength":1398104,"default":""},"max_chunks":{"type":"integer","minimum":1,"maximum":8,"default":8}},"required":["version","root","spec","action"],"description":"Chunk uses exactly the spec ordinal length and canonical base64, at most 1 MiB decoded. Other actions require ordinal zero and an empty chunk. Only reclaim may change max_chunks from eight. Seal authenticates bytes; semantic frozen-plan restoration remains mandatory before admission."}
+    NativeSourcePlanQuota:
+      {"type":"object","additionalProperties":false,"properties":{"epoch":{"type":"integer","format":"uint64","minimum":1},"active":{"type":"integer","minimum":0,"maximum":8},"reserved":{"type":"integer","format":"uint64","minimum":0,"maximum":268435456}},"required":["epoch","active","reserved"],"description":"Root-wide bounded staging accounting. Charge remains held through accepted work and partial reclamation. Explicit fencing advances epoch; absent old grants cannot restart."}
+    NativeSourcePlanStatus:
+      {"type":"object","additionalProperties":false,"properties":{"present":{"type":"boolean"},"received":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"sealed_position":{"$ref":"#/components/schemas/NativeHistoryDigest","nullable":true},"fenced_position":{"$ref":"#/components/schemas/NativeHistoryDigest","nullable":true},"seal":{"$ref":"#/components/schemas/NativeHistoryDigest","nullable":true},"fence":{"$ref":"#/components/schemas/NativeHistoryDigest","nullable":true},"reclamation":{"$ref":"#/components/schemas/NativeHistoryDigest","nullable":true}},"required":["present","received","sealed_position","fenced_position","seal","fence","reclamation"],"description":"Snapshot status for exactly one immutable spec. Received is a 128-bit chunk bitmap with unused bits zero. Proof/position pairs, original seal/fence cuts and reclamation epoch must validate; absent or unsealed work never proves input ownership."}
+    NativeSourcePlanObservation:
+      {"type":"object","additionalProperties":false,"properties":{"root":{"$ref":"#/components/schemas/NativeSourcePlanRoot"},"cut":{"$ref":"#/components/schemas/NativeHistoryDigest"},"quota":{"$ref":"#/components/schemas/NativeSourcePlanQuota"},"status":{"$ref":"#/components/schemas/NativeSourcePlanStatus","nullable":true}},"required":["root","cut","quota","status"],"description":"One native snapshot after serving-owner ReadIndex qualification. Cut is the actual sparse native Raft apply position, not a fabricated quorum watermark. Status is null only when no spec was queried."}
+    NativeSourcePlanQuery:
+      {"type":"object","additionalProperties":false,"properties":{"root":{"$ref":"#/components/schemas/NativeSourcePlanRoot"},"spec":{"$ref":"#/components/schemas/NativeSourcePlanSpec","nullable":true},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1},"minimum_native_sequence":{"type":"integer","enum":[0],"default":0}},"required":["root","minimum_applied_index"],"description":"Route-qualified Raft-root query. Optional spec requests upload status; omission requests root quota only. All response evidence must be at or beyond the minimum applied index."}
+    NativeSourcePlanChunkQuery:
+      {"type":"object","additionalProperties":false,"properties":{"root":{"$ref":"#/components/schemas/NativeSourcePlanRoot"},"spec":{"$ref":"#/components/schemas/NativeSourcePlanSpec"},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1},"minimum_native_sequence":{"type":"integer","enum":[0],"default":0}},"required":["root","spec","minimum_applied_index"]}
+    NativeSourcePlanRead:
+      {"type":"object","additionalProperties":false,"properties":{"query":{"$ref":"#/components/schemas/NativeSourcePlanChunkQuery"},"seal":{"$ref":"#/components/schemas/NativeHistoryDigest"},"ordinal":{"type":"integer","minimum":0,"maximum":80}},"required":["query","seal","ordinal"],"description":"Read one sealed chunk. Fenced, missing or reclaimed work cannot be read as owned input. Result bytes must match the spec ordinal hash and the expected seal."}
+    NativeSourcePlanObservationReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"query_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"observation":{"$ref":"#/components/schemas/NativeSourcePlanObservation"}},"required":["version","query_digest","observation"],"description":"At most 4096 bytes. Query digest binds unsealed presence and bitmap status as well as sealed evidence to the exact request."}
+    NativeSourcePlanChunkReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"observation":{"$ref":"#/components/schemas/NativeSourcePlanObservation"},"chunk_base64":{"type":"string","format":"byte","maxLength":1398104}},"required":["version","request_digest","observation","chunk_base64"],"description":"At most 2 MiB JSON and 1 MiB decoded binary. Validate exact request digest, root/cut, live seal, decoded size, canonical base64 and ordinal chunk hash before using bytes."}
+    NativeSourcePlanOutcome:
+      {"oneOf":[{"type":"object","additionalProperties":false,"properties":{"applied":{"$ref":"#/components/schemas/NativeSourcePlanStatus"}},"required":["applied"]},{"type":"object","additionalProperties":false,"properties":{"rejected":{"type":"string","enum":["invalid","scope_changed","expired","pending","conflict","backpressure"]}},"required":["rejected"]},{"type":"object","additionalProperties":false,"properties":{"superseded":{"type":"object","additionalProperties":false,"properties":{},"required":[]}},"required":["superseded"]}]}
+    NativeSourcePlanControlRequest:
+      {"oneOf":[{"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"operation":{"type":"string","enum":["submit"]},"source_owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"command":{"$ref":"#/components/schemas/NativeSourcePlanCommand"},"receipt":{"$ref":"#/components/schemas/NativeHistoryReceipt","nullable":true}},"required":["version","operation","source_owner","command"],"description":"Submit must have no receipt (omitted or null). It may propose once after full owner and protocol qualification; no automatic mutation retry."},{"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"operation":{"type":"string","enum":["recover"]},"source_owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"command":{"$ref":"#/components/schemas/NativeSourcePlanCommand"},"receipt":{"$ref":"#/components/schemas/NativeHistoryReceipt","nullable":true}},"required":["version","operation","source_owner","command","receipt"],"description":"Recover requires the original nonnull term/index receipt. It is read-only and never proposes a control or activation barrier."}]}
+    NativeSourcePlanControlReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"receipt":{"$ref":"#/components/schemas/NativeHistoryReceipt","nullable":true},"outcome":{"$ref":"#/components/schemas/NativeSourcePlanOutcome","nullable":true}},"required":["version","request_digest"],"description":"At most 4096 bytes. Outcome requires a positive exact receipt. Null or superseded outcome is unconfirmed; a known rejection is not success. Recovery echoes the original receipt. A lost response or malformed reply must not cause automatic re-proposal."}
+    NativeSourcePlanObserveRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"source_owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"query":{"$ref":"#/components/schemas/NativeSourcePlanQuery"}},"required":["version","source_owner","query"]}
+    NativeSourcePlanChunkRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"source_owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"request":{"$ref":"#/components/schemas/NativeSourcePlanRead"}},"required":["version","source_owner","request"]}
+    InternalChangefeedStateRequest:
+      type: object
+      additionalProperties: false
+      required: [version, action, metadata_group_id, metadata_incarnation]
+      properties:
+        version: {type: integer, enum: [1]}
+        action: {type: string, enum: [read, authority, mutate]}
+        metadata_group_id: {type: integer, minimum: 1}
+        metadata_incarnation:
+          type: string
+          minLength: 32
+          maxLength: 32
+          description: Expected immutable metadata cluster identity; checked before dispatch
+        id:
+          type: array
+          minItems: 16
+          maxItems: 16
+          items: {type: integer, minimum: 0, maximum: 255}
+          description: Required only for read; immutable feed ID
+        write:
+          type: string
+          maxLength: 8388608
+          description: Required only for mutate; exact encoded private revision-fenced write
+    InternalChangefeedStateReply:
+      type: object
+      additionalProperties: false
+      required: [version, action, metadata_group_id, metadata_incarnation]
+      properties:
+        version: {type: integer, enum: [1]}
+        action: {type: string, enum: [read, authority, mutate]}
+        metadata_group_id: {type: integer, minimum: 1}
+        metadata_incarnation: {type: string, minLength: 32, maxLength: 32}
+        id:
+          type: array
+          minItems: 16
+          maxItems: 16
+          items: {type: integer, minimum: 0, maximum: 255}
+        state:
+          type: string
+          maxLength: 8388608
+          description: Exact validated state envelope, present only for read
+        authority:
+          type: object
+          additionalProperties: false
+          required: [incarnation, sequence]
+          description: Present only for authority; omitted before first feed mutation
+          properties:
+            incarnation:
+              type: array
+              minItems: 32
+              maxItems: 32
+              items: {type: integer, minimum: 0, maximum: 255}
+            sequence: {type: integer, minimum: 1}
+    NativeHistoryPublicationOwner:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"metadata_group_id":{"type":"integer","format":"uint64","minimum":1},"metadata_incarnation":{"$ref":"#/components/schemas/NativeHistoryDigest","description":"Canonical 32-byte nonzero lowercase hexadecimal incarnation encoded as ASCII bytes."},"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"table_binding":{"$ref":"#/components/schemas/NativeHistoryDigest"},"root_generation":{"type":"integer","format":"uint64","minimum":0},"group_id":{"type":"integer","format":"uint64","minimum":1},"topology_epoch":{"type":"integer","format":"uint64","minimum":0}},"required":["version","metadata_group_id","metadata_incarnation","namespace","table_binding","root_generation","group_id","topology_epoch"]}
+    NativeHistoryDecisionRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1}},"required":["version","owner","transaction_id","minimum_applied_index"]}
+    NativeHistoryDecisionRecord:
+      {"type":"object","additionalProperties":false,"properties":{"status":{"type":"string","enum":["pending","committed","aborted"]},"begin_timestamp":{"type":"integer","format":"uint64","minimum":1},"created_at_ns":{"type":"integer","format":"uint64","minimum":1},"commit_version":{"type":"integer","format":"uint64","minimum":0},"finalized_at_ns":{"type":"integer","format":"uint64","minimum":0},"prepared":{"type":"boolean"},"intents_resolved":{"type":"boolean"},"digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"source_purpose":{"description":"Optional retained source admission fingerprint. Source-owned pending transactions cannot be expired by ordinary transaction recovery.","$ref":"#/components/schemas/NativeHistoryDigest"},"source_scope":{"$ref":"#/components/schemas/NativeSourceScopeReference","description":"Optional retained protocol-39 attempt identity. Required on every routed resolution of a scoped source transaction."}},"required":["status","begin_timestamp","created_at_ns","commit_version","finalized_at_ns","prepared","intents_resolved","digest"]}
+    NativeHistoryDecisionParticipant:
+      {"type":"object","additionalProperties":false,"properties":{"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"owner_fence":{"$ref":"#/components/schemas/NativeHistoryDigest"},"roles":{"type":"integer","minimum":1,"maximum":7},"input_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"locator":{"type":"string","minLength":1,"maxLength":1024},"routed_owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"}},"required":["namespace","owner_fence","roles","input_digest","locator","routed_owner"]}
+    NativeHistoryDecisionAdmission:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[3]},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"admission_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"coordinator_namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"coordinator_fence":{"$ref":"#/components/schemas/NativeHistoryDigest"},"participants":{"type":"array","minItems":1,"maxItems":1024,"items":{"$ref":"#/components/schemas/NativeHistoryDecisionParticipant"}}},"required":["version","transaction_id","admission_digest","coordinator_namespace","coordinator_fence","participants"]}
+    NativeHistoryDecisionAdmissionEnvelope:
+      {"type":"object","additionalProperties":false,"properties":{"admission":{"$ref":"#/components/schemas/NativeHistoryDecisionAdmission"},"digest":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["admission","digest"]}
+    NativeHistoryDecisionEvidence:
+      {"type":"object","additionalProperties":false,"properties":{"record":{"$ref":"#/components/schemas/NativeHistoryDecisionRecord"},"admission":{"$ref":"#/components/schemas/NativeHistoryDecisionAdmissionEnvelope"}},"required":["record","admission"],"nullable":true}
+    NativeHistoryDecisionReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"cut":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"decision":{"$ref":"#/components/schemas/NativeHistoryDecisionEvidence"}},"required":["version","request_digest","cut","decision"]}
+    NativeHistoryDecisionError:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"code":{"type":"string","enum":["invalid_request","resynchronization_required","topology_changed","unsupported","unavailable","corrupt_decision","internal_error"]}},"required":["version","code"]}
+    NativeHistoryOwnerRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"expected_table_binding":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["version","expected_table_binding"]}
+    NativeHistoryOwnerObservation:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"cut":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"retention_limit_bytes":{"type":"integer","format":"uint64","minimum":1}},"required":["version","request_digest","cut","retention_limit_bytes"]}
+    NativeHistoryOwnerReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"observation":{"$ref":"#/components/schemas/NativeHistoryOwnerObservation"}},"required":["version","owner","observation"]}
+    NativeHistoryPublicationRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"manifest_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"commit_version":{"type":"integer","format":"uint64","minimum":1},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1}},"required":["version","owner","transaction_id","manifest_digest","commit_version","minimum_applied_index"]}
+    NativeHistoryPublicationCut:
+      {"type":"object","additionalProperties":false,"properties":{"term":{"type":"integer","format":"uint64","minimum":1},"index":{"type":"integer","format":"uint64","minimum":1}},"required":["term","index"]}
+    NativeHistoryPublicationEvidence:
+      {"type":"object","additionalProperties":false,"properties":{"digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"retained_bytes":{"type":"integer","format":"uint64","minimum":1,"maximum":33554560},"position":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"}},"required":["digest","retained_bytes","position"],"nullable":true}
+    NativeHistoryPublicationReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"cut":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"publication":{"$ref":"#/components/schemas/NativeHistoryPublicationEvidence"}},"required":["version","request_digest","cut","publication"]}
+    NativeHistoryPublicationError:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"code":{"type":"string","enum":["invalid_request","resynchronization_required","topology_changed","unsupported","unavailable","corrupt_publication","internal_error"]}},"required":["version","code"]}
+    NativeHistoryResolutionRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"authority":{"type":"string","enum":["raft"]},"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"owner_fence":{"$ref":"#/components/schemas/NativeHistoryDigest"},"manifest_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"commit_version":{"type":"integer","format":"uint64","minimum":1},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1},"minimum_native_sequence":{"type":"integer","enum":[0]}},"required":["version","authority","namespace","transaction_id","owner_fence","manifest_digest","commit_version","minimum_applied_index"]}
+    NativeHistoryResolutionCut:
+      {"type":"object","additionalProperties":false,"properties":{"native_sequence":{"type":"integer","enum":[0]},"term":{"type":"integer","format":"uint64","minimum":1},"index":{"type":"integer","format":"uint64","minimum":1}},"required":["native_sequence","term","index"]}
+    NativeHistoryResolutionEvidence:
+      {"type":"object","additionalProperties":false,"properties":{"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"owner_fence":{"$ref":"#/components/schemas/NativeHistoryDigest"},"manifest_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"commit_version":{"type":"integer","format":"uint64","minimum":1},"source_position":{"$ref":"#/components/schemas/NativeHistoryDigest"},"outcome":{"oneOf":[{"type":"object","additionalProperties":false,"properties":{"effects":{"type":"object","additionalProperties":false,"properties":{"sequence":{"type":"integer","format":"uint64","minimum":1},"frame_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["sequence","frame_digest"]}},"required":["effects"]},{"type":"object","additionalProperties":false,"properties":{"no_effect":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["no_effect"]}]}},"required":["namespace","owner_fence","manifest_digest","commit_version","source_position","outcome"],"nullable":true}
+    NativeHistoryResolutionReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"cut":{"$ref":"#/components/schemas/NativeHistoryResolutionCut"},"resolution":{"$ref":"#/components/schemas/NativeHistoryResolutionEvidence"}},"required":["version","request_digest","cut","resolution"]}
+    NativeHistoryResolutionError:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"code":{"type":"string","enum":["invalid_request","resynchronization_required","topology_changed","unsupported","unavailable","corrupt_resolution","internal_error"]}},"required":["version","code"]}
+    NativeHistoryGrantIdentity:
+      {"type":"object","additionalProperties":false,"properties":{"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"authority":{"$ref":"#/components/schemas/NativeHistoryDigest"},"consumer":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"definition":{"$ref":"#/components/schemas/NativeHistoryDigest"},"sequence":{"type":"integer","format":"uint64","minimum":1},"policy_revision":{"type":"integer","format":"uint64","minimum":1}},"required":["namespace","authority","consumer","definition","sequence","policy_revision"]}
+    NativeHistoryGrantActive:
+      {"type":"object","additionalProperties":false,"properties":{"grant":{"type":"integer","format":"uint64","minimum":1},"consumer":{"$ref":"#/components/schemas/NativeHistoryConsumer"},"limit":{"type":"integer","format":"uint64","minimum":1}},"required":["grant","consumer","limit"]}
+    NativeHistoryGrantObservation:
+      {"oneOf":[{"type":"object","additionalProperties":false,"properties":{"unbound":{"type":"object","additionalProperties":false,"properties":{},"required":[]}},"required":["unbound"]},{"type":"object","additionalProperties":false,"properties":{"absent":{"type":"integer","format":"uint64","minimum":0}},"required":["absent"]},{"type":"object","additionalProperties":false,"properties":{"retired":{"type":"integer","format":"uint64","minimum":0}},"required":["retired"]},{"type":"object","additionalProperties":false,"properties":{"active":{"$ref":"#/components/schemas/NativeHistoryGrantActive"}},"required":["active"]},{"type":"object","additionalProperties":false,"properties":{"other_grant":{"$ref":"#/components/schemas/NativeHistoryGrantActive"}},"required":["other_grant"]}],"description":"Active requires the exact requested grant. Other_grant is not confirmation of it. Absent floor is below the requested sequence; retired floor is at or above it."}
+    NativeHistoryGrantRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"identity":{"$ref":"#/components/schemas/NativeHistoryGrantIdentity"}},"required":["version","identity"]}
+    NativeHistoryGrantReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"observation":{"$ref":"#/components/schemas/NativeHistoryGrantObservation"}},"required":["version","request_digest","observation"]}
+    NativeHistoryGrantError:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"code":{"type":"string","enum":["invalid_request","resynchronization_required","consumer_conflict","topology_changed","unsupported","unavailable","corrupt_observation","internal_error"]}},"required":["version","code"]}
+    NativeHistoryPosition:
+      {"type":"object","additionalProperties":false,"required":["sequence","event"],"properties":{"sequence":{"type":"integer","format":"uint64","minimum":0},"event":{"type":"integer","format":"uint32","minimum":0}}}
+    NativeHistoryPageRead:
+      {"type":"object","additionalProperties":false,"required":["reference","after","now_seconds"],"properties":{"reference":{"$ref":"#/components/schemas/NativeHistoryReference"},"after":{"$ref":"#/components/schemas/NativeHistoryPosition"},"now_seconds":{"type":"integer","format":"uint64","minimum":1},"max_events":{"type":"integer","format":"uint32","minimum":1,"maximum":1024,"default":256},"max_bytes":{"type":"integer","format":"uint32","minimum":1,"maximum":268435456,"default":1048576}}}
+    NativeHistoryPageRequest:
+      {"type":"object","additionalProperties":false,"required":["version","request"],"properties":{"version":{"type":"integer","enum":[1]},"request":{"$ref":"#/components/schemas/NativeHistoryPageRead"}},"description":"At most 4096 bytes; version is mandatory; reject unknown and duplicate fields. Reference namespace must equal the catalog fence namespace."}
+    NativeHistoryPageError:
+      {"type":"object","additionalProperties":false,"required":["version","code"],"properties":{"version":{"type":"integer","enum":[1]},"code":{"type":"string","enum":["invalid_request","resynchronization_required","topology_changed","page_budget_exceeded","unsupported","unavailable","corrupt_page","internal_error"]}}}
+    NativeHistoryNamespace:
+      {
+        "type": "array",
+        "minItems": 24,
+        "maxItems": 24,
+        "items": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        }
+      }
+    NativeHistoryDigest:
+      {
+        "type": "array",
+        "minItems": 32,
+        "maxItems": 32,
+        "items": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        }
+      }
+    NativeHistoryConsumerId:
+      {
+        "type": "array",
+        "minItems": 16,
+        "maxItems": 16,
+        "items": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        }
+      }
+    NativeHistoryReceipt:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "term",
+          "index"
+        ],
+        "properties": {
+          "term": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "index": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        }
+      }
+    NativeHistoryReference:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority",
+          "consumer",
+          "definition",
+          "epoch",
+          "grant"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "consumer": {
+            "$ref": "#/components/schemas/NativeHistoryConsumerId"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "epoch": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "grant": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        }
+      }
+    NativeHistoryGrant:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority",
+          "consumer",
+          "definition",
+          "sequence",
+          "expires_at_seconds",
+          "policy_revision"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "consumer": {
+            "$ref": "#/components/schemas/NativeHistoryConsumerId"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "sequence": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "expires_at_seconds": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "policy_revision": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "limit": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "default": 268435456
+          }
+        }
+      }
+    NativeHistoryRetirement:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority",
+          "consumer",
+          "definition",
+          "sequence",
+          "grant"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "consumer": {
+            "$ref": "#/components/schemas/NativeHistoryConsumerId"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "sequence": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "grant": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        }
+      }
+    NativeHistoryAcknowledge:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reference",
+          "previous",
+          "next"
+        ],
+        "properties": {
+          "reference": {
+            "$ref": "#/components/schemas/NativeHistoryReference"
+          },
+          "previous": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "next": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      }
+    NativeHistoryRenew:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reference",
+          "previous",
+          "next"
+        ],
+        "properties": {
+          "reference": {
+            "$ref": "#/components/schemas/NativeHistoryReference"
+          },
+          "previous": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "next": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        }
+      }
+    NativeHistoryReclaim:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reference"
+        ],
+        "properties": {
+          "reference": {
+            "$ref": "#/components/schemas/NativeHistoryReference"
+          },
+          "max_frames": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32,
+            "default": 1
+          }
+        }
+      }
+    NativeHistoryCollect:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "max_frames": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32,
+            "default": 1
+          }
+        }
+      }
+    NativeHistoryPolicyScope:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          }
+        }
+      }
+    NativeHistoryPolicySnapshot:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision",
+          "limit"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "limit": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        },
+        "description": "Root-scoped retained capture policy, not a consumer lease or source acknowledgement."
+      }
+    NativeHistoryPolicyConfigure:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority",
+          "previous_revision",
+          "revision",
+          "limit"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "previous_revision": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "revision": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "limit": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        },
+        "description": "Install or replace root capture policy by exact predecessor revision. Revision must advance; matching exact retries are idempotent. Limit includes retained data and outstanding credits. Initial activation is fenced against prepared legacy effects; it does not enroll a consumer, invent an ACK or establish a bootstrap cut. Requires data-Raft policy protocol activation."
+      }
+    NativeHistoryControlCommand:
+      {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "configure_policy"
+            ],
+            "properties": {
+              "configure_policy": {
+                "$ref": "#/components/schemas/NativeHistoryPolicyConfigure"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "inspect_policy"
+            ],
+            "properties": {
+              "inspect_policy": {
+                "$ref": "#/components/schemas/NativeHistoryPolicyScope"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "enroll"
+            ],
+            "properties": {
+              "enroll": {
+                "$ref": "#/components/schemas/NativeHistoryGrant"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "inspect"
+            ],
+            "properties": {
+              "inspect": {
+                "$ref": "#/components/schemas/NativeHistoryReference"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "acknowledge"
+            ],
+            "properties": {
+              "acknowledge": {
+                "$ref": "#/components/schemas/NativeHistoryAcknowledge"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "renew"
+            ],
+            "properties": {
+              "renew": {
+                "$ref": "#/components/schemas/NativeHistoryRenew"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "retire"
+            ],
+            "properties": {
+              "retire": {
+                "$ref": "#/components/schemas/NativeHistoryRetirement"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "reclaim"
+            ],
+            "properties": {
+              "reclaim": {
+                "$ref": "#/components/schemas/NativeHistoryReclaim"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "collect"
+            ],
+            "properties": {
+              "collect": {
+                "$ref": "#/components/schemas/NativeHistoryCollect"
+              }
+            }
+          }
+        ]
+      }
+    NativeHistoryConsumer:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "epoch",
+          "start",
+          "acknowledged",
+          "expires_at_seconds",
+          "policy_revision"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/NativeHistoryConsumerId"
+          },
+          "epoch": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "start": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "acknowledged": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "expires_at_seconds": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "policy_revision": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        }
+      }
+    NativeHistoryApplied:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [],
+        "properties": {
+          "policy": {"$ref": "#/components/schemas/NativeHistoryPolicySnapshot", "nullable": true},
+          "consumer": {
+            "$ref": "#/components/schemas/NativeHistoryConsumer",
+            "nullable": true
+          },
+          "reclaimed_frames": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 32,
+            "default": 0
+          }
+        }
+      }
+    NativeHistoryOutcome:
+      {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "applied"
+            ],
+            "properties": {
+              "applied": {
+                "$ref": "#/components/schemas/NativeHistoryApplied"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "rejected"
+            ],
+            "properties": {
+              "rejected": {
+                "type": "string",
+                "enum": [
+                  "invalid",
+                  "resynchronization",
+                  "consumer_conflict",
+                  "consumer_limit",
+                  "checkpoint_conflict",
+                  "full",
+                  "prepared_transactions"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "superseded"
+            ],
+            "properties": {
+              "superseded": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [],
+                "properties": {}
+              }
+            }
+          }
+        ]
+      }
+    NativeHistoryControlRequest:
+      {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "operation",
+              "command"
+            ],
+            "properties": {
+              "version": {
+                "type": "integer",
+                "enum": [
+                  1
+                ]
+              },
+              "command": {
+                "$ref": "#/components/schemas/NativeHistoryControlCommand"
+              },
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "submit"
+                ]
+              },
+              "receipt": {
+                "$ref": "#/components/schemas/NativeHistoryReceipt",
+                "nullable": true
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "command",
+              "operation",
+              "receipt"
+            ],
+            "properties": {
+              "version": {
+                "type": "integer",
+                "enum": [
+                  1
+                ]
+              },
+              "command": {
+                "$ref": "#/components/schemas/NativeHistoryControlCommand"
+              },
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "recover"
+                ]
+              },
+              "receipt": {
+                "$ref": "#/components/schemas/NativeHistoryReceipt"
+              }
+            }
+          }
+        ],
+        "description": "Version is mandatory. Submit requires a null or omitted receipt. Recover requires the original receipt. Namespace must match the authenticated route. Unknown and duplicate fields are rejected."
+      }
+    NativeHistoryControlResponse:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/NativeHistoryReceipt",
+            "nullable": true
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/NativeHistoryOutcome",
+            "nullable": true
+          }
+        },
+        "description": "Outcome requires a receipt. Recovery echoes the original receipt. Null outcome or superseded means unconfirmed; applied and rejected are resolved results, not equivalent success. Applied consumer identity/epoch and ACK/renew/reclamation bounds must match the request."
+      }
     StandbyIdentifier:
       type: string
       description: Stable hot-standby node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.

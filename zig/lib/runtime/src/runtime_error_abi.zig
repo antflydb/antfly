@@ -1118,6 +1118,60 @@ pub const Detail = enum(c_int) {
     storage_kernel_owner_stale_descriptor,
     object_table_definition_conflict,
     row_policy_limit_exceeded,
+    // Appended: source admission and committed-history lifecycle contracts.
+    invalid_source_admission,
+    source_admission_corrupt,
+    source_binding_conflict,
+    source_receipt_expired,
+    source_checkpoint_conflict,
+    source_payload_conflict,
+    source_table_mismatch,
+    source_transaction_identity_conflict,
+    source_already_committed,
+    source_outcome_unresolved,
+    invalid_history_admission,
+    history_corrupt,
+    history_resynchronization_required,
+    history_checkpoint_conflict,
+    history_consumer_conflict,
+    history_prepared_transactions_present,
+    history_consumer_limit,
+    history_mixed_control,
+    history_transaction_failed,
+    history_too_large,
+    history_schema_too_large,
+    history_full,
+    history_multiple_transactions,
+    history_authority_required,
+    invalid_committed_frame,
+    invalid_replication_checkpoint,
+    invalid_replication_transaction,
+    incomplete_replication_transaction,
+    unsupported_replication_truncate,
+    unsupported_replication_message,
+    invalid_source_control,
+    source_control_corrupt,
+    source_control_conflict,
+    source_admission_backpressure,
+    source_pending_work,
+    replication_projection_incomplete,
+    source_attempt_retired,
+    invalid_changefeed,
+    changefeed_corrupt,
+    changefeed_conflict,
+    changefeed_cursor_expired,
+    changefeed_backpressure,
+    changefeed_resynchronization_required,
+    changefeed_lease_expired,
+    changefeed_capability_unsupported,
+    invalid_history_page_request,
+    invalid_history_control_wire,
+    invalid_history_control_response,
+    conflicting_ordered_apply_receipt,
+    unsupported_commit_requirement,
+    commit_requirement_unavailable,
+    commit_requirement_too_large,
+    commit_requirement_failed,
 };
 
 pub const Status = extern struct {
@@ -2151,6 +2205,60 @@ pub fn statusFromError(err: anyerror) Status {
         // apart by name.
         error.EmbedAdmissionRefused => status(.retryable, .embed_admission_refused),
         error.ReadOutputTruncated => status(.invalid_argument, .read_output_truncated),
+        error.InvalidSourceAdmission => status(.invalid_argument, .invalid_source_admission),
+        error.SourceAdmissionCorrupt => status(.corrupt, .source_admission_corrupt),
+        error.SourceBindingConflict => status(.conflict, .source_binding_conflict),
+        error.SourceReceiptExpired => status(.conflict, .source_receipt_expired),
+        error.SourceCheckpointConflict => status(.conflict, .source_checkpoint_conflict),
+        error.SourcePayloadConflict => status(.conflict, .source_payload_conflict),
+        error.SourceTableMismatch => status(.conflict, .source_table_mismatch),
+        error.SourceTransactionIdentityConflict => status(.conflict, .source_transaction_identity_conflict),
+        error.SourceAlreadyCommitted => status(.conflict, .source_already_committed),
+        error.SourceOutcomeUnresolved => status(.retryable, .source_outcome_unresolved),
+        error.InvalidHistoryPageRequest => status(.invalid_argument, .invalid_history_page_request),
+        error.InvalidHistoryControlWire => status(.invalid_argument, .invalid_history_control_wire),
+        error.InvalidHistoryControlResponse => status(.corrupt, .invalid_history_control_response),
+        error.ConflictingOrderedApplyReceipt => status(.conflict, .conflicting_ordered_apply_receipt),
+        error.InvalidHistoryAdmission => status(.invalid_argument, .invalid_history_admission),
+        error.HistoryCorrupt => status(.corrupt, .history_corrupt),
+        error.HistoryResynchronizationRequired => status(.conflict, .history_resynchronization_required),
+        error.HistoryCheckpointConflict => status(.conflict, .history_checkpoint_conflict),
+        error.HistoryConsumerConflict => status(.conflict, .history_consumer_conflict),
+        error.HistoryPreparedTransactionsPresent => status(.retryable, .history_prepared_transactions_present),
+        error.HistoryConsumerLimit => status(.unavailable, .history_consumer_limit),
+        error.HistoryMixedControl => status(.invalid_argument, .history_mixed_control),
+        error.HistoryTransactionFailed => status(.conflict, .history_transaction_failed),
+        error.HistoryTooLarge => status(.invalid_argument, .history_too_large),
+        error.HistorySchemaTooLarge => status(.invalid_argument, .history_schema_too_large),
+        error.HistoryFull => status(.unavailable, .history_full),
+        error.HistoryMultipleTransactions => status(.unsupported, .history_multiple_transactions),
+        error.HistoryAuthorityRequired => status(.conflict, .history_authority_required),
+        error.InvalidCommittedFrame => status(.corrupt, .invalid_committed_frame),
+        error.InvalidReplicationCheckpoint => status(.invalid_argument, .invalid_replication_checkpoint),
+        error.InvalidReplicationTransaction => status(.invalid_argument, .invalid_replication_transaction),
+        error.IncompleteReplicationTransaction => status(.retryable, .incomplete_replication_transaction),
+        error.UnsupportedReplicationTruncate => status(.unsupported, .unsupported_replication_truncate),
+        error.UnsupportedReplicationMessage => status(.unsupported, .unsupported_replication_message),
+        error.InvalidSourceControl => status(.invalid_argument, .invalid_source_control),
+        error.SourceControlCorrupt => status(.corrupt, .source_control_corrupt),
+        error.SourceControlConflict => status(.conflict, .source_control_conflict),
+        error.SourceAdmissionBackpressure => status(.unavailable, .source_admission_backpressure),
+        error.SourcePendingWork => status(.conflict, .source_pending_work),
+        error.ReplicationProjectionIncomplete => status(.unsupported, .replication_projection_incomplete),
+        error.SourceAttemptRetired => status(.conflict, .source_attempt_retired),
+        error.InvalidChangefeed => status(.invalid_argument, .invalid_changefeed),
+        error.ChangefeedCorrupt => status(.corrupt, .changefeed_corrupt),
+        error.ChangefeedConflict => status(.conflict, .changefeed_conflict),
+        error.ChangefeedCursorExpired => status(.conflict, .changefeed_cursor_expired),
+        error.ChangefeedBackpressure => status(.unavailable, .changefeed_backpressure),
+        error.ChangefeedResynchronizationRequired => status(.conflict, .changefeed_resynchronization_required),
+        error.ChangefeedLeaseExpired => status(.conflict, .changefeed_lease_expired),
+        error.ChangefeedCapabilityUnsupported => status(.unsupported, .changefeed_capability_unsupported),
+        error.UnsupportedCommitRequirement => status(.unsupported, .unsupported_commit_requirement),
+        error.CommitRequirementUnavailable => status(.retryable, .commit_requirement_unavailable),
+        error.CommitRequirementTooLarge => status(.invalid_argument, .commit_requirement_too_large),
+        error.CommitRequirementFailed => status(.invalid_argument, .commit_requirement_failed),
+
         else => blk: {
             // Private error identities cannot cross this stable ABI. Retain
             // the owning side's name in diagnostics instead of leaving an
@@ -3198,6 +3306,59 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .privacy_window_limit_exceeded => "PrivacyWindowLimitExceeded",
         .privacy_window_token_limit_exceeded => "PrivacyWindowTokenLimitExceeded",
         .unknown_privacy_category => "UnknownPrivacyCategory",
+        .invalid_source_admission => "InvalidSourceAdmission",
+        .source_admission_corrupt => "SourceAdmissionCorrupt",
+        .source_binding_conflict => "SourceBindingConflict",
+        .source_receipt_expired => "SourceReceiptExpired",
+        .source_checkpoint_conflict => "SourceCheckpointConflict",
+        .source_payload_conflict => "SourcePayloadConflict",
+        .source_table_mismatch => "SourceTableMismatch",
+        .source_transaction_identity_conflict => "SourceTransactionIdentityConflict",
+        .source_already_committed => "SourceAlreadyCommitted",
+        .source_outcome_unresolved => "SourceOutcomeUnresolved",
+        .invalid_history_page_request => "InvalidHistoryPageRequest",
+        .invalid_history_control_wire => "InvalidHistoryControlWire",
+        .invalid_history_control_response => "InvalidHistoryControlResponse",
+        .conflicting_ordered_apply_receipt => "ConflictingOrderedApplyReceipt",
+        .invalid_history_admission => "InvalidHistoryAdmission",
+        .history_corrupt => "HistoryCorrupt",
+        .history_resynchronization_required => "HistoryResynchronizationRequired",
+        .history_checkpoint_conflict => "HistoryCheckpointConflict",
+        .history_consumer_conflict => "HistoryConsumerConflict",
+        .history_prepared_transactions_present => "HistoryPreparedTransactionsPresent",
+        .history_consumer_limit => "HistoryConsumerLimit",
+        .history_mixed_control => "HistoryMixedControl",
+        .history_transaction_failed => "HistoryTransactionFailed",
+        .history_too_large => "HistoryTooLarge",
+        .history_schema_too_large => "HistorySchemaTooLarge",
+        .history_full => "HistoryFull",
+        .history_multiple_transactions => "HistoryMultipleTransactions",
+        .history_authority_required => "HistoryAuthorityRequired",
+        .invalid_committed_frame => "InvalidCommittedFrame",
+        .invalid_replication_checkpoint => "InvalidReplicationCheckpoint",
+        .invalid_replication_transaction => "InvalidReplicationTransaction",
+        .incomplete_replication_transaction => "IncompleteReplicationTransaction",
+        .unsupported_replication_truncate => "UnsupportedReplicationTruncate",
+        .unsupported_replication_message => "UnsupportedReplicationMessage",
+        .invalid_source_control => "InvalidSourceControl",
+        .source_control_corrupt => "SourceControlCorrupt",
+        .source_control_conflict => "SourceControlConflict",
+        .source_admission_backpressure => "SourceAdmissionBackpressure",
+        .source_pending_work => "SourcePendingWork",
+        .replication_projection_incomplete => "ReplicationProjectionIncomplete",
+        .source_attempt_retired => "SourceAttemptRetired",
+        .invalid_changefeed => "InvalidChangefeed",
+        .changefeed_corrupt => "ChangefeedCorrupt",
+        .changefeed_conflict => "ChangefeedConflict",
+        .changefeed_cursor_expired => "ChangefeedCursorExpired",
+        .changefeed_backpressure => "ChangefeedBackpressure",
+        .changefeed_resynchronization_required => "ChangefeedResynchronizationRequired",
+        .changefeed_lease_expired => "ChangefeedLeaseExpired",
+        .changefeed_capability_unsupported => "ChangefeedCapabilityUnsupported",
+        .unsupported_commit_requirement => "UnsupportedCommitRequirement",
+        .commit_requirement_unavailable => "CommitRequirementUnavailable",
+        .commit_requirement_too_large => "CommitRequirementTooLarge",
+        .commit_requirement_failed => "CommitRequirementFailed",
     };
 }
 
@@ -3865,6 +4026,31 @@ test "positional IO errors preserve identity without becoming retryable pressure
     try std.testing.expectEqual(error.InputOutput, errorFromStatus(value));
 }
 
+test "source admission and history failures retain exact native boundary identities" {
+    for ([_]anyerror{ error.InvalidSourceAdmission, error.SourceAdmissionCorrupt, error.SourceBindingConflict, error.SourceReceiptExpired, error.SourceCheckpointConflict, error.SourcePayloadConflict, error.SourceTableMismatch, error.SourceTransactionIdentityConflict, error.SourceAlreadyCommitted, error.SourceOutcomeUnresolved, error.InvalidHistoryAdmission, error.HistoryCorrupt, error.HistoryResynchronizationRequired, error.HistoryCheckpointConflict, error.HistoryConsumerConflict, error.HistoryPreparedTransactionsPresent, error.HistoryConsumerLimit, error.HistoryMixedControl, error.HistoryTransactionFailed, error.HistoryTooLarge, error.HistorySchemaTooLarge, error.HistoryFull, error.HistoryMultipleTransactions, error.HistoryAuthorityRequired, error.InvalidCommittedFrame, error.InvalidReplicationCheckpoint, error.InvalidReplicationTransaction, error.IncompleteReplicationTransaction, error.UnsupportedReplicationTruncate, error.UnsupportedReplicationMessage, error.InvalidSourceControl, error.SourceControlCorrupt, error.SourceControlConflict, error.SourceAdmissionBackpressure, error.SourcePendingWork, error.ReplicationProjectionIncomplete, error.SourceAttemptRetired }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
+test "changefeed control failures preserve exact runtime identities" {
+    for ([_]anyerror{ error.InvalidChangefeed, error.ChangefeedCorrupt, error.ChangefeedConflict, error.ChangefeedCursorExpired, error.ChangefeedBackpressure, error.ChangefeedResynchronizationRequired, error.ChangefeedLeaseExpired, error.ChangefeedCapabilityUnsupported }) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+}
+
+test "history RPC request and receipt errors retain stable boundary identities" {
+    for ([_]anyerror{ error.InvalidHistoryPageRequest, error.InvalidHistoryControlWire, error.InvalidHistoryControlResponse, error.ConflictingOrderedApplyReceipt }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(transported));
+        const expected: Code = switch (err) {
+            error.InvalidHistoryPageRequest, error.InvalidHistoryControlWire => .invalid_argument,
+            error.InvalidHistoryControlResponse => .corrupt,
+            error.ConflictingOrderedApplyReceipt => .conflict,
+            else => unreachable,
+        };
+        try std.testing.expectEqual(@backingInt(expected), transported.code);
+    }
+}
+
 test "index dependency conflicts preserve identity across owner callbacks" {
     for ([_]anyerror{ error.IndexReferencedByAlias, error.IndexAliasGraphConflict, error.IndexAliasPreconditionRequired, error.IndexAliasPreconditionFailed }) |err| {
         const result = statusFromError(err);
@@ -3876,4 +4062,9 @@ test "index dependency conflicts preserve identity across owner callbacks" {
 test "index alias owner failures retain their runtime identities" {
     inline for (.{ error.StorageKernelOwnerStaleDescriptor, error.ObjectTableDefinitionConflict }) |failure|
         try std.testing.expectEqual(failure, errorFromStatus(statusFromError(failure)));
+}
+
+test "direct enrichment prerequisites retain stable runtime errors" {
+    inline for (.{ error.UnsupportedCommitRequirement, error.CommitRequirementUnavailable, error.CommitRequirementTooLarge, error.CommitRequirementFailed }) |err|
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
 }

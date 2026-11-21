@@ -26,16 +26,7 @@ const iceberg = @import("../iceberg_avro.zig");
 const bucket = @import("bucket.zig");
 const A = std.mem.Allocator;
 const V = std.json.Value;
-pub const Batch = struct {
-    batch_id: []const u8,
-    source: []const u8,
-    epoch: []const u8,
-    checkpoint: []const u8,
-    expected_checkpoint: ?[]const u8 = null,
-    key_fields: []const []const u8,
-    changes: []const Change,
-    pub const Change = struct { op: enum { upsert, delete }, row: V };
-};
+pub const Batch = @import("../../../storage/source_transaction.zig").Batch;
 pub const Files = struct { client: objectstore.Client, bucket: []const u8, prefix: []const u8, uri: []const u8, context: types.Context = .{} };
 pub const Prepared = struct { body: []const u8, snapshot_id: i64 };
 fn object(a: A) V {
@@ -67,13 +58,12 @@ pub fn schema(a: A, metadata: V) !V {
     for ((try m.get(metadata, "schemas")).array.items) |s| if (try m.int(try m.get(s, "schema-id")) == id) return s;
     return error.InvalidLakeMetadata;
 }
+pub const max_bootstrap_rows = 4 * parquet.max_rows;
 pub const stable_key = @import("stable_key.zig");
 const Rows = struct { data: []const V, keys: []const V, key_schema: V, ids: V };
 fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
-    if (batch.batch_id.len == 0 or batch.batch_id.len > 256 or batch.source.len == 0 or batch.source.len > 256 or batch.epoch.len == 0 or batch.epoch.len > 256 or batch.checkpoint.len == 0 or batch.checkpoint.len > 1024 or batch.key_fields.len == 0 or batch.key_fields.len > 32 or batch.changes.len == 0 or batch.changes.len > parquet.max_rows) return error.InvalidLakeChangeBatch;
-    if (batch.expected_checkpoint) |previous| {
-        if (previous.len > 1024 or std.mem.eql(u8, previous, batch.checkpoint)) return error.InvalidLakeChangeBatch;
-    }
+    try context.ensureActive();
+    batch.validateHeader(if (batch.bootstrap) max_bootstrap_rows else parquet.max_rows) catch return error.InvalidLakeChangeBatch;
     var fields = array(a);
     var ids = array(a);
     for (batch.key_fields, 0..) |name, index| {
@@ -138,14 +128,20 @@ fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
     // in schema width and retains excessive scratch in an attempt arena.
     var all_data = array(a);
     for (batch.changes) |change| if (change.op == .upsert) try append(&all_data, change.row);
-    if (all_data.array.items.len != 0) {
-        const checked = try parquet.encode(a, s, all_data.array.items, context);
-        a.free(checked);
-    }
-    const checked_keys = try parquet.encode(a, key_schema, keys.array.items, context);
-    a.free(checked_keys);
+    try validateParquetRows(a, s, all_data.array.items, context);
+    try validateParquetRows(a, key_schema, keys.array.items, context);
     return .{ .data = data.array.items, .keys = unique_keys.array.items, .key_schema = key_schema, .ids = ids };
 }
+fn validateParquetRows(a: A, schema_value: V, rows: []const V, context: types.Context) !void {
+    var offset: usize = 0;
+    while (offset < rows.len) {
+        const end = @min(offset + parquet.max_rows, rows.len);
+        const checked = try parquet.encode(a, schema_value, rows[offset..end], context);
+        a.free(checked);
+        offset = end;
+    }
+}
+
 pub fn validate(a: A, metadata_json: []const u8, batch: Batch, context: types.Context) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -424,16 +420,22 @@ pub fn prepare(a: A, table: types.Table, files: Files, batch: Batch, wal_lsn: u6
             const groups = if (layout) |spec| try bucket.group(a, spec, group) else &[_]bucket.Group{.{ .bucket = null, .rows = group }};
             var entries = array(a);
             const kind = if (deletes) "delete" else "data";
-            for (groups, 0..) |part, ordinal| {
-                const data = try parquet.encode(a, if (deletes) rows.key_schema else s, part.rows, files.context);
-                const data_uri = try upload(a, files, try std.fmt.allocPrint(a, "data/antfly-{s}-{s}-{d}.parquet", .{ digest, kind, ordinal }), data);
-                var data_file = try json(a, .{ .content = if (deletes) @as(i32, 2) else @as(i32, 0), .file_path = data_uri, .file_format = "PARQUET", .partition = if (layout) |spec| try spec.partition(a, part.bucket) else object(a), .record_count = part.rows.len, .file_size_in_bytes = data.len });
-                if (deletes) try put(a, &data_file, "equality_ids", rows.ids);
-                try append(&entries, try json(a, .{ .status = 1, .snapshot_id = snapshot_id, .sequence_number = seq, .file_sequence_number = seq, .data_file = data_file }));
+            for (groups) |part| {
+                var offset: usize = 0;
+                while (offset < part.rows.len) {
+                    const end = @min(offset + parquet.max_rows, part.rows.len);
+                    const ordinal = entries.array.items.len;
+                    const data = try parquet.encode(a, if (deletes) rows.key_schema else s, part.rows[offset..end], files.context);
+                    const data_uri = try upload(a, files, try std.fmt.allocPrint(a, "data/antfly-{s}-{s}-{d}.parquet", .{ digest, kind, ordinal }), data);
+                    var data_file = try json(a, .{ .content = if (deletes) @as(i32, 2) else @as(i32, 0), .file_path = data_uri, .file_format = "PARQUET", .partition = if (layout) |spec| try spec.partition(a, part.bucket) else object(a), .record_count = end - offset, .file_size_in_bytes = data.len });
+                    if (deletes) try put(a, &data_file, "equality_ids", rows.ids);
+                    try append(&entries, try json(a, .{ .status = 1, .snapshot_id = snapshot_id, .sequence_number = seq, .file_sequence_number = seq, .data_file = data_file }));
+                    offset = end;
+                }
             }
             const manifest = try avro.ocf(a, if (layout) |spec| try spec.entrySchema(a) else avro.entry_schema, entries.array.items, &.{ .{ .key = "schema", .value = schema_json }, .{ .key = "partition-spec", .value = if (layout) |spec| try std.json.Stringify.valueAlloc(a, spec.fields, .{}) else "[]" }, .{ .key = "partition-spec-id", .value = if (layout) |spec| try std.fmt.allocPrint(a, "{d}", .{spec.id}) else spec_string }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = if (deletes) "deletes" else "data" } });
             const manifest_uri = try upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-{s}-{s}.avro", .{ digest, kind }), manifest);
-            try append(&manifests, try json(a, .{ .manifest_path = manifest_uri, .manifest_length = manifest.len, .partition_spec_id = if (layout) |spec| spec.id else spec_id, .content = if (deletes) @as(i32, 1) else @as(i32, 0), .sequence_number = seq, .min_sequence_number = seq, .added_snapshot_id = snapshot_id, .added_files_count = groups.len, .existing_files_count = 0, .deleted_files_count = 0, .added_rows_count = group.len, .existing_rows_count = 0, .deleted_rows_count = 0 }));
+            try append(&manifests, try json(a, .{ .manifest_path = manifest_uri, .manifest_length = manifest.len, .partition_spec_id = if (layout) |spec| spec.id else spec_id, .content = if (deletes) @as(i32, 1) else @as(i32, 0), .sequence_number = seq, .min_sequence_number = seq, .added_snapshot_id = snapshot_id, .added_files_count = entries.array.items.len, .existing_files_count = 0, .deleted_files_count = 0, .added_rows_count = group.len, .existing_rows_count = 0, .deleted_rows_count = 0 }));
         }
     }
     const manifest_list = try avro.ocf(a, avro.list_schema, manifests.array.items, &.{ .{ .key = "format-version", .value = "2" }, .{ .key = "snapshot-id", .value = try std.fmt.allocPrint(a, "{d}", .{snapshot_id}) }, .{ .key = "sequence-number", .value = try std.fmt.allocPrint(a, "{d}", .{seq}) } });
@@ -443,6 +445,7 @@ pub fn prepare(a: A, table: types.Table, files: Files, batch: Batch, wal_lsn: u6
     try append(&updates, try json(a, .{ .action = "add-snapshot", .snapshot = snapshot }));
     try append(&updates, try json(a, .{ .action = "set-snapshot-ref", .@"ref-name" = "main", .@"snapshot-id" = snapshot_id, .type = "branch" }));
     try append(&updates, try json(a, .{ .action = "set-properties", .updates = .{ .@"antfly.wal.coverage" = try std.fmt.allocPrint(a, "{d}", .{wal_lsn}), .@"antfly.cdc.source" = batch.source, .@"antfly.cdc.epoch" = batch.epoch, .@"antfly.cdc.checkpoint" = batch.checkpoint, .@"antfly.cdc.key-fields" = key_definition } }));
+    if (batch.bootstrap) try append(&updates, try json(a, .{ .action = "set-properties", .updates = .{ .@"antfly.cdc.bootstrap-cut" = batch.checkpoint } }));
     return .{ .body = try std.json.Stringify.valueAlloc(a, .{ .requirements = requirements, .updates = updates }, .{}), .snapshot_id = snapshot_id };
 }
 
@@ -487,6 +490,62 @@ test "lake native row commit builds real data delete and retained manifests with
     var retained = try iceberg.parseManifestListAlloc(alloc, try read(a, files, try m.str(try m.get(later_snapshots[later_snapshots.len - 1], "manifest-list"))));
     defer retained.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 4), retained.entries.len);
+}
+
+test "lake native row commit checkpoint-only progress preserves rows and catalog guards" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var catalog: @import("managed.zig").Managed = .{ .client = memory.client(), .bucket = "archive", .prefix = "progress", .source_uri = "gs://archive/progress" };
+    var initial = try catalog.create(alloc, "init", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    defer initial.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const files: Files = .{ .client = memory.client(), .bucket = "archive", .prefix = "progress", .uri = "gs://archive/progress" };
+    var batch: Batch = .{ .batch_id = "poll-1", .source = "pg", .epoch = "slot-1", .checkpoint = "a", .key_fields = &.{"id"}, .changes = &.{} };
+    try validate(alloc, initial.metadata_json, batch, .{});
+    const first = try prepare(a, initial, files, batch, 1, 2);
+    var progress = try catalog.commit(alloc, .{ .id = "poll-1", .expected_metadata_location = initial.metadata_location, .body = first.body, .timestamp_ms = 2 });
+    defer progress.deinit(alloc);
+    const root = try m.parse(a, progress.metadata_json);
+    const props = try m.get(root, "properties");
+    try std.testing.expectEqualStrings("a", try m.str(try m.get(props, "antfly.cdc.checkpoint")));
+    try std.testing.expectEqualStrings("1", try m.str(try m.get(props, "antfly.wal.coverage")));
+    const snapshots = (try m.get(root, "snapshots")).array.items;
+    var empty = try iceberg.parseManifestListAlloc(alloc, try read(a, files, try m.str(try m.get(snapshots[snapshots.len - 1], "manifest-list"))));
+    defer empty.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty.entries.len);
+
+    batch.batch_id = "row";
+    batch.checkpoint = "b";
+    // A checkpoint-only commit still owns the source and exact predecessor.
+    try std.testing.expectError(error.LakeCheckpointConflict, prepare(a, progress, files, batch, 2, 3));
+    batch.expected_checkpoint = "a";
+    const image = try std.json.parseFromSliceLeaky(V, a, "{\"id\":1}", .{});
+    batch.changes = &.{.{ .op = .upsert, .row = image }};
+    const data = try prepare(a, progress, files, batch, 2, 3);
+    var with_row = try catalog.commit(alloc, .{ .id = "row", .expected_metadata_location = progress.metadata_location, .body = data.body, .timestamp_ms = 3 });
+    defer with_row.deinit(alloc);
+    batch.batch_id = "poll-2";
+    batch.expected_checkpoint = "b";
+    batch.checkpoint = "c";
+    batch.changes = &.{};
+    const last = try prepare(a, with_row, files, batch, 3, 4);
+    var advanced = try catalog.commit(alloc, .{ .id = "poll-2", .expected_metadata_location = with_row.metadata_location, .body = last.body, .timestamp_ms = 4 });
+    defer advanced.deinit(alloc);
+    const final_root = try m.parse(a, advanced.metadata_json);
+    const final_snapshots = (try m.get(final_root, "snapshots")).array.items;
+    var retained = try iceberg.parseManifestListAlloc(alloc, try read(a, files, try m.str(try m.get(final_snapshots[final_snapshots.len - 1], "manifest-list"))));
+    defer retained.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), retained.entries.len);
+    for (retained.entries) |entry| try std.testing.expectEqual(@as(?i64, 2), entry.sequence_number);
+    try std.testing.expectEqualStrings("c", try m.str(try m.get(try m.get(final_root, "properties"), "antfly.cdc.checkpoint")));
+    batch.source = "other";
+    try std.testing.expectError(error.LakeSourceConflict, prepare(a, advanced, files, batch, 4, 5));
+    batch.source = "pg";
+    batch.key_fields = &.{"missing"};
+    try std.testing.expectError(error.InvalidLakeChangeBatch, validate(alloc, advanced.metadata_json, batch, .{}));
 }
 
 test "lake catalog manifest merge splits a large eligible pool into bounded outputs" {
@@ -649,4 +708,41 @@ test "external lake immutable file reads use one bounded GCS request" {
     try std.testing.expectError(error.DeadlineExceeded, readLimited(arena.allocator(), files, uri, 64));
     try std.testing.expectEqual(calls, state.body_calls);
     try std.testing.expectEqual(@as(usize, 0), state.metadata_calls);
+}
+
+test "lake native row commit publishes a multi-file bootstrap at one cut" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var catalog: @import("managed.zig").Managed = .{ .client = memory.client(), .bucket = "archive", .prefix = "snapshot", .source_uri = "gs://archive/snapshot" };
+    var initial = try catalog.create(alloc, "init", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    defer initial.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rows = try a.alloc(Batch.Change, parquet.max_rows + 1);
+    for (rows, 0..) |*change, index| {
+        var row = object(a);
+        try put(a, &row, "id", .{ .integer = @intCast(index) });
+        change.* = .{ .op = .upsert, .row = row };
+    }
+    const files: Files = .{ .client = memory.client(), .bucket = "archive", .prefix = "snapshot", .uri = "gs://archive/snapshot" };
+    var batch: Batch = .{ .batch_id = "initial", .source = "postgres", .epoch = "1", .checkpoint = "cut", .key_fields = &.{"id"}, .changes = rows };
+    try std.testing.expectError(error.InvalidLakeChangeBatch, validate(a, initial.metadata_json, batch, .{}));
+    batch.bootstrap = true;
+    try validate(a, initial.metadata_json, batch, .{});
+    const prepared = try prepare(a, initial, files, batch, 1, 2);
+    var committed = try catalog.commit(alloc, .{ .id = "bootstrap", .expected_metadata_location = initial.metadata_location, .body = prepared.body, .timestamp_ms = 2 });
+    defer committed.deinit(alloc);
+    const metadata = try m.parse(a, committed.metadata_json);
+    const snapshots = (try m.get(metadata, "snapshots")).array.items;
+    try std.testing.expectEqual(@as(usize, 1), snapshots.len);
+    try std.testing.expectEqualStrings("cut", try m.str(try m.get(try m.get(metadata, "properties"), "antfly.cdc.bootstrap-cut")));
+    var list = try iceberg.parseManifestListAlloc(alloc, try read(a, files, try m.str(try m.get(snapshots[0], "manifest-list"))));
+    defer list.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), list.entries.len);
+    for (list.entries) |entry| {
+        try std.testing.expectEqual(@as(u64, 2), entry.added_files_count);
+        try std.testing.expectEqual(@as(u64, rows.len), entry.added_rows_count);
+    }
 }

@@ -10,6 +10,55 @@ native durable session owner, including savepoint rollback and constraint timing
 HTTP SQL support does not implicitly enable pgwire or make
 unsupported SQL shapes executable.
 
+Logical replication has a separate optional backend owner. The wire layer
+recognizes `replication=database`, authenticates first, and opens that owner only
+through `Backend.VTable.open_replication_session`. Ordinary SELECT permission is
+insufficient. Its live authorization callback runs at startup, before every
+replication administration command, and before the response. Owner close runs
+before the connection credential is released.
+
+`replication_commands.zig` parses bounded IDENTIFY_SYSTEM, logical slot creation,
+slot drop and pgoutput-v1 START commands. It preserves quoted publication names,
+rejects duplicate options and trailing commands, and never routes malformed
+replication commands through SQL. Physical replication, other plugins, binary
+output, logical messages, uncommitted streaming, two-phase and origin filtering
+are rejected explicitly. Creation carries temporary/snapshot choices to the
+backend, which must reject any runtime capability it cannot uphold.
+
+The optional stream owner supplies durable committed pgoutput messages at exact
+slot byte positions. CopyBoth serializes provider polling, feedback and live
+authorization while one bounded reader task receives frontend frames. Keepalives
+request feedback; only validated feedback refreshes the consumer deadline.
+Writes and provider operations have separate time limits. Successful writes never
+acknowledge history: the slot owner maps feedback to complete issued transactions.
+A validated reconnect frontier can precede replay from a rewound transaction
+Begin. Future feedback and mismatched payload positions fail explicitly.
+
+CopyDone joins the reader and finishes both COPY and START_REPLICATION before
+accepting the next command. Errors after COPY begins close the connection, since
+cancelling an in-flight read may leave a partial frontend frame. Cancellation
+and shutdown join readers before closing stream state or releasing credentials.
+Gateway renewal buffers are bounded and securely released, including discarded
+queued results. Connection memory contains at most a bounded message, not a whole
+committed transaction.
+
+START is rejected when the owner has no stream callback. The native runtime
+adapter does not yet register the replication capability. The private
+`metadata/pg_spool.zig` format and artifact-store adapter support authenticated
+message seeks and immutable rebuilds. Slot metadata now retains upload reservations,
+manifest locators, LSN mappings and cleanup debt; the filesystem store durably
+fences retired upload IDs. The private `metadata/pg_spool_cleanup.zig` worker
+resumes durable cleanup checkpoints and verifies physical absence before quota
+release. `metadata/pg_spool_upload.zig` binds frozen historical wire plans to
+single-use build grants before publication. `retained_stream.zig` bridges the
+retained stream owner to CopyBoth with explicit payload release and durable
+feedback. Slot publication selection is immutable before capture. Production
+namespace routing, scheduling, historical relational production and coherent
+database cuts remain required. These private contracts
+and wire tests do not establish existing-client compatibility or activate a
+production replication endpoint. Unknown slot administration stays with the
+replication owner rather than becoming SQL transaction completion work.
+
 SQL-language `PREPARE name [(types...)] AS statement`, `EXECUTE name
 [(expressions...)]`, and `DEALLOCATE [PREPARE] name|ALL` use the same bounded,
 connection-owned registry as wire Parse/Bind. Names survive transaction commit

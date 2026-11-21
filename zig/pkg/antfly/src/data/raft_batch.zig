@@ -21,6 +21,7 @@ const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig"
 
 pub const acknowledge_many_protocol_version = @import("../common/data_raft_protocol.zig").batch_acknowledge_many_protocol_version;
 pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
+pub const exact_prepare_protocol_version = @import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version;
 pub const artifact_catalog_protocol_version = internal_batch_forwarding.raft_batch_artifact_catalog_protocol_version;
 pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
 pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_batch_activation_barrier_protocol_version;
@@ -59,11 +60,37 @@ pub const OwnedReplicatedBatch = struct {
     batch: batch_api.OwnedBatchRequest,
     storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null,
     protocol_barrier_version: ?u16 = null,
+    history_commit_time_ns: ?i64 = null,
+    exact_prepare: bool = false,
 
     pub fn deinit(self: *OwnedReplicatedBatch, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         self.batch.deinit(alloc);
         if (self.storage_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// A retention command has no document batch, including an empty one. Callers
+/// must select its ordered control path explicitly before accessing row work.
+pub const OwnedApplyEntry = union(enum) {
+    source_legacy_terminal: @import("source_legacy_terminal_entry.zig").Owned,
+    batch: OwnedReplicatedBatch,
+    history_control: @import("history_control_entry.zig").Owned,
+    source_plan: @import("source_plan_entry.zig").Owned,
+    source_scope_control: @import("source_scope_entry.zig").Owned,
+    source_retirement: @import("source_retirement_entry.zig").Owned,
+    source_producer_closure: @import("source_producer_closure_entry.zig").Owned,
+    pub fn deinit(self: *OwnedApplyEntry, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .batch => |*value| value.deinit(alloc),
+            .history_control => |*value| value.deinit(),
+            .source_plan => |*value| value.deinit(),
+            .source_scope_control => |*value| value.deinit(),
+            .source_retirement => |*value| value.deinit(),
+            .source_producer_closure => |*value| value.deinit(),
+            .source_legacy_terminal => |*value| value.deinit(),
+        }
         self.* = undefined;
     }
 };
@@ -90,12 +117,19 @@ pub fn encode(alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.type
     return try encodeWithStorageOwnerDescriptor(alloc, table_name, req, null);
 }
 
+pub fn isFrozenPrepare(req: db_mod.types.BatchRequest) bool {
+    const mutation = req.transaction orelse return false;
+    return mutation == .prepare and mutation.prepare.completion_owner != null;
+}
+
 pub fn encodeWithStorageOwnerDescriptor(
     alloc: std.mem.Allocator,
     table_name: []const u8,
     req: db_mod.types.BatchRequest,
     descriptor: ?descriptor_contract.Descriptor,
 ) ![]u8 {
+    if (try @import("../common/data_raft_protocol.zig").completionProtocolVersion(alloc, req)) |required| if (protocol_version < required)
+        return error.UnsupportedRaftBatchProtocolVersion;
     if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) return error.InvalidBatchRequest;
     const batch_json = try batch_api.encodeBatchRequest(alloc, req);
     defer alloc.free(batch_json);
@@ -108,7 +142,12 @@ pub fn encodeWithStorageOwnerDescriptor(
         try writer.print(",\"storage_owner\":{f}", .{std.json.fmt(value, .{})});
     }
     try writer.writeAll(",\"batch\":");
-    try writer.writeAll(batch_json);
+    // A JSON string preserves decimal tokens through the outer envelope's
+    // generic JSON decoder. Older replicas reject this batch shape.
+    if (isFrozenPrepare(req))
+        try writer.print("{f}", .{std.json.fmt(batch_json, .{})})
+    else
+        try writer.writeAll(batch_json);
     try writer.writeByte('}');
     return try out.toOwnedSlice();
 }
@@ -117,7 +156,9 @@ pub fn looksLikeEnvelope(payload: []const u8) bool {
     const trimmed = std.mem.trim(u8, payload, " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, "{")) return false;
     return std.mem.indexOf(u8, trimmed, "\"table\"") != null and
-        std.mem.indexOf(u8, trimmed, "\"batch\"") != null;
+        (std.mem.indexOf(u8, trimmed, "\"batch\"") != null or
+            std.mem.indexOf(u8, trimmed, "\"history_commit_time_ns\"") != null or
+            std.mem.indexOf(u8, trimmed, "\"row_batch_json\"") != null);
 }
 
 fn cloneStorageOwnerDescriptor(
@@ -150,8 +191,69 @@ fn cloneStorageOwnerDescriptor(
 pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBatch {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always });
     defer parsed.deinit();
+    return decodeBatchValue(alloc, parsed.value);
+}
+
+/// Applying owners must handle history_control before considering row work.
+/// Ordinary callers retain the fail-closed decoder above.
+pub fn decodeForApply(alloc: std.mem.Allocator, payload: []const u8) !OwnedApplyEntry {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
+    defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidReplicatedBatch;
-    const root = parsed.value.object;
+    if (parsed.value.object.contains("history_commit_time_ns") or parsed.value.object.contains("row_batch_json")) {
+        const clock = @import("history_clock_entry.zig");
+        if (payload.len > clock.max_bytes) return error.InvalidReplicatedBatch;
+        var entry = try clock.decodeValue(alloc, parsed.value);
+        defer entry.deinit();
+        var batch = try entry.value.rowBatch(alloc);
+        errdefer batch.deinit(alloc);
+        const table = try alloc.dupe(u8, entry.value.table);
+        errdefer alloc.free(table);
+        return .{ .batch = .{
+            .table_name = table,
+            .batch = batch,
+            .storage_owner_descriptor = try cloneStorageOwnerDescriptor(alloc, entry.value.storage_owner),
+            .history_commit_time_ns = entry.value.history_commit_time_ns,
+        } };
+    }
+    if (parsed.value.object.contains("source_legacy_terminal")) {
+        const legacy = @import("source_legacy_terminal_entry.zig");
+        if (payload.len > legacy.max_bytes) return error.InvalidReplicatedBatch;
+        return .{ .source_legacy_terminal = try legacy.decodeValue(alloc, parsed.value) };
+    }
+    if (parsed.value.object.contains("source_producer_closure")) {
+        const closure = @import("source_producer_closure_entry.zig");
+        if (payload.len > closure.max_bytes) return error.InvalidReplicatedBatch;
+        return .{ .source_producer_closure = try closure.decodeValue(alloc, parsed.value) };
+    }
+    if (parsed.value.object.contains("source_retirement")) {
+        const retirement = @import("source_retirement_entry.zig");
+        if (payload.len > retirement.max_bytes) return error.InvalidReplicatedBatch;
+        return .{ .source_retirement = try retirement.decodeValue(alloc, parsed.value) };
+    }
+    if (parsed.value.object.contains("source_scope_control")) {
+        const scope = @import("source_scope_entry.zig");
+        if (payload.len > scope.max_bytes) return error.InvalidReplicatedBatch;
+        return .{ .source_scope_control = try scope.decodeValue(alloc, parsed.value) };
+    }
+    if (parsed.value.object.contains("source_plan")) {
+        const plan = @import("source_plan_entry.zig");
+        if (payload.len > plan.max_bytes) return error.InvalidReplicatedBatch;
+        return .{ .source_plan = try plan.decodeValue(alloc, parsed.value) };
+    }
+    if (parsed.value.object.contains("history_control")) {
+        const history = @import("history_control_entry.zig");
+        if (payload.len > history.max_bytes) return error.InvalidReplicatedBatch;
+        return .{ .history_control = try history.decodeValue(alloc, parsed.value) };
+    }
+    return .{ .batch = try decodeBatchValue(alloc, parsed.value) };
+}
+
+fn decodeBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedReplicatedBatch {
+    if (value != .object) return error.InvalidReplicatedBatch;
+    const root = value.object;
+    if (root.contains("source_owner")) return error.UnsupportedRaftBatchProtocolVersion;
+    if (root.contains("history_commit_time_ns") or root.contains("row_batch_json") or root.contains("source_legacy_terminal") or root.contains("history_control") or root.contains("source_plan") or root.contains("source_scope_control") or root.contains("source_retirement") or root.contains("source_producer_closure")) return error.UnsupportedRaftBatchProtocolVersion;
     const table_value = root.get("table") orelse return error.InvalidReplicatedBatch;
     if (table_value != .string) return error.InvalidReplicatedBatch;
     const batch_value = root.get("batch") orelse return error.InvalidReplicatedBatch;
@@ -173,10 +275,14 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
             .protocol_barrier_version = version,
         };
     }
-    const batch_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(batch_value, .{})});
-    defer alloc.free(batch_json);
+    const exact_prepare = batch_value == .string;
+    const batch_json = if (exact_prepare) batch_value.string else try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(batch_value, .{})});
+    defer if (!exact_prepare) alloc.free(batch_json);
     var batch = try batch_api.parseInternalBatchRequest(alloc, batch_json);
     errdefer batch.deinit(alloc);
+    if (exact_prepare and !isFrozenPrepare(batch.req)) return error.InvalidReplicatedBatch;
+    if (try @import("../common/data_raft_protocol.zig").completionProtocolVersion(alloc, batch.req)) |required| if (protocol_version < required)
+        return error.UnsupportedRaftBatchProtocolVersion;
 
     var storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null;
     errdefer if (storage_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
@@ -195,6 +301,7 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
         .table_name = table_name,
         .batch = batch,
         .storage_owner_descriptor = storage_owner_descriptor,
+        .exact_prepare = exact_prepare,
     };
 }
 
@@ -204,6 +311,52 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "raft batch preserves frozen decimal PREPARE inputs" {
+            const alloc = std.testing.allocator;
+            const owner: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion.RoutedOwner = .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+                .namespace = @splat(1),
+                .table_binding = @splat(2),
+                .root_generation = 0,
+                .group_id = 7,
+                .topology_epoch = 3,
+            };
+            const request: db_mod.types.BatchRequest = .{
+                .sync_level = .write,
+                .timestamp_ns = 10,
+                .document_version_scheme = .revision_v1,
+                .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 3, .completion_owner = owner } },
+                .writes = &.{.{ .key = "row", .value = "{\"amount\":12345678901234567890.12345678,\"fraction\":2.50000000}" }},
+            };
+            const frozen = try batch_api.completionPrepareInput(alloc, request);
+            defer alloc.free(frozen);
+            const entry = try encode(alloc, "docs", request);
+            defer alloc.free(entry);
+            var decoded = try decodeForApply(alloc, entry);
+            defer decoded.deinit(alloc);
+            try std.testing.expect(decoded.batch.exact_prepare);
+            const received = try batch_api.completionPrepareInput(alloc, decoded.batch.batch.req);
+            defer alloc.free(received);
+            try std.testing.expectEqualStrings(frozen, received);
+
+            var gated = request;
+            gated.commit_requires = .direct_enrichments;
+            const gated_input = try batch_api.completionPrepareInput(alloc, gated);
+            defer alloc.free(gated_input);
+            gated.prepared_enrichments_json = "{}";
+            const gated_entry = try encode(alloc, "docs", gated);
+            defer alloc.free(gated_entry);
+            var gated_decoded = try decodeForApply(alloc, gated_entry);
+            defer gated_decoded.deinit(alloc);
+            const gated_replay = gated_decoded.batch.batch.req;
+            try std.testing.expectEqualStrings("{}", gated_replay.prepared_enrichments_json.?);
+            try std.testing.expectEqual(.revision_v1, gated_replay.document_version_scheme);
+            const gated_received = try batch_api.completionPrepareInput(alloc, gated_replay);
+            defer alloc.free(gated_received);
+            try std.testing.expectEqualStrings(gated_input, gated_received);
+        }
+
         test "ordered artifact merge adoption uses private raft batch encoding" {
             const alloc = std.testing.allocator;
             const request: db_mod.types.BatchRequest = .{ .merge_proof_adoption = .{

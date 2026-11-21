@@ -359,6 +359,12 @@ pub const ArtifactStore = struct {
         visit_scoped_uploads: ?*const fn (*anyopaque, [32]u8, ScopedUploadVisitor, CancellationToken) anyerror!void = null,
         reclaim_retired_scoped_inventory: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
         cleanup_retired_scoped_temporaries: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
+        /// Durable monotonic barrier: all scoped puts through this token have
+        /// drained and every later put at/below it fails, across owner reopen.
+        retire_scoped_uploads: ?*const fn (*anyopaque, [32]u8, u64, CancellationToken) anyerror!void = null,
+        /// Prove the scope is fenced and all payload/inventory bytes are gone.
+        /// An exhausted enumerator alone does not establish this condition.
+        scoped_uploads_reclaimed: ?*const fn (*anyopaque, UploadScope, CancellationToken) anyerror!bool = null,
     };
 
     /// Borrowed hint-only view. The backend owner must outlive it. Preserve
@@ -502,6 +508,23 @@ pub const ArtifactStore = struct {
         if (metadata.byte_len != contents.len or !std.mem.eql(u8, &expected, metadata.artifact_id)) return error.ArtifactIntegrityMismatch;
         try cancellation.check();
         return metadata;
+    }
+
+    pub fn scopedUploadsReclaimed(self: *ArtifactStore, scope: UploadScope, cancellation: CancellationToken) !bool {
+        try scope.validate();
+        try cancellation.check();
+        const verify = self.vtable.scoped_uploads_reclaimed orelse return error.ArtifactUploadRetirementUnsupported;
+        const result = try verify(self.ptr, scope, cancellation);
+        try cancellation.check();
+        return result;
+    }
+
+    pub fn retireScopedUploads(self: *ArtifactStore, domain: [32]u8, through: u64, cancellation: CancellationToken) !void {
+        if (std.mem.allEqual(u8, &domain, 0) or through == 0) return error.InvalidArtifactUploadScope;
+        try cancellation.check();
+        const retire = self.vtable.retire_scoped_uploads orelse return error.ArtifactUploadRetirementUnsupported;
+        try retire(self.ptr, domain, through, cancellation);
+        try cancellation.check();
     }
 
     pub fn visitScopedUploads(self: *ArtifactStore, domain: [32]u8, visitor: ScopedUploadVisitor, cancellation: CancellationToken) !void {

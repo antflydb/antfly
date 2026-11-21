@@ -2335,6 +2335,8 @@ pub const ProvisionedTableWriteCache = struct {
         }
     };
 
+    /// Installed by the serving owner; raw library writers remain unqualified.
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority = null,
     alloc: std.mem.Allocator,
     lsm_cache: ?*lsm_backend.Cache = null,
     hbc_cache: ?*hbc_mod.Cache = null,
@@ -3251,6 +3253,7 @@ pub const ProvisionedTableWriteCache = struct {
                 inference_api_url: ?[]const u8,
                 inference_api_key: ?[]const u8,
                 policy_table_name: []const u8,
+                authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority,
             ) !OpenedDb {
                 const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(open_mode, hot_standby_async_mirror);
                 var db = if (indexes_json) |managed_indexes_json|
@@ -3274,6 +3277,7 @@ pub const ProvisionedTableWriteCache = struct {
                             .schema_json_before_index_load = schema_json,
                             .inference_api_url = inference_api_url,
                             .inference_api_key = inference_api_key,
+                            .online_source_authority = authority,
                             .replication_write_gate = replication_write_gate,
                             .replication_async_effect_mirror = effective_hot_standby_mirror,
                             .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -3289,6 +3293,7 @@ pub const ProvisionedTableWriteCache = struct {
                         .backend_runtime = runtime,
                         .identity_namespace = identity_namespace,
                         .prefer_existing_identity_namespace = identity_namespace != null,
+                        .online_source_authority = authority,
                         .replication_write_gate = replication_write_gate,
                         .replication_async_effect_mirror = effective_hot_standby_mirror,
                         .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -3355,6 +3360,7 @@ pub const ProvisionedTableWriteCache = struct {
                 self.inference_api_url,
                 self.inference_api_key,
                 table_name,
+                self.online_source_authority,
             );
             const owned_db = try self.alloc.create(db_mod.DB);
             errdefer self.alloc.destroy(owned_db);
@@ -3412,6 +3418,7 @@ pub const ProvisionedTableWriteCache = struct {
             self.inference_api_url,
             self.inference_api_key,
             table_name,
+            self.online_source_authority,
         );
         errdefer opened.db.close();
         const start_bulk_session = opened.start_bulk_session and self.bulkIngestSessionReadyForTable(table_name);
@@ -7137,9 +7144,13 @@ pub const ProvisionedTableWriteSource = struct {
     local_change_hook: ?LocalChangeHook = null,
     local_index_repair_debt_hook: ?LocalIndexRepairDebtHook = null,
     raft_batcher: ?RaftBatcher = null,
+    completion_coordinator: ?@import("completion_admission.zig").Coordinator = null,
     /// Set only after startup proves this process is the non-Raft standalone
     /// data owner. A temporarily absent Raft callback is not that proof.
     standalone_sql_range_guards: bool = false,
+    /// Installed by the serving owner; raw library writers remain unqualified.
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority = null,
+    native_history_owner: bool = false,
     local_write_owner: ?*ProvisionedTableWriteSource = null,
     /// Optional local physical-operation provider. Top-level routing,
     /// coalescing, admission, and lifecycle remain on this source; a compiled
@@ -7335,6 +7346,7 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     const WriteCoalesceEntry = struct {
+        source_producer: @FieldType(db_mod.types.BatchRequest, "source_producer") = .unlabelled,
         group: GroupBatch = .{ .group_id = 0 },
         sync_level: db_mod.types.SyncLevel = .write,
         timestamp_ns: u64 = 0,
@@ -7732,6 +7744,23 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    pub fn withSourceAuthority(self: *ProvisionedTableWriteSource, authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority) !*ProvisionedTableWriteSource {
+        if (self.online_source_authority == authority) return self;
+        if (comptime control_only_storage_sources) {
+            self.online_source_authority = authority;
+            return self;
+        }
+        var locks = WriteCacheTransitionLocks.init(self, true, true);
+        defer locks.deinit();
+        try locks.reserveClearCapacity();
+        self.online_source_authority = authority;
+        if (locks.first) |cache| cache.online_source_authority = authority;
+        if (locks.second) |cache| cache.online_source_authority = authority;
+        locks.clearCaches(false);
+        locks.drainAndRelease();
+        return self;
+    }
+
     pub fn withHotStandbyWriteGate(
         self: *ProvisionedTableWriteSource,
         gate: ?db_mod.ReplicationWriteGate,
@@ -7843,6 +7872,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer cache.unlockOpenMutex();
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
+        cache.online_source_authority = self.online_source_authority;
         cache.setRuntimeHooksLocked(
             self.resolution_candidate_source,
             self.entity_sink,
@@ -7876,6 +7906,12 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn withStandaloneSqlRangeGuards(self: *ProvisionedTableWriteSource, enabled: bool) *ProvisionedTableWriteSource {
         self.standalone_sql_range_guards = enabled;
+        return self;
+    }
+
+    /// Set only by runtime owner selection, independently of SQL capabilities.
+    pub fn withNativeHistoryOwner(self: *ProvisionedTableWriteSource, enabled: bool) *ProvisionedTableWriteSource {
+        self.native_history_owner = enabled;
         return self;
     }
 
@@ -12642,6 +12678,7 @@ pub const ProvisionedTableWriteSource = struct {
 
             const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(mode, self.hot_standby_async_mirror);
             var effective_open_options = managed_open_options;
+            effective_open_options.online_source_authority = self.online_source_authority;
             effective_open_options.private_restore_bootstrap = if (preloaded_metadata) |metadata| metadata.restore_reservation != null else false;
             effective_open_options.drain_resolver_backfill = false;
             effective_open_options.defer_resolver_workers = true;
@@ -12714,6 +12751,7 @@ pub const ProvisionedTableWriteSource = struct {
                         .backend_runtime = cache.backend_runtime,
                         .primary_backend = if (local_persisted_metadata) existingPrimaryBackend() else (db_mod.OpenOptions{}).primary_backend,
                         .identity_namespace = identity_namespace,
+                        .online_source_authority = self.online_source_authority,
                         .prefer_existing_identity_namespace = identity_namespace != null,
                         .replication_write_gate = self.replication_write_gate,
                         .replication_async_effect_mirror = effective_hot_standby_mirror,
@@ -13822,7 +13860,7 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         }
 
-        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
         db.close();
     }
 
@@ -15852,6 +15890,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.backend_runtime,
                 self.replication_write_gate,
                 null,
+                self.online_source_authority,
             ) catch |err| {
                 if (isTransientWriterOpenConflict(err))
                     return error.HASeedSnapshotRuntimeBusy;
@@ -15876,6 +15915,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.backend_runtime,
             self.replication_write_gate,
             null,
+            self.online_source_authority,
         );
         defer db.close();
         return try captureHotStandbySeedDbSnapshot(alloc, &db, path, snapshot_token, destination_root);
@@ -20271,13 +20311,120 @@ pub const ProvisionedTableWriteSource = struct {
         self.local_db_mutex.unlock();
     }
 
+    /// Owned single-root capability for a provisioned native writer. A locator
+    /// is copied, but its original table/range identity is never recomputed as
+    /// a replacement identity. Keep this value stable while using source().
+    pub const NativeHistoryRoot = struct {
+        owner: *ProvisionedTableWriteSource,
+        storage_owner: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []u8,
+        group_id: u64,
+        namespace: [24]u8,
+
+        const history = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+        pub fn deinit(self: *@This()) void {
+            self.alloc.free(self.table_name);
+            self.* = undefined;
+        }
+        fn qualify(self: *@This()) !void {
+            // Ordered and hot-standby control need their durable apply/mirror
+            // path. Never silently mutate retention through a local handle.
+            if (comptime control_only_storage_sources) return error.ChangefeedCapabilityUnsupported;
+            if (!self.owner.native_history_owner or self.owner.raft_batcher != null or
+                self.storage_owner.raft_batcher != null or self.storage_owner.replication_write_gate != null or
+                self.storage_owner.groupLocalWriteSource() != null or self.storage_owner.write_cache == null)
+                return error.ChangefeedCapabilityUnsupported;
+        }
+        fn validateCatalog(self: *@This()) !void {
+            try self.qualify();
+            const current = try loadTableIdentityNamespaceForGroup(self.alloc, self.owner.catalog, self.table_name, self.group_id) orelse return error.HistoryResynchronizationRequired;
+            const bytes = namespaceBytes(current);
+            if (!std.mem.eql(u8, &bytes, &self.namespace)) return error.HistoryResynchronizationRequired;
+        }
+        fn namespaceBytes(value: doc_identity.Namespace) [24]u8 {
+            var bytes: [24]u8 = undefined;
+            std.mem.writeInt(u64, bytes[0..8], value.table_id, .big);
+            std.mem.writeInt(u64, bytes[8..16], value.shard_id, .big);
+            std.mem.writeInt(u64, bytes[16..24], value.range_id, .big);
+            return bytes;
+        }
+        const Lease = struct {
+            root: *NativeHistoryRoot,
+            cached: ProvisionedTableWriteCache.CachedDb,
+            fn deinit(self: *@This()) void {
+                self.cached.deinit(self.root.alloc);
+                self.root.storage_owner.endGroupOperation(self.root.table_name, self.root.group_id);
+            }
+        };
+        fn acquire(self: *@This()) !Lease {
+            try self.qualify();
+            const owner = self.storage_owner;
+            owner.beginGroupOperation(self.table_name, self.group_id);
+            errdefer owner.endGroupOperation(self.table_name, self.group_id);
+            try self.validateCatalog();
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(self.alloc, owner.replica_root_dir, self.group_id);
+            defer self.alloc.free(path);
+            var cached = try owner.getOrOpenCachedDbForLocalMutation(self.alloc, owner.write_cache.?, path, self.group_id, owner.visibleRootGeneration(self.group_id), self.table_name, false);
+            errdefer cached.deinit(self.alloc);
+            try cached.db.provisionNativeHistoryAuthority(self.namespace);
+            try self.validateCatalog();
+            return .{ .root = self, .cached = cached };
+        }
+        fn admissionNamespace(raw: *anyopaque) ![24]u8 {
+            const self: *NativeHistoryRoot = @ptrCast(@alignCast(raw));
+            var lease = try self.acquire();
+            defer lease.deinit();
+            const result = try lease.cached.db.nativeSourceAdmissionNamespace();
+            try self.validateCatalog();
+            return result;
+        }
+        fn consumerControl(raw: *anyopaque, command: history.history_consumer.Command) !history.history_consumer.Result {
+            const self: *NativeHistoryRoot = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, &command.namespace(), &self.namespace)) return error.HistoryResynchronizationRequired;
+            var lease = try self.acquire();
+            defer lease.deinit();
+            const result = try lease.cached.db.nativeHistoryConsumerControl(command);
+            try self.validateCatalog();
+            return result;
+        }
+        fn page(raw: *anyopaque, alloc: std.mem.Allocator, request: history.history_page.Request) !history.history_page.Page {
+            const self: *NativeHistoryRoot = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, &request.reference.namespace, &self.namespace)) return error.HistoryResynchronizationRequired;
+            var lease = try self.acquire();
+            defer lease.deinit();
+            var result = try lease.cached.db.nativeHistoryPage(alloc, request);
+            errdefer result.deinit();
+            try self.validateCatalog();
+            return result;
+        }
+        pub fn source(self: *@This()) TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{ .batch = unsupportedBatch, .native_source_admission_namespace = admissionNamespace, .native_history_consumer_control = consumerControl, .native_history_page = page } };
+        }
+        fn unsupportedBatch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnsupportedOperation;
+        }
+    };
+
+    pub fn bindNativeHistoryRoot(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64) !NativeHistoryRoot {
+        var result: NativeHistoryRoot = .{ .owner = self, .storage_owner = self.local_write_owner orelse self, .alloc = alloc, .table_name = try alloc.dupe(u8, table_name), .group_id = group_id, .namespace = @splat(0) };
+        errdefer result.deinit();
+        try result.qualify();
+        const namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id) orelse return error.HistoryResynchronizationRequired;
+        result.namespace = NativeHistoryRoot.namespaceBytes(namespace);
+        _ = try NativeHistoryRoot.admissionNamespace(&result);
+        return result;
+    }
+
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
+            .supports_transaction_producers = true,
             .supports_sql_range_guards = if (self.raft_batcher) |batcher|
                 batcher.vtable.batch_group_routed_with_cancellation != null
             else
                 self.standalone_sql_range_guards and (self.groupLocalWriteSource() != null or self.write_cache != null),
+            .supports_transaction_producer_phases = true,
             .vtable = &.{
                 .activate_range_tracking = activateRangeTracking,
                 .create_table = createTable,
@@ -20370,7 +20517,7 @@ pub const ProvisionedTableWriteSource = struct {
             return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, cached.db, body);
         }
 
-        var db = openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror) catch |err| switch (err) {
+        var db = openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority) catch |err| switch (err) {
             error.FileNotFound => return error.UnknownGroup,
             else => return err,
         };
@@ -20402,7 +20549,7 @@ pub const ProvisionedTableWriteSource = struct {
             return try cached.db.resolverReviewsJsonAlloc(alloc, body);
         }
 
-        var db = openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror) catch |err| switch (err) {
+        var db = openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority) catch |err| switch (err) {
             error.FileNotFound => return error.UnknownGroup,
             else => return err,
         };
@@ -20457,7 +20604,7 @@ pub const ProvisionedTableWriteSource = struct {
                 defer cached.deinit(alloc);
                 break :blk try applyGraphMetricActionToDb(alloc, cached.db, index_name, metric_name, action);
             } else blk: {
-                var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
                 defer db.close();
                 break :blk try applyGraphMetricActionToDb(alloc, &db, index_name, metric_name, action);
             };
@@ -20889,7 +21036,7 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
 
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try applyLocalTableSchemaJson(alloc, &db, schema_json);
@@ -21332,7 +21479,8 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn coalesceCompatibleEntry(first: *const WriteCoalesceEntry, candidate: *const WriteCoalesceEntry) bool {
-        return first.sync_level == candidate.sync_level and
+        return first.source_producer == candidate.source_producer and
+            first.sync_level == candidate.sync_level and
             first.timestamp_ns == candidate.timestamp_ns and
             first.group.topology_epoch == candidate.group.topology_epoch and
             std.meta.eql(first.group.identity_namespace, candidate.group.identity_namespace);
@@ -21340,6 +21488,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn coalescedEntryBatchRequest(entry: *const WriteCoalesceEntry) db_mod.types.BatchRequest {
         return .{
+            .source_producer = entry.source_producer,
             .sync_level = entry.sync_level,
             .timestamp_ns = entry.timestamp_ns,
         };
@@ -21355,6 +21504,7 @@ pub const ProvisionedTableWriteSource = struct {
         var entry = WriteCoalesceEntry{
             .group = try cloneWriteCoalesceGroupBatch(alloc, group),
             .sync_level = req.sync_level,
+            .source_producer = req.source_producer,
             .timestamp_ns = req.timestamp_ns,
         };
         defer freeWriteCoalesceGroupBatch(alloc, &entry.group);
@@ -21694,7 +21844,7 @@ pub const ProvisionedTableWriteSource = struct {
             try applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req, cancellation);
             cache.publishCachedLeaseGeneration(&cached, target_generation);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGateAndIdentity(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, group.identity_namespace);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGateAndIdentity(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, group.identity_namespace, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespaceExpected(group.identity_namespace, &db);
             try applyGroupBatch(alloc, self.catalog, &db, table_name, group, req, cancellation);
@@ -21821,6 +21971,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
                     .transforms = group.transforms.items,
+                    .source_producer = req.source_producer,
                     .timestamp_ns = req.timestamp_ns,
                     .sync_level = req.sync_level,
                 }, cancellation) catch |err| {
@@ -21900,7 +22051,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             return try executeBackupPinControl(alloc, cached.db, group_id, request, control);
         }
-        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
         defer db.close();
         return try executeBackupPinControl(alloc, &db, group_id, request, control);
     }
@@ -21965,7 +22116,7 @@ pub const ProvisionedTableWriteSource = struct {
                 return try exportPortableBackupShardWithSeal(alloc, cached.db, plan.backup_root, plan.backup_id, group_id, plan.io, try @import("antfly_local_sources").api_backup_contract.sealedHandleForGroup(plan.sealed_handles, group_id), plan.cancellation);
             }
 
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             return try exportPortableBackupShardWithSeal(alloc, &db, plan.backup_root, plan.backup_id, group_id, plan.io, try @import("antfly_local_sources").api_backup_contract.sealedHandleForGroup(plan.sealed_handles, group_id), plan.cancellation);
         }
@@ -22000,7 +22151,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer {
             if (read_cache_exclusive) |*exclusive| exclusive.deinit();
         }
-        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
         defer db.close();
         var native_snapshot = try prepareNativeBackupShardSnapshot(alloc, &db, path, group_id, plan);
         defer native_snapshot.deinit(alloc);
@@ -22421,6 +22572,8 @@ pub const ProvisionedTableWriteSource = struct {
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
+                .completion = self.completion_coordinator,
+                .completion_context = .{ .cancellation = cancellation },
                 .retain_terminal = retain_terminal,
                 .report_post_commit_failure = false,
                 .fanout_io = self.tableActivityIo(),
@@ -22457,6 +22610,8 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        _ = try @import("antfly_local_sources").api_distributed_txn_contract.transactionProducer(tables);
+        for (tables) |table| if (table.source_admission != null) return error.UnsupportedOperation;
         if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
@@ -22546,6 +22701,7 @@ pub const ProvisionedTableWriteSource = struct {
         // `batch` retains the established schema, cache, coalescing, HA, and
         // sync-level behavior used by all non-transactional shard writes.
         const applied = self.batchWithVisibilityCancellation(alloc, table_req.table_name, .{
+            .source_producer = table_req.source_producer,
             .commit_requires = table_req.commit_requires,
             .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
@@ -22620,6 +22776,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         const batcher = self.raft_batcher orelse return null;
         const req: db_mod.types.BatchRequest = .{
+            .source_producer = table_req.source_producer,
             .commit_requires = table_req.commit_requires,
             .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
@@ -23410,7 +23567,7 @@ pub const ProvisionedTableWriteSource = struct {
             try cached.db.waitForCurrentSyncLevelWithCancellation(sync_level, cancellation);
             self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try db.waitForCurrentSyncLevelWithCancellation(sync_level, cancellation);
@@ -23478,7 +23635,7 @@ pub const ProvisionedTableWriteSource = struct {
             try self.applyRestoreStagingBatch(alloc, table_name, group_id, .{
                 .restore_staging_scope = scope,
                 .restore_staging_plan_id = context.restore_staging_plan_id,
-                .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = begin_timestamp, .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null), .topology_epoch = topology_epoch, .retain_terminal = retain_terminal, .participants = participants } },
+                .transaction = .{ .begin = .{ .ordinary_producer = context.source_producer == .ordinary, .legacy_producer = context.source_producer == .legacy_cdc, .txn_id = txn_id, .begin_timestamp = begin_timestamp, .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null), .topology_epoch = topology_epoch, .retain_terminal = retain_terminal, .participants = participants } },
             }, context);
             return {};
         }
@@ -23487,6 +23644,8 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
                 .transaction = .{ .begin = .{
+                    .ordinary_producer = context.source_producer == .ordinary,
+                    .legacy_producer = context.source_producer == .legacy_cdc,
                     .txn_id = txn_id,
                     .begin_timestamp = begin_timestamp,
                     .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
@@ -23500,7 +23659,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const owner = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            return try owner.txnBeginGroupLocal(
+            return try owner.txnBeginGroupLocalWithPreDecisionContext(
                 alloc,
                 group_id,
                 table_name,
@@ -23509,10 +23668,11 @@ pub const ProvisionedTableWriteSource = struct {
                 topology_epoch,
                 retain_terminal,
                 participants,
+                context,
             );
         }
         if (self.groupLocalWriteSource()) |owner|
-            return try owner.txnBeginGroupLocal(
+            return try owner.txnBeginGroupLocalWithPreDecisionContext(
                 alloc,
                 group_id,
                 table_name,
@@ -23521,6 +23681,7 @@ pub const ProvisionedTableWriteSource = struct {
                 topology_epoch,
                 retain_terminal,
                 participants,
+                context,
             );
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -23529,6 +23690,8 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             try ensurePreDecisionContextActive(context);
             try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, .{ .transaction = .{ .begin = .{
+                .ordinary_producer = context.source_producer == .ordinary,
+                .legacy_producer = context.source_producer == .legacy_cdc,
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
@@ -23540,11 +23703,13 @@ pub const ProvisionedTableWriteSource = struct {
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try ensurePreDecisionContextActive(context);
             try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, .{ .transaction = .{ .begin = .{
+                .ordinary_producer = context.source_producer == .ordinary,
+                .legacy_producer = context.source_producer == .legacy_cdc,
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
@@ -23578,6 +23743,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
+        if (req.source_admission != null) return error.UnsupportedOperation;
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
         if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
@@ -23610,7 +23776,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .graph_writes = req.graph_writes,
                 .graph_deletes = req.graph_deletes,
                 .predicates = req.predicates,
-                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .ordinary_producer = req.completion_ordinary_producer, .legacy_producer = req.completion_legacy_producer } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
                 .range_guards = req.range_guards,
@@ -23642,7 +23808,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .graph_writes = req.graph_writes,
                 .graph_deletes = req.graph_deletes,
                 .predicates = req.predicates,
-                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .ordinary_producer = req.completion_ordinary_producer, .legacy_producer = req.completion_legacy_producer } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
                 .range_guards = req.range_guards,
@@ -23691,7 +23857,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, txn_id, table_name, req.writes, req.deletes, req.transforms);
@@ -23805,7 +23971,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (status == .committed and shouldDrainCachedManagedDbAfterBatch(sync_level))
                 try drainManagedDbBeforeClose(cached.db);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try applyReplicatedTransactionMutationWithCancellation(alloc, &db, table_name, group_id, .{
@@ -23865,7 +24031,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             return try cached.db.getTransactionStatus(txn_id);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             return try db.getTransactionStatus(txn_id);
@@ -23982,7 +24148,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try db.markTransactionParticipantResolved(txn_id, participant);
@@ -24286,7 +24452,7 @@ pub const ProvisionedTableWriteSource = struct {
                         return;
                     }
                 } else {
-                    var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                    var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
                     defer db.close();
                     try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
                     if (try corruptEmbeddingArtifactInDb(alloc, &db, doc_key, index_name)) {
@@ -24346,6 +24512,7 @@ pub const ProvisionedTableWriteSource = struct {
                     self.backend_runtime,
                     self.replication_write_gate,
                     self.hot_standby_async_mirror,
+                    self.online_source_authority,
                 );
                 defer db.close();
                 try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
@@ -24725,7 +24892,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const result = try db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
@@ -24805,7 +24972,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const result = try db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
@@ -24885,7 +25052,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const result = try db.applyDocumentArtifactChildRangeBatch(child_batch);
@@ -24963,7 +25130,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const range_result = try db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
@@ -25047,7 +25214,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             break :blk try db.listArtifactRepairIssuesPage(alloc, req);
@@ -25150,7 +25317,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const group_result = try db.repairArtifactIssuesWithRequestOptions(alloc, req, effective_options);
@@ -25231,6 +25398,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
     };
 
+    /// Production metadata writers enable the signed retained-history path.
+    /// Physical-only adapters may expose just the legacy local callback set.
+    /// Configure before acquiring hosted physical writers.
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority = null,
+    completion_admission: bool = false,
+    provision_history_policy: bool = false,
+    history_policy_guard: ?@import("history_policy_provisioning.zig").Guard = null,
+    history_policy_cache: @import("history_policy_provisioning.zig").Cache = .{},
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     router: table_router.HostedGroupRouter,
@@ -25263,6 +25438,38 @@ pub const HostedProvisionedTableWriteSource = struct {
             .router = router,
             .executor = executor,
         };
+    }
+
+    pub fn withHistoryPolicyProvisioning(self: *HostedProvisionedTableWriteSource, guard: ?@import("history_policy_provisioning.zig").Guard) *HostedProvisionedTableWriteSource {
+        self.provision_history_policy = true;
+        self.history_policy_guard = guard;
+        self.completion_admission = true;
+        return self;
+    }
+
+    pub fn withCompletionAdmission(self: *HostedProvisionedTableWriteSource) *HostedProvisionedTableWriteSource {
+        self.completion_admission = true;
+        return self;
+    }
+
+    /// Serving configuration, never inferred from public JSON or root contents.
+    /// Reconfiguration requires releasing the hosted writer cache first.
+    pub fn withSourceAuthority(self: *HostedProvisionedTableWriteSource, authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority) !*HostedProvisionedTableWriteSource {
+        if (self.online_source_authority == authority) return self;
+        if (comptime !control_only_storage_sources) {
+            if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
+                cache.write_cache.lockOpenMutex();
+                defer cache.write_cache.unlockOpenMutex();
+                lockAtomic(&cache.mutex);
+                defer cache.mutex.unlock();
+                lockAtomic(&cache.write_cache.entry_lifecycle_mutex);
+                defer cache.write_cache.entry_lifecycle_mutex.unlock();
+                if (cache.write_cache.entries.items.len != 0 or cache.write_cache.retired_entries.items.len != 0 or cache.write_cache.closing_entries.items.len != 0) return error.SourcePendingWork;
+                cache.write_cache.online_source_authority = authority;
+            }
+        }
+        self.online_source_authority = authority;
+        return self;
     }
 
     pub fn withBackendRuntime(self: *HostedProvisionedTableWriteSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableWriteSource {
@@ -25450,6 +25657,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         self: *HostedProvisionedTableWriteSource,
         cache: *HostedManagedDbCache,
     ) void {
+        cache.write_cache.online_source_authority = self.online_source_authority;
         cache.write_cache.backend_runtime = self.backend_runtime;
         cache.write_cache.antfly_provider = providerWithRemoteCapabilityCache(
             self.antfly_provider,
@@ -25469,6 +25677,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         owner: *ProvisionedTableWriteSource,
         cache: *HostedManagedDbCache,
     ) void {
+        owner.online_source_authority = self.online_source_authority;
         owner.catalog = self.catalog;
         owner.backend_runtime = self.backend_runtime;
         owner.remote_capability_cache = &cache.remote_capability_cache;
@@ -25621,6 +25830,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !ProvisionedTableWriteCache.CachedDb {
         if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         const lsm_root_generation = self.visibleRootGeneration(group_id);
+        cache.write_cache.online_source_authority = self.online_source_authority;
         if (self.backend_runtime) |runtime| cache.write_cache.backend_runtime = runtime;
         cache.write_cache.antfly_provider = providerWithRemoteCapabilityCache(
             self.antfly_provider,
@@ -25766,6 +25976,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .inference_api_url = cache.write_cache.inference_api_url,
                     .inference_api_key = cache.write_cache.inference_api_key,
                     .remote_capability_cache = &cache.remote_capability_cache,
+                    .online_source_authority = self.online_source_authority,
                     .replication_write_gate = cache.write_cache.replication_write_gate,
                     .replication_async_effect_mirror = effective_hot_standby_mirror,
                     .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -25785,6 +25996,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .backend_runtime = cache.write_cache.backend_runtime,
                 .identity_namespace = identity_namespace,
                 .prefer_existing_identity_namespace = identity_namespace != null,
+                .online_source_authority = self.online_source_authority,
                 .replication_write_gate = cache.write_cache.replication_write_gate,
                 .replication_async_effect_mirror = effective_hot_standby_mirror,
                 .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -25844,6 +26056,8 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
         return .{
             .ptr = self,
+            .supports_transaction_producers = true,
+            .supports_transaction_producer_phases = true,
             .vtable = &.{
                 .drop_table = dropTable,
                 .activate_range_tracking = activateRangeTrackingHosted,
@@ -26424,6 +26638,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             .graph_writes = req.graph_writes,
                             .graph_deletes = req.graph_deletes,
                             .predicates = req.predicates,
+                            .source_producer = req.source_producer,
                             .timestamp_ns = req.timestamp_ns,
                             .sync_level = req.sync_level,
                         }, dispatch_ctx.dispatcher());
@@ -26439,6 +26654,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             .graph_writes = req.graph_writes,
                             .graph_deletes = req.graph_deletes,
                             .predicates = req.predicates,
+                            .source_producer = req.source_producer,
                             .timestamp_ns = req.timestamp_ns,
                             .sync_level = req.sync_level,
                         });
@@ -26514,6 +26730,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        for (tables) |table| if (table.source_admission != null) return error.UnsupportedOperation;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
         return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
@@ -26574,6 +26791,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
         _ = worker_impl.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        var completion_transport: @import("hosted_completion.zig").Hosted = .{ .catalog = self.catalog, .router = self.router, .executor = self.executor, .secret = self.internal_service_secret, .issuer = self.internal_service_issuer, .provision_policy = self.provision_history_policy, .policy_guard = self.history_policy_guard, .policy_cache = &self.history_policy_cache };
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
@@ -26586,6 +26804,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
+                .completion = if (self.completion_admission) completion_transport.coordinator() else null,
+                .completion_context = .{ .cancellation = cancellation },
                 .retain_terminal = retain_terminal,
                 .report_post_commit_failure = false,
                 .fanout_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null,
@@ -27020,6 +27240,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             .restore_staging_scope = context.restore_staging_scope,
             .restore_staging_plan_id = context.restore_staging_plan_id,
             .transaction = .{ .begin = .{
+                .ordinary_producer = context.source_producer == .ordinary,
+                .legacy_producer = context.source_producer == .legacy_cdc,
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
@@ -27052,6 +27274,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
+        if (req.source_admission != null) return error.UnsupportedOperation;
         return try batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
             .row_policy_principal_proof = req.row_policy_principal_proof,
             .row_policy_database = req.row_policy_database,
@@ -27065,7 +27288,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             .graph_writes = req.graph_writes,
             .graph_deletes = req.graph_deletes,
             .predicates = req.predicates,
-            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .ordinary_producer = req.completion_ordinary_producer, .legacy_producer = req.completion_legacy_producer } },
             .integrity = req.integrity,
             .integrity_commands = req.integrity_commands,
             .range_guards = req.range_guards,
@@ -28200,7 +28423,7 @@ fn openManagedDbForTableGroupWithRuntime(
     group_id: u64,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
-    return try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, catalog, table_name, group_id, backend_runtime, null, null);
+    return try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, catalog, table_name, group_id, backend_runtime, null, null, null);
 }
 
 fn openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(
@@ -28212,6 +28435,7 @@ fn openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     replication_write_gate: ?db_mod.ReplicationWriteGate,
     hot_standby_async_mirror: ?db_mod.ReplicationAsyncEffectMirror,
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority,
 ) !db_mod.DB {
     return try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGateAndIdentity(
         alloc,
@@ -28223,6 +28447,7 @@ fn openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(
         replication_write_gate,
         hot_standby_async_mirror,
         null,
+        online_source_authority,
     );
 }
 
@@ -28236,8 +28461,9 @@ fn openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGateAndIdentity(
     replication_write_gate: ?db_mod.ReplicationWriteGate,
     hot_standby_async_mirror: ?db_mod.ReplicationAsyncEffectMirror,
     identity_namespace: ?doc_identity.Namespace,
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority,
 ) !db_mod.DB {
-    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentity(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime, replication_write_gate, hot_standby_async_mirror, identity_namespace);
+    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentity(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime, replication_write_gate, hot_standby_async_mirror, identity_namespace, online_source_authority);
 }
 
 fn openManagedDbForTableWithCache(
@@ -28319,6 +28545,7 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGate(
         replication_write_gate,
         hot_standby_async_mirror,
         null,
+        null,
     );
 }
 
@@ -28336,6 +28563,7 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentit
     replication_write_gate: ?db_mod.ReplicationWriteGate,
     hot_standby_async_mirror: ?db_mod.ReplicationAsyncEffectMirror,
     identity_namespace_override: ?doc_identity.Namespace,
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority,
 ) !db_mod.DB {
     const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(.default, hot_standby_async_mirror);
     const identity_namespace = identity_namespace_override orelse
@@ -28349,6 +28577,7 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentit
             .backend_runtime = backend_runtime,
             .identity_namespace = identity_namespace,
             .prefer_existing_identity_namespace = identity_namespace != null,
+            .online_source_authority = online_source_authority,
             .replication_write_gate = replication_write_gate,
             .replication_async_effect_mirror = effective_hot_standby_mirror,
             .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -28375,6 +28604,7 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentit
         null,
         identity_namespace,
         .{
+            .online_source_authority = online_source_authority,
             .replication_write_gate = replication_write_gate,
             .replication_async_effect_mirror = effective_hot_standby_mirror,
             .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -32878,7 +33108,7 @@ fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReq
     // Both routed and legacy group endpoints consume the internal batch wire
     // contract. A separate document-only serializer silently dropped topology
     // authority (and ordinary predicates, timestamps, and sync requirements).
-    return try batch_api.encodeBatchRequest(alloc, req);
+    return try batch_api.encodeRoutedBatchRequest(alloc, req);
 }
 
 /// Encodes the canonical internal batch wire contract for the compiled storage
@@ -33357,6 +33587,23 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "data raft ordered history coalescer retains distinct producer partitions" {
+            const Source = ProvisionedTableWriteSource;
+            const ordinary: Source.WriteCoalesceEntry = .{ .source_producer = .ordinary };
+            var legacy = ordinary;
+            legacy.source_producer = .legacy_cdc;
+            var old = ordinary;
+            old.source_producer = .unlabelled;
+            try std.testing.expect(Source.coalesceCompatibleEntry(&ordinary, &ordinary));
+            try std.testing.expect(!Source.coalesceCompatibleEntry(&ordinary, &legacy));
+            try std.testing.expect(!Source.coalesceCompatibleEntry(&ordinary, &old));
+            try std.testing.expect(!Source.coalesceCompatibleEntry(&legacy, &old));
+            try std.testing.expectEqual(ordinary.source_producer, Source.coalescedEntryBatchRequest(&ordinary).source_producer);
+            try std.testing.expectEqual(legacy.source_producer, Source.coalescedEntryBatchRequest(&legacy).source_producer);
+            const group: GroupBatch = .{ .group_id = 1 };
+            try std.testing.expectEqual(legacy.source_producer, groupBatchRequest(group, Source.coalescedEntryBatchRequest(&legacy)).source_producer);
+        }
+
         test "compiled startup catch-up retains exact retries across owner contention" {
             if (comptime !control_only_storage_sources) return error.SkipZigTest;
             const alloc = std.testing.allocator;
@@ -40489,6 +40736,709 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "history page wire owns binary images through every allocation failure" {
+            try @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire.test_support.allocationFailures();
+        }
+
+        test "history page wire validates checksums cursor metadata and budgets" {
+            try @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire.test_support.malformedPages();
+        }
+
+        test "ordered history consumer completion BEGIN atomically retains plan and applied cut" {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/completion-begin", .{tmp.sub_path});
+            defer a.free(path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false, .start_resolver_workers = false };
+            var db = try db_mod.DB.open(a, path, options);
+            var opened = true;
+            defer if (opened) db.close();
+            const source = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+            const completion = source.history_resolution_wire.completion;
+            var namespace: [24]u8 = @splat(0);
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 1, .big);
+            std.mem.writeInt(u64, namespace[16..24], 1, .big);
+            const members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = @splat(2), .roles = completion.Roles.guards, .locator = "table2:4:docs:group:1" }};
+            var admission: completion.Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = members[0].owner_fence, .participants = &members };
+            const raw = try completion.encodeAdmission(a, admission);
+            defer a.free(raw);
+            const entry: db_mod.OrderedApplyReceipt = .{ .term = 1, .index = 2 };
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.beginReplicatedCompletionTransaction(raw, null, 10, 11, true, entry));
+            try std.testing.expect((try db.orderedApplyReceipt()) == null);
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(admission.transaction_id));
+            const grant: source.history_consumer.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1, .limit = 4 * 1024 * 1024 };
+            _ = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 1 }, false);
+            try std.testing.expectEqualDeep(admission.transaction_id, try db.beginReplicatedCompletionTransaction(raw, null, 10, 11, true, entry));
+            try std.testing.expectEqualDeep(entry, (try db.orderedApplyReceipt()).?);
+            try std.testing.expectEqual(.pending, try db.getTransactionStatus(admission.transaction_id));
+            const key = try std.fmt.allocPrint(a, "{s}{s}", .{ completion.admission_prefix, &admission.transaction_id });
+            defer a.free(key);
+            const stored = try db.core.store.get(a, key);
+            defer a.free(stored);
+            try std.testing.expectEqualStrings(raw, stored);
+            admission.admission_digest[0] ^= 1;
+            const changed = try completion.encodeAdmission(a, admission);
+            defer a.free(changed);
+            try std.testing.expectError(error.DecisionConflict, db.beginReplicatedCompletionTransaction(changed, null, 10, 11, true, entry));
+            try std.testing.expectError(error.DecisionConflict, db.beginReplicatedCompletionTransaction(changed, null, 10, 11, true, .{ .term = 1, .index = 3 }));
+            try std.testing.expectEqualDeep(entry, (try db.orderedApplyReceipt()).?);
+            opened = false;
+            db.close();
+            db = try db_mod.DB.open(a, path, options);
+            opened = true;
+            try std.testing.expectEqualDeep(admission.transaction_id, try db.beginReplicatedCompletionTransaction(raw, null, 10, 11, true, entry));
+            try std.testing.expectEqual(.pending, try db.getTransactionStatus(admission.transaction_id));
+            const reopened = try db.core.store.get(a, key);
+            defer a.free(reopened);
+            try std.testing.expectEqualStrings(raw, reopened);
+            // A complete participant certificate is reserved before BEGIN.
+            // A large frozen plan cannot consume beyond this root's budget.
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const many = try scratch.alloc(completion.Participant, 512);
+            many[0] = members[0];
+            const padding: [900]u8 = @splat('x');
+            for (many[1..], 1..) |*member, index| {
+                var member_namespace: [24]u8 = @splat(0);
+                member_namespace[0] = 1;
+                std.mem.writeInt(u64, member_namespace[16..24], index, .big);
+                member.* = .{ .namespace = member_namespace, .owner_fence = @splat(7), .roles = completion.Roles.guards, .locator = try std.fmt.allocPrint(scratch, "{d}:{s}", .{ index, &padding }) };
+            }
+            var full_plan = admission;
+            full_plan.transaction_id = @splat(8);
+            full_plan.participants = many;
+            const full_raw = try completion.encodeAdmission(a, full_plan);
+            defer a.free(full_raw);
+            try std.testing.expect(try full_plan.reservationBytes(full_raw.len) > grant.limit);
+            const retained_history = @import("antfly_local_sources").storage_committed_history;
+            const before_full = try db.core.store.get(a, retained_history.state_key);
+            defer a.free(before_full);
+            try std.testing.expectError(error.HistoryFull, db.beginReplicatedCompletionTransaction(full_raw, null, 20, 21, true, .{ .term = 1, .index = 3 }));
+            try std.testing.expectEqualDeep(entry, (try db.orderedApplyReceipt()).?);
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(full_plan.transaction_id));
+            const full_key = try std.fmt.allocPrint(a, "{s}{s}", .{ completion.admission_prefix, &full_plan.transaction_id });
+            defer a.free(full_key);
+            try std.testing.expectError(error.NotFound, db.core.store.get(a, full_key));
+            const after_full = try db.core.store.get(a, retained_history.state_key);
+            defer a.free(after_full);
+            try std.testing.expectEqualStrings(before_full, after_full);
+            const batch_wire = @import("antfly_local_sources").api_internal_batch;
+            const v2_id: [16]u8 = @splat(9);
+            const routed_owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = db.core.root_generation, .group_id = 1, .topology_epoch = 1 };
+            const prepare: db_mod.types.BatchRequest = .{ .timestamp_ns = 30, .document_version_scheme = .revision_v1, .transaction = .{ .prepare = .{ .txn_id = v2_id, .topology_epoch = 1, .completion_owner = routed_owner } }, .writes = &.{.{ .key = "v2-row", .value = "{\"v\":1}" }} };
+            const prepare_bytes = try batch_wire.completionPrepareInput(a, prepare);
+            defer a.free(prepare_bytes);
+            const input_digest = completion.preparedInputDigest(namespace, prepare_bytes);
+            const v2_members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = routed_owner.digest(), .roles = completion.Roles.effects, .locator = members[0].locator, .input_digest = input_digest }};
+            const v2: completion.Admission = .{ .version = 2, .transaction_id = v2_id, .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = routed_owner.digest(), .participants = &v2_members };
+            const v2_bytes = try completion.encodeAdmission(a, v2);
+            defer a.free(v2_bytes);
+            try std.testing.expectError(error.InvalidHistoryAdmission, db.beginReplicatedCompletionTransaction(v2_bytes, null, 30, 31, true, .{ .term = 1, .index = 3 }));
+            var replacement_owner = routed_owner;
+            replacement_owner.root_generation += 1;
+            try std.testing.expectError(error.TopologyChanged, db.beginReplicatedCompletionTransaction(v2_bytes, replacement_owner, 30, 31, true, .{ .term = 1, .index = 3 }));
+            var replacement_members = v2_members;
+            replacement_members[0].owner_fence = replacement_owner.digest();
+            var replacement_plan = v2;
+            replacement_plan.coordinator_fence = replacement_owner.digest();
+            replacement_plan.participants = &replacement_members;
+            const replacement_bytes = try completion.encodeAdmission(a, replacement_plan);
+            defer a.free(replacement_bytes);
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.beginReplicatedCompletionTransaction(replacement_bytes, replacement_owner, 30, 31, true, .{ .term = 1, .index = 3 }));
+            try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
+            _ = try db.beginReplicatedCompletionTransaction(v2_bytes, routed_owner, 30, 31, true, .{ .term = 1, .index = 3 });
+            var intent_request: db_mod.types.TransactionIntentRequest = .{ .document_version_scheme = .revision_v1, .completion_owner = routed_owner, .writes = &.{.{ .key = "v2-row", .value = "{\"v\":1}" }} };
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 }));
+            intent_request.completion_input_digest = @splat(7);
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 }));
+            try std.testing.expectEqual(@as(u64, 3), (try db.orderedApplyReceipt()).?.index);
+            intent_request.completion_input_digest = input_digest;
+            intent_request.completion_owner = null;
+            try std.testing.expectError(error.InvalidHistoryAdmission, db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 }));
+            intent_request.completion_owner = replacement_owner;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 }));
+            try std.testing.expectEqual(@as(u64, 3), (try db.orderedApplyReceipt()).?.index);
+            intent_request.completion_owner = routed_owner;
+            try db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 });
+            try std.testing.expect((try db.get(a, "v2-row")) == null);
+            const intent_key = try std.fmt.allocPrint(a, "\x00\x00__txn_intents__:{s}:v2-row", .{&v2_id});
+            defer a.free(intent_key);
+            const original_intents = try db.core.store.get(a, intent_key);
+            defer a.free(original_intents);
+            try db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 5 });
+            try std.testing.expectEqual(@as(u64, 5), (try db.orderedApplyReceipt()).?.index);
+            const retry_intents = try db.core.store.get(a, intent_key);
+            defer a.free(retry_intents);
+            try std.testing.expectEqualStrings(original_intents, retry_intents);
+            opened = false;
+            db.close();
+            db = try db_mod.DB.open(a, path, options);
+            opened = true;
+            try db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 6 });
+            try std.testing.expectError(error.InvalidHistoryAdmission, db.resolveReplicatedTransactionAtOrderedReceipt(v2_id, .committed, 40, .write, .none, .{ .term = 1, .index = 7 }, null));
+            try std.testing.expectEqual(@as(u64, 6), (try db.orderedApplyReceipt()).?.index);
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.resolveReplicatedCompletionTransactionAtOrderedReceipt(v2_id, .committed, 40, .{ .term = 1, .index = 7 }, null, replacement_owner));
+            try std.testing.expect((try db.get(a, "v2-row")) == null);
+            try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(v2_id, .committed, 40, .{ .term = 1, .index = 7 }, null, routed_owner);
+            const receipt = try db.historyResolution(a, .{ .authority = .raft, .namespace = namespace, .transaction_id = v2_id, .owner_fence = routed_owner.digest(), .manifest_digest = (try v2.manifest(40)).digest(), .commit_version = 40, .minimum_applied_index = 7 });
+            try std.testing.expect(receipt.resolution != null);
+            try std.testing.expectEqual(@as(u64, 7), receipt.cut.index);
+            try std.testing.expectEqual(@as(u64, 1), receipt.resolution.?.outcome.effects.sequence);
+            try db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 });
+            try std.testing.expectEqual(@as(u64, 7), (try db.orderedApplyReceipt()).?.index);
+            try std.testing.expectEqual(.committed, try db.getTransactionStatus(v2_id));
+            // A new log entry may retry the terminal decision, but cannot
+            // replace its original authority or mint a newer effects receipt.
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.resolveReplicatedCompletionTransactionAtOrderedReceipt(v2_id, .committed, 40, .{ .term = 1, .index = 8 }, null, replacement_owner));
+            try std.testing.expectEqual(@as(u64, 7), (try db.orderedApplyReceipt()).?.index);
+            try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(v2_id, .committed, 40, .{ .term = 1, .index = 8 }, null, routed_owner);
+            const retried = try db.historyResolution(a, .{ .authority = .raft, .namespace = namespace, .transaction_id = v2_id, .owner_fence = routed_owner.digest(), .manifest_digest = (try v2.manifest(40)).digest(), .commit_version = 40, .minimum_applied_index = 8 });
+            try std.testing.expectEqualDeep(receipt.resolution, retried.resolution);
+
+            // Guard/checkpoint participants still require an explicit prepared
+            // vote. Their positive no-effect receipt comes from resolution.
+            const guard_id: [16]u8 = @splat(10);
+            const guard_prepare: db_mod.types.BatchRequest = .{ .timestamp_ns = 50, .document_version_scheme = .revision_v1, .transaction = .{ .prepare = .{ .txn_id = guard_id, .topology_epoch = 1, .completion_owner = routed_owner } } };
+            const guard_input = try batch_wire.completionPrepareInput(a, guard_prepare);
+            defer a.free(guard_input);
+            const guard_members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = routed_owner.digest(), .roles = completion.Roles.guards | completion.Roles.checkpoint, .locator = members[0].locator, .input_digest = completion.preparedInputDigest(namespace, guard_input) }};
+            var guard_plan: completion.Admission = .{ .version = 2, .transaction_id = guard_id, .admission_digest = @splat(11), .coordinator_namespace = namespace, .coordinator_fence = routed_owner.digest(), .participants = &guard_members };
+            const guard_bytes = try completion.encodeAdmission(a, guard_plan);
+            defer a.free(guard_bytes);
+            _ = try db.beginReplicatedCompletionTransaction(guard_bytes, routed_owner, 50, 51, true, .{ .term = 1, .index = 9 });
+            try std.testing.expectError(error.SourceOutcomeUnresolved, db.resolveReplicatedCompletionTransactionAtOrderedReceipt(guard_id, .committed, 52, .{ .term = 1, .index = 10 }, null, routed_owner));
+            try std.testing.expectEqual(@as(u64, 9), (try db.orderedApplyReceipt()).?.index);
+            try db.writeReplicatedTransactionAtOrderedReceipt(guard_id, .{ .completion_owner = routed_owner, .completion_input_digest = guard_members[0].input_digest, .document_version_scheme = .revision_v1 }, .{ .term = 1, .index = 10 });
+            try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(guard_id, .committed, 52, .{ .term = 1, .index = 11 }, null, routed_owner);
+            const guard_receipt = try db.historyResolution(a, .{ .authority = .raft, .namespace = namespace, .transaction_id = guard_id, .owner_fence = routed_owner.digest(), .manifest_digest = (try guard_plan.manifest(52)).digest(), .commit_version = 52, .minimum_applied_index = 11 });
+            try std.testing.expect(guard_receipt.resolution.?.outcome == .no_effect);
+            try std.testing.expectEqual(@as(u64, 11), std.mem.readInt(u64, guard_receipt.resolution.?.source_position[8..16], .little));
+
+            // Abort is legal before a prepared vote, but cannot manufacture a
+            // committed no-effect receipt for that participant.
+            guard_plan.transaction_id = @splat(12);
+            const abort_bytes = try completion.encodeAdmission(a, guard_plan);
+            defer a.free(abort_bytes);
+            _ = try db.beginReplicatedCompletionTransaction(abort_bytes, routed_owner, 60, 61, true, .{ .term = 1, .index = 12 });
+            try std.testing.expectError(error.InvalidHistoryAdmission, db.resolveReplicatedTransactionAtOrderedReceipt(guard_plan.transaction_id, .aborted, 62, .write, .none, .{ .term = 1, .index = 13 }, null));
+            try std.testing.expectEqual(.pending, try db.getTransactionStatus(guard_plan.transaction_id));
+            try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(guard_plan.transaction_id, .aborted, 62, .{ .term = 1, .index = 13 }, null, routed_owner);
+            try std.testing.expectEqual(.aborted, try db.getTransactionStatus(guard_plan.transaction_id));
+            const aborted = try db.historyResolution(a, .{ .authority = .raft, .namespace = namespace, .transaction_id = guard_plan.transaction_id, .owner_fence = routed_owner.digest(), .manifest_digest = (try guard_plan.manifest(62)).digest(), .commit_version = 62, .minimum_applied_index = 13 });
+            try std.testing.expect(aborted.resolution == null);
+
+            const StateReader = struct {
+                fn read(database: *db_mod.DB) !retained_history.State {
+                    var txn = try database.core.store.beginReadTxn();
+                    defer txn.abort();
+                    return (try retained_history.load(&txn)).?;
+                }
+            };
+            const before_publication = try StateReader.read(&db);
+            var publication_query: retained_history.CompletionPublicationQuery = .{ .owner = routed_owner, .transaction_id = v2_id, .manifest_digest = (try v2.manifest(40)).digest(), .commit_version = 40, .minimum_applied_index = 13 };
+            const not_published = try db.historyCompletionPublication(a, publication_query);
+            try std.testing.expect(not_published.publication == null);
+            try std.testing.expectEqual(@as(u64, 13), not_published.cut.index);
+            const certificate = try completion.encode(a, .{ .manifest = try v2.manifest(40), .resolutions = &.{receipt.resolution.?} });
+            defer a.free(certificate);
+            try std.testing.expectError(error.SourceOutcomeUnresolved, db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 13 }));
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.publishReplicatedCompletionCertificate(certificate, replacement_owner, .{ .term = 1, .index = 14 }));
+            var conflicting_receipt = receipt.resolution.?;
+            conflicting_receipt.outcome.effects.frame_digest[0] ^= 1;
+            const conflicting_certificate = try completion.encode(a, .{ .manifest = try v2.manifest(40), .resolutions = &.{conflicting_receipt} });
+            defer a.free(conflicting_certificate);
+            try std.testing.expectError(error.DecisionConflict, db.publishReplicatedCompletionCertificate(conflicting_certificate, routed_owner, .{ .term = 1, .index = 14 }));
+            try std.testing.expectEqualDeep(before_publication, try StateReader.read(&db));
+            try std.testing.expectEqual(@as(u64, 13), (try db.orderedApplyReceipt()).?.index);
+            const publication = try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 14 });
+            const after_publication = try StateReader.read(&db);
+            try std.testing.expectEqual(@as(u64, 14), publication.position.index);
+            const publication_observation = try db.historyCompletionPublication(a, publication_query);
+            try publication_observation.validate(publication_query);
+            var forged_observation = publication_observation;
+            forged_observation.request_digest[0] ^= 1;
+            try std.testing.expectError(error.HistoryCorrupt, forged_observation.validate(publication_query));
+            forged_observation = publication_observation;
+            forged_observation.publication.?.position.index += 1;
+            try std.testing.expectError(error.HistoryCorrupt, forged_observation.validate(publication_query));
+            try std.testing.expectEqualDeep(publication, publication_observation.publication.?);
+            try std.testing.expectEqual(@as(u64, 14), publication_observation.cut.index);
+            publication_query.minimum_applied_index = 15;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.historyCompletionPublication(a, publication_query));
+            publication_query.minimum_applied_index = 14;
+            publication_query.owner = replacement_owner;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.historyCompletionPublication(a, publication_query));
+            publication_query.owner = routed_owner;
+            publication_query.manifest_digest[0] ^= 1;
+            try std.testing.expectError(error.HistoryCorrupt, db.historyCompletionPublication(a, publication_query));
+            publication_query.manifest_digest[0] ^= 1;
+            const publication_record_raw = try db.core.store.get(a, &retained_history.completionPublicationKey(14));
+            defer a.free(publication_record_raw);
+            const publication_record = try retained_history.CompletionPublicationRecord.decode(publication_record_raw);
+            try std.testing.expectEqualDeep(v2_id, publication_record.transaction_id);
+            try std.testing.expectEqualDeep(publication.position, publication_record.position);
+            try std.testing.expectEqualDeep(publication.digest, publication_record.certificate_digest);
+            try std.testing.expectEqual(before_publication.reserved_bytes - try v2.reservationBytes(v2_bytes.len), after_publication.reserved_bytes);
+            try std.testing.expectEqual(before_publication.retained_bytes + publication.retained_bytes, after_publication.retained_bytes);
+            try std.testing.expectEqual(before_publication.latest, after_publication.latest);
+            try std.testing.expectEqualDeep(publication, try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 14 }));
+            try std.testing.expectEqualDeep(publication, try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 15 }));
+            try std.testing.expectEqualDeep(after_publication, try StateReader.read(&db));
+            try std.testing.expectError(error.NotFound, db.core.store.get(a, &retained_history.completionPublicationKey(15)));
+            const stored_certificate = try db.core.store.get(a, &retained_history.completionCertificateKey(v2_id));
+            defer a.free(stored_certificate);
+            try std.testing.expectEqualStrings(certificate, stored_certificate);
+            opened = false;
+            db.close();
+            db = try db_mod.DB.open(a, path, options);
+            opened = true;
+            try std.testing.expectEqualDeep(publication, try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 14 }));
+            try std.testing.expectEqualDeep(after_publication, try StateReader.read(&db));
+            try std.testing.expectEqual(@as(u64, 15), (try db.orderedApplyReceipt()).?.index);
+            publication_query.minimum_applied_index = 15;
+            const reopened_publication = try db.historyCompletionPublication(a, publication_query);
+            try std.testing.expectEqualDeep(publication, reopened_publication.publication.?);
+            try std.testing.expectEqual(@as(u64, 15), reopened_publication.cut.index);
+            try std.testing.expectEqualDeep(after_publication, try StateReader.read(&db));
+            var committed_guard_plan = guard_plan;
+            committed_guard_plan.transaction_id = guard_id;
+            const guard_certificate = try completion.encode(a, .{ .manifest = try committed_guard_plan.manifest(52), .resolutions = &.{guard_receipt.resolution.?} });
+            defer a.free(guard_certificate);
+            const guard_publication = try db.publishReplicatedCompletionCertificate(guard_certificate, routed_owner, .{ .term = 1, .index = 16 });
+            const after_guard_publication = try StateReader.read(&db);
+            try std.testing.expectEqual(@as(u64, 16), guard_publication.position.index);
+            const guard_observation = try db.historyCompletionPublication(a, .{ .owner = routed_owner, .transaction_id = guard_id, .manifest_digest = (try committed_guard_plan.manifest(52)).digest(), .commit_version = 52, .minimum_applied_index = 16 });
+            try std.testing.expectEqualDeep(guard_publication, guard_observation.publication.?);
+            const guard_record_raw = try db.core.store.get(a, &retained_history.completionPublicationKey(16));
+            defer a.free(guard_record_raw);
+            const guard_record = try retained_history.CompletionPublicationRecord.decode(guard_record_raw);
+            try std.testing.expectEqualDeep(guard_id, guard_record.transaction_id);
+            try std.testing.expectEqual(after_publication.reserved_bytes - try committed_guard_plan.reservationBytes(guard_bytes.len), after_guard_publication.reserved_bytes);
+            try std.testing.expectEqual(after_publication.retained_bytes + guard_publication.retained_bytes, after_guard_publication.retained_bytes);
+            try std.testing.expectEqual(before_publication.latest, after_guard_publication.latest);
+
+            // Simulate a primary metadata compaction independently of the
+            // retained completion material; this does not enable GC policy.
+            try db.core.store.delete(&(completion.record_prefix.* ++ v2_id));
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(v2_id));
+            publication_query.minimum_applied_index = 16;
+            const without_primary = try db.historyCompletionPublication(a, publication_query);
+            try without_primary.validate(publication_query);
+            try std.testing.expectEqualDeep(publication, without_primary.publication.?);
+            try std.testing.expectEqual(@as(u64, 16), without_primary.cut.index);
+            try std.testing.expectEqualDeep(publication, try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 14 }));
+            try std.testing.expectEqualDeep(after_guard_publication, try StateReader.read(&db));
+
+            // A corrupt retained ledger must neither become absence nor be
+            // repaired by this read-only path.
+            const retained_record_key = try std.fmt.allocPrint(a, "\x00\x00__committed_history__:completion_retained:{s}", .{&v2_id});
+            defer a.free(retained_record_key);
+            const retained_record = try db.core.store.get(a, retained_record_key);
+            defer a.free(retained_record);
+            retained_record[4] ^= 1;
+            try db.core.store.putBatch(&.{.{ .key = retained_record_key, .value = retained_record }}, &.{});
+            try std.testing.expectError(error.HistoryCorrupt, db.historyCompletionPublication(a, publication_query));
+            const still_corrupt = try db.core.store.get(a, retained_record_key);
+            defer a.free(still_corrupt);
+            try std.testing.expectEqualStrings(retained_record, still_corrupt);
+            retained_record[4] ^= 1;
+            try db.core.store.putBatch(&.{.{ .key = retained_record_key, .value = retained_record }}, &.{});
+            const restored_publication = try db.historyCompletionPublication(a, publication_query);
+            try std.testing.expectEqualDeep(publication, restored_publication.publication.?);
+            try std.testing.expectEqual(@as(u64, 16), (try db.orderedApplyReceipt()).?.index);
+            try std.testing.expectEqualDeep(after_guard_publication, try StateReader.read(&db));
+        }
+
+        test "ordered history consumer grant wire contracts" {
+            try @import("antfly_local_sources").api_local_table_writes.table_write_source.history_grant_wire.test_support.contracts();
+        }
+
+        test "ordered history consumer grant observations recover leases without mutation" {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/history-grant-observation", .{tmp.sub_path});
+            defer a.free(path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false, .start_resolver_workers = false };
+            var db = try db_mod.DB.open(a, path, options);
+            var opened = true;
+            defer if (opened) db.close();
+            const history = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+            var namespace: [24]u8 = @splat(0);
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 1, .big);
+            std.mem.writeInt(u64, namespace[16..24], 1, .big);
+            var grant: history.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
+            const identity = history.GrantIdentity.fromGrant(grant);
+            try std.testing.expectError(error.InvalidHistoryAdmission, db.orderedHistoryGrant(identity, 0));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedHistoryGrant(identity, 1));
+            var invalid = grant;
+            invalid.limit = 1;
+            _ = try db.applyOrderedHistoryConsumerControl(.{ .enroll = invalid }, .{ .term = 1, .index = 1 }, false);
+            const initial_marker = try db.orderedApplyReceipt();
+            try std.testing.expectEqual(.unbound, try db.orderedHistoryGrant(identity, 1));
+            try std.testing.expectEqualDeep(initial_marker, try db.orderedApplyReceipt());
+            try std.testing.expectError(error.NotFound, db.core.store.get(a, history.key));
+            const admitted = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 2 }, false);
+            const observed = try db.orderedHistoryGrant(identity, 2);
+            try std.testing.expectEqualDeep(admitted.applied.consumer.?, observed.active.consumer);
+            try std.testing.expectEqual(grant.limit, observed.active.limit);
+            try std.testing.expectEqual(null, observed.active.quiescent_latest);
+            var cut_identity = identity;
+            cut_identity.include_cut = true;
+            const admitted_marker = try db.orderedApplyReceipt();
+            try std.testing.expectEqual(@as(?u64, admitted.applied.consumer.?.start), (try db.orderedHistoryGrant(cut_identity, 2)).active.quiescent_latest);
+            try std.testing.expectEqualDeep(admitted_marker, try db.orderedApplyReceipt());
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedHistoryGrant(identity, 3));
+            try std.testing.expectError(error.OnlineSourceScopeChanged, db.nativeHistoryGrant(identity));
+            var different = identity;
+            different.sequence = 2;
+            try std.testing.expectEqual(@as(u64, 1), (try db.orderedHistoryGrant(different, 2)).other_grant.grant);
+            different = identity;
+            different.consumer = @splat(4);
+            different.sequence = 3;
+            try std.testing.expectEqual(@as(u64, 0), (try db.orderedHistoryGrant(different, 2)).absent);
+            different = identity;
+            different.authority[0] ^= 1;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedHistoryGrant(different, 2));
+            different = identity;
+            different.namespace[0] ^= 1;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedHistoryGrant(different, 2));
+            different = identity;
+            different.definition[0] ^= 1;
+            try std.testing.expectError(error.HistoryConsumerConflict, db.orderedHistoryGrant(different, 2));
+            different = identity;
+            different.policy_revision += 1;
+            try std.testing.expectError(error.HistoryConsumerConflict, db.orderedHistoryGrant(different, 2));
+            const ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .definition = grant.definition, .epoch = observed.active.consumer.epoch, .grant = grant.sequence };
+            _ = try db.applyOrderedHistoryConsumerControl(.{ .renew = .{ .reference = ref, .previous = 1000, .next = 2000 } }, .{ .term = 1, .index = 3 }, false);
+            try std.testing.expectEqual(@as(u64, 2000), (try db.orderedHistoryGrant(identity, 3)).active.consumer.expires_at_seconds);
+            _ = try db.applyOrderedHistoryConsumerControl(.{ .retire = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .definition = grant.definition, .sequence = 2, .grant = 1 } }, .{ .term = 1, .index = 4 }, false);
+            try std.testing.expectEqual(@as(u64, 2), (try db.orderedHistoryGrant(identity, 4)).retired);
+            different = identity;
+            different.sequence = 3;
+            try std.testing.expectEqual(@as(u64, 2), (try db.orderedHistoryGrant(different, 4)).absent);
+            grant.sequence = 3;
+            const fresh_command: history.Command = .{ .enroll = grant };
+            const fresh = try db.applyOrderedHistoryConsumerControl(fresh_command, .{ .term = 1, .index = 5 }, false);
+            const current = history.GrantIdentity.fromGrant(grant);
+            try std.testing.expectEqual(@as(u64, 2), (try db.orderedHistoryGrant(current, 5)).active.consumer.epoch);
+            const superseded = try db.orderedHistoryGrant(identity, 5);
+            try std.testing.expectEqual(@as(u64, 3), superseded.other_grant.grant);
+            db.close();
+            opened = false;
+            db = try db_mod.DB.open(a, path, options);
+            opened = true;
+            const before = try db.orderedApplyReceipt();
+            try std.testing.expectEqualDeep(fresh.applied.consumer.?, (try db.orderedHistoryGrant(current, 5)).active.consumer);
+            try std.testing.expectEqualDeep(before, try db.orderedApplyReceipt());
+            try std.testing.expectEqualDeep(fresh, try db.orderedHistoryOutcome(a, .{ .command = fresh_command, .entry = .{ .term = 1, .index = 5 }, .minimum_applied_index = 5 }));
+            const native_history = @import("antfly_local_sources").storage_committed_history;
+            const native_bytes = try db.core.store.get(a, native_history.state_key);
+            defer a.free(native_bytes);
+            const authority_bytes = try db.core.store.get(a, history.key);
+            defer a.free(authority_bytes);
+            // A missing native lease under a valid authority record is corrupt,
+            // never proof that enrollment can start over.
+            try db.core.store.putBatch(&.{}, &.{native_history.state_key});
+            try std.testing.expectError(error.HistoryCorrupt, db.orderedHistoryGrant(current, 5));
+            try db.core.store.putBatch(&.{.{ .key = native_history.state_key, .value = native_bytes }}, &.{});
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                try native_history.release(&txn, namespace, grant.consumer, fresh.applied.consumer.?.epoch);
+                try txn.commit();
+            }
+            try std.testing.expectError(error.HistoryCorrupt, db.orderedHistoryGrant(current, 5));
+            try db.core.store.putBatch(&.{.{ .key = native_history.state_key, .value = native_bytes }}, &.{});
+            // An uncontrolled legacy consumer cannot be adopted as a missing
+            // grant merely because its authority record is absent.
+            try db.core.store.putBatch(&.{}, &.{history.key});
+            try std.testing.expectError(error.HistoryConsumerConflict, db.orderedHistoryGrant(current, 5));
+            try db.core.store.putBatch(&.{.{ .key = history.key, .value = authority_bytes }}, &.{});
+            try std.testing.expectEqualDeep(fresh.applied.consumer.?, (try db.orderedHistoryGrant(current, 5)).active.consumer);
+            try db.core.store.putBatch(&.{.{ .key = history.key, .value = "corrupt grant authority" }}, &.{});
+            try std.testing.expectError(error.HistoryCorrupt, db.orderedHistoryGrant(current, 5));
+            try std.testing.expectEqualDeep(before, try db.orderedApplyReceipt());
+            const standalone_path = try std.fmt.allocPrint(a, "{s}-standalone", .{path});
+            defer a.free(standalone_path);
+            var standalone_options = options;
+            standalone_options.online_source_authority = .native;
+            var standalone = try db_mod.DB.open(a, standalone_path, standalone_options);
+            defer standalone.close();
+            try standalone.provisionNativeHistoryAuthority(namespace);
+            try std.testing.expectEqual(.unbound, try standalone.nativeHistoryGrant(current));
+            try std.testing.expectError(error.OnlineSourceScopeChanged, standalone.orderedHistoryGrant(current, 1));
+            const native_admitted = try standalone.nativeHistoryConsumerControl(.{ .enroll = grant });
+            try std.testing.expectEqualDeep(native_admitted.consumer.?, (try standalone.nativeHistoryGrant(current)).active.consumer);
+            try std.testing.expect((try standalone.orderedApplyReceipt()) == null);
+        }
+
+        test "ordered history consumer effects and rejections survive reopen without replaying collection" {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ordered-history-control", .{tmp.sub_path});
+            defer a.free(path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false, .start_resolver_workers = false };
+            var db = try db_mod.DB.open(a, path, options);
+            var db_open = true;
+            defer if (db_open) db.close();
+            var namespace: [24]u8 = @splat(0);
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 1, .big);
+            std.mem.writeInt(u64, namespace[16..24], 1, .big);
+            const history = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+            const ordered = db_mod.DB.ordered_history;
+            const grant: history.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
+            var invalid = grant;
+            invalid.limit = 1;
+            const rejected = try db.applyOrderedHistoryConsumerControl(.{ .enroll = invalid }, .{ .term = 1, .index = 1 }, false);
+            try std.testing.expectEqual(ordered.Rejection.invalid, rejected.rejected);
+            try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
+            const admitted = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 2 }, false);
+            const consumer = admitted.applied.consumer.?;
+            try std.testing.expectEqual(@as(u64, 1), consumer.epoch);
+            try std.testing.expectEqualDeep(admitted, try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 2 }, false));
+            try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "one", .value = "{\"v\":1}" }} }, .{ .term = 1, .index = 3 }, false);
+            try std.testing.expectEqualDeep(admitted, try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 2 }, false));
+            try std.testing.expectError(error.ConflictingOrderedApplyReceipt, db.applyOrderedHistoryConsumerControl(.{ .enroll = invalid }, .{ .term = 1, .index = 2 }, false));
+            const ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = consumer.epoch, .grant = grant.sequence, .definition = grant.definition };
+            const read_request: db_mod.DB.HistoryPageRequest = .{ .reference = ref, .after = .{}, .now_seconds = 100, .max_events = 1 };
+            try std.testing.expectError(error.OnlineSourceScopeChanged, db.nativeHistoryPage(a, read_request));
+            try std.testing.expectError(error.InvalidHistoryAdmission, db.orderedHistoryPage(a, read_request, 0));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedHistoryPage(a, read_request, 4));
+            var retained = try db.orderedHistoryPage(a, read_request, 3);
+            defer retained.deinit();
+            try std.testing.expectEqual(@as(usize, 1), retained.events.len);
+            try std.testing.expectEqualStrings("{\"v\":1}", retained.events[0].after.?);
+            try std.testing.expectEqual(@as(u64, 1), retained.next.sequence);
+            try std.testing.expect(retained.caught_up);
+            const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire;
+            const encoded_page = try wire.encode(a, retained, read_request);
+            defer a.free(encoded_page);
+            var transported = try wire.decode(a, encoded_page, read_request);
+            defer transported.deinit();
+            try std.testing.expectEqualDeep(retained.header, transported.header);
+            try std.testing.expectEqualDeep(retained.events, transported.events);
+            var failing_read = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            try std.testing.expectError(error.OutOfMemory, db.orderedHistoryPage(failing_read.allocator(), read_request, 3));
+            var expired_read = read_request;
+            expired_read.now_seconds = grant.expires_at_seconds;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedHistoryPage(a, expired_read, 3));
+            const bad_ack = try db.applyOrderedHistoryConsumerControl(.{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 999 } }, .{ .term = 1, .index = 4 }, false);
+            try std.testing.expectEqual(ordered.Rejection.checkpoint_conflict, bad_ack.rejected);
+            const ack: history.Command = .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 1 } };
+            const confirmed = try db.applyOrderedHistoryConsumerControl(ack, .{ .term = 1, .index = 5 }, false);
+            try std.testing.expectEqual(@as(u64, 1), confirmed.applied.consumer.?.acknowledged);
+            db.close();
+            db_open = false;
+            db = try db_mod.DB.open(a, path, options);
+            db_open = true;
+            try std.testing.expectEqualDeep(confirmed, try db.applyOrderedHistoryConsumerControl(ack, .{ .term = 1, .index = 5 }, false));
+            // The page owns its historical image across writer close/reopen.
+            try std.testing.expectEqualStrings("{\"v\":1}", retained.events[0].after.?);
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedHistoryPage(a, read_request, 5));
+            var caught_up_request = read_request;
+            caught_up_request.after = retained.next;
+            var caught_up_page = try db.orderedHistoryPage(a, caught_up_request, 5);
+            defer caught_up_page.deinit();
+            try std.testing.expect(caught_up_page.caught_up);
+            try std.testing.expectEqual(@as(usize, 0), caught_up_page.events.len);
+
+            try std.testing.expectEqual(.superseded, try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 2 }, false));
+            const closed: history.Command = .{ .retire = .{ .namespace = namespace, .authority = grant.authority, .sequence = 2, .consumer = grant.consumer, .definition = grant.definition, .grant = 1 } };
+            _ = try db.applyOrderedHistoryConsumerControl(closed, .{ .term = 1, .index = 6 }, false);
+            const late = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 7 }, false);
+            try std.testing.expectEqual(ordered.Rejection.resynchronization, late.rejected);
+            var fresh = grant;
+            fresh.sequence = 3;
+            const renewed = try db.applyOrderedHistoryConsumerControl(.{ .enroll = fresh }, .{ .term = 1, .index = 8 }, false);
+            try std.testing.expectEqual(@as(u64, 2), renewed.applied.consumer.?.epoch);
+            const stored = try db.core.store.get(a, ordered.key);
+            defer a.free(stored);
+            const original = try ordered.Record.decode(stored);
+            try std.testing.expectEqualDeep(renewed, original.outcome);
+            const corrupt = try a.dupe(u8, stored);
+            defer a.free(corrupt);
+            corrupt[48] ^= 1;
+            try db.core.store.putBatch(&.{.{ .key = ordered.key, .value = corrupt }}, &.{});
+            try std.testing.expectError(error.HistoryCorrupt, db.applyOrderedHistoryConsumerControl(.{ .enroll = fresh }, .{ .term = 1, .index = 8 }, false));
+            try std.testing.expectError(error.HistoryCorrupt, db.orderedHistoryOutcome(a, .{ .command = .{ .enroll = fresh }, .entry = .{ .term = 1, .index = 8 }, .minimum_applied_index = 8 }));
+            try db.core.store.putBatch(&.{.{ .key = ordered.key, .value = stored }}, &.{});
+            for ([_]u64{ 9, 10 }) |index| try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "one", .value = "{\"v\":2}" }} }, .{ .term = 1, .index = index }, false);
+            const fresh_ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = renewed.applied.consumer.?.epoch, .grant = fresh.sequence, .definition = grant.definition };
+            _ = try db.applyOrderedHistoryConsumerControl(.{ .acknowledge = .{ .reference = fresh_ref, .previous = 1, .next = 3 } }, .{ .term = 1, .index = 11 }, false);
+            const collect: history.Command = .{ .reclaim = .{ .reference = fresh_ref, .max_frames = 1 } };
+            const collected = try db.applyOrderedHistoryConsumerControl(collect, .{ .term = 1, .index = 12 }, false);
+            try std.testing.expectEqual(@as(u8, 1), collected.applied.reclaimed_frames);
+            const state_key = "\x00\x00__committed_history__:state";
+            const collected_state = try db.core.store.get(a, state_key);
+            defer a.free(collected_state);
+            db.close();
+            db_open = false;
+            db = try db_mod.DB.open(a, path, options);
+            db_open = true;
+            try std.testing.expectEqualDeep(collected, try db.applyOrderedHistoryConsumerControl(collect, .{ .term = 1, .index = 12 }, false));
+            const replayed_state = try db.core.store.get(a, state_key);
+            defer a.free(replayed_state);
+            try std.testing.expectEqualSlices(u8, collected_state, replayed_state);
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            try std.testing.expectError(error.OutOfMemory, ordered.fingerprint(failing.allocator(), collect));
+            for (std.enums.values(ordered.Rejection)) |reason| {
+                var record = original;
+                record.outcome = .{ .rejected = reason };
+                try std.testing.expectEqualDeep(record, try ordered.Record.decode(&(try record.encode())));
+            }
+        }
+        test "ordered history consumer captures bootstrap with replay at its original cut" {
+            const a = std.testing.allocator;
+            const history = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ordered-bootstrap-control", .{tmp.sub_path});
+            defer a.free(path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false, .start_resolver_workers = false };
+            var db = try db_mod.DB.open(a, path, options);
+            var open = true;
+            defer if (open) db.close();
+            var namespace: [24]u8 = undefined;
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 1, .big);
+            std.mem.writeInt(u64, namespace[16..24], 1, .big);
+            const grant: history.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
+            const capture: history.Command = .{ .capture_bootstrap = .{ .grant = grant, .expires_at_seconds = 500 } };
+            try db.applyOrderedCommittedMutation(.{ .writes = &.{ .{ .key = "one", .value = "{\"v\":1}" }, .{ .key = "two", .value = "{\"v\":3}" } } }, .{ .term = 1, .index = 1 }, false);
+            const applied = try db.applyOrderedHistoryConsumerControl(capture, .{ .term = 1, .index = 2 }, false);
+            const enrolled = applied.applied.consumer.?;
+            try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "one", .value = "{\"v\":2}" }} }, .{ .term = 1, .index = 3 }, false);
+            db.close();
+            open = false;
+            db = try db_mod.DB.open(a, path, options);
+            open = true;
+            try std.testing.expectEqualDeep(applied, try db.applyOrderedHistoryConsumerControl(capture, .{ .term = 1, .index = 2 }, false));
+            try std.testing.expectEqualDeep(applied, try db.applyOrderedHistoryConsumerControl(capture, .{ .term = 1, .index = 4 }, false));
+            const ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.epoch, .grant = grant.sequence, .definition = grant.definition };
+            var identity = history.GrantIdentity.fromGrant(grant);
+            try std.testing.expect((try db.orderedHistoryGrant(identity, 4)).active.bootstrap == null);
+            identity.include_bootstrap = true;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedHistoryGrant(identity, 5));
+            const pin = (try db.orderedHistoryGrant(identity, 4)).active.bootstrap.?;
+            try std.testing.expectEqual(@as(u64, 500), pin.expires_at_seconds);
+            const history_page = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page;
+            const page_request: history_page.BootstrapRequest = .{ .reference = ref, .digest = pin.digest, .now_seconds = 100, .max_rows = 1 };
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.historyBootstrapPage(a, page_request, 5));
+            try std.testing.expectError(error.OnlineSourceScopeChanged, db.historyBootstrapPage(a, page_request, null));
+            var first = try db.historyBootstrapPage(a, page_request, 4);
+            defer first.deinit();
+            try std.testing.expect(!first.done);
+            try std.testing.expectEqual(@as(u32, 1), first.next_row);
+            const bootstrap_wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_bootstrap_wire;
+            const encoded = try bootstrap_wire.encode(a, first, page_request);
+            defer a.free(encoded);
+            var transported = try bootstrap_wire.decode(a, encoded, page_request);
+            defer transported.deinit();
+            try std.testing.expectEqualDeep(first.rows, transported.rows);
+            var next = page_request;
+            next.after_rows = first.next_row;
+            try std.testing.expectError(error.HistoryCorrupt, bootstrap_wire.decode(a, encoded, next));
+            encoded[encoded.len - 1] ^= 1;
+            try std.testing.expectError(error.HistoryCorrupt, bootstrap_wire.decode(a, encoded, page_request));
+            var second = try db.historyBootstrapPage(a, next, 4);
+            defer second.deinit();
+            try std.testing.expect(second.done);
+            try std.testing.expectEqual(@as(u32, 2), second.next_row);
+            next.after_rows = 3;
+            try std.testing.expectError(error.HistoryCheckpointConflict, db.historyBootstrapPage(a, next, 4));
+            next = page_request;
+            next.max_bytes = 1;
+            try std.testing.expectError(error.HistoryTooLarge, db.historyBootstrapPage(a, next, 4));
+            const release: history.Command = .{ .release_bootstrap = .{ .reference = ref, .digest = pin.digest } };
+            _ = (try db.applyOrderedHistoryConsumerControl(release, .{ .term = 1, .index = 5 }, false)).applied;
+            try std.testing.expect((try db.orderedHistoryGrant(identity, 5)).active.bootstrap == null);
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.historyBootstrapPage(a, page_request, 5));
+            try std.testing.expectEqualStrings("{\"v\":1}", first.rows[0].value);
+            try std.testing.expectEqualStrings("{\"v\":3}", second.rows[0].value);
+            var tail = try db.orderedHistoryPage(a, .{ .reference = ref, .after = .{ .sequence = enrolled.start }, .now_seconds = 100 }, 5);
+            defer tail.deinit();
+            try std.testing.expectEqualStrings("{\"v\":2}", tail.events[0].after.?);
+        }
+
+        test "provisioned native history root retains committed images across writer reopen and fences replacement" {
+            if (comptime control_only_storage_sources) return error.SkipZigTest;
+            const a = std.testing.allocator;
+            const Catalog = struct {
+                tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "docs", .placement_role = "data", .indexes_json = "{}" }},
+                ranges: [1]metadata_table_manager.RangeRecord = .{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }},
+                fn iface(self: *@This()) table_catalog.CatalogSource {
+                    const Routing = table_catalog.TestAdminRoutingAdapter(snapshot, free);
+                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = Routing.routingSnapshot, .linearizable_routing_snapshot = Routing.linearizableSnapshot, .free_routing_snapshot = Routing.freeRoutingSnapshot } };
+                }
+                fn snapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &self.tables, .ranges = &self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-history-root", .{tmp.sub_path});
+            defer a.free(path);
+            var catalog: Catalog = .{};
+            var cache = ProvisionedTableWriteCache.init(a);
+            defer cache.deinit();
+            var owner = ProvisionedTableWriteSource.init(path, catalog.iface());
+            defer deinitManagedSourceForTest(&owner, &cache);
+            owner.write_cache = &cache;
+            try std.testing.expectError(error.ChangefeedCapabilityUnsupported, owner.bindNativeHistoryRoot(a, "docs", 7001));
+            _ = owner.withNativeHistoryOwner(true);
+            var root = try owner.bindNativeHistoryRoot(a, "docs", 7001);
+            defer root.deinit();
+            const source = root.source();
+            const namespace = try source.nativeSourceAdmissionNamespace();
+            try std.testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, namespace[0..8], .big));
+            const enrolled = (try source.nativeHistoryConsumerControl(.{ .enroll = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 } })).consumer.?;
+            const history = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+            const request: history.history_page.Request = .{ .reference = .{ .namespace = namespace, .authority = @splat(1), .consumer = @splat(2), .epoch = enrolled.epoch, .grant = 1, .definition = @splat(3) }, .after = .{ .sequence = enrolled.start }, .now_seconds = 100, .max_events = 10, .max_bytes = 65536 };
+            _ = try owner.source().batch(a, "docs", .{ .writes = &.{.{ .key = "one", .value = "{\"n\":1}" }}, .sync_level = .write });
+            var first = try source.nativeHistoryPage(a, request);
+            defer first.deinit();
+            try std.testing.expectEqual(@as(usize, 1), first.events.len);
+            try std.testing.expectEqualStrings("{\"n\":1}", first.events[0].after.?);
+            cache.deinit();
+            cache = ProvisionedTableWriteCache.init(a);
+            try std.testing.expectEqual(namespace, try source.nativeSourceAdmissionNamespace());
+            _ = try owner.source().batch(a, "docs", .{ .writes = &.{.{ .key = "one", .value = "{\"n\":99}" }}, .sync_level = .write });
+            var replay = try source.nativeHistoryPage(a, request);
+            defer replay.deinit();
+            try std.testing.expectEqual(first.header.?.sequence, replay.header.?.sequence);
+            try std.testing.expectEqualStrings("{\"n\":1}", replay.events[0].after.?);
+            catalog.tables[0].table_id = 8;
+            catalog.ranges[0].table_id = 8;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, source.nativeSourceAdmissionNamespace());
+            try std.testing.expectError(error.HistoryResynchronizationRequired, source.nativeHistoryPage(a, request));
+            catalog.tables[0].table_id = 7;
+            catalog.ranges[0].table_id = 7;
+            _ = owner.withNativeHistoryOwner(false);
+            try std.testing.expectError(error.ChangefeedCapabilityUnsupported, source.nativeHistoryPage(a, request));
+            _ = owner.withNativeHistoryOwner(true);
+            // A serving profile cannot convert a persisted Raft root, or a
+            // legacy ordered artifact without a versioned authority record.
+            for ([_]u64{ 7002, 7003 }) |group| {
+                catalog.ranges[0].group_id = group;
+                const db_path = try metadata_mod.groupDbPathFromReplicaRoot(a, path, group);
+                defer a.free(db_path);
+                {
+                    var ordered = try db_mod.DB.open(a, db_path, .{ .identity_namespace = tableIdentityNamespaceForRangeId(7, catalog.ranges[0]), .online_source_authority = if (group == 7002) .raft else null, .start_optional_runtimes = false, .start_index_workers = false, .start_resolver_workers = false });
+                    defer ordered.close();
+                    if (group == 7003) try ordered.core.store.putBatch(&.{.{ .key = &internal_keys.ordered_document_applied_entry_key, .value = "ordered-owner-proof" }}, &.{});
+                }
+                try std.testing.expectError(error.OnlineSourceScopeChanged, owner.bindNativeHistoryRoot(a, "docs", group));
+            }
+        }
         // Source quiescence joins source-owned work; cached DB workers also
         // borrow it through runtime hooks and must drain before its destruction.
         fn deinitManagedSourceForTest(source: *ProvisionedTableWriteSource, cache: *ProvisionedTableWriteCache) void {
@@ -43977,6 +44927,720 @@ fn implementationTests() type {
 
             _ = (try source.source().acknowledgeTransactionCommit(alloc, txn_id, 0, "docs")) orelse return error.TestUnexpectedResult;
             try std.testing.expect(!try db.hasTopologySensitiveTransactions());
+        }
+
+        test "bound source admission survives receipt eviction and restart without repeating transforms" {
+            const admission = @import("antfly_local_sources").api_local_table_writes.source_admission;
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-source-admission", .{tmp.sub_path});
+            defer alloc.free(path);
+            const options: db_mod.OpenOptions = .{
+                .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+                .online_source_authority = .native,
+            };
+            var db = try db_mod.DB.open(alloc, path, options);
+            defer db.close();
+            try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"count\":0}" }}, .sync_level = .write });
+            var source = BoundTableWriteSource.init("docs", &db);
+            var request: distributed_txn.TableCommitRequest = .{
+                .table_name = "docs",
+                .transforms = &.{.{
+                    .key = "counter",
+                    .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+                }},
+            };
+            var command: admission.Command = .{
+                .table_id = 7,
+                .generation = 1,
+                .source = "postgres",
+                .epoch = "slot",
+                .definition_digest = @splat(1),
+                .batch_id = "one",
+                .source_sequence = 10,
+                .checkpoint = "cp1",
+                .payload_digest = @splat(2),
+                .participant_digest = admission.operationsDigest(request),
+                .accepted_at_ns = 20_000,
+                .receipt_window = 2,
+            };
+            const first_command = command;
+            for (0..3) |i| {
+                if (i == 1) {
+                    command.batch_id = "two";
+                    command.source_sequence = 20;
+                    command.expected_checkpoint = "cp1";
+                    command.checkpoint = "cp2";
+                    command.accepted_at_ns += 1;
+                } else if (i == 2) {
+                    command.batch_id = "three";
+                    command.source_sequence = 30;
+                    command.expected_checkpoint = "cp2";
+                    command.checkpoint = "cp1";
+                    command.accepted_at_ns += 1;
+                }
+                request.source_admission = command;
+                const first = (try source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{request}, .write)).?;
+                try std.testing.expect(first == .committed);
+                const retry = (try source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{request}, .write)).?;
+                try std.testing.expect(retry == .committed);
+                var altered = request;
+                altered.source_admission.?.payload_digest = @splat(3);
+                try std.testing.expectError(error.SourcePayloadConflict, source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{altered}, .write));
+                _ = try source.source().acknowledgeTransactionCommit(alloc, command.transactionId(), 0, "docs");
+            }
+            request.source_admission = first_command;
+            try std.testing.expectError(error.SourceReceiptExpired, source.source().commitTransactionWithId(alloc, first_command.transactionId(), first_command.accepted_at_ns, &.{request}, .write));
+            try std.testing.expectError(error.InvalidIntegrityOperation, db.batch(.{ .writes = &.{.{ .key = &admission.headKey(command), .value = "forged" }} }));
+            db.close();
+            db = try db_mod.DB.open(alloc, path, options);
+            source = BoundTableWriteSource.init("docs", &db);
+            request.source_admission = command;
+            const recovered = (try source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{request}, .write)).?;
+            try std.testing.expect(recovered == .committed);
+            var result = (try db.lookup(alloc, "counter", .{})).?;
+            defer result.deinit(alloc);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("count").?.integer);
+
+            command.batch_id = "prepared-before-restart";
+            command.source_sequence = 40;
+            command.expected_checkpoint = "cp1";
+            command.checkpoint = "cp3";
+            command.accepted_at_ns += 1;
+            request.source_admission = command;
+            const participant = try distributed_txn.participantIdForGroup(alloc, "docs", 0);
+            defer alloc.free(participant);
+            _ = try db.beginSourceTransaction(command, command.accepted_at_ns, &.{participant});
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(command.transactionId(), command.accepted_at_ns, command.accepted_at_ns, &.{participant}, true, true));
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.resolveTransactionIntents(command.transactionId(), .aborted, command.accepted_at_ns + 1));
+            try std.testing.expectError(error.SourceOutcomeUnresolved, db.resolveSourceTransaction(command, .committed, .write, .none));
+            try db.writeTransaction(command.transactionId(), .{
+                .source_admission = command,
+                .transforms = request.transforms,
+            });
+            // Repeated prepare validates committed versions without treating
+            // this same transaction's own intents as another writer.
+            try db.writeTransaction(command.transactionId(), .{
+                .source_admission = command,
+                .transforms = request.transforms,
+            });
+            try std.testing.expect((try db.sourceAdmissionReceipt(command)) == null);
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeTransaction(command.transactionId(), .{ .writes = &.{.{ .key = "counter", .value = "{\"count\":999}" }} }));
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.resolveTransactionIntents(command.transactionId(), .committed, command.accepted_at_ns + 1));
+            db.close();
+            db = try db_mod.DB.open(alloc, path, options);
+            source = BoundTableWriteSource.init("docs", &db);
+            var altered_pending = command;
+            altered_pending.payload_digest = @splat(4);
+            try std.testing.expectError(error.SourcePayloadConflict, db.sourceAdmissionReceipt(altered_pending));
+            var altered_request = request;
+            altered_request.source_admission = altered_pending;
+            try std.testing.expectError(error.SourcePayloadConflict, source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{altered_request}, .write));
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try db.getTransactionStatus(command.transactionId()));
+            // Recover using only the durable command and original coordinator
+            // locator, including after the live table locator has changed.
+            source.table_name = "renamed-docs";
+            const resolved = (try source.source().resolveSourceAdmission(alloc, "docs", command, .write, .{})).?;
+            try std.testing.expect(resolved == .committed);
+            try std.testing.expect((try db.sourceAdmissionReceipt(command)) != null);
+            var final = (try db.lookup(alloc, "counter", .{})).?;
+            defer final.deinit(alloc);
+            var final_parsed = try std.json.parseFromSlice(std.json.Value, alloc, final.json, .{});
+            defer final_parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 4), final_parsed.value.object.get("count").?.integer);
+            try source.source().releaseSourceAdmission(alloc, "docs", command);
+            try source.source().releaseSourceAdmission(alloc, "docs", command);
+            try std.testing.expect(try db.cleanupTransactionMetadataIfEligible(command.transactionId(), std.math.maxInt(u64), std.math.maxInt(u64)));
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(command.transactionId()));
+            const released = (try source.source().resolveSourceAdmission(alloc, "docs", command, .write, .{})).?;
+            try std.testing.expect(released == .committed);
+            try std.testing.expect(released.committed.coordinator_table_name == null);
+        }
+
+        test "bound source admission actor recovers real native and metadata stores after lost replies" {
+            const delivery = @import("../metadata/source_delivery.zig");
+            const native = @import("../metadata/native_source_delivery.zig");
+            const admission = @import("antfly_local_sources").api_local_table_writes.source_admission;
+            const control = @import("../metadata/source_control.zig");
+            const Store = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
+            const Context = struct {
+                cancellation: db_mod.types.CancellationToken = .none,
+                pub fn ensureActive(_: @This()) !void {}
+            };
+            const Service = struct {
+                store: *Store,
+                metadata_group_id: u64 = @import("antfly_local_sources").common_group_ids.main_metadata_group_id,
+                revision: u64 = 0,
+                lose_accept_ack: bool = false,
+                lose_reserve_ack: bool = false,
+                lose_replan_ack: bool = false,
+                lost: bool = false,
+                pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, version: u16) !void {
+                    try std.testing.expectEqual(control.protocol_version, version);
+                }
+                pub fn ensureLinearizableReadWithContext(_: *@This(), _: Context) !void {}
+                pub fn projectedStore(self: *@This()) ?*Store {
+                    return self.store;
+                }
+                pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: anytype) !u64 {
+                    try self.store.applyStandaloneCommand(self.metadata_group_id, .{ .apply_source_control = command.apply_source_control });
+                    var write = try control.parseWrite(std.testing.allocator, command.apply_source_control);
+                    defer write.deinit();
+                    self.lost = (self.lose_accept_ack and write.value.mutation == .accept) or
+                        (self.lose_reserve_ack and write.value.mutation == .reserve) or
+                        (self.lose_replan_ack and write.value.mutation == .replan);
+                    self.revision += 1;
+                    return self.revision;
+                }
+                fn state(self: *@This(), allocator: std.mem.Allocator, source_scope: control.Scope) !std.json.Parsed(control.State) {
+                    const bytes = try self.store.getSourceControl(allocator, self.metadata_group_id, source_scope.table_id, source_scope.source_id);
+                    defer allocator.free(bytes);
+                    return control.parse(allocator, bytes);
+                }
+                pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: Context) !void {
+                    if (self.lost) return error.TestLostMetadataReply;
+                }
+            };
+            const Adapter = struct {
+                inner: native.Adapter,
+                lose_reply: bool = true,
+                block_release: bool = false,
+                admissions: usize = 0,
+                replans: usize = 0,
+                pub fn validateScope(self: *@This(), scope: control.Scope) !void {
+                    return self.inner.validateScope(scope);
+                }
+                pub fn plan(self: *@This(), a: std.mem.Allocator, scope: control.Scope, input: delivery.Input, table: distributed_txn.TableCommitRequest) !delivery.Plan {
+                    return self.inner.plan(a, scope, input, table);
+                }
+                pub fn resolve(self: *@This(), a: std.mem.Allocator, scope: control.Scope, pending: control.Reservation, request: Context) !?delivery.Acceptance {
+                    return self.inner.resolve(a, scope, pending, request);
+                }
+                pub fn admit(self: *@This(), a: std.mem.Allocator, scope: control.Scope, pending: control.Reservation, table: distributed_txn.TableCommitRequest, request: Context) !delivery.Acceptance {
+                    self.admissions += 1;
+                    const result = try self.inner.admit(a, scope, pending, table, request);
+                    if (self.lose_reply) return error.TestLostDestinationReply;
+                    return result;
+                }
+                pub fn replan(self: *@This(), allocator: std.mem.Allocator, source_scope: control.Scope, pending: control.Reservation, request_table: distributed_txn.TableCommitRequest, context: Context) !delivery.Replan {
+                    self.replans += 1;
+                    return self.inner.replan(allocator, source_scope, pending, request_table, context);
+                }
+                pub fn inspect(self: *@This(), a: std.mem.Allocator, scope: control.Scope, receipt: []const u8) !delivery.ReceiptIdentity {
+                    return self.inner.inspect(a, scope, receipt);
+                }
+                pub fn release(self: *@This(), a: std.mem.Allocator, scope: control.Scope, receipt: []const u8, request: Context) !void {
+                    if (self.block_release) return error.TestReleaseUnavailable;
+                    return self.inner.release(a, scope, receipt, request);
+                }
+            };
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/delivery-native", .{tmp.sub_path});
+            defer a.free(path);
+            const meta_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/delivery-metadata", .{tmp.sub_path});
+            defer a.free(meta_path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native };
+            var db = try db_mod.DB.open(a, path, options);
+            defer db.close();
+            try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"count\":0}" }}, .sync_level = .write });
+            var bound = BoundTableWriteSource.init("docs", &db);
+            var metadata_store = try Store.init(a, .{ .root_dir = meta_path });
+            defer metadata_store.deinit();
+            var svc: Service = .{ .store = &metadata_store };
+            const config = "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]";
+            try metadata_store.applyStandaloneCommand(svc.metadata_group_id, .{ .upsert_table = .{ .table_id = 7, .name = "docs", .schema_json = "{}", .replication_sources_json = config } });
+            var adapter: Adapter = .{ .inner = try native.Adapter.init(bound.source(), "docs") };
+            const scope: control.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = try control.definitionDigest(a, config, 0), .provider = @splat(3), .destination = .native, .destination_binding = native.binding(adapter.inner.namespace) };
+            var catalog: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(config, &catalog, .{});
+            var input: delivery.Input = .{ .batch_id = "one", .checkpoint = "cp", .payload_digest = @splat(4), .accepted_at_ns = 20_000 };
+            var table: distributed_txn.TableCommitRequest = .{ .table_name = "docs", .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }} };
+            try std.testing.expectError(error.TestLostDestinationReply, delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{}));
+            db.close();
+            metadata_store.deinit();
+            db = try db_mod.DB.open(a, path, options);
+            metadata_store = try Store.init(a, .{ .root_dir = meta_path });
+            bound = BoundTableWriteSource.init("renamed-docs", &db);
+            adapter.inner = try native.Adapter.init(bound.source(), "renamed-docs");
+            var recovered = try delivery.recover(&svc, &adapter, a, scope, catalog, Context{});
+            try std.testing.expectEqual(@as(u64, 1), recovered.value.committed.sequence);
+            try std.testing.expect(recovered.value.pending == null);
+            recovered.deinit();
+            table.table_name = "renamed-docs";
+            input.accepted_at_ns = 999_000;
+            var duplicate = try delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{});
+            duplicate.deinit();
+            try std.testing.expectEqual(@as(usize, 1), adapter.admissions);
+            input.payload_digest = @splat(5);
+            try std.testing.expectError(error.SourcePayloadConflict, delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{}));
+            input.batch_id = "two";
+            input.expected_checkpoint = "cp";
+            adapter.lose_reply = false;
+            svc.lose_accept_ack = true;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{}));
+            adapter.block_release = true;
+            try std.testing.expectError(error.TestReleaseUnavailable, delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{}));
+            adapter.block_release = false;
+            svc.lose_accept_ack = false;
+            var final = try delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{});
+            defer final.deinit();
+            try std.testing.expectEqual(@as(u64, 2), final.value.committed.sequence);
+            try std.testing.expectEqual(@as(usize, 2), adapter.admissions);
+            // Progress-only polls still commit the source checkpoint in the
+            // destination transaction, without inventing a document mutation.
+            input.batch_id = "progress-only";
+            input.expected_checkpoint = "cp";
+            input.checkpoint = "cp3";
+            input.payload_digest = @splat(6);
+            input.accepted_at_ns += 1;
+            table.transforms = &.{};
+            var progress_only = try delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{});
+            defer progress_only.deinit();
+            try std.testing.expectEqual(@as(u64, 3), progress_only.value.committed.sequence);
+            try std.testing.expectEqualStrings("cp3", progress_only.value.committed.checkpoint);
+            try std.testing.expectEqual(@as(usize, 3), adapter.admissions);
+            var row = (try db.lookup(a, "counter", .{})).?;
+            defer row.deinit(a);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, row.json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("count").?.integer);
+            // Reordering the current catalog relocates this same source; it
+            // cannot reset its checkpoint or allocate a new delivery identity.
+            const moved_config = "[{\"type\":\"postgres\",\"postgres_table\":\"other\"},{\"type\":\"postgres\",\"postgres_table\":\"users\"}]";
+            try metadata_store.applyStandaloneCommand(svc.metadata_group_id, .{ .upsert_table = .{ .table_id = 7, .name = "renamed-docs", .schema_json = "{}", .replication_sources_json = moved_config } });
+            var moved = scope;
+            moved.source_ordinal = 1;
+            std.crypto.hash.sha2.Sha256.hash(moved_config, &catalog, .{});
+            var relocated = try delivery.recover(&svc, &adapter, a, moved, catalog, Context{});
+            defer relocated.deinit();
+            try std.testing.expectEqual(@as(u32, 1), relocated.value.scope.?.source_ordinal);
+            try std.testing.expectEqual(@as(u64, 3), relocated.value.committed.sequence);
+            try std.testing.expectEqualStrings("cp3", relocated.value.committed.checkpoint);
+            try std.testing.expectEqual(@as(usize, 3), adapter.admissions);
+            var recovery_arena = std.heap.ArenaAllocator.init(a);
+            defer recovery_arena.deinit();
+            const recovery_alloc = recovery_arena.allocator();
+            const Fixture = struct {
+                fn command(allocator: std.mem.Allocator, source_scope: control.Scope, pending: control.Reservation, request_table: distributed_txn.TableCommitRequest) !admission.Command {
+                    return .{
+                        .table_id = source_scope.table_id,
+                        .generation = source_scope.generation,
+                        .source = try allocator.dupe(u8, &std.fmt.bytesToHex(source_scope.source_id, .lower)),
+                        .epoch = try allocator.dupe(u8, &std.fmt.bytesToHex(source_scope.identity(), .lower)),
+                        .definition_digest = source_scope.definition,
+                        .batch_id = pending.batch_id,
+                        .source_sequence = pending.sequence,
+                        .checkpoint = pending.checkpoint,
+                        .expected_checkpoint = pending.expected_checkpoint,
+                        .payload_digest = pending.payload_digest,
+                        .participant_digest = admission.operationsDigest(request_table),
+                        .accepted_at_ns = pending.accepted_at_ns,
+                    };
+                }
+            };
+            // Lose the reservation reply before destination admission. An empty
+            // source BEGIN may then be fenced atomically with its abort.
+            input.batch_id = "replan-me";
+            input.expected_checkpoint = "cp3";
+            input.checkpoint = "cp4";
+            input.payload_digest = @splat(7);
+            input.accepted_at_ns += 1;
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "100" }} }};
+            svc.lose_reserve_ack = true;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, delivery.deliver(&svc, &adapter, a, moved, catalog, input, table, Context{}));
+            svc.lose_reserve_ack = false;
+            var reserved = try svc.state(a, moved);
+            defer reserved.deinit();
+            const original_pending = reserved.value.pending.?;
+            const expected_reservation = original_pending.identity(moved);
+            // The catalog can reorder between reserve and replan. Locator
+            // refresh must not require a successful ordinary recovery first.
+            try metadata_store.applyStandaloneCommand(svc.metadata_group_id, .{ .upsert_table = .{ .table_id = 7, .name = "renamed-docs", .schema_json = "{}", .replication_sources_json = config } });
+            moved.source_ordinal = 0;
+            std.crypto.hash.sha2.Sha256.hash(config, &catalog, .{});
+            try std.testing.expectError(error.SourceControlConflict, delivery.replan(&svc, &adapter, a, moved, catalog, @splat(0), input, table, Context{}));
+            const old_command = try Fixture.command(recovery_alloc, moved, original_pending, table);
+            try std.testing.expectEqual(original_pending.transaction_id, old_command.transactionId());
+            const participant = try distributed_txn.participantIdForGroup(a, "renamed-docs", 0);
+            defer a.free(participant);
+            _ = try db.beginSourceTransaction(old_command, input.accepted_at_ns, &.{participant});
+            var stale_table = table;
+            stale_table.source_admission = old_command;
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }};
+            svc.lose_replan_ack = true;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, delivery.replan(&svc, &adapter, a, moved, catalog, expected_reservation, input, table, Context{}));
+            svc.lose_replan_ack = false;
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(old_command.transactionId()));
+            var replacement = try delivery.replan(&svc, &adapter, a, moved, catalog, expected_reservation, input, table, Context{});
+            defer replacement.deinit();
+            try std.testing.expectEqual(@as(usize, 1), adapter.replans);
+            try std.testing.expectEqual(@as(u32, 0), replacement.value.scope.?.source_ordinal);
+            try std.testing.expectEqual(original_pending.sequence, replacement.value.pending.?.sequence);
+            try std.testing.expectEqual(original_pending.accepted_at_ns, replacement.value.pending.?.accepted_at_ns);
+            try std.testing.expect(!std.mem.eql(u8, &old_command.transactionId(), &replacement.value.pending.?.transaction_id));
+            // The fence, not a retained transaction record, rejects late RPCs.
+            db.close();
+            metadata_store.deinit();
+            db = try db_mod.DB.open(a, path, options);
+            metadata_store = try Store.init(a, .{ .root_dir = meta_path });
+            bound = BoundTableWriteSource.init("renamed-docs", &db);
+            adapter.inner = try native.Adapter.init(bound.source(), "renamed-docs");
+            try std.testing.expectError(error.SourceAttemptRetired, db.beginSourceTransaction(old_command, input.accepted_at_ns, &.{participant}));
+            try std.testing.expectError(error.SourceAttemptRetired, bound.source().admitSourceTransaction(a, stale_table, .none));
+            input.accepted_at_ns += 100;
+            var replanned_commit = try delivery.deliver(&svc, &adapter, a, moved, catalog, input, table, Context{});
+            defer replanned_commit.deinit();
+            try std.testing.expectEqual(@as(u64, 4), replanned_commit.value.committed.sequence);
+            try std.testing.expectEqualStrings("cp4", replanned_commit.value.committed.checkpoint);
+            try std.testing.expectError(error.SourceReceiptExpired, db.retireSourceAttempt(old_command));
+            var completed_replan = try delivery.replan(&svc, &adapter, a, moved, catalog, expected_reservation, input, table, Context{});
+            defer completed_replan.deinit();
+            try std.testing.expectEqual(@as(usize, 1), adapter.replans);
+            // A prepared original plan resolves its own rows; replanning must
+            // never replace a durable vote with the newly proposed payload.
+            input.batch_id = "prepared-must-resolve";
+            input.expected_checkpoint = "cp4";
+            input.checkpoint = "cp5";
+            input.payload_digest = @splat(8);
+            input.accepted_at_ns += 1;
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "2" }} }};
+            svc.lose_reserve_ack = true;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, delivery.deliver(&svc, &adapter, a, moved, catalog, input, table, Context{}));
+            svc.lose_reserve_ack = false;
+            var prepared_reservation = try svc.state(a, moved);
+            defer prepared_reservation.deinit();
+            const prepared_pending = prepared_reservation.value.pending.?;
+            const prepared_command = try Fixture.command(recovery_alloc, moved, prepared_pending, table);
+            _ = try db.beginSourceTransaction(prepared_command, input.accepted_at_ns, &.{participant});
+            try db.writeTransaction(prepared_command.transactionId(), .{ .source_admission = prepared_command, .transforms = table.transforms });
+            try std.testing.expectError(error.SourcePendingWork, db.retireSourceAttempt(prepared_command));
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "200" }} }};
+            var original_commit = try delivery.replan(&svc, &adapter, a, moved, catalog, prepared_pending.identity(moved), input, table, Context{});
+            defer original_commit.deinit();
+            try std.testing.expectEqual(@as(u64, 5), original_commit.value.committed.sequence);
+            try std.testing.expect(original_commit.value.pending == null);
+            try std.testing.expectEqual(@as(usize, 1), adapter.replans);
+            // An ordinary BEGIN with the same ID is not source admission and
+            // cannot be aborted as collateral when closing the source grant.
+            input.batch_id = "ordinary-id-collision";
+            input.expected_checkpoint = "cp5";
+            input.checkpoint = "cp6";
+            input.payload_digest = @splat(9);
+            input.accepted_at_ns += 1;
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "100" }} }};
+            svc.lose_reserve_ack = true;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, delivery.deliver(&svc, &adapter, a, moved, catalog, input, table, Context{}));
+            svc.lose_reserve_ack = false;
+            var collision = try svc.state(a, moved);
+            defer collision.deinit();
+            const collision_pending = collision.value.pending.?;
+            const collision_command = try Fixture.command(recovery_alloc, moved, collision_pending, table);
+            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(collision_command.transactionId(), input.accepted_at_ns, input.accepted_at_ns, &.{participant}, true, true);
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }};
+            var collision_replan = try delivery.replan(&svc, &adapter, a, moved, catalog, collision_pending.identity(moved), input, table, Context{});
+            defer collision_replan.deinit();
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try db.getTransactionStatus(collision_command.transactionId()));
+            var collision_commit = try delivery.deliver(&svc, &adapter, a, moved, catalog, input, table, Context{});
+            defer collision_commit.deinit();
+            try std.testing.expectEqual(@as(u64, 6), collision_commit.value.committed.sequence);
+            try std.testing.expectEqual(@as(usize, 2), adapter.replans);
+            try db.resolveTransactionIntents(collision_command.transactionId(), .aborted, input.accepted_at_ns + 1);
+            var final_row = (try db.lookup(a, "counter", .{})).?;
+            defer final_row.deinit(a);
+            var final_value = try std.json.parseFromSlice(std.json.Value, a, final_row.json, .{});
+            defer final_value.deinit();
+            try std.testing.expectEqual(@as(i64, 6), final_value.value.object.get("count").?.integer);
+            // Namespace capability rejects a stale/recreated immutable target.
+            var wrong = scope;
+            wrong.table_id = 8;
+            try std.testing.expectError(error.SourceBindingConflict, adapter.inner.validateScope(wrong));
+        }
+
+        test "native source plan control persists exact seal cuts across the engine boundary" {
+            try @import("source_plan_native_test.zig").run(false);
+        }
+        test "native source plan control ordered apply retains rejection and reclamation cuts" {
+            try @import("source_plan_native_test.zig").run(true);
+        }
+
+        test "native history consumer control persists leases and rejects Raft and foreign roots" {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-history-control", .{tmp.sub_path});
+            defer a.free(path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native };
+            var db = try db_mod.DB.open(a, path, options);
+            var open = true;
+            defer if (open) db.close();
+            const namespace = try db.nativeSourceAdmissionNamespace();
+            const grant: db_mod.DB.HistoryConsumerGrant = .{ .namespace = namespace, .authority = @splat(9), .sequence = 1, .consumer = @splat(1), .definition = @splat(2), .expires_at_seconds = 1000, .policy_revision = 1 };
+            var bound = BoundTableWriteSource.init("docs", &db);
+            const source = bound.source();
+            const enrolled = (try source.nativeHistoryConsumerControl(.{ .enroll = grant })).consumer.?;
+            try db.batch(.{ .writes = &.{ .{ .key = "one", .value = "{\"value\":1}" }, .{ .key = "two", .value = "{\"value\":2}" } } });
+            const ref: db_mod.DB.HistoryConsumerReference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.epoch, .grant = grant.sequence, .definition = grant.definition };
+            _ = try db.nativeHistoryConsumerControl(.{ .renew = .{ .reference = ref, .previous = 1000, .next = 2000 } });
+            db.close();
+            open = false;
+            db = try db_mod.DB.open(a, path, options);
+            open = true;
+            const found = (try db.nativeHistoryConsumerControl(.{ .inspect = ref })).consumer.?;
+            try std.testing.expectEqual(enrolled.epoch, found.epoch);
+            try std.testing.expectEqual(@as(u64, 2000), found.expires_at_seconds);
+            var page = try source.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 101, .max_events = 1 });
+            defer page.deinit();
+            try std.testing.expectEqual(.root_local, page.header.?.transaction_scope);
+            try std.testing.expectEqual(@as(usize, 1), page.events.len);
+            try std.testing.expectEqual(@as(u64, 0), page.next.sequence);
+            try std.testing.expectEqual(@as(u32, 1), page.next.event);
+            try std.testing.expect(!page.caught_up);
+            try std.testing.expectEqual(@as(u64, 0), (try db.nativeHistoryConsumerControl(.{ .inspect = ref })).consumer.?.acknowledged);
+            var retry = try db.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 101, .max_events = 1 });
+            defer retry.deinit();
+            try std.testing.expectEqualSlices(u8, page.events[0].key, retry.events[0].key);
+            try std.testing.expectEqualSlices(u8, page.events[0].after.?, retry.events[0].after.?);
+            var tail = try source.nativeHistoryPage(a, .{ .reference = ref, .after = page.next, .now_seconds = 101, .max_events = 1 });
+            defer tail.deinit();
+            try std.testing.expectEqual(@as(u64, 1), tail.next.sequence);
+            try std.testing.expectEqual(@as(u32, 0), tail.next.event);
+            try std.testing.expect(tail.caught_up);
+            try std.testing.expectError(error.HistoryTooLarge, db.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 101, .max_bytes = 1 }));
+            try std.testing.expectError(error.HistoryCheckpointConflict, db.nativeHistoryPage(a, .{ .reference = ref, .after = .{ .event = 2 }, .now_seconds = 101 }));
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 2000 }));
+            _ = try db.nativeHistoryConsumerControl(.{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 1 } });
+            _ = try db.nativeHistoryConsumerControl(.{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 1 } });
+            const reclaimed = try db.nativeHistoryConsumerControl(.{ .reclaim = .{ .reference = ref, .max_frames = 2 } });
+            try std.testing.expectEqual(@as(u8, 1), reclaimed.reclaimed_frames);
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 101 }));
+            var empty = try db.nativeHistoryPage(a, .{ .reference = ref, .after = tail.next, .now_seconds = 101 });
+            defer empty.deinit();
+            try std.testing.expect(empty.header == null and empty.events.len == 0 and empty.caught_up);
+            // Previously returned page bytes survive transaction teardown and GC.
+            try std.testing.expectEqualSlices(u8, page.events[0].after.?, retry.events[0].after.?);
+            _ = try db.nativeHistoryConsumerControl(.{ .retire = .{ .namespace = namespace, .authority = grant.authority, .sequence = 2, .consumer = grant.consumer, .definition = grant.definition, .grant = grant.sequence } });
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.nativeHistoryConsumerControl(.{ .enroll = grant }));
+            var wrong = grant;
+            wrong.namespace = @splat(3);
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.nativeHistoryConsumerControl(.{ .enroll = wrong }));
+            const raft_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/raft-history-control", .{tmp.sub_path});
+            defer a.free(raft_path);
+            var raft_options = options;
+            raft_options.online_source_authority = .raft;
+            var raft_db = try db_mod.DB.open(a, raft_path, raft_options);
+            defer raft_db.close();
+            try std.testing.expectError(error.OnlineSourceScopeChanged, raft_db.nativeHistoryConsumerControl(.{ .enroll = grant }));
+        }
+
+        test "native history consumer control persists a bootstrap image with its continuation" {
+            const a = std.testing.allocator;
+            const history = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-bootstrap-pin", .{tmp.sub_path});
+            defer a.free(path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native };
+            var db = try db_mod.DB.open(a, path, options);
+            var open = true;
+            defer if (open) db.close();
+            const namespace = try db.nativeSourceAdmissionNamespace();
+            const grant: history.Grant = .{ .namespace = namespace, .authority = @splat(9), .sequence = 1, .consumer = @splat(1), .definition = @splat(2), .expires_at_seconds = 1000, .policy_revision = 1 };
+            try db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"value\":\"before-bootstrap\"}" }} });
+            {
+                var blocked = try db.core.store.beginWriteTxn();
+                defer blocked.abort();
+                try blocked.put("\x00\x00__txn_intents__:bootstrap-guard", "prepared");
+                try std.testing.expectError(error.HistoryPreparedTransactionsPresent, history.captureBootstrap(a, &blocked, grant, 500));
+            }
+            const pin = captured: {
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                const pin = try history.captureBootstrap(a, &txn, grant, 500);
+                try txn.commit();
+                break :captured pin;
+            };
+            const ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = pin.consumer.epoch, .grant = grant.sequence, .definition = grant.definition };
+            try db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"value\":\"after-bootstrap\"}" }} });
+            db.close();
+            open = false;
+            db = try db_mod.DB.open(a, path, options);
+            open = true;
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                defer txn.abort();
+                const retry = try history.captureBootstrap(a, &txn, grant, 500);
+                try std.testing.expectEqualDeep(pin, retry);
+                const image = try history.readBootstrap(&txn, ref, pin.digest, 101);
+                var decoded = try history.BootstrapImage.decode(image);
+                const row = (try decoded.rows.next()).?;
+                try std.testing.expectEqualStrings("{\"value\":\"before-bootstrap\"}", row.value);
+                try std.testing.expectEqual(@as(?history.BootstrapImage.Row, null), try decoded.rows.next());
+                try std.testing.expectError(error.HistoryResynchronizationRequired, history.readBootstrap(&txn, ref, pin.digest, 500));
+                var wrong_digest = pin.digest;
+                wrong_digest[0] ^= 1;
+                try std.testing.expectError(error.HistoryConsumerConflict, history.releaseBootstrap(&txn, ref, wrong_digest));
+                try history.releaseBootstrap(&txn, ref, pin.digest);
+                try history.releaseBootstrap(&txn, ref, pin.digest);
+                try std.testing.expectError(error.HistoryResynchronizationRequired, history.readBootstrap(&txn, ref, pin.digest, 101));
+                try std.testing.expectEqual(pin.consumer.start, (try history.inspect(&txn, ref)).start);
+            }
+            var page = try db.nativeHistoryPage(a, .{ .reference = ref, .after = .{ .sequence = pin.consumer.start }, .now_seconds = 101 });
+            defer page.deinit();
+            try std.testing.expectEqual(pin.consumer.start + 1, page.header.?.sequence);
+            try std.testing.expect(std.mem.indexOf(u8, page.events[0].after.?, "after-bootstrap") != null);
+            _ = try db.nativeHistoryConsumerControl(.{ .retire = .{ .namespace = namespace, .authority = grant.authority, .sequence = 2, .consumer = grant.consumer, .definition = grant.definition, .grant = 1 } });
+            var txn = try db.core.store.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expectError(error.HistoryResynchronizationRequired, history.readBootstrap(&txn, ref, pin.digest, 101));
+        }
+
+        test "native history consumer control document provider preserves authorized historical replay" {
+            try @import("../metadata/native_changefeed_delivery_test.zig").run();
+            try @import("../metadata/native_changefeed_delivery_test.zig").bootstrap();
+            try @import("../metadata/native_changefeed_delivery_test.zig").coordinated();
+        }
+
+        test "native history consumer control adapter recovers metadata and root after lost progress replies" {
+            const root_adapter = @import("../metadata/native_changefeed_root.zig");
+            const control = @import("../metadata/changefeed_control.zig");
+            const Store = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
+            const Table = @import("../metadata/domain.zig").TableRecord;
+            const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+            const Harness = struct {
+                store: *Store,
+                a: std.mem.Allocator,
+                states: std.ArrayList(control.Parsed) = .empty,
+                definition: control.Definition,
+                fn deinit(self: *@This()) void {
+                    for (self.states.items) |*state| state.deinit();
+                    self.states.deinit(std.testing.allocator);
+                }
+                fn load(self: *@This()) !control.State {
+                    const bytes = try self.store.getChangefeedControl(std.testing.allocator, group, @splat(4));
+                    defer std.testing.allocator.free(bytes);
+                    var parsed = try control.parse(std.testing.allocator, bytes);
+                    errdefer parsed.deinit();
+                    try self.states.append(std.testing.allocator, parsed);
+                    return parsed.value;
+                }
+                fn mutate(self: *@This(), mutation: control.Mutation) !control.State {
+                    const before = try self.load();
+                    const write: control.Write = .{ .id = @splat(4), .authority = @splat(9), .owner = self.definition.owner, .authorization = self.definition.authorization, .expected_revision = before.revision, .expected_epoch = before.epoch, .mutation = mutation };
+                    try self.store.applyStandaloneCommand(group, .{ .apply_changefeed_control = try control.encodeWrite(self.a, write) });
+                    return self.load();
+                }
+                fn deliverAndAck(self: *@This(), state: control.State, page: anytype) !control.State {
+                    var delivery: control.Delivery = .{ .sequence = state.latest_delivery + 1, .before = state.latest_cursor, .cursor = @splat(0), .authority = control.hash(.{ .header = page.header.?, .first = page.first_ordinal, .next = page.next }), .issued_at = 200 + state.latest_delivery, .advances = &.{.{ .namespace = page.header.?.namespace, .position = .{ .sequence = page.next.sequence, .event = page.next.event } }} };
+                    delivery.cursor = delivery.identity(state.id, state.epoch);
+                    _ = try self.mutate(.{ .issue = delivery });
+                    return self.mutate(.{ .acknowledge = delivery.cursor });
+                }
+            };
+            const a = std.testing.allocator;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/native-feed-adapter", .{tmp.sub_path});
+            const meta_path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/native-feed-metadata", .{tmp.sub_path});
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native };
+            var db = try db_mod.DB.open(a, path, options);
+            var db_open = true;
+            defer if (db_open) db.close();
+            var store = try Store.init(a, .{ .root_dir = meta_path });
+            var meta_open = true;
+            defer if (meta_open) store.deinit();
+            const table: Table = .{ .table_id = 7, .name = "docs", .schema_json = "{}" };
+            try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+            var bound = BoundTableWriteSource.init("docs", &db);
+            var adapter = try root_adapter.Adapter.init(bound.source(), table);
+            const definition: control.Definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = control.tableBinding(table), .policy_revision = 1, .contract = .native_document }} };
+            var harness: Harness = .{ .store = &store, .a = scratch, .definition = definition };
+            defer harness.deinit();
+            var state = try harness.mutate(.{ .create = .{ .id = @splat(4), .definition = definition, .now = 100, .expires_at = 1000 } });
+            const plan = try adapter.plan(state);
+            state = try harness.mutate(.{ .plan_roots = &.{plan} });
+            const original_plan = state;
+            const lost_enrollment = try adapter.enroll(state);
+            // A primary commit occurs after root enrollment but before metadata
+            // receives that reply. Retrying must retain the original start cut.
+            try db.batch(.{ .writes = &.{ .{ .key = "one", .value = "{\"value\":1}" }, .{ .key = "two", .value = "{\"value\":2}" } } });
+            state = try harness.mutate(.{ .renew = .{ .now = 110, .expires_at = 1200 } });
+            const retried = try adapter.enroll(state);
+            try std.testing.expectEqual(lost_enrollment.enroll.consumer_epoch, retried.enroll.consumer_epoch);
+            try std.testing.expectEqual(lost_enrollment.enroll.start, retried.enroll.start);
+            state = try harness.mutate(retried);
+            // This fixture owns exactly one native root. It certifies only this
+            // known root set, without asserting a distributed/bootstrap cut.
+            state = try harness.mutate(.{ .seal = .{ .cut = control.hash(.{ .namespace = plan.namespace, .start = state.roots[0].start, .epoch = state.roots[0].consumer_epoch }) } });
+            const initial = state.latest_cursor;
+            var first = try adapter.read(a, state, initial, 200, 1, 1024 * 1024);
+            defer first.deinit();
+            try std.testing.expectEqual(@as(u32, 1), first.next.event);
+            state = try harness.deliverAndAck(state, first);
+            state = try harness.mutate(try adapter.flushAcknowledged(state));
+            try std.testing.expectEqual(@as(u64, 0), state.roots[0].reclaimed_through);
+            try std.testing.expectEqual(@as(u8, 0), try adapter.collect(state, 32));
+            var second = try adapter.read(a, state, state.latest_cursor, 201, 1, 1024 * 1024);
+            defer second.deinit();
+            try std.testing.expectEqual(@as(u64, 1), second.next.sequence);
+            state = try harness.deliverAndAck(state, second);
+            _ = try adapter.flushAcknowledged(state); // Lose native ACK reply.
+            try std.testing.expectEqual(@as(u8, 1), try adapter.collect(state, 32));
+            try db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"value\":3}" }} });
+            var third = try adapter.read(a, state, state.latest_cursor, 202, 1, 1024 * 1024);
+            defer third.deinit();
+            state = try harness.deliverAndAck(state, third);
+            // Metadata still records native ACK 0, while the root has ACK 1.
+            // A newer authorized target must recover that actual predecessor.
+            state = try harness.mutate(try adapter.flushAcknowledged(state));
+            try std.testing.expectEqual(@as(u64, 2), state.roots[0].reclaimed_through);
+            try std.testing.expectError(error.ChangefeedCursorExpired, adapter.read(a, state, initial, 203, 1, 1024 * 1024));
+            state = try harness.mutate(.close);
+            _ = try adapter.retire(state); // Lose root-release reply.
+            // Collection no longer needs the now-retired consumer credential.
+            try std.testing.expectEqual(@as(u8, 1), try adapter.collect(state, 32));
+            db.close();
+            db_open = false;
+            store.deinit();
+            meta_open = false;
+            db = try db_mod.DB.open(a, path, options);
+            db_open = true;
+            store = try Store.init(a, .{ .root_dir = meta_path });
+            meta_open = true;
+            adapter = try root_adapter.Adapter.init(bound.source(), table);
+            state = try harness.load();
+            state = try harness.mutate(try adapter.retire(state));
+            state = try harness.mutate(.finish_close);
+            try std.testing.expectEqual(control.Phase.deleted, state.phase);
+            try std.testing.expectEqual(@as(u8, 0), try adapter.collect(state, 32));
+            try std.testing.expectError(error.HistoryResynchronizationRequired, adapter.enroll(original_plan));
+            var object_table = table;
+            object_table.storage.engine = .object;
+            try std.testing.expectError(error.ChangefeedCapabilityUnsupported, root_adapter.Adapter.init(bound.source(), object_table));
+        }
+
+        test "bound source admission capability rejects unscoped and Raft-owned roots" {
+            const native = @import("../metadata/native_source_delivery.zig");
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            for (0..2) |i| {
+                const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-capability-{d}", .{ tmp.sub_path, i });
+                defer a.free(path);
+                var options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } };
+                if (i == 1) options.online_source_authority = .raft;
+                var db = try db_mod.DB.open(a, path, options);
+                defer db.close();
+                var bound = BoundTableWriteSource.init("docs", &db);
+                try std.testing.expectError(error.OnlineSourceScopeChanged, native.Adapter.init(bound.source(), "docs"));
+            }
         }
 
         test "bound single-group batch reports prepared intent conflicts" {

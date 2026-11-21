@@ -422,7 +422,7 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner
 fn supportsWeights(bound: *const binding.Bound) bool {
     if (bound.ordered.len != 0) return false;
     for (bound.specs) |spec| {
-        if (spec.kind == .pattern_set) return false;
+        if (spec.kind == .pattern_set or spec.kind == .array_agg) return false;
         if (!spec.distinct and (spec.kind == .sum or spec.kind == .avg) and spec.input_type != .integer and spec.input_element != .numeric) {
             // AVG can retain an exact weighted binary64 total. SUM keeps its
             // ordered overflow behavior and REAL keeps its own rounding rules.
@@ -442,7 +442,7 @@ fn multiplicity(bound: *const binding.Bound) catalog.Multiplicity {
         if (spec.distinct) continue;
         switch (spec.kind) {
             .min, .max, .bool_and, .bool_or => {},
-            .count, .sum, .avg, .pattern_set => return .exact,
+            .count, .sum, .avg, .pattern_set, .array_agg => return .exact,
         }
     }
     return .presence;

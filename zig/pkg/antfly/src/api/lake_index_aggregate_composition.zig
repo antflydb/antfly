@@ -41,7 +41,7 @@ pub const Composition = struct {
     pub fn create(a: A, recipe: Recipe, factory: Factory) !*Composition {
         if (recipe.inputs.len == 0 or recipe.inputs.len > 256) return error.InvalidSqlBackendResponse;
         for (recipe.inputs) |input| {
-            if (input.spec.distinct or input.spec.kind == .pattern_set) return error.UnsupportedNativeAggregateComposition;
+            if (input.spec.distinct or input.spec.kind == .pattern_set or input.spec.kind == .array_agg) return error.UnsupportedNativeAggregateComposition;
         }
         const self = try a.create(Composition);
         self.* = .{ .a = a, .factory = factory, .width = recipe.inputs.len };

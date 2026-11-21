@@ -937,6 +937,19 @@ fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) engine.Outcome
     return .{ .value = self.runDueLsmObsoleteReclaimUntilIdle(max_steps) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn applyOrderedTimestampedMutation(self: *DB, request: types.BatchRequest, identity: db.OrderedApplyReceipt, committed_at_ns: i64, bypass: bool) engine.Outcome(void) {
+    return .{ .value = self.applyOrderedTimestampedMutation(request, identity, committed_at_ns, bypass) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn applyOrderedCommittedMutationWithProducer(self: *DB, request: types.BatchRequest, producer: @import("source_producer_policy.zig").Producer, identity: db.OrderedApplyReceipt, bypass: bool) engine.Outcome(void) {
+    return .{ .value = self.applyOrderedCommittedMutationWithProducer(request, producer, identity, bypass) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn resolveOrderedClosedLegacyTerminal(self: *DB, owner: @import("transaction_completion.zig").RoutedOwner, proof: @import("transactions.zig").LegacyTerminalResolution, entry: db.OrderedApplyReceipt) engine.Outcome(@import("source_legacy_terminal_ordered.zig").Outcome) {
+    return .{ .value = self.resolveOrderedClosedLegacyTerminal(owner, proof, entry) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn applyOrderedSourceProducerClosure(self: *DB, owner: @import("transaction_completion.zig").RoutedOwner, entry: db.OrderedApplyReceipt, bypass: bool) engine.Outcome(@import("source_producer_policy.zig").Closure) {
+    return .{ .value = self.applyOrderedSourceProducerClosure(owner, entry, bypass) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn applyOrderedCommittedMutation(self: *DB, request: types.BatchRequest, identity: db.OrderedApplyReceipt, bypass_write_gate: bool) engine.Outcome(void) {
     return .{ .value = self.applyOrderedCommittedMutation(request, identity, bypass_write_gate) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -1122,8 +1135,39 @@ fn beginTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, 
     return .{ .value = self.beginTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn beginProducerTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, producer: @import("source_producer_policy.zig").Producer) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginProducerTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, producer) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn beginReplicatedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: db.OrderedApplyReceipt, purpose: [32]u8) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginReplicatedSourceCompletionTransaction(encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn beginReplicatedScopedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: db.OrderedApplyReceipt, purpose: [32]u8, scope: @import("source_scope.zig").Reference) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginReplicatedScopedSourceCompletionTransaction(encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn resolveReplicatedSourceCompletionTransactionAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("transaction_completion.zig").RoutedOwner, purpose: [32]u8) engine.Outcome(void) {
+    return .{ .value = self.resolveReplicatedSourceCompletionTransactionAtOrderedReceipt(txn_id, status, commit_version, identity, resolved_participant, owner, purpose) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("transaction_completion.zig").RoutedOwner, purpose: [32]u8, scope: @import("source_scope.zig").Reference) engine.Outcome(void) {
+    return .{ .value = self.resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt(txn_id, status, commit_version, identity, resolved_participant, owner, purpose, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn beginReplicatedCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: ?@import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginReplicatedCompletionTransaction(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn beginReplicatedOrdinaryCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginReplicatedOrdinaryCompletionTransaction(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn beginReplicatedLegacyCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginReplicatedLegacyCompletionTransaction(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn beginReplicatedTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8) engine.Outcome(@import("transactions.zig").TxnId) {
     return .{ .value = self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn beginReplicatedProducerTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8, producer: @import("source_producer_policy.zig").Producer) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginReplicatedProducerTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, producer) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn writeIntents(self: *DB, txn_id: @import("transactions.zig").TxnId, intents: []const @import("transactions.zig").WriteIntent, predicates: []const @import("transactions.zig").VersionPredicate) engine.Outcome(void) {
@@ -1134,8 +1178,118 @@ fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntent
     return .{ .value = self.writeTransaction(txn_id, req) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn resolveSourceTransaction(self: *DB, command: @import("source_admission.zig").Command, status: @import("transactions.zig").TxnStatus, sync_level: types.SyncLevel, cancellation: types.CancellationToken) engine.Outcome(void) {
+    self.resolveSourceTransaction(command, status, sync_level, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
+}
+fn retireSourceAttempt(self: *DB, command: @import("source_admission.zig").Command) engine.Outcome([@import("source_admission.zig").fence_size]u8) {
+    return .{ .value = self.retireSourceAttempt(command) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn beginSourceTransaction(self: *DB, command: @import("source_admission.zig").Command, created_at_ns: u64, participants: []const []const u8) engine.Outcome(types.TxnId) {
+    return .{ .value = self.beginSourceTransaction(command, created_at_ns, participants) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn nativeSourcePlanControl(self: *DB, request: @import("source_plan_control.zig").Request) engine.Outcome(@import("source_plan_storage.zig").Status) {
+    return .{ .value = self.nativeSourcePlanControl(request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn applyOrderedSourcePlanControl(self: *DB, request: @import("source_plan_control.zig").Request, entry: types.OrderedApplyReceipt, bypass_write_gate: bool) engine.Outcome(@import("source_plan_control.zig").Outcome) {
+    return .{ .value = self.applyOrderedSourcePlanControl(request, entry, bypass_write_gate) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn applyOrderedSourceScopeControl(self: *DB, command: @import("source_scope_control.zig").Command, entry: types.OrderedApplyReceipt, bypass_write_gate: bool) engine.Outcome(@import("source_scope_ordered.zig").Outcome) {
+    return .{ .value = self.applyOrderedSourceScopeControl(command, entry, bypass_write_gate) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn applyOrderedSourceRetirement(self: *DB, command: @import("source_scope_retirement.zig").Command, entry: types.OrderedApplyReceipt, bypass_write_gate: bool) engine.Outcome(@import("source_scope_retirement_ordered.zig").Recovery) {
+    return .{ .value = self.applyOrderedSourceRetirement(command, entry, bypass_write_gate) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn orderedSourceRetirementOutcome(self: *DB, query: @import("source_scope_retirement_ordered.zig").Query) engine.Outcome(@import("source_scope_retirement_ordered.zig").Recovery) {
+    return .{ .value = self.orderedSourceRetirementOutcome(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn orderedSourceScopeOutcome(self: *DB, recovery: @import("source_scope_ordered.zig").Recovery) engine.Outcome(@import("source_scope_ordered.zig").Outcome) {
+    return .{ .value = self.orderedSourceScopeOutcome(recovery) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn legacyRecoveryInventory(self: *DB, a: Allocator, query: @import("source_legacy_inventory.zig").Query) engine.Outcome(@import("source_legacy_inventory.zig").Observation) {
+    return .{ .value = self.legacyRecoveryInventory(a, query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn legacyTerminalOutcome(self: *DB, query: @import("source_legacy_terminal_ordered.zig").Query) engine.Outcome(@import("source_legacy_terminal_ordered.zig").Observation) {
+    return .{ .value = self.legacyTerminalOutcome(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn sourceProducerClosureObservation(self: *DB, query: @import("source_producer_policy.zig").Query) engine.Outcome(@import("source_producer_policy.zig").Observation) {
+    return .{ .value = self.sourceProducerClosureObservation(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn sourceScopeObservation(self: *DB, query: @import("source_scope_control.zig").Query) engine.Outcome(@import("source_scope_control.zig").Observation) {
+    return .{ .value = self.sourceScopeObservation(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn sourceCheckpointObservation(self: *DB, request: @import("source_checkpoint_read.zig").Request) engine.Outcome(@import("source_checkpoint_read.zig").Reply) {
+    return .{ .value = self.sourceCheckpointObservation(request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn sourcePlanObservation(self: *DB, query: @import("source_plan_control.zig").Query) engine.Outcome(@import("source_plan_control.zig").Observation) {
+    return .{ .value = self.sourcePlanObservation(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn sourcePlanChunk(self: *DB, allocator: Allocator, request: @import("source_plan_control.zig").ReadRequest) engine.Outcome(@import("source_plan_control.zig").Read) {
+    return .{ .value = self.sourcePlanChunk(allocator, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn orderedSourcePlanOutcome(self: *DB, recovery: @import("source_plan_control.zig").Recovery) engine.Outcome(@import("source_plan_control.zig").Outcome) {
+    return .{ .value = self.orderedSourcePlanOutcome(recovery) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn nativeHistoryConsumerControl(self: *DB, command: @import("history_consumer.zig").Command) engine.Outcome(@import("history_consumer.zig").Result) {
+    return .{ .value = self.nativeHistoryConsumerControl(command) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn provisionNativeHistoryAuthority(self: *DB, expected_namespace: [24]u8) engine.Outcome(void) {
+    self.provisionNativeHistoryAuthority(expected_namespace) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
+}
+fn applyOrderedHistoryConsumerControl(self: *DB, command: @import("history_consumer.zig").Command, entry: types.OrderedApplyReceipt, bypass_write_gate: bool) engine.Outcome(@import("history_ordered.zig").Outcome) {
+    return .{ .value = self.applyOrderedHistoryConsumerControl(command, entry, bypass_write_gate) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn nativeHistoryGrant(self: *DB, requested: @import("history_consumer.zig").GrantIdentity) engine.Outcome(@import("history_consumer.zig").GrantObservation) {
+    return .{ .value = self.nativeHistoryGrant(requested) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn publishReplicatedCompletionCertificate(self: *DB, raw: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, entry: @import("db/types.zig").OrderedApplyReceipt) engine.Outcome(@import("committed_history.zig").CompletionPublication) {
+    return .{ .value = self.publishReplicatedCompletionCertificate(raw, owner, entry) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn historyCompletionDecision(self: *DB, allocator: std.mem.Allocator, query: @import("history_decision_wire.zig").Query) engine.Outcome([]u8) {
+    return .{ .value = self.historyCompletionDecision(allocator, query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn historyAdmission(self: *DB, query: @import("history_admission_wire.zig").Query) engine.Outcome(@import("history_admission_wire.zig").Reply) {
+    return .{ .value = self.historyAdmission(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn historyCompletionPublication(self: *DB, allocator: Allocator, query: @import("committed_history.zig").CompletionPublicationQuery) engine.Outcome(@import("committed_history.zig").CompletionPublicationObservation) {
+    return .{ .value = self.historyCompletionPublication(allocator, query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn historyResolution(self: *DB, allocator: Allocator, request: @import("history_resolution_wire.zig").Request) engine.Outcome(@import("history_resolution_wire.zig").Reply) {
+    return .{ .value = self.historyResolution(allocator, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn orderedHistoryGrant(self: *DB, requested: @import("history_consumer.zig").GrantIdentity, minimum_applied_index: u64) engine.Outcome(@import("history_consumer.zig").GrantObservation) {
+    return .{ .value = self.orderedHistoryGrant(requested, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn orderedHistoryOutcome(self: *DB, allocator: std.mem.Allocator, recovery: @import("history_ordered.zig").Lookup) engine.Outcome(@import("history_ordered.zig").Outcome) {
+    return .{ .value = self.orderedHistoryOutcome(allocator, recovery) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn historyBootstrapPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").BootstrapRequest, minimum_applied_index: ?u64) engine.Outcome(@import("history_page.zig").BootstrapPage) {
+    return .{ .value = self.historyBootstrapPage(allocator, request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn orderedHistoryPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request, minimum_applied_index: u64) engine.Outcome(@import("history_page.zig").Page) {
+    return .{ .value = self.orderedHistoryPage(allocator, request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn nativeHistoryPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request) engine.Outcome(@import("history_page.zig").Page) {
+    return .{ .value = self.nativeHistoryPage(allocator, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn nativeSourceAdmissionNamespace(self: *DB) engine.Outcome([24]u8) {
+    return .{ .value = self.nativeSourceAdmissionNamespace() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn sourceAdmissionStatus(self: *DB, command: @import("source_admission.zig").Command) engine.Outcome(@import("source_admission.zig").Status) {
+    return .{ .value = self.sourceAdmissionStatus(command) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn resolveTransactionIntentsWithSyncLevelAndCancellation(self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, sync_level: types.SyncLevel, visibility_cancellation: types.CancellationToken) engine.Outcome(void) {
     return .{ .value = self.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, visibility_cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn resolveReplicatedCompletionTransactionAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, completion_owner: @import("transaction_completion.zig").RoutedOwner) engine.Outcome(void) {
+    return .{ .value = self.resolveReplicatedCompletionTransactionAtOrderedReceipt(txn_id, status, commit_version, identity, resolved_participant, completion_owner) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn resolveReplicatedTransactionAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, sync_level: types.SyncLevel, visibility_cancellation: types.CancellationToken, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8) engine.Outcome(void) {

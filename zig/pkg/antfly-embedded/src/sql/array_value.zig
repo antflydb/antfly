@@ -32,6 +32,7 @@ pub const Budget = json_order.Budget;
 pub const ElementType = @import("../common/sql_builtin_type.zig").Type;
 
 pub const Dimension = @import("../common/sql_array_layout.zig").Dimension;
+pub const max_rank = @import("../common/sql_array_layout.zig").max_rank;
 pub const Limits = struct { elements: usize = 65536, bytes: usize = 8 * 1024 * 1024, work: usize = 1_048_576 };
 pub const Comparison = enum {
     eq,
@@ -645,7 +646,7 @@ pub const Value = struct {
 
 /// Shared allocation-free shape gate for prepared and directly typed results.
 pub fn validateShape(dimensions: []const Dimension, count_: usize, limits: Limits) !bool {
-    if (dimensions.len > 6 or count_ > limits.elements) return error.SqlProgramLimitExceeded;
+    if (dimensions.len > max_rank or count_ > limits.elements) return error.SqlProgramLimitExceeded;
     var empty = dimensions.len == 0;
     for (dimensions) |dimension| {
         if (dimension.length == 0) empty = true;

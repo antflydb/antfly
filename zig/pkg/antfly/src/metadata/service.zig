@@ -3720,7 +3720,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
         .register_store, .upsert_store, .upsert_store_heartbeat => |record| {
             if (record.artifact_sources_protocol_version >= 4) {
                 required = @max(required, metadata_topology_protocol.index_alias_lifecycle_version);
-            } else if (record.artifact_sources_protocol_version >= 3) required = @max(required, 90);
+            } else if (record.artifact_sources_protocol_version >= 3) required = @max(required, metadata_topology_protocol.source_control_version);
         },
         .upsert_table => |table| required = @max(required, (try tableDecoderVersion(a, table))),
         .compare_and_replace_table => |cas| required = @max(required, @max((try tableDecoderVersion(a, cas.expected)), (try tableDecoderVersion(a, cas.replacement)))),
@@ -3823,6 +3823,9 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
         },
         else => {},
     }
+    if (command == .apply_source_control) return @import("source_control.zig").requiredProtocolEncoded(command.apply_source_control);
+    if (command == .apply_changefeed_control) return @import("changefeed_control.zig").requiredProtocolEncoded(command.apply_changefeed_control);
+    if (command == .apply_pg_publication) return metadata_topology_protocol.pg_publication_version;
     if (command == .apply_transaction_sessions) {
         const frame = command.apply_transaction_sessions;
         if (frame.len == 0) return metadata_topology_protocol.current_version;
@@ -3831,6 +3834,12 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
             2 => metadata_topology_protocol.bound_session_version,
             else => metadata_topology_protocol.current_version,
         };
+    }
+    if (command == .apply_system_catalog) {
+        const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind } };
+        var parsed = std.json.parseFromSlice(Header, std.heap.page_allocator, command.apply_system_catalog, .{ .ignore_unknown_fields = true }) catch return metadata_topology_protocol.current_version;
+        defer parsed.deinit();
+        if (parsed.value.mutation.kind == .graph) return metadata_topology_protocol.graph_definition_version;
     }
     if (command == .apply_resolver_authority or command == .advance_resolver_namespace) return metadata_topology_protocol.resolver_records_version;
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
@@ -4747,6 +4756,70 @@ fn runResolverNamespaceRound(service: anytype) !void {
     };
     try service.proposeTransitionCommand(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } });
 }
+
+const ChangefeedExpiry = struct {
+    const feed = @import("changefeed_control.zig");
+
+    lane: std.Io.Mutex = .init,
+    next_scan_ns: u64 = 0,
+    after: ?feed.Id = null,
+
+    fn run(self: *ChangefeedExpiry, svc: anytype) void {
+        if (!self.lane.tryLock()) return;
+        defer self.lane.unlock(std.Options.debug_io);
+        const monotonic = platform_time.monotonicNs();
+        if (monotonic < self.next_scan_ns) return;
+        self.next_scan_ns = monotonic +| std.time.ns_per_s;
+        if (!svc.runtime_mutex.tryLock()) return;
+        const host = if (@TypeOf(svc.*) == MetadataHttpService) svc.raft.host.http_host.host else svc.raft.host.host;
+        const local_leader = host.isLocalLeader(svc.metadata_group_id);
+        svc.unlockRuntime();
+        if (!local_leader) {
+            self.after = null;
+            return;
+        }
+        const store = svc.projectedStore() orelse return;
+        const now = platform_time.realtimeNs() / std.time.ns_per_s;
+        if (now == 0) return;
+        const page_result = store.scanChangefeedMaintenance(svc.alloc, svc.metadata_group_id, now, self.after) catch |err| {
+            std.log.warn("changefeed expiry scan failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const request: api_operation.RequestContext = .{
+            .deadline_ns = monotonic +| std.time.ns_per_s / 4,
+            .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" },
+        };
+        for (page_result.items()) |id| {
+            expire(svc, store, id, now, request) catch |err| switch (err) {
+                error.ChangefeedConflict => continue,
+                error.NotLeader, error.DeadlineExceeded, error.MetadataMutationOutcomeUnknown => return,
+                else => std.log.warn("changefeed expiry failed: {s}", .{@errorName(err)}),
+            };
+        }
+        self.after = page_result.next;
+    }
+
+    fn expire(svc: anytype, store: anytype, id: feed.Id, now: u64, request: api_operation.RequestContext) !void {
+        try request.ensureActive();
+        const bytes = try store.getChangefeedControl(svc.alloc, svc.metadata_group_id, id);
+        defer svc.alloc.free(bytes);
+        var parsed = try feed.parse(svc.alloc, bytes);
+        defer parsed.deinit();
+        const state = parsed.value;
+        if (!state.expiryDue(now)) return;
+        if (!std.mem.eql(u8, &id, &state.id)) return error.ChangefeedCorrupt;
+        const definition = state.definition.?;
+        try feed.mutateOnService(svc, svc.alloc, .{
+            .id = id,
+            .authority = state.authority,
+            .owner = definition.owner,
+            .authorization = definition.authorization,
+            .expected_revision = state.revision,
+            .expected_epoch = state.epoch,
+            .mutation = .{ .expire = now },
+        }, request);
+    }
+};
 
 fn runRelationReconciliationRound(service: anytype) !void {
     const store = service.projectedStore() orelse {
@@ -6199,6 +6272,7 @@ pub const MetadataService = struct {
     cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     relation_reconciliation_worker: relation_worker.Worker = .{},
+    changefeed_expiry: ChangefeedExpiry = .{},
     relation_publication_preparation: RelationPublicationPreparation = .{},
     // Coordinate proposal progress across in-process callers just as the HTTP
     // service does: one waiter drives Raft while the others sleep on a
@@ -7415,6 +7489,21 @@ pub const MetadataService = struct {
         try syncRestoreProgressBatch(self, sync);
     }
 
+    pub fn readChangefeedControl(self: *MetadataService, a: std.mem.Allocator, id: [16]u8, request: api_operation.RequestContext) ![]u8 {
+        return @import("changefeed_control.zig").readOnService(self, a, id, request);
+    }
+    pub fn mutateChangefeedControl(self: *MetadataService, a: std.mem.Allocator, write: @import("changefeed_control.zig").Write, request: api_operation.RequestContext) !void {
+        return @import("changefeed_control.zig").mutateOnService(self, a, write, request);
+    }
+
+    pub fn readSourceControl(self: *MetadataService, a: std.mem.Allocator, table_id: u64, source_id: [32]u8, request: api_operation.RequestContext) ![]u8 {
+        return @import("source_control.zig").readOnService(self, a, table_id, source_id, request);
+    }
+
+    pub fn mutateSourceControl(self: *MetadataService, a: std.mem.Allocator, write: @import("source_control.zig").Write, request: api_operation.RequestContext) !void {
+        return @import("source_control.zig").mutateOnService(self, a, write, request);
+    }
+
     pub fn upsertReplicationSourceStatus(self: *MetadataService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
     }
@@ -7473,6 +7562,14 @@ pub const MetadataService = struct {
             platform_clock.Clock.real().sleepMs(1);
         }
         return error.MetadataMutationApplyTimeout;
+    }
+
+    /// Prevent the unscoped coordinator from starting destination-owned work.
+    /// The native activation gate still requires independent persisted drainage.
+    pub fn legacyReplicationSourceIntakeAllowed(self: *MetadataService, table_id: u64, ordinal: u32, definition: @import("source_control.zig").Digest) !bool {
+        try self.ensureLinearizableReadWithContext(api_operation.RequestContext{});
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.legacyReplicationSourceIntakeAllowed(self.alloc, self.metadata_group_id, table_id, ordinal, definition);
     }
 
     pub fn replicationSourceAuthorityCurrent(
@@ -7690,6 +7787,7 @@ pub const MetadataService = struct {
         if (!try self.ensureMetadataIncarnation()) return;
         try runRelationReconciliationRound(self);
         try runResolverNamespaceRound(self);
+        self.changefeed_expiry.run(self);
         if (!self.observe_local_replica_root) return;
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForRound();
         if ((self.store_status_ticks >= 40 or backfill_markers.len > 0) and shouldRefreshLocalStoreStatus(self, backfill_markers)) {
@@ -7728,6 +7826,7 @@ pub const MetadataService = struct {
         if (!try self.ensureMetadataIncarnation()) return;
         try runRelationReconciliationRound(self);
         try runResolverNamespaceRound(self);
+        self.changefeed_expiry.run(self);
         if (!self.observe_local_replica_root) return;
 
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForLifecycleRound();
@@ -8988,6 +9087,7 @@ pub const MetadataHttpService = struct {
     cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     relation_reconciliation_worker: relation_worker.Worker = .{},
+    changefeed_expiry: ChangefeedExpiry = .{},
     relation_publication_preparation: RelationPublicationPreparation = .{},
     runtime_mutex: std.Io.Mutex = .init,
     catalog_mutation_mutex: std.Io.RwLock = .init,
@@ -9015,6 +9115,8 @@ pub const MetadataHttpService = struct {
     embedding_activity_cache: EmbeddingActivityCache = .{},
     catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader = .{},
     cdc_write_source_override: ?api_table_writes.TableWriteSource = null,
+    // Installed before start and borrowed until the CDC jobs drain.
+    cdc_lake_owner: ?CdcLakeOptions = null,
     local_group_status_provider: ?LocalGroupStatusProvider = null,
     local_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     routed_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -9216,6 +9318,44 @@ pub const MetadataHttpService = struct {
     pub fn setLifecycleReconcileHook(self: *MetadataHttpService, hook: ?LifecycleReconcileHook) void {
         self.lifecycle_reconcile_hook = hook;
         self.lifecycle_reconcile_requested.store(true, .release);
+    }
+
+    const CdcLakeRequest = metadata_replication_backfill.ExternalStreamDestination.Request;
+    const CdcLakeOptions = struct {
+        ptr: *anyopaque,
+        resolve: *const fn (*anyopaque, std.mem.Allocator, CdcLakeRequest) anyerror!@import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions,
+    };
+
+    pub fn installCdcLakeOwner(self: *MetadataHttpService, owner: CdcLakeOptions) void {
+        self.cdc_lake_owner = owner;
+    }
+
+    pub fn drainCdcJobs(self: *MetadataHttpService) void {
+        shutdownCdcRuntimeJobs(self);
+    }
+
+    fn resolveCdcLakeOwner(raw: *anyopaque, a: std.mem.Allocator, request: CdcLakeRequest) !@import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(raw));
+        const owner = self.cdc_lake_owner orelse return error.UnsupportedReplicationRoute;
+        return owner.resolve(owner.ptr, a, request);
+    }
+
+    fn checkCdcLakeOwner(raw: *anyopaque, request: CdcLakeRequest) !void {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(raw));
+        try ensureCdcWorkPermit(self);
+        try self.ensureLinearizableReadWithContext(.{ .deadline_ns = request.deadline_ns });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (try store.getTable(self.alloc, self.metadata_group_id, request.table.table_id)) orelse return error.CatalogGenerationChanged;
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        if (table.object_storage_generation != request.table.object_storage_generation or
+            !std.mem.eql(u8, table.schema_json, request.table.schema_json) or
+            !std.mem.eql(u8, table.replication_sources_json, request.table.replication_sources_json)) return error.CatalogGenerationChanged;
+        const current = (try store.getReplicationSourceStatus(self.alloc, self.metadata_group_id, table.table_id, request.cutover.source_ordinal)) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, current);
+        if (!replicationCutoverAuthorityMatches(current, request.cutover)) return error.ReplicationCutoverAuthorityLost;
+        const definition = try @import("source_control.zig").definitionDigest(self.alloc, table.replication_sources_json, request.cutover.source_ordinal);
+        if (!try store.legacyReplicationSourceIntakeAllowed(self.alloc, self.metadata_group_id, table.table_id, request.cutover.source_ordinal, definition)) return error.SourcePendingWork;
+        try ensureCdcWorkPermit(self);
     }
 
     pub fn setCdcWriteSource(self: *MetadataHttpService, source: ?api_table_writes.TableWriteSource) void {
@@ -10639,6 +10779,14 @@ pub const MetadataHttpService = struct {
         return error.MetadataMutationApplyTimeout;
     }
 
+    /// Prevent the unscoped coordinator from starting destination-owned work.
+    /// The native activation gate still requires independent persisted drainage.
+    pub fn legacyReplicationSourceIntakeAllowed(self: *MetadataHttpService, table_id: u64, ordinal: u32, definition: @import("source_control.zig").Digest) !bool {
+        try self.ensureLinearizableReadWithContext(api_operation.RequestContext{});
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.legacyReplicationSourceIntakeAllowed(self.alloc, self.metadata_group_id, table_id, ordinal, definition);
+    }
+
     pub fn replicationSourceAuthorityCurrent(
         self: *MetadataHttpService,
         expected_replication_sources_json: []const u8,
@@ -11457,6 +11605,7 @@ pub const MetadataHttpService = struct {
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         try runRelationReconciliationRound(self);
         try runResolverNamespaceRound(self);
+        self.changefeed_expiry.run(self);
         if (skip_local_replica_root or !self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
@@ -11562,6 +11711,7 @@ pub const MetadataHttpService = struct {
         self.refreshProbeReady();
         try runRelationReconciliationRound(self);
         try runResolverNamespaceRound(self);
+        self.changefeed_expiry.run(self);
         if (!self.observe_local_replica_root) return;
 
         var local_transition_inputs = try captureLocalTransitionInputs(self);
@@ -11833,6 +11983,7 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         snapshot: *MetadataStatus,
     ) void {
+        snapshot.managed_iceberg_sources = self.cdc_lake_owner != null and self.replica_root_dir != null;
         snapshot.runtime_status_protocol_activated_version = self.runtimeStatusProtocolActivationVersion();
         snapshot.dense_native_storage_protocol_activated_version =
             self.denseNativeStorageProtocolActivationVersion();
@@ -11944,6 +12095,7 @@ pub const MetadataHttpService = struct {
         });
         current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
         current_status.metrics = self.metrics();
+        current_status.managed_iceberg_sources = self.cdc_lake_owner != null and self.replica_root_dir != null;
         return current_status;
     }
 
@@ -13774,6 +13926,12 @@ pub const MetadataHttpService = struct {
             cdc_group_router.router(),
             self.raft.host.http_host.request_executor,
         );
+        _ = hosted_write_source.withHistoryPolicyProvisioning(.{ .ptr = self, .check_fn = struct {
+            fn check(ptr: *anyopaque, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+                try context.ensureActive();
+                try ensureCdcWorkPermit(@as(*MetadataHttpService, @ptrCast(@alignCast(ptr))));
+            }
+        }.check });
         _ = hosted_write_source.withBackendRuntime(runtime);
         _ = hosted_write_source.withSecretStore(self.secret_store);
         _ = hosted_write_source.withInternalServiceAuth(
@@ -13782,6 +13940,12 @@ pub const MetadataHttpService = struct {
         );
         _ = hosted_write_source.withDestinationAuthorization(self.destination_authorizer);
         const write_source = self.cdc_write_source_override orelse hosted_write_source.source();
+        var lake_owner: @import("../serverless/lake_ingestion.zig").StreamOwner = .{
+            .ptr = self,
+            .resolve = resolveCdcLakeOwner,
+            .check = checkCdcLakeOwner,
+        };
+        const lake_destination = if (self.cdc_lake_owner != null) lake_owner.port() else null;
         var cursors = loadCdcCursors(self);
         defer storeCdcCursors(self, cursors);
 
@@ -13790,6 +13954,7 @@ pub const MetadataHttpService = struct {
             .io = runtime.io() orelse std.Options.debug_io,
             .registry = &self.cdc_backfill_registry,
             .write_source = write_source,
+            .external_destination = lake_destination,
             .secret_store = self.secret_store,
             .work_permit = cdcWorkPermit(self),
             .destination_authorizer = self.destination_authorizer,
@@ -13819,6 +13984,7 @@ pub const MetadataHttpService = struct {
             .io = runtime.io() orelse std.Options.debug_io,
             .registry = &self.cdc_backfill_registry,
             .write_source = write_source,
+            .external_destination = lake_destination,
             .secret_store = self.secret_store,
             .work_permit = cdcWorkPermit(self),
             .destination_authorizer = self.destination_authorizer,
@@ -18042,7 +18208,8 @@ fn tableLifecycleMatches(
     return switch (expected) {
         .present => {
             const record = table orelse return false;
-            return tableRangesReady(snapshot, record.table_id);
+            // External object tables commit their definition without native placement.
+            return record.storage.engine == .object or tableRangesReady(snapshot, record.table_id);
         },
         .absent => table == null,
     };
@@ -24087,6 +24254,90 @@ test "selected owner readiness transition index cancels while observations are l
     try std.testing.expectError(error.Canceled, lockReadinessTransitions(&mutex, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = Cancel.canceled } }));
     try std.testing.expectEqual(@as(usize, 3), cancellation.calls);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, lockReadinessTransitions(&mutex, .{ .deadline_ns = 0 }));
+}
+
+test "source control requires its coordinated decoder floor before metadata proposal" {
+    const contract = @import("source_control.zig");
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(contract.manifest_protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_source_control = "{}" }));
+    const scope: contract.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
+    var write: contract.Write = .{ .table_id = 7, .source_id = scope.source_id, .expected_revision = 0, .expected_binding = scope.identity(), .expected_catalog_digest = @splat(5), .mutation = .{ .configure = scope } };
+    const legacy = try contract.encodeWrite(a, write);
+    defer a.free(legacy);
+    try std.testing.expectEqual(contract.protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_source_control = legacy }));
+    write.mutation = .{ .seal_artifact = .{ .reservation_digest = @splat(6), .stamp = @splat(7) } };
+    const artifact = try contract.encodeWrite(a, write);
+    defer a.free(artifact);
+    try std.testing.expectEqual(contract.artifact_control.protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_source_control = artifact }));
+    write.mutation = .{ .bind_checkpoint = .{ .binding = scope.identity(), .table_name = "checkpoint-owner", .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "01010101010101010101010101010101".*, .namespace = @splat(1), .table_binding = @splat(5), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } } };
+    const binding = try contract.encodeWrite(a, write);
+    defer a.free(binding);
+    try std.testing.expectEqual(contract.checkpoint_authority.protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_source_control = binding }));
+    write.mutation = .{ .fence_checkpoint = .{ .authority_digest = @splat(6), .proof = @splat(7) } };
+    const fenced = try contract.encodeWrite(a, write);
+    defer a.free(fenced);
+    try std.testing.expectEqual(contract.checkpoint_authority.protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_source_control = fenced }));
+    write.mutation = .{ .close = {} };
+    const closing = try contract.encodeWrite(a, write);
+    defer a.free(closing);
+    try std.testing.expectEqual(contract.closing_protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_source_control = closing }));
+    write.mutation = .{ .reserve = .{ .sequence = 1, .batch_id = "one", .checkpoint = "cp1", .accepted_at_ns = 1, .payload_digest = @splat(6), .plan_digest = @splat(7), .transaction_id = @splat(8), .destination = .native, .delivery_manifest = "retained", .retain_manifest = true, .artifact = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = contract.artifact_control.domainFor(scope.identity()), .attempt = .{ 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, .bytes = 128, .checksum = @splat(10), .plan_digest = @splat(11) } } };
+    const retained = try contract.encodeWrite(a, write);
+    defer a.free(retained);
+    try std.testing.expectEqual(contract.manifest_protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_source_control = retained }));
+}
+
+test "changefeed control requires its coordinated decoder floor before metadata proposal" {
+    try std.testing.expectEqual(@import("changefeed_control.zig").verified_bootstrap_protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_changefeed_control = "{}" }));
+    try std.testing.expectEqual(metadata_topology_protocol.pg_publication_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_pg_publication = "{}" }));
+}
+
+test "changefeed control expiry applies a fenced reset only when the lease is due" {
+    const a = std.testing.allocator;
+    const feed = ChangefeedExpiry.feed;
+    const Client = struct {
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64 = 1,
+        state: feed.State,
+        applied: usize = 0,
+
+        pub fn getChangefeedControl(self: *@This(), allocator: std.mem.Allocator, group: u64, id: feed.Id) ![]u8 {
+            try std.testing.expectEqual(self.metadata_group_id, group);
+            try std.testing.expectEqual(self.state.id, id);
+            return feed.encode(allocator, self.state);
+        }
+        pub fn mutateChangefeedState(self: *@This(), allocator: std.mem.Allocator, write: feed.Write, request: api_operation.RequestContext) !void {
+            try request.ensureActive();
+            try std.testing.expectEqual(feed.Mutation{ .expire = 200 }, write.mutation);
+            self.state = try write.apply(allocator, self.state, self.state.authority_sequence + 1);
+            self.applied += 1;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const definition: feed.Definition = .{
+        .owner = @splat(1),
+        .authorization = @splat(2),
+        .tables = &.{.{ .table_id = 7, .binding = @splat(5), .policy_revision = 1, .contract = .native_document }},
+    };
+    const id: feed.Id = @splat(4);
+    const command: feed.Write = .{
+        .id = id,
+        .authority = @splat(9),
+        .owner = definition.owner,
+        .authorization = definition.authorization,
+        .expected_revision = 0,
+        .expected_epoch = 0,
+        .mutation = .{ .create = .{ .id = id, .definition = definition, .now = 100, .expires_at = 200 } },
+    };
+    var client: Client = .{ .alloc = arena.allocator(), .state = try command.apply(arena.allocator(), .{}, 1) };
+    try ChangefeedExpiry.expire(&client, &client, id, 199, .{});
+    try std.testing.expectEqual(@as(usize, 0), client.applied);
+    try ChangefeedExpiry.expire(&client, &client, id, 200, .{});
+    try std.testing.expectEqual(feed.Phase.reset_required, client.state.phase);
+    try std.testing.expectEqual(feed.Reset.lease_expired, client.state.reset_reason);
+    try ChangefeedExpiry.expire(&client, &client, id, 201, .{});
+    try std.testing.expectEqual(@as(usize, 1), client.applied);
 }
 
 test "index alias legacy store admission uses only the durable presence lookup" {

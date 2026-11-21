@@ -241,6 +241,10 @@ pub const View = struct {
     values: []const Value,
     by_id: std.AutoHashMapUnmanaged(u64, usize),
     by_name: std.StringHashMapUnmanaged(usize),
+    schema_search_path: ?[]const []const u8 = null,
+    snapshot_lsn: ?u64 = null,
+    transaction_xid: ?u64 = null,
+    transaction_timestamp_ns: ?u64 = null,
 
     pub fn capture(backing: std.mem.Allocator, owner: Owner, scope: Scope, overlay: []const OverlayEntry) !View {
         var arena = std.heap.ArenaAllocator.init(backing);
@@ -288,6 +292,13 @@ pub const View = struct {
             .database = try alloc.dupe(u8, scope.database),
         };
         return .{ .arena = arena, .scope = owned_scope, .epoch = raw.epoch, .definitions = definitions, .values = values, .by_id = by_id, .by_name = by_name };
+    }
+
+    pub fn setSchemaSearchPath(self: *View, names: []const []const u8) !void {
+        const alloc = self.arena.allocator();
+        const owned = try alloc.alloc([]const u8, names.len);
+        for (owned, names) |*out, name| out.* = try alloc.dupe(u8, name);
+        self.schema_search_path = owned;
     }
 
     pub fn deinit(self: *View) void {
@@ -571,6 +582,60 @@ test "SQL current_setting evaluates from one authorized pinned view" {
     var result = try runtime.execute(std.testing.allocator, with_capture, &compiled, &.{}, .{});
     defer result.deinit();
     try std.testing.expectEqualStrings("alice-tenant", result.output.rows[0][0].string);
+    var wal = try compiler.compile(std.testing.allocator, "SELECT CASE pg_is_in_recovery() WHEN 't' THEN pg_last_wal_receive_lsn() ELSE pg_catalog.pg_current_wal_lsn() END, pg_last_wal_receive_lsn() IS NULL", .{});
+    defer wal.deinit();
+    try std.testing.expect(wal.uses_snapshot_lsn);
+    try std.testing.expectError(error.SqlSnapshotLsnUnavailable, runtime.execute(std.testing.allocator, with_capture, &wal, &.{}, .{}));
+    with_capture.setting_capture.?.snapshot_lsn = 0x1_00000002;
+    var wal_result = try runtime.execute(std.testing.allocator, with_capture, &wal, &.{}, .{});
+    defer wal_result.deinit();
+    try std.testing.expectEqualStrings("1/2", wal_result.output.rows[0][0].string);
+    try std.testing.expect(wal_result.output.rows[0][1].bool);
+    with_capture.setting_capture.?.snapshot_lsn = null;
+
+    var xid = try compiler.compile(std.testing.allocator, "SELECT CASE pg_is_in_recovery() WHEN 't' THEN '0'::xid8 ELSE pg_current_xact_id() END, '18446744073709551615'::pg_catalog.xid8", .{});
+    defer xid.deinit();
+    try std.testing.expect(xid.uses_transaction_xid);
+    try std.testing.expectError(error.NoActiveSqlTransaction, runtime.execute(std.testing.allocator, with_capture, &xid, &.{}, .{}));
+    with_capture.setting_capture.?.transaction_xid = 9007199254740993;
+    var xid_result = try runtime.execute(std.testing.allocator, with_capture, &xid, &.{}, .{});
+    defer xid_result.deinit();
+    try std.testing.expectEqualStrings("9007199254740993", xid_result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("18446744073709551615", xid_result.output.rows[0][1].string);
+    try std.testing.expectError(error.SqlNumericOutOfRange, compiler.compile(std.testing.allocator, "SELECT '18446744073709551616'::xid8", .{}));
+    with_capture.setting_capture.?.transaction_xid = null;
+
+    var timestamp = try compiler.compile(std.testing.allocator, "SELECT CURRENT_TIMESTAMP, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(0)", .{});
+    defer timestamp.deinit();
+    try std.testing.expect(timestamp.uses_transaction_timestamp);
+    with_capture.setting_capture.?.transaction_timestamp_ns = 1_999_500_500;
+    var timestamp_result = try runtime.execute(std.testing.allocator, with_capture, &timestamp, &.{}, .{});
+    defer timestamp_result.deinit();
+    const times = timestamp_result.output.rows[0];
+    try std.testing.expectEqualStrings("1970-01-01T00:00:01.999501000Z", times[0].string);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:02.000000000Z", times[1].string);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:02.000000000Z", times[2].string);
+    try std.testing.expectError(error.SqlInvalidParameterValue, compiler.compile(std.testing.allocator, "SELECT CURRENT_TIMESTAMP(7)", .{}));
+    with_capture.setting_capture.?.transaction_timestamp_ns = null;
+
+    var schemas = try compiler.compile(std.testing.allocator, "SELECT current_schemas(false)[1], pg_catalog.current_schemas(true)[1], current_schemas(true)[3], current_schemas(NULL) IS NULL", .{});
+    defer schemas.deinit();
+    try std.testing.expect(schemas.uses_current_schemas and schemas.uses_current_setting);
+    with_capture.setting_capture.?.schema_search_path = &.{ "app", "public" };
+    var schema_result = try runtime.execute(std.testing.allocator, with_capture, &schemas, &.{}, .{});
+    defer schema_result.deinit();
+    const cells = schema_result.output.rows[0];
+    try std.testing.expectEqualStrings("app", cells[0].string);
+    try std.testing.expectEqualStrings("pg_catalog", cells[1].string);
+    try std.testing.expectEqualStrings("public", cells[2].string);
+    try std.testing.expect(cells[3].bool);
+    with_capture.setting_capture.?.schema_search_path = &.{ "app", "pg_catalog" };
+    var explicit_result = try runtime.execute(std.testing.allocator, with_capture, &schemas, &.{}, .{});
+    defer explicit_result.deinit();
+    try std.testing.expectEqualStrings("app", explicit_result.output.rows[0][1].string);
+    try std.testing.expect(explicit_result.output.rows[0][2] == .null);
+    try std.testing.expectEqualStrings("pg_catalog", cells[1].string);
+
     var joined = try compiler.compile(std.testing.allocator, "SELECT a.id FROM a JOIN b ON a.id = b.id AND current_setting('app.tenant') = 'alice-tenant'", .{});
     defer joined.deinit();
     try std.testing.expectError(error.SettingCatalogUnavailable, describe.describe(std.testing.allocator, plain, &joined, &.{}));
