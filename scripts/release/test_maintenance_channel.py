@@ -62,18 +62,20 @@ class MaintenanceChannelTests(unittest.TestCase):
     def test_routing_preserves_historical_specs(self):
         for tag, expected in (
             ("v0.3.3", "v0-3"),
+            ("v0.3.3-rc.1", "v0-3-next"),
             ("v0.4.0", "stable"),
             ("v0.4.0-rc.1", "next"),
         ):
             with self.subTest(tag=tag):
                 self.assertEqual(channels.resolve_channel(tag)[0], expected)
-        spec = channels.build_release_spec("v0.3.2", "stable", "a" * 40, "b" * 40)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "spec.json"
-            path.write_text(json.dumps(spec.document()))
-            self.assertEqual(
-                verify_release_spec(path, "v0.3.2", "a" * 40)["channel"], "stable"
-            )
+        for tag, name in (("v0.3.2", "stable"), ("v0.3.0-rc.18", "next")):
+            spec = channels.build_release_spec(tag, name, "a" * 40, "b" * 40)
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "spec.json"
+                path.write_text(json.dumps(spec.document()))
+                self.assertEqual(
+                    verify_release_spec(path, tag, "a" * 40)["channel"], name
+                )
 
     def test_patch_after_v04_leaves_global_stable_untouched(self):
         stable = MemoryStore("stable", "v0.4.0")
@@ -97,6 +99,49 @@ class MaintenanceChannelTests(unittest.TestCase):
         older = state.release_identity("v0.3.3", "f" * 40, "a" * 64, "v0-3")
         with self.assertRaisesRegex(SystemExit, "cannot move backward"):
             state.begin_promotion(maintenance, older, None, "v0-3")
+
+    def test_patch_rc_after_v04_rc_uses_an_independent_monotonic_channel(self):
+        global_next = MemoryStore("next", "v0.4.0-rc.1")
+        maintenance = MemoryStore("v0-3-next", "v0.3.3-rc.1")
+        original = copy.deepcopy(global_next.document)
+        name, policy = channels.resolve_channel("v0.3.3-rc.2")
+        self.assertEqual(name, "v0-3-next")
+        self.assertFalse(policy["publish_npm"])
+        self.assertFalse(policy["publish_pypi"])
+        self.assertEqual(policy["github_release"], "prerelease")
+        candidate = state.release_identity(
+            "v0.3.3-rc.2",
+            "c" * 40,
+            "d" * 64,
+            name,
+            container_digest="sha256:" + "e" * 64,
+        )
+        state.preflight_promotion(maintenance, candidate, None, name)
+        state.begin_promotion(maintenance, candidate, None, name)
+        state.finish_promotion(maintenance, candidate, name)
+        self.assertEqual(maintenance.document["current"]["tag"], "v0.3.3-rc.2")
+        self.assertEqual(global_next.document, original)
+        with self.assertRaisesRegex(SystemExit, "cannot move backward"):
+            state.preflight_promotion(global_next, candidate, None, "next")
+        older = state.release_identity("v0.3.3-rc.1", "a" * 40, "b" * 64, name)
+        with self.assertRaisesRegex(SystemExit, "cannot move backward"):
+            state.begin_promotion(maintenance, older, None, name)
+        for tag in ("v0.3.3", "v0.4.0-rc.1"):
+            with self.subTest(tag=tag), self.assertRaises(SystemExit):
+                channels.resolve_channel(tag, name)
+
+    def test_policy_rejects_duplicate_maintenance_channels_of_the_same_kind(self):
+        policy = channels.load_policy()
+        for name in ("v0-3", "v0-3-next"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                changed = copy.deepcopy(policy)
+                changed["channels"][name + "-duplicate"] = copy.deepcopy(
+                    changed["channels"][name]
+                )
+                path = Path(directory) / "policy.json"
+                path.write_text(json.dumps(changed))
+                with self.assertRaisesRegex(SystemExit, "duplicate.*maintenance"):
+                    channels.load_policy(path)
 
     def test_other_lines_and_prereleases_cannot_use_series_channel(self):
         for tag in ("v0.2.6", "v0.4.0", "v0.3.4-rc.1"):

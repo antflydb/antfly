@@ -523,7 +523,7 @@ logs, memory summaries, and linker maps are uploaded on failure as separate
 diagnostic artifacts, without compiler caches. macOS cross builds resolve the
 versioned LLVM linker directory and check linker/nm availability before compiling.
 
-The immutable 0.3 and nightly build also runs the released v0.2.5 writer and
+The immutable 0.3, 0.4, and nightly build also runs the released v0.2.5 writer and
 `scripts/ci/qualify-v02-server-upgrade.py` against the newly built Darwin server
 archive. This gates publication on in-place data reopen, updates/deletes, crash
 recovery, the rollback gate, and portable/native restore. It is separate from
@@ -609,9 +609,15 @@ installer bootstrap, or the unversioned Homebrew formula. Default installs stay
 on v0.3.2 until the next global stable release. Install a maintenance version
 explicitly with the installer (for example, `sh install.sh v0.3.3`), use
 `@antfly/cli@v0-3` with npm, or select the `v0-3` container tag. Existing v0.3
-releases retain their recorded `stable` channel during recovery; pass that
-recorded channel explicitly when recovering a release from before the handoff.
-Prereleases still use `next`, independently of the stable maintenance channel.
+releases retain their recorded `stable` or `next` channel during recovery; pass
+that recorded channel explicitly when recovering a release from before the handoff.
+Maintenance prereleases such as `v0.3.3-rc.1` automatically select `v0-3-next`,
+with a separate promotion journal, container alias and R2 metadata pointer.
+They publish GitHub prereleases and follow the existing prerelease policy of no
+npm/PyPI publication. Global `next` remains available for v0.4 prereleases;
+advancing it cannot block v0.3 release candidates. Maintenance prereleases use
+the same retention grace period after their matching stable release as global
+prereleases.
 
 Protect `v0.3.x` with the same review requirements and app-bound checks as
 `main`: `PR CI` and `Apache license boundary`, an up-to-date branch, one review,

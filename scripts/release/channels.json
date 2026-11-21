@@ -67,6 +67,23 @@
       "recovery_sources": ["github-release", "object-storage"],
       "retention": {"mode": "forever"},
       "release_line": "0.3"
+    },
+    "v0-3-next": {
+      "tag_kind": "prerelease",
+      "ordering": "semver",
+      "journal_key": "antfly/channels/v0-3-next.json",
+      "bootstrap_sources": ["object-storage"],
+      "npm_tag": null,
+      "publish_npm": false,
+      "publish_pypi": false,
+      "publish_homebrew": false,
+      "container_alias": "v0-3-next",
+      "object_alias": "v0-3-next",
+      "object_static_files": {},
+      "github_release": "prerelease",
+      "recovery_sources": ["github-release", "object-storage"],
+      "retention": {"mode": "after-stable", "grace_days": 90},
+      "release_line": "0.3"
     }
   }
 }

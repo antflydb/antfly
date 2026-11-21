@@ -500,7 +500,9 @@ class CAbiPackagingTests(unittest.TestCase):
         )
 
         channels = channel_policy["channels"]
-        self.assertEqual(set(channels), {"stable", "next", "nightly", "v0-3"})
+        self.assertEqual(
+            set(channels), {"stable", "next", "nightly", "v0-3", "v0-3-next"}
+        )
         self.assertEqual(channels["stable"]["npm_tag"], "latest")
         self.assertTrue(channels["stable"]["publish_npm"])
         self.assertEqual(channels["next"]["container_alias"], "next")
