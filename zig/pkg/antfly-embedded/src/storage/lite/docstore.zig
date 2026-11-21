@@ -2916,6 +2916,10 @@ const MutationRequest = struct {
     durable: bool = true,
     index_only: bool = false,
     artifact_lease: bool = false,
+    scope_delete_prefix: ?[]const u8 = null,
+    scope_delete_exact_key: ?[]const u8 = null,
+    scope_delete_only: bool = false,
+    scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
     /// Never closes a group by becoming its leader, and never durable on
     /// its own: it joins whichever group a foreground (non-ride-along)
     /// member next forms, or `forceDrainDurable`'s forced group if none
@@ -5560,6 +5564,10 @@ pub const Store = struct {
         durable: bool = true,
         index_only: bool = false,
         artifact_lease: bool = false,
+        scope_delete_prefix: ?[]const u8 = null,
+        scope_delete_exact_key: ?[]const u8 = null,
+        scope_delete_only: bool = false,
+        scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
         /// Estimated size of this member's writes. Used only to bound group
         /// formation (`group_max_bytes`); never required to be exact. Also
         /// what `stageRideAlong` tracks against `ride_along_byte_threshold`.
@@ -5726,6 +5734,10 @@ pub const Store = struct {
             .durable = !ride_along and plan.durable,
             .index_only = plan.index_only,
             .artifact_lease = plan.artifact_lease,
+            .scope_delete_prefix = plan.scope_delete_prefix,
+            .scope_delete_exact_key = plan.scope_delete_exact_key,
+            .scope_delete_only = plan.scope_delete_only,
+            .scope_delete_redo_bytes = plan.scope_delete_redo_bytes,
             .ride_along = ride_along,
             .estimated_bytes = plan.estimated_bytes,
         };
@@ -6303,7 +6315,8 @@ pub const Store = struct {
         var tail: ?*MutationRequest = null;
         var bytes: usize = 0;
         while (self.commit_head) |request| {
-            if (batch.head != null and (batch.size >= self.group_max_requests or bytes +| request.estimated_bytes > self.group_max_bytes)) break;
+            if (batch.head != null and (request.scope_delete_prefix != null or
+                batch.size >= self.group_max_requests or bytes +| request.estimated_bytes > self.group_max_bytes)) break;
             self.commit_head = request.next;
             if (self.commit_head == null) self.commit_tail = null;
             request.next = null;
@@ -6317,6 +6330,7 @@ pub const Store = struct {
             } else {
                 self.non_ride_along_pending_count -|= 1;
             }
+            if (request.scope_delete_prefix != null) break;
         }
         return batch;
     }
@@ -6457,7 +6471,38 @@ pub const Store = struct {
     }
 
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true, false);
+        return self.submitScopedMutation(.{ .context = context, .apply = apply, .durable = durable, .index_only = true });
+    }
+
+    pub fn submitIndexScopeDeletion(self: *Store, scope: []const u8, prefix: []const u8, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitIndexPlanForScope(scope, .{
+            .context = context,
+            .apply = apply,
+            .index_only = true,
+            .scope_delete_prefix = prefix,
+            .scope_delete_only = true,
+        });
+    }
+
+    pub fn submitIndexTreeDeletion(self: *Store, prefix: []const u8, exact_key: []const u8) !void {
+        const Request = struct {
+            prefix: []const u8,
+            exact_key: []const u8,
+
+            fn apply(context: *anyopaque, file: *native.NativeFile) !void {
+                const request: *const @This() = @ptrCast(@alignCast(context));
+                try file.deleteIndexCatalogPrefix(request.prefix, request.exact_key);
+            }
+        };
+        var request = Request{ .prefix = prefix, .exact_key = exact_key };
+        try self.submitScopedMutation(.{
+            .context = &request,
+            .apply = Request.apply,
+            .index_only = true,
+            .scope_delete_prefix = prefix,
+            .scope_delete_exact_key = exact_key,
+            .scope_delete_only = true,
+        });
     }
 
     /// A durability barrier allocates no pages and requires no allocator
@@ -6478,7 +6523,7 @@ pub const Store = struct {
     }
 
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, false, false);
+        return self.submitScopedMutation(.{ .context = context, .apply = apply, .durable = durable });
     }
 
     /// WS7/WS5 interim ride-along commit, one named helper so every caller
@@ -6498,7 +6543,7 @@ pub const Store = struct {
     /// Immutable source aliases are read-path metadata, not authored writes.
     /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        return self.submitScopedMutation(context, apply, true, false, true);
+        return self.submitScopedMutation(.{ .context = context, .apply = apply, .artifact_lease = true });
     }
 
     /// `submitIndexMutation` for one native-catalog index scope. Through a
@@ -6509,8 +6554,12 @@ pub const Store = struct {
     /// whole). Checked under the writer admission, which excludes every
     /// other writer until this commit lands.
     pub fn submitIndexMutationForScope(self: *Store, scope: []const u8, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        if (self.write_target == null) return self.submitIndexMutation(context, apply, durable);
-        const admission = self.writer_admission orelse return self.submitIndexMutation(context, apply, durable);
+        return self.submitIndexPlanForScope(scope, .{ .context = context, .apply = apply, .durable = durable, .index_only = true });
+    }
+
+    fn submitIndexPlanForScope(self: *Store, scope: []const u8, plan: MutationPlan) !void {
+        if (self.write_target == null) return self.submitScopedMutation(plan);
+        const admission = self.writer_admission orelse return self.submitScopedMutation(plan);
         try admission.enter(admission.ptr, .index);
         defer admission.leave(admission.ptr);
         const io = self.file.runtime();
@@ -6521,7 +6570,7 @@ pub const Store = struct {
             self.index_fence_refused.store(true, .release);
             return error.EnrichmentWaitCanceled;
         }
-        const shared = if (self.file.redo) |*redo| redo.shared else return self.submitIndexMutation(context, apply, durable);
+        const shared = if (self.file.redo) |*redo| redo.shared else return self.submitScopedMutation(plan);
         if (shared.scopeLatestSequence(io, scope) > self.indexScopeFence(scope)) {
             self.index_fence_refused.store(true, .release);
             return error.EnrichmentWaitCanceled;
@@ -6529,7 +6578,7 @@ pub const Store = struct {
         // Reserved before publishing: recording the commit afterwards must
         // not fail once storage has changed.
         try self.reserveIndexScope(scope);
-        try self.submitIndexMutation(context, apply, durable);
+        try self.submitScopedMutation(plan);
         self.noteIndexScopeCommit(scope, shared.scopeLatestSequence(io, scope));
     }
 
@@ -6617,7 +6666,7 @@ pub const Store = struct {
         value.* = @max(value.*, sequence);
     }
 
-    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
+    fn submitScopedMutation(self: *Store, plan: MutationPlan) !void {
         // A forwarded request commits in the writer store's group, which
         // enters that store's admission, not this one's. The detached work
         // that built it must still hold the writer lease and pass this
@@ -6628,9 +6677,9 @@ pub const Store = struct {
         // current writer reads the owner's serving root, which only the
         // admission below may do.
         const forwarded_admission = if (self.write_target != null) self.writer_admission else null;
-        if (forwarded_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease) .artifact_lease else if (index_only) .index else .primary);
+        if (forwarded_admission) |admission| try admission.enter(admission.ptr, if (plan.artifact_lease) .artifact_lease else if (plan.index_only) .index else .primary);
         defer if (forwarded_admission) |admission| admission.leave(admission.ptr);
-        const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
+        const ticket = try self.stage(plan);
         ticket.wait() catch |err| {
             // §9.7f: a redo-log file's own fixed log-capacity reservation
             // can go stale -- frozen at whatever it was sized to when
@@ -6658,7 +6707,7 @@ pub const Store = struct {
                 // request), and retry only if the reservation shrank.
                 const shrank = (if (forwarded_admission != null) self.reclaimOversizedRedoReservationAdmitted() else self.reclaimOversizedRedoReservation()) catch false;
                 if (shrank) {
-                    const retry_ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
+                    const retry_ticket = try self.stage(plan);
                     return retry_ticket.wait();
                 }
             }
@@ -6712,6 +6761,25 @@ pub const Store = struct {
         try self.refreshAdmissionAssumeLocked();
         try self.initializeReadGenerationAssumeLocked();
         errdefer self.publishReadCheckpointAssumeLocked();
+        if (head.scope_delete_prefix) |prefix| {
+            std.debug.assert(head.next == null);
+            // This is under the writer lease and store mutex, so an empty
+            // scope cannot acquire postings between the probe and the delete.
+            const other_bytes = if (head.scope_delete_redo_bytes) |measure| measure(head.context, &self.file) else 0;
+            switch (try self.file.planIndexScopeDeletion(prefix, head.scope_delete_exact_key, other_bytes)) {
+                .empty => if (head.scope_delete_only) {
+                    // An earlier ride-along may be the reason this scope
+                    // is empty. Honor the durable request even without edits.
+                    if (force_durable or head.durable or self.writer_admission != null) try self.file.sync();
+                    head.committed_sequence = self.file.committedSequence();
+                    return;
+                },
+                .inline_delete => {},
+                // Older overlay entries could shadow physical deletes in
+                // later private batches. Settle them before the transaction.
+                .fold_first => try self.file.checkpointRedoLog(),
+            }
+        }
         if (artifact_lease_only) {
             try self.file.beginArtifactLeaseTransaction();
         } else {
@@ -7345,6 +7413,7 @@ pub const Txn = struct {
     // `PrimaryCommitContext.apply`). Encoded keys are owned by
     // `index_catalog_arena`, created lazily on first use.
     index_catalog_pending: std.ArrayListUnmanaged(native.CatalogMutation) = .empty,
+    index_catalog_delete_prefix: ?[]const u8 = null,
     index_catalog_arena: ?std.heap.ArenaAllocator = null,
     read_only: bool = true,
     writer_reserved: bool = false,
@@ -7595,10 +7664,17 @@ pub const Txn = struct {
         // as `mutations` above. Empty for every write that does not use
         // `Txn.putIndexCatalogBatch`.
         index_catalog_mutations: []const native.CatalogMutation = &.{},
+        index_catalog_delete_prefix: ?[]const u8 = null,
+        fn scopeDeleteRedoBytes(ptr: *anyopaque, file: *const native.NativeFile) usize {
+            const context: *const @This() = @ptrCast(@alignCast(ptr));
+            return file.indexScopeCompanionRedoBytes(context.mutations, context.index_catalog_mutations);
+        }
+
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
             try file.putDocumentBatch(context.mutations);
             if (context.index_catalog_mutations.len != 0) try file.putIndexCatalogBatch(context.index_catalog_mutations);
+            if (context.index_catalog_delete_prefix) |prefix| try file.deleteIndexCatalogPrefix(prefix, null);
         }
     };
 
@@ -7695,7 +7771,7 @@ pub const Txn = struct {
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0) {
+        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0 and self.index_catalog_delete_prefix == null) {
             self.abort();
             return .{};
         }
@@ -7712,6 +7788,17 @@ pub const Txn = struct {
             if (Store.test_commit_key_hook) |hook| hook(mutations[i].key, mutations[i].key.len + mutations[i].value.len);
             node = current.next();
         }
+        // Scope deletion wins over every staged mutation within the scope.
+        // Discard those edits before they can enter the private redo overlay.
+        if (self.index_catalog_delete_prefix) |prefix| {
+            var retained: usize = 0;
+            for (self.index_catalog_pending.items) |mutation| {
+                if (std.mem.startsWith(u8, mutation.key, prefix)) continue;
+                self.index_catalog_pending.items[retained] = mutation;
+                retained += 1;
+            }
+            self.index_catalog_pending.items.len = retained;
+        }
         for (self.index_catalog_pending.items) |m| {
             estimated_bytes += m.key.len + m.value.len;
             if (Store.test_commit_key_hook) |hook| hook(m.key, m.key.len + m.value.len);
@@ -7724,7 +7811,7 @@ pub const Txn = struct {
         // `StagedCommit.wait()`/`abort()`, both of which run after the
         // group's `apply` callback has already consumed it, mirroring how
         // `mutations` above borrows `self.pending`'s own buffers.
-        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items };
+        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .index_catalog_delete_prefix = self.index_catalog_delete_prefix };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
@@ -7765,11 +7852,18 @@ pub const Txn = struct {
             const first_key = if (mutations.len != 0) mutations[0].key else "<none>";
             std.debug.print("[native-recovery] Txn.commitStaged ride_along={} mutation_count={d} first_key={s} index_catalog_mutation_count={d}\n", .{ self.ride_along, mutations.len, first_key, self.index_catalog_pending.items.len });
         }
+        const plan = Store.MutationPlan{
+            .context = context,
+            .apply = PrimaryCommitContext.apply,
+            .estimated_bytes = estimated_bytes,
+            .scope_delete_redo_bytes = if (self.index_catalog_delete_prefix != null) PrimaryCommitContext.scopeDeleteRedoBytes else null,
+            .scope_delete_prefix = self.index_catalog_delete_prefix,
+        };
         var ride_along_ticket: ?Store.Ticket = null;
         const staged: ?Store.Staged = if (self.ride_along) staged: {
-            ride_along_ticket = try store.stageRideAlong(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });
+            ride_along_ticket = try store.stageRideAlong(plan);
             break :staged null;
-        } else try store.enqueue(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });
+        } else try store.enqueue(plan);
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {
             // Keep `writer_admission` held past this point: staging is not
@@ -8543,10 +8637,20 @@ pub const Txn = struct {
         }
     }
 
+    /// Removes the scope at commit, including catalog edits staged in
+    /// this transaction, regardless of their order.
+    pub fn deleteIndexCatalogScope(self: *Txn, scope: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (self.index_catalog_delete_prefix != null) return error.InvalidBatch;
+        if (self.index_catalog_arena == null) self.index_catalog_arena = std.heap.ArenaAllocator.init(self.allocator);
+        self.index_catalog_delete_prefix = try @import("native_catalog_sink.zig").scopePrefixAlloc(self.index_catalog_arena.?.allocator(), scope);
+    }
+
     fn freeIndexCatalogPending(self: *Txn) void {
         if (self.index_catalog_arena) |*arena| arena.deinit();
         self.index_catalog_arena = null;
         self.index_catalog_pending = .empty;
+        self.index_catalog_delete_prefix = null;
     }
 
     fn pendingNode(node: *PendingTree.Node) *PendingNode {
@@ -10406,6 +10510,159 @@ test "lite native docstore putIndexCatalogBatch publishes primary and index-cata
     const active_value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_active_key)).?;
     defer allocator.free(active_value);
     try std.testing.expectEqualStrings("1", active_value);
+}
+
+test "lite native docstore skips redo folding for an empty index scope" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-empty-scope.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put("unrelated", "pending fold");
+        try txn.commit();
+    }
+    const before = store.file.committedSequence();
+    var sink: @import("native_catalog_sink.zig").Sink = .{ .store = &store, .allocator = allocator };
+    try @import("../native_catalog_backend.zig").deleteAllForScope(allocator, sink.sink(), "unused");
+    try std.testing.expectEqual(before, store.file.committedSequence());
+}
+
+test "lite durable empty index deletion syncs an earlier ride-along tombstone" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-empty-scope-barrier.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = false, .io = std.testing.io });
+    defer store.close();
+    store.ride_along_idle_ns = 10 * std.time.ns_per_s;
+
+    const prefix = "/directory/";
+    const key = prefix ++ "entry";
+    try store.file.putIndexCatalogRecord(key, "value");
+    {
+        try store.file.beginTransaction();
+        errdefer store.file.abortTransaction();
+        try store.file.deleteIndexCatalogRecord(key);
+        try store.file.commitTransactionWithDurability(false, null);
+    }
+    const pending = store.file.activeCheckpoint().commit_sequence;
+    try std.testing.expectEqual(native.NativeFile.IndexScopeDeletion.empty, try store.file.planIndexScopeDeletion(prefix, "/directory", 0));
+    try std.testing.expect(store.file.durableSequence() < pending);
+
+    try store.submitIndexTreeDeletion(prefix, "/directory");
+    try std.testing.expectEqual(pending, store.file.durableSequence());
+}
+
+test "lite native docstore deletes a small index scope without folding unrelated redo" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-small-scope.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.putIndexCatalogBatch("small", &.{.{ .namespace = null, .key = "posting", .value = "data" }});
+        try txn.commit();
+    }
+    try store.checkpointRedoLog();
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put("unrelated", "unfolded");
+        try txn.commit();
+    }
+    const folded = store.file.activeCheckpoint().redo_folded_through;
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        const value: [32 * 1024]u8 = @splat('x');
+        try txn.put("catalog", &value);
+        try txn.putIndexCatalogBatch("small", &.{.{ .namespace = null, .key = "pending", .value = "discard" }});
+        try txn.deleteIndexCatalogScope("small");
+        try txn.putIndexCatalogBatch("neighbor", &.{.{ .namespace = null, .key = "pending", .value = "keep" }});
+        try txn.commit();
+    }
+    try std.testing.expectEqual(folded, store.file.activeCheckpoint().redo_folded_through);
+    const key = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "small", null, "posting");
+    defer allocator.free(key);
+    try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(allocator, key)) == null);
+    const pending = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "small", null, "pending");
+    defer allocator.free(pending);
+    try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(allocator, pending)) == null);
+    const neighbor = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "neighbor", null, "pending");
+    defer allocator.free(neighbor);
+    const kept = (try store.file.getIndexCatalogRecordAlloc(allocator, neighbor)).?;
+    defer allocator.free(kept);
+    try std.testing.expectEqualStrings("keep", kept);
+}
+
+test "lite native docstore deletes a large index scope in one publication" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-scope-delete.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put("catalog", "present");
+        for (0..150) |i| {
+            var key: [160]u8 = @splat('k');
+            std.mem.writeInt(u64, key[0..8], i, .big);
+            try txn.putIndexCatalogBatch("idx", &.{.{ .namespace = null, .key = &key, .value = "posting" }});
+        }
+        try txn.putIndexCatalogBatch("idx-neighbor", &.{.{ .namespace = null, .key = "keep", .value = "neighbor" }});
+        try txn.commit();
+    }
+
+    {
+        var txn = try store.beginWrite();
+        defer txn.abort();
+        try txn.delete("catalog");
+        try txn.deleteIndexCatalogScope("idx");
+    }
+    const prefix = try @import("native_catalog_sink.zig").scopePrefixAlloc(allocator, "idx");
+    defer allocator.free(prefix);
+    {
+        var cursor = try store.file.indexCatalogCursor(store.file.activeCheckpoint(), prefix);
+        defer cursor.deinit();
+        const first = (try cursor.next()).?;
+        store.file.allocator.free(first.key);
+    }
+
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.delete("catalog");
+        try txn.deleteIndexCatalogScope("idx");
+        try txn.commit();
+    }
+    var cursor = try store.file.indexCatalogCursor(store.file.activeCheckpoint(), prefix);
+    defer cursor.deinit();
+    if (try cursor.next()) |record| {
+        store.file.allocator.free(record.key);
+        return error.TestUnexpectedResult;
+    }
+    const keep = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "idx-neighbor", null, "keep");
+    defer allocator.free(keep);
+    const value = (try store.file.getIndexCatalogRecordAlloc(allocator, keep)).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("neighbor", value);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get("catalog"));
 }
 
 test "lite native docstore putIndexCatalogBatch alone (no primary writes) still commits once" {

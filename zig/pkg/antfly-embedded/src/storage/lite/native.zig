@@ -3301,6 +3301,7 @@ pub const CatalogCursor = struct {
     /// future caller over a root outside TransactionWrites.Root's three
     /// has a documented, explicit opt-out rather than a silent mismatch).
     overlay_root: ?TransactionWrites.Root = null,
+    overlay_mark: u64 = 0,
     overlay: NativeFile.OverlayScanState = .{ .allocator = undefined },
     overlay_started: bool = false,
     /// The tree's own already-fetched candidate, held here whenever the
@@ -3333,7 +3334,7 @@ pub const CatalogCursor = struct {
             // absent key, so this stays a hard error rather than quietly
             // skipping (which `nextRecordAlloc`'s own one-key-at-a-time
             // contract has no loop to do safely).
-            const entry = (try file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key.key)) orelse return error.InvalidNativeRedoRecord;
+            const entry = (try file.redoOverlayEntryAt(self.overlay_root.?, self.overlay_mark, self.index.checkpoint.redo_folded_through, key.key)) orelse return error.InvalidNativeRedoRecord;
             defer file.allocator.free(entry.value);
             break :blk try file.catalogEntryValueAtCheckpointAlloc(allocator, entry, self.index.checkpoint);
         } else blk: {
@@ -3402,13 +3403,16 @@ pub const CatalogCursor = struct {
                 // phantom key, it must stay buffered rather than being
                 // freed as if the overlay had genuinely superseded it
                 // (same bug class as `MergedCursor.advance`'s own fix).
-                const entry = try file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key);
+                const checkpoint = self.index.checkpoint;
+                const deleted = if (file.redo) |redo|
+                    redo.shared.resolveDeletion(file.runtimeIo(), @backingInt(self.overlay_root.?), key, self.overlay_mark, checkpoint.redo_folded_through)
+                else
+                    null;
                 _ = try self.overlay.takeFront();
-                if (entry == null) {
+                if (deleted == null) {
                     self.pending_tree = candidate;
                     continue;
                 }
-                defer file.allocator.free(entry.?.value);
                 const tied = tree_key != null and std.mem.eql(u8, tree_key.?, key);
                 if (tied) {
                     var owned = candidate.?;
@@ -3416,7 +3420,7 @@ pub const CatalogCursor = struct {
                 } else {
                     self.pending_tree = candidate;
                 }
-                if (entry.?.is_delete) continue;
+                if (deleted.?) continue;
                 return .{ .key = try file.allocator.dupe(u8, key), .page_id = 0 };
             }
             const owned = candidate orelse break;
@@ -5028,14 +5032,14 @@ const RedoCommitState = struct {
 
     /// The exact byte length `appendRecord` would write right now for the
     /// currently staged `logical_pending`/`pending`, including the
-    /// redo-log's own record framing (`redo_log.header_len`) -- callers
+    /// redo-log's own header and end trailer -- callers
     /// check this against `self.writer.remaining()` *before* calling
     /// `appendRecord`, so a log that cannot fit this record is caught
     /// before anything is written, never surfacing as a failed, partial
     /// append (`error.LogFull`, which `publishCheckpoint` would otherwise
     /// report as the much less specific `error.OutcomeUnknown`).
     fn pendingRecordLen(self: *const RedoCommitState) u64 {
-        return redo_log.header_len + CompactCheckpoint.encoded_size + 4 + self.logical_pending.items.len + self.pending.items.len;
+        return 2 * redo_log.header_len + CompactCheckpoint.encoded_size + 4 + self.logical_pending.items.len + self.pending.items.len;
     }
 };
 
@@ -13696,6 +13700,132 @@ pub const NativeFile = struct {
         return try self.putCatalogBatchForRoot(.index, mutations, .{});
     }
 
+    pub const IndexScopeDeletion = enum { empty, inline_delete, fold_first };
+
+    fn logicalMutationWireBytes(key_len: usize, inline_value_len: usize, external: bool) usize {
+        // Root, key length, key and flags, then either an inline length
+        // and value or a pair of u64s identifying the external value.
+        return key_len +| 4 +| (if (external) @as(usize, 16) else 4 +| inline_value_len);
+    }
+
+    pub fn indexScopeCompanionRedoBytes(self: *const NativeFile, documents: []const DocumentMutation, catalog: []const CatalogMutation) usize {
+        var bytes: usize = 0;
+        for (documents) |mutation| {
+            const external = !mutation.is_delete and
+                (mutation.external_value_root_page != 0 or !self.documentEntryFitsInline(mutation.key, mutation.value));
+            bytes +|= logicalMutationWireBytes(mutation.key.len, if (mutation.is_delete) 0 else mutation.value.len, external);
+            // putDocumentBatch may stage a metadata record alongside each
+            // tracked key. Count repeated scopes conservatively here.
+            if (self.header.indexed_reclamation) {
+                if (recovery_agenda.namespace(mutation.key)) |scope| {
+                    bytes +|= logicalMutationWireBytes(recovery_agenda.prefix.len +| scope.len, 0, false);
+                }
+            }
+        }
+        for (catalog) |mutation| {
+            const external = !mutation.is_delete and
+                (mutation.external_value_root_page != 0 or !self.catalogEntryFitsInline(mutation.key, mutation.value));
+            bytes +|= logicalMutationWireBytes(mutation.key.len, if (mutation.is_delete) 0 else mutation.value.len, external);
+        }
+        return bytes;
+    }
+
+    /// A keys-only preflight with the same byte threshold used by private
+    /// flushes. Caller holds writer admission and the store mutation mutex.
+    pub fn planIndexScopeDeletion(self: *NativeFile, prefix: []const u8, exact_key: ?[]const u8, other_bytes: usize) !IndexScopeDeletion {
+        if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
+        try self.refreshIfWriterBaseStale();
+        try self.resyncRedoTailUnderAuthority();
+        const checkpoint = self.activeCheckpoint();
+        const exact_exists = if (exact_key) |key|
+            try self.getIndexCatalogRecordSizeAtCheckpoint(key, checkpoint) != null
+        else
+            false;
+        var cursor = try self.indexCatalogCursor(checkpoint, prefix);
+        defer cursor.deinit();
+        var entry = (try cursor.next()) orelse return if (exact_exists) .inline_delete else .empty;
+        const redo = self.redo orelse {
+            self.allocator.free(entry.key);
+            return .inline_delete;
+        };
+        var bytes = other_bytes;
+        if (exact_exists) bytes +|= logicalMutationWireBytes(exact_key.?.len, 0, false);
+        while (true) {
+            if (exact_key == null or !std.mem.eql(u8, entry.key, exact_key.?)) {
+                bytes +|= logicalMutationWireBytes(entry.key.len, 0, false);
+            }
+            self.allocator.free(entry.key);
+            if (bytes >= redo.large_txn_fallback_bytes) {
+                // A large companion batch can itself spill to physical
+                // writes outside the scope before deletion even starts.
+                if (other_bytes >= redo.large_txn_fallback_bytes) return .fold_first;
+                const overlaps = redo.shared.hasLivePrefix(self.runtimeIo(), @backingInt(TransactionWrites.Root.index), prefix, exact_key, self.readMark(checkpoint), checkpoint.redo_folded_through);
+                return if (overlaps) .fold_first else .inline_delete;
+            }
+            entry = (try cursor.next()) orelse return .inline_delete;
+        }
+    }
+
+    /// Apply a prefix delete in bounded private batches. The caller's
+    /// transaction publishes the scope removal together with its other writes.
+    pub fn deleteIndexCatalogPrefix(self: *NativeFile, prefix: []const u8, exact_key: ?[]const u8) !void {
+        const checkpoint = try self.materializeTransactionCheckpoint();
+        var batch = CatalogDeleteBatch{ .allocator = self.allocator, .file = self };
+        defer batch.deinit();
+        if (exact_key) |key| {
+            if (try self.getIndexCatalogRecordSizeAtCheckpoint(key, checkpoint) != null) try batch.add(key);
+        }
+        var cursor = try self.indexCatalogCursor(checkpoint, prefix);
+        defer cursor.deinit();
+        while (try cursor.next()) |record| {
+            defer self.allocator.free(record.key);
+            if (exact_key) |key| {
+                if (std.mem.eql(u8, record.key, key)) continue;
+            }
+            try batch.add(record.key);
+        }
+        try batch.flush();
+    }
+
+    // Subtree deletion stays one atomic native transaction. Each private flush
+    // releases keys and editor scratch; the cursor retains the original immutable
+    // root so subsequent batches cannot skip entries as the active tree shrinks.
+    const CatalogDeleteBatch = struct {
+        const max_keys = 64;
+        const max_key_bytes = 16 * 1024;
+        allocator: Allocator,
+        file: *NativeFile,
+        mutations: std.ArrayListUnmanaged(CatalogMutation) = .empty,
+        key_bytes: usize = 0,
+
+        fn clear(self: *@This()) void {
+            for (self.mutations.items) |mutation| self.allocator.free(mutation.key);
+            self.mutations.clearRetainingCapacity();
+            self.key_bytes = 0;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.clear();
+            self.mutations.deinit(self.allocator);
+        }
+
+        fn add(self: *@This(), key: []const u8) !void {
+            if (self.mutations.items.len != 0 and
+                (self.mutations.items.len >= max_keys or self.key_bytes + key.len > max_key_bytes)) try self.flush();
+            const owned = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(owned);
+            try self.mutations.append(self.allocator, .{ .key = owned, .is_delete = true });
+            self.key_bytes += owned.len;
+        }
+
+        fn flush(self: *@This()) !void {
+            if (self.mutations.items.len == 0) return;
+            try self.file.putIndexCatalogBatch(self.mutations.items);
+            _ = try self.file.materializeTransactionCheckpoint();
+            self.clear();
+        }
+    };
+
     const CatalogRoots = struct { history: u64, index: u64 = 0, indexed: bool = false };
 
     fn readCatalogRoots(self: *NativeFile, page: u64, checkpoint: CheckpointSlot) !CatalogRoots {
@@ -14681,7 +14811,7 @@ pub const NativeFile = struct {
         const overlay_root: TransactionWrites.Root = if (root == .metadata) .metadata else .index;
         var overlay = try OverlayScanState.initForPrefix(self.allocator, self, overlay_root, checkpoint, prefix);
         errdefer overlay.deinit();
-        return .{ .index = CheckpointedTree.init(self, indexed), .prefix = prefix, .overlay_root = overlay_root, .overlay = overlay };
+        return .{ .index = CheckpointedTree.init(self, indexed), .prefix = prefix, .overlay_root = overlay_root, .overlay_mark = self.readMark(checkpoint), .overlay = overlay };
     }
 
     fn snapshotCatalogRecordsFromRootAlloc(self: *NativeFile, allocator: Allocator, root: CatalogRoot) ![]OwnedCatalogRecord {

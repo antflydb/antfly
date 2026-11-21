@@ -755,6 +755,39 @@ pub const SharedRedoOverlay = struct {
         };
     }
 
+    pub fn hasLivePrefix(self: *SharedRedoOverlay, io: std.Io, root: u8, prefix: []const u8, exact: ?[]const u8, mark: u64, floor: u64) bool {
+        std.debug.assert(root < 3);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (exact) |key| {
+            if (self.maps[root].getPtr(key)) |head| {
+                if (head.*.resolve(mark)) |entry| {
+                    if (entry.sequence > floor and !entry.is_delete) return true;
+                }
+            }
+        }
+        const ordered = self.ordered[root].root;
+        var node = orderedFirstWithPrefix(ordered, prefix);
+        while (node) |current| : (node = orderedLowerBound(ordered, current.key, true)) {
+            if (!std.mem.startsWith(u8, current.key, prefix)) break;
+            const head = self.maps[root].getPtr(current.key) orelse continue;
+            const entry = head.*.resolve(mark) orelse continue;
+            if (entry.sequence > floor and !entry.is_delete) return true;
+        }
+        return false;
+    }
+
+    /// Resolves only whether a version shadows the tree and is a tombstone.
+    pub fn resolveDeletion(self: *SharedRedoOverlay, io: std.Io, root: u8, key: []const u8, mark: u64, fold_floor: u64) ?bool {
+        std.debug.assert(root < 3);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const head = self.maps[root].getPtr(key) orelse return null;
+        const entry = head.*.resolve(mark) orelse return null;
+        if (entry.sequence <= fold_floor) return null;
+        return entry.is_delete;
+    }
+
     /// Registers a live pin at `sequence`, counted toward this overlay's
     /// own reclaim floor regardless of whether the pinning reader also
     /// participates in the cross-process `ReaderCoordinator`/region

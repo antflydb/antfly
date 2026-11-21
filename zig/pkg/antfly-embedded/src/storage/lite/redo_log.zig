@@ -325,7 +325,7 @@ pub const Writer = struct {
             if (commit_sequence != last + 1) return error.SequenceOutOfOrder;
         }
         const record_len: u64 = header_len + payload.len;
-        if (record_len > self.remaining()) return error.LogFull;
+        if (record_len + header_len > self.remaining()) return error.LogFull;
 
         var header_buf: [header_len]u8 = undefined;
         const header = (RecordHeader{
@@ -363,15 +363,14 @@ pub const Writer = struct {
         // retryable torn-tail recovery this design promises for exactly
         // this case.
         //
-        // An all-zero header-sized end marker goes right after the record,
+        // A header-sized end trailer goes right after the record,
         // in the same write as the payload. A failed earlier append may
         // have left payload bytes past this record's end (recovery clears
         // only a torn header), and without the marker replay would read
         // them as the next header whenever this record is shorter.
         var end_marker: [header_len]u8 = undefined;
         (Trailer{ .sequence = commit_sequence, .salt = header.salt }).encode(&end_marker);
-        const marker_len: usize = if (record_len + header_len <= self.remaining()) header_len else 0;
-        try writePositionalPairAll(self.file, self.io, payload, end_marker[0..marker_len], offset + header_len);
+        try writePositionalPairAll(self.file, self.io, payload, &end_marker, offset + header_len);
         try self.file.writePositionalAll(self.io, &header_buf, offset);
 
         self.tail += record_len;
@@ -435,9 +434,11 @@ pub const Writer = struct {
     pub fn rollbackTo(self: *Writer, m: Mark) void {
         if (m.tail >= self.tail) return;
         const zeros: [4096]u8 = @splat(0);
+        // The record's trailer lies just outside the writer cursor.
+        const erase_end = @min(self.capacity, self.tail +| header_len);
         var pos = m.tail;
-        while (pos < self.tail) {
-            const chunk = @min(zeros.len, self.tail - pos);
+        while (pos < erase_end) {
+            const chunk = @min(zeros.len, erase_end - pos);
             // Best-effort, like every other write into this fixed,
             // preallocated extent (§9.1): a failure here leaves some stale
             // bytes behind, no worse off than not rolling back at all, so
@@ -671,9 +672,10 @@ pub fn replayBounded(
         const header, const record_header_len = switch (try readHeaderAt(file, io, base_offset + pos, remaining)) {
             // Too little room left for any header: the region's end.
             .short => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (remaining < legacy_header_len) .end_of_region else .torn_tail },
-            // Untouched, preallocated space or an end marker: a clean end,
-            // never a torn write (a real torn write leaves whatever bytes
-            // landed, not all-zero bytes).
+            // The append writes the payload and trailer before its
+            // header. At a zero header those bytes cannot distinguish an
+            // interrupted append from an erased record. The durable
+            // sequence promised by the caller is checked at recovery.
             .zero => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region },
             // This run's end. A retired run's trailer (another salt) past a
             // lost one is the end too, after a restart.
@@ -715,15 +717,10 @@ pub fn replayBounded(
 
         const payload_len: u64 = header.payload_len;
         if (record_header_len + payload_len > remaining) {
-            // The header is well-formed but claims more payload than the
-            // region has left. A real write can never produce this (the
-            // writer checks `remaining()` before appending), so this is
-            // either a torn write that landed a plausible-looking header
-            // with garbage length bits, or genuine corruption. Either way
-            // the record cannot be validated (there aren't enough bytes to
-            // checksum), so treat it as a torn tail: there is no complete
-            // record here to call corrupt.
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .torn_tail };
+            // A decoded header from this run cannot claim bytes past
+            // the extent. Fail closed even for old records that were
+            // allowed to fill the extent without an end trailer.
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
         }
 
         payload_buf.clearRetainingCapacity();
@@ -1286,6 +1283,63 @@ test "replay rejects a damaged salt inside a run, not a short log" {
     try testing.expectEqual(clean.tail, ended.valid_bytes);
 }
 
+test "replay accepts an interrupted first append with a prepared trailer" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var trailer: [header_len]u8 = undefined;
+    (Trailer{ .sequence = 11, .salt = 123 }).encode(&trailer);
+    try writePositionalPairAll(region.file, io, "prepared", &trailer, header_len);
+    const outcome = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
+    try testing.expectEqual(@as(u64, 0), outcome.valid_bytes);
+}
+
+test "rollback of the first append erases its prepared trailer" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+    var writer = Writer.initAt(region.file, io, 0, capacity, 0, 10);
+    const mark = writer.mark();
+    try writer.append(11, "rolled back");
+    const trailer_at = writer.tail;
+    writer.rollbackTo(mark);
+    var trailer: [header_len]u8 = undefined;
+    try testing.expectEqual(header_len, try region.file.readPositionalAll(io, &trailer, trailer_at));
+    try testing.expect(isAllZero(&trailer));
+}
+
+test "replay rejects a corrupted length even without a final trailer" {
+    const io = testing.io;
+    const capacity: u64 = 2 * (header_len + 1) + header_len;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(11, "a");
+    const last = writer.tail;
+    try writer.append(12, "b");
+
+    // Older writers could fill the extent without writing a trailer.
+    try region.file.writePositionalAll(io, &.{0x80}, last + 11);
+    const outcome = try replayBounded(testing.allocator, region.file, io, 0, capacity - header_len, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, outcome.stop_reason);
+    try testing.expectEqual(last, outcome.valid_bytes);
+
+    try region.file.writePositionalAll(io, &.{0x80}, 11);
+    const first = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, first.stop_reason);
+    try testing.expectEqual(@as(u64, 0), first.valid_bytes);
+
+    var single = Writer.init(region.file, io, 0, capacity);
+    try single.append(11, "a");
+    try region.file.writePositionalAll(io, &.{0x80}, 11);
+    const only = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, only.stop_reason);
+}
+
 test "replay keeps rejecting what retired bytes can never be" {
     const io = testing.io;
     const capacity: u64 = 4096;
@@ -1514,7 +1568,12 @@ test "rollbackTo is a no-op when nothing was appended since the mark" {
 
 test "writer rejects a record that would overflow the region" {
     const io = testing.io;
-    const capacity: u64 = header_len + 4; // room for exactly one 4-byte payload.
+    const capacity: u64 = 2 * header_len + 4;
+    var short_region = try makeTempRegion(io, capacity - 1);
+    defer cleanupTempRegion(io, &short_region.file, short_region.path[0..short_region.path_len]);
+    var short_writer = Writer.init(short_region.file, io, 0, capacity - 1);
+    try testing.expectError(error.LogFull, short_writer.append(1, "abcd"));
+    try testing.expectEqual(@as(u64, 0), short_writer.tail);
     var region = try makeTempRegion(io, capacity);
     defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
 
@@ -1523,7 +1582,7 @@ test "writer rejects a record that would overflow the region" {
     try testing.expectError(error.LogFull, writer.append(2, "e"));
 }
 
-test "replay stops at a torn tail and reports the valid prefix" {
+test "replay reports the valid prefix before an impossible header" {
     const io = testing.io;
     const capacity: u64 = 4096;
     var region = try makeTempRegion(io, capacity);
@@ -1535,16 +1594,8 @@ test "replay stops at a torn tail and reports the valid prefix" {
     try writer.sync();
     const good_tail = writer.tail;
 
-    // Simulate a crash mid-append of a third record whose header landed
-    // (the magic/version/header_len fields are intact and well-formed) but
-    // whose claimed payload length is physically impossible for the
-    // remaining region -- the one way `replay` can tell "this header is
-    // real but the record behind it never finished landing" apart from
-    // "this header is garbage" without being able to checksum bytes that
-    // were never written. A real torn write can produce exactly this: the
-    // header is a single small write that lands atomically more often than
-    // not, while the much larger payload write that follows it is what the
-    // crash interrupts.
+    // An impossible length in a complete-looking header is ambiguous
+    // without a durable watermark. Do not recover it as a torn append.
     var header_buf: [header_len]u8 = undefined;
     const torn: RecordHeader = .{ .payload_len = @intCast(capacity), .commit_sequence = 3, .crc32 = 0, .salt = writer.salt.? };
     torn.encode(&header_buf);
@@ -1554,17 +1605,7 @@ test "replay stops at a torn tail and reports the valid prefix" {
     try testing.expectEqual(@as(u64, 2), outcome.valid_count);
     try testing.expectEqual(@as(u64, 2), outcome.last_sequence.?);
     try testing.expectEqual(good_tail, outcome.valid_bytes);
-    try testing.expectEqual(StopReason.torn_tail, outcome.stop_reason);
-
-    // A writer resuming from this outcome must be able to append right
-    // where the valid prefix ended, overwriting the torn record.
-    var resumed = Writer.initAt(region.file, io, 0, capacity, outcome.valid_bytes, outcome.last_sequence);
-    try resumed.append(3, "three");
-    try resumed.sync();
-    const resumed_outcome = try replay(testing.allocator, region.file, io, 0, capacity, null, null, null);
-    try testing.expectEqual(@as(u64, 3), resumed_outcome.valid_count);
-    try testing.expectEqual(@as(u64, 3), resumed_outcome.last_sequence.?);
-    try testing.expectEqual(StopReason.end_of_region, resumed_outcome.stop_reason);
+    try testing.expectEqual(StopReason.corrupt_record, outcome.stop_reason);
 }
 
 test "replay stops at a torn tail when the file is physically shorter than the region" {

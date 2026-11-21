@@ -144,6 +144,8 @@ pub const GlobalReplayKind = enum(u8) {
     /// The first sequence the per-hint index covers (see
     /// `replay_hint_index_floor_key`).
     hint_index_floor = 0x5a,
+    journal_credit_lane_heads = 0x5b,
+    journal_credit_totals_witness = 0x5c,
     latest_sequence = 0x03,
     replication_applied = 0x04,
     ordered_document_applied = 0x05,
@@ -219,6 +221,8 @@ pub const replay_journal_format_v3: u32 = 3;
 pub const replay_journal_format_current: u32 = replay_journal_format_v3;
 pub const replay_journal_format_version_key = globalReplayPrefix(.journal_format_version);
 pub const journal_credit_ledger_key = globalReplayPrefix(.journal_credit_ledger);
+pub const journal_credit_lane_heads_key = globalReplayPrefix(.journal_credit_lane_heads);
+pub const journal_credit_totals_witness_key = globalReplayPrefix(.journal_credit_totals_witness);
 /// Sequences from this one on have an entry in each hint lane their record
 /// carries (a payload copy where readers use hint lanes, an empty index
 /// entry on a shared-lane store). An upgraded journal starts it at its head.
