@@ -27,6 +27,7 @@ const Context = @import("antfly_local_sources").api_operation.RequestContext;
 const A = std.mem.Allocator;
 pub const Root = struct {
     namespace: control.Namespace,
+    physical_range_id: u64 = 0,
     table_name: []const u8,
     table_binding: control.Digest,
     fence: metadata.CatalogRouteFence,
@@ -73,16 +74,33 @@ pub const Captured = struct {
             switch (std.mem.order(u8, &self.roots[middle].namespace, &namespace)) {
                 .lt => low = middle + 1,
                 .gt => high = middle,
-                .eq => return self.roots[middle],
+                .eq => {
+                    if ((middle > 0 and std.mem.eql(u8, &self.roots[middle - 1].namespace, &namespace)) or
+                        (middle + 1 < self.roots.len and std.mem.eql(u8, &self.roots[middle + 1].namespace, &namespace)))
+                        return error.ChangefeedResynchronizationRequired;
+                    return self.roots[middle];
+                },
             }
         }
         return error.ChangefeedResynchronizationRequired;
     }
+    pub fn findPhysical(self: *const Captured, table_id: u64, group_id: u64, range_id: u64) !Root {
+        for (self.roots) |root| {
+            if (root.fence.table_id == table_id and root.fence.route.group_id == group_id and root.physical_range_id == range_id)
+                return root;
+        }
+        return error.ChangefeedResynchronizationRequired;
+    }
+
     /// Caller persists this complete vector before any root dispatch. The
     /// ownership counter belongs to feed metadata, not a hash of topology.
     pub fn initialPlans(self: *const Captured, a: A) ![]control.RootPlan {
         const plans = try a.alloc(control.RootPlan, self.roots.len);
-        for (self.roots, plans) |root, *plan| plan.* = .{ .namespace = root.namespace, .ownership_epoch = 1 };
+        errdefer a.free(plans);
+        for (self.roots, plans, 0..) |root, *plan, index| {
+            if (index != 0 and std.mem.eql(u8, &self.roots[index - 1].namespace, &root.namespace)) return error.TopologyChanged;
+            plan.* = .{ .namespace = root.namespace, .ownership_epoch = 1 };
+        }
         return plans;
     }
 
@@ -180,6 +198,15 @@ pub const Source = struct {
     /// Authorization must precede capture. Returned locators borrow the owned
     /// generation, so they remain valid even after the publisher retires it.
     pub fn capture(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
+        return self.captureRoutes(a, definition, context, false);
+    }
+
+    /// Physical topology discovery also includes ranges sharing a document namespace.
+    pub fn capturePhysical(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
+        return self.captureRoutes(a, definition, context, true);
+    }
+
+    fn captureRoutes(self: Source, a: A, definition: control.Definition, context: Context, allow_shared_namespace: bool) !Captured {
         try context.ensureActive();
         try definition.validate();
         var budget = self.catalog.budget(null);
@@ -204,7 +231,7 @@ pub const Source = struct {
                 try budget.checkpointIndex(ordinal);
                 const shard = tables.rangeDocIdentityShardId(range.*);
                 const range_id = tables.rangeDocIdentityRangeId(range.*);
-                if (range.group_id == 0 or shard == 0 or range_id == 0) return error.TopologyChanged;
+                if (range.group_id == 0 or range.range_id == 0 or shard == 0 or range_id == 0) return error.TopologyChanged;
                 var namespace: control.Namespace = undefined;
                 std.mem.writeInt(u64, namespace[0..8], table.table_id, .big);
                 std.mem.writeInt(u64, namespace[8..16], shard, .big);
@@ -212,15 +239,21 @@ pub const Source = struct {
                 const route: catalog_api.CatalogGroupRoute = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = table.table_id, .shard_id = shard, .range_id = range_id } };
                 const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = session.snapshot.value.metadata_group_id, .metadata_incarnation = session.snapshot.value.metadata_incarnation, .catalog_revision = session.snapshot.value.catalog_revision, .table_id = table.table_id, .topology_epoch = view.topology_epoch, .route = route };
                 try fence.validate();
-                try roots.append(a, .{ .namespace = namespace, .table_name = table.name, .table_binding = expected.binding, .fence = fence });
+                try roots.append(a, .{ .namespace = namespace, .physical_range_id = range.range_id, .table_name = table.name, .table_binding = expected.binding, .fence = fence });
             }
         }
         std.mem.sort(Root, roots.items, {}, struct {
             fn less(_: void, left: Root, right: Root) bool {
-                return std.mem.order(u8, &left.namespace, &right.namespace) == .lt;
+                return switch (std.mem.order(u8, &left.namespace, &right.namespace)) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => left.fence.route.group_id < right.fence.route.group_id,
+                };
             }
         }.less);
-        for (roots.items, 0..) |root, index| if (index != 0 and std.mem.eql(u8, &roots.items[index - 1].namespace, &root.namespace)) return error.TopologyChanged;
+        if (!allow_shared_namespace) {
+            for (roots.items, 0..) |root, index| if (index != 0 and std.mem.eql(u8, &roots.items[index - 1].namespace, &root.namespace)) return error.TopologyChanged;
+        }
         try budget.checkpoint();
         try context.ensureActive();
         return .{ .allocator = a, .session = session, .roots = try roots.toOwnedSlice(a) };
@@ -650,6 +683,19 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectEqual(@as(usize, 3), plans.len);
         try std.testing.expectEqual(@as(u64, 1), plans[0].ownership_epoch);
         try std.testing.expectEqual(@as(usize, 0), fixture.admin_calls);
+        var split_ranges = ranges;
+        split_ranges[0].doc_identity_range_id = split_ranges[2].doc_identity_range_id;
+        const split_generation = try catalog_api.RoutingGeneration.create(a, snapshot(&records, &split_ranges), .{});
+        defer split_generation.release();
+        var split_fixture: Fixture = .{ .generation = split_generation };
+        var physical = try split_fixture.source().capturePhysical(a, definition, .{});
+        defer physical.deinit();
+        const parent = try physical.findPhysical(7, 71, 71);
+        const child = try physical.findPhysical(7, 72, 72);
+        try std.testing.expectEqual(parent.namespace, child.namespace);
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, physical.find(parent.namespace));
+        try std.testing.expectError(error.TopologyChanged, physical.initialPlans(a));
+        try std.testing.expectError(error.TopologyChanged, split_fixture.source().capture(a, definition, .{}));
         var replaced = records;
         replaced[0].table_id = 9;
         var replacement_ranges = ranges;
