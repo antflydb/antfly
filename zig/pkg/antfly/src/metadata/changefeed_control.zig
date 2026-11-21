@@ -166,6 +166,20 @@ pub const PhysicalRoot = struct {
     }
 };
 
+pub const SplitHandoff = struct {
+    predecessor: PhysicalRoot,
+    successor: PhysicalRoot,
+    cut: @import("antfly_local_sources").storage_committed_history.SplitCut,
+
+    fn validate(self: SplitHandoff, namespace: Namespace) !void {
+        if (!self.predecessor.valid() or !self.successor.valid() or self.predecessor.group_id == self.successor.group_id or
+            self.cut.successor_group != self.successor.group_id or !equal(self.cut.namespace, namespace) or
+            self.cut.transition == 0 or self.cut.attempt == 0 or self.cut.term == 0 or self.cut.index == 0 or
+            self.cut.reclaimed > self.cut.latest or !nz(self.cut.boundary))
+            return error.InvalidChangefeed;
+    }
+};
+
 fn writePhysicalRootRecord(value: anytype, writer: anytype) @TypeOf(writer.*).Error!void {
     try writer.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
@@ -173,6 +187,11 @@ fn writePhysicalRootRecord(value: anytype, writer: anytype) @TypeOf(writer.*).Er
             if (value.physical) |physical| {
                 try writer.objectField(name);
                 try writer.write(physical);
+            }
+        } else if (comptime std.mem.eql(u8, name, "split_handoff")) {
+            if (@field(value, name)) |handoff| {
+                try writer.objectField(name);
+                try writer.write(handoff);
             }
         } else {
             try writer.objectField(name);
@@ -203,6 +222,7 @@ pub const Root = struct {
     last_control: ?root_intent.Settlement = null,
     last_reconciliation: ?root_intent.Reconciliation = null,
     physical: ?PhysicalRoot = null,
+    split_handoff: ?SplitHandoff = null,
 
     pub fn jsonStringify(self: Root, writer: anytype) @TypeOf(writer.*).Error!void {
         return writePhysicalRootRecord(self, writer);
@@ -429,6 +449,11 @@ pub const State = struct {
                 (root.physical != null and !root.physical.?.valid()) or
                 !definition.contains(std.mem.readInt(u64, root.namespace[0..8], .big)) or
                 (index != 0 and std.mem.order(u8, &self.roots[index - 1].namespace, &root.namespace) != .lt)) return error.InvalidChangefeed;
+            if (root.split_handoff) |handoff| {
+                try handoff.validate(root.namespace);
+                if (!std.meta.eql(root.physical, @as(?PhysicalRoot, handoff.predecessor)) or root.consumer_epoch == 0)
+                    return error.InvalidChangefeed;
+            }
             if (root.renewed_through > self.expires_at or (root.consumer_epoch == 0 and root.renewed_through != 0)) return error.InvalidChangefeed;
             if (root.consumer_epoch == 0) {
                 if (root.start != 0 or root.delivered.order(.{}) != .eq or root.acknowledged.order(.{}) != .eq or root.reclaimed_through != 0 or root.snapshot != null) return error.InvalidChangefeed;
@@ -565,6 +590,7 @@ pub const Mutation = union(enum) {
     plan_roots: []const RootPlan,
     enroll: struct { namespace: Namespace, ownership_epoch: u64, grant_sequence: u64, consumer_epoch: u64, start: u64, snapshot: ?Snapshot = null },
     rebind: struct { namespace: Namespace, previous: u64, next: u64, proof: Digest },
+    stage_split_handoff: struct { namespace: Namespace, ownership_epoch: u64, handoff: SplitHandoff },
     refresh_grant: struct { namespace: Namespace, previous: u64 },
     stage_catalog_start: []const u8,
     seal: Seal,
@@ -590,6 +616,7 @@ pub const Mutation = union(enum) {
             .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
             .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
             .stage_catalog_start, .renew_catalog => return provider_history_protocol_version,
+            .stage_split_handoff => return physical_history_protocol_version,
             .plan_roots => |plans| for (plans) |plan| {
                 if (plan.physical != null) return physical_history_protocol_version;
             },
@@ -625,6 +652,10 @@ pub const Mutation = union(enum) {
             .enroll => |value| {
                 if (!nz(value.namespace) or value.ownership_epoch == 0 or value.grant_sequence == 0 or value.consumer_epoch == 0) return error.InvalidChangefeed;
                 if (value.snapshot) |pin| if (!nz(pin.id) or !nz(pin.digest) or pin.expires_at == 0) return error.InvalidChangefeed;
+            },
+            .stage_split_handoff => |value| {
+                if (!nz(value.namespace) or value.ownership_epoch == 0) return error.InvalidChangefeed;
+                try value.handoff.validate(value.namespace);
             },
             .refresh_grant => |value| if (!nz(value.namespace) or value.previous == 0) return error.InvalidChangefeed,
             .rebind => |value| if (!nz(value.namespace) or value.previous == 0 or value.next <= value.previous or !nz(value.proof)) return error.InvalidChangefeed,
@@ -683,6 +714,7 @@ pub const Mutation = union(enum) {
         const changed_root: ?Namespace = switch (self) {
             .enroll => |v| v.namespace,
             .rebind => |v| v.namespace,
+            .stage_split_handoff => |v| v.namespace,
             .refresh_grant => |v| v.namespace,
             .reclaimed => |v| v.namespace,
             .release_root => |v| v.namespace,
@@ -882,6 +914,22 @@ pub const Mutation = union(enum) {
                 roots[index].acknowledged = .{ .sequence = enrollment.start };
                 roots[index].reclaimed_through = enrollment.start;
                 roots[index].snapshot = enrollment.snapshot;
+                next.roots = roots;
+            },
+            .stage_split_handoff => |staged| {
+                if (state.phase != .streaming) return error.ChangefeedConflict;
+                const index = try state.rootIndex(staged.namespace);
+                const previous = state.roots[index];
+                if (previous.ownership_epoch != staged.ownership_epoch or previous.consumer_epoch == 0 or previous.released or
+                    !std.meta.eql(previous.physical, @as(?PhysicalRoot, staged.handoff.predecessor))) return error.ChangefeedConflict;
+                if (previous.split_handoff) |handoff| {
+                    if (!std.meta.eql(handoff, staged.handoff)) return error.ChangefeedConflict;
+                    return state;
+                }
+                if (staged.handoff.cut.reclaimed > previous.acknowledged.sequence)
+                    return error.ChangefeedResynchronizationRequired;
+                const roots = try a.dupe(Root, state.roots);
+                roots[index].split_handoff = staged.handoff;
                 next.roots = roots;
             },
             .rebind => |binding| {
@@ -1506,6 +1554,50 @@ fn testDelivery(state: State, advances: []const Advance) Delivery {
     var delivery: Delivery = .{ .sequence = state.latest_delivery + 1, .before = state.latest_cursor, .cursor = @splat(0), .authority = @splat(8), .issued_at = 200, .advances = advances };
     delivery.cursor = delivery.identity(state.id, state.epoch);
     return delivery;
+}
+
+test "changefeed stages a split proof without changing retained cursor positions" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try testState(a, .now);
+    const roots = try a.dupe(Root, state.roots);
+    roots[0].physical = .{ .group_id = 11, .range_id = 21 };
+    state.roots = roots;
+    const namespace = roots[0].namespace;
+    state = try step(a, state, .{ .issue = testDelivery(state, &.{.{ .namespace = namespace, .position = .{ .sequence = 11 } }}) });
+    var mutation: Mutation = .{ .stage_split_handoff = .{
+        .namespace = namespace,
+        .ownership_epoch = 1,
+        .handoff = .{
+            .predecessor = roots[0].physical.?,
+            .successor = .{ .group_id = 12, .range_id = 22 },
+            .cut = .{
+                .namespace = namespace,
+                .transition = 35,
+                .attempt = 1,
+                .successor_group = 12,
+                .term = 2,
+                .index = 45,
+                .latest = 11,
+                .reclaimed = 10,
+                .root_generation = 3,
+                .reserved_bytes = 0,
+                .boundary = @splat(1),
+            },
+        },
+    } };
+    const staged = try step(a, state, mutation);
+    try std.testing.expectEqual(state.acknowledged_cursor, staged.acknowledged_cursor);
+    try std.testing.expectEqual(state.latest_cursor, staged.latest_cursor);
+    try std.testing.expectEqual(@as(u64, 11), (try staged.rootsAt(a, staged.latest_cursor))[0].delivered.sequence);
+    var decoded = try parse(a, try encode(a, staged));
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(staged.roots[0].split_handoff, decoded.value.roots[0].split_handoff);
+    try std.testing.expectEqual(staged.revision, (try step(a, staged, mutation)).revision);
+    mutation.stage_split_handoff.handoff.cut.root_generation += 1;
+    try std.testing.expectError(error.ChangefeedConflict, step(a, staged, mutation));
 }
 
 test "changefeed control separates partial delivery ACK and native reclamation" {
