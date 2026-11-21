@@ -37,8 +37,13 @@ pub const State = enum {
     /// No journal yet: the first append initializes and stamps it.
     absent,
     current,
+    protected_credit,
     /// Initialized by the base revision or as v2: `upgrade` rewrites it.
     legacy,
+
+    pub fn isCurrent(value: State) bool {
+        return value == .current or value == .protected_credit;
+    }
 };
 
 pub fn state(txn: anytype) !State {
@@ -52,7 +57,8 @@ pub fn state(txn: anytype) !State {
     };
     const version = internal_keys.decodeReplayJournalFormatVersion(raw) orelse return error.UnsupportedReplayJournalFormat;
     if (version == internal_keys.replay_journal_format_v2) return .legacy;
-    if (version != internal_keys.replay_journal_format_current and version != internal_keys.replay_journal_format_protected_credit) return error.UnsupportedReplayJournalFormat;
+    if (version == internal_keys.replay_journal_format_protected_credit) return .protected_credit;
+    if (version != internal_keys.replay_journal_format_current) return error.UnsupportedReplayJournalFormat;
     return .current;
 }
 
