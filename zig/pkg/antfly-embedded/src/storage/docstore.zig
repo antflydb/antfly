@@ -269,7 +269,9 @@ const ReplayCreditWitness = struct {
     ledger: internal_keys.JournalCreditLedger,
 
     fn store(witness: ReplayCreditWitness, txn: anytype) !void {
-        const raw = witness.heads ++ witness.ledger.encode();
+        var raw: [encoded_len]u8 = undefined;
+        raw[0..heads_len].* = witness.heads;
+        raw[heads_len..].* = witness.ledger.encode();
         try txn.put(&internal_keys.journal_credit_lane_heads_key, &raw);
     }
 };
