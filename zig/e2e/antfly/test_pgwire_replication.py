@@ -813,7 +813,8 @@ def test_pg_recvlogical_resume_after_restart(
 
                     floor = lsn_value(recovered[4])
                     floor = expect_markers([b"after-node-failover"], floor)
-                    request_topology("split", {"split_key": "m"})
+                    # This internal endpoint takes a physical document key.
+                    request_topology("split", {"split_key": "doc:m"})
                     assert wait_until(
                         lambda: len(topology_snapshot()[2]) == 2,
                         timeout_s=180,
