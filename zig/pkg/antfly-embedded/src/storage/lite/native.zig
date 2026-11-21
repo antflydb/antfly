@@ -13755,7 +13755,13 @@ pub const NativeFile = struct {
                 bytes +|= logicalMutationWireBytes(entry.key.len, 0, false);
             }
             self.allocator.free(entry.key);
-            if (bytes >= redo.large_txn_fallback_bytes) return .fold_first;
+            if (bytes >= redo.large_txn_fallback_bytes) {
+                // A large companion batch can itself spill to physical
+                // writes outside the scope before deletion even starts.
+                if (other_bytes >= redo.large_txn_fallback_bytes) return .fold_first;
+                const overlaps = redo.shared.hasLivePrefix(self.runtimeIo(), @backingInt(TransactionWrites.Root.index), prefix, exact_key, self.readMark(checkpoint), checkpoint.redo_folded_through);
+                return if (overlaps) .fold_first else .inline_delete;
+            }
             entry = (try cursor.next()) orelse return .inline_delete;
         }
     }
