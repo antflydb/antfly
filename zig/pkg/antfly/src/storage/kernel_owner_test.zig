@@ -3973,6 +3973,14 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
         var old = try retained.openReadScope(a);
         defer old.close();
         try std.testing.expectEqualStrings("\x00", try old.getRange(key, 1, 1));
+        // Non-session rows have no derived prefix-cache entry. Ordinary
+        // range reads still reach the retained canonical value.
+        try std.testing.expectEqualStrings("\xff", try old.getRange(key, 0, 1));
+        if (old.probePrefix(key, 1)) |bytes| {
+            try std.testing.expectEqualStrings("\xff", bytes);
+        } else |err| {
+            try std.testing.expectEqual(error.EndOfStream, err);
+        }
     }
     var parent = try store.openSessionRead(a, group);
     var cursor = parent.openCursor() catch |err| {
@@ -4007,6 +4015,7 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
     var scoped = try recovered.openReadScope(a);
     defer scoped.close();
     try std.testing.expectEqualStrings("header", try scoped.getRange(session_key, 0, 6));
+    try std.testing.expectEqualStrings("header", try scoped.probePrefix(session_key, 6));
     const prefix = try records.keyAlloc(a, group, records.session_prefix);
     defer a.free(prefix);
     try std.testing.expectEqual(@as(u64, 0), try retained.countPrefix(prefix));

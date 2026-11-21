@@ -2822,17 +2822,10 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
         defer if (scope) |*s| s.close();
         const value = if (scope) |*s| blk: {
             if (request.length > kernel_owner_abi.metadata_session_max_value_bytes) return .invalid_argument;
-            if (s.getRange(key, request.offset, request.length)) |bytes| {
-                break :blk bytes;
-            } else |err| if (err != error.Unsupported) return storageOwnerStatusFromError(err);
             const session_record = @import("../metadata/transaction_session_record.zig");
             const logical = key[read.prefix.len..];
-            const cached = session_record.cachedRange(s, read.alloc, read.group, logical, request.offset, request.length) catch |err| return storageOwnerStatusFromError(err);
-            if (cached) |bytes| break :blk bytes;
-            if (request.operation == .probe_prefix) return .end_of_stream;
-            const full = s.get(key) catch |err| return storageOwnerStatusFromError(err);
-            if (request.offset > full.len or request.length > full.len - request.offset) return .end_of_stream;
-            break :blk full[@intCast(request.offset)..][0..request.length];
+            const mode: session_record.RangeRead = if (request.operation == .probe_prefix) .bounded_probe else .ordinary;
+            break :blk session_record.readRange(s, read.alloc, read.group, key, logical, request.offset, request.length, mode) catch |err| return storageOwnerStatusFromError(err);
         } else read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
         if (value.len > kernel_owner_abi.metadata_session_max_value_bytes) return .invalid_argument;
         const copy = read.alloc.dupe(u8, value) catch return .out_of_memory;

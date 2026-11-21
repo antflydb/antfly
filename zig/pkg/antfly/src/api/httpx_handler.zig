@@ -6832,7 +6832,7 @@ pub const AntflyApiHandler = struct {
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
                 self.connection_owned = try @import("sql_connections.zig").loadReconciled(store, &self.adapter.server.txn_sessions, std.heap.page_allocator, connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms);
                 const connection = self.connection_owned.?.value;
-                if (connection.state == .beginning or connection.state == .uncertain) return error.SqlConnectionBusy;
+                if (connection.state == .beginning) return error.SqlConnectionBusy;
                 if ((!self.adapter.inherit_session_database and !std.mem.eql(u8, self.adapter.database, connection.database)) or
                     (!self.adapter.inherit_session_namespace and !std.mem.eql(u8, self.adapter.namespace, connection.namespace))) return error.SqlConnectionChanged;
                 self.adapter.database = connection.database;
@@ -6846,6 +6846,10 @@ pub const AntflyApiHandler = struct {
                 if (connection.active_txn) |active| {
                     self.connection_session_hex = std.fmt.bytesToHex(active, .lower);
                     if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) return error.SqlTransactionNotActive;
+                    if (connection.state == .uncertain) {
+                        self.adapter.outcome_transaction_id = self.connection_session_hex;
+                        return error.SqlTransactionOutcomeUnknown;
+                    }
                     self.adapter.session_id = &self.connection_session_hex;
                     self.adapter.setting_overlay = &.{};
                 } else {
@@ -15499,6 +15503,33 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var after_close = try Route.statement(alloc, &handler, alice_auth, connection_id, "SHOW app.limit");
     defer after_close.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), after_close.status);
+
+    var second_open = try Route.call(alloc, &handler, alice_auth, .open, null, "{}");
+    defer second_open.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), second_open.status);
+    var second_connection = try std.json.parseFromSlice(sql_wire.SQLConnectionResponse, alloc, second_open.body, .{});
+    defer second_connection.deinit();
+    const uncertain_id = second_connection.value.connection_id;
+    var begun = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    defer begun.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), begun.status);
+    const principal = "connection_alice";
+    const node = server.localSessionNodeId();
+    const connections = @import("sql_connections.zig");
+    const id = std.fmt.bytesToHex(try distributed_txn.parseTxnIdHex(uncertain_id), .lower);
+    const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+    var active = try connections.load(&durable, alloc, id, principal, node, now_ms);
+    defer active.deinit();
+    const txn_id = active.value.active_txn.?;
+    const guard = try server.txn_sessions.mutation(alloc, txn_id, node);
+    _ = try connections.mutate(&durable, .{ .uncertain = .{ .id = id, .guard = guard } }, principal, node, now_ms);
+    var repeated = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "COMMIT");
+    defer repeated.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), repeated.status);
+    var diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, repeated.body, .{});
+    defer diagnostic.deinit();
+    try std.testing.expectEqualStrings("40003", diagnostic.value.code);
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(txn_id, .lower), diagnostic.value.transaction_id.?);
 }
 
 test "httpx SQL malformed catalog requests fail before publication" {

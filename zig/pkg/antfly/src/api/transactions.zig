@@ -1850,7 +1850,7 @@ pub const DurableSessionStore = struct {
             return switch (self) {
                 .beginning => connection.state == .beginning and connection.owner_node_id == owner,
                 .active => connection.state == .active and connection.owner_node_id == owner,
-                .expired => |expiry| (expiry.state == .beginning or expiry.state == .active) and
+                .expired => |expiry| (expiry.state == .beginning or expiry.state == .active or expiry.state == .uncertain) and
                     connection.state == expiry.state and connection.expires_at_ms <= expiry.cutoff_ms,
             };
         }
@@ -4394,57 +4394,70 @@ pub const SessionRegistry = struct {
     }
 
     pub fn getDetails(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SessionDetails {
-        return self.getDetailsFiltered(alloc, txn_id, .all, true);
+        return self.getDetailsFiltered(alloc, txn_id, .all, .details);
     }
 
     pub fn getDetailsForPrincipal(self: *SessionRegistry, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: ?[]const u8) !?SessionDetails {
-        return self.getDetailsFiltered(alloc, id, .{ .principal = principal }, true);
+        return self.getDetailsFiltered(alloc, id, .{ .principal = principal }, .details);
     }
 
     pub fn getAuthorizationDetailsForPrincipal(self: *SessionRegistry, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: ?[]const u8) !?SessionDetails {
-        return self.getDetailsFiltered(alloc, id, .{ .principal = principal }, false);
+        return self.getDetailsFiltered(alloc, id, .{ .principal = principal }, .authorization);
     }
 
-    fn getDetailsFiltered(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, filter: StatusPrincipalFilter, response: bool) !?SessionDetails {
+    pub fn getListingDetailsForPrincipal(self: *SessionRegistry, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: ?[]const u8) !?SessionDetails {
+        return self.getDetailsFiltered(alloc, id, .{ .principal = principal }, .listing);
+    }
+
+    const DetailsProjection = enum { details, listing, authorization };
+
+    fn getDetailsFiltered(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, filter: StatusPrincipalFilter, projection: DetailsProjection) !?SessionDetails {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        if (response and self.hasColocatedLease()) {
+        if (projection != .authorization and self.hasColocatedLease()) {
             const key = try makeSessionKey(alloc, txn_id);
             defer alloc.free(key);
-            switch (self.durable.?.backend) {
-                .docstore => |store| {
+            var snapshot = (switch (self.durable.?.backend) {
+                .docstore => |store| read: {
                     var txn = try store.beginReadTxn();
                     defer txn.abort();
-                    return self.detailsFromTxn(&txn, alloc, key, txn_id, filter);
+                    break :read try self.detailsFromTxn(&txn, alloc, key, txn_id, filter);
                 },
-                .runtime => |store| {
+                .runtime => |store| read: {
                     var txn = try store.beginRead();
                     defer txn.abort();
-                    return self.detailsFromTxn(&txn, alloc, key, txn_id, filter);
+                    break :read try self.detailsFromTxn(&txn, alloc, key, txn_id, filter);
                 },
-            }
+            }) orelse return null;
+            defer snapshot.session.deinit(alloc);
+            return try projectDetails(alloc, &snapshot.session, snapshot.status, projection);
         }
         var view = (try self.readSessionAssumeStripe(txn_id)) orelse return null;
         defer view.deinit();
         const session = view.session;
         if (!detailsPrincipalMatches(&session, filter)) return null;
-        const status = if (response) try sessionStatusFromSession(self, alloc, &session) else sessionStatusSnapshot(&session, self.durable != null);
-        return try projectDetails(alloc, &session, status, response);
+        const status = if (projection != .authorization) try sessionStatusFromSession(self, alloc, &session) else sessionStatusSnapshot(&session, self.durable != null);
+        return try projectDetails(alloc, &session, status, projection);
     }
 
-    fn detailsFromTxn(self: *SessionRegistry, txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: db_mod.types.TxnId, filter: StatusPrincipalFilter) !?SessionDetails {
+    const DetailsSnapshot = struct { session: Session, status: SessionStatus };
+
+    fn detailsFromTxn(self: *SessionRegistry, txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: db_mod.types.TxnId, filter: StatusPrincipalFilter) !?DetailsSnapshot {
         const raw = txn.get(key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
         var session = try decodeSessionRecord(alloc, id, raw);
-        defer session.deinit(alloc);
-        if (!detailsPrincipalMatches(&session, filter)) return null;
+        errdefer session.deinit(alloc);
+        if (!detailsPrincipalMatches(&session, filter)) {
+            session.deinit(alloc);
+            return null;
+        }
         var status = sessionStatusSnapshot(&session, true);
         status.lease_expires_at = try matchingLeaseExpiry(txn, alloc, id, session.owner_node_id);
         applySavepointLimits(self, &status);
-        return try projectDetails(alloc, &session, status, true);
+        return .{ .session = session, .status = status };
     }
 
     fn detailsPrincipalMatches(session: *const Session, filter: StatusPrincipalFilter) bool {
@@ -4454,7 +4467,7 @@ pub const SessionRegistry = struct {
         };
     }
 
-    fn projectDetails(alloc: std.mem.Allocator, session: *const Session, status: SessionStatus, response: bool) !SessionDetails {
+    fn projectDetails(alloc: std.mem.Allocator, session: *const Session, status: SessionStatus, projection: DetailsProjection) !SessionDetails {
         var details: SessionDetails = .{
             .graph_receipt = session.graph_receipt,
             .status = status,
@@ -4464,9 +4477,9 @@ pub const SessionRegistry = struct {
             .savepoint_ids = &.{},
         };
         errdefer details.deinit(alloc);
-        details.tables = if (session.graph_receipt and session.terminal_abort and session.staged == null) try cloneTableDetails(alloc, session.graph_abort_tables) else try sessionTableDetails(alloc, session.staged, response);
-        details.read_snapshots = try sessionReadSnapshots(alloc, session, response);
-        if (response) details.savepoint_ids = try sessionSavepointIds(alloc, session);
+        details.tables = if (session.graph_receipt and session.terminal_abort and session.staged == null) try cloneTableDetails(alloc, session.graph_abort_tables) else try sessionTableDetails(alloc, session.staged, projection == .details);
+        details.read_snapshots = try sessionReadSnapshots(alloc, session, projection == .details);
+        if (projection == .details) details.savepoint_ids = try sessionSavepointIds(alloc, session);
         if (session.staged) |*staged| {
             var bindings = std.ArrayList(CatalogBinding).empty;
             errdefer {
@@ -8313,6 +8326,7 @@ test "distributed txn legacy status and details report only a matching co-locate
     defer registry.deinit(a);
     const id: db_mod.types.TxnId = @splat(6);
     _ = try registry.beginForPrincipalWithSettingsAndId(a, .{}, 1, "alice", &.{}, null, id);
+    _ = (try registry.createSavepoint(a, try registry.mutation(a, id, 1))).?;
     const key = try makeSessionLeaseKey(a, id);
     defer a.free(key);
     for ([_]u64{ 2, 1 }) |owner| {
@@ -8332,6 +8346,11 @@ test "distributed txn legacy status and details report only a matching co-locate
         var details = (try registry.getDetailsForPrincipal(a, id, "alice")).?;
         defer details.deinit(a);
         try std.testing.expectEqual(status, details.status);
+        try std.testing.expectEqual(@as(usize, 1), details.savepoint_ids.len);
+        var listing = (try registry.getListingDetailsForPrincipal(a, id, "alice")).?;
+        defer listing.deinit(a);
+        try std.testing.expectEqual(status, listing.status);
+        try std.testing.expectEqual(@as(usize, 0), listing.savepoint_ids.len);
         var authorization = (try registry.getAuthorizationDetailsForPrincipal(a, id, "alice")).?;
         defer authorization.deinit(a);
         try std.testing.expectEqual(status.begin_timestamp, authorization.status.begin_timestamp);

@@ -14508,8 +14508,9 @@ pub const ApiHttpServer = struct {
         var authorized = std.ArrayListUnmanaged(transactions_api.SessionStatus).empty;
         errdefer authorized.deinit(self.alloc);
         for (candidates) |id| {
-            var details = (try self.authorizedTransactionSessionDetails(id, authenticated_identity, true)) orelse continue;
+            var details = (try self.txn_sessions.getListingDetailsForPrincipal(self.alloc, id, transactionPrincipal(authenticated_identity))) orelse continue;
             defer details.deinit(self.alloc);
+            if (!try self.transactionSessionDetailsAuthorized(authenticated_identity, details)) continue;
             try authorized.append(self.alloc, details.status);
         }
         return try authorized.toOwnedSlice(self.alloc);
