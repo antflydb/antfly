@@ -6768,6 +6768,9 @@ pub const Store = struct {
             const other_bytes = if (head.scope_delete_redo_bytes) |measure| measure(head.context, &self.file) else 0;
             switch (try self.file.planIndexScopeDeletion(prefix, head.scope_delete_exact_key, other_bytes)) {
                 .empty => if (head.scope_delete_only) {
+                    // An earlier ride-along may be the reason this scope
+                    // is empty. Honor the durable request even without edits.
+                    if (force_durable or head.durable or self.writer_admission != null) try self.file.sync();
                     head.committed_sequence = self.file.committedSequence();
                     return;
                 },
@@ -10527,6 +10530,35 @@ test "lite native docstore skips redo folding for an empty index scope" {
     var sink: @import("native_catalog_sink.zig").Sink = .{ .store = &store, .allocator = allocator };
     try @import("../native_catalog_backend.zig").deleteAllForScope(allocator, sink.sink(), "unused");
     try std.testing.expectEqual(before, store.file.committedSequence());
+}
+
+test "lite durable empty index deletion syncs an earlier ride-along tombstone" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-empty-scope-barrier.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+    store.ride_along_idle_ns = 10 * std.time.ns_per_s;
+
+    const prefix = "/directory/";
+    var record = native.CatalogMutation{ .key = prefix ++ "entry", .value = "value" };
+    const Apply = struct {
+        fn run(context: *anyopaque, file: *native.NativeFile) !void {
+            const mutation: *const native.CatalogMutation = @ptrCast(@alignCast(context));
+            try file.putIndexCatalogBatch(&.{mutation.*});
+        }
+    };
+    try store.submitIndexMutation(&record, Apply.run, true);
+    record.is_delete = true;
+    record.value = "";
+    try store.submitIndexMutation(&record, Apply.run, false);
+    const pending = store.file.committedSequence();
+    try std.testing.expect(store.file.durableSequence() < pending);
+
+    try store.submitIndexTreeDeletion(prefix, "/directory");
+    try std.testing.expectEqual(pending, store.file.durableSequence());
 }
 
 test "lite native docstore deletes a small index scope without folding unrelated redo" {
