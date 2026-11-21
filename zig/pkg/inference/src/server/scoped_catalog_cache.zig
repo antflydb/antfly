@@ -29,6 +29,46 @@ const max_cached_bytes_per_slot = 4 * 1024 * 1024;
 const max_cached_primary_bytes: usize = 1024 * 1024;
 const max_cached_adapter_bytes: usize = 64 * 1024;
 const gemma_identity = @import("../models/embedding_gemma2_identity.zig");
+const tokenizer_loader = @import("../models/tokenizer_loader.zig");
+const BoundedAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
+const gemma_inspection_limit = 512 * 1024 * 1024;
+var gemma_inspection_bytes: std.atomic.Value(usize) = .init(0);
+
+fn validateGemmaSidecar(artifacts: *const PublishedArtifacts, check: gemma_identity.CheckedSidecar, encoded: u64, control: ExecutionControl) !void {
+    const estimate = @import("../models/load_plan.zig").tokenizerAdmissionPlan(@intCast(encoded), .huggingface) catch return check.invalidError();
+    const charge = @min(gemma_inspection_limit, estimate.peak.host_weight_bytes);
+    // Reserve before reading or parsing. Other installations may still use
+    // the rest of the shared discovery scratch allowance concurrently.
+    var current = gemma_inspection_bytes.load(.monotonic);
+    while (true) {
+        try control.check();
+        if (charge > gemma_inspection_limit - current) return error.MemoryBudgetExceeded;
+        current = gemma_inspection_bytes.cmpxchgWeak(current, current + charge, .acq_rel, .monotonic) orelse break;
+    }
+    defer _ = gemma_inspection_bytes.fetchSub(charge, .release);
+    var scratch = BoundedAllocator{ .backing = artifacts.allocator, .limit = charge };
+    const a = scratch.allocator();
+    var borrowed = artifacts.*;
+    borrowed.allocator = a;
+    const result = switch (check) {
+        .tokenizer => result: {
+            const tokenizer = tokenizer_loader.loadDurableGemmaTokenizer(a, &borrowed) catch |err| break :result err;
+            tokenizer.deinitSelf();
+            break :result {};
+        },
+        .processor => result: {
+            const bytes = tokenizer_loader.readGemmaSidecar(&borrowed, .processor) catch |err| break :result err;
+            defer a.free(bytes);
+            break :result gemma_identity.validateProcessor(a, bytes);
+        },
+    };
+    result catch |err| {
+        if (err == error.OutOfMemory and scratch.denied) return check.invalidError();
+        return err;
+    };
+    try control.check();
+}
+
 const safetensors = @import("../models/safetensors.zig");
 const revalidate_after_ns = 60 * std.time.ns_per_s;
 const CompatibilitySummary = model_manager.CompatibilitySummary;
@@ -223,7 +263,7 @@ pub const Cache = struct {
 
             fn reject(self: *DependencyCache, owner: std.mem.Allocator, collector: MemberCollector, err: anyerror) !bool {
                 switch (err) {
-                    error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled, error.ModelArtifactsChanging => return err,
+                    error.OutOfMemory, error.MemoryBudgetExceeded, error.Timeout, error.Canceled, error.Cancelled, error.ModelArtifactsChanging => return err,
                     else => {},
                 }
                 self.failure = try FailedMember.capture(&collector, owner, err);
@@ -389,15 +429,11 @@ pub const Cache = struct {
                             const check = gemma_identity.CheckedSidecar.fromPath(sidecar) orelse continue;
                             try control.check();
                             const member = try std.fs.path.join(collector.allocator, &.{ artifacts.root, sidecar });
-                            const result = result: {
-                                const bytes = artifacts.readPath(member, gemma_identity.max_sidecar_bytes) catch |err| break :result err;
-                                defer artifacts.allocator.free(bytes);
-                                break :result check.validate(artifacts.allocator, bytes);
-                            };
-                            result catch |err| switch (err) {
+                            const discovered = collector.members.get(member).?;
+                            validateGemmaSidecar(artifacts, check, discovered.size, control) catch |err| switch (err) {
                                 error.ChecksumMismatch, error.FileTooLarge, error.InvalidEmbeddingGemma2Processor, error.InvalidEmbeddingGemma2Tokenizer => {
                                     collector.failed_member = member;
-                                    collector.failed_stamp = collector.members.get(member).?;
+                                    collector.failed_stamp = discovered;
                                     return if (err == error.FileTooLarge) check.invalidError() else err;
                                 },
                                 else => return err,
@@ -562,7 +598,7 @@ pub const Cache = struct {
                 if (self.checked_roles[i] == null) {
                     const cache = &inspection.dependencies_by_role[i];
                     self.checked_roles[i] = cache.check(self.snapshot.artifacts.allocator, artifacts, &inspection.execution_manifest, dependency, control) catch |err| switch (err) {
-                        error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+                        error.OutOfMemory, error.MemoryBudgetExceeded, error.Timeout, error.Canceled, error.Cancelled => return err,
                         else => invalid: {
                             self.invalidate();
                             break :invalid false;
@@ -572,7 +608,7 @@ pub const Cache = struct {
                 if (!self.checked_roles[i].?) return unavailable_dependency;
             }
             return inspection.backendSummary(artifacts, path, backend, roles[0..count], control) catch |err| switch (err) {
-                error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+                error.OutOfMemory, error.MemoryBudgetExceeded, error.Timeout, error.Canceled, error.Cancelled => return err,
                 error.ModelArtifactsChanging, error.InvalidManagedDownload, error.ChecksumMismatch, error.CatalogArtifactUnavailable => {
                     self.invalidate();
                     return unavailable_dependency;

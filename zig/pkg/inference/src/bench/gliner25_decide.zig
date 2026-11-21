@@ -40,8 +40,10 @@ pub fn main(init: std.process.Init) !void {
     var batch_tokens: usize = 16384;
     var worker = false;
     var precision: factory.GlinerCudaPrecision = .fp32;
+    var pjrt_options = inference.pjrt_options.Options{};
     while (args.next()) |arg| {
         const value = args.next() orelse return error.MissingArgument;
+        if (try pjrt_options.parse(arg, value)) continue;
         if (std.mem.eql(u8, arg, "--batch-tokens")) {
             batch_tokens = try std.fmt.parseInt(usize, value, 10);
             continue;
@@ -62,7 +64,9 @@ pub fn main(init: std.process.Init) !void {
     const tokenizer = try hf.HfTokenizer.loadFromBytesWithOptions(a, tokenizer_bytes, .{ .strict_unigram_normalizer = true });
     const tok = tokenizer.tokenizer();
     defer tok.deinitTokenizer();
-    const session = if (std.mem.eql(u8, selected, "cuda"))
+    const session = if (std.mem.eql(u8, selected, "pjrt"))
+        try factory.createPjrtSessionWithOptions(a, path, try pjrt_options.sessionOptions())
+    else if (std.mem.eql(u8, selected, "cuda"))
         try factory.createGlinerCudaSessionWithPrecision(a, path, precision)
     else if (std.mem.eql(u8, selected, "metal"))
         try factory.createMetalSession(a, path)
@@ -71,6 +75,10 @@ pub fn main(init: std.process.Init) !void {
     else
         return error.InvalidBackend;
     defer session.close();
+    if (std.mem.eql(u8, selected, "pjrt")) {
+        if (session.backend() != .pjrt or factory.getPjrtClientPtr(session) == null) return error.InvalidBackend;
+        precision = if (pjrt_options.precision == .bf16) .bf16 else .fp32;
+    }
     if (std.mem.eql(u8, selected, "metal") and session.backend() != .metal) return error.InvalidBackend;
     try factory.sealGlinerDecisionTokenizerDigest(session, inference.models.gliner_decide_qualification.Digest.of(tokenizer_bytes));
     if (factory.getGlinerDecideExecutionBatchPolicy(session)) |policy| {
@@ -201,7 +209,9 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
         .request_id = request_id,
         .duration_ns = @as(u64, @intFromFloat(median * std.time.ns_per_ms)),
         .backend = selected,
-        .precision = if (precision == .auto) "fp32" else @tagName(precision),
+        .actual_backend = @tagName(pipeline.session.backend()),
+        .precision = if (factory.getPjrtPrecision(pipeline.session)) |actual| if (actual == .bf16) "bf16" else "fp32" else if (precision == .auto) "fp32" else @tagName(precision),
+        .pjrt_precision = if (factory.getPjrtPrecision(pipeline.session)) |actual| @tagName(actual) else null,
         .model_variant = if (identity) |loaded| inference.models.gliner_decide_qualification.qualifiedVariant(loaded) else null,
         .case_index = case_index,
         .batch_size = requests.len,

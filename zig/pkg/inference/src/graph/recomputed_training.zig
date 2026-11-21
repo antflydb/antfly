@@ -392,7 +392,7 @@ pub fn nativeLocalBytes(compiled: *const program.Program) !usize {
             },
             .fused_modernbert_training_attention_v1, .fused_modernbert_training_attention_backward_v1 => |attrs| {
                 const backward = node.op == .fused_modernbert_training_attention_backward_v1;
-                scratch = @max(scratch, try @import("../ops/modernbert_training_attention.zig").scratchBytes(attrs, backward));
+                scratch = @max(scratch, try @import("../ops/range_attention_reference.zig").scratchBytes(attrs, backward));
             },
             else => {},
         }

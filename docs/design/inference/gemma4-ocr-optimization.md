@@ -72,13 +72,16 @@ retain the singleton normalization/residual family. Optional sum-of-squares and
 F16 projection remain governed by their existing policies; sum-of-squares is off
 by default. Kernel equality alone does not qualify the complete decoder.
 
-## Shared Q4 tiles, batched tails and carrier reuse
+## Batched tails and carrier reuse
+
+The shared-cache Q4 batch experiment was retired: across 96 M4 operator cases,
+the direct-row replacements retained exact outputs and took at most 0.619×
+the GPU time in both comparison orders. The invariant direct-row route remains.
 
 The following switches default off and are independently measurable:
 
 | Switch | Behavior and constraints |
 | --- | --- |
-| `TERMITE_METAL_Q4_0_BATCH_SHARED` | Load packed Q4 tiles once for 2–4 rows; pad row three with uniform barriers. Preserve scalar accumulation/reduction; unsupported threadgroup geometry falls back to invariant MMV. Mostly slower in the operator sweep; excluded from the faster configurations. |
 | `TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS` | With invariant dispatch, project all rows then use one singleton norm/residual threadgroup per row: two dispatches per cohort. Optional F16 projection keeps per-row fallback. |
 | `ANTFLY_GEMMA4_METAL_OCR_BATCH_QKV` | Reuse prepared Q + paired K/V scratch for eligible zero-bias Q4 slots, avoiding row-packing copies. Other formats keep the canonical route. |
 | `ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS` | Cache private buffers by semantic role at four-row capacity; grow by width, retaining old storage through live views. Frame dependency tracking orders overwrites. Differential diagnostics disable reuse. |

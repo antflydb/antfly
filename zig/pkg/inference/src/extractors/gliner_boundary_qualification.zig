@@ -216,6 +216,30 @@ pub fn sourceWords(allocator: Allocator, text: []const u8, options: processor.Op
     return ranges.len;
 }
 
+/// Match the real provider and immutable compile policy. A host transport is
+/// never evidence that a compiled model ran on the Native backend.
+pub fn backendForSession(session: @import("../backends/session.zig").Session) !policy.Backend {
+    switch (session.backend()) {
+        .native => return .native,
+        .metal => return .metal,
+        .cuda => return .cuda,
+        .pjrt => {
+            const profile = @import("../architectures/session_factory.zig").getPjrtExecutionProfile(session) orelse return error.UnsupportedGlinerBoundaryRuntime;
+            switch (profile.platform) {
+                .cpu => return if (profile.precision == .bf16) .pjrt_cpu_bf16 else .pjrt_cpu_f32,
+                .cuda => {
+                    if (!std.mem.eql(u8, profile.device_kind, "NVIDIA GB10")) return error.UnsupportedGlinerBoundaryRuntime;
+                    if (profile.precision == .f32 and profile.gemm == .provider_default) return .pjrt_cuda_f32;
+                    if (profile.precision == .bf16 and profile.gemm == .vendor_deterministic) return .pjrt_cuda_bf16_deterministic;
+                },
+                .other => {},
+            }
+        },
+        else => {},
+    }
+    return error.UnsupportedGlinerBoundaryRuntime;
+}
+
 /// Scalar-only observation of one real serial prepared batch. Whole-document
 /// source count comes from sourceWords() or the actual document plan; body word
 /// and padded encoded dimensions come exclusively from the prepared batch.

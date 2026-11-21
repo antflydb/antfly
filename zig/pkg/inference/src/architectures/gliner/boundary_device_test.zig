@@ -107,7 +107,7 @@ test "gliner boundary device rejects fallback and cleans failed preparation allo
     // absence of a device primitive cannot enter CPU math as a fallback.
     var vt = cb.vtable.*;
     vt.backendKind = metalKind;
-    vt.glinerBoundaryDevice = unavailableDevice;
+    vt.regions.relative_boundary.device = unavailableDevice;
     cb.vtable = &vt;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, failedPrepare, .{ &cb, &config, input });
     cb.execution_control = .{ .check_fn = struct {

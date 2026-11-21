@@ -42,6 +42,8 @@ const size_t antfly_pjrt_api_offsets[] = {
     offsetof(PJRT_Api, PJRT_Buffer_OnDeviceSizeInBytes),
     offsetof(PJRT_Api, PJRT_Buffer_ToHostBuffer),
     offsetof(PJRT_Api, PJRT_Executable_GetCompiledMemoryStats),
+    offsetof(PJRT_Api, PJRT_Device_GetDescription),
+    offsetof(PJRT_Api, PJRT_DeviceDescription_Kind),
 };
 
 const size_t antfly_pjrt_arg_layouts[] = {
@@ -103,4 +105,15 @@ const size_t antfly_pjrt_arg_layouts[] = {
     offsetof(PJRT_Buffer_MemoryLayout, type),
     offsetof(PJRT_ExecuteOptions, non_donatable_input_indices),
     offsetof(PJRT_ExecuteOptions, num_non_donatable_input_indices),
+    sizeof(PJRT_Device_GetDescription_Args),
+    offsetof(PJRT_Device_GetDescription_Args, struct_size),
+    offsetof(PJRT_Device_GetDescription_Args, extension_start),
+    offsetof(PJRT_Device_GetDescription_Args, device),
+    offsetof(PJRT_Device_GetDescription_Args, device_description),
+    sizeof(PJRT_DeviceDescription_Kind_Args),
+    offsetof(PJRT_DeviceDescription_Kind_Args, struct_size),
+    offsetof(PJRT_DeviceDescription_Kind_Args, extension_start),
+    offsetof(PJRT_DeviceDescription_Kind_Args, device_description),
+    offsetof(PJRT_DeviceDescription_Kind_Args, device_kind),
+    offsetof(PJRT_DeviceDescription_Kind_Args, device_kind_size),
 };

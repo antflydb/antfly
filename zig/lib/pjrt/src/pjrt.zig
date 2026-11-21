@@ -22,6 +22,37 @@ const std = @import("std");
 const c = @import("pjrt_c_types.zig");
 const hlo = @import("hlo.zig");
 
+// CompileOptionsProto env_option_overrides changes just this option, retaining
+// provider defaults for optimization and scheduling. XLA excess precision can
+// otherwise erase explicit F32→BF16→F32 rounding, even at observable outputs.
+// Schema: xla/pjrt/proto/compile_options.proto (fields 3 and 7).
+const strict_compile_options = blk: {
+    const build_options = [_]u8{ 0x1a, 0x04, 0x20, 0x01, 0x28, 0x01 };
+    const key = "xla_allow_excess_precision";
+    // Map entry: key(1), value(2): OptionOverrideProto.bool_field(2)=false.
+    // The zero is explicitly present in the oneof; omitting it is not false.
+    const entry = [_]u8{ 0x0a, key.len } ++ key.* ++ [_]u8{ 0x12, 0x02, 0x10, 0x00 };
+    break :blk build_options ++ [_]u8{ 0x3a, entry.len } ++ entry;
+};
+
+const vendor_gemm_compile_options = blk: {
+    const key = "xla_gpu_enable_triton_gemm";
+    const entry = [_]u8{ 0x0a, key.len } ++ key.* ++ [_]u8{ 0x12, 0x02, 0x10, 0x00 };
+    break :blk strict_compile_options ++ [_]u8{ 0x3a, entry.len } ++ entry;
+};
+
+const deterministic_vendor_compile_options = blk: {
+    const key = "xla_gpu_deterministic_ops";
+    const entry = [_]u8{ 0x0a, key.len } ++ key.* ++ [_]u8{ 0x12, 0x02, 0x10, 0x01 };
+    break :blk vendor_gemm_compile_options ++ [_]u8{ 0x3a, entry.len } ++ entry;
+};
+
+pub const CompileOptions = struct {
+    /// BF16 publications can distinguish the F32 accumulation schedules of
+    /// Triton and vendor GEMM. Select the qualified source schedule explicitly.
+    gpu_gemm: enum { provider_default, vendor, vendor_deterministic } = .provider_default,
+};
+
 pub const PjrtError = error{
     PjrtApiError,
     PluginLoadFailed,
@@ -30,6 +61,7 @@ pub const PjrtError = error{
     UnsupportedPjrtFeature,
     InvalidMemoryStats,
     OutputCountMismatch,
+    ProgramTooLarge,
 };
 
 /// Compiler-reported single-device execution footprint. Keep inputs and
@@ -217,11 +249,17 @@ pub const Buffer = struct {
         return self.downloadTyped(i64, .int64, allocator, allocator, expected);
     }
 
-    fn downloadTyped(self: *const Buffer, comptime T: type, comptime buffer_type: c.BufferType, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: ?[]const i64) ![]T {
+    /// Exact dense host readback for graph state/control tensors. Physical type
+    /// and shape are checked against the actual provider before allocation.
+    pub fn toTypedWithShapeAndScratch(self: *const Buffer, comptime T: type, kind: c.BufferType, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: []const i64) ![]T {
+        return self.downloadTyped(T, kind, allocator, scratch, expected);
+    }
+
+    fn downloadTyped(self: *const Buffer, comptime T: type, expected_kind: c.BufferType, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: ?[]const i64) ![]T {
         if (!self.api.hasBufferReadback()) return error.UnsupportedPjrtFeature;
         var kind = c.BufferElementTypeArgs{ .struct_size = @sizeOf(c.BufferElementTypeArgs), .extension_start = null, .buffer = self.handle, .buffer_type = .invalid };
         try checkError(self.api, self.api.bufferElementType(&kind));
-        if (kind.buffer_type != buffer_type) return error.PjrtApiError;
+        if (kind.buffer_type != expected_kind) return error.PjrtApiError;
         var dims = std.mem.zeroes(c.BufferDimensionsArgs);
         dims.struct_size = @sizeOf(@TypeOf(dims));
         dims.buffer = self.handle;
@@ -258,8 +296,8 @@ pub const Buffer = struct {
         if (query.event) |event| try awaitAndDestroyEvent(self.api, event);
         const size = query.dst_size;
         if (size != try std.math.mul(usize, elements, @sizeOf(T))) return error.PjrtApiError;
-        const num_elements = size / @sizeOf(T);
-        const result = try allocator.alloc(T, num_elements);
+        const num_values = size / @sizeOf(T);
+        const result = try allocator.alloc(T, num_values);
         errdefer allocator.free(result);
 
         var args = c.BufferToHostBufferArgs{
@@ -317,6 +355,11 @@ pub const LoadedExecutable = struct {
     /// Native executable metadata is authoritative; sidecar shapes must match
     /// before any execution or retained-state allocation can occur.
     pub fn validateOutputShapes(self: *const LoadedExecutable, expected: []const []const i64) !void {
+        return self.validateOutputSignature(expected, null);
+    }
+
+    pub fn validateOutputSignature(self: *const LoadedExecutable, expected: []const []const i64, expected_types: ?[]const c.BufferType) !void {
+        if (expected_types) |types| if (types.len != expected.len) return error.OutputCountMismatch;
         if (!self.api.hasOutputShapes()) return error.UnsupportedPjrtFeature;
         var owned = try self.executable();
         defer owned.deinit();
@@ -331,7 +374,8 @@ pub const LoadedExecutable = struct {
         if (types.num_output_types != expected.len or dims.num_outputs != expected.len) return error.OutputCountMismatch;
         var offset: usize = 0;
         for (expected, 0..) |shape, i| {
-            if ((types.output_types orelse return error.PjrtApiError)[i] != .float32) return error.PjrtApiError;
+            const expected_type = if (expected_types) |kinds| kinds[i] else c.BufferType.float32;
+            if ((types.output_types orelse return error.PjrtApiError)[i] != expected_type) return error.PjrtApiError;
             const rank = (dims.dim_sizes orelse return error.PjrtApiError)[i];
             if (rank != shape.len) return error.PjrtApiError;
             const end = try std.math.add(usize, offset, rank);
@@ -478,6 +522,21 @@ pub const Client = struct {
     handle: *c.PjrtClient,
     device: *c.PjrtDevice,
     lib: std.DynLib,
+    /// Immutable after publication; all shapes use the same selected schedule.
+    compile_options: CompileOptions = .{},
+
+    pub fn deviceKind(self: *const Client) PjrtError![]const u8 {
+        if (self.api._fns[c.Api.FN_DEVICE_GET_DESCRIPTION] == null or self.api._fns[c.Api.FN_DEVICE_DESCRIPTION_KIND] == null) return error.UnsupportedPjrtFeature;
+        var description = std.mem.zeroes(c.DeviceGetDescriptionArgs);
+        description.struct_size = @sizeOf(@TypeOf(description));
+        description.device = self.device;
+        try checkError(self.api, self.api.deviceGetDescription(&description));
+        var kind = std.mem.zeroes(c.DeviceDescriptionKindArgs);
+        kind.struct_size = @sizeOf(@TypeOf(kind));
+        kind.device_description = description.device_description orelse return error.PjrtApiError;
+        try checkError(self.api, self.api.deviceDescriptionKind(&kind));
+        return (kind.device_kind orelse return error.PjrtApiError)[0..kind.device_kind_size];
+    }
 
     pub fn platformName(self: *const Client) PjrtError![]const u8 {
         var args = std.mem.zeroes(c.ClientPlatformNameArgs);
@@ -507,6 +566,15 @@ pub const Client = struct {
 
     pub fn initWithMemoryPolicy(plugin_path: [:0]const u8, policy: ?MemoryPolicy) PjrtError!Client {
         if (policy) |bounded| if (bounded == .cuda) try validateBoundedCudaEnvironment();
+        var visible = [_]i64{0};
+        var options: [6]c.NamedValue = undefined;
+        const option_count: usize = if (policy) |bounded| switch (bounded) {
+            .cpu => 0,
+            .cuda => |limit| count: {
+                options = try cudaClientOptions(limit.capacity_bytes, limit.device_bytes, &visible);
+                break :count options.len;
+            },
+        } else 0;
         // Load plugin shared library
         var lib = std.DynLib.open(plugin_path) catch return PjrtError.PluginLoadFailed;
         errdefer lib.close();
@@ -528,16 +596,10 @@ pub const Client = struct {
         // Create client (empty options = defaults)
         var create_args: c.ClientCreateArgs = std.mem.zeroes(c.ClientCreateArgs);
         create_args.struct_size = @sizeOf(c.ClientCreateArgs);
-        var visible = [_]i64{0};
-        var options: [6]c.NamedValue = undefined;
-        if (policy) |bounded| switch (bounded) {
-            .cpu => {},
-            .cuda => |limit| {
-                options = try cudaClientOptions(limit.capacity_bytes, limit.device_bytes, &visible);
-                create_args.create_options = @ptrCast(&options);
-                create_args.num_options = options.len;
-            },
-        };
+        if (option_count != 0) {
+            create_args.create_options = @ptrCast(&options);
+            create_args.num_options = option_count;
+        }
         try checkError(api, api.clientCreate(&create_args));
 
         const client_handle = create_args.client orelse return PjrtError.PjrtApiError;
@@ -559,12 +621,17 @@ pub const Client = struct {
         if (devices_args.num_addressable_devices == 0) return PjrtError.NoDevices;
         const device = devices_args.addressable_devices.?[0] orelse return PjrtError.NoDevices;
 
-        return .{
+        const result = Client{
             .api = api,
             .handle = client_handle,
             .device = device,
             .lib = lib,
         };
+        if (policy) |bounded| switch (bounded) {
+            .cpu => if (!try result.isCpu()) return error.UnsupportedPjrtFeature,
+            .cuda => if (!std.ascii.eqlIgnoreCase(try result.platformName(), "cuda")) return error.UnsupportedPjrtFeature,
+        };
+        return result;
     }
 
     pub fn deinit(self: *Client) void {
@@ -610,41 +677,54 @@ pub const Client = struct {
     /// `num_outputs` is the number of output buffers the program produces
     /// (1 for single-output, N for tuple-root programs).
     pub fn compile(self: *const Client, hlo_bytes: []const u8, num_outputs: usize) PjrtError!LoadedExecutable {
-        // Build CompileOptionsProto: { executable_build_options(3): { num_replicas(4): 1, num_partitions(5): 1 } }
-        const compile_options = comptime blk: {
-            // ExecutableBuildOptionsProto
-            const num_replicas = [_]u8{ 0x20, 0x01 }; // field 4, varint 1
-            const num_partitions = [_]u8{ 0x28, 0x01 }; // field 5, varint 1
-            const build_opts = num_replicas ++ num_partitions;
-            // CompileOptionsProto field 3 (message)
-            const tag = [_]u8{0x1a}; // (3 << 3) | 2 = 26 = 0x1a
-            const len = [_]u8{build_opts.len};
-            break :blk tag ++ len ++ build_opts;
-        };
-
-        return self.compileWithOptions(hlo_bytes, num_outputs, &compile_options);
-    }
-
-    /// Compile an artifact with explicit, retained compiler options.
-    pub fn compileWithOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, compile_options: []const u8) PjrtError!LoadedExecutable {
-        const format = "hlo";
-        var program = c.Program{ .struct_size = @sizeOf(c.Program), .extension_start = null, .code = @constCast(hlo_bytes.ptr), .code_size = hlo_bytes.len, .format = format, .format_size = format.len };
-        var args = c.ClientCompileArgs{
-            .struct_size = @sizeOf(c.ClientCompileArgs),
-            .extension_start = null,
-            .client = self.handle,
-            .program = &program,
-            .compile_options = compile_options.ptr,
-            .compile_options_size = compile_options.len,
-            .executable = null,
-        };
-        try checkError(self.api, self.api.clientCompile(&args));
-        return self.validateLoadedOutputs(args.executable orelse return PjrtError.PjrtApiError, self.device, num_outputs);
+        return self.compileForDevice(hlo_bytes, num_outputs, self.device);
     }
 
     /// Compile an HLO program targeting a specific device.
     /// `num_outputs` is the number of output buffers the program produces.
     pub fn compileForDevice(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice) PjrtError!LoadedExecutable {
+        return self.compileWithOptions(hlo_bytes, num_outputs, target_device, self.compile_options);
+    }
+
+    pub fn compileWithOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, options: CompileOptions) PjrtError!LoadedExecutable {
+        const compile_options: []const u8 = switch (options.gpu_gemm) {
+            .provider_default => &strict_compile_options,
+            .vendor => &vendor_gemm_compile_options,
+            .vendor_deterministic => &deterministic_vendor_compile_options,
+        };
+        return self.compileForDeviceWithSerializedOptions(hlo_bytes, num_outputs, target_device, compile_options);
+    }
+
+    /// Resident boundary layouts are an ABI, not a provider scheduling hint.
+    /// Protobuf merges the additional executable-build message with the typed
+    /// replica/partition settings while retaining every precision/GEMM override.
+    pub fn compileWithEntryLayouts(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, layouts: []const u8, allocator: std.mem.Allocator) !LoadedExecutable {
+        return self.compileWithEntryLayoutsAndOptions(hlo_bytes, num_outputs, target_device, layouts, self.compile_options, allocator);
+    }
+
+    /// Resolve one program's schedule without mutating a shared client's policy.
+    pub fn compileWithEntryLayoutsAndOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, layouts: []const u8, policy: CompileOptions, allocator: std.mem.Allocator) !LoadedExecutable {
+        const defaults: []const u8 = switch (policy.gpu_gemm) {
+            .provider_default => &strict_compile_options,
+            .vendor => &vendor_gemm_compile_options,
+            .vendor_deterministic => &deterministic_vendor_compile_options,
+        };
+        const options = try std.mem.concat(allocator, u8, &.{ defaults, layouts });
+        defer allocator.free(options);
+        return self.compileForDeviceWithSerializedOptions(hlo_bytes, num_outputs, target_device, options);
+    }
+
+    /// Explicit serialized options retain the same placement, output and
+    /// program-size validation as the typed compilation API.
+    pub fn compileWithSerializedOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, compile_options: []const u8) PjrtError!LoadedExecutable {
+        return self.compileForDeviceWithSerializedOptions(hlo_bytes, num_outputs, self.device, compile_options);
+    }
+
+    fn compileForDeviceWithSerializedOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, compile_options: []const u8) PjrtError!LoadedExecutable {
+        // HloModuleProto uses protobuf's signed 32-bit message-size limit.
+        // Reject before the C boundary: some plugins throw a C++ exception
+        // while constructing the oversized program instead of returning Error.
+        if (hlo_bytes.len > std.math.maxInt(i32)) return error.ProgramTooLarge;
         const format = "hlo";
         var program = c.Program{
             .struct_size = @sizeOf(c.Program),
@@ -655,21 +735,12 @@ pub const Client = struct {
             .format_size = format.len,
         };
 
-        const compile_options = comptime blk: {
-            const num_replicas = [_]u8{ 0x20, 0x01 };
-            const num_partitions = [_]u8{ 0x28, 0x01 };
-            const build_opts = num_replicas ++ num_partitions;
-            const tag = [_]u8{0x1a};
-            const len = [_]u8{build_opts.len};
-            break :blk tag ++ len ++ build_opts;
-        };
-
         var args = c.ClientCompileArgs{
             .struct_size = @sizeOf(c.ClientCompileArgs),
             .extension_start = null,
             .client = self.handle,
             .program = &program,
-            .compile_options = &compile_options,
+            .compile_options = compile_options.ptr,
             .compile_options_size = compile_options.len,
             .executable = null,
         };
@@ -742,6 +813,24 @@ pub const Client = struct {
         return self.uploadBuffer(@ptrCast(data.ptr), .int64, dims, self.device);
     }
 
+    /// Contiguous typed input transfer. Integer/boolean/float64 operands must
+    /// never pass through F32 conversion. Completion owns the same upload path
+    /// as the typed convenience APIs.
+    pub fn bufferFromHostBytes(self: *const Client, bytes: []const u8, kind: c.BufferType, dims: []const i64) PjrtError!Buffer {
+        const width: usize = switch (kind) {
+            .pred, .int8, .uint8 => 1,
+            .int16, .uint16, .float16, .bfloat16 => 2,
+            .int32, .uint32, .float32 => 4,
+            .int64, .uint64, .float64, .complex64 => 8,
+            .complex128 => 16,
+            else => return error.UnsupportedPjrtFeature,
+        };
+        var count: usize = 1;
+        for (dims) |dim| count = std.math.mul(usize, count, std.math.cast(usize, dim) orelse return error.PjrtApiError) catch return error.PjrtApiError;
+        if (bytes.len != (std.math.mul(usize, count, width) catch return error.PjrtApiError)) return error.PjrtApiError;
+        return self.uploadBuffer(@ptrCast(bytes.ptr), kind, dims, self.device);
+    }
+
     /// Initialize PJRT client by searching for the plugin in standard locations.
     /// Search order:
     ///   1. ANTFLY_INFERENCE_XLA_PLUGIN, ANTFLY_INFERENCE_PJRT_PLUGIN,
@@ -749,11 +838,15 @@ pub const Client = struct {
     ///   2. ~/.termite/pjrt/<os>-<arch>/pjrt_c_api_cpu_plugin.dylib (or .so)
     ///   3. If neither resolves to an existing file, returns error.PjrtPluginNotFound
     pub fn initFromEnv(allocator: std.mem.Allocator) !Client {
+        return initFromEnvWithMemoryPolicy(allocator, null);
+    }
+
+    pub fn initFromEnvWithMemoryPolicy(allocator: std.mem.Allocator, policy: ?MemoryPolicy) !Client {
         const plugin_path = try resolvePjrtPluginPath(allocator);
         defer allocator.free(plugin_path);
         const plugin_path_z = try allocator.dupeSentinel(u8, plugin_path, 0);
         defer allocator.free(plugin_path_z);
-        return Client.init(plugin_path_z);
+        return Client.initWithMemoryPolicy(plugin_path_z, policy);
     }
 
     /// Upload f32 data to a specific device, returning a Buffer handle.
@@ -874,9 +967,9 @@ test "end-to-end: compile and execute HLO add via PJRT CPU plugin" {
     const alloc = std.testing.allocator;
 
     // Load CPU plugin — skip test gracefully if not found
-    var client = Client.initFromEnv(alloc) catch |err| {
-        std.debug.print("Skipping PJRT test (plugin not found: {})\n", .{err});
-        return;
+    var client = Client.initFromEnvWithMemoryPolicy(alloc, .cpu) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
     };
     defer client.deinit();
 
@@ -927,6 +1020,106 @@ test "end-to-end: compile and execute HLO add via PJRT CPU plugin" {
     try std.testing.expectApproxEqAbs(@as(f32, 22.0), result[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 33.0), result[2], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 44.0), result[3], 1e-6);
+
+    // Both values are observable: preserve F32 arithmetic and the separate
+    // BF16 publication. Excess precision must not merge these tuple leaves.
+    var rounding = hlo.Builder.init(alloc, "rounding");
+    defer rounding.deinit();
+    const source = try rounding.parameter(0, shape, "x");
+    const product = try rounding.multiply(source, try rounding.constantScalarF32(@sqrt(@as(f32, 512))));
+    const published = try rounding.convertType(try rounding.convertType(product, .bf16), .f32);
+    _ = try rounding.tuple(&.{ product, published });
+    const rounding_bytes = try hlo.Module.init("rounding", rounding.build()).serialize(alloc);
+    defer alloc.free(rounding_bytes);
+    var rounding_executable = try client.compile(rounding_bytes, 2);
+    defer rounding_executable.deinit();
+    const rounding_outputs = try rounding_executable.execute(&.{buf_x}, alloc);
+    defer alloc.free(rounding_outputs);
+    defer for (rounding_outputs) |*output| output.deinit();
+    const before = try rounding_outputs[0].toFloat32(alloc);
+    defer alloc.free(before);
+    const after = try rounding_outputs[1].toFloat32(alloc);
+    defer alloc.free(after);
+    for (x_data, before) |x, value| try std.testing.expectEqual(x * @sqrt(@as(f32, 512)), value);
+    try std.testing.expectEqualSlices(f32, &.{ 22.625, 45.25, 68.0, 90.5 }, after);
+}
+
+test "end-to-end: compact tuple loop dynamically publishes device rows" {
+    const a = std.testing.allocator;
+    var client = Client.initFromEnvWithMemoryPolicy(a, .cpu) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    var entry = hlo.Builder.init(a, "entry");
+    defer entry.deinit();
+    const shape = hlo.Shape.init(.f32, &.{4});
+    const initial = try entry.tuple(&.{ try entry.constantS32(hlo.Shape.scalar(.s32), &.{0}), try entry.parameter(0, shape, "input") });
+    var condition = hlo.Builder.init(a, "condition");
+    defer condition.deinit();
+    condition.next_id = 1_000_000_001;
+    condition.base_id = condition.next_id;
+    const cs = try condition.tupleParameter(0, entry.getInst(initial).tuple_child_shapes.?);
+    _ = try condition.lessThan(try condition.tupleElement(cs, 0), try condition.constantS32(hlo.Shape.scalar(.s32), &.{3}));
+    var body = hlo.Builder.init(a, "body");
+    defer body.deinit();
+    body.next_id = 2_000_000_001;
+    body.base_id = body.next_id;
+    const bs = try body.tupleParameter(0, entry.getInst(initial).tuple_child_shapes.?);
+    const cursor = try body.tupleElement(bs, 0);
+    const output = try body.tupleElement(bs, 1);
+    const row = try body.reshape(try body.convertType(cursor, .f32), hlo.Shape.init(.f32, &.{1}));
+    const replaced = try body.dynamicUpdateSlice(output, row, &.{cursor});
+    const observed = try body.dynamicSlice(replaced, &.{cursor}, &.{1});
+    const published = try body.dynamicUpdateSlice(replaced, observed, &.{cursor});
+    _ = try body.tuple(&.{ try body.add(cursor, try body.constantS32(hlo.Shape.scalar(.s32), &.{1})), published });
+    const loop = try entry.whileLoop(initial, condition.build().id, body.build().id);
+    _ = try entry.tupleElement(loop, 1);
+    const bytes = try hlo.Module.initWithAux("loop", entry.build(), &.{ condition.build(), body.build() }).serialize(a);
+    defer a.free(bytes);
+    var executable = try client.compile(bytes, 1);
+    defer executable.deinit();
+    for ([_]f32{ 5, 19, -2 }) |last| {
+        var input = try client.bufferFromHostFloat32(&.{ 9, 8, 7, last }, &.{4});
+        defer input.deinit();
+        const outputs = try executable.execute(&.{input}, a);
+        defer a.free(outputs);
+        defer for (outputs) |*buffer| buffer.deinit();
+        const actual = try outputs[0].toFloat32(a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, last }, actual);
+    }
+}
+
+test "end-to-end: reduced-precision GELU retains finite extrema and negative tails" {
+    const alloc = std.testing.allocator;
+    var client = Client.initFromEnvWithMemoryPolicy(alloc, .cpu) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    // Frozen native CUDA BF16 publications, including values where intrinsic
+    // tanh saturates too early and x*(1+tanh) overflows before the half factor.
+    const inputs = [_]u16{ 0, 0x8000, 0x3f80, 0xbf80, 0xc09c, 0xc0a0, 0x7f00, 0x7f7f, 0xff7f };
+    const expected = [_]u16{ 0, 0x8000, 0x3f57, 0xbe23, 0xb51c, 0xb4a0, 0x7f00, 0x7f7f, 0x8000 };
+    const dims = [_]i64{inputs.len};
+    var b = hlo.Builder.init(alloc, "gelu_publication");
+    defer b.deinit();
+    b.gelu_schedule = .coefficient_first_stable_tail;
+    const x = try b.parameter(0, hlo.Shape.init(.bf16, &dims), "x");
+    _ = try b.convertType(try b.gelu(try b.convertType(x, .f32)), .bf16);
+    const bytes = try hlo.Module.init("gelu_publication", b.build()).serialize(alloc);
+    defer alloc.free(bytes);
+    var executable = try client.compile(bytes, 1);
+    defer executable.deinit();
+    var input = try client.bufferFromHostBytes(std.mem.sliceAsBytes(&inputs), .bfloat16, &dims);
+    defer input.deinit();
+    const outputs = try executable.execute(&.{input}, alloc);
+    defer alloc.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    const actual = try outputs[0].toTypedWithShapeAndScratch(u16, .bfloat16, alloc, alloc, &dims);
+    defer alloc.free(actual);
+    try std.testing.expectEqualSlices(u16, &expected, actual);
 }
 
 test "end-to-end: serialize and deserialize HLO add executable when PJRT plugin supports it" {
@@ -1172,6 +1365,11 @@ test "bounded CUDA clients reject allocator environment overrides before plugin 
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[1], "false", 1));
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[2], "0", 1));
     try validateBoundedCudaEnvironment();
+    for ([_]Client.MemoryPolicy{
+        .{ .cuda = .{ .capacity_bytes = 0, .device_bytes = 8 * 1024 * 1024 } },
+        .{ .cuda = .{ .capacity_bytes = 4 * 1024 * 1024, .device_bytes = 0 } },
+        .{ .cuda = .{ .capacity_bytes = 8 * 1024 * 1024, .device_bytes = 4 * 1024 * 1024 } },
+    }) |policy| try std.testing.expectError(error.InvalidMemoryStats, Client.initWithMemoryPolicy("missing-provider", policy));
 }
 
 test "execution owns all native outputs and completion events across host allocation failures" {
@@ -1227,7 +1425,38 @@ test "compile and deserialize reject native output arity with balanced ownership
     const Fake = struct {
         var loaded_destroyed: usize = 0;
         var executable_destroyed: usize = 0;
+        var strict_compiles: usize = 0;
+        var vendor_expected = false;
+        var deterministic_expected = false;
+        var layouts_expected: ?[]const u8 = null;
+        fn checkOptions(bytes: []const u8) !void {
+            const wire = @import("protobuf").wire;
+            var pos: usize = 0;
+            try std.testing.expectEqual(@as(u32, 3), (try wire.readTag(bytes, &pos)).field);
+            const build = try wire.readLengthDelimited(bytes, &pos);
+            try std.testing.expectEqualSlices(u8, &.{ 0x20, 1, 0x28, 1 }, build);
+            const keys: []const []const u8 = if (deterministic_expected) &.{ "xla_allow_excess_precision", "xla_gpu_enable_triton_gemm", "xla_gpu_deterministic_ops" } else if (vendor_expected) &.{ "xla_allow_excess_precision", "xla_gpu_enable_triton_gemm" } else &.{"xla_allow_excess_precision"};
+            for (keys) |key| {
+                try std.testing.expectEqual(@as(u32, 7), (try wire.readTag(bytes, &pos)).field);
+                const entry = try wire.readLengthDelimited(bytes, &pos);
+                var cursor: usize = 0;
+                try std.testing.expectEqual(@as(u32, 1), (try wire.readTag(entry, &cursor)).field);
+                try std.testing.expectEqualStrings(key, try wire.readLengthDelimited(entry, &cursor));
+                try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(entry, &cursor)).field);
+                const value = try wire.readLengthDelimited(entry, &cursor);
+                try std.testing.expectEqual(entry.len, cursor);
+                cursor = 0;
+                try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(value, &cursor)).field);
+                try std.testing.expectEqual(@as(u64, if (std.mem.eql(u8, key, "xla_gpu_deterministic_ops")) 1 else 0), try wire.readVarint(value, &cursor));
+                try std.testing.expectEqual(value.len, cursor);
+            }
+            if (layouts_expected) |layouts| {
+                try std.testing.expectEqualSlices(u8, layouts, bytes[pos..]);
+            } else try std.testing.expectEqual(bytes.len, pos);
+        }
         fn compile(args: *c.ClientCompileArgs) callconv(.c) ?*c.PjrtError {
+            checkOptions(args.compile_options.?[0..args.compile_options_size]) catch @panic("invalid precision compile options");
+            strict_compiles += 1;
             args.executable = @ptrFromInt(1);
             return null;
         }
@@ -1261,14 +1490,51 @@ test "compile and deserialize reject native output arity with balanced ownership
     api._fns[c.Api.FN_EXEC_NUM_OUTPUTS] = @ptrCast(&Fake.count);
     api._fns[c.Api.FN_LOADED_EXEC_DESTROY] = @ptrCast(&Fake.destroyLoaded);
     api._fns[c.Api.FN_EXEC_DESTROY] = @ptrCast(&Fake.destroyExecutable);
-    const client = Client{ .lib = undefined, .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1) };
+    var client = Client{ .lib = undefined, .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1) };
     Fake.loaded_destroyed = 0;
     Fake.executable_destroyed = 0;
+    Fake.strict_compiles = 0;
     try std.testing.expectError(error.OutputCountMismatch, client.compile("hlo", 2));
     try std.testing.expectError(error.OutputCountMismatch, client.compileForDevice("hlo", 2, @ptrFromInt(1)));
+    Fake.vendor_expected = true;
+    defer Fake.vendor_expected = false;
+    try std.testing.expectError(error.OutputCountMismatch, client.compileWithOptions("hlo", 2, @ptrFromInt(1), .{ .gpu_gemm = .vendor }));
+    client.compile_options = .{ .gpu_gemm = .vendor };
+    try std.testing.expectError(error.OutputCountMismatch, client.compile("hlo", 2));
+    Fake.deterministic_expected = true;
+    defer Fake.deterministic_expected = false;
+    try std.testing.expectError(error.OutputCountMismatch, client.compileWithOptions("hlo", 2, client.device, .{ .gpu_gemm = .vendor_deterministic }));
     try std.testing.expectError(error.OutputCountMismatch, client.deserializeExecutable("serialized", 2));
-    try std.testing.expectEqual(@as(usize, 3), Fake.loaded_destroyed);
-    try std.testing.expectEqual(@as(usize, 3), Fake.executable_destroyed);
+    try std.testing.expectEqual(@as(usize, 5), Fake.strict_compiles);
+    try std.testing.expectEqual(@as(usize, 6), Fake.loaded_destroyed);
+    try std.testing.expectEqual(@as(usize, 6), Fake.executable_destroyed);
+    var builder = hlo.Builder.init(std.testing.allocator, "resident_layouts");
+    defer builder.deinit();
+    const bank = try builder.parameter(0, hlo.Shape.init(.f32, &.{ 448, 768 }), "bank");
+    _ = try builder.tuple(&.{bank});
+    const layouts = try hlo.Module.init("resident_layouts", builder.build()).serializeEntryLayoutOptions(std.testing.allocator);
+    defer std.testing.allocator.free(layouts);
+    Fake.layouts_expected = layouts;
+    defer Fake.layouts_expected = null;
+    for ([_]@FieldType(CompileOptions, "gpu_gemm"){ .provider_default, .vendor, .vendor_deterministic }) |policy| {
+        client.compile_options.gpu_gemm = policy;
+        Fake.vendor_expected = policy != .provider_default;
+        Fake.deterministic_expected = policy == .vendor_deterministic;
+        try std.testing.expectError(error.OutputCountMismatch, client.compileWithEntryLayouts("hlo", 2, client.device, layouts, std.testing.allocator));
+    }
+    try std.testing.expectEqual(@as(usize, 8), Fake.strict_compiles);
+    try std.testing.expectEqual(@as(usize, 9), Fake.loaded_destroyed);
+    try std.testing.expectEqual(@as(usize, 9), Fake.executable_destroyed);
+    client.compile_options.gpu_gemm = .provider_default;
+    for ([_]@FieldType(CompileOptions, "gpu_gemm"){ .provider_default, .vendor, .vendor_deterministic }) |policy| {
+        Fake.vendor_expected = policy != .provider_default;
+        Fake.deterministic_expected = policy == .vendor_deterministic;
+        try std.testing.expectError(error.OutputCountMismatch, client.compileWithEntryLayoutsAndOptions("hlo", 2, client.device, layouts, .{ .gpu_gemm = policy }, std.testing.allocator));
+        try std.testing.expectEqual(@FieldType(CompileOptions, "gpu_gemm").provider_default, client.compile_options.gpu_gemm);
+    }
+    try std.testing.expectEqual(@as(usize, 11), Fake.strict_compiles);
+    try std.testing.expectEqual(@as(usize, 12), Fake.loaded_destroyed);
+    try std.testing.expectEqual(@as(usize, 12), Fake.executable_destroyed);
 }
 
 test "float32 downloads use logical host bytes and reject invalid type size and shape" {
@@ -1451,4 +1717,12 @@ test "BF16 upload rejects invalid shape before accessing the provider" {
     try std.testing.expectError(error.InvalidDimensions, client.bufferFromHostBFloat16(&.{0x3f80}, &.{2}));
     try std.testing.expectError(error.InvalidDimensions, client.bufferFromHostBFloat16(&.{0x3f80}, &.{-1}));
     try std.testing.expectError(error.Overflow, client.bufferFromHostBFloat16(&.{0x3f80}, &.{ std.math.maxInt(i64), 3 }));
+}
+
+test "oversized HLO is rejected before entering the plugin" {
+    const client: Client = undefined;
+    // Never read: the length must be rejected before any provider/API access.
+    const bytes = @as([*]const u8, @ptrFromInt(1))[0 .. @as(usize, std.math.maxInt(i32)) + 1];
+    try std.testing.expectError(error.ProgramTooLarge, client.compileForDevice(bytes, 1, @ptrFromInt(1)));
+    try std.testing.expectError(error.ProgramTooLarge, client.compileWithOptions(bytes, 1, @ptrFromInt(1), .{ .gpu_gemm = .vendor }));
 }

@@ -131,7 +131,7 @@ pub const Encoder = struct {
             try next.copyFromDevice(self.compute.embeddingGemma2TrainingContext(), layer_output, next.len);
         }
         const final_hidden = (try tape.layerCheckpoint(12)).buffer;
-        const module = try self.compute.embeddingGemma2Module();
+        const module = try self.compute.encoderMultimodalModule();
         const ctx = self.compute.embeddingGemma2TrainingContext();
         try module.launchTrainingRmsNorm(ctx, scratch.final_norm, final_hidden, try self.compute.embeddingGemma2Bf16Weight(arch.WeightNames.final_norm), @intCast(rows), 512, self.config.rms_norm_eps);
         try projection.forward(self.compute, self.adapters, embedding_projection_adapter_index, arch.WeightNames.output_projection, scratch.final_norm, rows, 512, 768, self.training_plan.alpha, .{
@@ -168,7 +168,7 @@ pub const Encoder = struct {
         errdefer self.compute.synchronizeEmbeddingGemma2Training() catch {};
         try forward.uploadInput(self, input, try tape.layerCheckpoint(0));
         try buildCheckpoints(self, &forward, &tape, control);
-        const module = try self.compute.embeddingGemma2Module();
+        const module = try self.compute.encoderMultimodalModule();
         const ctx = self.compute.embeddingGemma2TrainingContext();
         const final_hidden = (try tape.layerCheckpoint(12)).buffer;
         try module.launchTrainingRmsNorm(ctx, forward.final_norm, final_hidden, try self.compute.embeddingGemma2Bf16Weight(arch.WeightNames.final_norm), @intCast(rows), 512, self.config.rms_norm_eps);
@@ -251,7 +251,7 @@ fn backwardLayer(encoder: *Encoder, forward: *ForwardScratch, backward: *Backwar
     const geometry = try training.officialLayerGeometry(layer);
     const qw: usize = geometry.queryWidth();
     const kvw: usize = geometry.kvWidth();
-    const module = try encoder.compute.embeddingGemma2Module();
+    const module = try encoder.compute.encoderMultimodalModule();
     const ctx = encoder.compute.embeddingGemma2TrainingContext();
     var name: [256]u8 = undefined;
     const layer_input = (try segment.slot(relative, .layer_input)).buffer;
@@ -393,7 +393,7 @@ const ForwardScratch = struct {
         const ctx = encoder.compute.embeddingGemma2TrainingContext();
         try self.mask.copyFromHost(ctx, std.mem.sliceAsBytes(input.attention_mask));
         try self.ids.copyFromHost(ctx, std.mem.sliceAsBytes(input.token_ids));
-        const module = try encoder.compute.embeddingGemma2Module();
+        const module = try encoder.compute.encoderMultimodalModule();
         try module.launchLookup(ctx, checkpoint.buffer, try encoder.compute.embeddingGemma2Bf16Weight(arch.WeightNames.token_embedding), self.ids, @intCast(input.token_ids.len), encoder.config.vocab_size, 512, 22.625);
     }
 };
@@ -403,7 +403,7 @@ fn forwardLayer(encoder: *Encoder, scratch: *ForwardScratch, segment: *tape_mod.
     const geometry = try training.officialLayerGeometry(layer);
     const query_width: usize = geometry.queryWidth();
     const kv_width: usize = geometry.kvWidth();
-    const module = try encoder.compute.embeddingGemma2Module();
+    const module = try encoder.compute.encoderMultimodalModule();
     const ctx = encoder.compute.embeddingGemma2TrainingContext();
     const layer_input = (try segment.slot(relative, .layer_input)).buffer;
     try layer_input.copyFromDevice(ctx, input, try checkedBytes(rows, 512, @sizeOf(u16)));

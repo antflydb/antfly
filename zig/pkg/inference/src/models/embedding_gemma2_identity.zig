@@ -24,7 +24,10 @@ pub const recipe = "embeddinggemma2-f32-mean-v6-webm-presentation";
 /// this complete execution recipe independently of the qualified F32 route.
 /// Portable MMA broadens BF16 tiled attention beyond the earlier SM89 route;
 /// invalidate earlier CUDA pins rather than mixing scalar/tiled vector recipes.
-pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v3-portable-mma";
+// The actual encoder arithmetic changed from the historical Lt/full-F32
+// route. Invalidate persistent vector/audio identities even for the default
+// zero optimization bits; full-F32 optional fallback has its own policy bit.
+pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v6-source-row-geometry";
 
 pub fn forBackend(artifact_identity: [64]u8, backend: @import("../backends/backends.zig").BackendType) [64]u8 {
     if (backend != .cuda) return artifact_identity;
@@ -36,13 +39,16 @@ pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/emb
     hash.update(cuda_recipe);
     if (policy.automatic_bits != 0) {
         hash.update("\x00" ++ @import("../ops/cuda/embedding_gemma2_policy.zig").automatic_recipe);
-        hash.update(&.{ @as(u8, @truncate(policy.automatic_bits)), @as(u8, @intCast(policy.automatic_bits >> 8)) });
+        const bits = policy.automatic_bits;
+        hash.update(&.{ @as(u8, @truncate(bits)), @as(u8, @truncate(bits >> 8)), @as(u8, @truncate(bits >> 16)), @as(u8, @truncate(bits >> 24)) });
     }
     if (policy.arithmeticBits() != 0) {
         hash.update("\x00optimized-v1");
         const bits = policy.arithmeticBits();
         hash.update(&.{@as(u8, @truncate(bits))});
-        if (bits > 255) hash.update(&.{@as(u8, @intCast(bits >> 8))});
+        if (bits > 255) hash.update(&.{@as(u8, @truncate(bits >> 8))});
+        if (bits > 65535) hash.update(&.{@as(u8, @truncate(bits >> 16))});
+        if (bits > 16777215) hash.update(&.{@as(u8, @truncate(bits >> 24))});
     }
     if (policy.global_gemm) hash.update("\x00global-packed-mqa-bf16-softmax-adaptive-v1");
     if (policy.extended_flash) hash.update("\x00extended-dispatch-v3");
@@ -65,6 +71,7 @@ pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/emb
 }
 
 pub const sidecars = [_][]const u8{ "config.json", "tokenizer.json", "tokenizer_config.json", "processor_config.json", "config_sentence_transformers.json", "1_Pooling/config.json" };
+pub const managed_tokenizer_recipe = "huggingface-root-tokenizer-json-v1";
 pub const max_sidecar_bytes = 64 * 1024 * 1024;
 pub const max_weight_bytes = 4 * 1024 * 1024 * 1024;
 
@@ -115,15 +122,26 @@ pub fn validateTokenizer(a: std.mem.Allocator, bytes: []const u8) !void {
         else => return error.InvalidEmbeddingGemma2Tokenizer,
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidEmbeddingGemma2Tokenizer;
-    const processor = parsed.value.object.get("post_processor") orelse return error.InvalidEmbeddingGemma2Tokenizer;
+    try validateTokenizerRoot(a, parsed.value);
+}
+
+pub fn validateTokenizerRoot(a: std.mem.Allocator, value: std.json.Value) !void {
+    if (value != .object) return error.InvalidEmbeddingGemma2Tokenizer;
+    const model = value.object.get("model") orelse return error.InvalidEmbeddingGemma2Tokenizer;
+    if (model != .object) return error.InvalidEmbeddingGemma2Tokenizer;
+    switch (model.object.get("vocab") orelse return error.InvalidEmbeddingGemma2Tokenizer) {
+        .object => |vocab| if (vocab.count() == 0) return error.InvalidEmbeddingGemma2Tokenizer,
+        .array => |vocab| if (vocab.items.len == 0) return error.InvalidEmbeddingGemma2Tokenizer,
+        else => return error.InvalidEmbeddingGemma2Tokenizer,
+    }
+    const processor = value.object.get("post_processor") orelse return error.InvalidEmbeddingGemma2Tokenizer;
     const reference = try std.json.parseFromSlice(std.json.Value, a,
         \\{"type":"TemplateProcessing","single":[{"SpecialToken":{"id":"<bos>","type_id":0}},{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"<eos>","type_id":0}}],"special_tokens":{"<bos>":{"id":"<bos>","ids":[2],"tokens":["<bos>"]},"<eos>":{"id":"<eos>","ids":[1],"tokens":["<eos>"]}}}
     , .{});
     defer reference.deinit();
     if (processor != .object) return error.InvalidEmbeddingGemma2Tokenizer;
     for ([_][]const u8{ "type", "single", "special_tokens" }) |key| if (!same(processor.object.get(key) orelse return error.InvalidEmbeddingGemma2Tokenizer, reference.value.object.get(key).?)) return error.InvalidEmbeddingGemma2Tokenizer;
-    const added = parsed.value.object.get("added_tokens") orelse return error.InvalidEmbeddingGemma2Tokenizer;
+    const added = value.object.get("added_tokens") orelse return error.InvalidEmbeddingGemma2Tokenizer;
     if (added != .array) return error.InvalidEmbeddingGemma2Tokenizer;
     const required = [_]struct { id: i64, token: []const u8 }{
         .{ .id = 0, .token = "<pad>" },          .{ .id = 1, .token = "<eos>" },         .{ .id = 2, .token = "<bos>" },
@@ -457,4 +475,89 @@ test "embeddinggemma2 CUDA portable attention recipe invalidates earlier pinned 
     try std.testing.expect(!std.mem.eql(u8, previous, &current));
     try std.testing.expectEqual(artifacts, forBackend(artifacts, .native));
     try std.testing.expectEqual(current, forCudaPolicy(artifacts, .{}));
+}
+
+test "CUDA fallback arithmetic has a distinct actual embedding identity" {
+    const artifact: [64]u8 = @splat('a');
+    const reduced = forCudaPolicy(artifact, .{});
+    const fallback = forCudaPolicy(artifact, .{ .matmul_arithmetic = .full_f32 });
+    try std.testing.expect(!std.mem.eql(u8, &reduced, &fallback));
+    // Exact A default algorithm: SHA256(v3 portable recipe + NUL + 64 a).
+    // Both new contracts must reject that historical persistent-cache key.
+    const actual_a_default = "08dc114a42e3cd516ba769d293e65e5255ed43944f0577120739916aa49a5f82";
+    try std.testing.expect(!std.mem.eql(u8, actual_a_default, &reduced));
+    try std.testing.expect(!std.mem.eql(u8, actual_a_default, &fallback));
+    const native_identity = forBackend(artifact, .native);
+    try std.testing.expectEqualSlices(u8, &artifact, &native_identity);
+}
+
+test "CUDA source operator recipe rejects the exact previous vendor reduction identity" {
+    const artifact: [64]u8 = @splat('a');
+    const previous = "21d6a986769026db0be60ede2c83005d23c379279f73ee4a73c313fcfb47dbe9";
+    // SHA256(v4 recipe + NUL + exact artifact) is kept as historical evidence.
+    const current = forCudaPolicy(artifact, .{});
+    try std.testing.expect(!std.mem.eql(u8, previous, &current));
+    try std.testing.expectEqual(artifact, forBackend(artifact, .native));
+}
+
+test "actual complete audio and optional audio fallback cannot share a persistent identity" {
+    const artifact = @as([64]u8, @splat('a'));
+    const complete = forCudaPolicy(artifact, .{});
+    const fallback = forCudaPolicy(artifact, .{ .audio_arithmetic = .full_f32 });
+    try std.testing.expect(!std.mem.eql(u8, &complete, &fallback));
+    const text_fallback = forCudaPolicy(artifact, .{ .matmul_arithmetic = .full_f32 });
+    try std.testing.expect(!std.mem.eql(u8, &fallback, &text_fallback));
+}
+
+test "CUDA padded source row geometry invalidates actual prior v5 vector identities" {
+    const artifact: [64]u8 = @splat('a');
+    const Policy = @import("../ops/cuda/embedding_gemma2_policy.zig").Policy;
+    const profiles = [_]Policy{ .{}, .{ .audio_arithmetic = .full_f32 }, .{ .matmul_arithmetic = .full_f32, .audio_arithmetic = .full_f32 } };
+    const prior_v5 = [_][]const u8{
+        "822acab89feeffc9d98e2ada7880a77a7f14dae5442365a9061d85b2a2d01e2e",
+        "9a629e9ab58cfa7059562cd7fe8b931e505e4751af1bd9cfcb9902913e332c10",
+        "d70309835e1ca34f149994e1017298da4f544e6b645fc56fbbedf555a61f0ebd",
+    };
+    var current: [profiles.len][64]u8 = undefined;
+    for (profiles, prior_v5, &current) |profile, previous, *value| {
+        value.* = forCudaPolicy(artifact, profile);
+        try std.testing.expect(!std.mem.eql(u8, value, previous));
+    }
+    try std.testing.expect(!std.mem.eql(u8, &current[0], &current[1]));
+    try std.testing.expect(!std.mem.eql(u8, &current[0], &current[2]));
+    try std.testing.expect(!std.mem.eql(u8, &current[1], &current[2]));
+    try std.testing.expectEqual(artifact, forBackend(artifact, .native));
+    try std.testing.expectEqual(artifact, forBackend(artifact, .metal));
+}
+
+test "CUDA persistent identity distinguishes actual padded and missing Lt legacy vision programs" {
+    const Policy = @import("../ops/cuda/embedding_gemma2_policy.zig").Policy;
+    const artifact: [64]u8 = @splat('a');
+    // Both real fallbacks lack classic/audio BF16, but only one retains Lt
+    // and therefore executes the padded source vision phase.
+    const padded = Policy{ .matmul_arithmetic = .full_f32, .audio_arithmetic = .full_f32, .source_vision_geometry = .source_padded };
+    const legacy = Policy{ .matmul_arithmetic = .full_f32, .audio_arithmetic = .full_f32, .source_vision_geometry = .legacy_dense };
+    try std.testing.expectEqual(@as(u32, 1 << 17), padded.arithmeticBits() ^ legacy.arithmeticBits());
+    try std.testing.expect(!std.mem.eql(u8, &forCudaPolicy(artifact, padded), &forCudaPolicy(artifact, legacy)));
+    const prior_unflagged_fallback: [64]u8 = "2552582f9496881f1203d32629e2723ee6d3414c76f5c3b5b79f27e5e3ead306".*;
+    try std.testing.expectEqual(prior_unflagged_fallback, forCudaPolicy(artifact, padded));
+    try std.testing.expect(!std.mem.eql(u8, &prior_unflagged_fallback, &forCudaPolicy(artifact, legacy)));
+    // The upper flag must survive the existing variable-width serialization.
+    const legacy_default = Policy{ .source_vision_geometry = .legacy_dense };
+    try std.testing.expect(!std.mem.eql(u8, &forCudaPolicy(artifact, .{}), &forCudaPolicy(artifact, legacy_default)));
+    try std.testing.expectEqual(artifact, forBackend(artifact, .native));
+    try std.testing.expectEqual(artifact, forBackend(artifact, .metal));
+}
+
+test "CUDA automatic policy identity retains the full global attention bit" {
+    const Policy = @import("../ops/cuda/embedding_gemma2_policy.zig").Policy;
+    const artifact: [64]u8 = @splat('a');
+    const global_bit = (Policy{ .global_gemm = true }).arithmeticBits();
+    const global = forCudaPolicy(artifact, .{ .automatic_bits = global_bit });
+    const truncated = forCudaPolicy(artifact, .{ .automatic_bits = @as(u16, @truncate(global_bit)) });
+    try std.testing.expect(global_bit > 65535);
+    try std.testing.expect(!std.mem.eql(u8, &global, &truncated));
+    const full_f32 = forCudaPolicy(artifact, .{ .matmul_arithmetic = .full_f32 });
+    const explicit_global = forCudaPolicy(artifact, .{ .global_gemm = true });
+    try std.testing.expect(!std.mem.eql(u8, &full_f32, &explicit_global));
 }
