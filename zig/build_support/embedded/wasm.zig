@@ -635,6 +635,10 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         b.path("pkg/antfly-embedded/wasm_client.mjs"),
         "antfly-wasm/antfly_embedded_wasm_client.mjs",
     );
+    const install_antfly_wasm_opfs_store = b.addInstallFile(
+        b.path("pkg/antfly-embedded/wasm_opfs_store.mjs"),
+        "antfly-wasm/antfly_embedded_opfs_store.mjs",
+    );
     const install_antfly_wasm_browser = b.addInstallFile(
         b.path("pkg/antfly-embedded/wasm_smoke_browser.mjs"),
         "antfly-wasm/browser.mjs",
@@ -718,6 +722,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
                 &install_antfly_wasm.step,
                 &install_antfly_wasm_smoke_run.step,
                 &install_antfly_wasm_client.step,
+                &install_antfly_wasm_opfs_store.step,
                 &install_antfly_wasm_browser.step,
                 &install_antfly_wasm_index.step,
                 &install_antfly_wasm_readme.step,

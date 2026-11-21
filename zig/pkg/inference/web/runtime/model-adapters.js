@@ -48,7 +48,7 @@ const adapters = [
   {
     id: 'embedding_similarity', family: () => 'embedding', architecture: 'embedding',
     matches: (c, _e, m) => ['embedding_gemma2', 'embedding_gemma2_text'].includes(c.model_type) || m?.capabilities?.includes('embedding_similarity'),
-    tasks: ['decide'], capabilities: ['embedding_similarity'], kinds: ['choice', 'multi_choice'],
+    tasks: ['embed', 'decide'], capabilities: ['embedding_similarity'], kinds: ['choice', 'multi_choice'],
     unavailable: c => !['embedding_gemma2', 'embedding_gemma2_text'].includes(c.model_type) ? 'No embedding-similarity encoder adapter matches this configuration.' : undefined,
   },
 ];
@@ -71,10 +71,15 @@ export function resolveAdapter(config, encoderConfig = config, manifest) {
     declaredTasks = [...new Set([...declaredTasks.filter(t => !['extract', 'classify'].includes(t)), 'embed', 'decide'])];
     declaredCapabilities = [...new Set([...declaredCapabilities.filter(c => !['classification', 'extraction', 'typed_decisions'].includes(c)), 'embedding_similarity'])];
   }
-  const tasks = adapter.tasks.filter(t => declaredTasks.includes(t) && (t === 'decide'
+  // Retrieval embeddings share the encoder that embedding-similarity decisions use.
+  const tasks = adapter.tasks.filter(t => declaredTasks.includes(t) && (t === 'embed'
+    ? declaredCapabilities.includes('embedding_similarity')
+    : t === 'decide'
     ? declaredCapabilities.includes(adapter.id === 'embedding_similarity' ? 'embedding_similarity' : 'typed_decisions')
     : adapter.capabilities.some(c => !['typed_decisions', 'embedding_similarity'].includes(c) && declaredCapabilities.includes(c))));
-  const capabilities = adapter.capabilities.filter(c => declaredCapabilities.includes(c) && tasks.includes(['typed_decisions', 'embedding_similarity'].includes(c) ? 'decide' : 'extract'));
+  const capabilities = adapter.capabilities.filter(c => declaredCapabilities.includes(c) && (c === 'embedding_similarity'
+    ? tasks.includes('decide') || tasks.includes('embed')
+    : tasks.includes(c === 'typed_decisions' ? 'decide' : 'extract')));
   return {
     adapter: adapter.id, family: adapter.family(config), architecture: adapter.architecture,
     tasks: [...declaredTasks], capabilities: [...declaredCapabilities],

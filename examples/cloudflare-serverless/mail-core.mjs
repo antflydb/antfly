@@ -268,3 +268,91 @@ export class MailOutbox {
     ]);
   }
 }
+// Append-only per-mailbox change log for offline replicas (the PWA's local
+// index). Every indexed message gets exactly one monotonically increasing
+// sequence; a replica stores the last sequence it applied as its cursor.
+// Messages indexed before the log existed are appended by a bounded backfill
+// that walks the received-order index, so the log converges for old mailboxes.
+export const syncLimits = Object.freeze({ pageMessages: 25, textBytes: 64 * 1024, backfill: 50 });
+const SEQUENCE_DIGITS = 13;
+export class MailSyncLog {
+  constructor(store, { prefix = "mail/v1/sync/" } = {}) {
+    this.store = store;
+    this.prefix = prefix;
+  }
+  entryKey(sequence) {
+    return this.prefix + "log/" + String(sequence).padStart(SEQUENCE_DIGITS, "0");
+  }
+  cursorSequence(cursor) {
+    if (cursor === "" || cursor == null) return 0;
+    if (typeof cursor !== "string" || !/^\d{1,13}$/.test(cursor)) throw Error("InvalidSyncCursor");
+    return Number(cursor);
+  }
+  /** Append `id` once. Call inside the transaction that makes it searchable. */
+  async record(tx, id) {
+    if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    const marker = this.prefix + "id/" + id;
+    if (await tx.get(marker)) return false;
+    const sequence = ((await tx.get(this.prefix + "head")) ?? 0) + 1;
+    await tx.put(this.prefix + "head", sequence);
+    await tx.put(this.entryKey(sequence), id);
+    await tx.put(marker, sequence);
+    return true;
+  }
+  /** Append up to `limit` pre-existing messages; true when none remain. */
+  async backfill(limit = syncLimits.backfill) {
+    return this.store.transaction(async (tx) => {
+      const state = (await tx.get(this.prefix + "backfill")) ?? { after: "", done: false };
+      if (state.done) return true;
+      const page = await tx.list({ prefix: "mail/v1/order/", startAfter: state.after, limit });
+      for (const [key, id] of page) {
+        await this.record(tx, id);
+        state.after = key;
+      }
+      state.done = page.size < limit;
+      await tx.put(this.prefix + "backfill", state);
+      return state.done;
+    });
+  }
+  /** Message identities after `cursor`, oldest first, with the next cursor. */
+  async page(cursor = "", limit = syncLimits.pageMessages) {
+    const after = this.cursorSequence(cursor);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw Error("InvalidSyncLimit");
+    return this.store.transaction(async (tx) => {
+      const head = (await tx.get(this.prefix + "head")) ?? 0;
+      if (after > head) throw Error("InvalidSyncCursor");
+      const page = await tx.list({
+        prefix: this.prefix + "log/",
+        startAfter: after ? this.entryKey(after) : "",
+        limit,
+      });
+      const ids = [];
+      let last = after;
+      for (const [key, id] of page) {
+        ids.push(id);
+        last = Number(key.slice(this.prefix.length + 4));
+      }
+      return { ids, cursor: String(last), head, more: last < head };
+    });
+  }
+}
+/** The replica view of a message: text only, bounded, no attachment bytes. */
+export function syncMessage(message) {
+  const bytes = new TextEncoder().encode(message.text ?? "");
+  const truncated = bytes.length > syncLimits.textBytes;
+  const text = truncated
+    ? new TextDecoder().decode(bytes.slice(0, syncLimits.textBytes)).replace(/�$/, "")
+    : (message.text ?? "");
+  return {
+    id: message.id,
+    thread_id: message.thread_id ?? message.id,
+    subject: message.subject ?? "",
+    from: message.from ?? "",
+    to: message.to ?? "",
+    received_at: message.received_at ?? 0,
+    quarantined: message.quarantined === true,
+    attachments: (message.attachments ?? []).map(({ index, filename, size }) => ({ index, filename, size })),
+    text,
+    text_truncated: truncated,
+  };
+}

@@ -116,3 +116,141 @@ The native integration reused the unchanged qualified WASM artifacts from
 `9b81fa0021`; no native engine code was changed or rebuilt for this auth work.
 These local checks do not qualify a live domain, SMTP delivery or the performance
 gate. No existing MX/DNS/routing records were modified and no real mail was sent.
+
+## On-device search (progressive web app)
+
+The mail app is also an installable PWA that can keep an **opt-in, private copy
+of one mailbox in the browser** and search it by meaning. Retrieval runs at the
+edge in the literal sense: on the user's device, with no inference service. The
+server copy stays authoritative. The local copy is a rebuildable cache.
+
+```
+Mailbox actor ──/mail/sync (text only, cursor)──▶ page
+                                                   │ EmbeddingGemma 2 (@antfly/web, WASM CPU)
+                                                   ▼
+                       database worker: Antfly embedded WASM (hosted profile)
+                                                   │ changed files between calls
+                                                   ▼
+                                    OPFS: blobs + A/B manifest generations
+```
+
+### Sync log
+
+Each mailbox actor keeps an append-only log (`mail/v1/sync/log/<seq>`) written
+in the **same transaction** that marks a message indexed and lists it. A
+per-message marker makes recording idempotent across queue replay. Mailboxes
+created before the log existed are backfilled in bounded steps by walking the
+received-order index; markers prevent duplicates when new mail races the
+backfill. `GET /mail/sync?cursor=<seq>` returns up to 25 messages after the
+cursor, oldest first: id, thread, subject, addresses, time, attachment names and
+sizes, and text truncated to 64 KiB. It omits attachment bytes, R2 keys and
+digests. The session selects the actor, as for every other route; a cursor is
+only a position and grants nothing. Deletion and edits are not synchronized,
+because the app has no message deletion yet. When it gains one, the log needs
+tombstone entries.
+
+### Embeddings
+
+`@antfly/web` gained an `embed()` task for EmbeddingGemma 2. It is the same
+browser encoder path as embedding-similarity decisions: the task prefix
+(`RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY`), tokenization, encoder and
+Matryoshka truncation, plus the same `model_identity`. Unlike decisions, inputs
+are truncated to `max_tokens` (default 512, configured to 256 here) instead of
+rejected, because documents are routinely long. Requests carry at most 32 inputs
+and 16,384 tokens. Execution is WASM CPU only; the browser has no WebGPU path for
+this encoder yet.
+
+The operator publishes the model once with `publish-local-model.mjs`. The
+browser never loads the media towers, so the script removes exactly those
+tensors (the regex the runtime uses to skip them). That roughly halves the
+download and keeps every file under `@antfly/web`'s 1 GiB catalog file limit.
+The bundle's own integrity receipt pins the unstripped weights, so it is
+replaced by catalog SHA-256 pins, which `downloadCatalogModel` verifies and
+caches in OPFS. Weights are served same-origin from a private R2 bucket, only to
+signed-in users. This keeps `connect-src 'self'` and avoids becoming an open
+mirror. The weights keep their upstream license.
+
+Vectors are written as an **external** `dense_vector` index (cosine, 256 dims by
+default) through `_embeddings`, so the embedded database needs no embedder
+callback. Queries combine a full-text match on one `content` field (subject,
+sender, body) with the query vector, merged with RRF. The local space records
+the model id, file pins, dimensions and token limit. A copy built for a
+different space is discarded and rebuilt, never mixed.
+
+### Persistence in the browser
+
+The embedded hosted profile previously ran only on `MemoryStorage`. Rather than
+write a second implementation of the storage interface against OPFS, the WASM
+build wraps `MemoryStorage` with per-path version tracking. That covers write,
+append, rename, delete and tree deletion. It also exports:
+
+- `open_tracked`: open on tracked storage, keeping imported files;
+- `storage_import`: restore a file before opening;
+- `storage_manifest_json`: `{path, size, version}` for every file;
+- `storage_file_ptr` / `storage_file_len`: copy one file out.
+
+The module is single-threaded and every call runs to completion, so a manifest
+taken between calls is a crash-consistent image. It is equivalent to a process
+stop at that point with every write synced.
+
+`antfly_embedded_opfs_store.mjs` persists those images:
+
+1. Write changed files as new immutable blobs.
+2. Write the next A/B manifest slot. The manifest carries the generation, a
+   SHA-256 of its body, the file→blob map and caller metadata.
+3. Delete blobs that neither of the two newest generations references.
+
+Loading picks the newest manifest whose checksum and blobs are complete. A torn
+manifest falls back one generation. The sync cursor rides in the manifest
+metadata, so data and cursor commit together. A crash after step 1 merely
+re-applies a page; upserts make that idempotent.
+
+OPFS does not document crash-atomic rename. The store never relies on rename,
+and it does not claim that `createWritable` closes atomically on every engine;
+the checksum and the second slot cover a torn write. The whole database is
+resident in WASM memory. That suits a mailbox-sized text index (tens of MB) and
+stays inside the 2 GiB wasm32 ceiling. It is not a general large-dataset
+browser backend; a direct OPFS `Storage` implementation is still the long-term
+path for that.
+
+### Privacy and lifecycle
+
+- **Off by default.** Enabling asks for confirmation and shows the model's
+  download size, then requests persistent storage.
+- **Text and vectors stay on the device.** The server sees only `/mail/sync`
+  reads, the same data the inbox already shows that user.
+- **Sign-out removes every on-device copy** and the remembered offline identity,
+  for shared machines. This works without loading the runtime. The model cache
+  is kept because it contains no user data.
+- **"Remove from this device"** deletes one mailbox's copy.
+- **Offline.** The service worker caches the shell, the content-addressed runtime
+  (immutable), and the runtime config and model catalog (network-first). It
+  never caches mail, auth or weights. If the server is unreachable at startup
+  and this device holds an opted-in copy, the app opens into on-device search
+  instead of the sign-in screen; messages open from the local copy.
+- **CSP.** It adds only `'wasm-unsafe-eval'`, `worker-src 'self'` and
+  `manifest-src 'self'`. Everything stays same-origin.
+
+### Validation and limits
+
+Covered by tests:
+
+- The embedded WASM smoke test runs tracked storage through the OPFS store
+  against an in-memory directory: empty load, incremental checkpoints, reopen in
+  a fresh module, dense and hybrid search after restore, and torn-manifest
+  fallback.
+- `test-backends-runtime.mjs` adds `embed` checks to the synthetic
+  full-geometry EmbeddingGemma 2 fixture.
+- `test/mail-local.test.mjs` covers the sync log and backfill, the bounded
+  export, route scoping, CSP and caching headers, document and query shapes,
+  media-tower stripping and catalog pins, opt-in UI, sign-out wipe and offline
+  start.
+
+Not yet validated:
+
+- A real EmbeddingGemma 2 checkpoint in a real browser. That includes retrieval
+  quality, embedding throughput on CPU and OPFS behavior under quota pressure
+  per engine.
+- Running the stripped checkpoint through the full loader.
+- Deployed Workers asset limits for the runtime files (`build-local.mjs` fails
+  the build if any file exceeds 25 MiB).

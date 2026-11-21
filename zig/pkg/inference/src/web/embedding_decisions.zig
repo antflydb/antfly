@@ -196,3 +196,61 @@ pub fn run(backing: A, compute: *WasmCompute, cfg: encoder.Config, tok: Tokenize
     } else try put(a, &root, "answers", .{ .array = answers });
     return std.json.Stringify.valueAlloc(backing, V{ .object = root }, .{});
 }
+
+/// Browser retrieval embeddings on the same encoder path as decisions.
+/// Inputs are rendered with EmbeddingGemma2's task prefix and truncated to
+/// `max_tokens`; callers that must not truncate use decisions instead.
+pub const EmbedRequest = struct {
+    inputs: []const []const u8,
+    task_type: []const u8 = "RETRIEVAL_DOCUMENT",
+    dimensions: u32 = encoder.output_dim,
+    max_tokens: u32 = 512,
+};
+
+pub const embed_max_inputs = 32;
+pub const embed_max_request_tokens = 16 * 1024;
+
+pub fn embed(backing: A, compute: *WasmCompute, cfg: encoder.Config, tok: Tokenizer, json: []const u8, identity: []const u8, validate_only: bool) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try std.json.parseFromSliceLeaky(EmbedRequest, a, json, .{ .duplicate_field_behavior = .@"error" });
+    if (request.inputs.len == 0 or request.inputs.len > embed_max_inputs) return error.EmbedRequestLimitExceeded;
+    if (!encoder.validDimension(request.dimensions)) return error.InvalidEmbeddingDimensions;
+    if (request.max_tokens < 8 or request.max_tokens > 2048) return error.EmbedRequestLimitExceeded;
+    const prefix = try encoder.taskPrefix(request.task_type);
+    var input_tokens: usize = 0;
+    const vectors = try a.alloc([]const f32, request.inputs.len);
+    for (request.inputs, vectors) |text, *vector| {
+        if (text.len > 256 * 1024) return error.EmbedRequestLimitExceeded;
+        try pipeline.validateGroup(.{ .content = &.{.{ .text = text }} }, .{ .task_type = request.task_type, .dimensions = request.dimensions });
+        const rendered = try std.fmt.allocPrint(a, "{s}{s}", .{ prefix, text });
+        var tokens = try tok.encodeForModel(a, rendered, request.max_tokens);
+        defer tokens.deinit();
+        var count: usize = 0;
+        for (tokens.attention_mask) |m| count += @intFromBool(m != 0);
+        if (count == 0) return error.EmbedRequestLimitExceeded;
+        input_tokens += count;
+        if (input_tokens > embed_max_request_tokens) return error.EmbedRequestLimitExceeded;
+        if (validate_only) {
+            vector.* = &.{};
+            continue;
+        }
+        const ids = try a.alloc(i64, count);
+        for (tokens.ids[0..count], ids) |id, *out| out.* = id;
+        const mask = try a.alloc(i64, count);
+        @memset(mask, 1);
+        var cb = compute.computeBackend();
+        const values = try pipeline.preparedText(&cb, backing, cfg, ids, mask, request.dimensions);
+        defer backing.free(values);
+        vector.* = try a.dupe(f32, values);
+    }
+    if (validate_only) return std.json.Stringify.valueAlloc(backing, .{ .valid = true, .encoded_tokens = input_tokens }, .{});
+    return std.json.Stringify.valueAlloc(backing, .{
+        .model_identity = identity,
+        .task_type = request.task_type,
+        .dimensions = request.dimensions,
+        .embeddings = vectors,
+        .usage = .{ .input_tokens = input_tokens, .output_tokens = 0 },
+    }, .{});
+}

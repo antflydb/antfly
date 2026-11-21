@@ -10194,14 +10194,14 @@ pub const IndexedClauseMembership = struct {
 
     fn shouldProbe(self: *const @This(), key: []const u8) bool {
         const hash = std.hash.Wyhash.hash(0, key) | 1;
-        return self.rejected[hash % self.rejected.len] == hash;
+        return self.rejected[@intCast(hash % self.rejected.len)] == hash;
     }
 
     fn put(self: *@This(), alloc: Allocator, budget: ?*WorkBudget, key: []const u8, rows: *const roaring.RoaringBitmap) void {
         const hash = std.hash.Wyhash.hash(0, key) | 1;
         var retained = false;
         defer if (!retained) {
-            self.rejected[hash % self.rejected.len] = hash;
+            self.rejected[@intCast(hash % self.rejected.len)] = hash;
         };
         const bytes = key.len +| rows.cloneStorageBound() +| (3 * @sizeOf(roaring.RoaringBitmap));
         if (bytes > max_bytes - self.bytes or self.entries.contains(key)) return;

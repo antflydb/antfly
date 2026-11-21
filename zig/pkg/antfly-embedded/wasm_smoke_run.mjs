@@ -21,6 +21,7 @@ import {
     formatDotpromptMediaUrl,
     instantiateAntflyEmbeddedApiFromBytes,
 } from "./antfly_embedded_wasm_client.mjs";
+import { openOpfsStore } from "./antfly_embedded_opfs_store.mjs";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const wasmPath = path.join(dir, "antfly.wasm");
@@ -185,4 +186,89 @@ for (const query of [
     if (!Object.hasOwn(source, "meta") || source.meta !== null) throw new Error("WASM edge-only mutation changed its source document");
 }
 api.close();
+
+// --- Change-tracked storage persisted through the OPFS checkpoint store ---
+// A small in-memory stand-in for FileSystemDirectoryHandle.
+function memoryDirectory() {
+    const entries = new Map();
+    const notFound = () => Object.assign(new Error("missing"), { name: "NotFoundError" });
+    return {
+        entries: () => entries.entries(),
+        async getDirectoryHandle(name, options = {}) {
+            if (!entries.has(name)) {
+                if (!options.create) throw notFound();
+                entries.set(name, memoryDirectory());
+            }
+            return entries.get(name);
+        },
+        async getFileHandle(name, options = {}) {
+            if (!entries.has(name)) {
+                if (!options.create) throw notFound();
+                entries.set(name, { bytes: new Uint8Array(0) });
+            }
+            const file = entries.get(name);
+            return {
+                async getFile() { return new Blob([file.bytes]); },
+                async createWritable() {
+                    const parts = [];
+                    return {
+                        async write(bytes) { parts.push(new Uint8Array(bytes)); },
+                        async close() { file.bytes = new Uint8Array(await new Blob(parts).arrayBuffer()); },
+                        async abort() {},
+                    };
+                },
+            };
+        },
+        async removeEntry(name) {
+            if (!entries.delete(name)) throw notFound();
+        },
+    };
+}
+const opfsRoot = memoryDirectory();
+const store = await openOpfsStore(opfsRoot);
+const first = await store.load(api);
+if (first.restored) throw new Error("empty OPFS store reported a restore");
+api.addIndex({ name: "mail_semantic", kind: "dense_vector", config_json: JSON.stringify({ dims: 3, metric: "cosine", external: true }) });
+api.putMany({
+    "msg:a": { subject: "invoice from the plumber", body: "pipes fixed", _embeddings: { mail_semantic: [1, 0, 0] } },
+    "msg:b": { subject: "team offsite agenda", body: "hiking and dinner", _embeddings: { mail_semantic: [0, 1, 0] } },
+});
+api.runUntilIdle();
+const checkpoint1 = await store.checkpoint(api, { cursor: "c1" });
+if (checkpoint1.generation !== 1 || checkpoint1.written === 0) throw new Error("first checkpoint wrote nothing");
+const checkpoint2 = await store.checkpoint(api, { cursor: "c1" });
+if (checkpoint2.written !== 0) throw new Error("unchanged checkpoint rewrote files");
+api.put("msg:c", { subject: "plumber follow-up", body: "invoice paid", _embeddings: { mail_semantic: [0.9, 0.1, 0] } });
+api.runUntilIdle();
+const checkpoint3 = await store.checkpoint(api, { cursor: "c2" });
+if (checkpoint3.written === 0 || checkpoint3.written >= checkpoint3.files) throw new Error("incremental checkpoint was not incremental");
+api.close();
+
+// Reopen from the checkpoint alone, in a fresh module instance.
+const reopenedApi = await instantiateAntflyEmbeddedApiFromBytes(wasmBytes, {});
+const reopenedStore = await openOpfsStore(opfsRoot);
+const restored = await reopenedStore.load(reopenedApi);
+if (!restored.restored || restored.metadata?.cursor !== "c2") throw new Error("OPFS checkpoint did not restore its metadata");
+if (reopenedApi.lookup("msg:c")._source.subject !== "plumber follow-up") throw new Error("restored lookup failed");
+const dense = reopenedApi.search({ embeddings: { mail_semantic: [1, 0, 0] }, indexes: ["mail_semantic"], limit: 2 });
+const denseIds = JSON.stringify(dense);
+if (!denseIds.includes("msg:a") || !denseIds.includes("msg:c") || denseIds.includes("msg:b")) throw new Error(`restored dense search failed: ${denseIds}`);
+const hybrid = reopenedApi.search({
+    full_text_search: { match: { field: "subject", text: "offsite" } },
+    embeddings: { mail_semantic: [0, 1, 0] },
+    indexes: ["mail_semantic"],
+    merge_config: { strategy: "rrf" },
+    limit: 3,
+});
+if (!JSON.stringify(hybrid).includes("msg:b")) throw new Error("restored hybrid search failed");
+// A torn newest manifest falls back to the previous complete generation.
+const tornSlot = await opfsRoot.getFileHandle(`manifest-${restored.generation % 2}.json`);
+const tornWriter = await tornSlot.createWritable();
+await tornWriter.write(new TextEncoder().encode("{\"format\":1,\"sha256\":\"00\""));
+await tornWriter.close();
+const fallbackApi = await instantiateAntflyEmbeddedApiFromBytes(wasmBytes, {});
+const fallback = await (await openOpfsStore(opfsRoot)).load(fallbackApi);
+if (!fallback.restored || fallback.generation !== restored.generation - 1) throw new Error("torn manifest did not fall back a generation");
+reopenedApi.close();
+fallbackApi.close();
 console.log("antfly embedded shared smoke passed: ok");

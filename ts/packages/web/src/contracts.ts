@@ -3,7 +3,7 @@ export type WeightPrecision = "q8_0" | "q4_k" | "q4_0" | "fp32" | "fp16_encoder"
 export type Backend = "auto" | "wasm" | "webgpu";
 export type RuntimeArchitecture = "span" | "boundary" | "modernbert" | "embedding";
 export type ModelFamily = "gliner2" | "gliner25" | "decide" | "laya" | "opendecider" | "embedding";
-export type InferenceTask = "extract" | "decide";
+export type InferenceTask = "extract" | "decide" | "embed";
 export type DecisionKind = "choice" | "multi_choice" | "score" | "predicate";
 export type ModelCapabilities = Readonly<{
   tasks: readonly string[];
@@ -432,6 +432,34 @@ export type DecisionResponse = {
   | { answers: DecisionAnswer[]; data?: never }
   | { answers?: never; data: { input_index: number; id?: string; answers: DecisionAnswer[] }[] }
 );
+/** EmbeddingGemma2 task prompts; queries and documents use different prefixes. */
+export type EmbeddingTaskType =
+  | "RETRIEVAL_QUERY"
+  | "RETRIEVAL_DOCUMENT"
+  | "QUESTION_ANSWERING"
+  | "FACT_VERIFICATION"
+  | "CODE_RETRIEVAL_QUERY"
+  | "CLASSIFICATION"
+  | "CLUSTERING"
+  | "SEMANTIC_SIMILARITY";
+/**
+ * Up to 32 texts and 16,384 encoded tokens per request. Each input is
+ * truncated to `max_tokens` (8-2048, default 512); `dimensions` keeps the
+ * leading Matryoshka components (1-768, default 768).
+ */
+export type EmbeddingRequest = {
+  inputs: string[];
+  task_type?: EmbeddingTaskType;
+  dimensions?: number;
+  max_tokens?: number;
+};
+export type EmbeddingResponse = {
+  model_identity: string;
+  task_type: EmbeddingTaskType;
+  dimensions: number;
+  embeddings: number[][];
+  usage: { input_tokens: number; output_tokens: number };
+};
 export type ModelInspection = {
   family: ModelFamily;
   architecture: RuntimeArchitecture | "embedding";

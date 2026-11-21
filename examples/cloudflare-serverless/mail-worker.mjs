@@ -35,6 +35,38 @@ const actor = (env, id) => {
 };
 const hint = (env, mailbox, kind, id) =>
   env.MAIL_QUEUE.send({ mailbox, kind, ...(id ? { id } : {}) });
+// WASM compilation and module workers back the optional on-device index.
+// Everything, including model downloads, stays same-origin.
+export const contentSecurityPolicy =
+  "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; " +
+  "connect-src 'self'; img-src 'self'; manifest-src 'self'; object-src 'none'; " +
+  "base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+// The on-device embedding model, published by the operator to a private R2
+// bucket (see publish-local-model.mjs). Served only to signed-in users so the
+// deployment is not an open mirror; never contains user data.
+async function localModel(env, pathname, method) {
+  const path = pathname.slice("/local/models/".length);
+  if (
+    method !== "GET" ||
+    !env.MAIL_MODELS ||
+    !path ||
+    path.length > 512 ||
+    path.split("/").some((part) => !part || part === "." || part === "..") ||
+    !/^[A-Za-z0-9._/-]+$/.test(path)
+  )
+    return new Response("not found", { status: 404 });
+  const object = await env.MAIL_MODELS.get((env.MAIL_MODEL_PREFIX ?? "local-models/") + path);
+  if (!object) return new Response("not found", { status: 404 });
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": path.endsWith(".json") ? "application/json" : "application/octet-stream",
+      "Content-Length": String(object.size),
+      // The catalog can be republished; pinned weight files are content-checked.
+      "Cache-Control": path === "catalog.json" ? "private, no-cache" : "private, max-age=86400",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -45,16 +77,19 @@ export default {
       return Response.redirect(target.href, 307);
     }
     if (url.pathname.startsWith("/api/auth/")) return env.AUTH_SERVICE.fetch(request);
-    if (!url.pathname.startsWith("/mail/") && url.pathname !== "/api/me") {
+    const modelPath = url.pathname.startsWith("/local/models/");
+    if (!url.pathname.startsWith("/mail/") && url.pathname !== "/api/me" && !modelPath) {
       if (request.method !== "GET" || !env.MAIL_ASSETS)
         return new Response("not found", { status: 404 });
       const asset = await env.MAIL_ASSETS.fetch(request),
         headers = new Headers(asset.headers);
-      headers.set(
-        "Content-Security-Policy",
-        "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
-      );
+      headers.set("Content-Security-Policy", contentSecurityPolicy);
       headers.set("X-Content-Type-Options", "nosniff");
+      // The service worker must update promptly; versioned runtimes never change.
+      if (url.pathname === "/sw.js" || url.pathname === "/local/config.json")
+        headers.set("Cache-Control", "no-cache");
+      else if (asset.ok && /^\/local\/[a-f0-9]{16}\//.test(url.pathname))
+        headers.set("Cache-Control", "public, max-age=31536000, immutable");
       return new Response(asset.body, { status: asset.status, headers });
     }
     let cookies = [];
@@ -73,10 +108,13 @@ export default {
       if (request.method !== "GET" && request.headers.get("Origin") !== env.AUTH_ORIGIN)
         return reply({ error: "InvalidOrigin" }, 403);
       if (url.pathname === "/api/me" && request.method === "GET") return reply(session);
+      if (modelPath) return withCookies(await localModel(env, url.pathname, request.method));
       if (url.pathname === "/mail/messages" && request.method === "GET")
         return reply(
           publicPage(await takeRpcData(stub.list(mailbox.id, url.searchParams.get("cursor") ?? "")))
         );
+      if (url.pathname === "/mail/sync" && request.method === "GET")
+        return reply(await takeRpcData(stub.sync(mailbox.id, url.searchParams.get("cursor") ?? "")));
       if (url.pathname === "/mail/search" && request.method === "GET")
         return reply(publicPage(await takeRpcData(stub.search(mailbox.id, url.searchParams.get("q")))));
       const match = /^\/mail\/messages\/([a-f0-9-]{36})(?:\/attachments\/(\d{1,2}))?$/.exec(

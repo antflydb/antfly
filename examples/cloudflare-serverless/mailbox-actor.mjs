@@ -18,6 +18,9 @@ import { createRuntime } from "./runtime.mjs";
 import { buildKernel, sharedCache } from "./kernels.mjs";
 import {
   MailOutbox,
+  MailSyncLog,
+  syncMessage,
+  syncLimits,
   uuid,
   objectPrefix,
   parseMail,
@@ -48,6 +51,7 @@ export class Mailbox extends R2CommitCoordinator {
     this.outbox = new MailOutbox(this.serviceStore, {
       maxPerHour: Number(env.MAIL_SENDS_PER_HOUR ?? 20),
     });
+    this.syncLog = new MailSyncLog(this.serviceStore);
   }
   scope(id) {
     if (!uuid(id) || !this.env.MAILBOXES.idFromName(id).equals(this.ctx.id))
@@ -210,6 +214,8 @@ export class Mailbox extends R2CommitCoordinator {
         "mail/v1/order/" + String(9999999999999 - current.received_at).padStart(13, "0") + "/" + id,
         id
       );
+      // Offline replicas learn about the message in the same commit that lists it.
+      await this.syncLog.record(tx, id);
     });
     return this.publish(mailbox);
   }
@@ -259,6 +265,25 @@ export class Mailbox extends R2CommitCoordinator {
       if (message) messages.push(message);
     }
     return { messages };
+  }
+  // Incremental, text-only export of this mailbox for the PWA's local index.
+  // Session membership has already selected this actor; the cursor is only a
+  // position in this mailbox's log and grants nothing on its own.
+  async sync(mailbox, cursor = "") {
+    this.scope(mailbox);
+    const backfilled = await this.syncLog.backfill();
+    const page = await this.syncLog.page(cursor);
+    const messages = [];
+    for (const id of page.ids) {
+      const message = await this.message(mailbox, id);
+      if (message) messages.push(syncMessage(message));
+    }
+    return {
+      messages,
+      cursor: page.cursor,
+      more: page.more || !backfilled,
+      limits: { text_bytes: syncLimits.textBytes },
+    };
   }
   async attachment(mailbox, id, index) {
     const prefix = this.scope(mailbox),

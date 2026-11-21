@@ -380,6 +380,49 @@ export function bindAntflyEmbeddedApi(exports) {
             exports.antfly_embedded_close();
             return lastMessage();
         },
+        // --- Change-tracked storage for host persistence (see WASM.md) ---
+        openTracked() {
+            expectOk(exports.antfly_embedded_open_tracked());
+            return lastMessage();
+        },
+        storageReset() {
+            expectOk(exports.antfly_embedded_storage_reset());
+            return lastMessage();
+        },
+        storageImport(path, bytes) {
+            const name = writeInput(String(path));
+            const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+            const ptr = data.length ? Number(exports.antfly_embedded_alloc(data.length)) : 0;
+            if (ptr === 0 && data.length > 0) {
+                freeInput(name);
+                throw new Error("allocation failed");
+            }
+            try {
+                if (data.length) new Uint8Array(exports.memory.buffer, ptr, data.length).set(data);
+                expectOk(exports.antfly_embedded_storage_import(name.ptr, name.len, ptr, data.length));
+            } finally {
+                if (data.length) exports.antfly_embedded_free(ptr, data.length);
+                freeInput(name);
+            }
+        },
+        storageManifest() {
+            expectOk(exports.antfly_embedded_storage_manifest_json());
+            return JSON.parse(lastResult()).files;
+        },
+        /** Copy one stored file out of WASM memory; null when it does not exist. */
+        storageFile(path, expectedSize) {
+            const name = writeInput(String(path));
+            try {
+                const len = Number(exports.antfly_embedded_storage_file_len(name.ptr, name.len));
+                if (expectedSize != null && len !== expectedSize) return null;
+                if (len === 0) return new Uint8Array(0);
+                const ptr = Number(exports.antfly_embedded_storage_file_ptr(name.ptr, name.len));
+                if (ptr === 0) return null;
+                return new Uint8Array(exports.memory.buffer, ptr, len).slice();
+            } finally {
+                freeInput(name);
+            }
+        },
         batchJson(body) {
             return callJson(exports.antfly_embedded_batch_json, toJsonBody(body));
         },

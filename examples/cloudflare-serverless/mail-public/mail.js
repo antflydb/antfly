@@ -18,7 +18,44 @@ let me = null,
   cursor = null,
   replyTo = null,
   editorId = null,
-  folder = "inbox";
+  folder = "inbox",
+  local = null,
+  localOpening = null;
+// On-device search is optional and loaded lazily; see local-index.js.
+const LOCAL_FLAGS = "antfly-mail-local-v1";
+// Minimal identity for opening an opted-in copy offline; removed on sign-out.
+const OFFLINE_IDENTITY = "antfly-mail-offline-identity-v1";
+const localModule = () => import("/local-index.js");
+const localSupported = () =>
+  typeof Worker !== "undefined" &&
+  typeof WebAssembly !== "undefined" &&
+  typeof navigator.storage?.getDirectory === "function";
+function localFlags() {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_FLAGS) ?? "{}") ?? {};
+  } catch {
+    return {};
+  }
+}
+// Sign-out on a shared machine removes every on-device mailbox copy. This needs
+// no runtime download, so it works even when the local module cannot load.
+async function wipeLocal() {
+  local?.close();
+  local = null;
+  localReady(null);
+  try {
+    localStorage.removeItem(LOCAL_FLAGS);
+    localStorage.removeItem(OFFLINE_IDENTITY);
+  } catch {
+    /* Storage disabled: nothing was ever stored. */
+  }
+  if (typeof navigator.storage?.getDirectory !== "function") return;
+  try {
+    await (await navigator.storage.getDirectory()).removeEntry("antfly-mail-local", { recursive: true });
+  } catch (error) {
+    if (error?.name !== "NotFoundError") throw error;
+  }
+}
 function status(text, error = false) {
   $("status").textContent = text;
   $("status").classList.toggle("error", error);
@@ -52,9 +89,12 @@ async function load(path = "/mail/messages") {
   folder = path.startsWith("/mail/outbox") ? "outbox" : "inbox";
   const result = await api(path);
   cursor = result.cursor;
+  render(result.messages);
+}
+function render(messages) {
   $("next").hidden = !cursor;
   $("messages").replaceChildren();
-  for (const message of result.messages) {
+  for (const message of messages) {
     const button = document.createElement("button");
     button.className = "mail-row";
     button.append(
@@ -66,12 +106,17 @@ async function load(path = "/mail/messages") {
           new Date(message.received_at ?? message.created_at).toLocaleString()
       )
     );
+    if (message.local) {
+      const badge = text("small", "Found on this device");
+      badge.className = "local";
+      button.append(badge);
+    }
     button.onclick = guarded(() =>
       folder === "outbox" ? showOutbound(message) : openMessage(message.id)
     );
     $("messages").append(button);
   }
-  if (!result.messages.length) $("messages").append(text("p", "No messages."));
+  if (!messages.length) $("messages").append(text("p", "No messages."));
 }
 function showOutbound(message) {
   $("message").replaceChildren(
@@ -86,7 +131,15 @@ function showOutbound(message) {
     );
 }
 async function openMessage(id) {
-  const message = await api("/mail/messages/" + encodeURIComponent(id));
+  let message;
+  try {
+    message = await api("/mail/messages/" + encodeURIComponent(id));
+  } catch (error) {
+    // Offline: read the on-device copy when there is one.
+    message = local ? await local.message(id) : null;
+    if (!message) throw error;
+    message.offline = true;
+  }
   const article = $("message");
   article.replaceChildren(
     text("h2", message.subject || "(No subject)"),
@@ -102,6 +155,10 @@ async function openMessage(id) {
   }
   if (message.html_available)
     article.append(text("small", "This message also contains HTML. Only plain text is displayed."));
+  if (message.offline)
+    article.append(
+      text("small", "Shown from this device's copy" + (message.text_truncated ? " (long text shortened)." : "."))
+    );
   const reply = text("button", "Reply");
   reply.onclick = () => edit(message);
   article.append(document.createElement("br"), reply);
@@ -120,11 +177,33 @@ function edit(message) {
     : "";
   $("editor").elements.text.focus();
 }
+function offlineIdentity() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(OFFLINE_IDENTITY) ?? "null");
+    return saved && localFlags()[saved.mailbox?.id] === true ? saved : null;
+  } catch {
+    return null;
+  }
+}
+function rememberIdentity() {
+  try {
+    if (localFlags()[me.mailbox.id] === true)
+      localStorage.setItem(
+        OFFLINE_IDENTITY,
+        JSON.stringify({ user: { email: me.user.email }, mailbox: { id: me.mailbox.id, address: me.mailbox.address } })
+      );
+  } catch {
+    /* Offline reopening is a convenience. */
+  }
+}
 async function refresh() {
+  let offline = false;
   try {
     me = await api("/api/me");
-  } catch {
-    me = null;
+  } catch (error) {
+    // A network failure (not a 401) with an opted-in copy opens it offline.
+    me = error instanceof TypeError ? offlineIdentity() : null;
+    offline = !!me;
   }
   $("account").hidden = !!me;
   $("mail").hidden = !me;
@@ -132,8 +211,100 @@ async function refresh() {
   $("identity").textContent = me?.user.email ?? "";
   if (me) {
     $("address").textContent = "Your mailbox: " + me.mailbox.address;
-    await load();
+    $("local").hidden = !localSupported();
+    $("local-toggle").checked = localFlags()[me.mailbox.id] === true;
+    if ($("local-toggle").checked) {
+      rememberIdentity();
+      startLocal(false);
+    }
+    if (offline) {
+      status("You are offline. Searching this device's copy of your mailbox.");
+      $("messages").replaceChildren(text("p", "Offline: use search to find messages on this device."));
+    } else await load();
   }
+}
+function localStatus(message, progress) {
+  $("local-status").textContent = message;
+  $("local-progress").hidden = !progress;
+  if (progress) {
+    if (progress.total) {
+      $("local-progress").max = progress.total;
+      $("local-progress").value = progress.loaded ?? 0;
+    } else $("local-progress").removeAttribute("value");
+  }
+}
+function localReady(state) {
+  $("local-badge").textContent = state ? "· " + (state.messages ?? 0) + " messages on this device" : "";
+  $("search-where").hidden = !state;
+  $("local-sync").hidden = !state;
+  $("local-remove").hidden = !state;
+}
+const megabytes = (bytes) => (bytes / 1024 ** 2).toFixed(bytes < 10 * 1024 ** 2 ? 1 : 0) + " MB";
+// Open this mailbox's on-device copy, downloading the model on first use, then sync.
+function startLocal(confirmDownload) {
+  localOpening ??= (async () => {
+    const mailboxId = me.mailbox.id;
+    try {
+      const module = await localModule();
+      const config = await module.localConfig();
+      if (
+        confirmDownload &&
+        !confirm(
+          "On-device search downloads the " + config.catalog.name + " model (" +
+            megabytes(config.downloadBytes) + ") once, then indexes this mailbox in the background. Continue?"
+        )
+      ) {
+        $("local-toggle").checked = false;
+        return;
+      }
+      local = await module.LocalMailIndex.open(mailboxId, {
+        config,
+        onStatus: (s) =>
+          localStatus(
+            s.stage === "model-download" || s.stage === "model-verify"
+              ? "Downloading the on-device model…"
+              : "Preparing the on-device model…",
+            s
+          ),
+      });
+      // Signed out or opted out while the model was loading: discard the copy.
+      if (me?.mailbox.id !== mailboxId || !$("local-toggle").checked) {
+        const opened = local;
+        local = null;
+        await opened.remove();
+        return;
+      }
+      rememberIdentity();
+      localReady(local.state);
+      if (navigator.onLine !== false) await syncLocal();
+      else localStatus("Offline. " + (local.state.messages ?? 0) + " messages available on this device.");
+    } catch (error) {
+      localStatus("On-device search is unavailable: " + error.message);
+    } finally {
+      localOpening = null;
+    }
+  })();
+  return localOpening;
+}
+async function syncLocal() {
+  if (!local) return;
+  localStatus("Indexing new messages on this device…", {});
+  const state = await local.sync({
+    onStatus: (s) => {
+      if (s.stage === "synced") localReady(local.state);
+      localStatus("Indexing new messages on this device… " + (s.loaded ?? 0) + " so far", {});
+    },
+  });
+  localReady(state);
+  localStatus("Up to date. " + megabytes(state.bytes ?? 0) + " stored on this device.");
+}
+async function stopLocal() {
+  const current = local;
+  local = null;
+  localReady(null);
+  if (current) await current.remove();
+  else if (me) await (await localModule()).removeMailbox(me.mailbox.id);
+  localStatus("Removed this mailbox's copy from this device.");
 }
 $("login").onsubmit = guarded(async (event) => {
   const form = event.currentTarget,
@@ -159,13 +330,38 @@ $("login").onsubmit = guarded(async (event) => {
   status(me ? "Signed in." : "Check your email to verify your account, then sign in.");
 });
 $("logout").onclick = guarded(async () => {
+  if (local || Object.keys(localFlags()).length) await wipeLocal();
   await api("/api/auth/sign-out", {});
   await refresh();
   status("Signed out.");
 });
 $("search").onsubmit = guarded(async (event) => {
-  await load("/mail/search?q=" + encodeURIComponent(event.currentTarget.elements.query.value));
+  const e = event.currentTarget.elements,
+    query = e.query.value;
+  if (local && (e.where.value === "device" || !navigator.onLine)) {
+    folder = "inbox";
+    cursor = null;
+    render(await local.search(query));
+    return;
+  }
+  await load("/mail/search?q=" + encodeURIComponent(query));
 });
+$("local-toggle").onchange = guarded(async (event) => {
+  if (event.currentTarget.checked) await startLocal(true);
+  else await stopLocal();
+});
+$("local-sync").onclick = guarded(syncLocal);
+$("local-remove").onclick = guarded(async () => {
+  $("local-toggle").checked = false;
+  await stopLocal();
+});
+addEventListener("online", () => {
+  if (local) syncLocal().catch((error) => localStatus(error.message));
+});
+if ("serviceWorker" in navigator)
+  navigator.serviceWorker.register("/sw.js").catch(() => {
+    /* The app still works online without the offline shell. */
+  });
 $("inbox").onclick = guarded(() => load());
 $("outbox").onclick = guarded(() => load("/mail/outbox"));
 $("next").onclick = guarded(() =>

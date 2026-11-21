@@ -1,0 +1,13 @@
+{
+  "name": "Antfly Mail",
+  "short_name": "Mail",
+  "description": "Private webmail with optional on-device semantic search.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f7fa",
+  "theme_color": "#20232c",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

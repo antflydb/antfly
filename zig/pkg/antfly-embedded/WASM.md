@@ -146,6 +146,41 @@ reopen. Raw embedded calls reject protected tables because these entry points
 do not carry authenticated principal authority. Hosts drive graph indexing
 with `runUntilIdle()` alongside other derived indexes.
 
+## Persisting a Browser Database (OPFS)
+
+The hosted bundle can persist itself without a full OPFS `Storage`
+implementation. `openTracked()` opens the database on `MemoryStorage` wrapped
+with per-path change versions. Writes, appends, renames, deletes and tree
+deletes bump or drop a path's version. The client adds:
+
+- `storageManifest()`: `[{path, size, version}]` for every stored file.
+- `storageFile(path, size)`: copy one file out of WASM memory.
+- `storageReset()` / `storageImport(path, bytes)`: restore files before
+  `openTracked()`. Imports are rejected while the database is open.
+
+The module is single-threaded, so a manifest taken between calls is a
+crash-consistent image of storage. `antfly_embedded_opfs_store.mjs` (installed
+next to the client) turns that into durable OPFS checkpoints:
+
+```js
+import { openOpfsStore } from "./antfly_embedded_opfs_store.mjs";
+const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle("my-db", { create: true });
+const store = await openOpfsStore(dir);
+const { restored, metadata } = await store.load(api); // imports the newest complete generation, then openTracked()
+api.putMany(docs);
+api.runUntilIdle();
+await store.checkpoint(api, { cursor }); // writes only changed files, then the next A/B manifest
+```
+
+A checkpoint writes immutable blobs, then the next manifest slot (with a
+SHA-256 over its body), then deletes blobs that neither of the two newest
+generations references. `load()` uses the newest manifest whose checksum and
+blobs are complete, falling back one generation after a torn write. Caller
+metadata commits atomically with the data. The store never relies on rename.
+The database stays resident in WASM memory, so this suits datasets that fit
+comfortably in wasm32 memory. Treat the copy as rebuildable: delete the
+directory and reload from the source of truth if `load()` restores nothing.
+
 ## Host Storage Contracts
 
 Browser/WASM and other hosted runtimes should not need to emulate a full POSIX
@@ -352,5 +387,6 @@ Remaining concerns outside this seam include:
 The next useful adapter should live outside core storage logic:
 
 - browser JS host
-- `HostStorage` backed by OPFS
+- `HostStorage` backed by OPFS directly (the tracked-memory checkpoints above
+  cover databases that fit in memory)
 - `HostObjectStorage` backed by IndexedDB or OPFS blobs

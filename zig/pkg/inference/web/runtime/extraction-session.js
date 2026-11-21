@@ -104,7 +104,7 @@ export class ExtractionSession {
     const bytes = encoder.encode(JSON.stringify(request));
     if (bytes.length > 512 * 1024) throw new Error('Extraction request exceeds 512 KiB');
     try {
-      this.check(this.bytes(bytes, (ptr, len) => task ? this.wasm.inference_run(this.handle, ptr, len, task === 'decide' ? 1 : 0, Number(validateOnly)) : this.wasm.extraction_run(this.handle, ptr, len, Number(validateOnly))));
+      this.check(this.bytes(bytes, (ptr, len) => task ? this.wasm.inference_run(this.handle, ptr, len, { extract: 0, decide: 1, embed: 2 }[task] ?? 0, Number(validateOnly)) : this.wasm.extraction_run(this.handle, ptr, len, Number(validateOnly))));
     } catch (error) {
       if (error instanceof WebAssembly.RuntimeError) {
         const detail = decoder.decode(this.abi.view(Uint8Array, this.wasm.extraction_error_ptr(), Number(this.wasm.extraction_error_len())));

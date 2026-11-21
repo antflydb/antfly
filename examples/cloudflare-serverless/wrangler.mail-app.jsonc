@@ -47,6 +47,10 @@
     {
       "binding": "MAIL_OBJECTS",
       "bucket_name": "antfly-mail-objects"
+    },
+    {
+      "binding": "MAIL_MODELS",
+      "bucket_name": "antfly-mail-models"
     }
   ],
   "durable_objects": {

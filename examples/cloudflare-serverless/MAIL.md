@@ -18,12 +18,72 @@ Implemented:
   `MAIL_SENDS_PER_HOUR`). Unknown submissions are never automatically resent.
 - Queue replay and restart-safe receipt/projection state, with periodic bounded
   reconciliation of pending work.
+- An installable PWA with opt-in on-device semantic search (see below).
 
 This is webmail, with no IMAP/POP server or Gmail synchronization. Mailboxes are
 currently private per-user inboxes; shared mailbox memberships, folders/drafts,
 mailbox deletion/retention controls and delivery-event reconciliation are future
 work. Account deletion is disabled in this app until the mailbox lifecycle is
 implemented. The generic auth adapter retains its own account-deletion support.
+
+## On-device search (PWA)
+
+The app installs as a progressive web app. Users can opt in to keeping a
+**private copy of their mailbox in the browser** and searching it by meaning
+with EmbeddingGemma 2, which runs on their device through Antfly's WASM
+inference. Message text and embeddings never leave the device, and search keeps
+working offline. It is off by default; signing out deletes every on-device copy.
+
+How it works:
+
+1. The page pulls new messages, text only, from `GET /mail/sync?cursor=`, an
+   append-only per-mailbox log.
+2. It embeds them in batches with `@antfly/web`'s `embed()` task.
+3. A dedicated worker writes them to an embedded Antfly database: a full-text
+   index plus an external 256-dimension vector index.
+4. Each page is checkpointed to OPFS together with its cursor, so a reload
+   resumes where it left off.
+5. Searches run keyword and semantic retrieval locally and merge them with RRF.
+
+See the [design](../../docs/design/cloudflare-mail-service.md#on-device-search-progressive-web-app)
+for consistency, privacy and limits.
+
+Enable it on a deployment:
+
+```sh
+# 1. Build the browser runtime into mail-public/local/ (Zig 0.17 + pnpm).
+#    Optional: LOCAL_EMBEDDING_DIMENSIONS=128|256|512|768, LOCAL_EMBEDDING_MAX_TOKENS.
+ANTFLY_ZIG=/path/to/zig npm run build:local
+
+# 2. Publish a text-only copy of EmbeddingGemma 2 to the private model bucket.
+npx wrangler r2 bucket create antfly-mail-models
+antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
+npm run publish:local-model -- \
+  --model-dir ~/.antfly/inference/models/google/embeddinggemma-2--antfly-... \
+  --upload --bucket antfly-mail-models
+```
+
+The publish script removes the image/audio towers, which the browser never
+loads, and writes a `catalog.json` with SHA-256 pins that the browser verifies.
+Files are served same-origin from `/local/models/` to signed-in users only. The
+weights keep their upstream license; serving them is subject to its terms. For
+`npm run dev:mail`, add `--local` to upload into the local Miniflare bucket.
+Without `mail-public/local/` or a published catalog, the opt-in panel reports
+that on-device search is not installed, and the rest of the app is unaffected.
+
+Building the browser WASM bundle needs a lot of memory: its build step declares
+a 20 GiB ceiling. On smaller machines, run `zig build wasm -j1 --maxrss <bytes>`
+in `zig/` first, then `LOCAL_SKIP_ZIG=1 npm run build:local`.
+
+Limits:
+
+- Embedding runs on the WASM CPU backend, so first sync of a large mailbox
+  takes time. It runs in the background and resumes after reloads.
+- The local database is resident in WASM memory, sized for a mailbox's text
+  (each message's text is capped at 64 KiB in the sync export), not for
+  arbitrary corpora.
+- Deleted or edited messages are not synchronized yet, because the app has no
+  deletion.
 
 ## Local setup
 
@@ -55,7 +115,7 @@ capture Worker records outgoing messages without an SMTP binding; the integratio
 capture Worker and never sends real mail. Use the private test fixture to drive
 inbound events and inspect verification/recovery emails.
 
-Run local checks:
+Run local checks (`test:mail` includes the on-device search tests):
 
 ```sh
 npm run test:mail

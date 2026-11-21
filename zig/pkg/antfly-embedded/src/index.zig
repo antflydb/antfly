@@ -3282,7 +3282,7 @@ pub const IndexSnapshot = struct {
                 self.spill_control = control;
                 self.spill_manager = spill.initSearchSpill(
                     alloc,
-                    snapshot.read_context_io orelse std.Io.Threaded.global_single_threaded.io(),
+                    snapshot.read_context_io orelse if (builtin.os.tag == .freestanding) .failing else std.Io.Threaded.global_single_threaded.io(),
                     self,
                     Check.run,
                 );
