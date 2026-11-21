@@ -17315,7 +17315,10 @@ pub const DataServer = struct {
             try self.waitDataReadSafeWithCancellation(group_id, "transition-topology", 5_000, cancellation);
         }
         try cancellation.check();
-        var owner = try self.leaseReplicatedTransitionOwner(group_id, resolved.contract, resolved.role, .exact);
+        var owner = self.leaseReplicatedTransitionOwner(group_id, resolved.contract, resolved.role, .exact) catch |err| {
+            std.log.debug("transition topology owner unavailable group_id={} mode={s} err={s}", .{ group_id, @tagName(request.mode), @errorName(err) });
+            return err;
+        };
         defer owner.release();
         return owner.readRelationalTopologyJson(alloc, @tagName(request.mode));
     }

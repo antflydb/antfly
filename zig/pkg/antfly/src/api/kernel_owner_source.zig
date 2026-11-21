@@ -1281,7 +1281,10 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn leaseTransitionOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor) !TransitionLease {
         const path = try std.fmt.allocPrint(self.alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer self.alloc.free(path);
-        return .{ .lease = try self.acquireDescriptor(group_id, table_name, path, descriptor) };
+        // A transition's catalog descriptor pins the physical source or
+        // provisional destination. Its lifecycle reads can use the resident
+        // owner while ordinary catalog reconciliation is still fenced.
+        return .{ .lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false, .resident, .{ .allow_deferred_catalog = true }) };
     }
 
     pub fn reconcileDataRaftProjection(
@@ -8882,7 +8885,7 @@ test "fence-deferred owner preserves control admission without exposing stale pu
     };
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.acquireDescriptorOnce(1, "docs", "/unused", exact, .shared, .resident, .{}));
     try std.testing.expect(!entry.retired);
-    var control = try source.acquireDescriptorOnce(1, "docs", "/unused", exact, .shared, .resident, .{ .allow_deferred_catalog = true });
+    var control = try source.leaseTransitionOwner(1, "docs", exact);
     try std.testing.expectEqual(@as(usize, 2), entry.active_users);
     control.deinit();
     const successor: descriptor_contract.Descriptor = .{
