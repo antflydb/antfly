@@ -621,6 +621,7 @@ pub const OpenOptions = struct {
     table_storage: ?table_storage_mod.Settings = null,
     /// Upgrade writable non-Lite journals to the single-record credit format.
     /// Set false before the upgrade when rollback to a v3-only binary is required.
+    /// Deployments can also set ANTFLY_KEEP_REPLAY_CREDIT_V3=true.
     enable_protected_replay_credit: bool = true,
     open_mode: OpenOptions.OpenMode = .writer,
     /// An authenticated restore decoder needs rows and schema layouts, never
@@ -4031,12 +4032,6 @@ pub const DB = struct {
                 try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, &opened_primary.store, upgrade_control);
             }
             if (opts.initial_owner_range) |initial| try range_state_mod.initializeOwnerRange(alloc, &opened_primary.store, initial);
-            if (opts.enable_protected_replay_credit and
-                !openModeRequiresReadOnlyBackends(opts.open_mode) and
-                !opened_primary.store.sharedReplayLane())
-            {
-                try opened_primary.store.enableProtectedReplayCredit();
-            }
             profile.primary_store_ns = elapsedSince(open_primary_started_ns);
             const core_resources_started_ns = monotonicTimeNs();
             // openCoreResourcesFromPrimaryStore assumes ownership on entry,
@@ -4519,6 +4514,16 @@ pub const DB = struct {
                 db.scheduleGeneratedArtifactCleanup();
             }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) _ = try db.drainStandaloneGraphEndpointCleanup();
+            // Switch formats after startup validation and recovery have
+            // succeeded. An earlier open failure leaves the old reader
+            // able to reopen the journal.
+            if (opts.enable_protected_replay_credit and
+                !platform.env.getenvBool("ANTFLY_KEEP_REPLAY_CREDIT_V3") and
+                !openModeRequiresReadOnlyBackends(opts.open_mode) and
+                !db.core.store.sharedReplayLane())
+            {
+                try db.core.store.enableProtectedReplayCredit();
+            }
             profile.total_ns = monotonicTimeNs() - open_started_ns;
             if (openProfileEnabled()) {
                 logOpenProfile(path, opts.open_mode, db.start_index_workers, profile);

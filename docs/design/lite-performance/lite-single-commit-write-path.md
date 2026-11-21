@@ -1839,8 +1839,8 @@ checkpoint regardless, so this loses nothing a workload would need.
 
 Durable redo commits use two ordered barriers per group. The writer
 appends the existing compact redo records, flushes them, writes a
-checksummed frontier to the alternate slot, and flushes again before
-acknowledging the group. The two slots reserve independent pages
+checksummed frontier to both copies of the alternate slot, and flushes
+again before acknowledging the group. Each copy is on a separate page
 immediately before the redo extent. Each frontier records the run salt,
 last covered sequence, and end offset. The shared lock region continues
 to supply the fast path for concurrent readers.
