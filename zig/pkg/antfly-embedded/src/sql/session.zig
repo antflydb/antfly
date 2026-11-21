@@ -28,7 +28,7 @@ pub const Scope = struct { principal: []const u8, database: []const u8 = "defaul
 pub const Begin = struct { isolation: Isolation = .serializable, mode: ReadMode = .read_write };
 pub const Transaction = struct { id: Id, state: State, isolation: Isolation, mode: ReadMode, savepoints: usize = 0 };
 pub const CommitOutcome = enum { committed, committed_pending, committed_repair_required, aborted, unknown };
-pub const CommitResult = struct { outcome: CommitOutcome, reconciliation_id: Id };
+pub const CommitResult = struct { outcome: CommitOutcome, reconciliation_id: Id, abort_cause: ?error{ RowPolicyDenied, StorageReadTemporarilyUnavailable } = null };
 pub const Control = union(enum) { begin: Begin, commit, rollback, savepoint: []const u8, rollback_to: []const u8, release: []const u8 };
 pub const Result = struct { status: Status, transaction_id: ?Id, commit: ?CommitResult = null };
 

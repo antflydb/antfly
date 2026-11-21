@@ -45,7 +45,7 @@ pub fn execute(alloc: std.mem.Allocator, adapter: *execution.Adapter, command: C
     if (!std.meta.eql(state.connection_id, adapter.connection_id)) return error.SqlConnectionNotFound;
     if (state.metadata.failed) return error.SqlTransactionAborted;
     if (state.owner_node_id != adapter.server.localSessionNodeId()) return error.SessionLeaseLost;
-    try adapter.server.txn_sessions.validateSqlLease(session_alloc, id, state.owner_node_id);
+    const guard = try adapter.server.txn_sessions.mutation(session_alloc, id, adapter.server.localSessionNodeId());
     if ((!adapter.inherit_session_database and !std.mem.eql(u8, adapter.database, state.metadata.database)) or
         (!adapter.inherit_session_namespace and !std.mem.eql(u8, adapter.namespace, state.metadata.namespace))) return error.SqlTransactionNotActive;
     const previous_database = adapter.database;
@@ -62,7 +62,7 @@ pub fn execute(alloc: std.mem.Allocator, adapter: *execution.Adapter, command: C
     adapter.transaction_status = .in_transaction;
     adapter.result_session_id = std.fmt.bytesToHex(id, .lower);
     if (command == .reset_all) {
-        try adapter.server.txn_sessions.resetAllSqlSettings(session_alloc, id, principal);
+        try adapter.server.txn_sessions.resetAllSqlSettings(session_alloc, guard, principal);
         return runtime.Result.empty(alloc, "RESET");
     }
     if (command == .discard_all) return error.ActiveSqlTransaction;
@@ -72,15 +72,15 @@ pub fn execute(alloc: std.mem.Allocator, adapter: *execution.Adapter, command: C
             // Parse against the same authoritative catalog capture used for
             // the durable mutation; a preliminary read doubles remote work
             // and can race a definition change before publication.
-            try adapter.server.txn_sessions.setSqlSettingRaw(session_alloc, id, principal, capture.owner, value.name, value.value, value.local);
+            try adapter.server.txn_sessions.setSqlSettingRaw(session_alloc, guard, principal, capture.owner, value.name, value.value, value.local);
             break :blk runtime.Result.empty(alloc, "SET");
         },
         .reset => |name| blk: {
-            try adapter.server.txn_sessions.resetSqlSetting(session_alloc, id, principal, capture.owner, name);
+            try adapter.server.txn_sessions.resetSqlSetting(session_alloc, guard, principal, capture.owner, name);
             break :blk runtime.Result.empty(alloc, "RESET");
         },
         .reset_local => |name| blk: {
-            try adapter.server.txn_sessions.resetLocalSqlSetting(session_alloc, id, principal, capture.owner, name);
+            try adapter.server.txn_sessions.resetLocalSqlSetting(session_alloc, guard, principal, capture.owner, name);
             break :blk runtime.Result.empty(alloc, "SET");
         },
         .show => |name| blk: {

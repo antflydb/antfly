@@ -1103,6 +1103,7 @@ const LocalStandaloneMetadata = struct {
                 .table_routing_snapshot = catalogTableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = catalogTableRoutingSnapshot,
                 .owner_readiness = catalogOwnerReadiness,
+                .decision_admission = catalogDecisionAdmission,
                 .privacy_policy_binding = catalogPrivacyPolicyBinding,
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .wait_for_routing_change = catalogWaitForRoutingChange,
@@ -2125,6 +2126,30 @@ const LocalStandaloneMetadata = struct {
         if (self.lifecycle_store) |store| if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
 
         return self.routingSnapshotLocked(deadline_ns);
+    }
+
+    fn catalogDecisionAdmission(ptr: *anyopaque, request: antfly.metadata_api.DecisionAdmissionRequest, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.DecisionAdmission {
+        const generation = try acquireRoutingGeneration(ptr, budget, true);
+        defer generation.release();
+        const catalog = generation.indexed.snapshot.value;
+        if (request.table_batch) |batch| {
+            if (request.route_check != null or batch.tables.len == 0) return error.InvalidArgument;
+            const stable = stable: {
+                for (batch.tables) |expected| {
+                    const view = generation.indexed.tableRoutingView(expected.table_name, budget) catch |err| if (err == error.TableNotFound) break :stable false else return err;
+                    if (view.table_id != expected.table_id or view.topology_epoch != expected.topology_epoch) break :stable false;
+                }
+                break :stable true;
+            };
+            return .{ .stable = stable, .tables_checked = true, .catalog_revision = catalog.catalog_revision, .metadata_group_id = catalog.metadata_group_id, .metadata_incarnation = catalog.metadata_incarnation };
+        }
+        const view = try generation.indexed.tableRoutingView(request.table_name, budget);
+        var stable = view.table_id == request.table_id;
+        if (stable) if (request.route_check) |check| {
+            const fence = try antfly.public_api.table_catalog.generationDecisionRoute(generation, request.table_name, check.route.group_id, budget);
+            stable = fence.topology_epoch == check.topology_epoch and std.meta.eql(fence.route, check.route);
+        };
+        return .{ .stable = stable, .route_checked = request.route_check != null, .catalog_revision = catalog.catalog_revision, .metadata_group_id = catalog.metadata_group_id, .metadata_incarnation = catalog.metadata_incarnation };
     }
 
     fn catalogOwnerReadiness(ptr: *anyopaque, request: antfly.metadata_api.OwnerReadinessRequest, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.OwnerReadiness {
@@ -4293,7 +4318,8 @@ const LocalStandaloneMetadata = struct {
         if (!self.standaloneRelationPublicationSupported()) return .idle;
         const before = try store.standaloneRevision();
         const outcome = self.relation_reconciliation.step(store, self.alloc, group_ids.main_metadata_group_id, self.metadata_incarnation orelse return error.InvalidMetadataIncarnation, self.local_node_id, platform_time.monotonicNs(), mode) catch |err| switch (err) {
-            error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.OutOfMemory, error.MetadataMutationOutcomeUnknown => return .idle,
+            error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.MetadataMutationOutcomeUnknown => return .idle,
+            error.OutOfMemory => if (mode == .startup) return error.OutOfMemory else return .idle,
             else => return err,
         };
         if (outcome != .applied) return outcome;
@@ -16362,7 +16388,11 @@ test "system catalog standalone relation coordinator publishes changed schemas a
         // must not certify it merely because publication itself succeeded.
         var snapshot = try LocalStandaloneMetadata.catalogAdminSnapshot(&metadata);
         defer LocalStandaloneMetadata.catalogFreeAdminSnapshot(&metadata, &snapshot);
-        try std.testing.expectEqualStrings(if (iteration == 0) old_schema else new_schema, metadata.findTableByNameLocked("physical").?.schema_json);
+        // Schema mutation adds durable column lineage to the submitted JSON.
+        // The recovered projection must contain the exact committed bytes.
+        const durable = (try store.getTable(alloc, group, table.table_id)).?;
+        defer antfly.metadata.table_manager.freeTable(alloc, durable);
+        try std.testing.expectEqualStrings(durable.schema_json, metadata.findTableByNameLocked("physical").?.schema_json);
         const resolved = try store.resolveSystemCatalogIdentities(alloc, group, .{ .relations = &targets });
         defer resolved.deinit(alloc);
         try std.testing.expect(resolved.relations[iteration] != null);
@@ -16456,6 +16486,12 @@ test "system catalog standalone relation coordinator startup publishes empty and
     {
         var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
         defer metadata.deinit();
+        {
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+            metadata.alloc = failing.allocator();
+            defer metadata.alloc = alloc;
+            try std.testing.expectError(error.OutOfMemory, metadata.reconcileRelationsRound(.startup));
+        }
         // A deliberately delayed background round must never stall startup.
         metadata.relation_reconciliation.next_round_at_ns = std.math.maxInt(u64);
         try metadata.awaitInitialRelationPublication(std.testing.io, cancellation.token());

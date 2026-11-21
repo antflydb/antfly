@@ -36,14 +36,16 @@ pub const Coordinator = struct {
         const lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
         defer lease.release();
         const info = server.txn_sessions.getInfo(id) orelse return error.SqlTransactionNotActive;
+        if (info.version.owner != server.localSessionNodeId()) return error.SessionLeaseLost;
+        if (info.terminal_abort) return .{ .outcome = .aborted, .reconciliation_id = id };
         var lake_validation: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = self.identity, .context = self.context };
         lake_validation.validateAcceptedSerializable(alloc, id) catch |err| {
             if (err != error.SqlWriteConflict) return err;
-            if (!server.txn_sessions.removeBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
+            if (!server.txn_sessions.retireBeforeExecution(alloc, id, info.version, false)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .aborted, .reconciliation_id = id };
         };
-        var request = (try server.txn_sessions.cloneCommitRequest(alloc, id, null)) orelse {
-            if (!server.txn_sessions.commitBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
+        var request = (try server.txn_sessions.cloneOwnedCommitRequest(alloc, id, server.localSessionNodeId(), null)) orelse {
+            if (!server.txn_sessions.retireBeforeExecution(alloc, id, info.version, true)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .committed, .reconciliation_id = id };
         };
         defer request.deinit(alloc);
@@ -53,11 +55,11 @@ pub const Coordinator = struct {
         const tables = tables_view.tables;
         try server.validateCommitTablesAgainstSchema(self.context, tables);
         if (try server.validateCommitReadSet(request) != null) {
-            if (!server.txn_sessions.removeBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
+            if (!server.txn_sessions.retireBeforeExecution(alloc, id, request.session_version.?, false)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .aborted, .reconciliation_id = id };
         }
         if (tables.len == 0) {
-            if (!server.txn_sessions.commitBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
+            if (!server.txn_sessions.retireBeforeExecution(alloc, id, request.session_version.?, true)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .committed, .reconciliation_id = id };
         }
         const source = server.table_writes orelse return error.UnsupportedSqlExecution;
@@ -67,14 +69,15 @@ pub const Coordinator = struct {
         defer proof_arena.deinit();
         const signed = try server.signCurrentRowPolicyMutationParticipants(proof_arena.allocator(), prepared.tables, self.context);
         if (self.context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
-        var plan = (try server.txn_sessions.sealExecutionPlan(alloc, id, signed)) orelse return error.SqlTransactionNotActive;
+        var plan = (try server.txn_sessions.sealExecutionPlan(alloc, id, server.localSessionNodeId(), signed)) orelse return error.SqlTransactionNotActive;
         defer plan.deinit();
         // Once the durable plan is sealed, no error is safe to turn into a
         // replay invitation. Maintenance owns completion under this same id.
-        const outcome = (source.commitTransactionWithIdAndCancellation(alloc, id, info.begin_timestamp, plan.value, info.sync_level, self.context.cancellation) catch |err| {
-            if (transactions.classifyCommitRejection(info, err) == .fresh) {
-                _ = (server.txn_sessions.recordTerminalAbort(alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
-                return .{ .outcome = .aborted, .reconciliation_id = id };
+        const outcome = (source.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, info.sync_level, plan.firstAttempt(), self.context.cancellation) catch |err| {
+            const rejection = transactions.classifyCommitRejection(plan.firstAttempt(), err);
+            if (rejection == .fresh or rejection == .confirmed) {
+                _ = (server.txn_sessions.recordAttemptAbort(alloc, id, if (rejection == .fresh) plan.publication else null) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
+                return .{ .outcome = .aborted, .abort_cause = transactions.abortCause(err), .reconciliation_id = id };
             }
             if (err == error.EnrichmentWorkerFailed) {
                 // Persist terminal repair debt before exposing it. The legacy
@@ -117,6 +120,7 @@ pub const Adapter = struct {
     alloc: std.mem.Allocator,
     registry: *transactions.SessionRegistry,
     node_id: u64,
+    admitted: ?transactions.Mutation = null,
     commit_context: *anyopaque,
     commit_fn: *const fn (*anyopaque, sql.Scope, sql.Id) anyerror!sql.CommitResult,
     supports_range_guards: bool = false,
@@ -144,7 +148,11 @@ pub const Adapter = struct {
         errdefer state.deinit(self.alloc);
         if (!std.meta.eql(state.connection_id, self.connection_id)) return error.SqlConnectionNotFound;
         if (state.owner_node_id != self.node_id) return error.SessionLeaseLost;
-        try self.registry.validateSqlLease(self.alloc, id, self.node_id);
+        const current = try self.registry.mutation(self.alloc, id, self.node_id);
+        if (self.admitted) |prior| {
+            if (std.mem.eql(u8, &prior.id, &id) and prior.tenure != current.tenure) return error.SessionLeaseLost;
+        }
+        self.admitted = current;
         if (!std.mem.eql(u8, state.metadata.database, scope.database) or !std.mem.eql(u8, state.metadata.namespace, scope.namespace)) return error.SqlTransactionNotActive;
         return state;
     }
@@ -173,8 +181,7 @@ pub const Adapter = struct {
             // No transaction ID has escaped to the caller. A proven local
             // rollback permits release; otherwise retain the beginning fence
             // for explicit recovery instead of allowing DISCARD to race it.
-            if (self.registry.removeBeforeExecution(self.alloc, info.txn_id))
-                self.connectionMutation(scope, .{ .abort_begin = .{ .id = connection, .txn_id = info.txn_id } }) catch {};
+            self.registry.rollbackConnectionBeforeExecution(info.txn_id, connection, info.version, .beginning) catch {};
             return err;
         };
         return .{ .id = info.txn_id, .state = .active, .isolation = options.isolation, .mode = options.mode };
@@ -213,8 +220,8 @@ pub const Adapter = struct {
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
         if (self.connection_id) |connection|
-            try self.registry.rollbackConnectionBeforeExecution(self.alloc, id, connection)
-        else if (!self.registry.removeBeforeExecution(self.alloc, id))
+            try self.registry.rollbackConnectionBeforeExecution(id, connection, state.version, .active)
+        else if (!self.registry.retireBeforeExecution(self.alloc, id, state.version, false))
             return error.SqlTransactionOutcomeUnknown;
     }
 
@@ -222,28 +229,28 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        _ = (try self.registry.createNamedSavepoint(self.alloc, id, name)) orelse return error.SqlTransactionNotActive;
+        _ = (try self.registry.createNamedSavepoint(self.alloc, self.admitted.?, name)) orelse return error.SqlTransactionNotActive;
     }
 
     fn rollbackTo(ptr: *anyopaque, scope: sql.Scope, id: sql.Id, name: []const u8) !void {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        _ = (try self.registry.rollbackToNamedSavepoint(self.alloc, id, name)) orelse return error.SqlSavepointNotFound;
+        _ = (try self.registry.rollbackToNamedSavepoint(self.alloc, self.admitted.?, name)) orelse return error.SqlSavepointNotFound;
     }
 
     fn release(ptr: *anyopaque, scope: sql.Scope, id: sql.Id, name: []const u8) !void {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        _ = (try self.registry.releaseNamedSavepoint(self.alloc, id, name)) orelse return error.SqlSavepointNotFound;
+        _ = (try self.registry.releaseNamedSavepoint(self.alloc, self.admitted.?, name)) orelse return error.SqlSavepointNotFound;
     }
 
     fn failed(ptr: *anyopaque, scope: sql.Scope, id: sql.Id) !void {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        try self.registry.setSqlFailed(self.alloc, id, true);
+        try self.registry.setSqlFailed(self.alloc, self.admitted.?, true);
     }
 
     fn abandon(ptr: *anyopaque, scope: sql.Scope, id: sql.Id) void {

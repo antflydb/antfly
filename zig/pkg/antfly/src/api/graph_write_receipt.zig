@@ -29,9 +29,9 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         std.log.warn("graph receipt admission failed err={s}", .{@errorName(err)});
         return err;
     };
-    var execution_sealed = false;
-    errdefer if (!execution_sealed) {
-        _ = registry.recordTerminalAbort(owned, id) catch null;
+    var unexecuted: ?sessions.DurableSessionStore.Version = info.version;
+    errdefer if (unexecuted) |version| {
+        _ = registry.retireBeforeExecution(owned, id, version, false);
     };
     const lease = registry.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
     defer lease.release();
@@ -52,8 +52,9 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         };
         try entry.predicates.appendSlice(input_alloc, table.predicates);
     }
-    var staged = (try registry.cloneCommitRequest(owned, id, &input)) orelse return error.InvalidTransactionSessionRecord;
+    var staged = (try registry.cloneOwnedCommitRequest(owned, id, server.localSessionNodeId(), &input)) orelse return error.InvalidTransactionSessionRecord;
     defer staged.deinit(owned);
+    unexecuted = staged.session_version;
     var prepared = server.preparePublicCommitWithIntegrity(alloc, tables, context) catch |err| {
         std.log.warn("graph receipt integrity preparation failed err={s}", .{@errorName(err)});
         return err;
@@ -65,15 +66,16 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         std.log.warn("graph receipt principal preparation failed err={s}", .{@errorName(err)});
         return err;
     };
-    execution_sealed = true;
-    var plan = (registry.sealExecutionPlan(owned, id, signed) catch return .{ .status = .unknown }) orelse return .{ .status = .unknown };
+    unexecuted = null;
+    var plan = (registry.sealExecutionPlan(owned, id, server.localSessionNodeId(), signed) catch return .{ .status = .unknown }) orelse return .{ .status = .unknown };
     defer plan.deinit();
     const writer = server.table_writes orelse return .{ .status = .unknown };
     const normalized = context.platformDeadline() catch return .{ .status = .unknown };
-    const outcome = (writer.commitTransactionWithIdAndCancellation(alloc, id, info.begin_timestamp, plan.value, .full_index, normalized.cancellation) catch |err| {
-        if (err == error.TransactionPrepareAbortedRowPolicyDenied) {
-            _ = registry.recordTerminalAbort(owned, id) catch return .{ .status = .unknown };
-            return .{ .status = .aborted, .failure = error.RowPolicyDenied };
+    const outcome = (writer.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, .full_index, plan.firstAttempt(), normalized.cancellation) catch |err| {
+        const rejection = sessions.classifyCommitRejection(plan.firstAttempt(), err);
+        if (rejection == .confirmed or rejection == .fresh) {
+            _ = (registry.recordAttemptAbort(owned, id, if (rejection == .fresh) plan.publication else null) catch null) orelse return .{ .status = .unknown };
+            return .{ .status = .aborted, .failure = sessions.abortCause(err) orelse err };
         }
         if (err == error.EnrichmentWorkerFailed) {
             _ = registry.recordTerminalCommitWithRepair(owned, id, .committed, true, null, null) catch return .{ .status = .committed_pending };

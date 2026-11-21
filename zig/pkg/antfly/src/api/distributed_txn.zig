@@ -1192,6 +1192,9 @@ pub const ExecuteOptions = struct {
     /// Preserve the terminal coordinator decision for an externally supplied
     /// transaction ID's retry window.
     retain_terminal: bool = false,
+    /// The session owner holds execution ownership and just sealed the plan
+    /// for the first time. A previously sealed plan might have submitted.
+    fresh_retained_id: bool = false,
     /// Only callers with an externally reusable transaction ID can safely
     /// surface a post-decision error. An ephemeral caller would retry under a
     /// new ID and reapply non-idempotent transforms.
@@ -1365,177 +1368,17 @@ fn executeMultiTableCommitOnce(
         participants.deinit(alloc);
     }
 
-    var table_groups: std.StringHashMapUnmanaged(ParticipantGroups) = .empty;
-    defer {
-        var it = table_groups.valueIterator();
-        while (it.next()) |groups| groups.deinit(alloc);
-        table_groups.deinit(alloc);
-    }
-    // Cascades can enlist additional tables after SQL admission. All participants
-    // in a transaction must prepare against the same metadata incarnation.
-    var bound_incarnation: ?[16]u8 = null;
-    for (tables) |table| if (table.bound_catalog_incarnation) |incarnation| {
-        if (bound_incarnation) |bound| if (!std.mem.eql(u8, &bound, &incarnation)) return error.CatalogGenerationChanged;
-        bound_incarnation = incarnation;
+    const admitted = routeParticipants(alloc, catalog, tables, &participants, options.retain_terminal) catch |err| {
+        // Only this call site proves that BEGIN has not been dispatched.
+        if (options.fresh_retained_id and err == error.CatalogGenerationChanged) return error.PreDispatchCatalogGenerationChanged;
+        if (err == error.CatalogRouteFenceUnsupported) {
+            if (!options.retain_terminal or options.fresh_retained_id) return error.PreDispatchDecisionAdmissionUnavailable;
+            return error.StorageReadTemporarilyUnavailable;
+        }
+        return err;
     };
-    for (tables) |table| {
-        var routing = (try table_catalog.transactionRoutingSnapshot(alloc, catalog, table.table_name)) orelse return error.TableNotFound;
-        defer routing.deinit(alloc);
-        const topology_epoch = routing.topology_epoch;
-        const slot = try table_groups.getOrPut(alloc, table.table_name);
-        if (!slot.found_existing) slot.value_ptr.* = .empty;
-        const groups = slot.value_ptr;
 
-        if (bound_incarnation) |incarnation| {
-            const actual = routing.snapshot.status.metadata_incarnation orelse return error.CatalogGenerationChanged;
-            if (!std.mem.eql(u8, &actual, &std.fmt.bytesToHex(incarnation, .lower))) return error.CatalogGenerationChanged;
-        }
-        try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
-        for (table.range_guards) |owner| {
-            const fence = owner.fence;
-            if (routing.snapshot.status.metadata_group_id != fence.metadata_group_id or
-                !std.meta.eql(routing.snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
-                return error.TopologyChanged;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, fence.route.group_id, topology_epoch);
-            if (participant.route_fence) |*existing| {
-                if (!@import("antfly_local_sources").api_range_read_guards.sameOwner(existing.*, fence)) return error.TopologyChanged;
-                existing.catalog_revision = @max(existing.catalog_revision, fence.catalog_revision);
-            } else participant.route_fence = fence;
-            for (owner.proofs) |proof| try participant.range_guards.append(alloc, proof);
-        }
-
-        for (table.writes) |write| {
-            const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.writes.append(alloc, write);
-        }
-        for (table.deletes) |key| {
-            const group_id = routing.resolveGroupForKey(key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.deletes.append(alloc, key);
-        }
-        for (table.graph_writes) |edge| {
-            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.graph_writes.append(alloc, edge);
-        }
-        for (table.graph_deletes) |edge| {
-            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.graph_deletes.append(alloc, edge);
-        }
-        for (table.predicates) |predicate| {
-            const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.predicates.append(alloc, predicate);
-        }
-        for (table.transforms) |transform| {
-            const group_id = routing.resolveGroupForKey(transform.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.transforms.append(alloc, transform);
-        }
-        for (table.integrity) |operation| {
-            const group_id = routing.resolveGroupForKey(operation.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.integrity.append(alloc, operation);
-        }
-        for (table.integrity_commands) |command| {
-            const group_id = routing.resolveGroupForKey(&command.address.routing) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            try participant.integrity_commands.append(alloc, command);
-        }
-        if (table.relational_activation) |command| {
-            const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            if (participant.relational_activation != null) return error.InvalidTxnRequest;
-            participant.relational_activation = command;
-        }
-        if (table.relational_retirement) |command| {
-            const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            if (participant.relational_retirement != null) return error.InvalidTxnRequest;
-            participant.relational_retirement = command;
-        }
-        if (table.relational_index_maintenance) |command| {
-            const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            if (group_id != command.owner_group_id) return error.PreparedGenerationChanged;
-            const participant = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, group_id, topology_epoch);
-            if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
-            participant.relational_index_maintenance = command;
-        }
-        if (table.commit_requires == .direct_enrichments and groups.count() == 0) {
-            _ = try ensureParticipantTxn(alloc, &participants, groups, table.table_name, routing.resolveGroupForKey("") orelse return error.UnknownGroup, topology_epoch);
-        }
-        // Match all enlisted owner proofs in one traversal of this table's
-        // ranges. Guarded reads keep their observed fence and bound writes get
-        // a fence from the same routing snapshot used to choose their group.
-        if (bound_incarnation != null or table.range_guards.len != 0) {
-            var remaining = groups.count();
-            for (routing.ranges) |range| {
-                if (remaining == 0) break;
-                const index = groups.get(range.group_id) orelse continue;
-                const participant = &participants.items[index];
-                const manager = @import("../metadata/table_manager.zig");
-                const range_id = manager.rangeDocIdentityRangeId(range.*);
-                const fence: @import("../metadata/api.zig").CatalogRouteFence = .{
-                    .metadata_group_id = routing.snapshot.status.metadata_group_id,
-                    .metadata_incarnation = routing.snapshot.status.metadata_incarnation,
-                    .catalog_revision = 0,
-                    .table_id = range.table_id,
-                    .topology_epoch = topology_epoch,
-                    .route = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = range.table_id, .shard_id = manager.rangeDocIdentityShardId(range.*), .range_id = range_id } },
-                };
-                if (participant.route_fence) |observed| {
-                    if (observed.table_id != fence.table_id or observed.route.range_id != range_id or
-                        !std.meta.eql(observed.route.identity_namespace, fence.route.identity_namespace)) return error.TopologyChanged;
-                } else if (bound_incarnation != null) {
-                    participant.route_fence = fence;
-                }
-                remaining -= 1;
-            }
-            if (remaining != 0) return error.TopologyChanged;
-        }
-        for (groups.values()) |index| {
-            const participant = &participants.items[index];
-            if (participant.topology_epoch != topology_epoch) return error.TopologyChanged;
-            if (participant.row_policy_principal_proof.len != 0 and
-                (!std.mem.eql(u8, participant.row_policy_principal_proof, table.row_policy_principal_proof) or
-                    !std.mem.eql(u8, participant.row_policy_database, table.row_policy_database) or
-                    participant.row_policy_admitted_at_seconds != table.row_policy_admitted_at_seconds))
-                return error.InvalidTxnRequest;
-            participant.row_policy_principal_proof = table.row_policy_principal_proof;
-            participant.row_policy_database = table.row_policy_database;
-            participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
-            participant.normalized_graph_rows = table.normalized_graph_rows;
-            if (participant.commit_requires != null and table.commit_requires != null and participant.commit_requires != table.commit_requires) return error.InvalidTxnRequest;
-            if (table.commit_requires) |requirement| participant.commit_requires = requirement;
-            if (participant.relational_schema_version) |existing| {
-                if (table.relational_schema_version) |requested| {
-                    if (existing != requested) return error.InvalidTxnRequest;
-                }
-            } else participant.relational_schema_version = table.relational_schema_version;
-            if (participant.schema_version) |existing| {
-                if (table.schema_version) |requested| if (existing != requested) return error.CatalogGenerationChanged;
-            } else participant.schema_version = table.schema_version;
-            if (participant.relational_integrity_generation_set) |existing| {
-                const requested = table.relational_integrity_generation_set orelse return error.PreparedGenerationChanged;
-                if (!std.mem.eql(u8, &existing, &requested)) return error.PreparedGenerationChanged;
-            } else participant.relational_integrity_generation_set = table.relational_integrity_generation_set;
-            participant.relational_repair = table.relational_repair;
-            const routed_restore_scope = (try catalog.restoreScopeForGroup(participant.table_name, participant.group_id)) orelse table.restore_staging_scope;
-            if (participant.restore_staging_scope) |existing| {
-                const requested = routed_restore_scope orelse return error.RestoreStagingChanged;
-                if (!std.mem.eql(u8, &existing, &requested)) return error.RestoreStagingChanged;
-            } else participant.restore_staging_scope = routed_restore_scope;
-            const routed_restore_plan = (try catalog.restorePlanForGroup(participant.table_name, participant.group_id)) orelse table.restore_staging_plan_id;
-            if (participant.restore_staging_plan_id) |existing| {
-                const requested = routed_restore_plan orelse return error.RestoreStagingChanged;
-                if (!std.mem.eql(u8, &existing, &requested)) return error.RestoreStagingChanged;
-            } else participant.restore_staging_plan_id = routed_restore_plan;
-            try validateRestorePlan(participant.restore_staging_scope, participant.restore_staging_plan_id);
-        }
-    }
-
+    defer if (admitted) |stamp| alloc.free(stamp.enlisted);
     const participant_ids = try alloc.alloc([]const u8, participants.items.len);
     var participant_ids_initialized: usize = 0;
     defer {
@@ -1733,21 +1576,15 @@ fn executeMultiTableCommitOnce(
     // admission and the exact range epoch before the coordinator participant
     // records the irreversible commit decision.
     if (!resume_committed) {
-        for (participants.items, 0..) |participant, i| {
-            var already_checked = false;
-            for (participants.items[0..i]) |prior| {
-                if (std.mem.eql(u8, prior.table_name, participant.table_name)) {
-                    already_checked = true;
-                    break;
-                }
-            }
-            if (already_checked) continue;
-            table_catalog.validateTransactionTopologyEpoch(alloc, catalog, participant.table_name, participant.topology_epoch) catch |err| {
-                abort_on_error = false;
-                try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
-                return err;
+        validateParticipantEpochs(alloc, catalog, participants.items, admitted) catch |err| {
+            abort_on_error = false;
+            try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
+            // The abort above is durable even when this invocation is a replay.
+            return switch (err) {
+                error.TopologyChanged, error.CatalogGenerationChanged, error.TableNotFound => .{ .conflict = .{ .table_name = participants.items[0].table_name, .key = "", .message = "topology changed", .phase = .prepare, .retryable = true } },
+                else => error.TransactionPrepareAbortedUnavailable,
             };
-        }
+        };
     }
 
     // Visibility and propagation can both remain pending (for example, when
@@ -1762,7 +1599,7 @@ fn executeMultiTableCommitOnce(
     if (participants.items.len > 0) {
         const participant = participants.items[0];
         const coordinator_sync_level: db_mod.types.SyncLevel = if (sync_level == .propose) .write else sync_level;
-        worker.resolveGroupWithCancellation(alloc, participant.group_id, participant.table_name, .{
+        const decision: TxnResolveRequest = .{
             .restore_staging_scope = participant.restore_staging_scope,
             .restore_staging_plan_id = participant.restore_staging_plan_id,
             .txn_id = txn_id,
@@ -1771,7 +1608,7 @@ fn executeMultiTableCommitOnce(
             // Fence every first-pass resolution against the topology pinned at
             // admission. Recovery deliberately uses epoch zero: a durable
             // commit decision must remain resolvable after a topology change.
-            .topology_epoch = if (!resume_committed) participant.topology_epoch else 0,
+            .topology_epoch = if (!resume_committed) participant.decision_epoch else 0,
             // The first participant is the transaction decision record. It must
             // be committed and applied before any other participant can learn a
             // commit decision, even when the public request selected the faster
@@ -1779,7 +1616,8 @@ fn executeMultiTableCommitOnce(
             // the caller's requested visibility contract and are recoverable
             // from the durable coordinator decision.
             .sync_level = coordinator_sync_level,
-        }, options.post_commit_cancellation) catch |err| switch (err) {
+        };
+        worker.resolveGroupWithCancellation(alloc, participant.group_id, participant.table_name, decision, options.post_commit_cancellation) catch |err| switch (err) {
             error.DecisionConflict => {
                 if (trace_writer) |tw| {
                     tw.traceEvent(&.{
@@ -1815,15 +1653,17 @@ fn executeMultiTableCommitOnce(
                 // (for example while mirroring or waiting for an index). Read
                 // the participant record before deciding whether abort is
                 // still legal.
+                if (err == error.DecisionNotProposed and (!options.retain_terminal or options.fresh_retained_id) and !resume_committed) {
+                    abort_on_error = false;
+                    try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
+                    return error.TopologyChanged;
+                }
                 const durable_status = resolveCoordinatorDecisionAfterFailure(
                     alloc,
                     worker,
                     participant,
-                    txn_id,
-                    commit_version,
-                    coordinator_sync_level,
+                    decision,
                     err,
-                    options.post_commit_cancellation,
                 ) catch |status_err| {
                     // The outcome is uncertain. Recovery will consult the
                     // participant record; aborting here could contradict a
@@ -1978,20 +1818,14 @@ fn resolveCoordinatorDecisionAfterFailure(
     alloc: std.mem.Allocator,
     worker: ParticipantWorker,
     participant: ParticipantTxn,
-    txn_id: db_mod.types.TxnId,
-    commit_version: u64,
-    sync_level: db_mod.types.SyncLevel,
+    decision: TxnResolveRequest,
     initial_resolve_error: anyerror,
-    cancellation: db_mod.types.CancellationToken,
 ) !db_mod.types.TxnStatus {
-    _ = cancellation;
     return try resolveCoordinatorDecisionAfterFailureUntil(
         alloc,
         worker,
         participant,
-        txn_id,
-        commit_version,
-        sync_level,
+        decision,
         initial_resolve_error,
         platform_time.monotonicNs() +| coordinator_resolution_timeout_ns,
     );
@@ -2001,9 +1835,7 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
     alloc: std.mem.Allocator,
     worker: ParticipantWorker,
     participant: ParticipantTxn,
-    txn_id: db_mod.types.TxnId,
-    commit_version: u64,
-    sync_level: db_mod.types.SyncLevel,
+    decision: TxnResolveRequest,
     initial_resolve_error: anyerror,
     deadline_ns: u64,
 ) !db_mod.types.TxnStatus {
@@ -2015,7 +1847,7 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
             alloc,
             participant.group_id,
             participant.table_name,
-            participant.statusRequest(txn_id),
+            participant.statusRequest(decision.txn_id),
             deadline_ns,
         ) catch |status_err| status_failure: {
             last_status_error = status_err;
@@ -2040,15 +1872,7 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
         // cancellation cannot prove the first commit was not accepted. This
         // bounded recovery loop has its own deadline and repeats only the
         // exact same idempotent decision.
-        worker.resolveGroupUntil(alloc, participant.group_id, participant.table_name, .{
-            .restore_staging_scope = participant.restore_staging_scope,
-            .restore_staging_plan_id = participant.restore_staging_plan_id,
-            .txn_id = txn_id,
-            .status = .committed,
-            .commit_version = commit_version,
-            .topology_epoch = participant.topology_epoch,
-            .sync_level = sync_level,
-        }, deadline_ns) catch |retry_err| {
+        worker.resolveGroupUntil(alloc, participant.group_id, participant.table_name, decision, deadline_ns) catch |retry_err| {
             last_resolve_error = retry_err;
             const now_ns = platform_time.monotonicNs();
             if (now_ns < deadline_ns) sleepNs(@min(coordinator_resolution_retry_ns, deadline_ns - now_ns));
@@ -2070,6 +1894,7 @@ const ParticipantTxn = struct {
     table_name: []const u8,
     group_id: u64,
     topology_epoch: u64,
+    decision_epoch: u64 = 0,
     relational_schema_version: ?u32 = null,
     relational_integrity_generation_set: ?[32]u8 = null,
     restore_staging_scope: ?[32]u8 = null,
@@ -2279,7 +2104,7 @@ const ResolveFollowerFanoutTask = struct {
             .txn_id = txn_id,
             .status = .committed,
             .commit_version = commit_version,
-            .topology_epoch = if (resume_committed) 0 else participant.topology_epoch,
+            .topology_epoch = if (resume_committed) 0 else participant.decision_epoch,
             .sync_level = sync_level,
         }, cancellation) catch |err| {
             slot.err = err;
@@ -2377,17 +2202,392 @@ fn firstFanoutError(slots: []const ParticipantFanoutSlot) ?usize {
 }
 
 // Indices survive relocation of the shared list and preserve first-enlistment order.
+const TableRoutes = struct {
+    const manager = @import("../metadata/table_manager.zig");
+    requirements: TableCommitRequest,
+    descriptor: ?*const manager.TableRecord = null,
+    range_builder: std.ArrayList(*const manager.RangeRecord) = .empty,
+    ranges: []const *const manager.RangeRecord = &.{},
+    epoch: u64 = 0,
+    groups: ParticipantGroups = .empty,
+    guard_owners: std.AutoHashMapUnmanaged(u64, range_reads.ProofMap) = .empty,
+    proof_count: usize = 0,
+    has_addressed_work: bool = false,
+
+    fn mergeRequirements(self: *@This(), table: TableCommitRequest) !void {
+        const prior = &self.requirements;
+        // Never mix credential, repair or restore contexts across fragments.
+        if (!std.mem.eql(u8, prior.row_policy_principal_proof, table.row_policy_principal_proof) or
+            !std.mem.eql(u8, prior.row_policy_database, table.row_policy_database) or
+            prior.row_policy_admitted_at_seconds != table.row_policy_admitted_at_seconds or
+            prior.normalized_graph_rows != table.normalized_graph_rows or prior.relational_repair != table.relational_repair)
+            return error.InvalidTxnRequest;
+        if (!std.meta.eql(prior.restore_staging_scope, table.restore_staging_scope) or
+            !std.meta.eql(prior.restore_staging_plan_id, table.restore_staging_plan_id)) return error.RestoreStagingChanged;
+        try mergeRequirement(&prior.schema_version, table.schema_version, error.CatalogGenerationChanged);
+        try mergeRequirement(&prior.relational_schema_version, table.relational_schema_version, error.InvalidTxnRequest);
+        try mergeRequirement(&prior.relational_integrity_generation_set, table.relational_integrity_generation_set, error.PreparedGenerationChanged);
+        prior.commit_requires = db_mod.types.CommitRequires.strongest(prior.commit_requires, table.commit_requires);
+    }
+
+    fn mergeRequirement(current: anytype, incoming: @TypeOf(current.*), conflict: anyerror) !void {
+        const value = incoming orelse return;
+        if (current.*) |prior| if (!std.meta.eql(prior, value)) return conflict;
+        current.* = value;
+    }
+};
+
+const range_reads = @import("antfly_local_sources").api_range_read_guards;
+const RoutingIdentity = struct {
+    group_id: u64,
+    verified_revision: ?u64 = null,
+    enlisted: []const AdmissionRequest.TableCheck = &.{},
+    incarnation: ?@import("../metadata/api.zig").MetadataClusterIncarnation,
+
+    fn requireIncarnation(self: RoutingIdentity, bound: ?[16]u8) !void {
+        if (bound) |id| {
+            const actual = self.incarnation orelse return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, &actual, &std.fmt.bytesToHex(id, .lower))) return error.CatalogGenerationChanged;
+        }
+    }
+
+    fn from(snapshot: *const @import("../metadata/api.zig").AdminSnapshot) RoutingIdentity {
+        return .{ .group_id = snapshot.status.metadata_group_id, .incarnation = snapshot.status.metadata_incarnation };
+    }
+};
+
+const RoutesByName = std.StringArrayHashMapUnmanaged(TableRoutes);
+
+fn loadTableRoutes(a: std.mem.Allocator, by_name: *RoutesByName, snapshot: *const @import("../metadata/api.zig").AdminSnapshot) !void {
+    var by_id: std.AutoHashMapUnmanaged(u64, *TableRoutes) = .empty;
+    for (snapshot.tables) |*descriptor| {
+        const routes = by_name.getPtr(descriptor.name) orelse continue;
+        if (routes.descriptor != null) return error.CatalogGenerationChanged;
+        const slot = try by_id.getOrPut(a, descriptor.table_id);
+        if (slot.found_existing) return error.CatalogGenerationChanged;
+        slot.value_ptr.* = routes;
+        routes.descriptor = descriptor;
+    }
+    // Walk history once for the whole admission. Old records without a
+    // table ID are matched while collecting the selected tables' ranges.
+    var legacy_groups: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    inline for (.{ snapshot.split_transitions, snapshot.merge_transitions }) |transitions| {
+        for (transitions) |transition| {
+            if (!table_catalog.blocksTransactionRouting(transition)) continue;
+            const binding = transition.table_contract;
+            if (by_id.contains(binding.table_id) or by_name.contains(binding.table_name)) return error.TopologyChanged;
+            if (binding.table_id == 0) {
+                const split = @hasField(@TypeOf(transition), "source_group_id");
+                try legacy_groups.put(a, if (split) transition.source_group_id else transition.donor_group_id, {});
+                try legacy_groups.put(a, if (split) transition.destination_group_id else transition.receiver_group_id, {});
+            }
+        }
+    }
+    for (snapshot.ranges) |*range| {
+        const routes = by_id.get(range.table_id) orelse continue;
+        if (legacy_groups.contains(range.group_id)) return error.TopologyChanged;
+        try routes.range_builder.append(a, range);
+    }
+    for (by_name.values()) |*routes| {
+        routes.ranges = routes.range_builder.items;
+        if (routes.ranges.len == 0) return error.TableNotFound;
+        routes.epoch = table_catalog.sortedTransactionTopologyEpoch(routes.descriptor.?.*, routes.ranges);
+    }
+}
+
+test "distributed txn batched admission checks legacy owner groups and ignores terminal history" {
+    const metadata = @import("../metadata/api.zig");
+    const manager = @import("../metadata/table_manager.zig");
+    const transitions = @import("../metadata/transition_state.zig");
+    var descriptors = [_]manager.TableRecord{ .{ .name = "a", .table_id = 1 }, .{ .name = "b", .table_id = 2 } };
+    var ranges = [_]manager.RangeRecord{ .{ .table_id = 1, .group_id = 10, .start_key = "" }, .{ .table_id = 2, .group_id = 20, .start_key = "" } };
+    var splits = [_]transitions.SplitTransitionRecord{.{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 99, .destination_group_id = 20 }};
+    var merges = [_]transitions.MergeTransitionRecord{.{ .transition_id = 2, .donor_group_id = 98, .receiver_group_id = 97, .table_contract = .{ .table_name = "a" } }};
+    const snapshot: metadata.AdminSnapshot = .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &descriptors, .ranges = &ranges, .split_transitions = &splits, .merge_transitions = &merges, .stores = &.{}, .placement_intents = &.{} };
+    for (0..3) |phase| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var selected: RoutesByName = .empty;
+        for (descriptors) |table| try selected.put(arena.allocator(), table.name, .{ .requirements = .{ .table_name = table.name } });
+        if (phase != 0) merges[0].phase = .finalized;
+        if (phase == 2) splits[0].phase = .rolled_back;
+        const admitted = loadTableRoutes(arena.allocator(), &selected, &snapshot);
+        if (phase == 2) try admitted else try std.testing.expectError(error.TopologyChanged, admitted);
+    }
+}
+
+const AdmissionRequest = @import("../metadata/api.zig").DecisionAdmissionRequest;
+
+fn validateTableBatch(catalog: table_catalog.CatalogSource, identity: RoutingIdentity, tables: []const AdmissionRequest.TableCheck) !?u64 {
+    const capture = catalog.vtable.decision_admission orelse return null;
+    const check = capture(catalog.ptr, .{
+        .table_name = tables[0].table_name,
+        .table_id = tables[0].table_id,
+        .table_batch = .{ .tables = tables, .verified_revision = identity.verified_revision.? },
+    }, catalog.budget(null)) catch |err| if (err == error.UnsupportedOperation) return null else return err;
+    // An older metadata peer can answer only for the first table.
+    if (!check.tables_checked) return null;
+    if (check.metadata_group_id != identity.group_id or !std.meta.eql(check.metadata_incarnation, identity.incarnation)) return error.CatalogGenerationChanged;
+    if (!check.stable) return error.TopologyChanged;
+    return check.catalog_revision;
+}
+
+fn validateParticipantEpochs(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, participants: []const ParticipantTxn, admitted: ?RoutingIdentity) !void {
+    if (participants.len == 0) return;
+    const identity = admitted orelse return error.CatalogGenerationChanged;
+    if (identity.enlisted.len != 0 and (try validateTableBatch(table_catalog.decisionCatalog(catalog), identity, identity.enlisted)) != null) return;
+    var workspace = std.heap.ArenaAllocator.init(alloc);
+    defer workspace.deinit();
+    const a = workspace.allocator();
+    var by_name: RoutesByName = .empty;
+    for (participants) |participant| {
+        const slot = try by_name.getOrPut(a, participant.table_name);
+        if (!slot.found_existing) slot.value_ptr.* = .{ .requirements = .{ .table_name = participant.table_name } };
+    }
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    if (identity.group_id != snapshot.status.metadata_group_id or !std.meta.eql(identity.incarnation, snapshot.status.metadata_incarnation)) return error.CatalogGenerationChanged;
+    try loadTableRoutes(a, &by_name, &snapshot);
+    for (participants) |participant| {
+        if (participant.topology_epoch != 0 and by_name.getPtr(participant.table_name).?.epoch != participant.topology_epoch) return error.TopologyChanged;
+    }
+}
+
+fn bindParticipantRoute(participant: *ParticipantTxn, identity: RoutingIdentity, topology_epoch: u64, range: *const TableRoutes.manager.RangeRecord, bound: bool) !void {
+    const manager = @import("../metadata/table_manager.zig");
+    const range_id = manager.rangeDocIdentityRangeId(range.*);
+    const fence: @import("../metadata/api.zig").CatalogRouteFence = .{
+        .metadata_group_id = identity.group_id,
+        .metadata_incarnation = identity.incarnation,
+        .catalog_revision = 0,
+        .table_id = range.table_id,
+        .topology_epoch = topology_epoch,
+        .route = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = range.table_id, .shard_id = manager.rangeDocIdentityShardId(range.*), .range_id = range_id } },
+    };
+    if (participant.route_fence) |observed| {
+        if (observed.table_id != fence.table_id or observed.route.range_id != range_id or
+            !std.meta.eql(observed.route.identity_namespace, fence.route.identity_namespace)) return error.TopologyChanged;
+    } else if (bound) {
+        participant.route_fence = fence;
+    }
+}
+
+fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, participants: *std.ArrayListUnmanaged(ParticipantTxn), retain_terminal: bool) !?RoutingIdentity {
+    if (tables.len == 0) return null;
+    var workspace = std.heap.ArenaAllocator.init(alloc);
+    defer workspace.deinit();
+    const a = workspace.allocator();
+    var by_name: RoutesByName = .empty;
+    var bound_incarnation: ?[16]u8 = null;
+    for (tables) |table| {
+        try TableRoutes.mergeRequirement(&bound_incarnation, table.bound_catalog_incarnation, error.CatalogGenerationChanged);
+        const slot = try by_name.getOrPut(a, table.table_name);
+        if (slot.found_existing) try slot.value_ptr.mergeRequirements(table) else slot.value_ptr.* = .{ .requirements = table };
+        slot.value_ptr.has_addressed_work = slot.value_ptr.has_addressed_work or table.range_guards.len != 0 or
+            table.writes.len != 0 or table.deletes.len != 0 or table.graph_writes.len != 0 or table.graph_deletes.len != 0 or
+            table.predicates.len != 0 or table.transforms.len != 0 or table.integrity.len != 0 or table.integrity_commands.len != 0 or
+            table.relational_activation != null or table.relational_retirement != null or table.relational_index_maintenance != null;
+    }
+    const authority = table_catalog.decisionCatalog(catalog);
+    var generation: ?*table_catalog.RoutingGeneration = null;
+    defer if (generation) |g| g.release();
+    var admin: ?@import("../metadata/api.zig").AdminSnapshot = null;
+    defer if (admin) |*snapshot| catalog.freeAdminSnapshot(snapshot);
+    const identity: RoutingIdentity = selected: {
+        if (authority.vtable.decision_admission != null) if (authority.vtable.acquire_routing_generation) |acquire| {
+            const budget = authority.budget(null);
+            generation = try acquire(authority.ptr, budget, true);
+            const indexed = &generation.?.indexed;
+            const view = indexed.snapshot.value;
+            var id: RoutingIdentity = .{ .group_id = view.metadata_group_id, .incarnation = view.metadata_incarnation, .verified_revision = view.catalog_revision };
+            try id.requireIncarnation(bound_incarnation);
+            const checks = try a.alloc(AdmissionRequest.TableCheck, by_name.count());
+            for (by_name.keys(), by_name.values(), checks) |name, *routes, *check| {
+                const table = try indexed.tableRoutingView(name, budget);
+                routes.ranges = indexed.tableRanges(table.table_id);
+                if (routes.ranges.len == 0) return error.TableNotFound;
+                routes.epoch = table.topology_epoch;
+                check.* = .{ .table_id = table.table_id, .table_name = name, .topology_epoch = table.topology_epoch };
+            }
+            if (try validateTableBatch(authority, id, checks)) |revision| {
+                id.verified_revision = revision;
+                break :selected id;
+            }
+            // A legacy planning snapshot cannot establish that the metadata peer
+            // supports the final proposal gate. Probe that exact wire contract
+            // before allowing BEGIN to escape on a mixed-version cluster.
+            const table = checks[0];
+            const range = indexed.tableRanges(table.table_id)[0];
+            const fence = try table_catalog.generationDecisionRoute(generation.?, table.table_name, range.group_id, budget);
+            table_catalog.validateRaftDecision(authority, table.table_name, fence, budget) catch |err| switch (err) {
+                error.UnsupportedOperation => return error.CatalogRouteFenceUnsupported,
+                else => return err,
+            };
+        };
+        admin = try catalog.adminSnapshot();
+        const id = RoutingIdentity.from(&admin.?);
+        try id.requireIncarnation(bound_incarnation);
+        try loadTableRoutes(a, &by_name, &admin.?);
+        break :selected id;
+    };
+    // Enlist in original request order: the first participant is the coordinator.
+    for (tables) |table| {
+        const routes = by_name.getPtr(table.table_name).?;
+        const groups = &routes.groups;
+        const topology_epoch = routes.epoch;
+        try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
+        for (table.range_guards) |owner| {
+            const fence = owner.fence;
+            if (identity.group_id != fence.metadata_group_id or
+                !std.meta.eql(identity.incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
+                return error.TopologyChanged;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, fence.route.group_id, topology_epoch);
+            if (participant.route_fence) |*existing| {
+                if (!range_reads.sameOwner(existing.*, fence)) return error.TopologyChanged;
+                existing.catalog_revision = @max(existing.catalog_revision, fence.catalog_revision);
+            } else participant.route_fence = fence;
+            const observations = try routes.guard_owners.getOrPut(a, fence.route.group_id);
+            if (!observations.found_existing) {
+                if (routes.guard_owners.count() > range_reads.max_owners) return error.TransactionTooLarge;
+                observations.value_ptr.* = .empty;
+            }
+            for (owner.proofs) |proof| {
+                if (!try range_reads.observe(observations.value_ptr, a, proof)) continue;
+                if (routes.proof_count == range_reads.max_proofs) return error.TransactionTooLarge;
+                routes.proof_count += 1;
+                try participant.range_guards.append(alloc, proof);
+            }
+        }
+
+        for (table.writes) |write| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, write.key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.writes.append(alloc, write);
+        }
+        for (table.deletes) |key| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.deletes.append(alloc, key);
+        }
+        for (table.graph_writes) |edge| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, edge.source) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.graph_writes.append(alloc, edge);
+        }
+        for (table.graph_deletes) |edge| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, edge.source) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.graph_deletes.append(alloc, edge);
+        }
+        for (table.predicates) |predicate| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, predicate.key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.predicates.append(alloc, predicate);
+        }
+        for (table.transforms) |transform| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, transform.key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.transforms.append(alloc, transform);
+        }
+        for (table.integrity) |operation| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, operation.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.integrity.append(alloc, operation);
+        }
+        for (table.integrity_commands) |command| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, &command.address.routing) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.integrity_commands.append(alloc, command);
+        }
+        if (table.relational_activation) |command| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, command.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            if (participant.relational_activation != null) return error.InvalidTxnRequest;
+            participant.relational_activation = command;
+        }
+        if (table.relational_retirement) |command| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, command.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            if (participant.relational_retirement != null) return error.InvalidTxnRequest;
+            participant.relational_retirement = command;
+        }
+        if (table.relational_index_maintenance) |command| {
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, command.routing_key) orelse return error.UnknownGroup;
+            if (group_id != command.owner_group_id) return error.PreparedGenerationChanged;
+            const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
+            if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
+            participant.relational_index_maintenance = command;
+        }
+        // Stable IDs may already have an ordered participant list on disk
+        // from an earlier binary. Reconstruct its first-enlistment order.
+        if ((retain_terminal or !routes.has_addressed_work) and table.commit_requires == .direct_enrichments and groups.count() == 0) {
+            _ = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, table_catalog.resolveGroupForKeyFromRanges(routes.ranges, "") orelse return error.UnknownGroup, topology_epoch);
+        }
+    }
+    // Only the enlisted table stamps outlive planning; the generation and
+    // routing workspace can both be released while participants prepare.
+    var enlisted: std.ArrayList(AdmissionRequest.TableCheck) = .empty;
+    defer enlisted.deinit(alloc);
+    for (by_name.values()) |*routes| {
+        const table = routes.requirements;
+        const groups = &routes.groups;
+        const topology_epoch = routes.epoch;
+        if (identity.verified_revision != null and groups.count() != 0)
+            try enlisted.append(alloc, .{ .table_name = table.table_name, .table_id = routes.ranges[0].table_id, .topology_epoch = topology_epoch });
+        const decision_epoch = table_catalog.decisionEpochForAuthority(identity.group_id, identity.incarnation, topology_epoch);
+        if (bound_incarnation != null or routes.guard_owners.count() != 0) {
+            if (identity.verified_revision != null) {
+                const budget = authority.budget(null);
+                for (groups.values()) |index| {
+                    const participant = &participants.items[index];
+                    const range = try generation.?.indexed.rangeForGroup(routes.ranges[0].table_id, participant.group_id, budget);
+                    try bindParticipantRoute(participant, identity, topology_epoch, range, bound_incarnation != null);
+                }
+            } else {
+                var remaining = groups.count();
+                for (routes.ranges) |range| {
+                    if (remaining == 0) break;
+                    const index = groups.get(range.group_id) orelse continue;
+                    try bindParticipantRoute(&participants.items[index], identity, topology_epoch, range, bound_incarnation != null);
+                    remaining -= 1;
+                }
+                if (remaining != 0) return error.TopologyChanged;
+            }
+        }
+        for (groups.values()) |index| {
+            const participant = &participants.items[index];
+            participant.decision_epoch = decision_epoch;
+            participant.row_policy_principal_proof = table.row_policy_principal_proof;
+            participant.row_policy_database = table.row_policy_database;
+            participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
+            participant.normalized_graph_rows = table.normalized_graph_rows;
+            participant.commit_requires = table.commit_requires;
+            participant.relational_schema_version = table.relational_schema_version;
+            participant.schema_version = table.schema_version;
+            participant.relational_integrity_generation_set = table.relational_integrity_generation_set;
+            participant.relational_repair = table.relational_repair;
+            participant.restore_staging_scope = (try catalog.restoreScopeForGroup(participant.table_name, participant.group_id)) orelse table.restore_staging_scope;
+            participant.restore_staging_plan_id = (try catalog.restorePlanForGroup(participant.table_name, participant.group_id)) orelse table.restore_staging_plan_id;
+            try validateRestorePlan(participant.restore_staging_scope, participant.restore_staging_plan_id);
+        }
+    }
+    var result = identity;
+    result.enlisted = try enlisted.toOwnedSlice(alloc);
+    return result;
+}
+
 const ParticipantGroups = std.AutoArrayHashMapUnmanaged(u64, usize);
 
 fn ensureParticipantTxn(
     alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
     grouped: *std.ArrayListUnmanaged(ParticipantTxn),
     groups: *ParticipantGroups,
     table_name: []const u8,
     group_id: u64,
     topology_epoch: u64,
 ) !*ParticipantTxn {
-    const slot = try groups.getOrPut(alloc, group_id);
+    const slot = try groups.getOrPut(scratch, group_id);
     if (slot.found_existing) {
         const participant = &grouped.items[slot.value_ptr.*];
         if (participant.topology_epoch != topology_epoch) return error.TopologyChanged;
@@ -5016,6 +5216,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.resolve_calls += 1;
                     try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+                    try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
                     try std.testing.expectEqual(@as(u64, 10_001), req.commit_version);
                     try std.testing.expectEqual(db_mod.types.SyncLevel.write, req.sync_level);
                 }
@@ -5040,13 +5241,8 @@ fn consumerTests() type {
                 std.testing.allocator,
                 recorder.worker(),
                 .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
-                txn_id,
-                10_001,
-                // Every ambiguous coordinator retry must preserve the durable barrier
-                // selected for the original decision submission.
-                .write,
+                .{ .txn_id = txn_id, .commit_version = 10_001, .status = .committed, .topology_epoch = 0, .sync_level = .write },
                 error.InjectedResolveFailure,
-                .none,
             );
             try std.testing.expectEqual(db_mod.types.TxnStatus.committed, status);
             try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
@@ -5097,9 +5293,7 @@ fn consumerTests() type {
                 std.testing.allocator,
                 recorder.worker(),
                 .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
-                txn_id,
-                10_001,
-                .write,
+                .{ .txn_id = txn_id, .commit_version = 10_001, .status = .committed, .topology_epoch = 42, .sync_level = .write },
                 error.InjectedResolveFailure,
                 platform_time.monotonicNs() + 10 * std.time.ns_per_ms,
             ));
@@ -5142,6 +5336,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.resolve_until_calls += 1;
                     try std.testing.expectEqual(self.expected_deadline_ns, deadline_ns);
+                    try std.testing.expectEqual(@as(u64, 42), req.topology_epoch);
                     try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
                 }
             };
@@ -5152,9 +5347,7 @@ fn consumerTests() type {
                 std.testing.allocator,
                 recorder.worker(),
                 .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
-                try parseTxnIdHex("00112233445566778899aabbccddeeff"),
-                10_001,
-                .write,
+                .{ .txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff"), .commit_version = 10_001, .status = .committed, .topology_epoch = 42, .sync_level = .write },
                 error.InjectedResolveFailure,
                 deadline_ns,
             );
@@ -5698,6 +5891,7 @@ fn consumerTests() type {
 
         test "distributed txn coordinator groups by range and commits all participants" {
             const FakeCatalog = struct {
+                var snapshots: usize = 0;
                 fn iface() table_catalog.CatalogSource {
                     return .{
                         .ptr = undefined,
@@ -5709,6 +5903,7 @@ fn consumerTests() type {
                 }
 
                 fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+                    snapshots += 1;
                     const metadata_table_manager = @import("../metadata/table_manager.zig");
                     const raft_reconciler = @import("../raft/reconciler.zig");
                     const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -5785,10 +5980,13 @@ fn consumerTests() type {
                         try std.testing.expectEqual(group_id, fence.route.group_id);
                         try std.testing.expectEqual(@as(u64, if (group_id == 8001) 8 else 7), fence.table_id);
                         try std.testing.expectEqual(@as([32]u8, @splat('1')), fence.metadata_incarnation.?);
+                        try std.testing.expectEqual(@as(?u32, if (group_id == 8001) null else 7), req.req.schema_version);
+                        if (group_id != 8001) try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, req.req.commit_requires.?);
                         self.bound_prepares += 1;
                     }
                     try std.testing.expect(req.req.writes.len + req.req.deletes.len + req.req.predicates.len + req.req.integrity.len + req.req.range_guards.len > 0);
                     if (req.req.range_guards.len != 0) {
+                        try std.testing.expectEqual(@as(usize, 1), req.req.range_guards.len);
                         try std.testing.expectEqual(@as(u64, 7002), group_id);
                         try std.testing.expectEqual(@as(?u64, 9007199254740993), req.req.range_guards[0].generation);
                         self.range_prepares += 1;
@@ -5818,7 +6016,7 @@ fn consumerTests() type {
 
                 fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnResolveRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    try std.testing.expect(req.topology_epoch != 0);
+                    if (req.status == .committed) try std.testing.expect(req.topology_epoch != 0);
                     try self.resolves.append(std.testing.allocator, .{
                         .group_id = group_id,
                         .status = req.status,
@@ -5958,6 +6156,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), recorder.semantic_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.activation_prepares);
             try std.testing.expectError(error.CatalogGenerationChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(2), 40_000, 40_001, &.{.{ .table_name = "docs", .bound_catalog_incarnation = @splat(0xaa), .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, null));
+            try std.testing.expectError(error.PreDispatchCatalogGenerationChanged, executeMultiTableCommitWithOptions(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(2), 40_000, 40_001, &.{.{ .table_name = "docs", .bound_catalog_incarnation = @splat(0xaa), .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, null, .{ .retain_terminal = true, .fresh_retained_id = true }));
             var routing = (try table_catalog.transactionRoutingSnapshot(std.testing.allocator, FakeCatalog.iface(), "docs")).?;
             defer routing.deinit(std.testing.allocator);
             const manager = @import("../metadata/table_manager.zig");
@@ -5968,22 +6167,149 @@ fn consumerTests() type {
             };
             recorder.coordinator_group = 7002;
             recorder.includes_audit = true;
-            const guarded = try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("40112233445566778899aabbccddeeff"), 50_000, 50_001, &.{
-                .{ .table_name = "docs", .bound_catalog_incarnation = @splat(0x11), .range_guards = (&observation)[0..1] },
+            const snapshots_before = FakeCatalog.snapshots;
+            const guarded_tables: []const TableCommitRequest = &.{
+                .{ .table_name = "docs", .commit_requires = .none, .schema_version = 7, .bound_catalog_incarnation = @splat(0x11), .range_guards = (&observation)[0..1] },
                 .{ .table_name = "audit", .writes = &.{.{ .key = "log", .value = "{}" }} },
-                .{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
-            }, .write, null);
+                .{ .table_name = "docs", .commit_requires = .direct_enrichments, .range_guards = &.{observation}, .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
+            };
+            const guarded = try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("40112233445566778899aabbccddeeff"), 50_000, 50_001, guarded_tables, .write, null);
             try std.testing.expect(guarded == .committed);
+            // Routing and the post-prepare fence each take one fresh catalog snapshot.
+            try std.testing.expectEqual(snapshots_before + 2, FakeCatalog.snapshots);
+
+            // A production-capable source must use one generation for placement
+            // and a fresh, batched stability check on either side of prepare.
+            const Compact = struct {
+                generation: *table_catalog.RoutingGeneration,
+                checks: usize = 0,
+                recheck_failure: ?anyerror = null,
+                supports_batch: bool = true,
+                supports_single: bool = true,
+                fn acquire(ptr: *anyopaque, _: table_catalog.RoutingBudget, authoritative: bool) !*table_catalog.RoutingGeneration {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(authoritative);
+                    self.generation.retain();
+                    return self.generation;
+                }
+                fn check(ptr: *anyopaque, request: AdmissionRequest, _: table_catalog.RoutingBudget) !@import("../metadata/api.zig").DecisionAdmission {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (request.route_check != null and self.supports_single)
+                        return .{ .route_checked = true, .stable = true, .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 10 };
+                    if (!self.supports_batch) return error.UnsupportedOperation;
+                    const batch = request.table_batch orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(@as(usize, 2), batch.tables.len);
+                    try std.testing.expectEqual(@as(u64, if (self.checks == 0) 9 else 10), batch.verified_revision);
+                    self.checks += 1;
+                    if (self.checks == 2) if (self.recheck_failure) |err| return err;
+                    return .{ .tables_checked = true, .stable = true, .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 10 };
+                }
+            };
+            const original = try FakeCatalog.adminSnapshot(undefined);
+            const generation = try table_catalog.RoutingGeneration.create(std.testing.allocator, .{ .tables = original.tables, .ranges = original.ranges, .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 9 }, .{});
+            defer generation.release();
+            var compact = Compact{ .generation = generation };
+            const before_compact = FakeCatalog.snapshots;
+            const compact_source: table_catalog.CatalogSource = .{ .ptr = &compact, .vtable = &.{ .admin_snapshot = FakeCatalog.adminSnapshot, .free_admin_snapshot = FakeCatalog.freeAdminSnapshot, .acquire_routing_generation = Compact.acquire, .decision_admission = Compact.check } };
+            for ([_]bool{ true, false }) |supports_batch| {
+                compact.supports_batch = supports_batch;
+                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena.deinit();
+                var enlisted_participants: std.ArrayListUnmanaged(ParticipantTxn) = .empty;
+                const stamp = try routeParticipants(arena.allocator(), compact_source, &.{
+                    .{ .table_name = "docs", .bound_catalog_incarnation = @splat(0x11), .writes = &.{.{ .key = "a", .value = "{}" }} },
+                    .{ .table_name = "audit", .writes = &.{.{ .key = "b", .value = "{}" }} },
+                }, &enlisted_participants, true);
+                for (enlisted_participants.items) |participant| try std.testing.expectEqual(participant.group_id, participant.route_fence.?.route.group_id);
+                try validateParticipantEpochs(arena.allocator(), compact_source, enlisted_participants.items, stamp);
+                try std.testing.expectEqual(@as(usize, 2), compact.checks);
+                try std.testing.expectEqual(before_compact + @as(usize, if (supports_batch) 0 else 2), FakeCatalog.snapshots);
+            }
+            compact.supports_single = false;
+            const begins_before_probe = recorder.begins.items.len;
+            try std.testing.expectError(error.PreDispatchDecisionAdmissionUnavailable, executeMultiTableCommitWithOptions(std.testing.allocator, compact_source, recorder.worker(), @splat(2), 40_000, 40_001, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "a", .value = "{}" }} }}, .write, null, .{ .retain_terminal = true, .fresh_retained_id = true }));
+            try std.testing.expectEqual(begins_before_probe, recorder.begins.items.len);
             try std.testing.expectEqual(@as(usize, 3), guarded.committed.participant_count);
             try std.testing.expectEqual(@as(usize, 3), recorder.bound_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.range_prepares);
             const prior_begins = recorder.begins.items.len;
+            {
+                var participants: std.ArrayListUnmanaged(ParticipantTxn) = .empty;
+                defer {
+                    for (participants.items) |*participant| participant.deinit(std.testing.allocator);
+                    participants.deinit(std.testing.allocator);
+                }
+                _ = try routeParticipants(std.testing.allocator, FakeCatalog.iface(), &.{
+                    .{ .table_name = "docs", .commit_requires = .direct_enrichments },
+                    .{ .table_name = "docs", .commit_requires = .none, .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
+                }, &participants, false);
+                try std.testing.expectEqual(@as(usize, 1), participants.items.len);
+                try std.testing.expectEqual(@as(u64, 7002), participants.items[0].group_id);
+                try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, participants.items[0].commit_requires.?);
+            }
+            {
+                var participants: std.ArrayListUnmanaged(ParticipantTxn) = .empty;
+                defer {
+                    for (participants.items) |*participant| participant.deinit(std.testing.allocator);
+                    participants.deinit(std.testing.allocator);
+                }
+                _ = try routeParticipants(std.testing.allocator, FakeCatalog.iface(), &.{
+                    .{ .table_name = "docs", .commit_requires = .direct_enrichments },
+                    .{ .table_name = "audit", .writes = &.{.{ .key = "log", .value = "{}" }} },
+                    .{ .table_name = "docs", .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
+                }, &participants, true);
+                try std.testing.expectEqual(@as(usize, 3), participants.items.len);
+                try std.testing.expectEqual(@as(u64, 7001), participants.items[0].group_id);
+                try std.testing.expectEqual(@as(u64, 7002), participants.items[2].group_id);
+            }
+            var inconsistent = observation;
+            inconsistent.proofs = &.{.{ .bucket = 100, .generation = 1 }};
+            try std.testing.expectError(error.SqlWriteConflict, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(4), 60_000, 60_001, &.{
+                .{ .table_name = "docs", .range_guards = &.{observation} },
+                .{ .table_name = "docs", .range_guards = &.{inconsistent} },
+            }, .write, null));
+            const enlisted = [_]ParticipantTxn{.{ .group_id = 7002, .table_name = "docs", .topology_epoch = routing.topology_epoch }};
+            try std.testing.expectError(error.CatalogGenerationChanged, validateParticipantEpochs(std.testing.allocator, FakeCatalog.iface(), &enlisted, .{ .group_id = 1, .incarnation = @splat('2') }));
+            {
+                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena.deinit();
+                var names: RoutesByName = .empty;
+                try names.put(arena.allocator(), "docs", .{ .requirements = .{ .table_name = "docs" } });
+                var snapshot = routing.snapshot;
+                var duplicate = [_]manager.TableRecord{ snapshot.tables[0], snapshot.tables[1] };
+                duplicate[1].name = duplicate[0].name;
+                snapshot.tables = &duplicate;
+                try std.testing.expectError(error.CatalogGenerationChanged, loadTableRoutes(arena.allocator(), &names, &snapshot));
+            }
+            try std.testing.expectError(error.CatalogGenerationChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(4), 60_000, 60_001, &.{
+                .{ .table_name = "docs", .schema_version = 7, .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
+                .{ .table_name = "docs", .schema_version = 8, .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
+            }, .write, null));
             var stale = observation;
             stale.fence.route.range_id +%= 1;
             try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(3), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = &.{ stale, observation } }}, .write, null));
             observation.fence.metadata_incarnation = @splat('2');
             try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("50112233445566778899aabbccddeeff"), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = (&observation)[0..1] }}, .write, null));
             try std.testing.expectEqual(prior_begins, recorder.begins.items.len);
+            // Admit all three writes on the compact generation itself. The
+            // post-prepare check is the only injected routing failure.
+            const recheck_tables = [_]TableCommitRequest{
+                .{ .table_name = "docs", .schema_version = 7, .bound_catalog_incarnation = @splat(0x11), .commit_requires = .direct_enrichments, .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
+                .{ .table_name = "audit", .writes = &.{.{ .key = "log", .value = "{}" }} },
+                .{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
+            };
+            for ([_]bool{ true, false }) |fresh| {
+                for ([_]anyerror{ error.CatalogRoutingSnapshotTimeout, error.TopologyChanged }) |failure| {
+                    compact.supports_batch = true;
+                    compact.checks = 0;
+                    compact.recheck_failure = failure;
+                    const rechecked = executeMultiTableCommitWithOptions(std.testing.allocator, compact_source, recorder.worker(), @splat(7), 70_000, 70_001, &recheck_tables, .write, null, .{ .retain_terminal = true, .fresh_retained_id = fresh });
+                    if (failure == error.TopologyChanged) {
+                        try std.testing.expect((try rechecked) == .conflict);
+                    } else try std.testing.expectError(error.TransactionPrepareAbortedUnavailable, rechecked);
+                    try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, recorder.resolves.items[recorder.resolves.items.len - 1].status);
+                }
+            }
         }
 
         test "stable distributed transaction retry resumes a durable commit decision" {
@@ -6592,6 +6918,41 @@ fn consumerTests() type {
                 .propose,
                 null,
             ));
+            const Rejected = struct {
+                commits: usize = 0,
+                aborts: usize = 0,
+                probes: usize = 0,
+                fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+                fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (req.status == .aborted) {
+                        self.aborts += 1;
+                        return;
+                    }
+                    self.commits += 1;
+                    return error.DecisionNotProposed;
+                }
+                fn probe(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64) !db_mod.types.TxnStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.probes += 1;
+                    return .committed;
+                }
+            };
+            for ([_]ExecuteOptions{ .{}, .{ .retain_terminal = true, .fresh_retained_id = true }, .{ .retain_terminal = true } }, 0..) |options, index| {
+                var rejected = Rejected{};
+                const worker = ParticipantWorker{ .ptr = &rejected, .vtable = &.{ .begin_group = Recorder.begin, .prepare_group = Rejected.prepare, .resolve_group = Rejected.resolve, .status_group = Recorder.status, .status_group_until = Rejected.probe } };
+                const result = executeMultiTableCommitWithOptions(std.testing.allocator, FakeCatalog.iface(), worker, txn_id, 10_000, 10_001, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, null, options);
+                try std.testing.expectEqual(@as(usize, 1), rejected.commits);
+                if (index == 2) {
+                    try std.testing.expectError(error.CommitVisibilityNotSatisfied, result);
+                    try std.testing.expectEqual(@as(usize, 0), rejected.aborts);
+                    try std.testing.expect(rejected.probes > 0);
+                } else {
+                    try std.testing.expectError(error.TopologyChanged, result);
+                    try std.testing.expectEqual(@as(usize, 1), rejected.aborts);
+                    try std.testing.expectEqual(@as(usize, 0), rejected.probes);
+                }
+            }
         }
 
         test "distributed txn coordinator returns unknown group without restarting the transaction" {

@@ -2797,6 +2797,10 @@ pub const ApiHttpClient = struct {
             }
             if (resp.status == 409) {
                 if (@import("relational_integrity_errors.zig").decode(resp.body)) |reason| return reason;
+                if (std.mem.eql(u8, resp.body, "decision not proposed")) {
+                    if (outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)) return error.DecisionNotProposed;
+                    return error.RaftBatchWriteOutcomeUnknown;
+                }
                 if (std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "OnlineMergeArtifactCatalogUncoordinated")) {
                     if (forwarding != null and (outcome == null or
                         !std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
@@ -3434,6 +3438,7 @@ pub const ApiHttpClient = struct {
         if (isRetainedPreDecisionPressure(resp)) return error.RetainedEffectsFull;
         if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
         if (remoteRelationalRowError(resp.status, resp.body)) |reason| return reason;
+        if (resp.status == 503 and std.mem.eql(u8, resp.body, "storage read temporarily unavailable")) return error.StorageReadTemporarilyUnavailable;
         switch (resp.status) {
             200 => return .applied,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
@@ -4335,6 +4340,11 @@ test "relational row query remote transaction prepare preserves scalar validatio
         try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
     }
     executor.status = 500;
+    executor.body = "storage read temporarily unavailable";
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
+    executor.status = 503;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
+    executor.status = 500;
     executor.body = "RelationalExpressionOverflow";
     try std.testing.expectError(error.InvalidRemoteResponse, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
 }
@@ -4526,6 +4536,7 @@ fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
 }
 
 fn remoteGroupTxnResolveConflictError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "decision not proposed")) return error.DecisionNotProposed;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "topology changed") or std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;

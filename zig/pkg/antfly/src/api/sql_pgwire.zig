@@ -190,7 +190,8 @@ pub const Adapter = struct {
         var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
         defer state.deinit(self.server.alloc);
         if (state.terminal != null or !std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
-        try self.server.txn_sessions.setSqlFailed(self.server.alloc, id, true);
+        const guard = try self.server.txn_sessions.mutation(self.server.alloc, id, self.server.localSessionNodeId());
+        try self.server.txn_sessions.setSqlFailed(self.server.alloc, guard, true);
     }
 
     fn evaluateParameters(_: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request, expressions: []const []const u8) ![]const std.json.Value {
@@ -354,7 +355,9 @@ pub const Adapter = struct {
                 if (access != .allowed) return;
                 // Never erase a started distributed decision; durable session
                 // maintenance retains it after this connection disappears.
-                job.credential.session_cleanup_complete = job.server.txn_sessions.removeBeforeExecution(job.server.alloc, job.id);
+                const info = job.server.txn_sessions.getInfo(job.id) orelse return;
+                if (info.version.owner != job.server.localSessionNodeId()) return;
+                job.credential.session_cleanup_complete = job.server.txn_sessions.retireBeforeExecution(job.server.alloc, job.id, info.version, false);
             }
         };
         var job = Cleanup{ .server = self.server, .principal = credential.sessionPrincipal(), .id = id, .completion_io = network_io, .credential = credential };
@@ -505,21 +508,22 @@ const OwnedRead = struct {
         self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .read_requirements = request.read_requirements, .shared_receipt_wait_budget = request.read_receipt_budget, .lake_visibility = if (request.read_requirements.visibility) |visibility| if (visibility == .accepted) .accepted else .committed else @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
         defer if (transaction_lease) |lease| lease.release();
+        var tenure: ?u128 = null;
         if (self.session_id) |id_hex| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(id_hex) catch return error.SqlTransactionNotActive;
-            if (try server.txn_sessions.principalAccess(server.alloc, id, credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
             transaction_lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
-            var state = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionNotActive;
-            defer state.deinit(server.alloc);
+            tenure = try server.txn_sessions.sqlReaderTenure(alloc, id, credential.sessionPrincipal(), server.localSessionNodeId());
+            var state = (try server.txn_sessions.readSqlState(alloc, id, &self.staged)) orelse return error.SqlTransactionNotActive;
+            defer state.deinit(alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
             if (!std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
-            self.staged = try server.txn_sessions.cloneSqlStaged(alloc, id);
             if (state.metadata.accepted_lake_reads) {
                 if (request.read_requirements.visibility == .committed) return error.ReadSnapshotTooOld;
                 self.native_adapter.lake_visibility = .accepted;
             }
             self.native_adapter.accepted_lake_repeatable = self.native_adapter.lake_visibility == .accepted and (state.metadata.isolation != .serializable or state.metadata.mode == .read_only);
             self.native_adapter.active_transaction = id;
+            self.native_adapter.admitted_mutation = .{ .id = id, .owner = server.localSessionNodeId(), .tenure = tenure };
             self.native_adapter.staged = &self.staged;
             if (state.metadata.isolation != .read_committed) self.native_adapter.range_reads = &self.range_guards;
         }
@@ -536,7 +540,7 @@ const OwnedRead = struct {
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
-        var opening: CursorAdmission = .{ .out = arena, .adapter = adapter, .native = &self.native_adapter, .credential = credential, .admitted = admitted_revision };
+        var opening: CursorAdmission = .{ .out = arena, .adapter = adapter, .native = &self.native_adapter, .credential = credential, .admitted = admitted_revision, .lease_epoch = tenure };
         opening.install(&stream_backend);
         const opened = try Pull.Stream.openOwned(try @import("sql_memory_owner.zig").create(adapter.server.alloc, alloc, adapter.server.shared_resource_manager orelse &adapter.server.local_resource_manager), stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
         if (opened == null) {
@@ -562,10 +566,9 @@ const OwnedRead = struct {
         };
         errdefer self.stream.close();
         self.retained = opening.captured orelse return error.InvalidSqlBackendResponse;
-        if (self.session_id) |id_hex| if (self.range_guards.tables.len != 0) {
-            const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
-            _ = (try server.txn_sessions.stage(server.alloc, id, &self.range_guards)) orelse return error.SqlTransactionNotActive;
-        };
+        if (self.session_id != null and self.range_guards.tables.len != 0) {
+            _ = (try server.txn_sessions.stage(server.alloc, self.native_adapter.admitted_mutation.?, &self.range_guards)) orelse return error.SqlTransactionNotActive;
+        }
         if (transaction_lease) |lease| {
             lease.release();
             transaction_lease = null;
@@ -606,19 +609,12 @@ const OwnedRead = struct {
 
     fn pull(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
         if (self.detached) return error.InvalidSqlBackendResponse;
-        try request.check();
         // Retained snapshots have a hard initial statement deadline, even if
         // later Execute messages carry a newer per-request deadline.
         try self.authority.request.check();
-        try self.authority.credential.validate();
-        if (self.session_id) |id_hex| {
-            const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
-            if (try self.adapter.server.txn_sessions.principalAccess(self.adapter.server.alloc, id, self.authority.credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
-            var state = (try self.adapter.server.txn_sessions.getSqlState(self.adapter.server.alloc, id)) orelse return error.SqlTransactionNotActive;
-            defer state.deinit(self.adapter.server.alloc);
-            if (state.metadata.failed or state.terminal != null) return error.SqlTransactionNotActive;
-        }
-        try self.retained.check(alloc, self.authority.credential, request, false);
+        var attached = request;
+        attached.session_id = self.session_id;
+        try self.retained.check(alloc, self.authority.credential, attached, false);
         var page = try self.stream.nextBatch(limit);
         errdefer page.deinit();
         const owner = try alloc.create(PageOwner);
@@ -722,6 +718,7 @@ const CursorAdmission = struct {
     native: *execution.Adapter,
     credential: *Credential,
     admitted: ReadRevision,
+    lease_epoch: ?u128,
     previous: @FieldType(catalog.Backend, "execution_binding_validator") = null,
     captured: ?RetainedRead = null,
 
@@ -734,6 +731,7 @@ const CursorAdmission = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.previous) |validator| try validator.validate(validator.ptr, scratch, binding);
         self.captured = try RetainedRead.capture(self.out, self.adapter, self.credential, self.native.identity.* orelse return error.Unauthorized, binding, self.native.context, self.native.revision, self.admitted);
+        self.captured.?.lease_epoch = self.lease_epoch;
         // A later native operator may mint another owner proof. Bind its role
         // set under the same manager lock that signs that proof.
         self.native.identity.*.?.bound_policy_roles = self.captured.?.role_digest;
@@ -746,6 +744,7 @@ const RetainedRead = struct {
     policies: []const OwnedRead.Policy,
     bindings: []const Domain.CursorBinding,
     validated: ReadRevision,
+    lease_epoch: ?u128 = null,
     validated_stamp: ?wire.CatalogStamp = null,
     role_digest: ?[32]u8 = null,
     cut: Cut,
@@ -880,6 +879,11 @@ const RetainedRead = struct {
         try request.check();
         try credential.validate();
         if (self.adapter.server.cfg.user_manager != credential.manager) return error.Unauthorized;
+        if (request.session_id) |encoded| {
+            const id = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
+            const epoch = try self.adapter.server.txn_sessions.sqlReaderTenure(a, id, credential.sessionPrincipal(), self.adapter.server.localSessionNodeId());
+            if (epoch != self.lease_epoch) return error.SessionLeaseLost;
+        }
         const revision = try self.validateAccess(a, credential);
         var context = try requestContext(credential, &request).platformDeadline();
         if (self.validated_stamp orelse self.cut.stamp) |stamp| context.bound_catalog_incarnation = stamp.relation_epoch.incarnation;
@@ -1180,7 +1184,7 @@ const Job = struct {
         };
         defer lease.release(self.adapter.server.sqlPlanCacheIo());
         const compiled = lease.compiled();
-        if (self.request.capture_cursor_authority and compiled.statement != .select) return error.UnsupportedSqlExecution;
+        if (self.request.capture_cursor_authority == .require_select and compiled.statement != .select) return error.UnsupportedSqlExecution;
         const write = self.kind == .execute and switch (compiled.statement) {
             .select, .explain => false,
             .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
@@ -1191,7 +1195,7 @@ const Job = struct {
         preparation.release();
         // Sample before loading grants so a concurrent revocation can only
         // cause a cache miss, never attest a descriptor built under old grants.
-        const cursor_revision = if (self.request.capture_cursor_authority) self.credential.readRevision() else null;
+        const cursor_revision = if (self.request.capture_cursor_authority != .none and compiled.statement == .select) self.credential.readRevision() else null;
         const authority_revision = if (self.kind == .describe) try self.credential.descriptionRevision() else 0;
         var identity: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
         defer identity.?.deinit(server.alloc);
@@ -1281,7 +1285,11 @@ const Job = struct {
         var execution_backend = guarded.backend();
         var opening: CursorAdmission = undefined;
         if (cursor_revision) |revision| {
-            opening = .{ .out = self.alloc, .adapter = self.adapter, .native = &native_adapter, .credential = self.credential, .admitted = revision };
+            const tenure = if (self.request.session_id) |hex|
+                try server.txn_sessions.sqlReaderTenure(self.alloc, try @import("distributed_txn.zig").parseTxnIdHex(hex), self.credential.sessionPrincipal(), server.localSessionNodeId())
+            else
+                null;
+            opening = .{ .lease_epoch = tenure, .out = self.alloc, .adapter = self.adapter, .native = &native_adapter, .credential = self.credential, .admitted = revision };
             opening.install(&execution_backend);
         }
         execution_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
@@ -1296,7 +1304,9 @@ const Job = struct {
         if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
         errdefer if (native_adapter.result_session_id) |id| {
             const transaction_id = @import("distributed_txn.zig").parseTxnIdHex(&id) catch unreachable;
-            server.txn_sessions.setSqlFailed(server.alloc, transaction_id, true) catch {};
+            if (native_adapter.admitted_mutation) |guard| {
+                if (std.mem.eql(u8, &guard.id, &transaction_id)) server.txn_sessions.setSqlFailed(server.alloc, guard, true) catch {};
+            }
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = .failed;
         };
         // After a durable commit, even acknowledgement-allocation failure must
@@ -2758,6 +2768,13 @@ test "SQL pgwire retained reads track the serving policy even without a catalog 
     retained.policies = &.{.{ .resource = "physical", .filter = null }};
     var cancel = std.atomic.Value(bool).init(false);
     const req: wire.Request = .{ .statement = "", .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } }, .cancel_requested = &cancel };
+    const session = try api.txn_sessions.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, api.localSessionNodeId(), credential.sessionPrincipal());
+    const session_id = std.fmt.bytesToHex(session.txn_id, .lower);
+    var attached = req;
+    attached.session_id = &session_id;
+    try retained.check(a, credential, attached, true);
+    try std.testing.expect(api.txn_sessions.remove(a, session.txn_id));
+    try std.testing.expectError(error.SqlTransactionNotActive, retained.check(a, credential, attached, false));
     try manager.addRoleToSubject("bob", "auditor");
     fake.revision += 1;
     fake.binding_lookups = 0;

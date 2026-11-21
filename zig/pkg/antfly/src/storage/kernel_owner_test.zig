@@ -3945,13 +3945,44 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
     var current = try store.openSessionRead(a, group);
     defer current.abort();
     try std.testing.expectEqualStrings("\x80committed", try current.get(key));
-    var cursor = try current.openCursor();
+    {
+        var reader = try store.openSessionRead(a, group);
+        var ranged = reader.openReadScope(a) catch |err| {
+            reader.abort();
+            return err;
+        };
+        reader.abort();
+        defer ranged.close();
+        try std.testing.expectEqualStrings("commit", try ranged.getRange(key, 1, 6));
+        try std.testing.expectError(error.EndOfStream, ranged.getRange(key, 8, 8));
+        try std.testing.expectError(error.EndOfStream, ranged.getRange(key, 20, 0));
+        try std.testing.expectError(error.InvalidArgument, ranged.getRange("outside-session-namespace", 0, 1));
+        var old = try retained.openReadScope(a);
+        defer old.close();
+        try std.testing.expectEqualStrings("\x00", try old.getRange(key, 1, 1));
+    }
+    var parent = try store.openSessionRead(a, group);
+    var cursor = parent.openCursor() catch |err| {
+        parent.abort();
+        return err;
+    };
+    parent.abort();
     {
         defer cursor.close();
         try std.testing.expectEqualStrings(key, (try cursor.last()).?.key);
         try std.testing.expectEqualStrings("\x80committed", (try cursor.seekAtOrAfter(key)).?.value);
         try std.testing.expect((try cursor.next()) == null);
     }
+    const session = records.session_prefix ++ "00112233445566778899aabbccddeeff";
+    const session_key = try records.keyAlloc(a, group, session);
+    defer a.free(session_key);
+    const large = try a.alloc(u8, 256 << 10);
+    defer a.free(large);
+    @memset(large, 'z');
+    @memcpy(large[0..6], "header");
+    const addition = try records.encode(a, .{ .changes = &.{.{ .key = session, .expected = null, .value = large }} });
+    defer a.free(addition);
+    try store.applyStandaloneCommand(group, .{ .apply_transaction_sessions = addition });
     const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
     defer a.free(snapshot);
     var restored = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = target_path, .no_sync = true });
@@ -3960,6 +3991,9 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
     var recovered = try restored.openSessionRead(a, group);
     defer recovered.abort();
     try std.testing.expectEqualStrings("\x80committed", try recovered.get(key));
+    var scoped = try recovered.openReadScope(a);
+    defer scoped.close();
+    try std.testing.expectEqualStrings("header", try scoped.getRange(session_key, 0, 6));
 }
 
 test "opaque metadata apply owner preserves semantic error identity" {

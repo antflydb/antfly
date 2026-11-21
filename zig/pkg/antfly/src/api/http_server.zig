@@ -6618,7 +6618,6 @@ pub const ApiHttpServer = struct {
                 .commit => |*commit| {
                     const distributed_view = commit.request.distributedTables(self.alloc) catch |err| {
                         std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
                         continue;
                     };
                     defer distributed_view.deinit();
@@ -6644,6 +6643,12 @@ pub const ApiHttpServer = struct {
                         else
                             commit.sync_level,
                     ) catch |err| switch (err) {
+                        error.TransactionPrepareAbortedRowPolicyDenied, error.TransactionPrepareAbortedUnavailable => {
+                            self.txn_sessions.publishAbortAndRetire(self.alloc, txn_id, null) catch |persist_err| {
+                                std.log.warn("stable transaction abort persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                            };
+                            continue;
+                        },
                         error.EnrichmentWorkerFailed => {
                             // Older records and third-party sources may expose a
                             // committed terminal repair only as an error. Persist
@@ -6678,8 +6683,7 @@ pub const ApiHttpServer = struct {
                         .conflict => {
                             // A replayed transaction ID can only conflict when
                             // the coordinator durably chose abort.
-                            _ = (self.txn_sessions.recordTerminalAbort(self.alloc, txn_id) catch continue) orelse continue;
-                            _ = self.txn_sessions.remove(self.alloc, txn_id);
+                            self.txn_sessions.publishAbortAndRetire(self.alloc, txn_id, null) catch continue;
                         },
                         .committed => |committed| {
                             const repair_required = commit.repair_required or committed.visibility_repair_required;
@@ -15202,7 +15206,8 @@ pub const ApiHttpServer = struct {
             // This marker exists only after every contacted participant has
             // a durable abort. Unlike generic 503, the batch cannot later
             // commit, so callers may safely retry with a new attempt.
-            error.TransactionPrepareAbortedUnavailable => return error.WriteDefinitelyAbortedUnavailable,
+            error.TransactionPrepareAbortedRowPolicyDenied => return error.Forbidden,
+            error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable => return error.WriteDefinitelyAbortedUnavailable,
             error.PreDecisionReadUnavailable => return error.WritePrecommitReadUnavailable,
             // Coverage is checked before coordinator admission. Preserve that
             // definite result instead of the generic unknown-write 503.
@@ -62917,7 +62922,7 @@ test "SQL pgwire native ordinary rollback leaves no permanent completion proofs"
     for (&ids) |*id| {
         const session = try registry.begin(a, .{}, 0);
         id.* = session.txn_id;
-        try std.testing.expect(registry.removeBeforeExecution(a, session.txn_id));
+        try std.testing.expect(registry.retireBeforeExecution(a, session.txn_id, session.version, false));
     }
     try std.testing.expectEqual(@as(usize, 0), registry.sessions.count());
     for (ids) |id| {

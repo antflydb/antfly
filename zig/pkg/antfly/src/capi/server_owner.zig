@@ -2220,6 +2220,15 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.reportBaselineProgressForKey(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .decision_admission => |input| {
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
+                    const budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget = .{
+                        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+                        .cancellation = ownerQueryCancellation(&request.control),
+                    };
+                    const value = handle.store.decisionAdmission(a, group_id, input, budget) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .owner_readiness => |input| {
                     if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
                     const budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget = .{
@@ -2741,6 +2750,7 @@ const MetadataSessionRead = struct {
     alloc: Allocator,
     txn: antfly.capi_dependencies.storage_docstore.DocStore.Txn,
     prefix: []u8,
+    group: u64,
 };
 pub fn metadataSessionReadOpen(store_ptr: ?*anyopaque, request: *const kernel_owner_abi.MetadataApplyGroupRequest, out_read: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     out_read.* = null;
@@ -2761,7 +2771,7 @@ pub fn metadataSessionReadOpen(store_ptr: ?*anyopaque, request: *const kernel_ow
         owner.alloc.destroy(read);
         return storageOwnerStatusFromError(err);
     };
-    read.* = .{ .alloc = owner.alloc, .txn = txn, .prefix = owned };
+    read.* = .{ .alloc = owner.alloc, .txn = txn, .prefix = owned, .group = request.group_id };
     out_read.* = read;
     return .ok;
 }
@@ -2782,13 +2792,25 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     upper[read.prefix.len - 1] += 1;
     const upper_bound = upper[0..read.prefix.len];
     const bounded = switch (request.operation) {
-        .get, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
+        .get, .get_range, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
         else => false,
     };
     const upper_seek = request.operation == .seek_at_or_before and std.mem.eql(u8, key, upper_bound);
     if (bounded and ((!std.mem.startsWith(u8, key, read.prefix) and !upper_seek) or key.len > read.prefix.len + 512)) return .invalid_argument;
-    if (request.operation == .get) {
-        const value = read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
+    if (request.operation == .get or request.operation == .get_range) {
+        var scope = if (request.operation == .get_range) read.txn.openReadScope(read.alloc) catch |err| return storageOwnerStatusFromError(err) else null;
+        defer if (scope) |*s| s.close();
+        const value = if (scope) |*s| blk: {
+            if (request.length > 32 << 20) return .invalid_argument;
+            if (s.getRange(key, request.offset, request.length)) |bytes| {
+                break :blk bytes;
+            } else |err| if (err != error.Unsupported) return storageOwnerStatusFromError(err);
+            const cached = @import("../metadata/transaction_session_record.zig").cachedRange(s, read.alloc, read.group, key[read.prefix.len..], request.offset, request.length) catch |err| return storageOwnerStatusFromError(err);
+            if (cached) |bytes| break :blk bytes;
+            const full = s.get(key) catch |err| return storageOwnerStatusFromError(err);
+            if (request.offset > full.len or request.length > full.len - request.offset) return .end_of_stream;
+            break :blk full[@intCast(request.offset)..][0..request.length];
+        } else read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
         if (value.len > 32 << 20) return .invalid_argument;
         const copy = read.alloc.dupe(u8, value) catch return .out_of_memory;
         out_value.* = .{ .ptr = if (copy.len == 0) null else copy.ptr, .len = @intCast(copy.len) };
@@ -2797,7 +2819,7 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     var cursor = read.txn.openCursor() catch |err| return storageOwnerStatusFromError(err);
     defer cursor.close();
     var entry = switch (request.operation) {
-        .get => unreachable,
+        .get, .get_range => unreachable,
         .first => cursor.seekAtOrAfter(read.prefix),
         .last => cursor.seekAtOrBefore(upper_bound),
         .next, .seek_at_or_after => cursor.seekAtOrAfter(key),
