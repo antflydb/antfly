@@ -37,6 +37,12 @@ pub const Picture = struct {
     profile: u8 = 0,
     av1_config: ?[4]u8 = null,
     apple_compatible: bool = true,
+
+    pub fn sameAppleFormat(left: Picture, right: Picture) bool {
+        return left.width == right.width and left.height == right.height and left.bit_depth == right.bit_depth and
+            left.chroma_format == right.chroma_format and left.profile == right.profile and
+            std.meta.eql(left.color, right.color) and std.meta.eql(left.av1_config, right.av1_config);
+    }
 };
 pub const Restart = struct { packet: usize = 0, logical: usize = 0, sequence: ?struct { packet: usize, offset: usize, size: usize } = null };
 /// Bounds a single replay, including any separately read sequence bootstrap.
@@ -68,6 +74,7 @@ pub const Index = struct {
     restarts: []Restart = &.{},
     reader: ?*const media.webm.Reader = null,
     apple_packet_layout: bool = false,
+    apple_index_eligible: ?bool = null,
     coded_bytes: ?usize = null,
     packet_byte_prefix: []usize = &.{},
     frame_units: usize = 0,
@@ -188,6 +195,7 @@ const Collect = struct {
     restarts: std.ArrayList(Restart) = .empty,
     restart_limit: usize = 8192,
     apple_packet_layout: bool = true,
+    apple_index_eligible: bool = true,
     frame_units: usize = 0,
     largest_picture: u64 = 0,
     fn restart(self: *Collect, value: Restart) !void {
@@ -203,6 +211,14 @@ const Collect = struct {
         try self.push(.{ .pts = frame.pts_ns, .duration = frame.duration_ns, .packet_index = frame.source_packet, .width = frame.width, .height = frame.height, .bit_depth = frame.bit_depth, .chroma_format = frame.chroma_format, .color = frame.color });
     }
     fn push(self: *Collect, picture: Picture) !void {
+        if (self.apple_index_eligible) {
+            self.apple_index_eligible = picture.apple_compatible and picture.packet_index != null;
+            if (self.apple_index_eligible and self.pictures.items.len != 0) {
+                const first = self.pictures.items[0];
+                const previous = self.pictures.items[self.pictures.items.len - 1];
+                self.apple_index_eligible = first.sameAppleFormat(picture) and picture.packet_index.? > previous.packet_index.?;
+            }
+        }
         if (self.pictures.items.len >= self.limit) return error.ResourceLimitExceeded;
         if (self.pictures.items.len == self.pictures.capacity) {
             // Cap capacity at the declared picture limit. The admission budget
@@ -265,7 +281,7 @@ fn buildIndex(a: std.mem.Allocator, decoder_allocator: std.mem.Allocator, reader
     errdefer a.free(pictures);
     const restarts = try collector.restarts.toOwnedSlice(a);
     errdefer a.free(restarts);
-    return .{ .allocator = a, .pictures = pictures, .restarts = restarts, .reader = reader, .frame_units = collector.frame_units, .largest_picture = collector.largest_picture, .apple_packet_layout = options.strategy == .headers and collector.apple_packet_layout, .operating_point = options.decoder.av1_operating_point, .all_layers = options.decoder.av1_all_layers, .duration_seconds = reader.duration_seconds };
+    return .{ .allocator = a, .pictures = pictures, .restarts = restarts, .reader = reader, .frame_units = collector.frame_units, .largest_picture = collector.largest_picture, .apple_packet_layout = options.strategy == .headers and collector.apple_packet_layout, .apple_index_eligible = options.strategy == .headers and collector.apple_index_eligible, .operating_point = options.decoder.av1_operating_point, .all_layers = options.decoder.av1_all_layers, .duration_seconds = reader.duration_seconds };
 }
 /// Header indexing validates visible-picture geometry/reference metadata. Pixel
 /// reconstruction and entropy validity remain the selected replay's responsibility.

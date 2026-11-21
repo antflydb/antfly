@@ -58,11 +58,6 @@ pub fn configuration(codec: media.webm.Codec, picture: pictures.Picture) !Config
     }
     return value;
 }
-fn sameFormat(left: pictures.Picture, right: pictures.Picture) bool {
-    return left.width == right.width and left.height == right.height and left.bit_depth == right.bit_depth and
-        left.chroma_format == right.chroma_format and left.profile == right.profile and
-        std.meta.eql(left.color, right.color) and std.meta.eql(left.av1_config, right.av1_config);
-}
 const Capture = struct {
     indexed: pictures.Index,
     selected: []const usize,
@@ -136,6 +131,10 @@ pub fn validate(reader: *media.webm.Reader, indexed: pictures.Index) !Configurat
     if (!indexed.apple_packet_layout) return error.UnsupportedVideoProfile;
     const shape = indexed.pictures[0];
     const config = try configuration(reader.track.codec, shape);
+    if (indexed.apple_index_eligible) |eligible| {
+        if (!eligible) return error.UnsupportedVideoProfile;
+        return config;
+    }
     var previous: ?usize = null;
     // Validate the whole indexed format before entering native decode. A packet
     // with multiple visible pictures cannot be identified by sourceFrameRefCon.
@@ -145,7 +144,7 @@ pub fn validate(reader: *media.webm.Reader, indexed: pictures.Index) !Configurat
         if (packet_id >= reader.packets.len) return error.InvalidVideoIndex;
         if (previous) |p| if (packet_id <= p) return error.UnsupportedVideoProfile;
         previous = packet_id;
-        if (!picture.apple_compatible or !sameFormat(shape, picture)) return error.UnsupportedVideoProfile;
+        if (!picture.apple_compatible or !shape.sameAppleFormat(picture)) return error.UnsupportedVideoProfile;
     }
     return config;
 }
@@ -252,7 +251,9 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     }
     if (!warm) restart = if (options.replay_budget) |budget| try budget.coldRestart(indexed, reader, first, end + 1, reader.input.control) else indexed.restartFor(first);
     if (restart.packet > end) return error.InvalidVideoIndex;
-    if (end - restart.packet + 1 > options.decode.max_decode_packets) return error.ResourceLimitExceeded;
+    if (end - restart.packet + 1 > options.decode.max_decode_packets) {
+        return if (options.replay_budget != null) error.AppleReplayPacketLimit else error.ResourceLimitExceeded;
+    }
     const bytes = try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, selected.len, shape.bit_depth);
     if (bytes > options.decode.max_surface_bytes) return error.ResourceLimitExceeded;
     const metadata = try std.math.mul(usize, selected.len, @sizeOf(?apple.Surface) + @sizeOf(bool));

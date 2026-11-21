@@ -1568,6 +1568,21 @@ test "embeddinggemma2 video reader timestamps and cache binding survive independ
     try std.testing.expect(try replay.fits(restart_index, &restart_reader, .{ .packet = 2 }, 3, .{}));
     try std.testing.expect(!try replay.fits(restart_index, &restart_reader, .{}, 3, .{}));
 
+    try std.testing.expect(index.apple_index_eligible != null);
+    if (@import("builtin").os.tag == .macos and index.apple_index_eligible.? and index.apple_packet_layout) {
+        const AppleSink = struct {
+            fn frame(_: *anyopaque, _: usize, _: *const video.apple.Surface, _: video.webm_pictures.Picture) !void {
+                return error.TestUnexpectedResult;
+            }
+        };
+        const reads_before_apple = source.reads;
+        try std.testing.expectError(error.AppleReplayPacketLimit, video.apple_webm.decodeTo(a, &reader, index, &.{0}, .{
+            .decode = .{ .max_decode_packets = 0 },
+            .replay_budget = planned.window.?.replay,
+        }, .{ .context = &marker, .accept = AppleSink.frame }));
+        try std.testing.expectEqual(reads_before_apple, source.reads);
+    }
+
     var cancelled_scope = InspectionScope{ .allocator = a };
     defer cancelled_scope.deinit();
     const scoped_config = Configuration{ .webm = input, .sampling = .gemma4, .inspection_scope = &cancelled_scope };
@@ -3277,7 +3292,7 @@ fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: vi
 }
 fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput) !void {
     if (capture.prefetch) |producer| try producer.waitForDecoder();
-    const budget = if (input) |bound| if (bound.window) |window| blk: {
+    var budget = if (input) |bound| if (bound.window) |window| blk: {
         var replay = window.replay;
         var stop: usize = 0;
         for (selected) |id| {
@@ -3292,8 +3307,16 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
     const estimate = if (indexed.pictures.len != 0) try video.apple.surfaceAdmissionBytesForDepth(indexed.pictures[0].width, indexed.pictures[0].height, selected.len, indexed.pictures[0].bit_depth) else 0;
     if (capture.decoder.policy == .automatic and estimate > 512 * 1024 * 1024) capture.decoder.fallback();
     if (capture.decoder.policy != .portable and (capture.decoder.policy == .apple or estimate <= 512 * 1024 * 1024)) {
+        const bytes_before = reader.input.total_bytes;
         const receipt: ?video.apple_webm.Receipt = decodeAppleWebm(a, reader, indexed, selected, capture, input, budget) catch |err| blk: {
-            try appleUnavailable(capture, err);
+            const reason = if (err == error.AppleReplayPacketLimit)
+                (if (capture.decoder.policy == .automatic) error.UnsupportedVideoProfile else error.ResourceLimitExceeded)
+            else
+                err;
+            try appleUnavailable(capture, reason);
+            // The worker owns this source view. Its counters include packet
+            // and sequence bootstrap reads, even when Apple publishes nothing.
+            if (budget) |*remaining| remaining.coded_bytes -|= std.math.cast(usize, reader.input.total_bytes - bytes_before) orelse std.math.maxInt(usize);
             break :blk @as(?video.apple_webm.Receipt, null);
         };
         if (receipt) |value| {
