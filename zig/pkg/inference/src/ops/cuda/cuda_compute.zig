@@ -39931,6 +39931,41 @@ test "Gemma4 CUDA projector residual workspace preserves two and three term rect
     }
 }
 
+test "Gemma4 CUDA projector residual recovery handles a partial warp and overflowing products" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const inner = 2560;
+    const cols = 35;
+    var inputs: [inner]f32 = @splat(0);
+    inputs[0] = std.math.floatMax(f32);
+    inputs[1] = std.math.floatMax(f32);
+    var src = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, @sizeOf(@TypeOf(inputs)));
+    defer src.free(&compute.ctx);
+    try src.copyFromHost(&compute.ctx, std.mem.asBytes(&inputs));
+    const weights = try std.testing.allocator.alloc(u16, inner * cols);
+    defer std.testing.allocator.free(weights);
+    var w = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, weights.len * 2);
+    defer w.free(&compute.ctx);
+    var dst = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, cols * 4);
+    defer dst.free(&compute.ctx);
+    for ([_]bool{ true, false }) |bf16| {
+        @memset(weights, 0);
+        for (0..cols) |col| {
+            weights[col * inner] = 0x4000; // +2 in both formats
+            weights[col * inner + 1] = 0xc000; // -2
+        }
+        try w.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(weights));
+        var output: [cols]f32 = @splat(std.math.nan(f32));
+        output[1] = 19;
+        try dst.copyFromHost(&compute.ctx, std.mem.asBytes(&output));
+        try compute.scalar_clamp_kernel.finishProjection(&compute.ctx, dst.ptr, 0, src.ptr, w.ptr, 1, inner, cols, bf16);
+        try compute.ctx.synchronize();
+        try dst.copyToHost(&compute.ctx, std.mem.asBytes(&output));
+        for (output, 0..) |value, col| try std.testing.expectEqual(@as(f32, if (col == 1) 19 else 0), value);
+    }
+}
+
 test "Gemma4 CUDA projector cache preserves compact dtype and independent admission through borrowers" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;

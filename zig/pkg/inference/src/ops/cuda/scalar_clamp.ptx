@@ -191,65 +191,200 @@ done:
     .param .u64 weights, .param .u32 count, .param .u32 inputs,
     .param .u32 outputs, .param .u32 bf16
 ) {
-    .reg .pred p, is_bf;
-    .reg .b32 i, block, tid, size, n, cols, inner, fmt, row, col, k, bits;
-    .reg .b64 dst, src, w, addend, offset, start;
+    .reg .pred p, active, repair, is_bf, leader, wide;
+    .reg .b32 i, n, inner, cols, fmt, row, col, k, bits, mask, bit, slot, lane, id;
+    .reg .b64 dst, addend, src, w, offset, start;
     .reg .b16 half;
     .reg .f32 sum, other, x, y;
+    .reg .f64 acc, term, xd, yd;
+    mov.u32 i, %ctaid.x;
+    mov.u32 k, %ntid.x;
+    mov.u32 slot, %tid.x;
+    mad.lo.u32 i, i, k, slot;
+    mov.u32 lane, %laneid;
     ld.param.u32 n, [count];
-    mov.u32 block, %ctaid.x;
-    mov.u32 tid, %tid.x;
-    mov.u32 size, %ntid.x;
-    mad.lo.u32 i, block, size, tid;
-    setp.ge.u32 p, i, n;
-    @p bra done;
     ld.param.u64 dst, [output];
     ld.param.u64 addend, [correction];
     mul.wide.u32 offset, i, 4;
     add.u64 dst, dst, offset;
-    ld.global.f32 sum, [dst];
-    setp.eq.u64 p, addend, 0;
-    @!p bra add_correction;
-    testp.finite.f32 p, sum;
-    @p bra done;
-    bra recompute;
-add_correction:
+    setp.lt.u32 active, i, n;
+    mov.f32 sum, 0f00000000;
+    @active ld.global.f32 sum, [dst];
+    setp.ne.u64 p, addend, 0;
+    and.pred p, p, active;
     add.u64 addend, addend, offset;
-    ld.global.f32 other, [addend];
-    add.rn.f32 sum, sum, other;
+    @p ld.global.f32 other, [addend];
+    @p add.rn.f32 sum, sum, other;
+    @p st.global.f32 [dst], sum;
     testp.finite.f32 p, sum;
-    @p bra store;
-recompute:
-    ld.param.u32 cols, [outputs];
+    not.pred repair, p;
+    and.pred repair, repair, active;
     ld.param.u32 inner, [inputs];
+    setp.lt.u32 p, inner, 128;
+    @p bra short_dot;
+    vote.sync.ballot.b32 mask, repair, 0xffffffff;
+    setp.eq.u32 p, mask, 0;
+    @p bra done;
+
+    // Each set bit names an exceptional output. All 32 lanes read consecutive
+    // weights for that dot. Repeat in F64 only if F32 partial sums overflow.
+    ld.param.u32 cols, [outputs];
     ld.param.u32 fmt, [bf16];
+    setp.ne.u32 is_bf, fmt, 0;
+    setp.eq.u32 leader, lane, 0;
+repair_output:
+    brev.b32 bits, mask;
+    clz.b32 slot, bits;
+    sub.u32 id, i, lane;
+    add.u32 id, id, slot;
+    div.u32 row, id, cols;
+    rem.u32 col, id, cols;
     ld.param.u64 src, [input];
     ld.param.u64 w, [weights];
-    div.u32 row, i, cols;
-    rem.u32 col, i, cols;
     mul.wide.u32 start, row, inner;
     shl.b64 start, start, 2;
     add.u64 src, src, start;
     mul.wide.u32 start, col, inner;
     shl.b64 start, start, 1;
     add.u64 w, w, start;
-    setp.ne.u32 is_bf, fmt, 0;
-    mov.u32 k, 0;
+    mov.pred wide, 0;
+start_dot:
     mov.f32 sum, 0f00000000;
+    mov.f64 acc, 0d0000000000000000;
+    // Four adjacent coefficients per lane amortize address calculation
+    // and loop dependencies on the aligned dense projector matrices.
+    or.b64 offset, src, w;
+    and.b64 offset, offset, 15;
+    setp.ne.u64 p, offset, 0;
+    @p bra scalar_dot;
+    @wide bra scalar_dot;
+    and.b32 bits, inner, 127;
+    setp.ne.u32 p, bits, 0;
+    @p bra scalar_dot;
+    shl.b32 k, lane, 2;
+vector_dot:
+    {
+        .reg .b32 packed0, packed1;
+        .reg .b16 h0, h1, h2, h3;
+        .reg .f32 v0, v1, v2, v3;
+        mul.wide.u32 offset, k, 4;
+        add.u64 start, src, offset;
+        ld.global.v4.f32 {v0, v1, v2, v3}, [start];
+        mul.wide.u32 offset, k, 2;
+        add.u64 start, w, offset;
+        ld.global.v2.b32 {packed0, packed1}, [start];
+        mov.b32 {h0,h1}, packed0;
+        mov.b32 {h2,h3}, packed1;
+        @!is_bf cvt.f32.f16 y, h0;
+        @is_bf mov.b32 y, {0,h0};
+        fma.rn.f32 sum, v0, y, sum;
+        @!is_bf cvt.f32.f16 y, h1;
+        @is_bf mov.b32 y, {0,h1};
+        fma.rn.f32 sum, v1, y, sum;
+        @!is_bf cvt.f32.f16 y, h2;
+        @is_bf mov.b32 y, {0,h2};
+        fma.rn.f32 sum, v2, y, sum;
+        @!is_bf cvt.f32.f16 y, h3;
+        @is_bf mov.b32 y, {0,h3};
+        fma.rn.f32 sum, v3, y, sum;
+    }
+    add.u32 k, k, 128;
+    setp.lt.u32 p, k, inner;
+    @p bra vector_dot;
+    bra reduce;
+scalar_dot:
+    mov.u32 k, lane;
 accumulate:
-    ld.global.f32 x, [src];
-    ld.global.b16 half, [w];
+    setp.ge.u32 p, k, inner;
+    @p bra reduce;
+    mul.wide.u32 offset, k, 4;
+    add.u64 start, src, offset;
+    ld.global.f32 x, [start];
+    mul.wide.u32 offset, k, 2;
+    add.u64 start, w, offset;
+    ld.global.b16 half, [start];
     @!is_bf cvt.f32.f16 y, half;
     @is_bf cvt.u32.u16 bits, half;
     @is_bf shl.b32 bits, bits, 16;
     @is_bf mov.b32 y, bits;
+    @!wide fma.rn.f32 sum, x, y, sum;
+    @wide cvt.f64.f32 xd, x;
+    @wide cvt.f64.f32 yd, y;
+    @wide fma.rn.f64 acc, xd, yd, acc;
+    sub.u32 bits, inner, k;
+    setp.le.u32 p, bits, 32;
+    @p bra reduce;
+    add.u32 k, k, 32;
+    bra accumulate;
+reduce:
+    @wide bra wide_reduce;
+    mov.u32 k, 16;
+reduce_f32:
+    shfl.sync.bfly.b32 other, sum, k, 31, 0xffffffff;
+    add.rn.f32 sum, sum, other;
+    shr.u32 k, k, 1;
+    setp.ne.u32 p, k, 0;
+    @p bra reduce_f32;
+    testp.finite.f32 p, sum;
+    vote.sync.all.pred p, p, 0xffffffff;
+    @p bra publish;
+    mov.pred wide, 1;
+    bra start_dot;
+wide_reduce:
+    mov.u32 k, 16;
+reduce_step:
+    {
+        .reg .b32 lo, hi;
+        mov.b64 {lo, hi}, acc;
+        shfl.sync.bfly.b32 lo, lo, k, 31, 0xffffffff;
+        shfl.sync.bfly.b32 hi, hi, k, 31, 0xffffffff;
+        mov.b64 term, {lo, hi};
+    }
+    add.rn.f64 acc, acc, term;
+    shr.u32 k, k, 1;
+    setp.ne.u32 p, k, 0;
+    @p bra reduce_step;
+    cvt.rn.f32.f64 sum, acc;
+publish:
+    ld.param.u64 dst, [output];
+    mul.wide.u32 offset, id, 4;
+    add.u64 dst, dst, offset;
+    @leader st.global.f32 [dst], sum;
+    sub.u32 bit, mask, 1;
+    and.b32 mask, mask, bit;
+    setp.ne.u32 p, mask, 0;
+    @p bra repair_output;
+    bra done;
+short_dot:
+    // A short dot stays in its owning lane. This keeps the scalar loads
+    // and exact FMA order of the small-shape path.
+    @!repair bra done;
+    ld.param.u32 cols, [outputs];
+    ld.param.u32 fmt, [bf16];
+    setp.ne.u32 is_bf, fmt, 0;
+    div.u32 row, i, cols;
+    rem.u32 col, i, cols;
+    ld.param.u64 src, [input];
+    ld.param.u64 w, [weights];
+    mul.wide.u32 start, row, inner;
+    shl.b64 start, start, 2;
+    add.u64 src, src, start;
+    mul.wide.u32 start, col, inner;
+    shl.b64 start, start, 1;
+    add.u64 w, w, start;
+    mov.u32 k, inner;
+    mov.f32 sum, 0f00000000;
+short_term:
+    ld.global.f32 x, [src];
+    ld.global.b16 half, [w];
+    @!is_bf cvt.f32.f16 y, half;
+    @is_bf mov.b32 y, {0,half};
     fma.rn.f32 sum, x, y, sum;
     add.u64 src, src, 4;
     add.u64 w, w, 2;
-    add.u32 k, k, 1;
-    setp.lt.u32 p, k, inner;
-    @p bra accumulate;
-store:
+    sub.u32 k, k, 1;
+    setp.ne.u32 p, k, 0;
+    @p bra short_term;
     st.global.f32 [dst], sum;
 done:
     ret;

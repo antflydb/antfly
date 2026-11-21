@@ -75,3 +75,5 @@ aspect ratio, generated with FFmpeg (`testsrc`, `setsar=2/1`, H.264 Baseline and
 `hevc-fragmented.mp4` remuxes the four-second `codecs/hevc-hvc1.mp4` fixture with FFmpeg stream copy, `-use_editlist 0 -movflags +empty_moov+default_base_moof+frag_keyframe`. Each tfdt is advanced by 1,966,080 ticks (120 seconds at 16,384 Hz).
 
 `h264-sps-intra-geometry.mp4` is the lib/video non-IDR intra geometry transition fixture used to verify independent chunk replay.
+
+`h264-cropped-coded-width.mp4` contains one 4112×64 AVC picture cropped to 4096×64 in the SPS. Generate the elementary stream with `ffmpeg -f lavfi -i color=s=4112x64:r=1 -frames:v 1 -threads 1 -pix_fmt yuv420p -c:v libx264 -x264-params crop-rect=0,0,16,0 -f h264 crop.h264`, then remux with `ffmpeg -r 1 -i crop.h264 -c copy -movflags +faststart h264-cropped-coded-width.mp4`.

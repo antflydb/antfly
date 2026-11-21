@@ -345,16 +345,22 @@ fn partBytes(part: Part) []const u8 {
         inline else => |bytes| bytes,
     };
 }
+pub const AdmittedVideos = @import("embedding_gemma2_video.zig").AdmittedVideos;
 pub const Group = struct {
-    video_inspection: ?*const @import("embedding_gemma2_video.zig").PixelInspection = null,
+    videos: ?*const AdmittedVideos = null,
     title: ?[]const u8 = null,
     content: []const Part,
-    fn webmInput(self: Group, payload: anytype) !?@import("embedding_gemma2_video.zig").WebmInput {
-        if (@TypeOf(payload) == SampledVideo) return payload.webm;
-        const inspected = self.video_inspection orelse return null;
-        if (!inspected.matches(payload)) return error.InvalidVideoReaderSelection;
-        if (inspected.webm) |*webm| return .{ .reader = &webm.reader, .index = &webm.index, .reference_owner = inspected };
-        return null;
+
+    pub fn encodedVideo(part: Part) ?SampledVideo {
+        return switch (part) {
+            .video => |bytes| .{ .bytes = bytes, .sampling = .reference },
+            .sampled_video => |movie| if (movie.reader == null and movie.webm == null) movie else null,
+            else => null,
+        };
+    }
+    pub fn inspection(self: Group, movie: SampledVideo) ?*const @import("embedding_gemma2_video.zig").PixelInspection {
+        const videos = self.videos orelse return null;
+        return videos.find(movie.bytes, movie.sampling);
     }
 };
 pub const MediaTimings = struct {
@@ -766,29 +772,25 @@ pub fn embedCached(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
 
 /// Indexed readers need packet/picture metadata and one bounded probe payload.
 /// Unknown container inputs retain the full conservative parsing ceiling.
-fn preflightHostBytes(group: Group) !usize {
+pub fn preflightHostBytes(group: Group) !usize {
     const ceiling = 512 * 1024 * 1024;
     var indexed_pictures: ?usize = null;
     var bound_bytes: usize = 0;
-    for (group.content) |part| switch (part) {
-        .video => |bytes| {
-            const input = try group.webmInput(bytes) orelse return ceiling;
-            if (try input.referenceOrdinals()) |ids| {
-                // The source owns the index and selection. Preflight only
-                // retains its inspection wrapper and a bounded copy of IDs.
-                bound_bytes = try std.math.add(usize, bound_bytes, @sizeOf(@import("embedding_gemma2_video.zig").Inspection) + std.mem.sliceAsBytes(ids).len);
-            } else indexed_pictures = try std.math.add(usize, indexed_pictures orelse 0, input.index.pictures.len);
-        },
-        .sampled_video => |movie| {
-            // An unbound AVC reader may reconstruct pictures to establish its
-            // logical index (fields/partitions). Only a bound selection proves
-            // that inspection needs metadata rather than decoder references.
-            if (movie.reader != null and movie.selection == null) return ceiling;
-            const n = if (movie.reader) |reader| reader.packets.len else if (movie.webm) |webm| if (webm.timeline != null and movie.sampling != .reference) @as(usize, 32) else webm.index.pictures.len else return ceiling;
-            indexed_pictures = try std.math.add(usize, indexed_pictures orelse 0, n);
-        },
-        else => {},
-    };
+    for (group.content) |part| {
+        if (Group.encodedVideo(part)) |movie| if (group.inspection(movie)) |item| if (item.portable != null) continue;
+        switch (part) {
+            .video => return ceiling,
+            .sampled_video => |movie| {
+                // An unbound AVC reader may reconstruct pictures to establish its
+                // logical index (fields/partitions). Only a bound selection proves
+                // that inspection needs metadata rather than decoder references.
+                if (movie.reader != null and movie.selection == null) return ceiling;
+                const n = if (movie.reader) |reader| reader.packets.len else if (movie.webm) |webm| if (webm.timeline != null and movie.sampling != .reference) @as(usize, 32) else webm.index.pictures.len else return ceiling;
+                indexed_pictures = try std.math.add(usize, indexed_pictures orelse 0, n);
+            },
+            else => {},
+        }
+    }
     if (indexed_pictures) |count| {
         const metadata = try std.math.add(usize, 64 * 1024 * 1024, try std.math.mul(usize, count, 512));
         bound_bytes = try std.math.add(usize, bound_bytes, metadata);
@@ -916,7 +918,7 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
                 const packet_reader = if (@TypeOf(payload) == SampledVideo) payload.reader else null;
                 const selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null;
                 if (selection != null and packet_reader == null) return error.InvalidVideoReaderSelection;
-                const plan = try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &host_budget, .selection = selection, .webm = try group.webmInput(payload), .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope }, session.backend() == .metal);
+                const plan = try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &host_budget, .selection = selection, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope }, session.backend() == .metal);
                 device_bytes = @max(device_bytes, try plan.deviceBytes());
                 command_slots = @max(command_slots, plan.commands);
                 sequence_bound = try std.math.add(usize, sequence_bound, plan.sequence_tokens);
@@ -949,14 +951,27 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     options.video_cache_pins = &pins;
     bounded.limit = 512 * 1024 * 1024;
     const a = bounded.allocator();
-    var inspection_scope = @import("embedding_gemma2_video.zig").InspectionScope{ .allocator = a };
+    var inspection_scope = @import("embedding_gemma2_video.zig").InspectionScope{ .allocator = a, .admitted = group.videos };
     defer inspection_scope.deinit();
     options.video_inspection_scope = &inspection_scope;
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
     try validateGroupContent(group, options, session.backend() == .cuda);
+    // External callers may lend a plan created without this session's host
+    // admission. Cover its retained allocations until all workers have joined.
+    var metadata_permit: ?RunPermit = null;
+    defer if (metadata_permit) |*permit| permit.deinit();
+    if (group.videos) |videos| if (session.run_admission) |admission| {
+        var uncovered: usize = 0;
+        for (videos.items) |*item| {
+            const admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(item.memory.backing);
+            const funded = if (admitted) |owner| try owner.ownedHostBytesFor(admission.controller) else 0;
+            uncovered = try std.math.add(usize, uncovered, item.memory.live -| funded);
+        }
+        if (uncovered != 0) metadata_permit = try admitHostPreprocess(session, uncovered, control orelse .{});
+    };
     if (@import("build_options").enable_cuda and session.backend() == .cuda) {
         try validateCudaGroup(group, options);
-        if (group.content.len == 1 and group.content[0] == .video) return embedVideo(a, session, tokenizer, group.content[0].video, group.video_inspection, options, lock, control);
+        if (group.content.len == 1 and group.content[0] == .video) return embedVideo(a, session, tokenizer, group.content[0].video, group.inspection(Group.encodedVideo(group.content[0]).?), options, lock, control);
         if (!singleImageGroup(group) or !options.resident_images) return embedCudaGroup(a, session, tokenizer, group, options, lock, control);
     }
     if (options.video_ahead) |ahead| {
@@ -1019,7 +1034,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
                     const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
                     const packet_reader = if (@TypeOf(payload) == SampledVideo) payload.reader else null;
                     const selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null;
-                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(a, io, context.device, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &video_budget, .selection = selection, .webm = try group.webmInput(payload), .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });
+                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(a, io, context.device, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &video_budget, .selection = selection, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });
                     break;
                 },
                 else => {},
@@ -2169,19 +2184,11 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     try effective.check();
     // Bound container metadata before allocating it, without charging the
     // compressed MP4 as device input or opening the decoder before admission.
-    const shared = if (cached) |inspection| blk: {
-        if (!inspection.matches(bytes)) return error.InvalidVideoReaderSelection;
-        if (inspection.prepared) |*prepared| break :blk prepared;
-        return videoInputError(inspection.cuda_error orelse error.InvalidVideoReaderSelection);
-    } else null;
-    // Linked callers may supply a locally bounded inspection without a
-    // process lease. Credit only metadata funded by this admission controller.
-    const preflight = if (shared) |prepared| blk: {
-        const retained = prepared.retainedBytes();
-        const admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(cached.?.memory.backing);
-        const owned = if (admitted != null and session.run_admission != null) try admitted.?.ownedHostBytesFor(session.run_admission.?.controller) else 0;
-        break :blk retained - @min(retained - bytes.len, owned);
-    } else try std.math.add(usize, bytes.len, 128 * 1024 * 1024);
+    if (cached) |item| if (!item.matches(bytes) or item.sampling != .reference) return error.InvalidVideoReaderSelection;
+    const shared = if (cached) |item| if (item.cuda_only) |*prepared| prepared else null else null;
+    const reference = if (cached) |item| if (item.reference) |*ref| ref else null else null;
+    if (cached != null and shared == null and reference == null) return error.InvalidVideoInput;
+    const preflight = if (cached != null) bytes.len else try std.math.add(usize, bytes.len, 128 * 1024 * 1024);
     var host_permit = try session.admitHostPreprocess(preflight);
     defer host_permit.deinit();
     const Check = struct {
@@ -2192,14 +2199,14 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     };
     var local: @import("../ops/cuda/video.zig").PreparedEmbedding = undefined;
     const prepared = shared orelse blk: {
-        local.init(a, bytes, .{ .context = &effective, .check_fn = Check.check }) catch |err| return videoInputError(err);
+        local.initWithSharedPlan(a, bytes, .{ .context = &effective, .check_fn = Check.check }, reference) catch |err| return videoInputError(err);
         break :blk &local;
     };
     var local_live = shared == null;
     defer if (local_live) local.deinit();
     const inspected = prepared.inspection;
     const retained = prepared.retainedBytes();
-    if (local_live) try host_permit.retainHostBytes(retained);
+    if (local_live and reference == null) try host_permit.retainHostBytes(retained);
     var request = try cudaVideoRequest(inspected, bytes.len, options);
     request.pre_admitted_host_bytes = retained;
     var execution_waiter = Scheduler.Waiter{};
@@ -2513,7 +2520,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
                 } else if (!used_prefetch and prefetched != null) blk: {
                     used_prefetch = true;
                     break :blk try prefetched.?.encodeAllocStaged(a, cb, cb.embedding_stage);
-                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .prepared_frames = options.video_prepared_frames, .observer = options.video_observer, .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = try group.webmInput(payload), .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });
+                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .prepared_frames = options.video_prepared_frames, .observer = options.video_observer, .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });
                 defer encoded.deinit(a);
                 var count_video: usize = 0;
                 for (encoded.frame_tokens) |frame_count| count_video += frame_count;
@@ -4846,31 +4853,25 @@ test "embeddinggemma2 video lookahead cancellation precedes model admission and 
     try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
 }
 
-test "embeddinggemma2 native WebM reuses the admitted index and reference ordinals" {
+test "embeddinggemma2 native video borrows admitted packet and WebM plans for mixed groups" {
     const pipeline = @import("embedding_gemma2_video.zig");
-    const a = std.testing.allocator;
-    inline for (.{ "vp8.webm", "vp9.webm", "av1.webm" }) |name| {
+    inline for (.{ "vp8.webm", "vp9.webm", "av1.webm", "codecs/av1.mp4", "codecs/h264.mp4", "codecs/hevc-hvc1.mp4" }) |name| {
         const bytes = @embedFile("../testdata/video/" ++ name);
-        var inspection = pipeline.PixelInspection{};
-        defer inspection.deinit();
-        const pixels = try inspection.inspect(bytes, .{}, .reference);
-        try std.testing.expect(inspection.prepared == null);
-        try std.testing.expectEqual(error.UnsupportedVideoFormat, inspection.cuda_error.?);
-        const group = Group{ .content = &.{.{ .video = bytes }}, .video_inspection = &inspection };
-        const input = (try group.webmInput(bytes[0..bytes.len])).?;
-        const selected = (try input.referenceOrdinals()).?;
-        try std.testing.expect(input.index.reader == input.reader);
-        try std.testing.expectEqual(@sizeOf(pipeline.Inspection) + std.mem.sliceAsBytes(selected).len, try preflightHostBytes(group));
-        const mixed = Group{ .content = &.{ .{ .text = "caption" }, .{ .video = bytes } }, .video_inspection = &inspection };
-        try std.testing.expectEqual(try preflightHostBytes(group), try preflightHostBytes(mixed));
-        inspection.portable_source.limits.max_reads = inspection.portable_source.reads;
-        var scope = pipeline.InspectionScope{ .allocator = a };
+        var item = pipeline.PixelInspection{};
+        defer item.deinit();
+        const pixels = try item.inspect(bytes, .{}, .reference);
+        const videos = AdmittedVideos{ .items = (&item)[0..1] };
+        const group = Group{ .content = &.{ .{ .text = "caption" }, .{ .video = bytes } }, .videos = &videos };
+        try std.testing.expectEqual(0, try preflightHostBytes(group));
+        const entry = item.portable.?;
+        entry.source.limits.max_reads = entry.source.reads;
+        var scope = pipeline.InspectionScope{ .allocator = std.testing.failing_allocator, .admitted = &videos };
         defer scope.deinit();
-        const plan = try pipeline.inspectConfiguredPlan(a, bytes, null, .{}, .{ .webm = input, .inspection_scope = &scope }, false);
-        try std.testing.expectEqual(try preflightHostBytes(group), scope.retainedBytes());
+        const configuration = pipeline.Configuration{ .inspection_scope = &scope };
+        const plan = try pipeline.inspectConfiguredPlan(std.testing.failing_allocator, bytes, null, .{}, configuration, false);
         try std.testing.expectEqual(pixels, plan.pixels);
-        try std.testing.expectEqual(selected.len, plan.pictures);
-        for (selected, plan.picture_indexes[0..plan.pictures]) |expected, actual| try std.testing.expectEqual(expected, actual);
+        try std.testing.expectEqual(entry, scope.find(bytes, null, configuration).?);
+        try std.testing.expectEqual(0, scope.retainedBytes());
     }
 }
 

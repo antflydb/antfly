@@ -87,10 +87,10 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
     if (d->primaries_override >= 0) primaries = d->primaries_override;
     // HDR tone mapping needs an explicit, consistent gamut, as the portable policy does.
     int hdr = transfer == 16 || transfer == 18;
-    if (w == 0 || h == 0 || w % 2 || h % 2 || w > 4096 || h > 4096 || w != d->expected_width || h != d->expected_height ||
+    if (f->coded_width > 4096 || f->coded_height > 4096) { d->failed = 7; return 0; }
+    if (w == 0 || h == 0 || w % 2 || h % 2 || w != d->expected_width || h != d->expected_height ||
         f->codec != d->expected_codec || !f->progressive_sequence || f->chroma_format != cudaVideoChromaFormat_420 ||
         (bit_depth != 8 && bit_depth != 10) || f->bit_depth_chroma_minus8 != f->bit_depth_luma_minus8 ||
-        f->coded_width > 4096 || f->coded_height > 4096 ||
         f->display_area.left < 0 || f->display_area.top < 0 ||
         f->display_area.right > (int)f->coded_width || f->display_area.bottom > (int)f->coded_height ||
         // A declared container aspect wins. Without one, this came from the stream's

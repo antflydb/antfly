@@ -283,7 +283,7 @@ pub const PreparedEmbedding = struct {
         return self.initWithSharedPlan(allocator, bytes, control, null);
     }
 
-    pub fn initWithSharedPlan(self: *PreparedEmbedding, allocator: std.mem.Allocator, bytes: []const u8, control: media.source.Control, shared: ?*const Av1ReferencePlan) !void {
+    pub fn initWithSharedPlan(self: *PreparedEmbedding, allocator: std.mem.Allocator, bytes: []const u8, control: media.source.Control, shared: ?*const ReferencePlan) !void {
         if (bytes.len > packet_sampling.gemma4_max_input_bytes) return error.VideoInputTooLarge;
         self.source = .{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
         const limits = decodeLimits(.embedding_gemma2);
@@ -512,30 +512,30 @@ pub const DisplayPlan = struct {
     visible_count: ?usize = null,
     visible_ordinals: [32]usize = undefined,
 };
-/// Selection from the portable AV1 header walk of the same immutable MP4.
-pub const Av1ReferencePlan = struct {
+/// Presentation selection and normalized reader from the same immutable MP4.
+pub const ReferencePlan = struct {
     original: *const media.mp4.Reader,
     frame_units: usize,
     largest_picture: u64,
     plan: DisplayPlan,
 
-    fn readerFor(self: *const Av1ReferencePlan, bytes: []const u8, limits: media.mp4.Limits, control: media.source.Control) !*const media.mp4.Reader {
+    fn readerFor(self: *const ReferencePlan, bytes: []const u8, limits: media.mp4.Limits, control: media.source.Control) !*const media.mp4.Reader {
         const source = self.original.input.storage;
         if (source != .borrowed or source.borrowed.ptr != bytes.ptr or source.borrowed.len != bytes.len) return error.InvalidVideoReaderSelection;
         // Enforce CUDA geometry limits and the bound track identity without
         // expanding sample tables or selecting a different track.
         const track = try media.mp4.probeTrack(bytes, limits, control);
-        if (track.codec != .av1 or track.id != self.original.track.id) return error.InvalidVideoReaderSelection;
+        if (track.codec != self.original.track.codec or track.id != self.original.track.id) return error.InvalidVideoReaderSelection;
         if (self.original.packets.len > limits.max_samples) return limits.track_limit_error;
         return self.original;
     }
 
-    fn selectionFor(self: *const Av1ReferencePlan, reader: *media.mp4.Reader) !DisplayPlan {
+    fn selectionFor(self: *const ReferencePlan, reader: *media.mp4.Reader) !DisplayPlan {
         try validateDecodeSpan(reader.track, reader.packets);
-        if (self.frame_units > nvdec_max_samples or self.plan.visible_count.? > nvdec_max_samples or self.largest_picture > 4096 * 4096) return error.DecoderEnvelopeExceeded;
+        if (self.frame_units > nvdec_max_samples or (self.plan.visible_count orelse 0) > nvdec_max_samples or self.largest_picture > 4096 * 4096) return error.DecoderEnvelopeExceeded;
         var plan = self.plan;
         for (plan.pictures.ids(), 0..) |packet_id, i| {
-            if (packet_id >= reader.packets.len or (i != 0 and plan.visible_ordinals[i] < plan.visible_ordinals[i - 1])) return error.UnsupportedVideoFormat;
+            if (packet_id >= reader.packets.len or (plan.visible_count != null and i != 0 and plan.visible_ordinals[i] < plan.visible_ordinals[i - 1])) return error.UnsupportedVideoFormat;
             const pts = reader.packets[packet_id].pts;
             plan.pictures.timestamps_us[i] = try timestampUs(if (reader.track.edit.source_duration != null) @max(pts, reader.track.edit.source_start) else pts, reader.track.timescale);
         }
@@ -824,6 +824,22 @@ fn validateTimeline(track: media.mp4.Track, packets: []const media.mp4.Packet) !
         if ((@as(i128, packet.pts) + packet.duration) * 1_000_000 > max_ticks) return error.VideoDurationExceeded;
     }
     return end_us;
+}
+
+test "NVDEC rejects an oversized coded frame cropped to the allowed display width" {
+    const bytes = @embedFile("../../testdata/video/h264-cropped-coded-width.mp4");
+    const track = try media.mp4.probeTrack(bytes, decodeLimits(.embedding_gemma2), .{});
+    try std.testing.expectEqual(4096, track.width);
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try @import("cuda_compute.zig").CudaCompute.init(a);
+    defer compute.deinit();
+    const Capture = struct {
+        fn unexpected(_: *anyopaque, _: Frame) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    try std.testing.expectError(error.DecoderEnvelopeExceeded, decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &compute, .consume = Capture.unexpected }, .embedding_gemma2));
 }
 
 test "gemma4 video NVDEC samples a short HEVC fragment at a nonzero decode time" {

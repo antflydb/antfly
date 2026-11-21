@@ -42,7 +42,10 @@ The L4 serving profile uses the original nearest-even activation rounding.
 Losslessly converted BF16 weights take one F16 product, native F16 weights
 take two products, and remaining BF16 weights use the configured term count.
 The final addition uses F32. A nonfinite result is recomputed directly from
-the original F32 activations and the stored weights.
+the original F32 activations and the stored weights. For inner dimensions of at least
+128, a warp reads contiguous coefficients and reduces their products in
+parallel. If its F32 partial sums overflow, it repeats that dot product in F64.
+Shorter dots retain the original sequential F32 accumulation order.
 
 The offline GB10 residual candidate retains native BF16 weights. A
 single CUDA kernel splits each F32 activation into two or three BF16 terms

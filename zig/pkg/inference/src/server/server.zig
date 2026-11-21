@@ -25974,7 +25974,7 @@ pub const Node = struct {
         var copied: ?[]grouped.Group = null;
         defer if (copied) |values| out.free(values);
         for (input_groups, 0..) |group, index| {
-            if (group.video_inspection == null and group.content.len == 1 and group.content[0] == .video) {
+            if (group.videos == null and GroupVideoInspections.encodedCount(group) != 0) {
                 if (copied == null) copied = try out.dupe(grouped.Group, input_groups);
                 try inspections.prepare(self, out, &copied.?[index], control);
             }
@@ -26115,7 +26115,7 @@ pub const Node = struct {
             const shape = validateEmbeddingGroupContract(self, active_contract, group, groups.len, control) catch |err| {
                 if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
                 try errors.append(a, embedItemFailure(index, err, "embedding"));
-                retained.video_inspections.discard(a, group.video_inspection);
+                retained.video_inspections.discard(a, group.videos);
                 groups[index] = null;
                 continue;
             };
@@ -39524,34 +39524,55 @@ const ParsedBinaryEmbedInput = struct {
 
 const GroupVideoInspections = struct {
     const Inspection = @import("../pipelines/embedding_gemma2_video.zig").PixelInspection;
+    const grouped = @import("../pipelines/embedding_gemma2.zig");
     const Owned = struct {
-        inspection: Inspection = .{},
+        videos: grouped.AdmittedVideos,
         memory: @import("../backends/admitted_allocator.zig").AdmittedAllocator,
         slot: usize,
         fn destroy(owner: *Owned, a: std.mem.Allocator) void {
-            owner.inspection.deinit();
+            for (owner.videos.items) |*item| item.deinit();
+            owner.memory.allocator().free(owner.videos.items);
             owner.memory.deinit();
             a.destroy(owner);
         }
     };
     owned: std.ArrayList(*Owned) = .empty,
 
-    fn prepare(self: *GroupVideoInspections, node: *Node, a: std.mem.Allocator, group: *@import("../pipelines/embedding_gemma2.zig").Group, control: InferenceExecutionControl) !void {
-        if (group.video_inspection != null or group.content.len != 1 or group.content[0] != .video) return;
+    fn encodedCount(group: grouped.Group) usize {
+        var count: usize = 0;
+        for (group.content) |part| count += @intFromBool(grouped.Group.encodedVideo(part) != null);
+        return count;
+    }
+
+    fn prepare(self: *GroupVideoInspections, node: *Node, a: std.mem.Allocator, group: *grouped.Group, control: InferenceExecutionControl) !void {
+        if (group.videos != null) return;
+        const count = encodedCount(group.*);
+        if (count == 0) return;
         const owner = try a.create(Owned);
         errdefer a.destroy(owner);
-        owner.* = .{ .memory = try node.inferencePreparation(), .slot = self.owned.items.len };
+        owner.* = .{ .videos = .{ .items = &.{} }, .memory = try node.inferencePreparation(), .slot = self.owned.items.len };
         errdefer owner.memory.deinit();
-        owner.inspection.memory.backing = owner.memory.allocator();
-        errdefer owner.inspection.deinit();
-        _ = owner.inspection.inspect(group.content[0].video, control, .reference) catch |err|
-            return owner.memory.admission_error orelse err;
+        const backing = owner.memory.allocator();
+        owner.videos.items = backing.alloc(Inspection, count) catch |err| return owner.memory.admission_error orelse err;
+        @memset(owner.videos.items, .{});
+        errdefer {
+            for (owner.videos.items) |*item| item.deinit();
+            backing.free(owner.videos.items);
+        }
+        var index: usize = 0;
+        for (group.content) |part| {
+            const movie = grouped.Group.encodedVideo(part) orelse continue;
+            const item = &owner.videos.items[index];
+            item.memory.backing = backing;
+            _ = item.inspect(movie.bytes, control, movie.sampling) catch |err| return owner.memory.admission_error orelse err;
+            index += 1;
+        }
         try self.owned.append(a, owner);
-        group.video_inspection = &owner.inspection;
+        group.videos = &owner.videos;
     }
-    fn discard(self: *GroupVideoInspections, a: std.mem.Allocator, inspection: ?*const Inspection) void {
-        const value = inspection orelse return;
-        const owner: *Owned = @alignCast(@fieldParentPtr("inspection", @constCast(value)));
+    fn discard(self: *GroupVideoInspections, a: std.mem.Allocator, videos: ?*const grouped.AdmittedVideos) void {
+        const value = videos orelse return;
+        const owner: *Owned = @alignCast(@fieldParentPtr("videos", @constCast(value)));
         const slot = owner.slot;
         std.debug.assert(self.owned.items[slot] == owner);
         _ = self.owned.swapRemove(slot);
@@ -40933,11 +40954,11 @@ const EmbeddingGroupRequestBudget = struct {
 };
 
 fn prepareEmbeddingGroupContract(node: *Node, a: std.mem.Allocator, inspections: *GroupVideoInspections, contract: ResolvedInferenceExecutorContract, group: *@import("../pipelines/embedding_gemma2.zig").Group, count: usize, control: InferenceExecutionControl) !InferenceExecutorInvocationShape {
-    const previous = group.video_inspection;
+    const previous = group.videos;
     try inspections.prepare(node, a, group, control);
     errdefer if (previous == null) {
-        inspections.discard(a, group.video_inspection);
-        group.video_inspection = null;
+        inspections.discard(a, group.videos);
+        group.videos = null;
     };
     return validateEmbeddingGroupContract(node, contract, group.*, count, control);
 }
@@ -40980,9 +41001,9 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
             media_bytes = std.math.add(usize, media_bytes, bytes.len) catch return error.InferenceEncodedBytesExceeded;
             has_video = true;
             const charge = charge: {
-                if (group.content.len == 1 and part == .video) if (group.video_inspection) |inspection| {
-                    if (!inspection.matches(bytes)) return error.InvalidVideoReaderSelection;
-                    break :charge inspection.pixels;
+                if (@import("../pipelines/embedding_gemma2.zig").Group.encodedVideo(part)) |movie| if (group.videos) |videos| {
+                    const item = videos.find(movie.bytes, movie.sampling) orelse return error.InvalidVideoReaderSelection;
+                    break :charge item.pixels;
                 };
                 var memory = try node.inferencePreparation();
                 defer memory.deinit();
@@ -41113,6 +41134,22 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
         .code = "MODEL_RESOURCE_BUSY",
         .message = "insufficient inference capacity is currently available",
     };
+    if (embeddingMediaFailure(err)) |failure| return failure;
+    return switch (err) {
+        error.ResourceLimitExceeded => .{
+            .status = 400,
+            .code = "MODEL_RESOURCE_LIMIT",
+            .message = "request resource plan exceeds the configured inference budget",
+        },
+        else => .{
+            .status = 500,
+            .code = "INFERENCE_FAILED",
+            .message = internalErrorMessage("INFERENCE_FAILED", err),
+        },
+    };
+}
+
+fn embeddingMediaFailure(err: anyerror) ?EmbedDenseInputFailure {
     return switch (err) {
         error.EmbeddingSequenceTooLong => .{
             .status = 400,
@@ -41189,16 +41226,7 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
             .code = "INVALID_IMAGE",
             .message = "unsupported or corrupt image input",
         },
-        error.ResourceLimitExceeded => .{
-            .status = 400,
-            .code = "MODEL_RESOURCE_LIMIT",
-            .message = "request resource plan exceeds the configured inference budget",
-        },
-        else => .{
-            .status = 500,
-            .code = "INFERENCE_FAILED",
-            .message = internalErrorMessage("INFERENCE_FAILED", err),
-        },
+        else => null,
     };
 }
 
@@ -41245,9 +41273,7 @@ test "admission grouped and flat embedding responses preserve resource identity"
 /// Ordered groups can reject corrupt image headers during parsing, before
 /// inference. Preserve the same permanent image error as the execution path.
 fn groupedEmbeddingInputFailure(err: anyerror) ?EmbedDenseInputFailure {
-    if (err == error.ImageDecodeFailed or err == error.NvdecUnavailable or isEmbeddingInputContractError(err))
-        return embedDenseInputFailure(err);
-    return null;
+    return embeddingMediaFailure(err);
 }
 
 test "EmbeddingGemma2 grouped image parse failures keep permanent image errors" {
@@ -41379,11 +41405,7 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
         .retryable = false,
         .status = 413,
     };
-    if (err == error.NvdecUnavailable or isEmbeddingInputContractError(err)) {
-        var failure = embedInputItemFailure(index, err);
-        failure.stage = stage;
-        return failure;
-    }
+    if (embeddingMediaFailure(err)) |failure| return mediaItemFailure(index, failure, if (err == error.ImageDecodeFailed) "image_decode" else stage, err);
     if (isEmbedRequestOptionError(err)) return .{
         .index = @intCast(index),
         .code = "INVALID_REQUEST",
@@ -41402,14 +41424,6 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
         .retry_after_ms = transient_capacity_retry_after_ms,
     };
     return switch (err) {
-        error.ImageDecodeFailed => .{
-            .index = @intCast(index),
-            .code = "INVALID_IMAGE",
-            .message = "unsupported or corrupt image input",
-            .stage = "image_decode",
-            .retryable = false,
-            .status = 400,
-        },
         error.ResourceLimitExceeded => .{
             .index = @intCast(index),
             .code = "MODEL_RESOURCE_LIMIT",
@@ -41429,15 +41443,12 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
     };
 }
 
+fn mediaItemFailure(index: usize, failure: EmbedDenseInputFailure, stage: []const u8, err: anyerror) EmbedItemError {
+    return .{ .index = @intCast(index), .code = failure.code, .message = failure.message, .stage = stage, .retryable = err == error.NvdecUnavailable, .status = failure.status };
+}
+
 fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
-    if (err == error.NvdecUnavailable) {
-        const failure = embedDenseInputFailure(err);
-        return .{ .index = @intCast(index), .code = failure.code, .message = failure.message, .stage = "inference", .retryable = true, .status = failure.status };
-    }
-    if (isEmbeddingInputContractError(err) or err == error.NonFiniteEmbeddingOutput or err == error.ZeroEmbeddingOutput) {
-        const failure = embedDenseInputFailure(err);
-        return .{ .index = @intCast(index), .code = failure.code, .message = failure.message, .stage = "inference", .retryable = false, .status = failure.status };
-    }
+    if (embeddingMediaFailure(err)) |failure| return mediaItemFailure(index, failure, "inference", err);
     if (remoteContentRequestFailure(err)) |failure| {
         return .{
             .index = @intCast(index),
@@ -41527,25 +41538,48 @@ test "embedding decoder envelope reports a nonretryable video limit in both erro
     try std.testing.expect(!item.retryable);
 }
 
-fn isEmbeddingInputContractError(err: anyerror) bool {
-    return switch (err) {
-        error.EmbeddingSequenceTooLong,
-        error.InvalidVideoInput,
-        error.VideoDurationExceeded,
-        error.DecoderEnvelopeExceeded,
-        error.VideoInputTooLarge,
-        error.UnsupportedVideoBackend,
-        error.InvalidAudioSamples,
-        error.UnsupportedAudioFormat,
-        error.EmptyAudioInput,
-        error.InvalidAudioInput,
-        error.AudioTooLarge,
-        error.MediaPlaceholderMismatch,
-        error.EmptyEmbeddingInput,
-        error.InvalidImageInput,
-        => true,
-        else => false,
-    };
+test "grouped video HTTP errors preserve media identity under fail-fast and per-item policies" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    var inputs = [_][]const u8{ "text", "image", "video" };
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &inputs };
+    const contract = try resolvedInferenceExecutorContract(&node, "embed", &manifest);
+    for ([_][]const u8{ @embedFile("../testdata/video/codecs/hevc-422.mp4"), "\x00\x00\x00\x08free" }, [_][]const u8{ "VIDEO_CODEC_UNAVAILABLE", "INVALID_VIDEO" }) |clip, expected| {
+        const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(clip.len));
+        defer a.free(encoded);
+        const body = try std.json.Stringify.valueAlloc(a, .{.{ .content = .{ .{ .type = "text", .text = "caption" }, .{ .type = "media", .mime_type = "video/mp4", .data = std.base64.standard.Encoder.encode(encoded, clip) } } }}, .{});
+        defer a.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        const media = requestMediaAdmission(&node, denseEmbedRequestMediaShape(parsed.value));
+        try node.acquireAdmissionUnits(media.units);
+        var units = media.units;
+        defer node.releaseAdmissionUnits(units);
+        for ([_]EmbedErrorPolicy{ .fail_fast, .per_item }) |policy| {
+            var req = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+            defer req.deinit();
+            var ctx = httpx.Context.init(a, std.testing.io, &req);
+            defer ctx.deinit();
+            var response = node.createGroupedEmbedding(&ctx, "missing-model", &manifest, contract, .{ .model = "missing", .input = parsed.value, .encoding_format = null, .dimensions = null, .task_type = null, .error_policy = policy }, &.{}, .{ .media = media, .reserved_units = &units }, .{}) catch |err| try groupedEmbeddingFailureResponse(&ctx, err);
+            defer response.deinit();
+            var json = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer json.deinit();
+            const result = json.value.object;
+            if (policy == .fail_fast) {
+                try std.testing.expectEqual(400, response.status.code);
+                try std.testing.expectEqualStrings(expected, result.get("error").?.string);
+            } else {
+                try std.testing.expectEqual(200, response.status.code);
+                const failures = result.get("errors").?.array.items;
+                try std.testing.expectEqual(1, failures.len);
+                const item = failures[0].object;
+                try std.testing.expectEqualStrings(expected, item.get("code").?.string);
+                try std.testing.expectEqual(400, item.get("status").?.integer);
+                try std.testing.expect(!item.get("retryable").?.bool);
+            }
+        }
+    }
 }
 
 fn prepareInitialDenseEmbeddingPipeline(
@@ -51256,22 +51290,26 @@ test "embeddinggemma2 grouped video inspection admits actual parser storage and 
     contract.batch.max_encoded_media_bytes = 1024 * 1024;
     contract.batch.max_media_parts_per_item = 1;
     const grouped = @import("../pipelines/embedding_gemma2.zig");
-    const parts = [_]grouped.Part{.{ .video = @embedFile("../testdata/video/codecs/av1.mp4") }};
+    const parts = [_]grouped.Part{ .{ .text = "caption" }, .{ .video = @embedFile("../testdata/video/vp9.webm") } };
     var rejected = grouped.Group{ .content = &parts };
     var inspections = GroupVideoInspections{};
     defer inspections.deinit(a);
     var narrow = contract;
     narrow.batch.max_decoded_pixels = 1;
     try std.testing.expectError(error.InferenceDecodedPixelsExceeded, prepareEmbeddingGroupContract(&node, a, &inspections, narrow, &rejected, 1, .{}));
-    try std.testing.expect(rejected.video_inspection == null);
+    try std.testing.expect(rejected.videos == null);
     try std.testing.expectEqual(@as(usize, 0), domain.admission.snapshot().hostTotalBytes());
     var first = grouped.Group{ .content = &parts };
     var second = grouped.Group{ .content = &parts };
     _ = try prepareEmbeddingGroupContract(&node, a, &inspections, contract, &first, 2, .{});
     _ = try prepareEmbeddingGroupContract(&node, a, &inspections, contract, &second, 2, .{});
-    inspections.discard(a, first.video_inspection);
-    try std.testing.expect(second.video_inspection.?.pixels != 0);
-    inspections.discard(a, second.video_inspection);
+    const entry = first.videos.?.items[0].portable.?;
+    entry.source.limits.max_reads = entry.source.reads;
+    _ = try validateEmbeddingGroupContract(&node, contract, first, 2, .{});
+    try std.testing.expectEqual(0, try grouped.preflightHostBytes(first));
+    inspections.discard(a, first.videos);
+    try std.testing.expect(second.videos.?.items[0].pixels != 0);
+    inspections.discard(a, second.videos);
     try std.testing.expectEqual(@as(usize, 0), domain.admission.snapshot().hostTotalBytes());
 }
 
@@ -53926,7 +53964,7 @@ test "reader direct prompt preparation includes metadata and pinned model in rej
         const content = try a.alloc(u8, 16 * 1024);
         defer a.free(content);
         @memset(content, 'x');
-        try std.testing.expectError(error.OutOfMemory, Node.countPromptTokens(preparation.allocator(), "unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1, false, false));
+        try std.testing.expectError(error.OutOfMemory, Node.countPromptTokens(preparation.allocator(), "unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1, false, false, .{}));
         try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.admission_error.?);
     }
 }
