@@ -10428,6 +10428,48 @@ test "lite native docstore putIndexCatalogBatch publishes primary and index-cata
     try std.testing.expectEqualStrings("1", active_value);
 }
 
+// Many small index-catalog records churned through redo commits and folds
+// (a full-text doc map's shape) keep the allocator consistent.
+test "lite native docstore index catalog churn keeps the allocator consistent" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-index-catalog-churn.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .io = std.testing.io, .use_redo_log = true, .reclamation = .{ .page_reuse = true } });
+    defer store.close();
+
+    var key_buf: [32]u8 = undefined;
+    var value_buf: [12]u8 = undefined;
+    var other_buf: [32]u8 = undefined;
+    for (0..3000) |round| {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        const key = try std.fmt.bufPrint(&key_buf, "worker-{d}-{d}", .{ round % 8, (round * 7919) % 1024 });
+        std.mem.writeInt(u64, value_buf[0..8], round, .big);
+        std.mem.writeInt(u32, value_buf[8..12], @intCast(round % 13), .big);
+        const other = try std.fmt.bufPrint(&other_buf, "worker-{d}-{d}", .{ (round + 3) % 8, (round * 104729) % 1024 });
+        try txn.put(key, "primary");
+        try txn.putIndexCatalogBatch("idx/index", &.{
+            .{ .namespace = "docmap", .key = other, .is_delete = true },
+            .{ .namespace = "docmap", .key = key, .value = &value_buf },
+            .{ .namespace = "meta", .key = "next_seg_id", .value = value_buf[0..8] },
+        });
+        try txn.commit();
+        if (round % 250 == 249) try store.checkpointRedoLog();
+    }
+    try store.checkpointRedoLog();
+    {
+        const report = try store.file.check();
+        if (!report.valid) std.debug.print("live check issue: {s}\n", .{report.issue orelse "?"});
+    }
+    store.close();
+    store = try Store.open(allocator, path, true);
+    const report = try store.file.check();
+    if (!report.valid) std.debug.print("reopened check issue: {s}\n", .{report.issue orelse "?"});
+    try std.testing.expect(report.valid);
+}
+
 // A write reads index state at its own tip: committed records, then what
 // it staged itself, latest staging first and deletes hiding records.
 test "lite native docstore reads index-catalog records at the transaction tip" {

@@ -4100,7 +4100,7 @@ const PageAllocator = struct {
     }
     fn takeMetadataPage(context: *anyopaque) !u64 {
         const self: *PageAllocator = @ptrCast(@alignCast(context));
-        if (self.metadata_cursor == self.metadata_reserve.items.len) return error.InvalidNativeAllocator;
+        if (self.metadata_cursor == self.metadata_reserve.items.len) return nativeAllocatorInvalid(@src());
         const page = self.metadata_reserve.items[self.metadata_cursor];
         self.metadata_cursor += 1;
         return page;
@@ -4196,7 +4196,7 @@ const PageAllocator = struct {
         const root = switch (kind) {
             .document => (try decodeDocumentEntry(payload)).external_value_root_page,
             .catalog => (try decodeCatalogEntry(payload)).external_value_root_page,
-            else => return error.InvalidNativeAllocator,
+            else => return nativeAllocatorInvalid(@src()),
         };
         if (root != 0) try self.retainValue(root);
     }
@@ -11205,8 +11205,8 @@ pub const NativeFile = struct {
         var id = state.first_pending;
         var count: usize = 0;
         while (id != 0) {
-            const item = state.pending.get(id) orelse return error.InvalidNativeAllocator;
-            if (id <= previous or item.id != id or count >= state.pending.count()) return error.InvalidNativeAllocator;
+            const item = state.pending.get(id) orelse return nativeAllocatorInvalid(@src());
+            if (id <= previous or item.id != id or count >= state.pending.count()) return nativeAllocatorInvalid(@src());
             var encoded: [40]u8 = @splat(0);
             std.mem.writeInt(u64, encoded[0..8], id, .little);
             std.mem.writeInt(u64, encoded[8..16], item.epoch, .little);
@@ -11218,7 +11218,7 @@ pub const NativeFile = struct {
             previous = id;
             id = item.next;
         }
-        if (count != state.pending.count()) return error.InvalidNativeAllocator;
+        if (count != state.pending.count()) return nativeAllocatorInvalid(@src());
         var result: [32]u8 = undefined;
         hash.final(&result);
         return result;
@@ -11771,7 +11771,7 @@ pub const NativeFile = struct {
                 // fast-path compared the two unconditionally and flagged
                 // every such (legitimate) lag as `InvalidNativeAllocator`.
                 const allow_behind = self.header.redo_log_capacity != 0;
-                if (if (allow_behind) state.root.covered_pages > checkpoint.page_count else state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+                if (if (allow_behind) state.root.covered_pages > checkpoint.page_count else state.root.covered_pages != checkpoint.page_count) return nativeAllocatorInvalid(@src());
                 self.allocator_ledger_rebased = true;
                 self.allocator_work.journal_rebases +|= 1;
                 self.allocator_work.journal_rebase_ns +|= @intCast(@max(0, started.durationTo(std.Io.Clock.awake.now(self.runtime())).nanoseconds));
@@ -11789,7 +11789,7 @@ pub const NativeFile = struct {
             // legitimately ahead of what the ledger root itself covers.
             const covered_pages = (try allocator_v4.State.decodeRoot(payload)).covered_pages;
             const allow_behind = self.header.redo_log_capacity != 0;
-            if (if (allow_behind) covered_pages > checkpoint.page_count else covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+            if (if (allow_behind) covered_pages > checkpoint.page_count else covered_pages != checkpoint.page_count) return nativeAllocatorInvalid(@src());
         }
         const started = std.Io.Clock.awake.now(self.runtime());
         self.allocator_work.full_loads +|= 1;
@@ -12039,8 +12039,8 @@ pub const NativeFile = struct {
         var pending = state.pending.valueIterator();
         while (pending.next()) |item| {
             if (cancel) |token| try token.check();
-            if (item.kind != .record and physicalPage(item.page) != item.page) return error.InvalidNativeAllocator;
-            if (item.epoch > checkpoint.commit_sequence) return error.InvalidNativeAllocator;
+            if (item.kind != .record and physicalPage(item.page) != item.page) return nativeAllocatorInvalid(@src());
+            if (item.epoch > checkpoint.commit_sequence) return nativeAllocatorInvalid(@src());
             try self.indexedMark(graph, checkpoint, item.page);
             switch (item.kind) {
                 .allocator_chain => {
@@ -12048,20 +12048,20 @@ pub const NativeFile = struct {
                     while (page != 0) {
                         if (cancel) |token| try token.check();
                         try self.indexedMark(graph, checkpoint, page);
-                        if (state.count(page) != 0 or page == state.root_page or metadata_retirements.contains(page) or current_metadata.contains(page)) return error.InvalidNativeAllocator;
+                        if (state.count(page) != 0 or page == state.root_page or metadata_retirements.contains(page) or current_metadata.contains(page)) return nativeAllocatorInvalid(@src());
                         try metadata_retirements.put(self.allocator, page, {});
                         const next = try self.retiredAllocatorNext(page, checkpoint);
                         page = if (next == item.length) 0 else next;
                     }
                 },
                 .metadata => {
-                    if (state.count(item.page) != 0 or item.page == state.root_page or metadata_retirements.contains(item.page) or current_metadata.contains(item.page)) return error.InvalidNativeAllocator;
+                    if (state.count(item.page) != 0 or item.page == state.root_page or metadata_retirements.contains(item.page) or current_metadata.contains(item.page)) return nativeAllocatorInvalid(@src());
                     try metadata_retirements.put(self.allocator, item.page, {});
                 },
                 .page => try expected.retain(item.page),
                 .value => try self.indexedValue(graph, checkpoint, item.page, item.length, cancel),
                 .index => {
-                    if (graph.nodes.contains(item.page)) return error.InvalidNativeAllocator;
+                    if (graph.nodes.contains(item.page)) return nativeAllocatorInvalid(@src());
                     try graph.nodes.put(self.allocator, item.page, {});
                     try expected.retain(item.page);
                     const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, item.page, .document_index, checkpoint);
@@ -12074,7 +12074,7 @@ pub const NativeFile = struct {
                     };
                 },
                 .record => {
-                    if (graph.records.contains(item.page)) return error.InvalidNativeAllocator;
+                    if (graph.records.contains(item.page)) return nativeAllocatorInvalid(@src());
                     try graph.records.put(self.allocator, item.page, {});
                     try expected.retain(physicalPage(item.page));
                     const raw = try self.readPageAllocForCheckpoint(self.allocator, item.page, checkpoint);
@@ -12088,7 +12088,7 @@ pub const NativeFile = struct {
                             const record = try decodeCatalogEntry(try decodePagePayload(raw, .catalog));
                             break :blk .{ record.external_value_root_page, record.external_value_len };
                         },
-                        else => return error.InvalidNativeAllocator,
+                        else => return nativeAllocatorInvalid(@src()),
                     };
                     if (root != 0) try self.indexedValue(graph, checkpoint, root, length, cancel);
                 },
@@ -12098,10 +12098,10 @@ pub const NativeFile = struct {
             if (cancel) |token| try token.check();
             const wanted = expected.count(page);
             if (references == allocator_v4.free) {
-                if (wanted != 0) return error.InvalidNativeAllocator;
+                if (wanted != 0) return nativeAllocatorInvalid(@src());
             } else if (references != wanted) {
                 // allocatePage exposes owned raw blocks without an index edge.
-                if (wanted != 0 or references != 1) return error.InvalidNativeAllocator;
+                if (wanted != 0 or references != 1) return nativeAllocatorInvalid(@src());
                 const raw = try self.readPageAllocForCheckpoint(self.allocator, page, checkpoint);
                 defer self.allocator.free(raw);
                 _ = try decodePagePayload(raw, .data);
@@ -12123,7 +12123,7 @@ pub const NativeFile = struct {
         // always invalid, redo or not: no page beyond page_count exists
         // yet for anything to be owned within.
         const allow_behind = self.header.redo_log_capacity != 0;
-        if (if (allow_behind) state.root.covered_pages > checkpoint.page_count else state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+        if (if (allow_behind) state.root.covered_pages > checkpoint.page_count else state.root.covered_pages != checkpoint.page_count) return nativeAllocatorInvalid(@src());
         // §9 (redo + indexed reclamation): `state` was loaded against, and
         // `checkpoint` names, one specific generation -- but neither caller
         // of this function holds any lock that stops another generation
@@ -12184,7 +12184,7 @@ pub const NativeFile = struct {
             var pages = graph.pages.keyIterator();
             while (pages.next()) |page| {
                 if (cancel) |token| try token.check();
-                if (state.count(page.*) == allocator_v4.free or state.count(page.*) == 0) return error.InvalidNativeAllocator;
+                if (state.count(page.*) == allocator_v4.free or state.count(page.*) == 0) return nativeAllocatorInvalid(@src());
             }
             const old_payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, slot.free_map_root_page, .free_map, slot);
             defer self.allocator.free(old_payload);
@@ -12199,7 +12199,7 @@ pub const NativeFile = struct {
             // since those commits never rebuild the free map -- so this
             // slot's own stored root legitimately still covers fewer
             // pages than `slot.page_count` now says.
-            if ((if (allow_behind) old_root.covered_pages > slot.page_count else old_root.covered_pages != slot.page_count) or state.count(slot.free_map_root_page) == allocator_v4.free) return error.InvalidNativeAllocator;
+            if ((if (allow_behind) old_root.covered_pages > slot.page_count else old_root.covered_pages != slot.page_count) or state.count(slot.free_map_root_page) == allocator_v4.free) return nativeAllocatorInvalid(@src());
             // The fallback may name an older ledger. Read it independently;
             // loading it into the owner's cache would discard current state.
             var pinned_old_ctx = CheckpointPinnedLedgerContext{ .file = self, .checkpoint = slot };
@@ -12207,7 +12207,7 @@ pub const NativeFile = struct {
             defer old_state.deinit();
             for (old_state.metadata.items) |page| {
                 if (cancel) |token| try token.check();
-                if (state.count(page) == allocator_v4.free) return error.InvalidNativeAllocator;
+                if (state.count(page) == allocator_v4.free) return nativeAllocatorInvalid(@src());
             }
             if (active) {
                 // Same supersession as the entry check above (this
@@ -12229,7 +12229,7 @@ pub const NativeFile = struct {
         const kind: PageKind = switch (raw[4]) {
             @backingInt(PageKind.free_map) => .free_map,
             @backingInt(PageKind.allocator) => .allocator,
-            else => return error.InvalidNativeAllocator,
+            else => return nativeAllocatorInvalid(@src()),
         };
         return try a.dupe(u8, try decodePagePayload(raw, kind));
     }
@@ -12268,7 +12268,7 @@ pub const NativeFile = struct {
         const kind: PageKind = switch (raw[4]) {
             @backingInt(PageKind.free_map) => .free_map,
             @backingInt(PageKind.allocator) => .allocator,
-            else => return error.InvalidNativeAllocator,
+            else => return nativeAllocatorInvalid(@src()),
         };
         return try a.dupe(u8, try decodePagePayload(raw, kind));
     }
@@ -12381,7 +12381,7 @@ pub const NativeFile = struct {
     fn retiredAllocatorNext(self: *NativeFile, page: u64, checkpoint: CheckpointSlot) !u64 {
         const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page, .allocator, checkpoint);
         defer self.allocator.free(payload);
-        if (payload.len < 16 or (!std.mem.eql(u8, payload[0..4], "L4SS") and !std.mem.eql(u8, payload[0..4], "L4RQ") and !std.mem.eql(u8, payload[0..4], "L4DL"))) return error.InvalidNativeAllocator;
+        if (payload.len < 16 or (!std.mem.eql(u8, payload[0..4], "L4SS") and !std.mem.eql(u8, payload[0..4], "L4RQ") and !std.mem.eql(u8, payload[0..4], "L4DL"))) return nativeAllocatorInvalid(@src());
         return std.mem.readInt(u64, payload[8..16], .little);
     }
 
@@ -12428,7 +12428,7 @@ pub const NativeFile = struct {
             if (self.allocator_cancel_token) |token| try token.check();
             const root = state.metadata_heap.peek() orelse break;
             if (root.epoch > metadata_frontier) break;
-            if (root.page == 0 or root.page >= checkpoint.page_count) return error.InvalidNativeAllocator;
+            if (root.page == 0 or root.page >= checkpoint.page_count) return nativeAllocatorInvalid(@src());
             try state.complete(root);
             try state.releaseMetadata(root.page);
         }
@@ -12460,11 +12460,11 @@ pub const NativeFile = struct {
                 else => 8,
             };
             if (state.pending.count() + expansion >= state.pending_limit + allocator_v4.collector_reserve) break;
-            if (physicalPage(item.page) == 0 or physicalPage(item.page) >= checkpoint.page_count) return error.InvalidNativeAllocator;
+            if (physicalPage(item.page) == 0 or physicalPage(item.page) >= checkpoint.page_count) return nativeAllocatorInvalid(@src());
             try state.complete(item);
             switch (item.kind) {
                 .metadata => try state.releaseMetadata(item.page),
-                .allocator_chain => return error.InvalidNativeAllocator,
+                .allocator_chain => return nativeAllocatorInvalid(@src()),
                 .page => {
                     _ = try self.releaseRetiredPage(state, item.page);
                 },
@@ -12482,7 +12482,7 @@ pub const NativeFile = struct {
                             state.retired_inline_bytes +|= record.key.len + record.value.len;
                             break :blk .{ record.external_value_root_page, record.external_value_len };
                         },
-                        else => return error.InvalidNativeAllocator,
+                        else => return nativeAllocatorInvalid(@src()),
                     };
                     if (root != 0) try state.retireCollected(.{ .epoch = item.epoch, .page = root, .length = length, .kind = .value });
                     _ = try self.releaseRetiredPage(state, physicalPage(item.page));
@@ -12596,7 +12596,7 @@ pub const NativeFile = struct {
             checkpoint.page_count = pages.next_page_id;
             return self.writeFreeMapPage(checkpoint.free_map_root_page, checkpoint.page_count, pages.remainingFreePages());
         }
-        const state = pages.ledger orelse return error.InvalidNativeAllocator;
+        const state = pages.ledger orelse return nativeAllocatorInvalid(@src());
         var orphaned = pages.pending_values.iterator();
         while (orphaned.next()) |entry| try state.retire(.{ .epoch = self.publicationEpoch(), .page = entry.key_ptr.*, .length = entry.value_ptr.*, .kind = .value });
         pages.pending_values.clearRetainingCapacity();
@@ -12619,7 +12619,7 @@ pub const NativeFile = struct {
         }
         try pages.flush();
         try state.persist(.{ .context = pages, .allocate = PageAllocator.takeMetadataPage, .read = PageAllocator.readLedgerPage, .write = PageAllocator.writeLedgerPage, .payload_bytes = self.maxPagePayloadBytes(), .cancel_requested = if (self.allocator_cancel_token) |token| &token.requested else null }, checkpoint.free_map_root_page, &pages.next_page_id);
-        if (pages.metadata_cursor != pages.metadata_reserve.items.len) return error.InvalidNativeAllocator;
+        if (pages.metadata_cursor != pages.metadata_reserve.items.len) return nativeAllocatorInvalid(@src());
         checkpoint.page_count = pages.next_page_id;
         pages.ledger_persisted = true;
         if (self.reserve_retirement_capacity and !self.maintenance_publication) {
@@ -13903,7 +13903,7 @@ pub const NativeFile = struct {
         // A redo reservation release that must land in this same commit
         // (`releaseRedoReservation`).
         if (self.transaction_pages == null) if (self.catalog_commit_release) |release| {
-            const state = page_allocator.ledger orelse return error.InvalidNativeAllocator;
+            const state = page_allocator.ledger orelse return nativeAllocatorInvalid(@src());
             var page = release.from_page;
             while (page < release.to_page) : (page += 1) try state.releaseMetadata(page);
         };
@@ -38909,6 +38909,12 @@ test "lite redo log mixed solo-and-bulk commit reads back when the log has room"
 
 /// Reports which check found the redo log corrupt: the error alone does
 /// not say, and a corrupt log is never routine.
+/// Reports which allocator check failed (diagnostics for multi-process runs).
+fn nativeAllocatorInvalid(src: std.builtin.SourceLocation) error{InvalidNativeAllocator} {
+    std.log.warn("native allocator invalid: {s}:{d} in {s}", .{ src.file, src.line, src.fn_name });
+    return error.InvalidNativeAllocator;
+}
+
 fn redoLogCorrupt(src: std.builtin.SourceLocation) error{NativeRedoLogCorrupt} {
     std.log.warn("redo log corrupt: {s}:{d} in {s}", .{ src.file, src.line, src.fn_name });
     return error.NativeRedoLogCorrupt;

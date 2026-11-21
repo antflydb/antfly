@@ -199,7 +199,7 @@ pub const State = struct {
         // Update this copy when State gains a field.
         comptime std.debug.assert(std.meta.fieldNames(State).len == 29);
         if (self.changes.count() != 0 or self.added.items.len != 0 or self.completed.items.len != 0)
-            return error.InvalidNativeAllocator;
+            return invalidAllocator(@src());
         var copy = State.init(a);
         errdefer copy.deinit();
         copy.counts = try self.counts.clone(a);
@@ -309,7 +309,7 @@ pub const State = struct {
         for (0..pending_chunk_items) |offset| {
             const id = chunk * pending_chunk_items + offset;
             if (self.pending.get(id)) |item| {
-                if (item.id != id) return error.InvalidNativeAllocator;
+                if (item.id != id) return invalidAllocator(@src());
                 hash.update(&.{1});
                 var encoded: [40]u8 = @splat(0);
                 std.mem.writeInt(u64, encoded[0..8], id, .little);
@@ -414,7 +414,7 @@ pub const State = struct {
         self.* = undefined;
     }
     fn ensure(self: *State, page: u64) !void {
-        const needed = std.math.cast(usize, std.math.add(u64, page, 1) catch return error.InvalidNativeAllocator) orelse return error.InvalidNativeAllocator;
+        const needed = std.math.cast(usize, std.math.add(u64, page, 1) catch return invalidAllocator(@src())) orelse return invalidAllocator(@src());
         if (needed <= self.counts.items.len) return;
         const old = self.counts.items.len;
         try self.counts.resize(self.allocator, needed);
@@ -436,7 +436,7 @@ pub const State = struct {
     }
     pub fn reserveTail(self: *State, page: u64) !void {
         try self.ensure(page);
-        if (self.count(page) != 0) return error.InvalidNativeAllocator;
+        if (self.count(page) != 0) return invalidAllocator(@src());
     }
     fn setBitmap(self: *State, page: u64, available: bool) void {
         var index: usize = @intCast(page);
@@ -452,7 +452,7 @@ pub const State = struct {
         }
     }
     fn set(self: *State, page: u64, references: u32, journal: bool) !void {
-        if (page == 0 or (references >= free and references != free)) return error.InvalidNativeAllocator;
+        if (page == 0 or (references >= free and references != free)) return invalidAllocator(@src());
         try self.ensure(page);
         const previous = self.counts.items[@intCast(page)];
         if (journal) try self.changes.put(self.allocator, page, references);
@@ -486,13 +486,13 @@ pub const State = struct {
     }
     pub fn retain(self: *State, page: u64) !void {
         const current = self.count(page);
-        if (current == free or current == max_references) return error.InvalidNativeAllocator;
+        if (current == free or current == max_references) return invalidAllocator(@src());
         try self.set(page, current + 1, true);
     }
     /// Only the last removed ownership can retire children of a shared value.
     pub fn release(self: *State, page: u64) !bool {
         const current = self.count(page);
-        if (current == 0 or current >= free) return error.InvalidNativeAllocator;
+        if (current == 0 or current >= free) return invalidAllocator(@src());
         try self.set(page, if (current == 1) free else current - 1, true);
         return current == 1;
     }
@@ -501,12 +501,12 @@ pub const State = struct {
     /// until its completion has crossed both recovery slots.
     pub fn releaseDeferred(self: *State, page: u64) !bool {
         const current = self.count(page);
-        if (current == 0 or current >= free) return error.InvalidNativeAllocator;
+        if (current == 0 or current >= free) return invalidAllocator(@src());
         try self.set(page, current - 1, true);
         return current == 1;
     }
     pub fn releaseMetadata(self: *State, page: u64) !void {
-        if (self.count(page) != 0) return error.InvalidNativeAllocator;
+        if (self.count(page) != 0) return invalidAllocator(@src());
         try self.set(page, free, true);
     }
     pub fn allocate(self: *State) !?u64 {
@@ -515,12 +515,12 @@ pub const State = struct {
         var level: usize = self.bitmap.len;
         while (level > 0) {
             level -= 1;
-            if (index >= self.bitmap[level].items.len) return error.InvalidNativeAllocator;
+            if (index >= self.bitmap[level].items.len) return invalidAllocator(@src());
             const word = self.bitmap[level].items[index];
-            if (word == 0) return error.InvalidNativeAllocator;
+            if (word == 0) return invalidAllocator(@src());
             index = index * 64 + @as(usize, @intCast(@ctz(word)));
         }
-        if (self.count(index) != free) return error.InvalidNativeAllocator;
+        if (self.count(index) != free) return invalidAllocator(@src());
         try self.set(index, 0, true);
         self.allocations +|= 1;
         return index;
@@ -571,9 +571,9 @@ pub const State = struct {
     }
     pub fn complete(self: *State, item: Retirement) !void {
         try self.completed.append(self.allocator, item.id);
-        const first = self.queue(item.kind).pop() orelse return error.InvalidNativeAllocator;
-        if (first.id != item.id) return error.InvalidNativeAllocator;
-        const linked = self.pending.get(item.id) orelse return error.InvalidNativeAllocator;
+        const first = self.queue(item.kind).pop() orelse return invalidAllocator(@src());
+        if (first.id != item.id) return invalidAllocator(@src());
+        const linked = self.pending.get(item.id) orelse return invalidAllocator(@src());
         try self.dirtyPending(item.id);
         if (linked.previous != 0) self.pending.getPtr(linked.previous).?.next = linked.next else self.first_pending = linked.next;
         if (linked.next != 0) self.pending.getPtr(linked.next).?.previous = linked.previous else self.last_pending = linked.previous;
@@ -638,12 +638,12 @@ pub const State = struct {
         while (page != self.root.deltas) {
             try io.checkCancel();
             if (page == 0 or page == next.delta_stop or deltas.items.len >= max_pages) return false;
-            if (page >= next.covered_pages) return error.InvalidNativeAllocator;
-            for (deltas.items) |seen| if (seen == page) return error.InvalidNativeAllocator;
+            if (page >= next.covered_pages) return invalidAllocator(@src());
+            for (deltas.items) |seen| if (seen == page) return invalidAllocator(@src());
             try deltas.append(self.allocator, page);
             const payload = try io.read(io.context, self.allocator, page);
             defer self.allocator.free(payload);
-            if (payload.len < 16 or !std.mem.eql(u8, payload[0..4], "L4DL") or (payload.len - 16) % 56 != 0) return error.InvalidNativeAllocator;
+            if (payload.len < 16 or !std.mem.eql(u8, payload[0..4], "L4DL") or (payload.len - 16) % 56 != 0) return invalidAllocator(@src());
             page = get64(payload, 8);
         }
         try self.ensure(next.covered_pages - 1);
@@ -659,13 +659,13 @@ pub const State = struct {
                 switch (entry[0]) {
                     1 => {
                         const changed = get64(entry, 8);
-                        if (changed >= next.covered_pages) return error.InvalidNativeAllocator;
-                        try self.set(changed, std.math.cast(u32, get64(entry, 16)) orelse return error.InvalidNativeAllocator, false);
+                        if (changed >= next.covered_pages) return invalidAllocator(@src());
+                        try self.set(changed, std.math.cast(u32, get64(entry, 16)) orelse return invalidAllocator(@src()), false);
                     },
                     2 => {
                         var item = try decodeRetirement(entry[8..][0..48]);
                         if (item.id < self.root.next_id or item.id >= next.next_id or item.page == 0 or self.pending.contains(item.id) or
-                            self.pending.count() >= max_pending_objects + collector_reserve) return error.InvalidNativeAllocator;
+                            self.pending.count() >= max_pending_objects + collector_reserve) return invalidAllocator(@src());
                         try self.dirtyPending(item.id);
                         item.previous = self.last_pending;
                         try self.pending.put(self.allocator, item.id, item);
@@ -676,7 +676,7 @@ pub const State = struct {
                     },
                     3 => {
                         const id = get64(entry, 8);
-                        const item = self.pending.get(id) orelse return error.InvalidNativeAllocator;
+                        const item = self.pending.get(id) orelse return invalidAllocator(@src());
                         try self.dirtyPending(id);
                         if (item.previous != 0) self.pending.getPtr(item.previous).?.next = item.next else self.first_pending = item.next;
                         if (item.next != 0) self.pending.getPtr(item.next).?.previous = item.previous else self.last_pending = item.previous;
@@ -684,15 +684,15 @@ pub const State = struct {
                         self.stale_heap_items += 1;
                         if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending -= 1;
                     },
-                    else => return error.InvalidNativeAllocator,
+                    else => return invalidAllocator(@src()),
                 }
             }
         }
         self.root = next;
         self.root_page = root_page;
-        if (root_page >= next.covered_pages or self.count(root_page) == free) return error.InvalidNativeAllocator;
-        for (deltas.items) |metadata_page| if (self.count(metadata_page) == free) return error.InvalidNativeAllocator;
-        if (next.build_cursor != 0 and !self.pending.contains(next.build_cursor)) return error.InvalidNativeAllocator;
+        if (root_page >= next.covered_pages or self.count(root_page) == free) return invalidAllocator(@src());
+        for (deltas.items) |metadata_page| if (self.count(metadata_page) == free) return invalidAllocator(@src());
+        if (next.build_cursor != 0 and !self.pending.contains(next.build_cursor)) return invalidAllocator(@src());
         self.pruneHeap(&self.heap);
         self.pruneHeap(&self.metadata_heap);
         self.pruneHeap(&self.chains_heap);
@@ -746,21 +746,21 @@ pub const State = struct {
         inline for (.{ "delta_stop", "build_snapshot", "build_pending", "build_end", "build_cursor", "build_limit", "build_boundary", "build_delta_bytes" }, 0..) |name, i| put64(out, 64 + i * 8, @field(root, name));
     }
     pub fn decodeRoot(raw: []const u8) !Root {
-        if (raw.len != 64 and raw.len != 128 and raw.len != 192) return error.InvalidNativeAllocator;
+        if (raw.len != 64 and raw.len != 128 and raw.len != 192) return invalidAllocator(@src());
         const version = get64(raw, 56);
         if (!std.mem.eql(u8, raw[0..8], "AFL4ALOC") or version < 1 or version > 3 or
-            (version == 2 and raw.len != 128) or (version == 3 and raw.len != 192)) return error.InvalidNativeAllocator;
+            (version == 2 and raw.len != 128) or (version == 3 and raw.len != 192)) return invalidAllocator(@src());
         var root: Root = .{ .snapshot = get64(raw, 8), .pending = get64(raw, 16), .deltas = get64(raw, 24), .next_id = get64(raw, 32), .covered_pages = get64(raw, 40), .delta_bytes = get64(raw, 48) };
         if (version >= 2) inline for (.{ "delta_stop", "build_snapshot", "build_pending", "build_end", "build_cursor", "build_limit", "build_boundary", "build_delta_bytes" }, 0..) |name, i| {
             @field(root, name) = get64(raw, 64 + i * 8);
         };
-        if (root.next_id == 0 or root.covered_pages == 0 or root.snapshot == 0) return error.InvalidNativeAllocator;
+        if (root.next_id == 0 or root.covered_pages == 0 or root.snapshot == 0) return invalidAllocator(@src());
         for ([_]u64{ root.snapshot, root.pending, root.deltas, root.build_snapshot, root.build_pending }) |page|
-            if (page >= root.covered_pages) return error.InvalidNativeAllocator;
-        if (root.delta_stop >= root.covered_pages or root.build_boundary >= root.covered_pages) return error.InvalidNativeAllocator;
+            if (page >= root.covered_pages) return invalidAllocator(@src());
+        if (root.delta_stop >= root.covered_pages or root.build_boundary >= root.covered_pages) return invalidAllocator(@src());
         if (root.build_limit == 0) {
-            if (root.build_snapshot != 0 or root.build_pending != 0 or root.build_end != 0 or root.build_cursor != 0 or root.build_boundary != 0 or root.build_delta_bytes != 0) return error.InvalidNativeAllocator;
-        } else if (root.build_limit > root.next_id or root.build_end == 0 or root.build_end > root.covered_pages or root.build_cursor >= root.next_id or root.build_snapshot == 0) return error.InvalidNativeAllocator;
+            if (root.build_snapshot != 0 or root.build_pending != 0 or root.build_end != 0 or root.build_cursor != 0 or root.build_boundary != 0 or root.build_delta_bytes != 0) return invalidAllocator(@src());
+        } else if (root.build_limit > root.next_id or root.build_end == 0 or root.build_end > root.covered_pages or root.build_cursor >= root.next_id or root.build_snapshot == 0) return invalidAllocator(@src());
         return root;
     }
 
@@ -782,10 +782,10 @@ pub const State = struct {
             try self.visit(page, &visited);
             const payload = try io.read(io.context, a, page);
             defer a.free(payload);
-            if (payload.len < 24 or !std.mem.eql(u8, payload[0..4], "L4SS")) return error.InvalidNativeAllocator;
+            if (payload.len < 24 or !std.mem.eql(u8, payload[0..4], "L4SS")) return invalidAllocator(@src());
             const first = get64(payload, 16);
             const n = (payload.len - 24) / 4;
-            if ((payload.len - 24) % 4 != 0 or first != snapshot_first or first > self.root.covered_pages or n > self.root.covered_pages - first) return error.InvalidNativeAllocator;
+            if ((payload.len - 24) % 4 != 0 or first != snapshot_first or first > self.root.covered_pages or n > self.root.covered_pages - first) return invalidAllocator(@src());
             for (0..n) |i| {
                 try io.checkCancel();
                 const value = std.mem.readInt(u32, payload[24 + i * 4 ..][0..4], .little);
@@ -800,12 +800,12 @@ pub const State = struct {
             try self.visit(page, &visited);
             const payload = try io.read(io.context, a, page);
             defer a.free(payload);
-            if (payload.len < 16 or !std.mem.eql(u8, payload[0..4], "L4RQ") or (payload.len - 16) % 48 != 0) return error.InvalidNativeAllocator;
+            if (payload.len < 16 or !std.mem.eql(u8, payload[0..4], "L4RQ") or (payload.len - 16) % 48 != 0) return invalidAllocator(@src());
             var offset: usize = 16;
             while (offset < payload.len) : (offset += 48) {
                 try io.checkCancel();
                 const item = try decodeRetirement(payload[offset..][0..48]);
-                if (self.pending.contains(item.id) or self.pending.count() >= max_pending_objects + collector_reserve) return error.InvalidNativeAllocator;
+                if (self.pending.contains(item.id) or self.pending.count() >= max_pending_objects + collector_reserve) return invalidAllocator(@src());
                 try self.pending.put(a, item.id, item);
             }
             page = get64(payload, 8);
@@ -815,7 +815,7 @@ pub const State = struct {
         page = self.root.deltas;
         var before_build_boundary = true;
         while (page != self.root.delta_stop) {
-            if (page == 0) return error.InvalidNativeAllocator;
+            if (page == 0) return invalidAllocator(@src());
             try io.checkCancel();
             try self.visit(page, &visited);
             if (page == self.root.build_boundary) before_build_boundary = false;
@@ -823,7 +823,7 @@ pub const State = struct {
             try deltas.append(a, page);
             const payload = try io.read(io.context, a, page);
             defer a.free(payload);
-            if (payload.len < 16 or !std.mem.eql(u8, payload[0..4], "L4DL") or (payload.len - 16) % 56 != 0) return error.InvalidNativeAllocator;
+            if (payload.len < 16 or !std.mem.eql(u8, payload[0..4], "L4DL") or (payload.len - 16) % 56 != 0) return invalidAllocator(@src());
             page = get64(payload, 8);
         }
         var i = deltas.items.len;
@@ -839,28 +839,28 @@ pub const State = struct {
                 switch (entry[0]) {
                     1 => {
                         const changed_page = get64(entry, 8);
-                        if (changed_page >= self.root.covered_pages) return error.InvalidNativeAllocator;
-                        try self.set(changed_page, std.math.cast(u32, get64(entry, 16)) orelse return error.InvalidNativeAllocator, false);
+                        if (changed_page >= self.root.covered_pages) return invalidAllocator(@src());
+                        try self.set(changed_page, std.math.cast(u32, get64(entry, 16)) orelse return invalidAllocator(@src()), false);
                     },
                     2 => {
                         const item = try decodeRetirement(entry[8..][0..48]);
                         if (self.pending.get(item.id)) |existing| {
                             // The first builder batch can sample additions
                             // whose journal is published in that same batch.
-                            if (get64(raw, 56) == 1 or existing.epoch != item.epoch or existing.page != item.page or existing.length != item.length or existing.kind != item.kind) return error.InvalidNativeAllocator;
+                            if (get64(raw, 56) == 1 or existing.epoch != item.epoch or existing.page != item.page or existing.length != item.length or existing.kind != item.kind) return invalidAllocator(@src());
                         }
                         try self.pending.put(a, item.id, item);
                     },
                     3 => {
                         const id = get64(entry, 8);
-                        if (id == 0 or id >= self.root.next_id) return error.InvalidNativeAllocator;
-                        if (!self.removePending(id) and get64(raw, 56) == 1) return error.InvalidNativeAllocator;
+                        if (id == 0 or id >= self.root.next_id) return invalidAllocator(@src());
+                        if (!self.removePending(id) and get64(raw, 56) == 1) return invalidAllocator(@src());
                     },
-                    else => return error.InvalidNativeAllocator,
+                    else => return invalidAllocator(@src()),
                 }
             }
         }
-        if (self.pending.count() > max_pending_objects + collector_reserve) return error.InvalidNativeAllocator;
+        if (self.pending.count() > max_pending_objects + collector_reserve) return invalidAllocator(@src());
         var ids: std.ArrayList(u64) = .empty;
         defer ids.deinit(a);
         var keys = self.pending.keyIterator();
@@ -872,7 +872,7 @@ pub const State = struct {
             item.previous = self.last_pending;
             if (self.last_pending != 0) self.pending.getPtr(self.last_pending).?.next = id else self.first_pending = id;
             self.last_pending = id;
-            if (item.id >= self.root.next_id or item.page == 0) return error.InvalidNativeAllocator;
+            if (item.id >= self.root.next_id or item.page == 0) return invalidAllocator(@src());
             try self.queue(item.kind).push(a, item.*);
             if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending += 1;
         }
@@ -887,18 +887,18 @@ pub const State = struct {
                 try self.builder_metadata.append(a, page);
                 const payload = try io.read(io.context, a, page);
                 defer a.free(payload);
-                if (payload.len < 16 or !std.mem.eql(u8, payload[0..4], magic)) return error.InvalidNativeAllocator;
+                if (payload.len < 16 or !std.mem.eql(u8, payload[0..4], magic)) return invalidAllocator(@src());
                 page = get64(payload, 8);
             }
         }
-        if (self.root.build_cursor != 0 and !self.pending.contains(self.root.build_cursor)) return error.InvalidNativeAllocator;
-        for (self.metadata.items) |metadata_page| if (self.count(metadata_page) == free) return error.InvalidNativeAllocator;
-        if (self.count(root_page) == free) return error.InvalidNativeAllocator;
+        if (self.root.build_cursor != 0 and !self.pending.contains(self.root.build_cursor)) return invalidAllocator(@src());
+        for (self.metadata.items) |metadata_page| if (self.count(metadata_page) == free) return invalidAllocator(@src());
+        if (self.count(root_page) == free) return invalidAllocator(@src());
         self.clean();
         return self;
     }
     fn visit(self: *State, page: u64, visited: *std.AutoHashMapUnmanaged(u64, void)) !void {
-        if (page == 0 or page >= self.root.covered_pages or visited.contains(page)) return error.InvalidNativeAllocator;
+        if (page == 0 or page >= self.root.covered_pages or visited.contains(page)) return invalidAllocator(@src());
         try visited.put(self.allocator, page, {});
         try self.metadata.append(self.allocator, page);
     }
@@ -1009,7 +1009,7 @@ pub const State = struct {
             put64(payload, 8, self.root.build_pending);
             used = 16;
             while (self.root.build_cursor != 0 and self.root.build_cursor < self.root.build_limit and used + 48 <= payload.len) {
-                const item = self.pending.get(self.root.build_cursor) orelse return error.InvalidNativeAllocator;
+                const item = self.pending.get(self.root.build_cursor) orelse return invalidAllocator(@src());
                 encodeRetirement(item, payload[used..][0..48]);
                 used += 48;
                 self.root.build_cursor = item.next;
@@ -1050,7 +1050,7 @@ pub const State = struct {
 
     fn writeCounts(self: *State, io: IO) !u64 {
         const per_page = (io.payload_bytes - 24) / 4;
-        if (per_page == 0) return error.InvalidNativeAllocator;
+        if (per_page == 0) return invalidAllocator(@src());
         var end = self.counts.items.len;
         var next: u64 = 0;
         while (end > 1) {
@@ -1172,9 +1172,9 @@ fn encodeRetirement(item: Retirement, raw: []u8) void {
     raw[32] = @backingInt(item.kind);
 }
 fn decodeRetirement(raw: []const u8) !Retirement {
-    if (get64(raw, 0) == 0) return error.InvalidNativeAllocator;
-    for (raw[33..48]) |byte| if (byte != 0) return error.InvalidNativeAllocator;
-    return .{ .id = get64(raw, 0), .epoch = get64(raw, 8), .page = get64(raw, 16), .length = get64(raw, 24), .kind = std.enums.fromInt(Kind, raw[32]) orelse return error.InvalidNativeAllocator };
+    if (get64(raw, 0) == 0) return invalidAllocator(@src());
+    for (raw[33..48]) |byte| if (byte != 0) return invalidAllocator(@src());
+    return .{ .id = get64(raw, 0), .epoch = get64(raw, 8), .page = get64(raw, 16), .length = get64(raw, 24), .kind = std.enums.fromInt(Kind, raw[32]) orelse return invalidAllocator(@src()) };
 }
 
 const TestLedger = struct {
@@ -1196,7 +1196,7 @@ const TestLedger = struct {
     }
     pub fn read(context: *anyopaque, a: Allocator, page: u64) ![]u8 {
         const self: *TestLedger = @ptrCast(@alignCast(context));
-        return a.dupe(u8, self.pages.get(page) orelse return error.InvalidNativeAllocator);
+        return a.dupe(u8, self.pages.get(page) orelse return invalidAllocator(@src()));
     }
     fn write(context: *anyopaque, page: u64, payload: []const u8) !void {
         const self: *TestLedger = @ptrCast(@alignCast(context));
@@ -1600,4 +1600,10 @@ test "lite allocator v4 canceled digest initialization retains no partial cache"
     canceled.store(false, .release);
     try state.prepareDigestWithCancel(&canceled);
     try expectDigestMatchesRebuild(&state);
+}
+
+/// Reports which allocator check failed (diagnostics for multi-process runs).
+fn invalidAllocator(src: std.builtin.SourceLocation) error{InvalidNativeAllocator} {
+    std.log.warn("native allocator invalid: {s}:{d} in {s}", .{ src.file, src.line, src.fn_name });
+    return error.InvalidNativeAllocator;
 }

@@ -8527,6 +8527,17 @@ test "capi native separate writer processes keep full-text deletes at full_index
     const wrapper = try open(path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, false);
     const id = try api.publishHandle(wrapper);
     defer api.antfly_db_close(id);
+    // The file is consistent, allocator included.
+    {
+        var report: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&report);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_check_json(id, &report));
+        const body = report.ptr.?[0..report.len];
+        if (std.mem.indexOf(u8, body, "\"valid\":true") == null) {
+            std.debug.print("check report: {s}\n", .{body});
+            return error.TestUnexpectedResult;
+        }
+    }
     var query_buffer: [256]u8 = undefined;
     var expected_buffer: [64]u8 = undefined;
     for (0..workers) |worker| {
