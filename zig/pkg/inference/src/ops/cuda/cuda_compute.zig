@@ -20636,8 +20636,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const plan = entry.plan.?;
     const storage = plan.layout(input_bytes) catch return null;
     const output = storage.output orelse return null;
-    const t = tensorFromCt(inputs[0]);
-    const output_bytes = t.elem_count * @sizeOf(f32);
+    const first_input = tensorFromCt(inputs[0]);
+    const output_bytes = first_input.elem_count * @sizeOf(f32);
     if (output_bytes > output.bytes) return null;
     // The same complete event ABI drives preflight and actual arena lookup.
     const cache_request = self.audioArenaRequestFromPlan(cache_base, plan, storage);
@@ -20734,7 +20734,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         try self.ctx.recordProfileEnd(pair);
         arena.timing_replay = if (capture_sample) null else replay;
     };
-    const out = try self.createEmbeddingGemma2Tensor(t.shape, .f32);
+    const out = try self.createEmbeddingGemma2Tensor(first_input.shape, .f32);
     errdefer freeTensor(self, out);
     const result = try audioBufferView(arena.buffers[0], output.offset, output_bytes);
     try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, output_bytes);
