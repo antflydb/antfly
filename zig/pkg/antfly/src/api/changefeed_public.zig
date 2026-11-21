@@ -729,6 +729,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
         try policy.authorize(state.value, internal);
         try stageVisibleSplits(&client, a, source, &catalog_routes, &state, selection.after, internal);
+        try stageVisibleMerges(&client, a, source, &catalog_routes, &state, selection.after, internal);
         try progressSplitSuccessor(&client, a, source, &catalog_routes, state.value, selection.after, internal);
         return executeIceberg(&client, a, selection, limits, &policy, .{ .source = source, .captured = &catalog_routes }, internal);
     }
@@ -739,6 +740,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
     try policy.authorize(state.value, internal);
     try stageVisibleSplits(&client, a, source, &captured, &state, selection.after, internal);
+    try stageVisibleMerges(&client, a, source, &captured, &state, selection.after, internal);
     try progressSplitSuccessor(&client, a, source, &captured, state.value, selection.after, internal);
     var provider: native.ScheduledProvider(roots.Routed, RoutedFactory, Policy) = .{ .factory = .{ .source = source, .captured = &captured }, .policy = &policy };
     if (limits) |bounds|
@@ -810,6 +812,36 @@ pub fn stageVisibleSplits(client: *config.Client, a: A, source: source_api.Sourc
         parsed.* = observed;
     }
     try routes.validateInstalledRoutes(parsed.value);
+}
+
+pub fn stageVisibleMerges(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, parsed: *control.Parsed, cursor: control.Digest, request: Context) !void {
+    const state = parsed.value;
+    if (state.phase != .streaming or source.merge_cut == null or state.roots.len < 2) return;
+    try request.ensureActive();
+    var snapshot = try source.catalog.adminSnapshot();
+    defer source.catalog.freeAdminSnapshot(&snapshot);
+    for (snapshot.merge_transitions) |merge| {
+        if (merge.phase != .cutover_pending and merge.phase != .finalizing) continue;
+        const donor = for (state.roots) |root| {
+            const physical = root.physical orelse continue;
+            if (physical.group_id == merge.donor_group_id and root.merge_drain == null and root.split_handoff == null and root.pending_control == null)
+                break root;
+        } else continue;
+        _ = try state.contextAt(cursor);
+        if (state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) return error.ChangefeedLeaseExpired;
+        const mutation = (try source.prepareMergeDrain(a, routes, state, donor, merge, request)) orelse continue;
+        try change(client, a, state, mutation, request);
+        var observed = try load(client, a, state.id, request);
+        errdefer observed.deinit();
+        const expected = mutation.stage_merge_drain;
+        const index = try observed.value.rootIndex(expected.namespace);
+        if (observed.value.epoch != state.epoch or observed.value.revision <= state.revision or
+            !std.meta.eql(observed.value.roots[index].merge_drain, @as(?control.MergeDrain, expected.drain)))
+            return error.MetadataMutationOutcomeUnknown;
+        parsed.deinit();
+        parsed.* = observed;
+        return;
+    }
 }
 
 pub fn progressSplitSuccessor(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, state: control.State, cursor: control.Digest, request: Context) !void {

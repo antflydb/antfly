@@ -794,6 +794,7 @@ pub const CatalogRetainedStream = struct {
             var captured = try self.source.capturePhysical(allocator, observed.value.definition.?, self.context);
             defer captured.deinit();
             try feed_api.stageVisibleSplits(&client, allocator, self.source, &captured, &observed, observed.value.acknowledged_cursor, self.context);
+            try feed_api.stageVisibleMerges(&client, allocator, self.source, &captured, &observed, observed.value.acknowledged_cursor, self.context);
             const state = observed.value;
             const now = try selected.policy.nowSeconds(self.context);
             if (state.expires_at -| now <= history_lease_seconds / 2) {
