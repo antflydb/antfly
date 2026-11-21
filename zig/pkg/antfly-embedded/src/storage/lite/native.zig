@@ -8482,6 +8482,15 @@ pub const NativeFile = struct {
                     },
                 }
             }
+            if (torn_protected_watermark) {
+                // A writer can die after changing the active extent and
+                // before the first field of its new watermark is stored.
+                // With the writer fenced, load the selector from disk.
+                try self.adoptOnDiskCheckpoint(io);
+                checkpoint = self.activeCheckpoint();
+                folded_through = checkpoint.redo_folded_through;
+                if (scan_slot) |slot| scan_region.?.pinReader(slot, @max(folded_through, 1));
+            }
             var persisted_frontier: ?redo_log.Frontier = null;
             if (replay_ceiling == null and self.header.protected_redo and !self.no_sync) {
                 const durable = (try redoFrontierSlots(self.header).readLatest(self.file, io)) orelse return error.NativeRedoLogCorrupt;
@@ -18293,6 +18302,11 @@ pub const NativeFile = struct {
             try writeSlotPageTo(compact_file, io, compact_header.page_size, index, slot);
         }
         const after_size = next_page_id * @as(u64, self.header.page_size);
+        // Unindexed images reserve redo by extending the file directly.
+        // Apply the same workspace limit as the indexed page allocator.
+        if (self.vacuum_workspace_limit) |limit| {
+            if (after_size > limit) return error.LiteStorageBudgetExceeded;
+        }
         try compact_file.setLength(io, after_size);
         if (!self.no_sync) {
             if (compact_header.protected_redo) try writeRedoBaseline(compact_file, io, compact_header, compact_header.checkpoints[compact_header.active_checkpoint].commit_sequence);
