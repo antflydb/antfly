@@ -27844,7 +27844,10 @@ const RemoteMetadataSource = struct {
                 try routing_budget.checkpoint();
                 if (err == error.Cancelled or err == error.Canceled) return error.Canceled;
                 if (comptime Result == antfly.metadata_api.DecisionAdmission) {
-                    if (input.table_batch != null and err == error.UnsupportedOperation) return err;
+                    if (err == error.UnsupportedOperation) {
+                        last_err = err;
+                        continue;
+                    }
                 }
                 last_err = if (err == error.UnsupportedOperation) error.StorageReadTemporarilyUnavailable else normalizeCatalogRoutingSnapshotError(err);
                 continue;

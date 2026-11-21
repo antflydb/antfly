@@ -512,11 +512,10 @@ const OwnedRead = struct {
             const id = @import("distributed_txn.zig").parseTxnIdHex(id_hex) catch return error.SqlTransactionNotActive;
             transaction_lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
             tenure = try server.txn_sessions.sqlReaderTenure(alloc, id, credential.sessionPrincipal(), server.localSessionNodeId());
-            var state = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionNotActive;
-            defer state.deinit(server.alloc);
+            var state = (try server.txn_sessions.readSqlState(alloc, id, &self.staged)) orelse return error.SqlTransactionNotActive;
+            defer state.deinit(alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
             if (!std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
-            self.staged = try server.txn_sessions.cloneSqlStaged(alloc, id);
             if (state.metadata.accepted_lake_reads) {
                 if (request.read_requirements.visibility == .committed) return error.ReadSnapshotTooOld;
                 self.native_adapter.lake_visibility = .accepted;

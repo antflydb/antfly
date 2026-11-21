@@ -1371,6 +1371,10 @@ fn executeMultiTableCommitOnce(
     const admitted = routeParticipants(alloc, catalog, tables, &participants, options.retain_terminal) catch |err| {
         // Only this call site proves that BEGIN has not been dispatched.
         if (options.fresh_retained_id and err == error.CatalogGenerationChanged) return error.PreDispatchCatalogGenerationChanged;
+        if (err == error.CatalogRouteFenceUnsupported) {
+            if (!options.retain_terminal or options.fresh_retained_id) return error.PreDispatchDecisionAdmissionUnavailable;
+            return error.StorageReadTemporarilyUnavailable;
+        }
         return err;
     };
 
@@ -2345,6 +2349,25 @@ fn validateParticipantEpochs(alloc: std.mem.Allocator, catalog: table_catalog.Ca
     }
 }
 
+fn bindParticipantRoute(participant: *ParticipantTxn, identity: RoutingIdentity, topology_epoch: u64, range: *const TableRoutes.manager.RangeRecord, bound: bool) !void {
+    const manager = @import("../metadata/table_manager.zig");
+    const range_id = manager.rangeDocIdentityRangeId(range.*);
+    const fence: @import("../metadata/api.zig").CatalogRouteFence = .{
+        .metadata_group_id = identity.group_id,
+        .metadata_incarnation = identity.incarnation,
+        .catalog_revision = 0,
+        .table_id = range.table_id,
+        .topology_epoch = topology_epoch,
+        .route = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = range.table_id, .shard_id = manager.rangeDocIdentityShardId(range.*), .range_id = range_id } },
+    };
+    if (participant.route_fence) |observed| {
+        if (observed.table_id != fence.table_id or observed.route.range_id != range_id or
+            !std.meta.eql(observed.route.identity_namespace, fence.route.identity_namespace)) return error.TopologyChanged;
+    } else if (bound) {
+        participant.route_fence = fence;
+    }
+}
+
 fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, participants: *std.ArrayListUnmanaged(ParticipantTxn), retain_terminal: bool) !?RoutingIdentity {
     if (tables.len == 0) return null;
     var workspace = std.heap.ArenaAllocator.init(alloc);
@@ -2386,6 +2409,16 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
                 id.verified_revision = revision;
                 break :selected id;
             }
+            // A legacy planning snapshot cannot establish that the metadata peer
+            // supports the final proposal gate. Probe that exact wire contract
+            // before allowing BEGIN to escape on a mixed-version cluster.
+            const table = checks[0];
+            const range = indexed.tableRanges(table.table_id)[0];
+            const fence = try table_catalog.generationDecisionRoute(generation.?, table.table_name, range.group_id, budget);
+            table_catalog.validateRaftDecision(authority, table.table_name, fence, budget) catch |err| switch (err) {
+                error.UnsupportedOperation => return error.CatalogRouteFenceUnsupported,
+                else => return err,
+            };
         };
         admin = try catalog.adminSnapshot();
         const id = RoutingIdentity.from(&admin.?);
@@ -2498,34 +2531,24 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
         if (identity.verified_revision != null and groups.count() != 0)
             try enlisted.append(alloc, .{ .table_name = table.table_name, .table_id = routes.ranges[0].table_id, .topology_epoch = topology_epoch });
         const decision_epoch = table_catalog.decisionEpochForAuthority(identity.group_id, identity.incarnation, topology_epoch);
-        // Match all enlisted owner proofs in one traversal of this table's
-        // ranges. Guarded reads keep their observed fence and bound writes get
-        // a fence from the same routing snapshot used to choose their group.
         if (bound_incarnation != null or routes.guard_owners.count() != 0) {
-            var remaining = groups.count();
-            for (routes.ranges) |range| {
-                if (remaining == 0) break;
-                const index = groups.get(range.group_id) orelse continue;
-                const participant = &participants.items[index];
-                const manager = @import("../metadata/table_manager.zig");
-                const range_id = manager.rangeDocIdentityRangeId(range.*);
-                const fence: @import("../metadata/api.zig").CatalogRouteFence = .{
-                    .metadata_group_id = identity.group_id,
-                    .metadata_incarnation = identity.incarnation,
-                    .catalog_revision = 0,
-                    .table_id = range.table_id,
-                    .topology_epoch = topology_epoch,
-                    .route = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = range.table_id, .shard_id = manager.rangeDocIdentityShardId(range.*), .range_id = range_id } },
-                };
-                if (participant.route_fence) |observed| {
-                    if (observed.table_id != fence.table_id or observed.route.range_id != range_id or
-                        !std.meta.eql(observed.route.identity_namespace, fence.route.identity_namespace)) return error.TopologyChanged;
-                } else if (bound_incarnation != null) {
-                    participant.route_fence = fence;
+            if (identity.verified_revision != null) {
+                const budget = authority.budget(null);
+                for (groups.values()) |index| {
+                    const participant = &participants.items[index];
+                    const range = try generation.?.indexed.rangeForGroup(routes.ranges[0].table_id, participant.group_id, budget);
+                    try bindParticipantRoute(participant, identity, topology_epoch, range, bound_incarnation != null);
                 }
-                remaining -= 1;
+            } else {
+                var remaining = groups.count();
+                for (routes.ranges) |range| {
+                    if (remaining == 0) break;
+                    const index = groups.get(range.group_id) orelse continue;
+                    try bindParticipantRoute(&participants.items[index], identity, topology_epoch, range, bound_incarnation != null);
+                    remaining -= 1;
+                }
+                if (remaining != 0) return error.TopologyChanged;
             }
-            if (remaining != 0) return error.TopologyChanged;
         }
         for (groups.values()) |index| {
             const participant = &participants.items[index];
@@ -6156,6 +6179,7 @@ fn consumerTests() type {
                 generation: *table_catalog.RoutingGeneration,
                 checks: usize = 0,
                 supports_batch: bool = true,
+                supports_single: bool = true,
                 fn acquire(ptr: *anyopaque, _: table_catalog.RoutingBudget, authoritative: bool) !*table_catalog.RoutingGeneration {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(authoritative);
@@ -6164,6 +6188,8 @@ fn consumerTests() type {
                 }
                 fn check(ptr: *anyopaque, request: AdmissionRequest, _: table_catalog.RoutingBudget) !@import("../metadata/api.zig").DecisionAdmission {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (request.route_check != null and self.supports_single)
+                        return .{ .route_checked = true, .stable = true, .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 10 };
                     if (!self.supports_batch) return error.UnsupportedOperation;
                     const batch = request.table_batch orelse return error.TestUnexpectedResult;
                     try std.testing.expectEqual(@as(usize, 2), batch.tables.len);
@@ -6184,13 +6210,18 @@ fn consumerTests() type {
                 defer arena.deinit();
                 var enlisted_participants: std.ArrayListUnmanaged(ParticipantTxn) = .empty;
                 const stamp = try routeParticipants(arena.allocator(), compact_source, &.{
-                    .{ .table_name = "docs", .writes = &.{.{ .key = "a", .value = "{}" }} },
+                    .{ .table_name = "docs", .bound_catalog_incarnation = @splat('1'), .writes = &.{.{ .key = "a", .value = "{}" }} },
                     .{ .table_name = "audit", .writes = &.{.{ .key = "b", .value = "{}" }} },
                 }, &enlisted_participants, true);
+                for (enlisted_participants.items) |participant| try std.testing.expectEqual(participant.group_id, participant.route_fence.?.route.group_id);
                 try validateParticipantEpochs(arena.allocator(), compact_source, enlisted_participants.items, stamp);
                 try std.testing.expectEqual(@as(usize, 2), compact.checks);
                 try std.testing.expectEqual(before_compact + @as(usize, if (supports_batch) 0 else 2), FakeCatalog.snapshots);
             }
+            compact.supports_single = false;
+            const begins_before_probe = recorder.begins.items.len;
+            try std.testing.expectError(error.PreDispatchDecisionAdmissionUnavailable, executeMultiTableCommitWithOptions(std.testing.allocator, compact_source, recorder.worker(), @splat(2), 40_000, 40_001, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "a", .value = "{}" }} }}, .write, null, .{ .retain_terminal = true, .fresh_retained_id = true }));
+            try std.testing.expectEqual(begins_before_probe, recorder.begins.items.len);
             try std.testing.expectEqual(@as(usize, 3), guarded.committed.participant_count);
             try std.testing.expectEqual(@as(usize, 3), recorder.bound_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.range_prepares);

@@ -1192,11 +1192,12 @@ pub const DurableSessionStore = struct {
         }
     };
 
-    pub fn save(self: *DurableSessionStore, session: Session, max_record_bytes: ?usize) !void {
-        return self.saveChecked(session, max_record_bytes, null, null);
+    pub fn saveForTest(self: *DurableSessionStore, session: Session, max_record_bytes: ?usize) !void {
+        if (!@import("builtin").is_test) @compileError("unversioned session writes are restricted to fixtures");
+        return self.saveRecord(session, max_record_bytes, null, null, false);
     }
 
-    fn saveChecked(self: *DurableSessionStore, session: Session, max_record_bytes: ?usize, expected: ?Version, ttl_ns: ?u64) !void {
+    fn saveChecked(self: *DurableSessionStore, session: Session, max_record_bytes: ?usize, expected: Version, ttl_ns: ?u64) !void {
         return self.saveRecord(session, max_record_bytes, expected, ttl_ns, false);
     }
 
@@ -1754,10 +1755,25 @@ pub const DurableSessionStore = struct {
         }
     }
 
+    pub const DetachCondition = union(enum) {
+        beginning,
+        active,
+        expired: struct { state: sql_connection_record.State, cutoff_ms: u64 },
+
+        fn matches(self: DetachCondition, connection: sql_connection_record.Record, owner: u64) bool {
+            return switch (self) {
+                .beginning => connection.state == .beginning and connection.owner_node_id == owner,
+                .active => connection.state == .active and connection.owner_node_id == owner,
+                .expired => |expiry| (expiry.state == .beginning or expiry.state == .active) and
+                    connection.state == expiry.state and connection.expires_at_ms <= expiry.cutoff_ms,
+            };
+        }
+    };
+
     /// A connection-owned rollback has one durable decision: retire the
     /// unexecuted transaction and detach its exact connection in the same
     /// native transaction. Neither side may become visible alone.
-    fn deleteAndDetachConnection(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, connection_id: [32]u8, commit_settings: bool, expected: Version, expected_state: sql_connection_record.State) !void {
+    fn deleteAndDetachConnection(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, connection_id: [32]u8, commit_settings: bool, expected: Version, condition: DetachCondition) !void {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
@@ -1768,19 +1784,19 @@ pub const DurableSessionStore = struct {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                try self.deleteAndDetachConnectionTxn(&txn, key, txn_id, connection_id, commit_settings, expected, expected_state);
+                try self.deleteAndDetachConnectionTxn(&txn, key, txn_id, connection_id, commit_settings, expected, condition);
                 try txn.commit();
             },
             .runtime => |store| {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
-                try self.deleteAndDetachConnectionTxn(&txn, key, txn_id, connection_id, commit_settings, expected, expected_state);
+                try self.deleteAndDetachConnectionTxn(&txn, key, txn_id, connection_id, commit_settings, expected, condition);
                 try txn.commit();
             },
         }
     }
 
-    fn deleteAndDetachConnectionTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, txn_id: db_mod.types.TxnId, connection_id: [32]u8, commit_settings: bool, expected: Version, expected_state: sql_connection_record.State) !void {
+    fn deleteAndDetachConnectionTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, txn_id: db_mod.types.TxnId, connection_id: [32]u8, commit_settings: bool, expected: Version, condition: DetachCondition) !void {
         const raw = txn.get(key) catch |err| switch (err) {
             error.NotFound => return error.SqlTransactionOutcomeUnknown,
             else => return err,
@@ -1791,9 +1807,8 @@ pub const DurableSessionStore = struct {
             session.commit_execution_started or session.terminal_commit != null or session.terminal_abort) return error.SqlTransactionOutcomeUnknown;
         var connection = try sql_connection_record.loadTxn(txn, self.alloc, &connection_id);
         defer connection.deinit();
-        if (connection.value.state != expected_state or connection.value.active_txn == null or
+        if (!condition.matches(connection.value, session.owner_node_id) or connection.value.active_txn == null or
             !std.mem.eql(u8, &connection.value.active_txn.?, &txn_id) or
-            connection.value.owner_node_id != session.owner_node_id or
             !std.mem.eql(u8, connection.value.principal, session.principal orelse "")) return error.SqlTransactionOutcomeUnknown;
         var detached = connection.value;
         detached.state = .idle;
@@ -2304,6 +2319,10 @@ pub const SessionLeaseStore = struct {
     }
 
     pub fn renew(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64, now_ms: u64, ttl_ms: u64) !bool {
+        return self.renewMatching(txn_id, owner_node_id, now_ms, ttl_ms, false);
+    }
+
+    fn renewMatching(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64, now_ms: u64, ttl_ms: u64, existing_owner_only: bool) !bool {
         if (self.mutation_mutex) |mutex| platform_sync.lockYielding(mutex);
         defer if (self.mutation_mutex) |mutex| mutex.unlock();
         const key = try makeSessionLeaseKey(self.alloc, txn_id);
@@ -2315,7 +2334,8 @@ pub const SessionLeaseStore = struct {
         defer lease.deinit();
         const owner_id = try ownerLeaseId(self.alloc, owner_node_id);
         defer self.alloc.free(owner_id);
-        return try lease.renew(owner_id, now_ms, ttl_ms);
+        if (existing_owner_only) return lease.renewExistingOwner(owner_id, now_ms, ttl_ms);
+        return lease.renew(owner_id, now_ms, ttl_ms);
     }
 
     pub fn release(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64) !bool {
@@ -2339,6 +2359,11 @@ pub const SessionLeaseStore = struct {
 // propagation or generic execution errors.
 pub const CommitRejection = enum { none, fresh, confirmed, ambiguous };
 
+pub fn abortCause(err: anyerror) ?error{ RowPolicyDenied, StorageReadTemporarilyUnavailable } {
+    if (err == error.PreDispatchDecisionAdmissionUnavailable) return error.StorageReadTemporarilyUnavailable;
+    return confirmedAbortCause(err);
+}
+
 pub fn confirmedAbortCause(err: anyerror) ?error{ RowPolicyDenied, StorageReadTemporarilyUnavailable } {
     return switch (err) {
         error.TransactionPrepareAbortedRowPolicyDenied => error.RowPolicyDenied,
@@ -2351,7 +2376,7 @@ pub fn classifyCommitRejection(first_attempt: bool, err: anyerror) CommitRejecti
     if (confirmedAbortCause(err) != null) return .confirmed;
     if (err == error.CatalogGenerationChanged) return .ambiguous;
     const rejected = switch (err) {
-        error.PreDispatchCatalogGenerationChanged, error.TransactionTooLarge, error.InvalidBatchRequest, error.InvalidArgument, error.InvalidGraphEdges, error.UnsupportedTransformOperation, error.TopologyChanged, error.DecisionConflict, error.DocIdentityNamespaceMismatch, error.UnsupportedOperation, error.TableNotFound, error.UnknownGroup => true,
+        error.PreDispatchDecisionAdmissionUnavailable, error.PreDispatchCatalogGenerationChanged, error.TransactionTooLarge, error.InvalidBatchRequest, error.InvalidArgument, error.InvalidGraphEdges, error.UnsupportedTransformOperation, error.TopologyChanged, error.DecisionConflict, error.DocIdentityNamespaceMismatch, error.UnsupportedOperation, error.TableNotFound, error.UnknownGroup => true,
         else => false,
     };
     if (!rejected) return .none;
@@ -2525,7 +2550,7 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
             return err;
         };
-        self.sessions.ensureUnusedCapacity(alloc, 1) catch |err| {
+        self.reserveSessionSlotLocked(alloc) catch |err| {
             self.mutex.unlock();
             return err;
         };
@@ -2628,6 +2653,14 @@ pub const SessionRegistry = struct {
         terminal_abort: bool = false,
         savepoints: usize,
 
+        fn fromSession(alloc: std.mem.Allocator, session: *const Session) !?SqlState {
+            const metadata = session.sql orelse return null;
+            var result: SqlState = .{ .version = DurableSessionStore.Version.of(session.*), .metadata = try metadata.clone(alloc), .connection_id = session.connection_id, .owner_node_id = session.owner_node_id, .execution_started = session.commit_execution_started, .terminal = if (session.terminal_commit) |terminal| terminal.status else null, .terminal_abort = session.terminal_abort, .savepoints = session.savepoints.count() };
+            errdefer result.deinit(alloc);
+            result.setting_active = try cloneSettingEntries(alloc, session.setting_active.items);
+            return result;
+        }
+
         pub fn deinit(self: *SqlState, alloc: std.mem.Allocator) void {
             self.metadata.deinit(alloc);
             deinitSettingEntries(alloc, &self.setting_active);
@@ -2664,7 +2697,7 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
         }
         const durable = self.durable orelse return error.SqlTransactionNotActive;
-        const shared_lease = if (self.lease_store) |lease| std.meta.eql(lease.backend, durable.backend) else false;
+        const shared_lease = self.hasColocatedLease();
         const epoch = switch (durable.backend) {
             .docstore => |store| blk: {
                 var read = try store.beginReadTxn();
@@ -2680,28 +2713,56 @@ pub const SessionRegistry = struct {
         return if (shared_lease) epoch else self.sqlLeaseTenure(alloc, txn_id, owner);
     }
 
-    pub fn getSqlState(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SqlState {
-        const session_lock = self.sessionLock(txn_id);
-        session_lock.lock();
-        defer session_lock.unlock();
-        self.mutex.lock();
-        if (self.sessions.getPtr(txn_id)) |existing| {
-            defer self.mutex.unlock();
-            const metadata = existing.sql orelse return null;
-            var result: SqlState = .{ .version = DurableSessionStore.Version.of(existing.*), .metadata = try metadata.clone(alloc), .connection_id = existing.connection_id, .owner_node_id = existing.owner_node_id, .execution_started = existing.commit_execution_started, .terminal = if (existing.terminal_commit) |terminal| terminal.status else null, .terminal_abort = existing.terminal_abort, .savepoints = existing.savepoints.count() };
-            errdefer result.deinit(alloc);
-            result.setting_active = try cloneSettingEntries(alloc, existing.setting_active.items);
-            return result;
+    // The caller holds the session stripe for the lifetime of a cached view.
+    const SqlReadSession = struct {
+        session: Session,
+        owned_by: ?std.mem.Allocator = null,
+
+        fn deinit(self: *SqlReadSession) void {
+            if (self.owned_by) |a| self.session.deinit(a);
         }
-        self.mutex.unlock();
+
+        fn stagedRequest(self: *SqlReadSession, alloc: std.mem.Allocator) !OwnedTransactionCommitRequest {
+            const session = &self.session;
+            const metadata = session.sql orelse return error.SqlTransactionNotActive;
+            if (metadata.failed or session.terminal_abort) return error.SqlTransactionAborted;
+            if (session.commit_body_digest != null or session.commit_execution_started or session.terminal_commit != null)
+                return error.TransactionCommitSealed;
+            const staged = session.staged orelse return .{ .sync_level = session.sync_level };
+            if (self.owned_by) |a| if (std.meta.eql(a, alloc)) {
+                session.staged = null;
+                return staged;
+            };
+            return staged.clone(alloc);
+        }
+    };
+
+    fn readSqlSessionAssumeStripe(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !?SqlReadSession {
+        if (!self.durableMissIsAuthoritative()) {
+            self.mutex.lock();
+            const cached = self.sessions.get(txn_id);
+            self.mutex.unlock();
+            if (cached) |session| return .{ .session = session };
+        }
         const durable = self.durable orelse return null;
-        var loaded = (try durable.load(txn_id)) orelse return null;
-        defer loaded.deinit(durable.alloc);
-        const metadata = loaded.sql orelse return null;
-        var result: SqlState = .{ .version = DurableSessionStore.Version.of(loaded), .metadata = try metadata.clone(alloc), .connection_id = loaded.connection_id, .owner_node_id = loaded.owner_node_id, .execution_started = loaded.commit_execution_started, .terminal = if (loaded.terminal_commit) |terminal| terminal.status else null, .terminal_abort = loaded.terminal_abort, .savepoints = loaded.savepoints.count() };
-        errdefer result.deinit(alloc);
-        result.setting_active = try cloneSettingEntries(alloc, loaded.setting_active.items);
-        return result;
+        return .{ .session = (try durable.load(txn_id)) orelse return null, .owned_by = durable.alloc };
+    }
+
+    pub fn getSqlState(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SqlState {
+        return self.readSqlState(alloc, txn_id, null);
+    }
+
+    /// A portal needs metadata and its staged rows from the same durable cut.
+    pub fn readSqlState(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, staged: ?*OwnedTransactionCommitRequest) !?SqlState {
+        const stripe = self.sessionLock(txn_id);
+        stripe.lock();
+        defer stripe.unlock();
+        var view = (try self.readSqlSessionAssumeStripe(txn_id)) orelse return null;
+        defer view.deinit();
+        var state = (try SqlState.fromSession(alloc, &view.session)) orelse return null;
+        errdefer state.deinit(alloc);
+        if (staged) |out| out.* = try view.stagedRequest(alloc);
+        return state;
     }
 
     /// Read-only SQL statements must not consume an obsolete cached session
@@ -2734,12 +2795,12 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_execution_started) return error.SqlTransactionOutcomeUnknown;
         if (candidate.sql) |*metadata| metadata.failed = failed else return error.SqlTransactionNotActive;
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -2763,6 +2824,7 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         if (!principalsEqual(candidate.principal, principal)) return error.Forbidden;
         const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
@@ -2780,8 +2842,7 @@ pub const SessionRegistry = struct {
         try putSettingEntry(alloc, &candidate.setting_active, entry);
         if (!local) try putSettingEntry(alloc, &candidate.setting_committed, entry);
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -2801,6 +2862,7 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         if (!principalsEqual(candidate.principal, principal)) return error.Forbidden;
         const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
@@ -2812,8 +2874,7 @@ pub const SessionRegistry = struct {
         removeSettingEntry(alloc, &candidate.setting_active, definition.identity.id);
         if (!local) removeSettingEntry(alloc, &candidate.setting_committed, definition.identity.id);
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -2828,6 +2889,7 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         if (!principalsEqual(candidate.principal, principal)) return error.Forbidden;
         const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
@@ -2836,8 +2898,7 @@ pub const SessionRegistry = struct {
         deinitSettingEntries(alloc, &candidate.setting_active);
         deinitSettingEntries(alloc, &candidate.setting_committed);
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -2898,23 +2959,9 @@ pub const SessionRegistry = struct {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        self.mutex.lock();
-        const cached = self.sessions.get(txn_id);
-        self.mutex.unlock();
-        // The per-session stripe protects these owned slices while the map
-        // mutex remains free. Savepoint snapshots are not cloned for a SELECT.
-        var loaded: ?Session = null;
-        defer if (loaded) |*value| value.deinit(self.durable.?.alloc);
-        const current = cached orelse blk: {
-            const durable = self.durable orelse return error.SqlTransactionNotActive;
-            loaded = (try durable.load(txn_id)) orelse return error.SqlTransactionNotActive;
-            break :blk loaded.?;
-        };
-        const metadata = current.sql orelse return error.SqlTransactionNotActive;
-        if (metadata.failed) return error.SqlTransactionAborted;
-        if (current.commit_body_digest != null) return error.TransactionCommitSealed;
-        if (current.staged) |staged| return staged.clone(alloc);
-        return .{ .sync_level = current.sync_level };
+        var view = (try self.readSqlSessionAssumeStripe(txn_id)) orelse return error.SqlTransactionNotActive;
+        defer view.deinit();
+        return view.stagedRequest(alloc);
     }
 
     pub fn stageValidated(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest, validator: ?StageValidator) !?SessionInfo {
@@ -2923,6 +2970,7 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
 
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         if (candidate.sql) |metadata| {
             if (metadata.failed) return error.SqlTransactionAborted;
@@ -2942,8 +2990,7 @@ pub const SessionRegistry = struct {
         // the registry mutex is free and durable lease CAS still precedes publish.
         if (validator) |value| try value.validate(value.ptr, alloc, if (previous) |*old| old else null, &candidate.staged.?, req);
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2983,6 +3030,7 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest != null or candidate.commit_execution_started or candidate.terminal_abort or candidate.terminal_commit != null) return error.TransactionCommitSealed;
         if (try cloneReadSnapshotForKey(alloc, &candidate.lake_cuts, table, "accepted")) |value| {
@@ -2996,8 +3044,7 @@ pub const SessionRegistry = struct {
         if (candidate.sql) |*metadata| metadata.accepted_lake_reads = true;
         try upsertReadSnapshot(alloc, &candidate.lake_cuts, .{ .table_name = table, .key = "accepted", .version = table_id, .document_json = token_json });
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
         self.mutex.lock();
         defer self.mutex.unlock();
         const target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -3031,6 +3078,7 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
 
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         try upsertReadSnapshot(alloc, &candidate.read_snapshots, snapshot);
@@ -3040,8 +3088,7 @@ pub const SessionRegistry = struct {
             try candidate.staged.?.mergeFrom(alloc, req);
         }
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -3088,8 +3135,7 @@ pub const SessionRegistry = struct {
             errdefer out.deinit(alloc);
             touchSession(&candidate);
             out.session_version = DurableSessionStore.Version.of(candidate);
-            try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-            if (self.durable) |durable| try durable.saveChecked(candidate, self.max_record_bytes, expected, null);
+            try self.persistOwnedVersion(candidate, expected);
             self.mutex.lock();
             defer self.mutex.unlock();
             const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -3109,13 +3155,13 @@ pub const SessionRegistry = struct {
             candidate.deinit(alloc);
             return null;
         }
+        const staged_copy = try out.clone(alloc);
         if (candidate.staged) |*staged| staged.deinit(alloc);
-        candidate.staged = try out.clone(alloc);
+        candidate.staged = staged_copy;
         candidate.commit_body_digest = body_digest;
         touchSession(&candidate);
         out.session_version = DurableSessionStore.Version.of(candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        if (self.durable) |durable| try durable.saveChecked(candidate, self.max_record_bytes, expected, null);
+        try self.persistOwnedVersion(candidate, expected);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -3160,6 +3206,7 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
 
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         if (candidate.terminal_abort) return error.SqlTransactionAborted;
         const coordinator_acknowledged = if (candidate.terminal_commit) |terminal| blk: {
@@ -3188,8 +3235,7 @@ pub const SessionRegistry = struct {
             .coordinator_acknowledged = coordinator_acknowledged,
         };
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -3298,6 +3344,7 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest == null or candidate.staged == null) return error.InvalidTransactionSessionRecord;
         if (candidate.commit_execution_started) {
@@ -3306,8 +3353,7 @@ pub const SessionRegistry = struct {
         }
         candidate.commit_execution_started = true;
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -3328,14 +3374,17 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
 
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         const terminal = if (candidate.terminal_commit) |*value| value else return error.InvalidTransactionSessionRecord;
         if (terminal.coordinator_group_id == null) return error.InvalidTransactionSessionRecord;
-        if (terminal.coordinator_acknowledged) return {};
+        if (terminal.coordinator_acknowledged) {
+            candidate.deinit(alloc);
+            return {};
+        }
         terminal.coordinator_acknowledged = true;
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -3461,16 +3510,14 @@ pub const SessionRegistry = struct {
         if (candidate.owner_node_id != owner_node_id) {
             const durable = self.durable orelse return null;
             if (self.durable_scope != .cluster_shared or self.lease_store == null or self.owner_lease_ttl_ns == null or owner_node_id == 0) return null;
+            const expected = DurableSessionStore.Version.of(candidate);
+            candidate.owner_node_id = owner_node_id;
+            touchSession(&candidate);
             var adopted = try candidate.clone(alloc);
             var adopted_owned = true;
             defer if (adopted_owned) adopted.deinit(alloc);
-            const expected = DurableSessionStore.Version.of(adopted);
-            adopted.owner_node_id = owner_node_id;
-            touchSession(&adopted);
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
             if (!(try durable.saveWithLease(adopted, expected, now_ns / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return null;
-            candidate.deinit(durable.alloc);
-            candidate = try adopted.clone(durable.alloc);
             try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &adopted);
             adopted_owned = false;
         } else if (self.lease_store != null and self.owner_lease_ttl_ns != null) {
@@ -3553,6 +3600,7 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         if (self.max_savepoints) |limit| {
@@ -3577,8 +3625,7 @@ pub const SessionRegistry = struct {
         try candidate.savepoints.put(alloc, savepoint_id, new_savepoint);
         savepoint_inserted = true;
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -3607,6 +3654,7 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        const expected = DurableSessionStore.Version.of(candidate);
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         const savepoint_id = switch (target) {
@@ -3659,8 +3707,7 @@ pub const SessionRegistry = struct {
             removed.deinit(alloc);
         }
         touchSession(&candidate);
-        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistOwnedVersion(candidate, expected);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -3965,17 +4012,13 @@ pub const SessionRegistry = struct {
         return self.removeMode(alloc, txn_id, true, commit_settings, expected);
     }
 
-    pub fn rollbackConnectionBeforeExecution(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, connection_id: [32]u8, expected: DurableSessionStore.Version, expected_state: sql_connection_record.State) !void {
+    pub fn rollbackConnectionBeforeExecution(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, connection_id: [32]u8, expected: DurableSessionStore.Version, condition: DurableSessionStore.DetachCondition) !void {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        var current = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionOutcomeUnknown;
-        defer current.deinit(alloc);
-        if (current.connection_id == null or !std.mem.eql(u8, &current.connection_id.?, &connection_id) or
-            current.commit_execution_started or current.terminal_commit != null or current.terminal_abort) return error.SqlTransactionOutcomeUnknown;
         const durable = self.durable orelse return error.SqlConnectionUnavailable;
-        try durable.deleteAndDetachConnection(txn_id, connection_id, false, expected, expected_state);
-        self.releaseLease(txn_id, current.owner_node_id) catch {};
+        try durable.deleteAndDetachConnection(txn_id, connection_id, false, expected, condition);
+        self.releaseLease(txn_id, expected.owner) catch {};
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.sessions.fetchRemove(txn_id)) |removed| {
@@ -4054,22 +4097,25 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
             return;
         }
-        self.sessions.put(alloc, txn_id, candidate.*) catch |err| {
+        self.reserveSessionSlotLocked(alloc) catch |err| {
             self.mutex.unlock();
             return err;
         };
+        self.sessions.putAssumeCapacity(txn_id, candidate.*);
         candidate.* = undefined;
         self.mutex.unlock();
+    }
+
+    fn hasColocatedLease(self: *SessionRegistry) bool {
+        const durable = self.durable orelse return false;
+        const lease = self.lease_store orelse return false;
+        return std.meta.eql(lease.backend, durable.backend);
     }
 
     fn persistOwnedVersion(self: *SessionRegistry, session: Session, expected: DurableSessionStore.Version) !void {
         if (self.durable) |durable| {
             try durable.saveChecked(session, self.max_record_bytes, expected, if (self.lease_store != null) self.owner_lease_ttl_ns else null);
         } else try self.renewLeaseLocked(session.txn_id, session.owner_node_id);
-    }
-
-    fn persistLocked(self: *SessionRegistry, session: Session) !void {
-        if (self.durable) |durable| try durable.save(session, self.max_record_bytes);
     }
 
     fn deletePersistent(self: *SessionRegistry, txn_id: db_mod.types.TxnId, expected: DurableSessionStore.Version, cutoff: ?u64) !void {
@@ -4079,6 +4125,13 @@ pub const SessionRegistry = struct {
             defer self.mutex.unlock();
             if (self.known_durable_session_count) |count| self.known_durable_session_count = count -| 1;
         }
+    }
+
+    // BEGIN holds its slot across durable I/O. Every insertion must leave room
+    // for all outstanding publications, including loads on other stripes.
+    fn reserveSessionSlotLocked(self: *SessionRegistry, alloc: std.mem.Allocator) !void {
+        const pending = std.math.cast(u32, self.reserved_session_count + 1) orelse return error.SessionLimitExceeded;
+        try self.sessions.ensureUnusedCapacity(alloc, pending);
     }
 
     fn ensureSessionCapacityLocked(self: *SessionRegistry) !void {
@@ -4123,7 +4176,7 @@ pub const SessionRegistry = struct {
             defer if (cached_owned) cached.deinit(alloc);
             self.mutex.lock();
             defer self.mutex.unlock();
-            try self.sessions.ensureUnusedCapacity(alloc, 1);
+            try self.reserveSessionSlotLocked(alloc);
             if (self.sessions.fetchRemove(txn_id)) |old| {
                 var value = old.value;
                 value.deinit(alloc);
@@ -4153,7 +4206,8 @@ pub const SessionRegistry = struct {
             loaded_owned = false;
             return try session.clone(alloc);
         }
-        try self.sessions.put(alloc, txn_id, loaded);
+        try self.reserveSessionSlotLocked(alloc);
+        self.sessions.putAssumeCapacity(txn_id, loaded);
         loaded_owned = false;
         return try self.sessions.getPtr(txn_id).?.clone(alloc);
     }
@@ -4164,17 +4218,18 @@ pub const SessionRegistry = struct {
     }
 
     pub fn renewOwnedLeases(self: *SessionRegistry, owner_node_id: u64, now_ns: u64) !usize {
+        const durable = self.durable orelse return 0;
         var ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
-        defer ids.deinit(self.durable.?.alloc);
+        defer ids.deinit(durable.alloc);
         self.mutex.lock();
-        if (self.lease_store == null or self.owner_lease_ttl_ns == null or self.durable == null) {
+        if (self.lease_store == null or self.owner_lease_ttl_ns == null) {
             self.mutex.unlock();
             return 0;
         }
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.owner_node_id != owner_node_id) continue;
-            ids.append(self.durable.?.alloc, entry.key_ptr.*) catch |err| {
+            ids.append(durable.alloc, entry.key_ptr.*) catch |err| {
                 self.mutex.unlock();
                 return err;
             };
@@ -4190,7 +4245,10 @@ pub const SessionRegistry = struct {
             const still_owned = if (self.sessions.getPtr(txn_id)) |session| session.owner_node_id == owner_node_id else false;
             self.mutex.unlock();
             if (!still_owned) continue;
-            try self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns);
+            self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns) catch |err| switch (err) {
+                error.SessionLeaseLost => continue,
+                else => return err,
+            };
             renewed += 1;
         }
         return renewed;
@@ -4201,13 +4259,13 @@ pub const SessionRegistry = struct {
         const ttl_ns = self.owner_lease_ttl_ns orelse return;
         const now_ms = now_ns / std.time.ns_per_ms;
         const ttl_ms = @max(@as(u64, 1), ttl_ns / std.time.ns_per_ms);
-        if (!(try lease_store.renew(txn_id, owner_node_id, now_ms, ttl_ms))) return error.SessionLeaseLost;
+        if (!(try lease_store.renewMatching(txn_id, owner_node_id, now_ms, ttl_ms, self.hasColocatedLease()))) return error.SessionLeaseLost;
     }
 
     fn releaseLease(self: *SessionRegistry, txn_id: db_mod.types.TxnId, owner_node_id: u64) !void {
         const lease_store = self.lease_store orelse return;
         // A co-located lease was deleted in the session's version-checked transaction.
-        if (self.durable) |durable| if (std.meta.eql(durable.backend, lease_store.backend)) return;
+        if (self.hasColocatedLease()) return;
         _ = try lease_store.release(txn_id, owner_node_id);
     }
 
@@ -7695,6 +7753,11 @@ test "background recovery adopts an expired shared-store owner lease" {
     try std.testing.expect((try adopter.claimPendingRecovery(alloc, session.txn_id, 12, session.begin_timestamp)) == null);
     var lease = (try leases.load(alloc, session.txn_id)).?;
     defer lease_mod.deinitRecord(alloc, &lease);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, adopter.claimPendingRecovery(failing.allocator(), session.txn_id, 12, lease.expires_at_ms * std.time.ns_per_ms + 1));
+    var before_retry = (try durable.load(session.txn_id)).?;
+    try std.testing.expectEqual(@as(u64, 7), before_retry.owner_node_id);
+    before_retry.deinit(durable.alloc);
     var claimed = (try adopter.claimPendingRecovery(alloc, session.txn_id, 12, lease.expires_at_ms * std.time.ns_per_ms + 1)) orelse return error.TestExpectedEqual;
     defer claimed.deinit(alloc);
     try std.testing.expect(claimed == .commit);
@@ -7914,7 +7977,7 @@ test "transaction session registry reports status and cleans expired durable ses
     try std.testing.expect(status.durable);
 
     registry.sessions.getPtr(session.txn_id).?.last_touched_timestamp = 1;
-    try durable.save(registry.sessions.get(session.txn_id).?, null);
+    try durable.saveForTest(registry.sessions.get(session.txn_id).?, null);
     const removed = try registry.cleanupExpired(std.testing.allocator, 2);
     try std.testing.expectEqual(@as(usize, 1), removed);
     try std.testing.expect(registry.getInfo(session.txn_id) == null);
@@ -8777,7 +8840,7 @@ test "durable session mutations publish only after persistence succeeds: durable
 }
 
 test "SQL pgwire native commit rejection requires a fresh execution" {
-    for ([_]anyerror{ error.TableNotFound, error.TopologyChanged, error.TransactionTooLarge, error.UnknownGroup }) |err| {
+    for ([_]anyerror{ error.TableNotFound, error.TopologyChanged, error.TransactionTooLarge, error.UnknownGroup, error.PreDispatchDecisionAdmissionUnavailable }) |err| {
         try std.testing.expectEqual(CommitRejection.fresh, classifyCommitRejection(true, err));
         try std.testing.expectEqual(CommitRejection.ambiguous, classifyCommitRejection(false, err));
     }

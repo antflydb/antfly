@@ -768,6 +768,7 @@ pub const Operations = struct {
             const validator = self.txn_validator orelse return error.Unavailable;
             validator.validate(request, table_name, input.req.writes) catch |err| switch (err) {
                 error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+                error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
                 error.TableNotFound => return error.NotFound,
                 error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
                 error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.PreDecisionDeadlineExceeded,
@@ -789,6 +790,7 @@ pub const Operations = struct {
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.TransactionTooLarge => return error.TransactionTooLarge,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {
@@ -1565,6 +1567,8 @@ fn consumerTests() type {
                 source.failure = @field(errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
+            source.failure = error.StorageReadTemporarilyUnavailable;
+            try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             const execution_errors = @import("antfly_local_sources").schema_relational_expression_errors.Error || @import("relational_row_errors.zig").PolicyError;
             inline for (@typeInfo(execution_errors).error_set.error_names.?) |field| {
                 source.failure = @field(execution_errors, field);

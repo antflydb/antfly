@@ -3438,6 +3438,7 @@ pub const ApiHttpClient = struct {
         if (isRetainedPreDecisionPressure(resp)) return error.RetainedEffectsFull;
         if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
         if (remoteRelationalRowError(resp.status, resp.body)) |reason| return reason;
+        if (resp.status == 503 and std.mem.eql(u8, resp.body, "storage read temporarily unavailable")) return error.StorageReadTemporarilyUnavailable;
         switch (resp.status) {
             200 => return .applied,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
@@ -4338,6 +4339,11 @@ test "relational row query remote transaction prepare preserves scalar validatio
         executor.body = field;
         try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
     }
+    executor.status = 500;
+    executor.body = "storage read temporarily unavailable";
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
+    executor.status = 503;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
     executor.status = 500;
     executor.body = "RelationalExpressionOverflow";
     try std.testing.expectError(error.InvalidRemoteResponse, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));

@@ -77,7 +77,7 @@ pub const Coordinator = struct {
             const rejection = transactions.classifyCommitRejection(plan.firstAttempt(), err);
             if (rejection == .fresh or rejection == .confirmed) {
                 _ = (server.txn_sessions.recordAttemptAbort(alloc, id, if (rejection == .fresh) plan.publication else null) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
-                return .{ .outcome = .aborted, .abort_cause = transactions.confirmedAbortCause(err), .reconciliation_id = id };
+                return .{ .outcome = .aborted, .abort_cause = transactions.abortCause(err), .reconciliation_id = id };
             }
             if (err == error.EnrichmentWorkerFailed) {
                 // Persist terminal repair debt before exposing it. The legacy

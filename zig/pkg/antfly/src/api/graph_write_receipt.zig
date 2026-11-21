@@ -75,7 +75,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         const rejection = sessions.classifyCommitRejection(plan.firstAttempt(), err);
         if (rejection == .confirmed or rejection == .fresh) {
             _ = (registry.recordAttemptAbort(owned, id, if (rejection == .fresh) plan.publication else null) catch null) orelse return .{ .status = .unknown };
-            return .{ .status = .aborted, .failure = sessions.confirmedAbortCause(err) orelse err };
+            return .{ .status = .aborted, .failure = sessions.abortCause(err) orelse err };
         }
         if (err == error.EnrichmentWorkerFailed) {
             _ = registry.recordTerminalCommitWithRepair(owned, id, .committed, true, null, null) catch return .{ .status = .committed_pending };

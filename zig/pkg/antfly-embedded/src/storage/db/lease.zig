@@ -84,6 +84,16 @@ pub const Lease = struct {
     }
 
     pub fn tryAcquireFenced(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !AcquireResult {
+        return self.acquireMatching(owner_id, now_ms, ttl_ms, false);
+    }
+
+    /// An expired owner may start a new tenure, but a heartbeat may never
+    /// create a retired lease or take another session owner's tenure.
+    pub fn renewExistingOwner(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !bool {
+        return (try self.acquireMatching(owner_id, now_ms, ttl_ms, true)).acquired;
+    }
+
+    fn acquireMatching(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64, existing_owner_only: bool) !AcquireResult {
         var txn = try self.store.store.beginWrite();
         var committed = false;
         defer if (!committed) txn.abort();
@@ -93,6 +103,7 @@ pub const Lease = struct {
             else => return err,
         };
 
+        if (existing_owner_only and current_raw == null) return .{ .acquired = false };
         var epoch: u64 = 1;
         var kind: AcquireKind = .acquired;
         var expires_at_ms = std.math.add(u64, now_ms, ttl_ms) catch std.math.maxInt(u64);
@@ -105,7 +116,7 @@ pub const Lease = struct {
             const current = parsed.value;
             if (current.expires_at_ms > now_ms and std.mem.eql(u8, current.owner_id, owner_id))
                 expires_at_ms = @max(expires_at_ms, current.expires_at_ms);
-            if (current.expires_at_ms > now_ms and !std.mem.eql(u8, current.owner_id, owner_id)) {
+            if ((existing_owner_only or current.expires_at_ms > now_ms) and !std.mem.eql(u8, current.owner_id, owner_id)) {
                 return .{ .acquired = false, .epoch = current.epoch, .expires_at_ms = current.expires_at_ms };
             }
             epoch = if (current.expires_at_ms > now_ms and std.mem.eql(u8, current.owner_id, owner_id))

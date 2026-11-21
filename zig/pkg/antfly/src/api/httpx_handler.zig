@@ -4211,6 +4211,7 @@ pub const AntflyApiHandler = struct {
             error.EnrichmentRetryInProgress,
             => textResponse(ctx, 202, "committed_visibility_pending"),
             error.EnrichmentWorkerFailed => textResponse(ctx, 202, "committed_repair_required"),
+            error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
             error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
             error.Unavailable => textResponse(ctx, 503, "transaction unavailable"),
             else => textResponse(ctx, 500, "internal server error"),
@@ -6331,6 +6332,7 @@ pub const AntflyApiHandler = struct {
             }
             break :rejected switch (err) {
                 error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
+                error.PreDispatchDecisionAdmissionUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "transaction_precommit_aborted", .message = "Metadata decision admission unavailable.", .retryable = true }),
                 error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "transaction_precommit_aborted", .message = "Participant temporarily unavailable.", .retryable = true }),
                 error.TransactionTooLarge => {
                     return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions");
@@ -12576,6 +12578,18 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
         var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, error.GroupLeaderUnavailable, phase);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+    }
+
+    {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn/prepare");
+        defer request.deinit();
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, error.StorageReadTemporarilyUnavailable, .prepare);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expectEqualStrings("storage read temporarily unavailable", response.body.?);
         try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
     }
 
