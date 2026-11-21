@@ -47,7 +47,12 @@ pub fn verifyFiles(a: Allocator, directory: []const u8, pins: pipeline.Published
         if (comptime std.mem.eql(u8, reflected_name, "model.safetensors")) {
             var reader = try @import("../models/safetensors.zig").MMapReader.openFileAbsoluteLimited(a, path, pin.size_bytes, 1024 * 1024);
             defer reader.deinit();
-            try pinBytes(pin, reader.file_bytes);
+            // The header reader leaves tensor pages random-access. A full
+            // authentication scan must use the same bounded sequential hint
+            // as production identity capture, rather than fault every page.
+            const actual = if (reader.mmap_region != null) bundle.Digest.ofMapped(reader.file_bytes) else bundle.Digest.of(reader.file_bytes);
+            try std.testing.expectEqual(pin.size_bytes, actual.size_bytes);
+            try std.testing.expectEqualStrings(pin.sha256, &actual.sha256);
         } else {
             const bytes = try @import("../util/c_file.zig").readFileMax(a, path, pin.size_bytes);
             defer a.free(bytes);

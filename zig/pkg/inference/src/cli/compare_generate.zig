@@ -2487,9 +2487,7 @@ fn makeAnalyzeRunBudget(
         .native => .cpu,
         else => .gpu,
     };
-    var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
-    budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
-    budget_limits = try applyBudgetOverrides(budget_limits, opts);
+    const budget_limits = try session_factory.resolveBudgetLimitsForSessions(&.{model.session}, runtime.tier.memory.defaultLimitsForBackend(budget_backend_class), try budgetOverrideLimits(opts));
 
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
@@ -2525,14 +2523,14 @@ fn backendKindForSession(backend: backends.BackendType) ?runtime.kv.pool.Backend
     };
 }
 
-fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
+fn budgetOverrideLimits(opts: Options) !runtime.tier.memory.Limits {
     return (runtime.tier.memory.BudgetOverridesMib{
         .host = opts.host_budget_mb,
         .backend = opts.backend_budget_mb,
         .combined = opts.combined_budget_mb,
         .kv = opts.kv_budget_mb,
         .scratch = opts.scratch_budget_mb,
-    }).apply(defaults);
+    }).toByteLimits();
 }
 
 fn printCompareBudgetExceeded(

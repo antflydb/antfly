@@ -1040,6 +1040,8 @@ pub fn fillDenseQwen3LayerSpecs(
     return out[0..layer_count];
 }
 
+pub const PrefillRowsOutput = enum { all, kv_only };
+
 const DirectHiddenResult = struct {
     hidden: ops.CT,
     total_rows: usize,
@@ -1059,6 +1061,8 @@ const ReservedHiddenCarrier = struct {
     ) !?ReservedHiddenCarrier {
         if (comptime !build_options.enable_metal) return null;
         const pair = (try metal_compute_mod.MetalCompute.reserveHiddenStatePair(cb, rows, hidden_size)) orelse return null;
+        errdefer cb.free(pair.front);
+        errdefer cb.free(pair.back);
         if (!(try metal_compute_mod.MetalCompute.copyTensorInto(cb, hidden_input, pair.front))) {
             cb.free(pair.front);
             cb.free(pair.back);
@@ -1083,10 +1087,10 @@ const ReservedHiddenCarrier = struct {
     }
 
     fn replaceActive(self: *ReservedHiddenCarrier, cb: *const ops.ComputeBackend, next_hidden: ops.CT) !void {
+        defer if (!self.ownsSlot(next_hidden)) cb.free(next_hidden);
         if (!(try metal_compute_mod.MetalCompute.copyTensorInto(cb, next_hidden, self.inactive()))) {
             return error.UnsupportedTensorType;
         }
-        if (!self.ownsSlot(next_hidden)) cb.free(next_hidden);
         self.active_front = !self.active_front;
     }
 
@@ -2319,6 +2323,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
     decode_context: *const gpt_arch.DecodeContext,
     phase: BlockTimingPhase,
     ple_vectors: ?ops.CT,
+    row_output: PrefillRowsOutput,
 ) !?DirectHiddenResult {
     if (!supportsDirectGemmaRuntime(gpt_config, configured_layer_count, decode_context)) {
         if (prefillTraceRequested()) std.debug.print(
@@ -2333,6 +2338,10 @@ fn forwardFinalHiddenTensorGemmaDirect(
         return null;
     }
 
+    const layer_limit: usize = if (row_output == .kv_only) limit: {
+        if (cb.kind() != .metal or phase != .prefill or decode_context.query_sequence_len <= 1) return null;
+        break :limit gpt_config.sharedKvPrefillDonorLayers() orelse return null;
+    } else gpt_config.num_hidden_layers;
     const should_use_decoder_frame = shouldUseDecoderRuntimeFrame(phase, gpt_config, configured_layer_count, decode_context);
     const frame_begin_started_at = monotonicNowNs();
     var decoder_frame_active = if (should_use_decoder_frame)
@@ -2380,6 +2389,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             &frame_layers_buf,
             true,
         );
+        planned_frame_layers = planned_frame_layers[0..layer_limit];
         const layer_spec_finished_at = monotonicNowNs();
         if (layer_spec_finished_at > layer_spec_started_at) {
             timing_stats.prefill_frame_layer_spec_nanos += layer_spec_finished_at - layer_spec_started_at;
@@ -2389,6 +2399,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             .contract = .gemma4_gated_ple_shared_kv,
             .layer_count = planned_frame_layers.len,
             .rows = decode_context.query_sequence_len,
+            .seq_len = seq_len,
             .hidden_size = gpt_config.hidden_size,
             .vocab_size = gpt_config.vocab_size,
             .num_attention_heads = gpt_config.num_attention_heads,
@@ -2397,6 +2408,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             .final_norm_slot = finalNormSlot(configured_layer_count),
             .final_lm_head_slot = finalLmHeadSlot(configured_layer_count),
             .layers = planned_frame_layers,
+            .include_tail = row_output != .kv_only,
         });
         const frame_plan_finished_at = monotonicNowNs();
         if (frame_plan_finished_at > frame_plan_started_at) {
@@ -2439,6 +2451,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             .hidden = hidden_input,
             .ple_vectors = ple_vectors,
             .layers = planned_frame_layers,
+            .include_tail = row_output != .kv_only,
             .output_hidden = &frame_hidden,
         })) {
             const frame_execute_finished_at = monotonicNowNs();
@@ -2451,7 +2464,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
                 .total_rows = decode_context.query_sequence_len,
                 .decoder_frame_active = return_decoder_frame,
             };
-        } else if (prefillTraceRequested()) {
+        } else if (row_output == .kv_only) return error.PreparedKvPrefixExecutionFailed else if (prefillTraceRequested()) {
             std.debug.print(
                 "prefill-trace: gemma-direct frame_execute=false layers={d} rows={d}\n",
                 .{ planned_frame_layers.len, decode_context.query_sequence_len },
@@ -2473,6 +2486,8 @@ fn forwardFinalHiddenTensorGemmaDirect(
         );
     }
 
+    if (row_output == .kv_only) return null; // no frame means no KV writes occurred
+
     const use_copy_based_reserved_hidden = !decoder_frame_active or phase != .prefill or decode_context.query_sequence_len <= 1;
     var reserved_hidden: ?ReservedHiddenCarrier = if (disableReservedHiddenCarrierRequested() or !use_copy_based_reserved_hidden)
         null
@@ -2483,7 +2498,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             decode_context.query_sequence_len,
             gpt_config.hidden_size,
         );
-    errdefer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
+    defer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
 
     var hidden = if (reserved_hidden) |*carrier| carrier.active() else hidden_input;
     var owns_hidden = false;
@@ -5029,7 +5044,16 @@ fn forwardFinalHiddenTensorDirect(
     decode_context: *const gpt_arch.DecodeContext,
     phase: BlockTimingPhase,
     ple_vectors: ?ops.CT,
+    row_output: PrefillRowsOutput,
 ) !?DirectHiddenResult {
+    if (comptime build_options.enable_cuda) {
+        @import("../ops/cuda/cuda_compute.zig").CudaCompute.tracePrefillProgram(cb, "prepared", decode_context, configured_layer_count, seq_len);
+        if (cb.kind() == .cuda and phase == .prefill and configured_layer_count == gpt_config.num_hidden_layers and seq_len == decode_context.query_sequence_len and !gatedFamilyCompareRequested()) {
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.tryCapturedPrefillBeforeFinalNorm(cb, allocator, gpt_config, hidden_input, ple_vectors, decode_context)) |captured| {
+                return .{ .hidden = captured, .total_rows = 1 };
+            }
+        }
+    }
     if (try forwardFinalHiddenTensorGemmaDirect(
         cb,
         allocator,
@@ -5040,7 +5064,9 @@ fn forwardFinalHiddenTensorDirect(
         decode_context,
         phase,
         ple_vectors,
+        row_output,
     )) |gemma_hidden| return gemma_hidden;
+    if (row_output == .kv_only) return null;
     if (!supportsDirectGatedRuntime(gpt_config, configured_layer_count, decode_context)) return null;
 
     var decoder_frame_active = if (shouldUseDecoderRuntimeFrame(phase, gpt_config, configured_layer_count, decode_context))
@@ -5059,7 +5085,7 @@ fn forwardFinalHiddenTensorDirect(
         )
     else
         null;
-    errdefer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
+    defer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
 
     var hidden = if (reserved_hidden) |*carrier| carrier.active() else hidden_input;
     var owns_hidden = false;
@@ -5152,6 +5178,7 @@ fn forwardFinalHiddenLastRowDirect(
         decode_context,
         phase,
         ple_vectors,
+        .all,
     )) orelse return null;
     errdefer cb.free(hidden_result.hidden);
     if (hidden_result.total_rows == 1) return hidden_result.hidden;
@@ -6521,6 +6548,15 @@ pub const PrefillPreparedTail = struct {
     greedy_token_id: ?i64 = null,
 };
 
+pub const PrefillTailOptions = struct {
+    prefer_greedy_token: bool = false,
+    /// Borrowed scaled rows from the same prepared provider. Token IDs retain
+    /// their PLE semantics; every later transformer/tail stage is shared.
+    input_embeddings: ?ops.CT = null,
+    /// A native-program miss must decline before any decoder/KV execution.
+    execution: enum { compatible, captured_native } = .compatible,
+};
+
 pub fn forwardPrefillLastPreparedTail(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -6529,16 +6565,24 @@ pub fn forwardPrefillLastPreparedTail(
     input_ids: []const i64,
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
-    prefer_greedy_token: bool,
+    options: PrefillTailOptions,
 ) !?PrefillPreparedTail {
     if (!supportsConfig(gpt_config)) return null;
     if (input_ids.len == 0 or decode_context.query_sequence_len != input_ids.len) return null;
     if (decode_context.attention_mode != .paged_prefill) return null;
+    if (options.execution == .captured_native) {
+        if (options.input_embeddings != null) return null;
+        if (comptime !build_options.enable_cuda) return null;
+        if (configured_layer_count != gpt_config.num_hidden_layers or seq_len != decode_context.query_sequence_len or gatedFamilyCompareRequested()) return null;
+        if (!@import("../ops/cuda/cuda_compute.zig").CudaCompute.capturedPrefillRequested(cb)) return null;
+    }
     timing_stats.prefill_calls += 1;
     timing_stats.prefill_query_tokens += input_ids.len;
 
     var started_at = monotonicNowNs();
-    const hidden = try decoder_rms_runtime.embedTokens(cb, allocator, gpt_config, input_ids);
+    const hidden = options.input_embeddings orelse try decoder_rms_runtime.embedTokens(cb, allocator, gpt_config, input_ids);
+    var owns_input_hidden = options.input_embeddings == null;
+    defer if (owns_input_hidden) cb.free(hidden);
     var finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_embed_nanos += finished_at - started_at;
 
@@ -6601,7 +6645,11 @@ pub fn forwardPrefillLastPreparedTail(
     }
 
     started_at = monotonicNowNs();
-    const direct_hidden_result = try forwardFinalHiddenTensorDirect(
+    const direct_hidden_result: ?DirectHiddenResult = if (options.execution == .captured_native) native: {
+        if (comptime !build_options.enable_cuda) break :native null;
+        const captured = (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.tryCapturedPrefillBeforeFinalNorm(cb, allocator, gpt_config, hidden, ple_vectors, decode_context)) orelse break :native null;
+        break :native .{ .hidden = captured, .total_rows = 1 };
+    } else try forwardFinalHiddenTensorDirect(
         cb,
         allocator,
         gpt_config,
@@ -6611,10 +6659,10 @@ pub fn forwardPrefillLastPreparedTail(
         decode_context,
         .prefill,
         ple_vectors,
+        .all,
     );
     if (direct_hidden_result == null) {
         cancelDecoderRuntimeFrame(cb, &ple_frame_active);
-        cb.free(hidden);
         return null;
     }
     var decoder_frame_active = if (direct_hidden_result) |direct_hidden|
@@ -6644,7 +6692,13 @@ pub fn forwardPrefillLastPreparedTail(
     if (finished_at > started_at) timing_stats.prefill_block_nanos += finished_at - started_at;
     // The embedded rows were borrowed by the block stack (the direct paths
     // copy them into their own hidden buffers); release them here.
-    if (final_hidden != hidden) cb.free(hidden);
+    if (final_hidden == hidden) {
+        if (!owns_input_hidden) return error.PreparedPrefillAliasedBorrow;
+        owns_input_hidden = false;
+    } else if (owns_input_hidden) {
+        cb.free(hidden);
+        owns_input_hidden = false;
+    }
     var owns_final_hidden = true;
     errdefer if (owns_final_hidden) cb.free(final_hidden);
     if (direct_hidden_result != null and compare_hidden_input != null) {
@@ -6696,19 +6750,14 @@ pub fn forwardPrefillLastPreparedTail(
         if (sync_finished_at > sync_started_at) timing_stats.prefill_sync_nanos += sync_finished_at - sync_started_at;
     }
     const slice_started_at = monotonicNowNs();
-    const last_hidden = if (total_rows == 1)
-        final_hidden
-    else
-        try cb.sliceRows2D(allocator, final_hidden, total_rows - 1, 1, gpt_config.hidden_size);
+    // The final row can alias reserved/planned decoder scratch. A deferred
+    // public tail must preserve its value when another prompt reuses that arena.
+    const last_hidden = try cb.snapshotRows2D(allocator, final_hidden, total_rows - 1, 1, gpt_config.hidden_size);
     const slice_finished_at = monotonicNowNs();
     if (slice_finished_at > slice_started_at) timing_stats.prefill_last_hidden_slice_nanos += slice_finished_at - slice_started_at;
-    errdefer if (last_hidden != final_hidden) cb.free(last_hidden);
-    if (last_hidden != final_hidden) {
-        cb.free(final_hidden);
-        owns_final_hidden = false;
-    } else {
-        owns_final_hidden = false;
-    }
+    errdefer cb.free(last_hidden);
+    cb.free(final_hidden);
+    owns_final_hidden = false;
     const frame_finish_started_at = monotonicNowNs();
     finishDecoderRuntimeFrame(cb, &decoder_frame_active);
     const frame_finish_finished_at = monotonicNowNs();
@@ -6716,7 +6765,7 @@ pub fn forwardPrefillLastPreparedTail(
         timing_stats.prefill_frame_finish_nanos += frame_finish_finished_at - frame_finish_started_at;
     }
     var greedy_token_id: ?i64 = null;
-    if (prefer_greedy_token) {
+    if (options.prefer_greedy_token) {
         if (try cb.decoderRuntimeApplyRmsNormLinearArgmax(&.{
             .input = last_hidden,
             .norm_slot = finalNormSlot(configured_layer_count),
@@ -6749,11 +6798,16 @@ fn forwardFinalHiddenRowsInternal(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
     prepared_tail_suppress_token_ids: ?[]const i32,
+    row_output: PrefillRowsOutput,
 ) !?FinalHiddenRows {
     if (!supportsConfig(gpt_config)) return null;
     if (input_ids.len == 0 or decode_context.query_sequence_len != input_ids.len) return null;
     if (decode_context.attention_mode != .paged_prefill and decode_context.attention_mode != .paged_decode) return null;
 
+    if (decode_context.attention_mode == .paged_prefill) {
+        timing_stats.prefill_calls += 1;
+        timing_stats.prefill_query_tokens += input_ids.len;
+    }
     const phase: BlockTimingPhase = if (decode_context.attention_mode == .paged_decode) .greedy else .prefill;
     var input_frame: ?MtpVerifyInputFrame = if (cb.kind() == .metal and
         gemma4MtpVerifyInputFrameEnabled() and supportsMtpVerifyInputFrame(gpt_config, input_ids.len, seq_len) and
@@ -6785,6 +6839,7 @@ fn forwardFinalHiddenRowsInternal(
         decode_context,
         prepared_tail_suppress_token_ids,
         phase,
+        row_output,
     );
 }
 
@@ -6803,10 +6858,13 @@ pub fn forwardFinalHiddenRowsFromEmbeddings(
     ple_ids: []const i64,
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
+    row_output: PrefillRowsOutput,
 ) !?FinalHiddenRows {
     if (!supportsConfig(gpt_config)) return null;
     if (ple_ids.len == 0 or decode_context.query_sequence_len != ple_ids.len) return null;
     if (decode_context.attention_mode != .paged_prefill) return null;
+    timing_stats.prefill_calls += 1;
+    timing_stats.prefill_query_tokens += ple_ids.len;
     return forwardFinalHiddenRowsFromHidden(
         cb,
         allocator,
@@ -6819,6 +6877,7 @@ pub fn forwardFinalHiddenRowsFromEmbeddings(
         decode_context,
         null,
         .prefill,
+        row_output,
     );
 }
 
@@ -6834,6 +6893,7 @@ fn forwardFinalHiddenRowsFromHidden(
     decode_context: *const gpt_arch.DecodeContext,
     prepared_tail_suppress_token_ids: ?[]const i32,
     phase: BlockTimingPhase,
+    row_output: PrefillRowsOutput,
 ) !?FinalHiddenRows {
     var started_at = monotonicNowNs();
     var finished_at = started_at;
@@ -6871,6 +6931,7 @@ fn forwardFinalHiddenRowsFromHidden(
         decode_context,
         phase,
         ple_vectors,
+        row_output,
     );
     if (direct_hidden_result == null) {
         if (owns_hidden) cb.free(hidden);
@@ -6890,7 +6951,17 @@ fn forwardFinalHiddenRowsFromHidden(
             timing_stats.prefill_block_nanos += finished_at - started_at;
         }
     }
-    const final_hidden = (try cb.decoderRuntimeApplyRmsNorm(&.{
+    if (row_output == .kv_only and decoder_frame_active) {
+        // KV publication is the only output of this stage. A failed GPU
+        // completion must propagate before a later chunk can consume it.
+        cb.decoderRuntimeSubmitAndWaitFrame() catch |err| {
+            cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
+            cb.free(hidden_result.hidden);
+            return err;
+        };
+        decoder_frame_active = false;
+    }
+    const final_hidden = if (row_output == .kv_only) hidden_result.hidden else (try cb.decoderRuntimeApplyRmsNorm(&.{
         .slot = finalNormSlot(configured_layer_count),
         .input = hidden_result.hidden,
         .hidden_size = gpt_config.hidden_size,
@@ -6946,7 +7017,14 @@ pub fn forwardFinalHiddenRows(
         seq_len,
         decode_context,
         null,
+        .all,
     );
+}
+
+/// KV-only chunks retain the same planned native kernels and omit the
+/// suffix only after the adapter proves it has no independent KV state.
+pub fn forwardFinalHiddenRowsKvOnly(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, config: gpt_mod.Config, configured_layers: usize, ids: []const i64, total: usize, context: *const gpt_arch.DecodeContext) !?FinalHiddenRows {
+    return forwardFinalHiddenRowsInternal(cb, allocator, config, configured_layers, ids, total, context, null, .kv_only);
 }
 
 pub fn forwardFinalHiddenRowsPreparedArgmax(
@@ -6968,6 +7046,7 @@ pub fn forwardFinalHiddenRowsPreparedArgmax(
         seq_len,
         decode_context,
         suppress_token_ids,
+        .all,
     );
 }
 
@@ -7076,7 +7155,7 @@ pub fn forwardPrefillLastLogits(
         input_ids,
         seq_len,
         decode_context,
-        false,
+        .{},
     )) orelse return null;
     defer cb.free(tail.final_hidden);
 
@@ -7451,10 +7530,10 @@ test "Gemma4 MTP input frame transfers and cancels only owned frames" {
         }
     };
     var table = @import("../ops/native_compute.zig").vtable_impl;
-    table.decoderRuntimeBeginFrame = Probe.begin;
-    table.decoderRuntimeHasActiveFrame = Probe.hasActive;
-    table.decoderRuntimeSetActiveFrameRegime = Probe.regime;
-    table.decoderRuntimeCancelFrame = Probe.cancel;
+    table.regions.commands.beginFrame = Probe.begin;
+    table.regions.commands.hasActiveFrame = Probe.hasActive;
+    table.regions.decoder.setActiveFrameRegime = Probe.regime;
+    table.regions.commands.cancelFrame = Probe.cancel;
     var probe = Probe{};
     const cb: ops.ComputeBackend = .{ .ptr = &probe, .vtable = &table };
     var frame = try MtpVerifyInputFrame.begin(&cb);

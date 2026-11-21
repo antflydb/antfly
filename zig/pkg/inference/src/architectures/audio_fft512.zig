@@ -14,8 +14,10 @@
 // limitations under the License.
 
 const std = @import("std");
+const audio = @import("antfly_tile").native_audio;
+const Fft = audio.Fft512;
 pub const lanes = 8;
-pub fn fillTwiddles(out: *[512]f32) void {
+pub fn fillTwiddles(out: *[Fft.size]f32) void {
     for (0..256) |i| {
         const angle = -2.0 * std.math.pi * @as(f64, @floatFromInt(i)) / 512.0;
         out[2 * i] = @floatCast(@cos(angle));
@@ -25,33 +27,34 @@ pub fn fillTwiddles(out: *[512]f32) void {
 /// SIMD lanes are independent frames. No reduction order crosses a lane.
 /// Scratch is fixed (32 KiB), tails are zero-filled and never published.
 pub fn magnitudes(samples: []const f32, frames: usize, hop: usize, window: []const f32, twiddles: []const f32, output: []f32) !void {
-    if (frames == 0 or window.len != 320 or twiddles.len != 512 or output.len != try std.math.mul(usize, frames, 257)) return error.InvalidTensorShape;
-    const required = try std.math.add(usize, try std.math.mul(usize, frames - 1, hop), 320);
+    if (frames == 0 or window.len != Fft.frame_samples or twiddles.len != Fft.size or output.len != try std.math.mul(usize, frames, Fft.bins)) return error.InvalidTensorShape;
+    const required = try std.math.add(usize, try std.math.mul(usize, frames - 1, hop), Fft.frame_samples);
     if (samples.len < required) return error.InvalidTensorShape;
     const V = @Vector(lanes, f32);
-    var re: [512]V = undefined;
-    var im: [512]V = undefined;
+    var re: [Fft.size]V = undefined;
+    var im: [Fft.size]V = undefined;
     var first: usize = 0;
     while (first < frames) : (first += lanes) {
         for (0..512) |i| {
             var value: [lanes]f32 = @splat(0);
-            if (i < 320) for (&value, 0..) |*x, lane| {
+            if (i < Fft.frame_samples) for (&value, 0..) |*x, lane| {
                 if (first + lane < frames) x.* = samples[(first + lane) * hop + i] * window[i];
             };
-            const reversed: usize = @as(u32, @bitReverse(@as(u32, @intCast(i)))) >> 23;
+            const reversed: usize = @as(u32, @bitReverse(@as(u32, @intCast(i)))) >> Fft.reverse_shift;
             re[reversed] = value;
             im[reversed] = @splat(0);
         }
         var len: usize = 2;
-        while (len <= 512) : (len *= 2) {
+        while (len <= Fft.size) : (len *= 2) {
             const half = len / 2;
             var base: usize = 0;
-            while (base < 512) : (base += len) for (0..half) |j| {
-                const tw = j * (512 / len);
+            while (base < Fft.size) : (base += len) for (0..half) |j| {
+                const tw = j * (Fft.size / len);
                 const wr: V = @splat(twiddles[2 * tw]);
                 const wi: V = @splat(twiddles[2 * tw + 1]);
-                const r = re[base + j + half] * wr - im[base + j + half] * wi;
-                const v = re[base + j + half] * wi + im[base + j + half] * wr;
+                const product = audio.product(re[base + j + half], im[base + j + half], wr, wi);
+                const r = product.real;
+                const v = product.imag;
                 const ar = re[base + j];
                 const ai = im[base + j];
                 re[base + j] = ar + r;
@@ -61,11 +64,11 @@ pub fn magnitudes(samples: []const f32, frames: usize, hop: usize, window: []con
             };
         }
         for (0..257) |bin| {
-            const power: V = re[bin] * re[bin] + im[bin] * im[bin];
+            const power: V = audio.magnitudeSquared(re[bin], im[bin]);
             const magnitude: V = @sqrt(power);
             const values: [lanes]f32 = magnitude;
             for (values, 0..) |x, lane| if (first + lane < frames) {
-                output[(first + lane) * 257 + bin] = x;
+                output[(first + lane) * Fft.bins + bin] = x;
             };
         }
     }
