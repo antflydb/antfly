@@ -264,14 +264,41 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
     if policy.get("schema_version") != 4:
         raise SystemExit(f"unsupported release-channel schema in {path}")
     channels = policy.get("channels")
-    if not isinstance(channels, dict) or set(channels) != CHANNEL_NAMES:
+    if not isinstance(channels, dict) or not CHANNEL_NAMES <= set(channels):
         raise SystemExit("release-channel policy must define stable, next, and nightly")
 
     destinations: set[tuple[str, str]] = set()
     journal_keys: set[str] = set()
     for name, channel in channels.items():
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+            raise SystemExit(f"invalid release channel name: {name}")
         if not isinstance(channel, dict) or REQUIRED_FIELDS - channel.keys():
             raise SystemExit(f"release channel {name} is missing required fields")
+        if name not in CHANNEL_NAMES:
+            line = channel.get("release_line")
+            if (
+                not isinstance(line, str)
+                or not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", line)
+                or channel["tag_kind"] != "stable"
+                or channel["ordering"] != "semver"
+                or channel["retention"] != {"mode": "forever"}
+                or channel["github_release"] != "release"
+                or channel["publish_homebrew"]
+                or channel["object_static_files"]
+            ):
+                raise SystemExit(
+                    f"release channel {name} has invalid maintenance policy"
+                )
+            if any(
+                other != name and document.get("release_line") == line
+                for other, document in channels.items()
+                if isinstance(document, dict)
+            ):
+                raise SystemExit(
+                    f"release line {line} has duplicate maintenance channels"
+                )
+        elif "release_line" in channel:
+            raise SystemExit(f"global channel {name} cannot restrict a release line")
         if channel["tag_kind"] not in {"stable", "prerelease", "nightly"}:
             raise SystemExit(f"release channel {name} has invalid tag_kind")
         if channel["ordering"] not in {"semver", "sequence"}:
@@ -285,7 +312,7 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
             <= {"github-latest", "npm", "object-storage", "homebrew"}
         ):
             raise SystemExit(f"release channel {name} has invalid bootstrap_sources")
-        if channel["github_release"] not in {"latest", "prerelease", "none"}:
+        if channel["github_release"] not in {"latest", "release", "prerelease", "none"}:
             raise SystemExit(f"release channel {name} has invalid GitHub mode")
         expected_bootstrap_sources = {"object-storage"}
         if channel["publish_npm"]:
@@ -365,6 +392,7 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
     if {
         name: (channel["tag_kind"], channel["ordering"])
         for name, channel in channels.items()
+        if name in CHANNEL_NAMES
     } != {
         "stable": ("stable", "semver"),
         "next": ("prerelease", "semver"),
@@ -421,7 +449,11 @@ def validate_observed_channel_tag(
     channel = policy["channels"].get(channel_name)
     if not isinstance(channel, dict):
         raise SystemExit(f"unknown release channel: {channel_name}")
-    _, prerelease = parse_version(tag)
+    core, prerelease = parse_version(tag)
+    if channel.get("release_line") not in (None, f"{core[0]}.{core[1]}"):
+        raise SystemExit(
+            f"release channel {channel_name} requires line {channel['release_line']}"
+        )
     if not CONTAINER_TAG_PATTERN.fullmatch(tag):
         raise SystemExit(
             f"release tag cannot be represented by the container registry: {tag}"
@@ -463,9 +495,15 @@ def resolve_channel(
     allow_legacy: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     policy = policy or load_policy()
-    _, prerelease = parse_version(tag)
+    core, prerelease = parse_version(tag)
     if requested == "auto":
         requested = "next" if prerelease is not None else "stable"
+        if prerelease is None:
+            line = f"{core[0]}.{core[1]}"
+            for name, channel in policy["channels"].items():
+                if channel.get("release_line") == line:
+                    requested = name
+                    break
     validate_channel_tag(tag, requested, policy, allow_legacy=allow_legacy)
     return requested, dict(policy["channels"][requested])
 

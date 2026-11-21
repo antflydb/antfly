@@ -24,7 +24,7 @@ on:
         required: true
         type: string
       channel:
-        description: "auto, stable, next, or nightly"
+        description: "auto or a policy-defined release channel"
         required: true
         type: string
       build_controller_commit:
