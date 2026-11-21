@@ -40677,6 +40677,19 @@ fn tensorDTypeOp(ctx: *anyopaque, tensor: CT) anyerror!tensor_mod.DType {
     if (buf.declared_dtype) |dtype| return dtype;
     if (buf.data.len > 0) return .f32;
     if (buf.quantized_storage != null) return .f32;
+    // Native can publish a dense F32 tensor whose logical extent is empty.
+    // Zero backing bytes do not erase its dtype or turn a lazy weight into
+    // a materialized activation.
+    if (buf.lazy_entry == null and !buf.cached_weight and weightOrigin(buf) == null) {
+        if (buf.logical_shape) |shape| {
+            var empty = false;
+            for (shape) |dimension| {
+                if (dimension < 0) return error.UnsupportedTensorType;
+                empty = empty or dimension == 0;
+            }
+            if (empty) return .f32;
+        }
+    }
     return error.UnsupportedTensorType;
 }
 
