@@ -43,6 +43,7 @@ pub const ReferenceAdmission = struct {
 pub const Receipt = struct { hardware: bool, submitted_packets: usize };
 pub const Sink = struct {
     context: *anyopaque,
+    /// Called after native initialization succeeds, before submitting any packet.
     before_decode: ?*const fn (*anyopaque) void = null,
     accept: *const fn (*anyopaque, usize, *const apple.Surface, pictures.Picture) anyerror!void,
 };
@@ -267,12 +268,8 @@ pub fn planReplay(reader: *const media.webm.Reader, indexed: pictures.Index, sel
     if (end < first_packet or end >= reader.packets.len) return error.InvalidVideoIndex;
     if (cursor) |packet| {
         const warm = pictures.Restart{ .packet = packet, .logical = first };
-        if (first_packet >= packet) {
-            if (options.replay_budget == null) {
-                try checkPacketLimit(options, packet, end);
-                return .{ .restart = warm, .end = end, .reuse = true };
-            }
-            if (end - packet + 1 <= options.decode.max_decode_packets and try options.replay_budget.?.fits(indexed, reader, warm, end + 1, reader.input.control))
+        if (first_packet >= packet and end - packet + 1 <= options.decode.max_decode_packets) {
+            if (options.replay_budget == null or try options.replay_budget.?.fits(indexed, reader, warm, end + 1, reader.input.control))
                 return .{ .restart = warm, .end = end, .reuse = true };
         }
     }
@@ -322,7 +319,6 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     const seen = try a.alloc(bool, selected.len);
     defer a.free(seen);
     @memset(seen, false);
-    if (sink.before_decode) |before| before(sink.context);
     if (retained_owner != null and !warm) if (options.reference_admission) |admission| {
         try admission.acquire(admission.context, try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, 32, shape.bit_depth));
     };
@@ -353,6 +349,8 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
         session.drain() catch {};
         if (retained_owner) |owner| owner.active = null;
     }
+    try reader.input.checkControl();
+    if (sink.before_decode) |before| before(sink.context);
     for (restart.packet..end + 1) |packet_id| {
         try reader.input.control.check();
         const packet = reader.packets[packet_id];
@@ -475,7 +473,7 @@ fn qualify(bytes: []const u8, check_metal: bool) !void {
     const unique = ids[0..if (ids[1] == 0) @as(usize, 1) else 2];
     const receipt = decodeTo(a, &reader, indexed, unique, .{ .decode = .{ .require_hardware = false }, .pool = &pool }, .{ .context = &parity, .accept = Parity.accept }) catch |err| {
         try std.testing.expectEqual(baseline, pool.snapshot());
-        if (err == error.VideoDecoderUnavailable) return error.SkipZigTest;
+        if (err == error.VideoDecoderUnavailable or err == error.UnsupportedVideoProfile) return error.SkipZigTest;
         return err;
     };
     try std.testing.expectEqual(unique.len, parity.checked);
@@ -517,7 +515,7 @@ test "Apple WebM failure and cancellation drain surfaces before releasing reserv
     const sink = Sink{ .context = &dummy, .accept = Failure.accept };
     const result = decodeTo(a, &reader, indexed, &.{0}, .{ .decode = .{ .require_hardware = false }, .pool = &pool }, sink);
     if (result) |_| return error.TestUnexpectedResult else |err| {
-        try std.testing.expect(err == error.ConsumerFailure or err == error.VideoDecoderUnavailable);
+        try std.testing.expect(err == error.ConsumerFailure or err == error.VideoDecoderUnavailable or err == error.UnsupportedVideoProfile);
     }
     try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
     source.control = .{ .check_fn = Failure.cancelled };
@@ -539,7 +537,7 @@ fn qualifyIvf(bytes: []const u8, codec: media.webm.Codec, check_metal: bool) !vo
     try std.testing.expectEqual(@as(u8, 10), indexed.pictures[0].bit_depth);
     var parity = Parity{ .reader = &reader, .indexed = indexed, .check_metal = check_metal };
     const receipt = decodeTo(a, &reader, indexed, &.{0}, .{ .decode = .{ .require_hardware = false } }, .{ .context = &parity, .accept = Parity.accept }) catch |err| {
-        if (err == error.VideoDecoderUnavailable) return error.SkipZigTest;
+        if (err == error.VideoDecoderUnavailable or err == error.UnsupportedVideoProfile) return error.SkipZigTest;
         return err;
     };
     try std.testing.expectEqual(@as(usize, 1), parity.checked);
@@ -589,7 +587,7 @@ test "Apple WebM AV1 seek restores sequence OBU and ignores container sync hints
     defer indexed.deinit();
     var parity = Parity{ .reader = &reader, .indexed = indexed };
     const receipt = decodeTo(a, &reader, indexed, &.{3}, .{ .decode = .{ .require_hardware = false } }, .{ .context = &parity, .accept = Parity.accept }) catch |err| {
-        if (err == error.VideoDecoderUnavailable) return error.SkipZigTest;
+        if (err == error.VideoDecoderUnavailable or err == error.UnsupportedVideoProfile) return error.SkipZigTest;
         return err;
     };
     try std.testing.expectEqual(@as(usize, 1), parity.checked);
@@ -621,7 +619,7 @@ test "Apple WebM continuation retains references across windows and preserves ba
         const sink = Sink{ .context = &parity, .accept = Parity.accept };
         const first: usize = @min(2, indexed.pictures.len - 1);
         _ = owner.decodeTo(&reader, indexed, &.{first}, sink) catch |err| {
-            if (err == error.VideoDecoderUnavailable) return error.SkipZigTest;
+            if (err == error.VideoDecoderUnavailable or err == error.UnsupportedVideoProfile) return error.SkipZigTest;
             return err;
         };
         const cursor = owner.next_packet;
@@ -667,7 +665,7 @@ test "Apple WebM decode budget bounds submitted span rather than source length" 
     try std.testing.expect(reader.packets.len > 1);
     var parity = Parity{ .reader = &reader, .indexed = indexed };
     const receipt = decodeTo(a, &reader, indexed, &.{0}, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 1 } }, .{ .context = &parity, .accept = Parity.accept }) catch |err| {
-        if (err == error.VideoDecoderUnavailable) return error.SkipZigTest;
+        if (err == error.VideoDecoderUnavailable or err == error.UnsupportedVideoProfile) return error.SkipZigTest;
         return err;
     };
     try std.testing.expectEqual(@as(usize, 1), receipt.submitted_packets);

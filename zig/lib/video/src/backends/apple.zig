@@ -70,6 +70,12 @@ pub const CodedSession = struct {
         var handle: ?*anyopaque = null;
         const status = av_decoder_create_coded(@backingInt(codec), config.ptr, config.len, width, height, @backingInt(format), @intFromBool(require_hardware), callback, context, &handle);
         if (status == -108) return error.OutOfMemory; // memFullErr
+        if (codec == .vp9 or codec == .av1) switch (status) {
+            -12906, // kVTCouldNotFindVideoDecoderErr
+            -12910, // kVTVideoDecoderUnsupportedDataFormatErr
+            => return error.UnsupportedVideoProfile,
+            else => {},
+        };
         if (status != 0) return error.VideoDecoderUnavailable;
         return .{ .handle = handle.? };
     }
