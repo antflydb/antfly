@@ -120,12 +120,14 @@ pub const Port = struct {
         return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
     }
 
-    pub fn acknowledgePublished(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, fence: metadata.CatalogRouteFence, original: operation.RequestContext) !void {
+    /// Settle participant tracking after recovery confirms publication on every
+    /// committed owner or rollback on every aborted owner.
+    pub fn acknowledgeResolved(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, fence: metadata.CatalogRouteFence, original: operation.RequestContext) !void {
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
         const context = scope.context();
         try observation.validate(lookup);
         const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
-        if (decision.record.status != .committed) return error.SourceOutcomeUnresolved;
+        if (decision.record.status == .pending) return error.SourceOutcomeUnresolved;
         const admission = decision.admission.admission;
         const owner = try admission.recoveryOwner(admission.coordinator_namespace);
         const coordinator = try admission.member(admission.coordinator_namespace);

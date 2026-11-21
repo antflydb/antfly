@@ -139,10 +139,10 @@ pub const Recovery = struct {
         if (decision.record.status == .aborted) {
             for (fences, 0..) |fence, index| {
                 try self.checkpoint(context);
-                try self.checkpoint(context);
                 try self.participants.submitRetained(a, request.binding(), observed.value, index, fence, .resolve, context);
             }
             try self.checkpoint(context);
+            try self.participants.acknowledgeResolved(a, request.binding(), observed.value, coordinator_fence, context);
             return .aborted;
         }
         const manifest = try decision.committedManifest();
@@ -191,7 +191,7 @@ pub const Recovery = struct {
         }
         try self.checkpoint(context);
         if (!complete) return .incomplete;
-        try self.participants.acknowledgePublished(a, request.binding(), observed.value, coordinator_fence, context);
+        try self.participants.acknowledgeResolved(a, request.binding(), observed.value, coordinator_fence, context);
         return .complete;
     }
 };
@@ -372,10 +372,14 @@ test "data raft ordered history completion recovery retains guard checkpoints an
                         self.state.intents_resolved = true;
                     }
                     self.resolves += 1;
-                    if (!self.suppress_resolution) self.resolved[index] = true;
+                    if (terminal.status == .aborted or !self.suppress_resolution) self.resolved[index] = true;
                 },
                 .acknowledge_many => |value| {
-                    try std.testing.expect(self.published[0] and self.published[1]);
+                    if (self.state.status == .committed) {
+                        try std.testing.expect(self.published[0] and self.published[1]);
+                    } else {
+                        try std.testing.expect(self.state.status == .aborted and self.resolved[0] and self.resolved[1]);
+                    }
                     try std.testing.expectEqualSlices(u8, &self.admission.transaction_id, &value.txn_id);
                     const coordinator = self.admission.coordinator_namespace;
                     const expected_count: usize = if (self.state.retain_terminal) 1 else 2;
@@ -440,7 +444,10 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(.pending, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
     fake.state.status = .aborted;
     fake.state.finalized_at_ns = 30;
+    fake.state.retain_terminal = false;
+    fake.resolved = .{ false, false };
     try std.testing.expectEqual(.aborted, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
+    fake.state.retain_terminal = true;
     try std.testing.expectEqual(@as(usize, 4), fake.publishes);
     try std.testing.expectEqual(@as(usize, 5), fake.resolves);
     var retained: local.storage_history_recovery_wire.Request = .{ .owner = owners[0], .transaction_id = admission.transaction_id, .admission_digest = admission.digest(), .coordinator_locator = members[0].locator, .abort_before_ns = 20, .resolution_timestamp_ns = 30 };
