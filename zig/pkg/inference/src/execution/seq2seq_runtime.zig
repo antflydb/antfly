@@ -384,6 +384,49 @@ fn checkIncremental(allocator: std.mem.Allocator) !void {
     try std.testing.expect(controller.snapshot().host_kv_bytes > 0);
 }
 
+test "incremental seq2seq executes imported ONNX with empty and populated cache lengths" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const ids = try b.parameter("input_ids", ml.graph.Shape.init(.i64, &.{ 1, -1 }));
+    const encoder = try b.parameter("encoder_hidden_states", ml.graph.Shape.init(.f32, &.{ 1, -1, 4 }));
+    const branch = try b.parameter("use_cache_branch", ml.graph.Shape.init(.bool_, &.{1}));
+    const past = try b.parameter("past_key_values.0.decoder.key", ml.graph.Shape.init(.f32, &.{ 1, 1, -1, 4 }));
+    const token = try b.reduceSum(try b.convertDtype(ids, .f32), &.{ 0, 1 });
+    const cached = try b.reduceSum(try b.convertDtype(branch, .f32), &.{0});
+    const logits = try b.add(encoder, try b.add(token, cached));
+    const current = try b.reshape(logits, ml.graph.Shape.init(.f32, &.{ 1, 1, 1, 4 }));
+    const present = try b.concat(past, current, 2);
+    try graph.markOutput(logits);
+    try graph.markOutput(present);
+    const model = try @import("onnx_graph").exportGraph(a, &graph, .{ .node_name_overrides = &.{
+        .{ .node_id = logits, .name = "logits" },
+        .{ .node_id = present, .name = "present.0.decoder.key" },
+    } });
+    defer a.free(model);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "merged.onnx", .data = model });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "merged.onnx" });
+    defer a.free(path);
+    const session = try @import("../backends/imported_onnx_session.zig").createSessionWithOptions(a, path, .native, .{});
+    defer session.close();
+    var hidden = try backends.Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 1, 4 }, &.{ 1, 2, 3, 4 });
+    defer hidden.deinit();
+    var state = (try State.init(a, session, hidden, &.{1}, 4)) orelse return error.InvalidMergedDecoderFixture;
+    defer state.deinit();
+    var first = try state.step(&.{2}, null, null);
+    defer first.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6 }, first.asFloat32());
+    var next = try state.step(&.{ 2, 5 }, null, null);
+    defer next.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 7, 8, 9, 10 }, next.asFloat32());
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6, 7, 8, 9, 10 }, state.cached_outputs[1].asFloat32());
+}
+
 test "incremental seq2seq reuses self and cross KV with context isolation and full-prefix parity" {
     try checkIncremental(std.testing.allocator);
 }
