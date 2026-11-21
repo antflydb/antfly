@@ -705,7 +705,7 @@ test "db repair activation restarts unjournaled source races without penalizing 
             if (try @import("antfly_local_sources").storage_db_artifact_native_stream.advance(alloc, db.core.store, db.root_incarnation, "historic", plan.plan()) == .closed) break;
         } else return error.TestExpectedHistoricNativeClosure;
         const completion = @import("antfly_local_sources").storage_db_artifact_completion_progress;
-        try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.core.applied_sequence_checkpoint_path, db.root_incarnation, "historic", plan.plan(), .{ .time_budget_ns = null });
+        try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.root_incarnation, "historic", plan.plan(), .{ .time_budget_ns = null });
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
@@ -777,7 +777,7 @@ test "db repair activation automatically schedules bounded historical adoption a
         var plan = try db.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
         {
-            var busy = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.index_manager.checkpointIo(), db.core.store, db.core.applied_sequence_checkpoint_path)).?;
+            var busy = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.store)).?;
             defer busy.deinit();
             try engine.test_support.refreshArtifactProjections(engine.test_support.dbPointer(&db), alloc, "historic", plan.plan(), .{ .time_budget_ns = null });
             try std.testing.expect(try engine.test_support.indexRepairIdForIndex(engine.test_support.dbPointer(&db), alloc, "first") == null);
@@ -3623,7 +3623,7 @@ test "db ordered artifact inventory full text replay publishes physical coverage
         try std.testing.expectEqual(@as(u32, 1), entry.persistent.snapshot().liveDocCount());
         const Validate = struct {
             fn run(a: Allocator, target: *DB, generation: u64) !void {
-                var snapshot = (try apply_state.tryAcquireProjectionSnapshot(a, target.core.index_manager.checkpointIo(), target.core.store, target.core.applied_sequence_checkpoint_path)).?;
+                var snapshot = (try apply_state.tryAcquireProjectionSnapshot(a, target.core.store)).?;
                 defer snapshot.deinit();
                 try std.testing.expect(try target.core.index_manager.tryValidateFullTextProjection(a, &snapshot, "text", generation + 1) == null);
                 var guard = (try target.core.index_manager.tryValidateFullTextProjection(a, &snapshot, "text", generation)) orelse return error.TestExpectedPhysicalProjectionGuard;
@@ -3642,7 +3642,7 @@ test "db ordered artifact inventory full text replay publishes physical coverage
                 if (candidate.kind == .index_projection and std.mem.eql(u8, candidate.name, "text")) break candidate;
             } else return error.TestExpectedPhysicalProjectionNode;
             requirement = node.id;
-            var snapshot = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.index_manager.checkpointIo(), db.core.store, db.core.applied_sequence_checkpoint_path)).?;
+            var snapshot = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.store)).?;
             defer snapshot.deinit();
             var guard = (try db.core.index_manager.tryValidateFullTextProjection(alloc, &snapshot, "text", saved.generation)).?;
             defer guard.deinit();
@@ -3690,16 +3690,14 @@ test "db ordered artifact inventory full text replay publishes physical coverage
                 try txn.commit();
             }
             {
-                var busy = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.index_manager.checkpointIo(), db.core.store, db.core.applied_sequence_checkpoint_path)).?;
+                var busy = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.store)).?;
                 defer busy.deinit();
-                try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.core.applied_sequence_checkpoint_path, db.root_incarnation, "doc", plan.plan(), .{});
+                try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.root_incarnation, "doc", plan.plan(), .{});
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();
                 try std.testing.expect(try certificates.load(&read, &certificates.key("text")) == null);
             }
-            try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.core.applied_sequence_checkpoint_path, db.root_incarnation, "doc", plan.plan(), .{});
-            // Covered pages must not need a sidecar file at all.
-            try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, "missing-parent/no-sidecar", db.root_incarnation, "doc", plan.plan(), .{});
+            try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.root_incarnation, "doc", plan.plan(), .{});
             var complete = blk: {
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();
@@ -3727,7 +3725,7 @@ test "db ordered artifact inventory full text replay publishes physical coverage
             try std.testing.expectEqual(@as(u64, 0), (try @import("antfly_local_sources").storage_db_artifact_producer_obligations.load(&read)).?.pending_documents);
         }
         {
-            var snapshot = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.index_manager.checkpointIo(), db.core.store, db.core.applied_sequence_checkpoint_path)).?;
+            var snapshot = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.store)).?;
             defer snapshot.deinit();
             var guard = (try db.core.index_manager.tryValidateFullTextProjection(alloc, &snapshot, "text", saved.generation)).?;
             defer guard.deinit();
@@ -3740,13 +3738,13 @@ test "db ordered artifact inventory full text replay publishes physical coverage
         // certify completion, even though its config and generation match.
         var ahead = checkpoint;
         ahead.applied_sequence += 1;
-        try apply_state.saveProjectionCheckpointWithSidecar(alloc, db.core.index_manager.checkpointIo(), db.core.store, db.core.applied_sequence_checkpoint_path, "text", ahead);
+        try apply_state.saveProjectionCheckpoint(db.core.store, "text", ahead);
         {
-            var snapshot = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.index_manager.checkpointIo(), db.core.store, db.core.applied_sequence_checkpoint_path)).?;
+            var snapshot = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.store)).?;
             defer snapshot.deinit();
             try std.testing.expect(try db.core.index_manager.tryValidateFullTextProjection(alloc, &snapshot, "text", saved.generation) == null);
         }
-        try apply_state.saveProjectionCheckpointWithSidecar(alloc, db.core.index_manager.checkpointIo(), db.core.store, db.core.applied_sequence_checkpoint_path, "text", checkpoint);
+        try apply_state.saveProjectionCheckpoint(db.core.store, "text", checkpoint);
     }
     var db = try DB.open(alloc, path, options);
     defer db.close();

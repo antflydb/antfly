@@ -26,6 +26,10 @@ const bridge = @import("bridge.zig");
 const capabilities = @import("capabilities.zig");
 const docstore = @import("docstore.zig");
 const index_storage = @import("index_storage.zig");
+const native_catalog_sink = @import("native_catalog_sink.zig");
+/// Key prefix of every native-catalog index record (index content, not
+/// definitions) in the index catalog.
+pub const native_catalog_prefix = native_catalog_sink.reserved_prefix;
 const resource_manager_mod = @import("../resource_manager.zig");
 
 const Allocator = std.mem.Allocator;
@@ -79,6 +83,8 @@ pub const OpenOptions = struct {
     /// Optional caller-owned runtime for the complete native-single-file
     /// lifecycle. Bridge mode rejects it because that engine is native-only.
     io: ?std.Io = null,
+    /// See `docstore.Store.ride_along_idle_ns`'s own doc comment.
+    ride_along_idle_ns: ?u64 = null,
 };
 
 pub const CreateOptions = struct {
@@ -89,6 +95,10 @@ pub const CreateOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     writer_lock_marker: []const u8 = "",
     io: ?std.Io = null,
+    /// See `docstore.Store.ride_along_idle_ns`'s own doc comment.
+    ride_along_idle_ns: ?u64 = null,
+    /// See `docstore.Store.CreateOptions.use_redo_log`'s own doc comment.
+    use_redo_log: ?bool = null,
 };
 
 pub fn isAflitePath(path: []const u8) bool {
@@ -107,6 +117,8 @@ pub const StorageStatus = struct {
     page_size: ?u32 = null,
     active_checkpoint: ?u8 = null,
     checkpoint_sequence: ?u64 = null,
+    /// Last commit a redo-log fold published into the checkpoint tree.
+    redo_folded_through: ?u64 = null,
     page_count: ?u64 = null,
     fsync: ?bool = null,
 };
@@ -163,10 +175,33 @@ pub const Handle = struct {
     native_docstore: ?*docstore.Store = null,
     native_index_storage: ?*index_storage.Store = null,
     native_runtime_store: ?*backend_erased.Store = null,
+    /// Backs `opts.index_backends.text_main_native_catalog_sink` for every
+    /// `.native_catalog`-backed managed index this handle opens. Shared,
+    /// not per-namespace: `native_catalog_backend.Sink`'s `scope` parameter
+    /// (each index's own path) disambiguates callers.
+    native_catalog_sink: ?*native_catalog_sink.Sink = null,
     namespace_mutex: std.atomic.Mutex = .unlocked,
     namespace_runtimes: std.StringHashMapUnmanaged(NamespaceRuntime) = .empty,
     root_namespace_alias: ?[]u8 = null,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    /// Guards `deinit` against running twice on the same `Handle`. A caller
+    /// that explicitly closes a handle mid-scope and also leaves an
+    /// `errdefer`/`defer` registered earlier in the same scope (a common,
+    /// easy-to-hit pattern: see `crash_consistency_test.zig`'s `DbHandle`)
+    /// will invoke `deinit` a second time whenever anything *later* in that
+    /// scope returns an error. Before this flag, the second call read
+    /// `self.engine` and every other field out of memory `deinit` had
+    /// already set to `undefined` (poisoned to a repeating bit pattern in
+    /// safety-checked builds), so the switch below could take the wrong
+    /// branch entirely and dereference garbage -- observed as a
+    /// segmentation fault inside `bridge.zig`'s hashmap iterator, reached
+    /// through the `.bridge_lsm_container` arm despite every real handle in
+    /// that failure actually being `.native_single_file`. `deinit` only
+    /// needs to check this field, not reset it on exit: it is set `true`
+    /// *after* `self.* = undefined`, so it is the one field a stale second
+    /// call can still read correctly, and `undefined` already guarantees
+    /// nothing else in `self` is safe to touch once it is set.
+    closed: bool = false,
 
     /// Scope is a trusted authorization boundary chosen by the embedding host.
     /// The returned adapter borrows this handle and the key provider.
@@ -219,6 +254,11 @@ pub const Handle = struct {
     }
 
     pub fn deinit(self: *Handle) void {
+        // Idempotent: see `closed`'s doc comment. Must be the very first
+        // thing this function does, before anything below reads another
+        // field -- a second call after a prior `deinit` has nothing else
+        // in `self` it can safely read.
+        if (self.closed) return;
         switch (self.engine) {
             .bridge_lsm_container => {
                 if (comptime builtin.os.tag == .freestanding) {
@@ -239,6 +279,10 @@ pub const Handle = struct {
                 if (self.native_index_storage) |storage| {
                     self.allocator.destroy(storage);
                     self.native_index_storage = null;
+                }
+                if (self.native_catalog_sink) |sink| {
+                    self.allocator.destroy(sink);
+                    self.native_catalog_sink = null;
                 }
                 if (self.native_runtime_store) |runtime_store| {
                     runtime_store.deinit();
@@ -262,6 +306,7 @@ pub const Handle = struct {
             },
         }
         self.* = undefined;
+        self.closed = true;
     }
 
     pub fn configureDbOpenOptions(self: *Handle, opts: *db_mod.OpenOptions) !void {
@@ -276,7 +321,6 @@ pub const Handle = struct {
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.index_repair_checkpoint_storage = storage;
-                opts.external_derived_checkpoints = false;
                 opts.physical_root_mode = .external_backend;
             },
             .native_single_file => {
@@ -288,10 +332,52 @@ pub const Handle = struct {
                 opts.primary_backend = .{ .mem = .{} };
                 opts.primary_runtime_store = self.native_runtime_store.?;
                 const storage = self.native_index_storage.?.storage();
-                opts.index_backends.text_main_backend = .lsm;
-                opts.index_backends.dense_storage_backend = .lsm;
-                opts.index_backends.sparse_backend = .lsm;
-                opts.index_backends.graph_reverse_backend = .lsm;
+                // Full-text's own metadata/catalog (segment ranges, active
+                // segment set, generation metadata, and small segments
+                // themselves) is a native-catalog view, not an embedded LSM
+                // instance stored through the virtual filesystem below: see
+                // storage/native_catalog_backend.zig and
+                // lite/native_catalog_sink.zig. Sparse's own postings/chunk
+                // metadata is the same native-catalog view (see
+                // sparse/sparse.zig's `.native_catalog` `SparseBackend`), and
+                // so is graph's forward/reverse adjacency and metadata (see
+                // graph/graph.zig's `openEdgeStore` and
+                // docs/design/lite-performance/lite-single-commit-write-path.md
+                // §3.3). Dense's HBC metadata/node/postings KV namespaces are
+                // implemented the same way (storage/hbc_backend.zig's
+                // `OpenedBackend.native_catalog`, reviewed per-site across
+                // hbc_adapter.zig's ~20 switches over `env_owner`): measured
+                // at 11.4 syncs/update alone and after an unrelated full-text
+                // mode in the same process (down from 33-36 on `.lsm`), and
+                // across the full primary/indexed/graph/dense/sparse/dense-
+                // 8-writer single-process mode lineup
+                // (write_amplification_bench_test.zig's "diagnostic" tests).
+                // One run of that full lineup hit `error.
+                // UnexpectedNativePageKind` on close of an unrelated,
+                // dense-free full_text Fixture two Fixtures earlier in the
+                // same process; it did not reproduce on immediate retry
+                // (same binary, same machine) or in either smaller
+                // diagnostic, so it reads as the pre-existing close-time
+                // flake the native.zig owner is separately chasing (see this
+                // handback's bug-3/open-risk section), not a dense-specific
+                // regression -- but it is still an open, not-yet-explained
+                // intermittent finding worth tracking.
+                opts.index_backends.text_main_backend = .native_catalog;
+                opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
+                opts.index_backends.dense_storage_backend = .native_catalog;
+                opts.index_backends.dense_main_native_catalog_sink = self.native_catalog_sink.?.sink();
+                opts.index_backends.sparse_backend = .native_catalog;
+                opts.index_backends.sparse_main_native_catalog_sink = self.native_catalog_sink.?.sink();
+                opts.index_backends.graph_reverse_backend = .native_catalog;
+                opts.index_backends.graph_native_catalog_sink = self.native_catalog_sink.?.sink();
+                // `.native_catalog` indexes publish segments inline through
+                // the catalog sink and never get a file-backed
+                // SegmentFileStore (see persistent.zig's index-open gate), so
+                // large-payload typed staging needs its own bounded scratch
+                // directory. Point it at the real directory that hosts this
+                // Lite file -- never the virtual `native_index_base_path`
+                // used for index namespacing below.
+                opts.index_backends.native_catalog_scratch_dir = std.fs.path.dirname(self.native_docstore.?.file.path);
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
                 opts.index_backends.vector_block_storage = storage;
@@ -306,7 +392,6 @@ pub const Handle = struct {
                 opts.index_repair_checkpoint_storage = storage;
                 opts.index_base_path = native_index_base_path;
                 opts.index_open_parallelism = 1;
-                opts.external_derived_checkpoints = false;
                 opts.physical_root_mode = .external_backend;
                 opts.external_root_incarnation = try self.durableRootIncarnationLocked("root");
             },
@@ -362,10 +447,26 @@ pub const Handle = struct {
         opts.primary_backend = .{ .mem = .{} };
         opts.primary_runtime_store = runtime.runtime_store;
         const storage = self.native_index_storage.?.storage();
-        opts.index_backends.text_main_backend = .lsm;
-        opts.index_backends.dense_storage_backend = .lsm;
-        opts.index_backends.sparse_backend = .lsm;
-        opts.index_backends.graph_reverse_backend = .lsm;
+        // See the root-namespace configureDbOpenOptions above: full text's
+        // own metadata/catalog is native-catalog-backed here too. The
+        // per-index `scope` (derived from `opts.index_base_path` below)
+        // disambiguates this namespace's indexes from the root's and from
+        // every other namespace sharing this same Sink.
+        opts.index_backends.text_main_backend = .native_catalog;
+        opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
+        opts.index_backends.dense_storage_backend = .native_catalog;
+        opts.index_backends.dense_main_native_catalog_sink = self.native_catalog_sink.?.sink();
+        // See the root-namespace configureDbOpenOptions above: sparse and
+        // graph are native-catalog-backed here too, same shared sink, scope
+        // disambiguated by this namespace's own index paths.
+        opts.index_backends.sparse_backend = .native_catalog;
+        opts.index_backends.sparse_main_native_catalog_sink = self.native_catalog_sink.?.sink();
+        opts.index_backends.graph_reverse_backend = .native_catalog;
+        opts.index_backends.graph_native_catalog_sink = self.native_catalog_sink.?.sink();
+        // See the root-namespace configureDbOpenOptions above: bound
+        // large-payload typed staging to the real host directory, not the
+        // virtual per-namespace `index_base_path` set below.
+        opts.index_backends.native_catalog_scratch_dir = std.fs.path.dirname(self.native_docstore.?.file.path);
         opts.index_backends.text_lsm_storage = storage;
         opts.index_backends.dense_lsm_storage = storage;
         opts.index_backends.vector_block_storage = storage;
@@ -380,7 +481,6 @@ pub const Handle = struct {
         opts.index_repair_checkpoint_storage = storage;
         opts.index_base_path = runtime.index_base_path;
         opts.index_open_parallelism = 1;
-        opts.external_derived_checkpoints = false;
         opts.physical_root_mode = .external_backend;
         opts.external_root_incarnation = try self.durableRootIncarnationLocked(canonical_namespace);
     }
@@ -542,10 +642,11 @@ pub const Handle = struct {
                     .replay_layout = "native_replay_lanes_in_document_catalog",
                     .index_layout = native_index_layout,
                     .index_namespace = native_index_base_path,
-                    .format_version = if (file.header.indexed_reclamation) native.indexed_format_version else native.format_version,
+                    .format_version = native.format_version,
                     .page_size = file.header.page_size,
                     .active_checkpoint = file.header.active_checkpoint,
                     .checkpoint_sequence = checkpoint.commit_sequence,
+                    .redo_folded_through = checkpoint.redo_folded_through,
                     .page_count = checkpoint.page_count,
                     .fsync = !file.no_sync,
                 };
@@ -719,6 +820,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
         .io = opts.io,
+        .ride_along_idle_ns = opts.ride_along_idle_ns,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
 }
@@ -744,6 +846,8 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
         .resource_manager = resource_manager,
         .writer_lock_marker = opts.writer_lock_marker,
         .io = opts.io,
+        .ride_along_idle_ns = opts.ride_along_idle_ns,
+        .use_redo_log = opts.use_redo_log,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
 }
@@ -768,11 +872,35 @@ fn initNativeSingleFile(
     errdefer allocator.destroy(native_index_storage);
     native_index_storage.* = index_storage.Store.initWithNamespace(allocator, store, native_index_base_path);
 
+    const catalog_sink = try allocator.create(native_catalog_sink.Sink);
+    errdefer allocator.destroy(catalog_sink);
+    catalog_sink.* = .{ .store = store, .allocator = allocator };
+
     const runtime_store = try allocator.create(backend_erased.Store);
     errdefer allocator.destroy(runtime_store);
 
     runtime_store.* = try store.runtimeStore(allocator);
     errdefer runtime_store.deinit();
+
+    // These two catalog reads are the first thing any opener of `store.file`
+    // does -- before any `Txn`/`ReadView` of its own exists to protect the
+    // checkpoint `docstore.Store.openWithOptions`/`createWithOptions` just
+    // recovered. A concurrent writer's own background fold (same process:
+    // a maintenance thread; another process: a cross-process writer) can
+    // reclaim that checkpoint's pages, or drop its still-unfolded redo-log
+    // content, in the gap between recovering it and this call reading
+    // through it -- reached by every caller of `initNativeSingleFile`
+    // alike, read-only or not: `lite_connection.zig`'s `Owner.
+    // refreshMaintenanceSnapshot` opens exactly this way for its own
+    // detached maintenance snapshot (read-write, not `read_only`, so
+    // `docstore.Store.openWithOptions`'s own `pin_read_checkpoint` never
+    // applies to it), and reclamation work that instance later performs
+    // itself must not be held back by a pin outliving these two reads --
+    // hence a short-lived `ReadView`, released immediately below, rather
+    // than relying on (or extending) any longer-lived pin the opener might
+    // separately hold for its own lifetime.
+    var init_probe_view = try native.ReadView.open(&store.file, store.file.runtime());
+    defer init_probe_view.release(store.file.runtime());
 
     const artifact_profile = try store.file.getCatalogRecordAlloc(allocator, artifact_profile_catalog_key);
     defer if (artifact_profile) |profile| allocator.free(profile);
@@ -796,6 +924,7 @@ fn initNativeSingleFile(
         .engine = .native_single_file,
         .native_docstore = store,
         .native_index_storage = native_index_storage,
+        .native_catalog_sink = catalog_sink,
         .native_runtime_store = runtime_store,
         .root_namespace_alias = root_namespace_alias,
         .owned_resource_manager = owned_resource_manager,
@@ -1163,17 +1292,27 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expect(db_opts.resource_manager == handle.owned_resource_manager.?);
     try std.testing.expect(db_opts.primary_runtime_store != null);
     try std.testing.expect(db_opts.primary_backend == .mem);
-    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.text_main_backend), .lsm), db_opts.index_backends.text_main_backend);
-    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.dense_storage_backend), .lsm), db_opts.index_backends.dense_storage_backend);
-    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.sparse_backend), .lsm), db_opts.index_backends.sparse_backend);
-    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.graph_reverse_backend), .lsm), db_opts.index_backends.graph_reverse_backend);
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.text_main_backend), .native_catalog), db_opts.index_backends.text_main_backend);
+    try std.testing.expect(db_opts.index_backends.text_main_native_catalog_sink != null);
+    // Pre-existing gap fixed alongside dense's own native_catalog wiring:
+    // this asserted `.lsm` even after sparse_backend was landed as
+    // `.native_catalog` (the real value configureDbOpenOptions sets above),
+    // so this regression test was not actually covering sparse's real
+    // configured value. Dense now asserts `.native_catalog` too, now that
+    // it is activated (see the comment above this function's
+    // `dense_storage_backend` assignment).
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.dense_storage_backend), .native_catalog), db_opts.index_backends.dense_storage_backend);
+    try std.testing.expect(db_opts.index_backends.dense_main_native_catalog_sink != null);
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.sparse_backend), .native_catalog), db_opts.index_backends.sparse_backend);
+    try std.testing.expect(db_opts.index_backends.sparse_main_native_catalog_sink != null);
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.graph_reverse_backend), .native_catalog), db_opts.index_backends.graph_reverse_backend);
+    try std.testing.expect(db_opts.index_backends.graph_native_catalog_sink != null);
     try std.testing.expect(db_opts.index_backends.text_lsm_storage != null);
     try std.testing.expect(db_opts.index_backends.dense_lsm_storage != null);
     try std.testing.expect(db_opts.index_backends.sparse_lsm_storage != null);
     try std.testing.expect(db_opts.index_backends.graph_lsm_storage != null);
     try std.testing.expectEqualStrings(native_index_base_path, db_opts.index_base_path.?);
     try std.testing.expectEqual(@as(?usize, 1), db_opts.index_open_parallelism);
-    try std.testing.expect(!db_opts.external_derived_checkpoints);
     try std.testing.expectEqual(
         db_mod.OpenOptions.PhysicalRootMode.external_backend,
         db_opts.physical_root_mode,
@@ -1251,7 +1390,7 @@ test "lite backend reports native storage status from active checkpoint" {
     try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.replay_layout);
     try std.testing.expectEqualStrings(native_index_layout, status.index_layout);
     try std.testing.expectEqualStrings(native_index_base_path, status.index_namespace.?);
-    try std.testing.expectEqual(native.indexed_format_version, status.format_version.?);
+    try std.testing.expectEqual(native.format_version, status.format_version.?);
     try std.testing.expectEqual(native.default_page_size, status.page_size.?);
     try std.testing.expectEqual(handle.native_docstore.?.file.header.active_checkpoint, status.active_checkpoint.?);
     try std.testing.expectEqual(checkpoint.commit_sequence, status.checkpoint_sequence.?);
@@ -1483,7 +1622,28 @@ test "lite backend deferred opens leave derived replay to their external owner" 
     // still publishes it, with ordinary allocator validation before reuse.
     try db.runUntilIdle();
     try std.testing.expect(try db.core.loadAppliedSequence(a, "body_text") >= target);
-    try std.testing.expect(handle.native_docstore.?.file.free_pages_verified);
+    // `free_pages_verified` only flips on a real (non-diverting) redo-log
+    // checkpoint fold -- the catch-up write just applied above is an
+    // ordinary diverting commit under the redo log's default, which never
+    // touches the ledger (see `pageAllocatorForDivertingCommit`'s own doc
+    // comment). The only thing that folds it here is the store's
+    // background ride-along idle-flush timer (`docstore.zig`'s
+    // `rideAlongFlushLoop`/`maybeCheckpointRedoLogOnIdleTurn`), started
+    // eagerly for any redo-log file regardless of
+    // `start_index_workers`/`start_optional_runtime_workers` (both false
+    // above) -- `runUntilIdle()` itself never forces a fold for a write
+    // this small (nowhere near the log's own 25%-remaining backpressure
+    // bound), so asserting `free_pages_verified` immediately after one
+    // `runUntilIdle()` call races that independent ~50ms timer: it failed
+    // under light system load, where this test's own thread reliably
+    // reached the assertion before the timer's first tick. Poll for it
+    // instead, the same bounded busy-wait idiom `waitForGateStartedForTest`
+    // (docstore.zig) already uses for an independent-thread condition.
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    while (!handle.native_docstore.?.file.free_pages_verified) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+        @import("antfly_platform").time.yieldNow();
+    }
 }
 
 test "lite backend native engine can back db primary documents" {

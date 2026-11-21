@@ -20,20 +20,49 @@ const std = @import("std");
 const keys = @import("internal_keys.zig");
 const projection = @import("document_projection.zig");
 const value_identity = @import("source_value_identity.zig");
-const prefix = "\x00\x00__metadata__:document_mutation_revision_v1:";
+// v2: revision and content authority share one physical record (one commit,
+// one document_index leaf path) instead of two independently-keyed records.
+// A commit that advances the revision without a qualified content proof
+// (artifact/TTL-only writes, or an older-writer compatibility fence) simply
+// writes the revision-only encoding; `loadContent` then reports no proof.
+const prefix = "\x00\x00__metadata__:document_revision_v2:";
 pub const Key = [prefix.len + 32]u8;
-const content_prefix = "\x00\x00__metadata__:document_content_authority_v1:";
-pub const ContentKey = [content_prefix.len + 32]u8;
 pub const Content = struct { revision: u64, bytes: u64, kind: u8, digest: [32]u8 };
+
 pub fn keyFromHash(digest: [32]u8) Key {
     return prefix.* ++ digest;
 }
-pub fn contentKey(key: Key) ContentKey {
-    var result: ContentKey = undefined;
-    @memcpy(result[0..content_prefix.len], content_prefix);
-    @memcpy(result[content_prefix.len..], key[prefix.len..]);
-    return result;
+
+/// Combined on-disk value: revision (8 bytes) + presence flag (1 byte) +
+/// content authority (49 bytes) when present. `encoded_len_without_content`
+/// is the revision-only form written by artifact/TTL-only commits and by
+/// writers that intentionally fence a stale content cache.
+pub const encoded_len_without_content: usize = 9;
+pub const encoded_len_with_content: usize = 9 + 49;
+pub const Combined = struct { revision: u64, content: ?Content };
+
+pub fn encodeCombined(buf: *[encoded_len_with_content]u8, value: Combined) []const u8 {
+    std.mem.writeInt(u64, buf[0..8], value.revision, .little);
+    if (value.content) |content| {
+        buf[8] = 1;
+        @memcpy(buf[9..encoded_len_with_content], &encodeContent(content));
+        return buf[0..encoded_len_with_content];
+    }
+    buf[8] = 0;
+    return buf[0..encoded_len_without_content];
 }
+
+pub fn decodeCombined(raw: []const u8) !Combined {
+    if (raw.len < encoded_len_without_content) return error.InvalidDocumentMutationRevision;
+    const revision = std.mem.readInt(u64, raw[0..8], .little);
+    if (raw[8] == 0) {
+        if (raw.len != encoded_len_without_content) return error.InvalidDocumentMutationRevision;
+        return .{ .revision = revision, .content = null };
+    }
+    if (raw.len != encoded_len_with_content) return error.InvalidDocumentContentAuthority;
+    return .{ .revision = revision, .content = try decodeContent(raw[9..encoded_len_with_content]) };
+}
+
 fn decodeContent(raw: []const u8) !Content {
     if (raw.len != 49) return error.InvalidDocumentContentAuthority;
     return .{ .revision = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little), .kind = raw[16], .digest = raw[17..49].* };
@@ -46,14 +75,16 @@ pub fn loadContent(txn: anytype, physical: []const u8) !?Content {
     return loadContentByKey(txn, key, physical[physical.len - 1]);
 }
 /// A durable locator can revalidate authoritative content without fetching or
-/// rehashing an oversized opaque document key on every scheduler poll.
+/// rehashing an oversized opaque document key on every scheduler poll. In the
+/// v2 combined layout this is one read of the revision/content record itself.
 pub fn loadContentByKey(txn: anytype, key: Key, kind: u8) !?Content {
-    const raw = txn.get(&contentKey(key)) catch |err| {
+    const raw = txn.get(&key) catch |err| {
         if (err == error.NotFound) return null;
         return err;
     };
-    const value = try decodeContent(raw);
-    if (value.kind != kind or value.revision != try load(txn, key)) return null;
+    const combined = try decodeCombined(raw);
+    const value = combined.content orelse return null;
+    if (value.kind != kind or value.revision != combined.revision) return null;
     return value;
 }
 /// Decode a bounded proof window from one sorted, deduplicated metadata read.
@@ -68,39 +99,35 @@ pub fn loadWindowWithRevisions(txn: anytype, a: std.mem.Allocator, physical: []c
     const Entry = struct {
         key: []const u8,
         row: usize,
-        kind: enum { content, revision, timestamp },
+        kind: enum { combined, timestamp },
         value_index: usize = 0,
         fn less(_: void, left: @This(), right: @This()) bool {
             return std.mem.order(u8, left.key, right.key) == .lt;
         }
     };
-    const entries = try a.alloc(Entry, ids.len * 3);
+    const entries = try a.alloc(Entry, ids.len * 2);
     defer a.free(entries);
     var key_bytes: usize = 0;
-    for (ids) |id| key_bytes = try std.math.add(usize, key_bytes, @sizeOf(ContentKey) + @sizeOf(Key) + 2 + keys.encodedComponentLen(id));
+    for (ids) |id| key_bytes = try std.math.add(usize, key_bytes, @sizeOf(Key) + 2 + keys.encodedComponentLen(id));
     const slab = try a.alloc(u8, key_bytes);
     defer a.free(slab);
     var offset: usize = 0;
     for (physical, ids, 0..) |row, id, i| {
         const revision = keyForPhysical(row) orelse return error.InvalidArgument;
-        const content = slab[offset..][0..@sizeOf(ContentKey)];
-        @memcpy(content, &contentKey(revision));
-        offset += content.len;
-        const mutation = slab[offset..][0..@sizeOf(Key)];
-        @memcpy(mutation, &revision);
-        offset += mutation.len;
+        const combined = slab[offset..][0..@sizeOf(Key)];
+        @memcpy(combined, &revision);
+        offset += combined.len;
         const ttl = slab[offset..][0 .. 2 + keys.encodedComponentLen(id)];
         ttl[0] = keys.user_namespace;
         const end = 1 + keys.encodeComponent(ttl[1..], id);
         ttl[end] = keys.ttl_kind;
         offset += ttl.len;
-        entries[i * 3] = .{ .key = content, .row = i, .kind = .content };
-        entries[i * 3 + 1] = .{ .key = mutation, .row = i, .kind = .revision };
-        entries[i * 3 + 2] = .{ .key = ttl, .row = i, .kind = .timestamp };
+        entries[i * 2] = .{ .key = combined, .row = i, .kind = .combined };
+        entries[i * 2 + 1] = .{ .key = ttl, .row = i, .kind = .timestamp };
     }
     std.mem.sort(Entry, entries, {}, Entry.less);
-    var sorted: [192][]const u8 = undefined;
-    var values: [192]?[]const u8 = undefined;
+    var sorted: [128][]const u8 = undefined;
+    var values: [128]?[]const u8 = undefined;
     var count: usize = 0;
     for (entries) |*entry| {
         if (count == 0 or !std.mem.eql(u8, sorted[count - 1], entry.key)) {
@@ -114,10 +141,10 @@ pub fn loadWindowWithRevisions(txn: anytype, a: std.mem.Allocator, physical: []c
     @memset(timestamps, 0);
     var revisions: [64]u64 = @splat(0);
     for (entries) |entry| if (values[entry.value_index]) |raw| switch (entry.kind) {
-        .content => contents[entry.row] = try decodeContent(raw),
-        .revision => {
-            if (raw.len != 8) return error.InvalidDocumentMutationRevision;
-            revisions[entry.row] = std.mem.readInt(u64, raw[0..8], .little);
+        .combined => {
+            const decoded = try decodeCombined(raw);
+            revisions[entry.row] = decoded.revision;
+            if (decoded.content) |content| contents[entry.row] = content;
         },
         .timestamp => {
             timestamps[entry.row] = @import("ttl.zig").writeVersion(raw) orelse return error.InvalidTimestamp;
@@ -162,7 +189,7 @@ pub fn load(txn: anytype, key: Key) !u64 {
         if (err == error.NotFound) return 0;
         return err;
     };
-    if (raw.len != 8) return error.InvalidDocumentMutationRevision;
+    if (raw.len < 8) return error.InvalidDocumentMutationRevision;
     return std.mem.readInt(u64, raw[0..8], .little);
 }
 
@@ -247,7 +274,8 @@ pub fn stageContent(txn: anytype, physical: []const u8, content: Content) !bool 
         else => return err,
     };
     if (existing != null) return false;
-    try txn.put(&contentKey(key), &encodeContent(content));
+    var buf: [encoded_len_with_content]u8 = undefined;
+    try txn.put(&key, encodeCombined(&buf, .{ .revision = content.revision, .content = content }));
     return true;
 }
 
@@ -412,6 +440,13 @@ pub const Capture = struct {
             return;
         }
         const key = keyForPhysical(physical_key) orelse return;
+        try self.touchKeyed(alloc, key);
+    }
+
+    /// Record a single already-hashed physical key once. Call sites that have
+    /// already paid for `keyForPhysical` (the SHA-256 over the document
+    /// prefix) pass its result here instead of letting `touch` recompute it.
+    fn touchKeyed(self: *Capture, alloc: std.mem.Allocator, key: Key) !void {
         if (self.staged or self.poisoned) return error.RetainedEffectsTransactionFailed;
         errdefer self.poisoned = true;
         const entry = try self.documents.getOrPut(alloc, key);
@@ -421,48 +456,54 @@ pub const Capture = struct {
     /// Hash primary bytes once at the common physical writer boundary. The
     /// fixed map entry coalesces repeated writes and retains no document body.
     pub fn touchValue(self: *Capture, alloc: std.mem.Allocator, physical: []const u8, value: ?[]const u8) !void {
-        return self.touchValuePrepared(alloc, physical, value, null);
+        return self.touchValuePreparedKeyed(alloc, keyForPhysical(physical), physical, value, null);
     }
 
     /// The writer's snapshot qualifies prior metadata before any primary write.
     /// Fresh/unsupported rows require no primary-body read. Repeated writes use
     /// this transaction's most recent publication rather than the older snapshot.
+    ///
+    /// `keyForPhysical` hashes the document prefix with SHA-256; it is computed
+    /// once here and threaded through the `touchValuePrepared*` fallbacks below
+    /// instead of being re-derived at each of them (previously up to 4 hashes
+    /// for one ordinary write).
     pub fn touchValueWithReader(self: *Capture, alloc: std.mem.Allocator, reader: anytype, physical: []const u8, value: ?[]const u8) !void {
-        try self.touch(alloc, physical);
+        const key_opt = keyForPhysical(physical);
+        if (key_opt) |key| try self.touchKeyed(alloc, key);
         if (!keys.isStoredDocumentRowKey(physical) or value == null or value.?.len < projection.minimum_bytes)
-            return self.touchValuePrepared(alloc, physical, value, null);
-        const key = keyForPhysical(physical).?;
+            return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
+        const key = key_opt.?;
         const entry = self.documents.getPtr(key).?;
-        if (entry.* != .unchanged) return self.touchValuePrepared(alloc, physical, value, null);
+        if (entry.* != .unchanged) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
         errdefer self.poisoned = true;
         const previous_proof = loadContent(reader, physical) catch |err| switch (err) {
             error.InvalidDocumentContentAuthority, error.InvalidDocumentMutationRevision => null,
             else => return err,
         };
-        const proof = previous_proof orelse return self.touchValuePrepared(alloc, physical, value, null);
-        if (proof.bytes < projection.minimum_bytes) return self.touchValuePrepared(alloc, physical, value, null);
+        const proof = previous_proof orelse return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
+        if (proof.bytes < projection.minimum_bytes) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
         var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer arena.deinit();
         const scratch = arena.allocator();
         const raw_directory = reader.get(&projection.keyForRevision(key)) catch |err| {
-            if (err == error.NotFound) return self.touchValuePrepared(alloc, physical, value, null);
+            if (err == error.NotFound) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
             return err;
         };
-        if (raw_directory.len > projection.maximum_bytes) return self.touchValuePrepared(alloc, physical, value, null);
-        if (!std.mem.startsWith(u8, raw_directory, "DPD2")) return self.touchValuePrepared(alloc, physical, value, null);
+        if (raw_directory.len > projection.maximum_bytes) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
+        if (!std.mem.startsWith(u8, raw_directory, "DPD2")) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
         const directory = try scratch.dupe(u8, raw_directory);
         const raw_certificate = reader.get(&value_identity.keyForRevision(key)) catch |err| {
-            if (err == error.NotFound) return self.touchValuePrepared(alloc, physical, value, null);
+            if (err == error.NotFound) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
             return err;
         };
-        if (raw_certificate.len > value_identity.maximum_bytes) return self.touchValuePrepared(alloc, physical, value, null);
-        return self.touchValuePrepared(alloc, physical, value, .{ .bytes = proof.bytes, .kind = proof.kind, .digest = proof.digest, .directory = directory, .identities = raw_certificate });
+        if (raw_certificate.len > value_identity.maximum_bytes) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
+        return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, .{ .bytes = proof.bytes, .kind = proof.kind, .digest = proof.digest, .directory = directory, .identities = raw_certificate });
     }
 
-    fn touchValuePrepared(self: *Capture, alloc: std.mem.Allocator, physical: []const u8, value: ?[]const u8, prior: ?value_identity.Prior) !void {
-        try self.touch(alloc, physical);
+    fn touchValuePreparedKeyed(self: *Capture, alloc: std.mem.Allocator, key_opt: ?Key, physical: []const u8, value: ?[]const u8, prior: ?value_identity.Prior) !void {
+        if (key_opt) |key| try self.touchKeyed(alloc, key);
         if (!keys.isStoredDocumentRowKey(physical)) return;
-        const entry = self.documents.getPtr(keyForPhysical(physical).?).?;
+        const entry = self.documents.getPtr(key_opt.?).?;
         errdefer self.poisoned = true;
         const next: Change = if (value) |bytes| blk: {
             var digest: [32]u8 = undefined;
@@ -494,38 +535,41 @@ pub const Capture = struct {
         var iter = self.documents.iterator();
         while (iter.next()) |entry| {
             const key = entry.key_ptr.*;
-            const old = try load(txn, key);
+            // One read of the combined record replaces the old revision-key
+            // read plus the `.unchanged` branch's separate content-key read.
+            const existing: ?Combined = blk: {
+                const raw = txn.get(&key) catch |err| {
+                    if (err == error.NotFound) break :blk null;
+                    return err;
+                };
+                break :blk try decodeCombined(raw);
+            };
+            const old = if (existing) |e| e.revision else 0;
             const next = std.math.add(u64, old, 1) catch return error.DocumentMutationRevisionExhausted;
-            const cached_key = contentKey(key);
-            var cached: ?Content = switch (entry.value_ptr.*) {
+            // Artifact/TTL-only changes can retain a previously proven digest.
+            const cached: ?Content = switch (entry.value_ptr.*) {
                 .written => |value| value.proof,
                 .deleted => null,
                 .unchanged => blk: {
-                    const raw = txn.get(&cached_key) catch |err| {
-                        if (err == error.NotFound) break :blk null;
-                        return err;
-                    };
-                    const value = try decodeContent(raw);
+                    const value = (existing orelse break :blk null).content orelse break :blk null;
                     break :blk if (value.revision == old) value else null;
                 },
             };
-            // Update before publishing the revision; both share the commit.
-            // Artifact/TTL-only changes can retain a previously proven digest.
-            if (cached) |*value| {
-                value.revision = next;
-                try txn.put(&cached_key, &encodeContent(value.*));
-            } else if (entry.value_ptr.* == .deleted) {
-                txn.delete(&cached_key) catch |err| {
-                    if (err != error.NotFound) return err;
-                };
-            }
+            // One put carries both the revision and its content proof (when
+            // present), instead of two independently-keyed document_index
+            // records each copying their own root-to-leaf path.
+            var buf: [encoded_len_with_content]u8 = undefined;
+            const combined: Combined = if (cached) |value|
+                .{ .revision = next, .content = .{ .revision = next, .bytes = value.bytes, .kind = value.kind, .digest = value.digest } }
+            else
+                .{ .revision = next, .content = null };
+            try txn.put(&key, encodeCombined(&buf, combined));
             switch (entry.value_ptr.*) {
                 .written => |value| if (value.directory) |directory| {
                     try txn.put(&projection.keyForRevision(key), directory);
                     if (value.identities) |identities| try txn.put(&value_identity.keyForRevision(key), identities);
                 },
-                // Small writes do not add a cache lookup/delete to the hot
-                // path. A previous directory is harmless: digest/length checks
+                // A previous directory is harmless: digest/length checks
                 // exclude it, and a rewrite or deletion replaces/removes it.
                 .deleted => {
                     txn.delete(&projection.keyForRevision(key)) catch |err| {
@@ -537,9 +581,6 @@ pub const Capture = struct {
                 },
                 .unchanged => {},
             }
-            var raw: [8]u8 = undefined;
-            std.mem.writeInt(u64, &raw, next, .little);
-            try txn.put(&key, &raw);
         }
         self.staged = true;
     }
@@ -549,9 +590,8 @@ test "document mutation revision capture owns allocation failures and coalesces 
     const Case = struct {
         const Fake = struct {
             writes: usize = 0,
-            revision: [8]u8 = .{ 7, 0, 0, 0, 0, 0, 0, 0 },
-            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
-                if (std.mem.startsWith(u8, key, content_prefix)) return error.NotFound;
+            revision: [encoded_len_without_content]u8 = .{ 7, 0, 0, 0, 0, 0, 0, 0, 0 },
+            pub fn get(self: *@This(), _: []const u8) ![]const u8 {
                 return &self.revision;
             }
             pub fn delete(_: *@This(), _: []const u8) !void {
@@ -584,24 +624,22 @@ test "document mutation revision capture owns allocation failures and coalesces 
 test "public graph metric borrowed wire cached content authority fences legacy writes and coalesces primary bytes" {
     const Case = struct {
         const Fake = struct {
-            revision: [8]u8 = @splat(0),
-            content: ?[49]u8 = null,
+            record: [encoded_len_with_content]u8 = undefined,
+            len: usize = 0,
             read_bytes: usize = 0,
             pub fn get(self: *@This(), key: []const u8) ![]const u8 {
-                if (std.mem.startsWith(u8, key, content_prefix)) {
-                    if (self.content == null) return error.NotFound;
-                    self.read_bytes += 49;
-                    return &self.content.?;
-                }
                 if (!std.mem.startsWith(u8, key, prefix)) return error.TestUnexpectedResult;
-                self.read_bytes += 8;
-                return &self.revision;
+                if (self.len == 0) return error.NotFound;
+                self.read_bytes += self.len;
+                return self.record[0..self.len];
             }
             pub fn put(self: *@This(), key: []const u8, raw: []const u8) !void {
-                if (std.mem.startsWith(u8, key, content_prefix)) self.content = raw[0..49].* else self.revision = raw[0..8].*;
+                if (!std.mem.startsWith(u8, key, prefix)) return;
+                @memcpy(self.record[0..raw.len], raw);
+                self.len = raw.len;
             }
             pub fn delete(self: *@This(), key: []const u8) !void {
-                if (std.mem.startsWith(u8, key, content_prefix)) self.content = null;
+                if (std.mem.startsWith(u8, key, prefix)) self.len = 0;
             }
         };
         fn run(a: std.mem.Allocator) !void {
@@ -621,7 +659,8 @@ test "public graph metric borrowed wire cached content authority fences legacy w
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash("last bytes", &digest, .{});
             try std.testing.expectEqualSlices(u8, &digest, &cached.digest);
-            try std.testing.expectEqual(@as(usize, 57), fake.read_bytes);
+            // One merged read replaces the old two-key 57-byte read pair.
+            try std.testing.expectEqual(@as(usize, encoded_len_with_content), fake.read_bytes);
             // TTL/artifact-only revisions preserve content without hashing it.
             {
                 var capture = Capture{};
@@ -630,8 +669,11 @@ test "public graph metric borrowed wire cached content authority fences legacy w
                 try capture.stage(&fake);
             }
             try std.testing.expectEqual(@as(u64, 2), (try loadContent(&fake, physical)).?.revision);
-            // An older writer advances the revision without our cache update.
-            std.mem.writeInt(u64, &fake.revision, 3, .little);
+            // An older writer advances the revision and drops the cache in one write.
+            var legacy_buf: [encoded_len_with_content]u8 = undefined;
+            const legacy = encodeCombined(&legacy_buf, .{ .revision = 3, .content = null });
+            @memcpy(fake.record[0..legacy.len], legacy);
+            fake.len = legacy.len;
             try std.testing.expect((try loadContent(&fake, physical)) == null);
             {
                 var capture = Capture{};
@@ -646,13 +688,13 @@ test "public graph metric borrowed wire cached content authority fences legacy w
                 try capture.touchValue(a, physical, null);
                 try capture.stage(&fake);
             }
-            try std.testing.expect(fake.content == null);
+            try std.testing.expect((try loadContent(&fake, physical)) == null);
             try std.testing.expectEqual(@as(u64, 5), try load(&fake, keyForPhysical(physical).?));
         }
     };
     try Case.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
-    std.debug.print("CONTENT_AUTHORITY cached_read_bytes=57 primary_reads=0 query_hash_bytes=0\n", .{});
+    std.debug.print("CONTENT_AUTHORITY cached_read_bytes={d} primary_reads=0 query_hash_bytes=0\n", .{encoded_len_with_content});
 }
 
 test "public graph metric borrowed wire metadata window batches deduplicates and fences stale content" {
@@ -660,15 +702,14 @@ test "public graph metric borrowed wire metadata window batches deduplicates and
         const Fake = struct {
             calls: usize = 0,
             count: usize = 0,
-            revision: [8]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            record: [encoded_len_with_content]u8 = undefined,
             timestamp: [8]u8 = .{ 7, 0, 0, 0, 0, 0, 0, 0 },
-            content: [49]u8 = encodeContent(.{ .revision = 1, .bytes = 16384, .kind = 0, .digest = @splat(3) }),
             pub fn getManySorted(self: *@This(), sorted: []const []const u8, values: []?[]const u8) !void {
                 self.calls += 1;
                 self.count = sorted.len;
                 for (sorted, values, 0..) |key, *value, i| {
                     if (i > 0) try std.testing.expect(std.mem.order(u8, sorted[i - 1], key) == .lt);
-                    value.* = if (std.mem.startsWith(u8, key, content_prefix)) &self.content else if (std.mem.startsWith(u8, key, prefix)) &self.revision else &self.timestamp;
+                    value.* = if (std.mem.startsWith(u8, key, prefix)) &self.record else &self.timestamp;
                 }
             }
         };
@@ -677,26 +718,30 @@ test "public graph metric borrowed wire metadata window batches deduplicates and
             defer a.free(physical);
             var fake = Fake{};
             // Use the real primary suffix rather than assuming its encoding.
-            fake.content[16] = physical[physical.len - 1];
+            const encoded = encodeCombined(&fake.record, .{ .revision = 1, .content = .{ .revision = 1, .bytes = 16384, .kind = physical[physical.len - 1], .digest = @splat(3) } });
+            std.debug.assert(encoded.len == encoded_len_with_content);
             const rows: [64][]const u8 = @splat(physical);
             const ids: [64][]const u8 = @splat("doc");
             var contents: [64]?Content = undefined;
             var timestamps: [64]u64 = undefined;
             try loadWindow(&fake, a, &rows, &ids, &contents, &timestamps);
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
-            try std.testing.expectEqual(@as(usize, 3), fake.count);
+            try std.testing.expectEqual(@as(usize, 2), fake.count);
             for (contents, timestamps) |content, timestamp| {
                 try std.testing.expectEqual(@as(u64, 16384), content.?.bytes);
                 try std.testing.expectEqual(@as(u64, 7), timestamp);
             }
-            fake.revision[0] = 2;
+            // Bump only the outer revision, leaving the embedded content proof's
+            // own revision stale -- the merged-record equivalent of an older
+            // writer advancing the revision key without the content cache.
+            std.mem.writeInt(u64, fake.record[0..8], 2, .little);
             try loadWindow(&fake, a, &rows, &ids, &contents, &timestamps);
             for (contents) |content| try std.testing.expect(content == null);
         }
     };
     try Case.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
-    std.debug.print("AUTHORITY_WINDOW rows=64 point_calls_before=192 batch_calls_after=1 unique_keys=3\n", .{});
+    std.debug.print("AUTHORITY_WINDOW rows=64 point_calls_before=128 batch_calls_after=1 unique_keys=2\n", .{});
 }
 
 test "public graph metric borrowed wire backfill skips cached bodies and publishes metadata only" {
@@ -732,7 +777,17 @@ test "public graph metric borrowed wire backfill skips cached bodies and publish
     try std.testing.expect(warm_bytes < raw.len / 4);
     anchor.abort();
     anchor_live = false;
-    try store.delete(&contentKey(keyForPhysical(key).?));
+    {
+        // Drop the cached content proof while preserving the revision, the
+        // merged-record equivalent of deleting a separate content-only key.
+        const revision_key = keyForPhysical(key).?;
+        var drop = try store.beginWriteTxn();
+        errdefer drop.abort();
+        const current_revision = try load(&drop, revision_key);
+        var buf: [encoded_len_with_content]u8 = undefined;
+        try drop.put(&revision_key, encodeCombined(&buf, .{ .revision = current_revision, .content = null }));
+        try drop.commit();
+    }
     var missing = (try BackfillPage.prepare(backing, &store, false)).?;
     defer missing.deinit();
     try std.testing.expectEqual(@as(usize, 1), missing.entries.len);
@@ -769,20 +824,19 @@ test "public graph metric borrowed wire targeted proof repair bounds deduplicate
     try std.testing.expectEqual(@as(usize, 1), queue.count);
     try std.testing.expectEqual(@as(u64, 9), queue.entries[0].content.revision);
     const Fake = struct {
-        revision: [8]u8 = .{ 9, 0, 0, 0, 0, 0, 0, 0 },
+        record: [encoded_len_without_content]u8 = .{ 9, 0, 0, 0, 0, 0, 0, 0, 0 },
         present: bool = true,
         fail: bool = false,
         writes: usize = 0,
-        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+        pub fn get(self: *@This(), _: []const u8) ![]const u8 {
             if (self.fail) return error.TestPublicationFailure;
-            if (std.mem.startsWith(u8, key, content_prefix)) return error.NotFound;
-            return &self.revision;
+            return &self.record;
         }
         pub fn contains(self: *@This(), _: []const u8) !bool {
             return self.present;
         }
         pub fn put(self: *@This(), _: []const u8, raw: []const u8) !void {
-            try std.testing.expectEqual(@as(u64, 9), (try decodeContent(raw)).revision);
+            try std.testing.expectEqual(@as(u64, 9), (try decodeCombined(raw)).revision);
             self.writes += 1;
         }
     };
@@ -796,9 +850,9 @@ test "public graph metric borrowed wire targeted proof repair bounds deduplicate
     try std.testing.expect(queue.pending.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), queue.count);
     txn.fail = false;
-    txn.revision[0] = 10;
+    txn.record[0] = 10;
     try std.testing.expectEqual(@as(usize, 0), try page.stage(&txn));
-    txn.revision[0] = 9;
+    txn.record[0] = 9;
     txn.present = false;
     try std.testing.expectEqual(@as(usize, 0), try page.stage(&txn));
     txn.present = true;
@@ -846,7 +900,15 @@ test "public graph metric borrowed wire backfill deadline yields one row and res
         const key = try keys.documentKeyAlloc(a, id);
         defer a.free(key);
         try store.put(key, id);
-        try store.delete(&contentKey(keyForPhysical(key).?));
+        // Drop the cached content proof while preserving the revision, the
+        // merged-record equivalent of deleting a separate content-only key.
+        const revision_key = keyForPhysical(key).?;
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        const current_revision = try load(&write, revision_key);
+        var buf: [encoded_len_with_content]u8 = undefined;
+        try write.put(&revision_key, encodeCombined(&buf, .{ .revision = current_revision, .content = null }));
+        try write.commit();
     }
     const Clock = struct {
         value: u64 = 0,
@@ -892,7 +954,7 @@ test "public graph metric borrowed wire metadata window slab encodes binary iden
             calls: usize = 0,
             pub fn getManySorted(self: *@This(), sorted: []const []const u8, values: []?[]const u8) !void {
                 self.calls += 1;
-                try std.testing.expectEqual(@as(usize, ids.len * 3), sorted.len);
+                try std.testing.expectEqual(@as(usize, ids.len * 2), sorted.len);
                 var ttl_count: usize = 0;
                 for (sorted, values, 0..) |key, *value, i| {
                     if (i > 0) try std.testing.expect(std.mem.order(u8, sorted[i - 1], key) == .lt);

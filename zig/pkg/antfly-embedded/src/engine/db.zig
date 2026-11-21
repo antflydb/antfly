@@ -404,7 +404,6 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         if (!storage.supportsNativePathLocks() or !storage.supportsHostPathGenerationPublication()) {
             resolved.physical_root_mode = .external_backend;
             resolved.index_repair_checkpoint_storage = storage;
-            resolved.external_derived_checkpoints = false;
         }
     }
     if (profile == .hosted) {
@@ -430,7 +429,6 @@ test "embedded custom storage owns its physical namespace" {
         const options = toDbOpenOptions(.{ .storage = storage }, profile);
         try std.testing.expectEqual(.external_backend, options.physical_root_mode);
         try std.testing.expectEqual(storage.ptr, options.index_repair_checkpoint_storage.?.ptr);
-        try std.testing.expect(!options.external_derived_checkpoints);
     }
     var native_paths = storage.vtable.*;
     native_paths.supports_native_path_locks = true;
