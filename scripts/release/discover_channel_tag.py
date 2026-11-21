@@ -403,7 +403,7 @@ def main() -> int:
         "command",
         choices=("reconcile", "require", "github-latest", "npm", "npm-version"),
     )
-    parser.add_argument("--channel", choices=("stable", "next", "nightly"))
+    parser.add_argument("--channel", choices=tuple(load_policy()["channels"]))
     parser.add_argument("--repository")
     parser.add_argument("--npm-package", default="@antfly/cli")
     parser.add_argument("--npm-tag")

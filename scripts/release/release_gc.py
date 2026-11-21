@@ -331,7 +331,7 @@ def load_completion_history(
             raise SystemExit(
                 f"release completion key disagrees with its receipt: {item.key}"
             )
-        if receipt["channel"] != "stable":
+        if load_policy()["channels"][receipt["channel"]]["tag_kind"] != "stable":
             continue
         tag = str(receipt["tag"])
         release = releases.get(tag)
