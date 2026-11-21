@@ -165,6 +165,7 @@ pub fn ScheduledProvider(comptime Root: type, comptime Factory: type, comptime P
                 const index = (start + offset) % state.roots.len;
                 if (bootstrap_positions) |positions| if (positions[index].snapshot_delivered.done) continue;
                 const selected = state.roots[index];
+                if (selected.released) continue;
                 var root: Root = try self.factory.open(selected.namespace);
                 var provider: ProviderFor(Root, Policy) = .{ .root = &root, .policy = self.policy };
                 var attempt = std.heap.ArenaAllocator.init(a);

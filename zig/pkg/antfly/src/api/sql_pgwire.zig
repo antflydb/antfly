@@ -814,16 +814,19 @@ pub const CatalogRetainedStream = struct {
             }
             const renew = host.verified_history_expiry != state.expires_at;
             const reclaim = state.acknowledged_delivery != 0 and host.collected_history_delivery != state.acknowledged_delivery;
+            try feed_api.progressMergeDrain(&client, allocator, self.source, &captured, state, state.acknowledged_cursor, self.context);
             try feed_api.progressSplitSuccessor(&client, allocator, self.source, &captured, state, state.acknowledged_cursor, self.context);
             if (!renew and !reclaim) return;
             var history_policy: HistoryPolicy = .{ .source = self.source, .selected = selected, .io = selected.policy.io };
             if (renew) {
-                for (state.roots) |root| try @import("history_roots.zig").renewRoot(&client, &history_policy, allocator, state, try captured.findInstalled(root), self.context);
+                for (state.roots) |root| {
+                    if (!root.released) try @import("history_roots.zig").renewRoot(&client, &history_policy, allocator, state, try captured.findInstalled(root), self.context);
+                }
                 host.verified_history_expiry = state.expires_at;
             }
             if (!reclaim) return;
             for (state.roots) |root| {
-                if (root.acknowledged.sequence == root.start) continue;
+                if (root.released or root.acknowledged.sequence == root.start) continue;
                 const route = try captured.findInstalled(root);
                 const more = try @import("history_roots.zig").flushAcknowledged(&client, &history_policy, allocator, state, route, self.context);
                 if (more) return;

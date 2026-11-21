@@ -130,7 +130,17 @@ pub const Captured = struct {
             const table = for (definition.tables) |candidate| {
                 if (candidate.table_id == table_id) break candidate;
             } else return error.ChangefeedResynchronizationRequired;
-            if (root.ownership_epoch != 1 or root.released) return error.ChangefeedResynchronizationRequired;
+            if (root.ownership_epoch != 1) return error.ChangefeedResynchronizationRequired;
+            if (root.released) {
+                const drain = root.merge_drain orelse return error.ChangefeedResynchronizationRequired;
+                for (self.roots) |route| {
+                    if (route.fence.route.group_id != drain.donor.group_id) continue;
+                    _ = try self.findInstalled(root);
+                    covered_routes += 1;
+                    break;
+                }
+                continue;
+            }
             if (table.contract == .writable_iceberg_rows) {
                 if (!std.mem.eql(u8, &root.namespace, &control.catalogRootNamespace(table))) return error.ChangefeedResynchronizationRequired;
                 continue;

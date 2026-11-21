@@ -260,6 +260,13 @@ pub const Root = struct {
         return self.storage_namespace orelse self.namespace;
     }
 
+    pub fn mergeDrained(self: Root) bool {
+        const drain = self.merge_drain orelse return false;
+        return self.acknowledged.order(.{ .sequence = drain.latest }) == .eq and
+            self.reclaimed_through >= drain.latest and self.pending_control == null and
+            (self.snapshot == null or self.snapshot_released);
+    }
+
     pub fn transitionLimit(self: Root) ?u64 {
         if (self.merge_drain) |drain| return drain.latest;
         if (self.split_handoff) |handoff| return handoff.cut.latest;
@@ -534,7 +541,7 @@ pub const State = struct {
         }
         if (self.phase == .bootstrap or self.phase == .streaming) {
             if (!nz(self.cut) or self.roots.len == 0 or !nz(self.latest_cursor) or !nz(self.acknowledged_cursor)) return error.InvalidChangefeed;
-            for (self.roots) |root| if (root.consumer_epoch == 0 or root.released or (definition.start == .snapshot_then_changes and root.snapshot == null and (self.phase == .bootstrap or root.storage_namespace == null))) return error.InvalidChangefeed;
+            for (self.roots) |root| if (root.consumer_epoch == 0 or (root.released and (self.phase == .bootstrap or root.merge_drain == null)) or (definition.start == .snapshot_then_changes and root.snapshot == null and (self.phase == .bootstrap or root.storage_namespace == null))) return error.InvalidChangefeed;
         }
         if (self.slot) |slot| {
             if (self.phase == .enrolling) return error.InvalidChangefeed;
@@ -656,6 +663,7 @@ pub const Mutation = union(enum) {
     plan_roots: []const RootPlan,
     enroll: struct { namespace: Namespace, ownership_epoch: u64, grant_sequence: u64, consumer_epoch: u64, start: u64, snapshot: ?Snapshot = null },
     rebind: struct { namespace: Namespace, previous: u64, next: u64, proof: Digest },
+    release_merge_donor: struct { namespace: Namespace, transition: u64, receipt_term: u64, receipt_index: u64 },
     stage_merge_drain: struct { namespace: Namespace, ownership_epoch: u64, drain: MergeDrain },
     stage_split_handoff: struct { namespace: Namespace, ownership_epoch: u64, handoff: SplitHandoff },
     confirm_split_successor: struct { namespace: Namespace, grant_sequence: u64, consumer_epoch: u64 },
@@ -685,7 +693,7 @@ pub const Mutation = union(enum) {
             .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
             .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
             .stage_catalog_start, .renew_catalog => return provider_history_protocol_version,
-            .stage_merge_drain, .stage_split_handoff, .confirm_split_successor, .activate_split_successor => return physical_history_protocol_version,
+            .release_merge_donor, .stage_merge_drain, .stage_split_handoff, .confirm_split_successor, .activate_split_successor => return physical_history_protocol_version,
             .plan_roots => |plans| for (plans) |plan| {
                 if (plan.physical != null) return physical_history_protocol_version;
             },
@@ -722,6 +730,7 @@ pub const Mutation = union(enum) {
                 if (!nz(value.namespace) or value.ownership_epoch == 0 or value.grant_sequence == 0 or value.consumer_epoch == 0) return error.InvalidChangefeed;
                 if (value.snapshot) |pin| if (!nz(pin.id) or !nz(pin.digest) or pin.expires_at == 0) return error.InvalidChangefeed;
             },
+            .release_merge_donor => |value| if (!nz(value.namespace) or value.transition == 0 or value.receipt_term == 0 or value.receipt_index == 0) return error.InvalidChangefeed,
             .stage_merge_drain => |value| {
                 if (!nz(value.namespace) or value.ownership_epoch == 0) return error.InvalidChangefeed;
                 try value.drain.validate();
@@ -792,6 +801,7 @@ pub const Mutation = union(enum) {
         const changed_root: ?Namespace = switch (self) {
             .enroll => |v| v.namespace,
             .rebind => |v| v.namespace,
+            .release_merge_donor => |v| v.namespace,
             .stage_merge_drain => |v| v.namespace,
             .stage_split_handoff => |v| v.namespace,
             .activate_split_successor => |v| v.namespace,
@@ -994,6 +1004,24 @@ pub const Mutation = union(enum) {
                 roots[index].acknowledged = .{ .sequence = enrollment.start };
                 roots[index].reclaimed_through = enrollment.start;
                 roots[index].snapshot = enrollment.snapshot;
+                next.roots = roots;
+            },
+            .release_merge_donor => |released| {
+                if (state.phase != .streaming or state.cursors.len != 0) return error.ChangefeedConflict;
+                if (state.slot) |slot| {
+                    if (slot.entries.len != 0 or !equal(slot.mapped_cursor, state.acknowledged_cursor))
+                        return error.ChangefeedConflict;
+                    for (slot.spool.records) |record| if (record.phase == .uploading) return error.ChangefeedConflict;
+                }
+                const index = try state.rootIndex(released.namespace);
+                const donor = state.roots[index];
+                const drain = donor.merge_drain orelse return error.ChangefeedConflict;
+                if (!donor.mergeDrained() or drain.transition != released.transition or
+                    released.receipt_index <= drain.index or released.receipt_term < drain.term)
+                    return error.ChangefeedConflict;
+                if (donor.released) return state;
+                const roots = try a.dupe(Root, state.roots);
+                roots[index].released = true;
                 next.roots = roots;
             },
             .stage_merge_drain => |staged| {
@@ -1792,6 +1820,22 @@ test "changefeed stages a split proof without changing retained cursor positions
     try std.testing.expectEqual(merging.revision, (try step(a, merging, merge)).revision);
     merge.stage_merge_drain.drain.receiver.range_id += 1;
     try std.testing.expectError(error.ChangefeedResynchronizationRequired, step(a, merging, merge));
+    var release: Mutation = .{ .release_merge_donor = .{
+        .namespace = child.namespace,
+        .transition = 50,
+        .receipt_term = 2,
+        .receipt_index = 61,
+    } };
+    try std.testing.expectError(error.ChangefeedConflict, step(a, merging, release));
+    var draining = try step(a, merging, .{ .issue = testDelivery(merging, &.{.{ .namespace = child.namespace, .position = .{ .sequence = 3 } }}) });
+    draining = try step(a, draining, .{ .acknowledge = draining.latest_cursor });
+    draining = try step(a, draining, .{ .reclaimed = .{ .namespace = child.namespace, .consumer_epoch = child.consumer_epoch, .previous = 0, .next = 3 } });
+    release.release_merge_donor.receipt_index = 60;
+    try std.testing.expectError(error.ChangefeedConflict, step(a, draining, release));
+    release.release_merge_donor.receipt_index = 61;
+    const released = try step(a, draining, release);
+    try std.testing.expect(released.roots[try released.rootIndex(child.namespace)].released);
+    try std.testing.expectEqual(draining.latest_cursor, released.latest_cursor);
     confirmation.confirm_split_successor.consumer_epoch += 1;
     try std.testing.expectError(error.ChangefeedConflict, step(a, ready, confirmation));
     mutation.stage_split_handoff.handoff.cut.root_generation += 1;

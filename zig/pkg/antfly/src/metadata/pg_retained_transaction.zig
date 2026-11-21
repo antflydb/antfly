@@ -229,6 +229,7 @@ pub fn Producer(comptime Policy: type) type {
             const start: usize = @intCast(state.latest_delivery % positions.len);
             for (0..positions.len) |offset| {
                 const index = (start + offset) % positions.len;
+                if (positions[index].released) continue;
                 const candidate = self.readTransaction(a, state, &captured, positions, index, now, request) catch |err| switch (err) {
                     error.ReadUnavailable => continue,
                     else => return err,

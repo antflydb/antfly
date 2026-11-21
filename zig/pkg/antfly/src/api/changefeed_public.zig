@@ -94,7 +94,7 @@ const IcebergScheduler = struct {
         for (0..positions.len) |offset| {
             try request.ensureActive();
             const root = positions[(start + offset) % positions.len];
-            if (state.phase == .bootstrap and root.snapshot_delivered.done) continue;
+            if (root.released or (state.phase == .bootstrap and root.snapshot_delivered.done)) continue;
             if (partial) |namespace| {
                 if (!std.mem.eql(u8, &root.namespace, &namespace)) continue;
             }
@@ -730,6 +730,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         try policy.authorize(state.value, internal);
         try stageVisibleSplits(&client, a, source, &catalog_routes, &state, selection.after, internal);
         try stageVisibleMerges(&client, a, source, &catalog_routes, &state, selection.after, internal);
+        try progressMergeDrain(&client, a, source, &catalog_routes, state.value, selection.after, internal);
         try progressSplitSuccessor(&client, a, source, &catalog_routes, state.value, selection.after, internal);
         return executeIceberg(&client, a, selection, limits, &policy, .{ .source = source, .captured = &catalog_routes }, internal);
     }
@@ -741,6 +742,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     try policy.authorize(state.value, internal);
     try stageVisibleSplits(&client, a, source, &captured, &state, selection.after, internal);
     try stageVisibleMerges(&client, a, source, &captured, &state, selection.after, internal);
+    try progressMergeDrain(&client, a, source, &captured, state.value, selection.after, internal);
     try progressSplitSuccessor(&client, a, source, &captured, state.value, selection.after, internal);
     var provider: native.ScheduledProvider(roots.Routed, RoutedFactory, Policy) = .{ .factory = .{ .source = source, .captured = &captured }, .policy = &policy };
     if (limits) |bounds|
@@ -761,12 +763,14 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
             return error.MetadataMutationOutcomeUnknown;
     }
     for (active.roots) |item| {
+        if (item.released) continue;
         const root = try captured.findInstalled(item);
         if (item.snapshot == null or item.snapshot_released) continue;
         try releaseStreamingSnapshot(&client, &driver_policy, a, active, root, internal);
         break; // Maintenance resumes any remaining releases against fresh metadata.
     }
     for (active.roots) |item| {
+        if (item.released) continue;
         const root = try captured.findInstalled(item);
         _ = try source_api.flushAcknowledged(&client, &driver_policy, a, active, root, internal);
     }
@@ -841,6 +845,43 @@ pub fn stageVisibleMerges(client: *config.Client, a: A, source: source_api.Sourc
         parsed.deinit();
         parsed.* = observed;
         return;
+    }
+}
+
+pub fn progressMergeDrain(client: *config.Client, a: A, source: source_api.Source, routes: *const source_api.Captured, state: control.State, cursor: control.Digest, request: Context) !void {
+    if (state.phase != .streaming or state.cursors.len != 0) return;
+    if (state.slot) |slot| {
+        if (slot.entries.len != 0 or !same(slot.mapped_cursor, state.acknowledged_cursor)) return;
+        for (slot.spool.records) |record| if (record.phase == .uploading) return;
+    }
+    for (state.roots) |root| {
+        if (root.released or !root.mergeDrained()) continue;
+        _ = try state.contextAt(cursor);
+        if (state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) return error.ChangefeedLeaseExpired;
+        const drain = root.merge_drain.?;
+        const donor = try routes.findInstalled(root);
+        const command: @import("history_control_operations.zig").wire.Request = .{
+            .version = 1,
+            .operation = .submit,
+            .command = .{ .retire = .{
+                .namespace = root.storageNamespace(),
+                .authority = state.authority,
+                .consumer = state.consumerId(),
+                .definition = state.definition.?.identity(),
+                .grant = root.grant_sequence,
+                .sequence = state.authority_sequence,
+            } },
+        };
+        const result = try source.controls.execute(a, donor.fence, donor.table_name, command, request);
+        if (!result.confirmed()) return error.MetadataMutationOutcomeUnknown;
+        if (result.outcome.? == .rejected) return result.outcome.?.rejected.asError();
+        const receipt = result.receipt.?;
+        return change(client, a, state, .{ .release_merge_donor = .{
+            .namespace = root.namespace,
+            .transition = drain.transition,
+            .receipt_term = receipt.term,
+            .receipt_index = receipt.index,
+        } }, request);
     }
 }
 
@@ -1708,6 +1749,7 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
             try captured.validateInstalledRoutes(state);
             var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a, .renewing = true };
             for (state.roots) |item| {
+                if (item.released) continue;
                 const catalog_root = for (state.definition.?.tables) |table| {
                     if (table.contract == .writable_iceberg_rows and same(item.namespace, control.catalogRootNamespace(table))) break true;
                 } else false;
