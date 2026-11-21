@@ -755,26 +755,42 @@ pub const SharedRedoOverlay = struct {
         };
     }
 
-    pub fn hasLivePrefix(self: *SharedRedoOverlay, io: std.Io, root: u8, prefix: []const u8, exact: ?[]const u8, mark: u64, floor: u64) bool {
+    /// The caller serializes writes for the probed checkpoint. Releasing
+    /// the mutex between slices lets readers resolve unrelated keys while
+    /// a tombstone-heavy range is being examined.
+    pub fn hasLivePrefix(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, prefix: []const u8, exact: ?[]const u8, mark: u64, floor: u64) !bool {
         std.debug.assert(root < 3);
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
         if (exact) |key| {
-            if (self.maps[root].getPtr(key)) |head| {
-                if (head.*.resolve(mark)) |entry| {
-                    if (entry.sequence > floor and !entry.is_delete) return true;
+            if (self.resolveDeletion(io, root, key, mark, floor) == false) return true;
+        }
+
+        const keys_per_slice = 64;
+        var resume_key: std.ArrayList(u8) = .empty;
+        defer resume_key.deinit(allocator);
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            const ordered = self.ordered[root].root;
+            var node = if (resume_key.items.len == 0)
+                orderedFirstWithPrefix(ordered, prefix)
+            else
+                orderedLowerBound(ordered, resume_key.items, true);
+            for (0..keys_per_slice) |i| {
+                const current = node orelse return false;
+                if (!std.mem.startsWith(u8, current.key, prefix)) return false;
+                if (self.maps[root].getPtr(current.key)) |head| {
+                    if (head.*.resolve(mark)) |entry| {
+                        if (entry.sequence > floor and !entry.is_delete) return true;
+                    }
+                }
+                node = current.next();
+                if (i + 1 == keys_per_slice) {
+                    if (node == null or !std.mem.startsWith(u8, node.?.key, prefix)) return false;
+                    resume_key.clearRetainingCapacity();
+                    try resume_key.appendSlice(allocator, current.key);
                 }
             }
         }
-        const ordered = self.ordered[root].root;
-        var node = orderedFirstWithPrefix(ordered, prefix);
-        while (node) |current| : (node = orderedLowerBound(ordered, current.key, true)) {
-            if (!std.mem.startsWith(u8, current.key, prefix)) break;
-            const head = self.maps[root].getPtr(current.key) orelse continue;
-            const entry = head.*.resolve(mark) orelse continue;
-            if (entry.sequence > floor and !entry.is_delete) return true;
-        }
-        return false;
     }
 
     /// Resolves only whether a version shadows the tree and is a tombstone.
@@ -1577,6 +1593,25 @@ test "redo overlay ordered index: first/last/seek-at-or-after/seek-at-or-before 
     // Past either end: nothing.
     try std.testing.expectEqual(@as(?[]u8, null), try overlay.seekKeyAtOrAfterAlloc(a, std.testing.io, 0, "m/", "m/9", true));
     try std.testing.expectEqual(@as(?[]u8, null), try overlay.seekKeyAtOrBeforeAlloc(a, std.testing.io, 0, "m/", "m/1", true));
+}
+
+test "redo overlay live prefix probe crosses bounded tombstone slices" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(alloc);
+    for (0..130) |i| {
+        var key: [16]u8 = undefined;
+        const path = try std.fmt.bufPrint(&key, "p/{d:0>3}", .{i});
+        try overlay.appendVersion(alloc, io, 1, path, i + 1, try owned_allocator.dupe(u8, ""), true, 0, 0);
+    }
+    try overlay.appendVersion(alloc, io, 1, "q/later", 131, try owned_allocator.dupe(u8, "other"), false, 0, 0);
+    try std.testing.expect(!try overlay.hasLivePrefix(alloc, io, 1, "p/", null, 131, 0));
+    try std.testing.expect(try overlay.hasLivePrefix(alloc, io, 1, "p/", "q/later", 131, 0));
+
+    try overlay.appendVersion(alloc, io, 1, "p/last", 132, try owned_allocator.dupe(u8, "live"), false, 0, 0);
+    try std.testing.expect(try overlay.hasLivePrefix(alloc, io, 1, "p/", null, 132, 0));
+    try std.testing.expect(!try overlay.hasLivePrefix(alloc, io, 1, "p/", null, 132, 132));
 }
 
 test "redo overlay ordered index: a prefix scan never crosses into a neighboring prefix's keys" {
