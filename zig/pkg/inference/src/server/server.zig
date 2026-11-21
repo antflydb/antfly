@@ -41150,7 +41150,7 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
 }
 
 fn embeddingMediaFailure(err: anyerror) ?EmbedDenseInputFailure {
-    return switch (err) {
+    return switch (@import("../pipelines/embedding_gemma2.zig").videoInputError(err)) {
         error.EmbeddingSequenceTooLong => .{
             .status = 400,
             .code = "INPUT_TOO_LONG",
@@ -41169,7 +41169,6 @@ fn embeddingMediaFailure(err: anyerror) ?EmbedDenseInputFailure {
         error.MediaPlaceholderMismatch => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "media placeholders must reference each supplied image or audio part exactly once" },
         error.EmptyEmbeddingInput, error.InvalidImageInput => .{ .status = 400, .code = "INVALID_INPUT", .message = "embedding input must contain nonempty content" },
         error.NonFiniteEmbeddingOutput, error.ZeroEmbeddingOutput => .{ .status = 500, .code = "INVALID_EMBEDDING_OUTPUT", .message = "embedding output is nonfinite or has zero norm" },
-        error.UnsupportedVideoCodec,
         error.UnsupportedVideoProfile,
         error.UnsupportedVideoNal,
         error.UnsupportedVideoDisplay,
@@ -41186,26 +41185,10 @@ fn embeddingMediaFailure(err: anyerror) ?EmbedDenseInputFailure {
         error.MixedVideoPictures,
         error.OverlappingVideoSlices,
         error.UnsupportedDynamicVideoConfig,
-        error.EmptyVideo,
-        error.EmptyVideoTrack,
         error.InvalidSamplingPolicy,
         error.EmptyVideoWindow,
         error.InvalidSamplingMetadata,
         error.SamplingOverflow,
-        error.TimestampOverflow,
-        error.MalformedMedia,
-        error.MissingMovieMetadata,
-        error.NoRandomAccessPoint,
-        error.UnsupportedDataReference,
-        error.UnsupportedDisplayGeometry,
-        error.UnsupportedEncryptedMedia,
-        error.UnsupportedFragmentedMp4,
-        error.UnsupportedHybridMp4,
-        error.UnsupportedInterlacedVideo,
-        error.UnsupportedSampleDescription,
-        error.UnsupportedSampleSize,
-        error.UnsupportedTimeline,
-        error.UnsupportedContainer,
         error.MalformedTransportStream,
         error.MalformedTransportPes,
         error.TransportContinuityError,
@@ -41545,7 +41528,7 @@ test "grouped video HTTP errors preserve media identity under fail-fast and per-
     var inputs = [_][]const u8{ "text", "image", "video" };
     const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &inputs };
     const contract = try resolvedInferenceExecutorContract(&node, "embed", &manifest);
-    for ([_][]const u8{ @embedFile("../testdata/video/codecs/hevc-422.mp4"), "\x00\x00\x00\x08free" }, [_][]const u8{ "VIDEO_CODEC_UNAVAILABLE", "INVALID_VIDEO" }) |clip, expected| {
+    for ([_][]const u8{ @embedFile("../testdata/video/codecs/hevc-422.mp4"), "\x00\x00\x00\x08free", "\x00\x00\x00" }, [_][]const u8{ "VIDEO_CODEC_UNAVAILABLE", "INVALID_VIDEO", "INVALID_VIDEO" }) |clip, expected| {
         const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(clip.len));
         defer a.free(encoded);
         const body = try std.json.Stringify.valueAlloc(a, .{.{ .content = .{ .{ .type = "text", .text = "caption" }, .{ .type = "media", .mime_type = "video/mp4", .data = std.base64.standard.Encoder.encode(encoded, clip) } } }}, .{});

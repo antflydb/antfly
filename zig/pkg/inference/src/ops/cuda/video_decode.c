@@ -87,7 +87,7 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
     if (d->primaries_override >= 0) primaries = d->primaries_override;
     // HDR tone mapping needs an explicit, consistent gamut, as the portable policy does.
     int hdr = transfer == 16 || transfer == 18;
-    if (f->coded_width > 4096 || f->coded_height > 4096) { d->failed = 7; return 0; }
+    if (f->coded_width > 4096 || f->coded_height > 4096 || f->min_num_decode_surfaces > 32) { d->failed = 7; return 0; }
     if (w == 0 || h == 0 || w % 2 || h % 2 || w != d->expected_width || h != d->expected_height ||
         f->codec != d->expected_codec || !f->progressive_sequence || f->chroma_format != cudaVideoChromaFormat_420 ||
         (bit_depth != 8 && bit_depth != 10) || f->bit_depth_chroma_minus8 != f->bit_depth_luma_minus8 ||
@@ -101,7 +101,7 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
              : ((matrix != 1 && matrix != 2 && matrix != 5 && matrix != 6) ||
                 (primaries != 1 && primaries != 2 && primaries != 5 && primaries != 6) ||
                 (transfer != 1 && transfer != 2 && transfer != 6 && transfer != 13))) ||
-        !f->min_num_decode_surfaces || f->min_num_decode_surfaces > 32) { d->failed = 2; return 0; }
+        !f->min_num_decode_surfaces) { d->failed = 2; return 0; }
     // Never silently reinterpret a stream whose geometry or color changes.
     int compatible = d->codec == f->codec && d->width == w && d->height == h && d->coded_width == f->coded_width &&
         d->coded_height == f->coded_height && d->surfaces >= f->min_num_decode_surfaces && d->bit_depth == bit_depth &&
@@ -122,10 +122,12 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
     caps.eCodecType = f->codec; caps.eChromaFormat = f->chroma_format; caps.nBitDepthMinus8 = f->bit_depth_luma_minus8;
     cudaVideoSurfaceFormat output = bit_depth == 10 ? cudaVideoSurfaceFormat_P016 : cudaVideoSurfaceFormat_NV12;
     if (d->caps(&caps) || !caps.bIsSupported || !(caps.nOutputFormatMask & (1u << output)) ||
-        f->coded_width > caps.nMaxWidth || f->coded_height > caps.nMaxHeight ||
-        f->coded_width < caps.nMinWidth || f->coded_height < caps.nMinHeight ||
-        ((f->coded_width+15)/16)*((f->coded_height+15)/16) > caps.nMaxMBCount) {
+        f->coded_width < caps.nMinWidth || f->coded_height < caps.nMinHeight) {
         d->failed = 2; return 0;
+    }
+    if (f->coded_width > caps.nMaxWidth || f->coded_height > caps.nMaxHeight ||
+        ((f->coded_width + 15) / 16) * ((f->coded_height + 15) / 16) > caps.nMaxMBCount) {
+        d->failed = 7; return 0;
     }
     CUVIDDECODECREATEINFO c = {0};
     c.CodecType = f->codec; c.ChromaFormat = f->chroma_format;
