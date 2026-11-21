@@ -1750,7 +1750,7 @@ pub const DurableSessionStore = struct {
     /// A connection-owned rollback has one durable decision: retire the
     /// unexecuted transaction and detach its exact connection in the same
     /// native transaction. Neither side may become visible alone.
-    fn deleteAndDetachConnection(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, connection_id: [32]u8, commit_settings: bool, expected: Version) !void {
+    fn deleteAndDetachConnection(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, connection_id: [32]u8, commit_settings: bool, expected: Version, expected_state: sql_connection_record.State) !void {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
@@ -1761,19 +1761,19 @@ pub const DurableSessionStore = struct {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                try self.deleteAndDetachConnectionTxn(&txn, key, txn_id, connection_id, commit_settings, expected);
+                try self.deleteAndDetachConnectionTxn(&txn, key, txn_id, connection_id, commit_settings, expected, expected_state);
                 try txn.commit();
             },
             .runtime => |store| {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
-                try self.deleteAndDetachConnectionTxn(&txn, key, txn_id, connection_id, commit_settings, expected);
+                try self.deleteAndDetachConnectionTxn(&txn, key, txn_id, connection_id, commit_settings, expected, expected_state);
                 try txn.commit();
             },
         }
     }
 
-    fn deleteAndDetachConnectionTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, txn_id: db_mod.types.TxnId, connection_id: [32]u8, commit_settings: bool, expected: Version) !void {
+    fn deleteAndDetachConnectionTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, txn_id: db_mod.types.TxnId, connection_id: [32]u8, commit_settings: bool, expected: Version, expected_state: sql_connection_record.State) !void {
         const raw = txn.get(key) catch |err| switch (err) {
             error.NotFound => return error.SqlTransactionOutcomeUnknown,
             else => return err,
@@ -1784,7 +1784,7 @@ pub const DurableSessionStore = struct {
             session.commit_execution_started or session.terminal_commit != null or session.terminal_abort) return error.SqlTransactionOutcomeUnknown;
         var connection = try sql_connection_record.loadTxn(txn, self.alloc, &connection_id);
         defer connection.deinit();
-        if ((connection.value.state != .active and connection.value.state != .beginning) or connection.value.active_txn == null or
+        if (connection.value.state != expected_state or connection.value.active_txn == null or
             !std.mem.eql(u8, &connection.value.active_txn.?, &txn_id) or
             connection.value.owner_node_id != session.owner_node_id or
             !std.mem.eql(u8, connection.value.principal, session.principal orelse "")) return error.SqlTransactionOutcomeUnknown;
@@ -3931,7 +3931,7 @@ pub const SessionRegistry = struct {
         return self.removeMode(alloc, txn_id, true, commit_settings, expected);
     }
 
-    pub fn rollbackConnectionBeforeExecution(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, connection_id: [32]u8, expected: DurableSessionStore.Version) !void {
+    pub fn rollbackConnectionBeforeExecution(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, connection_id: [32]u8, expected: DurableSessionStore.Version, expected_state: sql_connection_record.State) !void {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
@@ -3940,7 +3940,7 @@ pub const SessionRegistry = struct {
         if (current.connection_id == null or !std.mem.eql(u8, &current.connection_id.?, &connection_id) or
             current.commit_execution_started or current.terminal_commit != null or current.terminal_abort) return error.SqlTransactionOutcomeUnknown;
         const durable = self.durable orelse return error.SqlConnectionUnavailable;
-        try durable.deleteAndDetachConnection(txn_id, connection_id, false, expected);
+        try durable.deleteAndDetachConnection(txn_id, connection_id, false, expected, expected_state);
         self.releaseLease(txn_id, current.owner_node_id) catch {};
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -3965,7 +3965,7 @@ pub const SessionRegistry = struct {
             // must share one native commit, regardless of which caller asked.
             if (current.commit_execution_started or current.terminal_commit != null or current.terminal_abort) return false;
             const durable = self.durable orelse return false;
-            durable.deleteAndDetachConnection(txn_id, connection_id, commit_settings, expected) catch return false;
+            durable.deleteAndDetachConnection(txn_id, connection_id, commit_settings, expected, .active) catch return false;
             self.mutex.lock();
             if (self.known_durable_session_count) |count| self.known_durable_session_count = count -| 1;
             self.mutex.unlock();

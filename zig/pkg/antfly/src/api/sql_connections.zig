@@ -47,9 +47,8 @@ pub fn load(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, 
 }
 
 /// Repair only outcomes that the durable transaction registry can prove. A
-/// beginning ID has never escaped in an HTTP response: clearing its fence
-/// first makes a concurrent creator fail binding, then an unexecuted session
-/// can be removed. An uncertain commit remains fenced until a terminal
+/// beginning ID has never escaped in an HTTP response. Retire an existing
+/// unexecuted session and its beginning fence in one transaction. An uncertain commit remains fenced until a terminal
 /// decision is visible; a missing record is never interpreted as an abort.
 pub fn loadReconciled(
     store: *transactions.DurableSessionStore,
@@ -85,17 +84,17 @@ fn loadReconciledAt(
     }
     if (state == .beginning) {
         if (session) |value| {
-            if (value.execution_started or value.terminal != null or value.terminal_abort) return error.SqlConnectionBusy;
+            if (value.owner_node_id != owner_node_id or value.execution_started or value.terminal != null or value.terminal_abort) return error.SqlConnectionBusy;
+            registry.rollbackConnectionBeforeExecution(alloc, txn_id, id, value.version, .beginning) catch |err| switch (err) {
+                error.SessionLeaseLost, error.SqlTransactionOutcomeUnknown => return owned,
+                else => return err,
+            };
+        } else {
+            _ = mutate(store, .{ .abort_begin = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
+                error.SqlConnectionBusy => return owned,
+                else => return err,
+            };
         }
-        // A racing BEGIN must bind the exact still-beginning ID before it
-        // responds. After this CAS succeeds it cannot return a session ID.
-        _ = mutate(store, .{ .abort_begin = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
-            error.SqlConnectionBusy => return owned,
-            else => return err,
-        };
-        if (session) |value| if (value.owner_node_id == owner_node_id) {
-            _ = registry.retireBeforeExecution(alloc, txn_id, value.version, false);
-        };
     } else if (session) |value| {
         if (value.terminal == null and !value.terminal_abort) return owned;
         _ = mutate(store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
@@ -338,6 +337,11 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
         },
         .abort_begin => |binding| blk: {
             if (next.state != .beginning or !std.mem.eql(u8, &next.active_txn.?, &binding.txn_id)) return error.SqlConnectionBusy;
+            if (try store.loadSessionTxn(txn, binding.txn_id)) |present| {
+                var session = present;
+                defer session.deinit(store.alloc);
+                return error.SqlConnectionBusy;
+            }
             next.state = .idle;
             next.active_txn = null;
             try record.putTxn(txn, alloc, next);
@@ -472,7 +476,10 @@ test "HTTP connection recovers a durable pre-response BEGIN fence without an esc
     // Expired non-idle roots must not occupy the bounded directory forever.
     const replacement: [32]u8 = @splat('d');
     _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = 2, .txn_id = txn_id } }, "alice", 7, 2);
+    _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
+    try std.testing.expectError(error.SqlConnectionBusy, mutate(&store, .{ .abort_begin = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2));
     try reconcileExpired(&store, &registry, alloc, 1001);
+    try std.testing.expect((try registry.getSqlState(alloc, txn_id)) == null);
     _ = try mutate(&store, .{ .create = .{ .id = replacement, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 2000, .database = "main", .namespace = "public" } }, "alice", 7, 1001);
     try std.testing.expectError(error.SqlConnectionNotFound, load(&store, alloc, id, "alice", 7, 2));
 }
@@ -504,7 +511,8 @@ test "HTTP connection keeps a referenced durable transaction through session GC"
     direct_route_details.deinit(alloc);
     var retained = (try registry.getSqlState(alloc, txn_id)) orelse return error.TestExpectedEqual;
     retained.deinit(alloc);
-    try registry.rollbackConnectionBeforeExecution(alloc, txn_id, id, begun.version);
+    try std.testing.expectError(error.SqlTransactionOutcomeUnknown, registry.rollbackConnectionBeforeExecution(alloc, txn_id, id, begun.version, .beginning));
+    try registry.rollbackConnectionBeforeExecution(alloc, txn_id, id, begun.version, .active);
     var idle = try load(&store, alloc, id, "alice", 7, 2);
     defer idle.deinit();
     try std.testing.expectEqual(record.State.idle, idle.value.state);

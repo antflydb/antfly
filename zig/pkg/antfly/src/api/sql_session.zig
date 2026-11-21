@@ -175,8 +175,7 @@ pub const Adapter = struct {
             // No transaction ID has escaped to the caller. A proven local
             // rollback permits release; otherwise retain the beginning fence
             // for explicit recovery instead of allowing DISCARD to race it.
-            if (self.registry.retireBeforeExecution(self.alloc, info.txn_id, info.version, false))
-                self.connectionMutation(scope, .{ .abort_begin = .{ .id = connection, .txn_id = info.txn_id } }) catch {};
+            self.registry.rollbackConnectionBeforeExecution(self.alloc, info.txn_id, connection, info.version, .beginning) catch {};
             return err;
         };
         return .{ .id = info.txn_id, .state = .active, .isolation = options.isolation, .mode = options.mode };
@@ -215,7 +214,7 @@ pub const Adapter = struct {
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
         if (self.connection_id) |connection|
-            try self.registry.rollbackConnectionBeforeExecution(self.alloc, id, connection, state.version)
+            try self.registry.rollbackConnectionBeforeExecution(self.alloc, id, connection, state.version, .active)
         else if (!self.registry.retireBeforeExecution(self.alloc, id, state.version, false))
             return error.SqlTransactionOutcomeUnknown;
     }
