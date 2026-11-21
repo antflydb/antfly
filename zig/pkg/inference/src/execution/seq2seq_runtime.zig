@@ -30,7 +30,8 @@ pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const 
     var encoder = false;
     var branch = false;
     var past_count: usize = 0;
-    for (inputs) |info| {
+    for (inputs, 0..) |info, index| {
+        for (inputs[0..index]) |prior| if (std.mem.eql(u8, prior.name, info.name)) return false;
         if (std.mem.eql(u8, info.name, "input_ids")) {
             if (info.dtype != .i64 or info.shape.len != 2 or info.shape[0] > 1 or info.shape[1] > 0) return false;
             ids = true;
@@ -50,7 +51,8 @@ pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const 
     }
     var present_count: usize = 0;
     var logits = false;
-    for (outputs) |info| {
+    for (outputs, 0..) |info, index| {
+        for (outputs[0..index]) |prior| if (std.mem.eql(u8, prior.name, info.name)) return false;
         if (std.mem.eql(u8, info.name, "logits")) {
             if (info.dtype != .f32 or info.shape.len != 3 or info.shape[0] > 1) return false;
             logits = true;
@@ -83,111 +85,155 @@ pub fn cacheBound(session: backends.Session, batch: usize, tokens: usize, contex
     return total;
 }
 
+const InputRole = union(enum) {
+    tokens,
+    encoder,
+    mask,
+    cache_branch,
+    past: struct { output_index: usize, empty_shape: [4]i64, cross: bool },
+};
+
 pub const State = struct {
     allocator: std.mem.Allocator,
     session: backends.Session,
-    cache: kv.KvCache,
+    roles: []InputRole,
+    inputs: []backends.Tensor,
+    /// Outputs retain the signature order. The logits slot carries no
+    /// ownership after publication, and each cross slot owns its latest value.
+    cached_outputs: []backends.Tensor = &.{},
+    logits_index: usize,
     /// Encoder buffers and mask are pinned by the enclosing generation request.
     encoder: backends.Tensor,
     mask: []const i64,
     processed: usize = 0,
     vocab_size: usize,
 
-    pub fn init(allocator: std.mem.Allocator, session: backends.Session, encoder: backends.Tensor, mask: []const i64, vocab_size: usize) ?State {
-        if (!qualified(session) or vocab_size == 0) return null;
+    pub fn init(allocator: std.mem.Allocator, session: backends.Session, encoder: backends.Tensor, mask: []const i64, vocab_size: usize) !?State {
+        if (!qualified(session) or vocab_size == 0 or vocab_size > std.math.maxInt(i64)) return null;
+        const input_info = session.inputInfo();
+        const output_info = session.outputInfo();
+        const roles = try allocator.alloc(InputRole, input_info.len);
+        errdefer allocator.free(roles);
+        const inputs = try allocator.alloc(backends.Tensor, input_info.len);
+        errdefer allocator.free(inputs);
+        for (input_info, roles) |info, *role| {
+            role.* = if (kv.pastInputSuffix(info.name)) |suffix| cache: {
+                for (output_info, 0..) |output, index| {
+                    if (kv.presentNameMatchesPastInput(info.name, output.name)) break :cache .{ .past = .{
+                        .output_index = index,
+                        .empty_shape = .{ 1, info.shape[1], 0, info.shape[3] },
+                        .cross = std.mem.indexOf(u8, suffix, ".encoder.") != null,
+                    } };
+                }
+                unreachable; // The immutable qualified signature has an exact match.
+            } else if (std.mem.eql(u8, info.name, "input_ids")) .tokens else if (std.mem.eql(u8, info.name, "encoder_hidden_states")) .encoder else if (std.mem.eql(u8, info.name, "encoder_attention_mask")) .mask else .cache_branch;
+        }
+        var logits_index: usize = 0;
+        for (output_info, 0..) |output, index| if (std.mem.eql(u8, output.name, "logits")) {
+            logits_index = index;
+            break;
+        };
         var planned = session;
         planned.cached_decoder_geometry = .{ .vocab_size = vocab_size };
         planned.broadcast_inputs = &.{"use_cache_branch"};
-        return .{ .allocator = allocator, .session = planned, .cache = kv.KvCache.init(allocator), .encoder = encoder.borrowedView("encoder_hidden_states"), .mask = mask, .vocab_size = vocab_size };
+        return .{
+            .allocator = allocator,
+            .session = planned,
+            .roles = roles,
+            .inputs = inputs,
+            .logits_index = logits_index,
+            .encoder = encoder.borrowedView("encoder_hidden_states"),
+            .mask = mask,
+            .vocab_size = vocab_size,
+        };
     }
 
     pub fn deinit(self: *State) void {
-        self.cache.deinit();
+        if (self.cached_outputs.len != 0) kv.freeTensorSlice(self.allocator, self.cached_outputs);
+        self.allocator.free(self.inputs);
+        self.allocator.free(self.roles);
     }
 
-    pub fn stepOutputs(self: *State, prefix: []const i64, dispatch: anytype, control: ?Control) ![]backends.Tensor {
-        const outputs = try self.allocator.alloc(backends.Tensor, 1);
-        errdefer self.allocator.free(outputs);
-        outputs[0] = try self.step(prefix, dispatch, control);
-        return outputs;
+    fn borrow(self: *const State, info: backends.TensorInfo, shape: []const i64, data: []const u8) backends.Tensor {
+        return .{ .data = @constCast(data), .shape = shape, .dtype = info.dtype, .name = info.name, .allocator = self.allocator, .owns_data = false, .owns_shape = false };
     }
 
-    /// Prefix belongs to this request and grows monotonically. Only new tokens
-    /// reach the graph after prefill; forced prompt tokens can append together.
+    /// Prefix grows monotonically. The same typed input map is reused across
+    /// prefill and incremental calls; no names or empty cache tensors are
+    /// allocated at a token boundary.
     pub fn step(self: *State, prefix: []const i64, dispatch: anytype, control: ?Control) !backends.Tensor {
         if (prefix.len <= self.processed) return error.InvalidDecoderPosition;
         if (control) |active| try active.check();
-        _ = self.session.compactExclusiveRows(self.allocator, self.cache.tensors, 64 * 1024, control) catch |err| switch (err) {
-            // Optional compaction must never reject an otherwise valid decode.
+        _ = self.session.compactExclusiveRows(self.allocator, self.cached_outputs, 64 * 1024, control) catch |err| switch (err) {
             error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => false,
             else => return err,
         };
+        const fresh = self.processed == 0;
         const tokens = prefix[self.processed..];
         const shape = [_]i64{ 1, @intCast(tokens.len) };
         const mask_shape = [_]i64{ 1, @intCast(self.mask.len) };
-        const branch_value = [_]u8{if (self.processed == 0) 0 else 1};
-        var inputs = std.ArrayListUnmanaged(backends.Tensor).empty;
-        defer {
-            for (inputs.items) |*input| input.deinit();
-            inputs.deinit(self.allocator);
-        }
-        try inputs.ensureTotalCapacity(self.allocator, self.session.inputInfo().len);
-        for (self.session.inputInfo()) |info| {
-            const tensor: backends.Tensor = if (std.mem.eql(u8, info.name, "input_ids"))
-                .{ .data = @constCast(std.mem.sliceAsBytes(tokens)), .shape = &shape, .dtype = .i64, .name = info.name, .allocator = self.allocator, .owns_data = false, .owns_shape = false }
-            else if (std.mem.eql(u8, info.name, "encoder_hidden_states")) self.encoder else if (std.mem.eql(u8, info.name, "encoder_attention_mask"))
-                .{ .data = @constCast(std.mem.sliceAsBytes(self.mask)), .shape = &mask_shape, .dtype = .i64, .name = info.name, .allocator = self.allocator, .owns_data = false, .owns_shape = false }
-            else if (std.mem.eql(u8, info.name, "use_cache_branch"))
-                .{ .data = @constCast(&branch_value), .shape = info.shape, .dtype = .bool_, .name = info.name, .allocator = self.allocator, .owns_data = false, .owns_shape = false }
-            else blk: {
-                if (self.processed == 0) break :blk try backends.Tensor.initFloat32(self.allocator, info.name, &.{ 1, info.shape[1], 0, info.shape[3] }, &.{});
-                const name = try kv.presentNameForPastInput(self.allocator, info.name);
-                defer self.allocator.free(name);
-                const cached = kv.findTensor(self.cache.tensors, name) orelse return error.MissingPastKeyValue;
-                break :blk cached.borrowedView(info.name);
+        const branch = [_]u8{@intFromBool(!fresh)};
+        const empty = std.mem.sliceAsBytes(@as([]const f32, &.{}));
+        for (self.session.inputInfo(), self.roles, self.inputs) |info, *role, *input| {
+            input.* = switch (role.*) {
+                .tokens => self.borrow(info, &shape, std.mem.sliceAsBytes(tokens)),
+                .encoder => self.encoder,
+                .mask => self.borrow(info, &mask_shape, std.mem.sliceAsBytes(self.mask)),
+                .cache_branch => self.borrow(info, info.shape, &branch),
+                .past => |*past| if (fresh)
+                    self.borrow(info, &past.empty_shape, empty)
+                else
+                    self.cached_outputs[past.output_index].borrowedView(info.name),
             };
-            inputs.appendAssumeCapacity(tensor);
         }
-        const outputs = try @import("tensor_dispatch.zig").run(self.allocator, self.session, null, self.session.execution_gate, inputs.items, control, dispatch);
-        var owned = true;
-        errdefer if (owned) kv.freeTensorSlice(self.allocator, outputs);
-        // Validate before committing state; errors never replay the model call.
+        const outputs = try @import("tensor_dispatch.zig").run(self.allocator, self.session, null, self.session.execution_gate, self.inputs, control, dispatch);
+        errdefer kv.freeTensorSlice(self.allocator, outputs);
         if (outputs.len != self.session.outputInfo().len) return error.InvalidDecoderOutput;
-        var logits_index: ?usize = null;
-        for (outputs, self.session.outputInfo(), 0..) |output, info, index| {
+        for (outputs, self.session.outputInfo()) |output, info| {
             if (!std.mem.eql(u8, output.name, info.name) or output.dtype != .f32) return error.InvalidDecoderOutput;
-            if (std.mem.eql(u8, output.name, "logits")) {
-                if (output.shape.len != 3 or output.shape[0] != 1 or output.shape[1] != tokens.len or output.shape[2] != self.vocab_size) return error.InvalidDecoderOutput;
-                logits_index = index;
-            } else {
-                if (output.shape.len != 4) return error.InvalidDecoderOutput;
-                const cross = std.mem.indexOf(u8, output.name, ".encoder.") != null;
-                if (cross and output.data.len == 0 and self.processed > 0) continue;
-                const expected = if (cross) self.mask.len else prefix.len;
-                if (output.shape[0] != 1 or output.shape[2] != expected) return error.InvalidDecoderOutput;
-                const suffix = kv.presentOutputSuffix(output.name).?;
-                for (inputs.items) |input| {
-                    const past_suffix = kv.pastInputSuffix(input.name) orelse continue;
-                    if (!std.mem.eql(u8, suffix, past_suffix)) continue;
-                    if (output.shape[1] != input.shape[1] or output.shape[3] != input.shape[3]) return error.InvalidDecoderOutput;
-                    break;
-                }
-            }
-            var elements: usize = 1;
-            for (output.shape) |dim| {
-                if (dim <= 0) return error.InvalidDecoderOutput;
-                elements = try std.math.mul(usize, elements, @intCast(dim));
-            }
-            if (try std.math.mul(usize, elements, @sizeOf(f32)) != output.data.len) return error.InvalidDecoderOutput;
         }
-        const index = logits_index orelse return error.InvalidDecoderOutput;
-        var logits = outputs[index];
-        outputs[index] = logits.borrowedView(logits.name);
-        errdefer logits.deinit();
-        try self.cache.replaceSeq2Seq(self.allocator, outputs);
-        owned = false;
+        const logits = outputs[self.logits_index];
+        const logits_shape = [_]i64{ 1, @intCast(tokens.len), @intCast(self.vocab_size) };
+        if (!std.mem.eql(i64, logits.shape, &logits_shape)) return error.InvalidDecoderOutput;
+        try validateOutputBytes(logits);
+        for (self.roles) |role| switch (role) {
+            .past => |past| {
+                const output = outputs[past.output_index];
+                if (output.shape.len != 4) return error.InvalidDecoderOutput;
+                if (!fresh and past.cross and output.data.len == 0) continue;
+                const expected = [_]i64{ 1, past.empty_shape[1], @intCast(if (past.cross) self.mask.len else prefix.len), past.empty_shape[3] };
+                if (!std.mem.eql(i64, output.shape, &expected)) return error.InvalidDecoderOutput;
+                try validateOutputBytes(output);
+            },
+            else => {},
+        };
+        // Every possible error precedes ownership transfer or advancement.
+        // An empty cross output explicitly keeps this request's previous K/V.
+        if (!fresh) {
+            for (self.roles) |role| switch (role) {
+                .past => |past| if (past.cross and outputs[past.output_index].data.len == 0) {
+                    const old = &self.cached_outputs[past.output_index];
+                    outputs[past.output_index].deinit();
+                    outputs[past.output_index] = old.*;
+                    old.* = old.borrowedView(old.name);
+                },
+                else => {},
+            };
+            kv.freeTensorSlice(self.allocator, self.cached_outputs);
+        }
+        outputs[self.logits_index] = self.borrow(self.session.outputInfo()[self.logits_index], &.{}, &.{});
+        self.cached_outputs = outputs;
         self.processed = prefix.len;
         return logits;
+    }
+
+    fn validateOutputBytes(output: backends.Tensor) !void {
+        var elements: usize = 1;
+        for (output.shape) |dim| {
+            if (dim <= 0) return error.InvalidDecoderOutput;
+            elements = try std.math.mul(usize, elements, @intCast(dim));
+        }
+        if (try std.math.mul(usize, elements, @sizeOf(f32)) != output.data.len) return error.InvalidDecoderOutput;
     }
 };
 
@@ -293,9 +339,9 @@ fn checkIncremental(allocator: std.mem.Allocator) !void {
     defer encoder.deinit();
     var other_encoder = try backends.Tensor.initFloat32(allocator, "last_hidden_state", &.{ 1, 2, 2 }, &.{ 2, 2, 2, 2 });
     defer other_encoder.deinit();
-    var first = State.init(allocator, session, encoder, &.{ 1, 1 }, 4).?;
+    var first = (try State.init(allocator, session, encoder, &.{ 1, 1 }, 4)).?;
     defer first.deinit();
-    var second = State.init(allocator, session, other_encoder, &.{ 1, 1 }, 4).?;
+    var second = (try State.init(allocator, session, other_encoder, &.{ 1, 1 }, 4)).?;
     defer second.deinit();
     const prefix = [_]i64{ 0, 2, 3 };
     for (1..4) |length| {
@@ -360,9 +406,9 @@ test "incremental seq2seq fuses prefill and cached steps with broadcast branch a
     defer encoder.deinit();
     var other = try backends.Tensor.initFloat32(std.testing.allocator, "hidden", &.{ 1, 2, 2 }, &.{ 2, 2, 2, 2 });
     defer other.deinit();
-    var first = State.init(std.testing.allocator, session, encoder, &.{ 1, 1 }, 4).?;
+    var first = (try State.init(std.testing.allocator, session, encoder, &.{ 1, 1 }, 4)).?;
     defer first.deinit();
-    var second = State.init(std.testing.allocator, session, other, &.{ 1, 1 }, 4).?;
+    var second = (try State.init(std.testing.allocator, session, other, &.{ 1, 1 }, 4)).?;
     defer second.deinit();
     const prefix = [_]i64{ 0, 2, 3 };
     for (1..4) |length| {
@@ -411,7 +457,7 @@ test "incremental seq2seq admits cache bytes before the backend call" {
     session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .kv_limit_bytes = 1 }, .static_workspace_bytes = 1, .check_live_memory = false };
     var encoder = try backends.Tensor.initFloat32(std.testing.allocator, "hidden", &.{ 1, 2, 2 }, &.{ 1, 1, 1, 1 });
     defer encoder.deinit();
-    var state = State.init(std.testing.allocator, session, encoder, &.{ 1, 1 }, 4).?;
+    var state = (try State.init(std.testing.allocator, session, encoder, &.{ 1, 1 }, 4)).?;
     defer state.deinit();
     try std.testing.expectError(error.ResourceLimitExceeded, state.step(&.{0}, null, null));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
@@ -427,7 +473,7 @@ test "incremental seq2seq cancellation after forwarding does not publish or repl
     session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false };
     var encoder = try backends.Tensor.initFloat32(std.testing.allocator, "hidden", &.{ 1, 2, 2 }, &.{ 1, 1, 1, 1 });
     defer encoder.deinit();
-    var state = State.init(std.testing.allocator, session, encoder, &.{ 1, 1 }, 4).?;
+    var state = (try State.init(std.testing.allocator, session, encoder, &.{ 1, 1 }, 4)).?;
     defer state.deinit();
     const Probe = struct {
         fn check(raw: ?*anyopaque) bool {
@@ -438,6 +484,6 @@ test "incremental seq2seq cancellation after forwarding does not publish or repl
     try std.testing.expectError(error.Cancelled, state.step(&.{0}, null, .{ .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = Probe.check } }));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 0), state.processed);
-    try std.testing.expectEqual(@as(usize, 0), state.cache.tensors.len);
+    try std.testing.expectEqual(@as(usize, 0), state.cached_outputs.len);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
 }
