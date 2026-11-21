@@ -23,6 +23,60 @@ pub const frame = @import("committed_frame.zig");
 const intent_value = @import("transaction_intent_value.zig");
 const A = std.mem.Allocator;
 pub const state_key = "\x00\x00__committed_history__:state";
+/// The predecessor frontier at the ordered range cut. Storage publishes this
+/// witness alongside the new range and its apply receipt.
+pub const SplitCut = struct {
+    pub const key = "\x00\x00__committed_history__:split_cut";
+    pub const encoded_size = 164;
+    namespace: frame.Namespace,
+    transition: u64,
+    attempt: u64,
+    successor_group: u64,
+    term: u64,
+    index: u64,
+    latest: u64,
+    reclaimed: u64,
+    root_generation: u64,
+    reserved_bytes: u64,
+    boundary: [32]u8,
+
+    pub fn encode(self: SplitCut) [encoded_size]u8 {
+        var raw: [encoded_size]u8 = undefined;
+        raw[0..4].* = "HSC1".*;
+        raw[4..28].* = self.namespace;
+        for ([_]u64{ self.transition, self.attempt, self.successor_group, self.term, self.index, self.latest, self.reclaimed }, 0..) |value, i| {
+            std.mem.writeInt(u64, raw[28 + 8 * i ..][0..8], value, .big);
+        }
+        raw[84..116].* = self.boundary;
+        std.mem.writeInt(u64, raw[116..124], self.root_generation, .big);
+        std.mem.writeInt(u64, raw[124..132], self.reserved_bytes, .big);
+        raw[132..164].* = frame.digest(raw[0..132]);
+        return raw;
+    }
+
+    pub fn decode(raw: []const u8) !SplitCut {
+        if (raw.len != encoded_size or !std.mem.eql(u8, raw[0..4], "HSC1") or
+            !std.mem.eql(u8, raw[132..164], &frame.digest(raw[0..132]))) return error.HistoryCorrupt;
+        var values: [7]u64 = undefined;
+        for (&values, 0..) |*value, i| value.* = std.mem.readInt(u64, raw[28 + 8 * i ..][0..8], .big);
+        if (std.mem.allEqual(u8, raw[4..28], 0) or std.mem.indexOfScalar(u64, values[0..5], 0) != null or values[6] > values[5])
+            return error.HistoryCorrupt;
+        return .{
+            .namespace = raw[4..28].*,
+            .transition = values[0],
+            .attempt = values[1],
+            .successor_group = values[2],
+            .term = values[3],
+            .index = values[4],
+            .latest = values[5],
+            .reclaimed = values[6],
+            .boundary = raw[84..116].*,
+            .root_generation = std.mem.readInt(u64, raw[116..124], .big),
+            .reserved_bytes = std.mem.readInt(u64, raw[124..132], .big),
+        };
+    }
+};
+
 pub const consumer_authority_key = "\x00\x00__committed_history__:consumer_authority";
 const record_prefix = "\x00\x00__committed_history__:record:";
 const chunk_prefix = "\x00\x00__committed_history__:chunk:";

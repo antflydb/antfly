@@ -8243,6 +8243,27 @@ pub const DB = struct {
         const range: types.ByteRange = .{ .start = start, .end = end };
         const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, range);
         defer self.alloc.free(range_value);
+        const history = @import("../committed_history.zig");
+        const history_cut: ?[history.SplitCut.encoded_size]u8 = if (identity) |entry| cut: {
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            const frontier = (try history.load(&read)) orelse break :cut null;
+            const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+            if (!std.mem.eql(u8, &namespace, &frontier.namespace)) return error.HistoryResynchronizationRequired;
+            break :cut (history.SplitCut{
+                .namespace = namespace,
+                .transition = transition.transition_id,
+                .attempt = transition.attempt_epoch,
+                .successor_group = transition.destination_group_id,
+                .term = entry.term,
+                .index = entry.index,
+                .latest = frontier.latest,
+                .reclaimed = frontier.reclaimed,
+                .boundary = history.frame.digest(transition.split_key),
+                .root_generation = self.core.root_generation,
+                .reserved_bytes = frontier.reserved_bytes,
+            }).encode();
+        } else null;
         // Publish graph source ownership before acknowledging the transition.
         // Physical retirement is a durable maintenance task, not Raft apply
         // work. Reverse reads use the same source fence; old metric jobs are
@@ -8267,6 +8288,7 @@ pub const DB = struct {
         defer metadata_writes.deinit(self.alloc);
         try metadata_writes.append(self.alloc, .{ .key = range_state_mod.range_key, .value = range_value });
         if (identity) |entry| try metadata_writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
+        if (history_cut != null) try metadata_writes.append(self.alloc, .{ .key = history.SplitCut.key, .value = &history_cut.? });
         if (replication_lsn) |lsn| try metadata_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_marker_buf));
         if (replication_payload) |payload| {
             const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
@@ -162280,4 +162302,61 @@ test "db ordered artifact inventory producer history is retained and qualified a
     wrong = request;
     wrong.namespace[0] ^= 1;
     try std.testing.expectError(error.HistoryResynchronizationRequired, reopened.artifactPublicationHistory(alloc, wrong, null));
+}
+
+test "db split finalization records the predecessor committed history frontier through reopen" {
+    const alloc = std.testing.allocator;
+    const history = @import("../committed_history.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/split-history", .{tmp.sub_path});
+    defer alloc.free(path);
+    const identity: doc_identity.Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    const namespace = @import("online_source_contract.zig").namespaceBytes(identity);
+    const options: OpenOptions = .{
+        .identity_namespace = identity,
+        .online_source_authority = .raft,
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    const entry: OrderedApplyReceipt = .{ .term = 2, .index = 9 };
+    const later: OrderedApplyReceipt = .{ .term = 2, .index = 10 };
+    const split: types.SplitTransitionMutation = .{
+        .kind = .finalize,
+        .transition_id = 5,
+        .attempt_epoch = 1,
+        .destination_group_id = 7,
+        .split_key = "doc:m",
+    };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        const policy = try db.applyOrderedHistoryConsumerControl(.{ .configure_policy = .{
+            .namespace = namespace,
+            .authority = @splat(1),
+            .previous_revision = 0,
+            .revision = 1,
+            .limit = history.default_limit,
+        } }, .{ .term = 2, .index = 7 }, false);
+        try std.testing.expect(policy == .applied);
+        try db.applyOrderedTimestampedMutation(.{ .source_producer = .ordinary, .writes = &.{.{ .key = "doc:a", .value = "{\"value\":1}" }} }, .{ .term = 2, .index = 8 }, 100, false);
+        try db.applyRangeFinalization(split, entry, null, null);
+        try db.applyOrderedTimestampedMutation(.{ .source_producer = .ordinary, .writes = &.{.{ .key = "doc:a", .value = "{\"value\":2}" }} }, later, 110, false);
+    }
+    var db = try DB.open(alloc, path, options);
+    defer db.close();
+    try db.applyRangeFinalization(split, entry, null, null);
+    try std.testing.expectEqualStrings("doc:m", db.getRange().end);
+    try std.testing.expectEqual(later, (try db.orderedApplyReceipt()).?);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    const cut = try history.SplitCut.decode(try read.get(history.SplitCut.key));
+    try std.testing.expectEqual(namespace, cut.namespace);
+    try std.testing.expectEqual(split.transition_id, cut.transition);
+    try std.testing.expectEqual(split.destination_group_id, cut.successor_group);
+    try std.testing.expectEqual(entry.index, cut.index);
+    try std.testing.expectEqual(history.frame.digest(split.split_key), cut.boundary);
+    try std.testing.expectEqual(@as(u64, 1), cut.latest);
+    try std.testing.expectEqual(@as(u64, 2), (try history.load(&read)).?.latest);
 }
