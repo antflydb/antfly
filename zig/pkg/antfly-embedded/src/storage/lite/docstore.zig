@@ -6465,15 +6465,17 @@ pub const Store = struct {
     }
 
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true, false);
+        return self.submitScopedMutation(.{ .context = context, .apply = apply, .durable = durable, .index_only = true });
     }
 
-    pub fn submitIndexScopeDeletion(self: *Store, prefix: []const u8, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        const admission = if (self.write_target != null) self.writer_admission else null;
-        if (admission) |lease| try lease.enter(lease.ptr, .index);
-        defer if (admission) |lease| lease.leave(lease.ptr);
-        const ticket = try self.stage(.{ .context = context, .apply = apply, .index_only = true, .scope_delete_prefix = prefix, .scope_delete_only = true });
-        try ticket.wait();
+    pub fn submitIndexScopeDeletion(self: *Store, scope: []const u8, prefix: []const u8, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitIndexPlanForScope(scope, .{
+            .context = context,
+            .apply = apply,
+            .index_only = true,
+            .scope_delete_prefix = prefix,
+            .scope_delete_only = true,
+        });
     }
 
     /// A durability barrier allocates no pages and requires no allocator
@@ -6494,7 +6496,7 @@ pub const Store = struct {
     }
 
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, false, false);
+        return self.submitScopedMutation(.{ .context = context, .apply = apply, .durable = durable });
     }
 
     /// WS7/WS5 interim ride-along commit, one named helper so every caller
@@ -6514,7 +6516,7 @@ pub const Store = struct {
     /// Immutable source aliases are read-path metadata, not authored writes.
     /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        return self.submitScopedMutation(context, apply, true, false, true);
+        return self.submitScopedMutation(.{ .context = context, .apply = apply, .artifact_lease = true });
     }
 
     /// `submitIndexMutation` for one native-catalog index scope. Through a
@@ -6525,8 +6527,12 @@ pub const Store = struct {
     /// whole). Checked under the writer admission, which excludes every
     /// other writer until this commit lands.
     pub fn submitIndexMutationForScope(self: *Store, scope: []const u8, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        if (self.write_target == null) return self.submitIndexMutation(context, apply, durable);
-        const admission = self.writer_admission orelse return self.submitIndexMutation(context, apply, durable);
+        return self.submitIndexPlanForScope(scope, .{ .context = context, .apply = apply, .durable = durable, .index_only = true });
+    }
+
+    fn submitIndexPlanForScope(self: *Store, scope: []const u8, plan: MutationPlan) !void {
+        if (self.write_target == null) return self.submitScopedMutation(plan);
+        const admission = self.writer_admission orelse return self.submitScopedMutation(plan);
         try admission.enter(admission.ptr, .index);
         defer admission.leave(admission.ptr);
         const io = self.file.runtime();
@@ -6537,7 +6543,7 @@ pub const Store = struct {
             self.index_fence_refused.store(true, .release);
             return error.EnrichmentWaitCanceled;
         }
-        const shared = if (self.file.redo) |*redo| redo.shared else return self.submitIndexMutation(context, apply, durable);
+        const shared = if (self.file.redo) |*redo| redo.shared else return self.submitScopedMutation(plan);
         if (shared.scopeLatestSequence(io, scope) > self.indexScopeFence(scope)) {
             self.index_fence_refused.store(true, .release);
             return error.EnrichmentWaitCanceled;
@@ -6545,7 +6551,7 @@ pub const Store = struct {
         // Reserved before publishing: recording the commit afterwards must
         // not fail once storage has changed.
         try self.reserveIndexScope(scope);
-        try self.submitIndexMutation(context, apply, durable);
+        try self.submitScopedMutation(plan);
         self.noteIndexScopeCommit(scope, shared.scopeLatestSequence(io, scope));
     }
 
@@ -6633,7 +6639,7 @@ pub const Store = struct {
         value.* = @max(value.*, sequence);
     }
 
-    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
+    fn submitScopedMutation(self: *Store, plan: MutationPlan) !void {
         // A forwarded request commits in the writer store's group, which
         // enters that store's admission, not this one's. The detached work
         // that built it must still hold the writer lease and pass this
@@ -6644,9 +6650,9 @@ pub const Store = struct {
         // current writer reads the owner's serving root, which only the
         // admission below may do.
         const forwarded_admission = if (self.write_target != null) self.writer_admission else null;
-        if (forwarded_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease) .artifact_lease else if (index_only) .index else .primary);
+        if (forwarded_admission) |admission| try admission.enter(admission.ptr, if (plan.artifact_lease) .artifact_lease else if (plan.index_only) .index else .primary);
         defer if (forwarded_admission) |admission| admission.leave(admission.ptr);
-        const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
+        const ticket = try self.stage(plan);
         ticket.wait() catch |err| {
             // §9.7f: a redo-log file's own fixed log-capacity reservation
             // can go stale -- frozen at whatever it was sized to when
@@ -6674,7 +6680,7 @@ pub const Store = struct {
                 // request), and retry only if the reservation shrank.
                 const shrank = (if (forwarded_admission != null) self.reclaimOversizedRedoReservationAdmitted() else self.reclaimOversizedRedoReservation()) catch false;
                 if (shrank) {
-                    const retry_ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
+                    const retry_ticket = try self.stage(plan);
                     return retry_ticket.wait();
                 }
             }
