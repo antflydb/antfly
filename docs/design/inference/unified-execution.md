@@ -345,6 +345,9 @@ geometry, declared admission, receiving banks, and retirement. The task supplies
 token rows, pooling intent, and its numerical lane. Source cohort admission and
 backend gates retain their order. A stale cold description can retry before
 numerical execution, and a submitted operation keeps its original failure.
+The EmbeddingGemma2 execution planner shares cohort limits across direct text
+and prepared media. The text packet sizing and physical encoder row geometry
+share one admission calculation for compact and padded schedules.
 
 `execution/audio_schedule.zig` owns the existing audio instruction tape and its
 arena layout. Alias lifetime propagation uses ML's same allocation-free liveness
@@ -369,7 +372,9 @@ outputs leave through the same prepared Source custody and retirement boundary.
 Decoder construction publishes the selected route, encoder storage, cache
 owner, and requested policy through the uniform report. The generic merged ONNX
 route uses the host-tensor dispatch ABI. Its typed control, self K/V, and cross K/V
-remain available to the batching callback. Native and compiled resident caches
+remain available to the batching callback. A verified optional merged artifact
+with an unsupported operator selects the ordinary decoder at load time. Receipt
+or checksum failure remains an error. Native and compiled resident caches
 report their actual runtime owner. Failed construction publishes the initiating
 error, with cache ownership and numerical counters unavailable.
 

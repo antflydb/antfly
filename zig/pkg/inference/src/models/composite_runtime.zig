@@ -236,7 +236,16 @@ pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control:
             };
             if (loaded) |_| {} else |err| {
                 switch (err) {
-                    error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => {},
+                    error.IncompatibleModel,
+                    error.UnsupportedArchitecture,
+                    error.UnsupportedOp,
+                    error.UnsupportedOperation,
+                    error.UnsupportedOperator,
+                    error.UnsupportedOnnxGraphBackendOperation,
+                    error.NoCompatibleBackend,
+                    error.NoBackendAvailable,
+                    error.UnsupportedBackend,
+                    => {},
                     else => return err,
                 }
                 if (decoder) |*candidate| candidate.deinit();
