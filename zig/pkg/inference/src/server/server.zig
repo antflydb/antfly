@@ -51301,9 +51301,14 @@ test "scoped model discovery refuses an EmbeddingGemma 2 pin with missing recipe
     try testScopedShardedDiscovery(.none, .gemma_incomplete);
 }
 
+test "scoped model discovery refuses receipted EmbeddingGemma 2 sidecars with incompatible recipes" {
+    try testScopedShardedDiscovery(.none, .gemma_invalid_processor);
+    try testScopedShardedDiscovery(.none, .gemma_invalid_tokenizer);
+}
+
 const scoped_catalog_test_safetensors = "\x4e\x00\x00\x00\x00\x00\x00\x00{\"model.embed_tokens.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
 
-fn testScopedShardedDiscovery(comptime graph_role: enum { none, primary, auxiliary, auxiliary_compatible_extent }, comptime fixture: enum { sharded, gemma_sharded, gemma_incomplete }) !void {
+fn testScopedShardedDiscovery(comptime graph_role: enum { none, primary, auxiliary, auxiliary_compatible_extent }, comptime fixture: enum { sharded, gemma_sharded, gemma_incomplete, gemma_invalid_processor, gemma_invalid_tokenizer }) !void {
     const gemma = fixture != .sharded;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -51319,18 +51324,19 @@ fn testScopedShardedDiscovery(comptime graph_role: enum { none, primary, auxilia
     try tmp.dir.createDirPath(io, path ++ "/parts");
     const dir = try tmp.dir.openDir(io, path, .{});
     defer dir.close(io);
+    if (fixture == .gemma_invalid_processor or fixture == .gemma_invalid_tokenizer) try dir.createDirPath(io, "1_Pooling");
     // The external tensor points beyond the end of a valid receipt member.
     const graph = "\x3a\x2c\x2a\x2a\x6a\x17\x0a\x08location\x12\x0btensors.bin\x6a\x0d\x0a\x06offset\x12\x03" ++
         (if (graph_role == .auxiliary_compatible_extent) "000" else "999") ++ "\x70\x01";
-    const native_files = if (fixture == .gemma_incomplete)
+    const native_files = if (fixture == .gemma_incomplete or fixture == .gemma_invalid_processor or fixture == .gemma_invalid_tokenizer)
         .{
             .{ "config.json", config },
             .{ "model.safetensors", weights },
-            .{ "tokenizer.json", "{}" },
+            .{ "tokenizer.json", if (fixture == .gemma_invalid_tokenizer) "{" else scoped_gemma_test_tokenizer },
             .{ "tokenizer_config.json", "{}" },
-            .{ "processor_config.json", "{}" },
+            .{ "processor_config.json", if (fixture == .gemma_invalid_processor) "{}" else @embedFile("../models/embedding_gemma2_processor.json") },
             .{ "config_sentence_transformers.json", "{}" },
-        }
+        } ++ (if (fixture == .gemma_incomplete) .{} else .{.{ "1_Pooling/config.json", "{}" }})
     else
         .{ .{ "config.json", config }, .{ index_path, index }, .{ shard_path, weights } };
     const graph_name = if (graph_role == .auxiliary or graph_role == .auxiliary_compatible_extent) "visual_model.onnx" else "model.onnx";
@@ -51379,7 +51385,7 @@ fn testScopedShardedDiscovery(comptime graph_role: enum { none, primary, auxilia
         const before = request_work_test_counters.compatibility_checkpoint_samples;
         var response = try node.listModels(&ctx);
         defer response.deinit();
-        if (fixture == .gemma_incomplete) {
+        if (fixture == .gemma_incomplete or fixture == .gemma_invalid_processor or fixture == .gemma_invalid_tokenizer) {
             try std.testing.expectEqual(@as(u16, 503), response.status.code);
             try std.testing.expectEqualStrings("true", response.headers.get("X-Antfly-Embedding-Artifact-Unavailable").?);
             continue;
@@ -51390,6 +51396,29 @@ fn testScopedShardedDiscovery(comptime graph_role: enum { none, primary, auxilia
         const model = parsed.value.object.get("embedders").?.object.get("acme/sharded").?;
         try std.testing.expectEqual(!gemma, model.object.get("model_revision_pinning").?.bool);
         if (attempt != 0) try std.testing.expectEqual(before, request_work_test_counters.compatibility_checkpoint_samples);
+    }
+
+    if (fixture == .gemma_invalid_processor or fixture == .gemma_invalid_tokenizer) {
+        const model_dir = try std.fs.path.join(a, &.{ root, path });
+        defer a.free(model_dir);
+        const publication = try managed.publicationGeneration(a, io, model_dir);
+        var manifest = try manifest_mod.loadBoundFromDir(a, io, model_dir, publication, false);
+        defer manifest.deinit();
+        const revisions = try node.model_manager.declaredEmbeddingRevisions(model_dir, manifest, .{ .io = io });
+        try std.testing.expect(revisions.len != 0);
+        const hex = std.fmt.bytesToHex(revisions.revisions[0], .lower);
+        const activation_path = try std.fmt.allocPrint(a, "/ai/v1/models/instances?model_revision={s}", .{&hex});
+        defer a.free(activation_path);
+        var activation = try httpx.Request.init(a, .POST, activation_path);
+        defer activation.deinit();
+        activation.body = "{\"model\":\"acme/sharded\",\"task\":\"embedder\"}";
+        var activation_ctx = httpx.Context.init(a, io, &activation);
+        defer activation_ctx.deinit();
+        var refused = try node.loadModelInstance(&activation_ctx);
+        defer refused.deinit();
+        try std.testing.expectEqual(@as(u16, 503), refused.status.code);
+        try std.testing.expectEqualStrings("true", refused.headers.get("X-Antfly-Embedding-Artifact-Unavailable").?);
+        try std.testing.expect(refused.headers.get(embedding_revision.response_header) == null);
     }
 
     if (gemma) return;
@@ -51657,12 +51686,27 @@ fn testScopedJinaAdapter(comptime missing_weights: bool) !void {
     try std.testing.expect(rejected.contains(@splat(1)));
 }
 
+const scoped_gemma_test_tokenizer =
+    \\{"post_processor":{"type":"TemplateProcessing","single":[{"SpecialToken":{"id":"<bos>","type_id":0}},{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"<eos>","type_id":0}}],"special_tokens":{"<bos>":{"id":"<bos>","ids":[2],"tokens":["<bos>"]},"<eos>":{"id":"<eos>","ids":[1],"tokens":["<eos>"]}}},"added_tokens":[
+    \\{"id":0,"content":"<pad>","special":true},{"id":1,"content":"<eos>","special":true},{"id":2,"content":"<bos>","special":true},
+    \\{"id":255999,"content":"<|image>","special":true},{"id":256000,"content":"<|audio>","special":true},{"id":258880,"content":"<|image|>","special":true},
+    \\{"id":258881,"content":"<|audio|>","special":true},{"id":258882,"content":"<image|>","special":true},{"id":258883,"content":"<audio|>","special":true},
+    \\{"id":258884,"content":"<|video|>","special":true}]}
+;
+
+fn scopedGemmaSidecarFixture(sidecar: []const u8, config: []const u8) []const u8 {
+    if (std.mem.eql(u8, sidecar, "config.json")) return config;
+    if (std.mem.eql(u8, sidecar, "processor_config.json")) return @embedFile("../models/embedding_gemma2_processor.json");
+    if (std.mem.eql(u8, sidecar, "tokenizer.json")) return scoped_gemma_test_tokenizer;
+    return "{}";
+}
+
 fn writeScopedGemmaSidecars(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, root: []const u8, config: []const u8) !void {
     for (@import("../models/embedding_gemma2_identity.zig").sidecars) |sidecar| {
         const path = try std.fs.path.join(a, &.{ root, sidecar });
         defer a.free(path);
         try dir.createDirPath(io, std.fs.path.dirname(path).?);
-        try dir.writeFile(io, .{ .sub_path = path, .data = if (std.mem.eql(u8, sidecar, "config.json")) config else "{}" });
+        try dir.writeFile(io, .{ .sub_path = path, .data = scopedGemmaSidecarFixture(sidecar, config) });
     }
 }
 
@@ -51684,23 +51728,20 @@ test "scoped model discovery resolves dense geometry without loading weights" {
     const managed = @import("../registry/managed_receipt.zig");
     const config = @embedFile("../architectures/embedding_gemma2_config.json");
     const weights = scoped_catalog_test_safetensors ++ "\x00\x00\x00\x00";
-    var config_digest: [32]u8 = undefined;
     var weights_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(config, &config_digest, .{});
     std.crypto.hash.sha2.Sha256.hash(weights, &weights_digest, .{});
-    const config_hex = std.fmt.bytesToHex(config_digest, .lower);
     const weights_hex = std.fmt.bytesToHex(weights_digest, .lower);
     const recipe = @import("../models/embedding_gemma2_identity.zig");
-    var sidecar_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash("{}", &sidecar_digest, .{});
-    const sidecar_hex = std.fmt.bytesToHex(sidecar_digest, .lower);
+    var sidecar_hexes: [recipe.sidecars.len][64]u8 = undefined;
     var members: [recipe.sidecars.len + 1]managed.ArtifactReceipt = undefined;
     members[0] = .{ .path = "model.safetensors", .size = weights.len, .sha256 = &weights_hex };
-    for (recipe.sidecars, 1..) |path, i|
-        members[i] = if (std.mem.eql(u8, path, "config.json"))
-            .{ .path = path, .size = config.len, .sha256 = &config_hex }
-        else
-            .{ .path = path, .size = 2, .sha256 = &sidecar_hex };
+    for (recipe.sidecars, 0..) |path, i| {
+        const contents = scopedGemmaSidecarFixture(path, config);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(contents, &digest, .{});
+        sidecar_hexes[i] = std.fmt.bytesToHex(digest, .lower);
+        members[i + 1] = .{ .path = path, .size = contents.len, .sha256 = &sidecar_hexes[i] };
+    }
     const source: managed.DownloadSource = .{ .owner = "acme", .name = "other", .variant = "safetensors", .selected_format = "safetensors" };
     const receipt = try std.json.Stringify.valueAlloc(a, managed.DownloadReceipt{
         .version = 2,

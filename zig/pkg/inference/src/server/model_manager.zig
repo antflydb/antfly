@@ -563,6 +563,16 @@ fn embeddingGemma2Weights(manifest: manifest_mod.ModelManifest) ![]const u8 {
     return manifest.safetensors_path.?;
 }
 
+fn verifiedGemmaEmbeddingSnapshot(artifacts: *PublishedArtifacts, weights: []const u8, signature: [32]u8) !@import("../models/embedding_gemma2_identity.zig").Snapshot {
+    const identity = @import("../models/embedding_gemma2_identity.zig");
+    var digests: [identity.sidecars.len + 1][32]u8 = undefined;
+    for (identity.sidecars ++ .{std.fs.path.basename(weights)}, &digests) |member, *digest| {
+        const hex = try artifacts.verifiedFileDigest(member) orelse return error.InvalidManagedDownload;
+        _ = std.fmt.hexToBytes(digest, hex) catch return error.InvalidManagedDownload;
+    }
+    return .{ .digest = identity.fromDigests(digests), .signature = signature };
+}
+
 fn artifactCandidateForBackend(
     man: manifest_mod.ModelManifest,
     backend: backends.BackendType,
@@ -10613,7 +10623,7 @@ pub const ModelManager = struct {
         return self.acquireVerifiedPinnedEmbedding(model_dir, expected, control, prepared) catch |err| {
             if (isPinnedBackendLoadFailure(err)) return error.PinnedEmbeddingBackendUnavailable;
             return switch (err) {
-                error.ChecksumMismatch, error.InvalidManagedDownload, error.ModelArtifactNotPublished, error.FileNotFound, error.NotDir, error.InvalidExternalPath, error.InvalidExternalOffset, error.ExternalRegionOutOfBounds => error.PinnedEmbeddingArtifactUnavailable,
+                error.ChecksumMismatch, error.InvalidManagedDownload, error.CatalogArtifactUnavailable, error.ModelArtifactNotPublished, error.FileNotFound, error.NotDir, error.InvalidExternalPath, error.InvalidExternalOffset, error.ExternalRegionOutOfBounds, error.InvalidEmbeddingGemma2Processor, error.InvalidEmbeddingGemma2Tokenizer => error.PinnedEmbeddingArtifactUnavailable,
                 else => err,
             };
         };
@@ -10843,6 +10853,12 @@ pub const ModelManager = struct {
         };
         tokenizer_artifacts.verification_cache = &self.verified_artifacts;
         if (control) |active| tokenizer_artifacts.verification_control = active;
+        const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
+        const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
+            try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, try embeddingGemma2Weights(man))
+        else
+            null;
+
         // A pinned load derives portable identity from the declaration, then
         // authenticates bytes through the selected tokenizer and session paths.
         const verify_selected = prepared != null and hasCompleteChecksums(tokenizer_artifacts);
@@ -10851,11 +10867,22 @@ pub const ModelManager = struct {
             // media pipeline outside backend session construction.
             inline for (.{ "config_path", "model_manifest_path", "tokenizer_json_path", "vocab_txt_path", "tokenizer_config_path", "special_tokens_map_path", "preprocessor_config_path", "processor_config_path" }) |field|
                 if (@field(man, field)) |metadata| try tokenizer_artifacts.verifyPath(metadata);
-            if (man.embedding_style == .embedding_gemma2) {
-                const recipe = @import("../models/embedding_gemma2_identity.zig");
-                for (recipe.sidecars) |sidecar| {
+            if (embedding_signature != null) {
+                const weights = try embeddingGemma2Weights(man);
+                if ((try tokenizer_artifacts.requireCatalogMember(weights)).size > eg2_identity.max_weight_bytes) return error.PinnedEmbeddingArtifactUnavailable;
+                for (eg2_identity.sidecars) |sidecar| {
                     const member = try std.fs.path.join(self.allocator, &.{ model_dir, sidecar });
                     defer self.allocator.free(member);
+                    if ((try tokenizer_artifacts.requireCatalogMember(member)).size > eg2_identity.max_sidecar_bytes) return error.PinnedEmbeddingArtifactUnavailable;
+                    if (eg2_identity.CheckedSidecar.fromPath(sidecar)) |check| {
+                        if (control) |active| try active.check();
+                        const bytes = tokenizer_artifacts.readPath(member, eg2_identity.max_sidecar_bytes) catch |err| switch (err) {
+                            error.FileTooLarge => return check.invalidError(),
+                            else => return err,
+                        };
+                        defer self.allocator.free(bytes);
+                        try check.validate(self.allocator, bytes);
+                    }
                     try tokenizer_artifacts.verifyPath(member);
                 }
             }
@@ -10866,11 +10893,6 @@ pub const ModelManager = struct {
             const slot = &self.declared_receipt_revisions[receipt.publication_generation[0] % self.declared_receipt_revisions.len];
             break :declared imagePreprocessingRevision(man, try slot.get(self.allocator, publication_io, receipt, control orelse .{}));
         } else try modelIdentityWithArtifacts(self.allocator, publication_io, model_dir, man, tokenizer_artifacts, control orelse .{});
-        const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
-        const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
-            try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, try embeddingGemma2Weights(man))
-        else
-            null;
 
         var qualified_profile_bundle: ?kernel_jit_profile_output.LoadedProfileBundle =
             if (sm.kernel_jit.qualified_profile_path) |path|
@@ -11089,9 +11111,13 @@ pub const ModelManager = struct {
                 ),
             };
         } else null;
-        // Hash only after tokenizer/session admission owns the loaded assets.
+        // Selected managed loads already authenticate the recipe members.
+        // Reuse those digests after admission instead of hashing weights again.
         const embedding_snapshot: ?eg2_identity.Snapshot = if (embedding_signature) |before| blk: {
-            const snapshot = try eg2_identity.snapshotCached(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?, control orelse .{});
+            const snapshot = if (verify_selected)
+                try verifiedGemmaEmbeddingSnapshot(tokenizer_artifacts, man.safetensors_path.?, before)
+            else
+                try eg2_identity.snapshotCached(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?, control orelse .{});
             if (!std.mem.eql(u8, &before, &snapshot.signature)) return error.ModelArtifactsChanging;
             break :blk snapshot;
         } else null;

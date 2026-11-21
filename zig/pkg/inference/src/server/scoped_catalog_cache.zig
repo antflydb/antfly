@@ -104,6 +104,7 @@ pub const Cache = struct {
             artifacts: *const PublishedArtifacts,
             members: std.StringHashMapUnmanaged(managed.ArtifactStamp) = .empty,
             failed_member: ?[]const u8 = null,
+            failed_stamp: ?managed.ArtifactStamp = null,
 
             fn stamp(self: *MemberCollector, path: []const u8) !managed.ArtifactStamp {
                 return self.artifacts.requireCatalogMember(path) catch |err| {
@@ -141,19 +142,23 @@ pub const Cache = struct {
         const FailedMember = struct {
             path: []const u8,
             reason: anyerror,
+            stamp: ?managed.ArtifactStamp,
 
             fn capture(collector: *const MemberCollector, owner: std.mem.Allocator, reason: anyerror) !?FailedMember {
                 const path = collector.failed_member orelse return null;
                 if (path.len > 4096) return null;
-                return .{ .path = try owner.dupe(u8, path), .reason = reason };
+                return .{ .path = try owner.dupe(u8, path), .reason = reason, .stamp = collector.failed_stamp };
             }
 
             fn recheck(self: *?FailedMember, owner: std.mem.Allocator, artifacts: *const PublishedArtifacts) !void {
                 if (self.*) |failure| {
-                    _ = artifacts.requireCatalogMember(failure.path) catch |err| switch (err) {
+                    const current = artifacts.requireCatalogMember(failure.path) catch |err| switch (err) {
                         error.ChecksumMismatch, error.CatalogArtifactUnavailable => return failure.reason,
                         else => return err,
                     };
+                    if (failure.stamp) |stamp| {
+                        if (std.meta.eql(stamp, current)) return failure.reason;
+                    }
                     owner.free(failure.path);
                     self.* = null;
                 }
@@ -194,7 +199,7 @@ pub const Cache = struct {
                     return true;
                 }
                 FailedMember.recheck(&self.failure, owner, artifacts) catch |err| switch (err) {
-                    error.ChecksumMismatch, error.CatalogArtifactUnavailable => return false,
+                    error.ChecksumMismatch, error.CatalogArtifactUnavailable, error.InvalidEmbeddingGemma2Processor, error.InvalidEmbeddingGemma2Tokenizer => return false,
                     else => return err,
                 };
                 if (self.retry_at) |retry| {
@@ -370,13 +375,33 @@ pub const Cache = struct {
                         const weights = manifest.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights;
                         const weight_member = try std.fs.path.join(artifacts.allocator, &.{ artifacts.root, std.fs.path.basename(weights) });
                         defer artifacts.allocator.free(weight_member);
-                        _ = try collector.add(weight_member);
+                        if (try collector.add(weight_member) > gemma_identity.max_weight_bytes) return error.InvalidManagedDownload;
                         try gemma_identity.requireWeightBinding(artifacts.allocator, artifacts.io, artifacts.root, weights);
                         for (gemma_identity.sidecars) |sidecar| {
                             try control.check();
                             const member = try std.fs.path.join(artifacts.allocator, &.{ artifacts.root, sidecar });
                             defer artifacts.allocator.free(member);
-                            _ = try collector.add(member);
+                            if (try collector.add(member) > gemma_identity.max_sidecar_bytes) return error.InvalidManagedDownload;
+                        }
+                        // Check the complete receipt closure first. The cheap
+                        // missing-member path stays independent of JSON parsing.
+                        for (gemma_identity.sidecars) |sidecar| {
+                            const check = gemma_identity.CheckedSidecar.fromPath(sidecar) orelse continue;
+                            try control.check();
+                            const member = try std.fs.path.join(collector.allocator, &.{ artifacts.root, sidecar });
+                            const result = result: {
+                                const bytes = artifacts.readPath(member, gemma_identity.max_sidecar_bytes) catch |err| break :result err;
+                                defer artifacts.allocator.free(bytes);
+                                break :result check.validate(artifacts.allocator, bytes);
+                            };
+                            result catch |err| switch (err) {
+                                error.ChecksumMismatch, error.FileTooLarge, error.InvalidEmbeddingGemma2Processor, error.InvalidEmbeddingGemma2Tokenizer => {
+                                    collector.failed_member = member;
+                                    collector.failed_stamp = collector.members.get(member).?;
+                                    return if (err == error.FileTooLarge) check.invalidError() else err;
+                                },
+                                else => return err,
+                            };
                         }
                     }
                     if (manifest.nativeCompanionPath()) |companion| _ = try collector.add(companion);

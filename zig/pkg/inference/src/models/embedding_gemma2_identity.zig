@@ -65,6 +65,9 @@ pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/emb
 }
 
 pub const sidecars = [_][]const u8{ "config.json", "tokenizer.json", "tokenizer_config.json", "processor_config.json", "config_sentence_transformers.json", "1_Pooling/config.json" };
+pub const max_sidecar_bytes = 64 * 1024 * 1024;
+pub const max_weight_bytes = 4 * 1024 * 1024 * 1024;
+
 pub const Snapshot = struct { digest: [64]u8, signature: [32]u8 };
 
 fn same(a: std.json.Value, b: std.json.Value) bool {
@@ -93,7 +96,10 @@ fn same(a: std.json.Value, b: std.json.Value) bool {
 }
 
 pub fn validateProcessor(a: std.mem.Allocator, bytes: []const u8) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" });
+    const parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEmbeddingGemma2Processor,
+    };
     defer parsed.deinit();
     const reference = try std.json.parseFromSlice(std.json.Value, a, @embedFile("embedding_gemma2_processor.json"), .{});
     defer reference.deinit();
@@ -104,7 +110,10 @@ pub fn validateProcessor(a: std.mem.Allocator, bytes: []const u8) !void {
 }
 
 pub fn validateTokenizer(a: std.mem.Allocator, bytes: []const u8) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" });
+    const parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEmbeddingGemma2Tokenizer,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidEmbeddingGemma2Tokenizer;
     const processor = parsed.value.object.get("post_processor") orelse return error.InvalidEmbeddingGemma2Tokenizer;
@@ -137,6 +146,31 @@ pub fn validateTokenizer(a: std.mem.Allocator, bytes: []const u8) !void {
         if (!found) return error.InvalidEmbeddingGemma2Tokenizer;
     }
 }
+
+pub const CheckedSidecar = enum {
+    processor,
+    tokenizer,
+
+    pub fn fromPath(relative: []const u8) ?CheckedSidecar {
+        if (std.mem.eql(u8, relative, "processor_config.json")) return .processor;
+        if (std.mem.eql(u8, relative, "tokenizer.json")) return .tokenizer;
+        return null;
+    }
+
+    pub fn invalidError(self: CheckedSidecar) error{ InvalidEmbeddingGemma2Processor, InvalidEmbeddingGemma2Tokenizer } {
+        return switch (self) {
+            .processor => error.InvalidEmbeddingGemma2Processor,
+            .tokenizer => error.InvalidEmbeddingGemma2Tokenizer,
+        };
+    }
+
+    pub fn validate(self: CheckedSidecar, a: std.mem.Allocator, bytes: []const u8) !void {
+        switch (self) {
+            .processor => try validateProcessor(a, bytes),
+            .tokenizer => try validateTokenizer(a, bytes),
+        }
+    }
+};
 
 pub fn requireWeightBinding(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights: []const u8) !void {
     const actual_weights = try receipt.resolveRegularFilePath(a, io, weights);
@@ -182,11 +216,10 @@ pub fn snapshot(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights
         const name = if (i == sidecars.len) "weights" else sidecars[i];
         const path = try receipt.resolveContainedArtifactPath(a, io, directory, if (i == sidecars.len) std.fs.path.basename(weights) else name);
         defer a.free(path);
-        var region = try file.MmapRegion.initLimited(a, path, if (i == sidecars.len) 4 * 1024 * 1024 * 1024 else 64 * 1024 * 1024);
+        var region = try file.MmapRegion.initLimited(a, path, if (i == sidecars.len) max_weight_bytes else max_sidecar_bytes);
         defer region.deinit();
         region.preserveFileCacheOnDeinit();
-        if (std.mem.eql(u8, name, "processor_config.json")) try validateProcessor(a, region.data);
-        if (std.mem.eql(u8, name, "tokenizer.json")) try validateTokenizer(a, region.data);
+        if (CheckedSidecar.fromPath(name)) |sidecar| try sidecar.validate(a, region.data);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         var offset: usize = 0;
         while (offset < region.data.len) {
