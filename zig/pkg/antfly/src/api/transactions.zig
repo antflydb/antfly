@@ -8138,6 +8138,30 @@ test "distributed txn legacy recovery counts malformed cursor rows" {
     try std.testing.expectEqualStrings(session_prefix ++ "!!", second.next_after.?);
 }
 
+test "distributed txn indexed recovery prunes a missing receipt marker" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "system/api-transaction-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(a, &store);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(a);
+    const id: db_mod.types.TxnId = @splat(8);
+    const key = try makeSessionRecoveryKey(a, id);
+    defer a.free(key);
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(key, &.{});
+        try txn.commit();
+    }
+    try std.testing.expect((try registry.claimPendingRecovery(a, id, 1, nextTxnTimestamp())) == null);
+    const page = try durable.scanRecoveryIds(a, null, 1);
+    defer a.free(page.ids);
+    try std.testing.expectEqual(@as(usize, 0), page.ids.len);
+}
+
 test "distributed txn sealed recovery rejects unsupported durable formats" {
     const a = std.testing.allocator;
     const id: db_mod.types.TxnId = @splat(0);
@@ -8195,6 +8219,8 @@ test "distributed txn graph admission distinguishes lost commit acknowledgments 
     try std.testing.expect(!txn.attempted);
     try std.testing.expectError(error.GraphReceiptAdmissionUnknown, DurableSessionStore.finishSessionWrite(&txn, true, true));
     try std.testing.expect(txn.attempted);
+    txn.failure = error.SessionWriteUnavailableBeforeProposal;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, DurableSessionStore.finishSessionWrite(&txn, true, true));
     txn.failure = error.SessionWriteNotLeaderBeforeProposal;
     try std.testing.expectError(error.NotLeader, DurableSessionStore.finishSessionWrite(&txn, true, true));
     txn.failure = error.NotLeader;
