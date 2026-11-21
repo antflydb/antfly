@@ -2357,6 +2357,9 @@ pub const ProvisionedTableWriteCache = struct {
     /// promotes resolution replay into cross-shard entity writes.
     promotion_leadership_source: ?PromotionLeadershipSourceContract = null,
     coordinated_ttl: ?server_coordinated_ttl.Port = null,
+    /// Context-source host (#1634) installed on every managed DB this cache
+    /// opens; it outlives the cache.
+    context_host: ?*@import("context_host.zig").Host = null,
     /// Optional HA ownership gate applied when this cache opens managed writer
     /// DBs. Changing the gate retires live cached DBs so the next operation
     /// reopens with the correct primary/standby role and background runtimes.
@@ -2654,8 +2657,31 @@ pub const ProvisionedTableWriteCache = struct {
     const RuntimeHookState = struct {
         group_id: u64 = 0,
         leadership_source: ?PromotionLeadershipSourceContract = null,
+        context_host: ?*@import("context_host.zig").Host = null,
+        context_table_name: []const u8 = "",
+        context_adapter: @import("antfly_local_sources").storage_db_context_host_json.Host = undefined,
         ttl_binding: server_coordinated_ttl.Binding = .{},
         visibility_binding: server_query_visibility.Binding = .{},
+
+        /// Installs the context host on `db` for this owner's group.
+        fn installContext(self: *RuntimeHookState, db: *db_mod.DB, table_name: []const u8) void {
+            if (self.context_host == null) return;
+            self.context_table_name = table_name;
+            self.context_adapter = .{ .call = .{ .ptr = self, .call_fn = contextCall } };
+            db.installContextHost(.{
+                .table_id = "",
+                .read_source = self.context_adapter.readSource(),
+                .dispatcher = self.context_adapter.dispatcher(),
+                .replication = self.context_adapter.replication(),
+                .topology = self.context_adapter.topology(),
+            }) catch |err| std.log.warn("context host install deferred table={s} group_id={d} err={s}", .{ table_name, self.group_id, @errorName(err) });
+        }
+
+        fn contextCall(ptr: *anyopaque, alloc: std.mem.Allocator, op: @import("antfly_local_sources").storage_db_context_host_json.Op, request: []const u8) anyerror![]u8 {
+            const self: *RuntimeHookState = @ptrCast(@alignCast(ptr));
+            const host = self.context_host orelse return error.ContextSourceTableUnavailable;
+            return host.call(alloc, @backingInt(op), self.group_id, self.context_table_name, request);
+        }
 
         fn owner(self: *RuntimeHookState) ?db_mod.PromotionOwner {
             if (self.leadership_source == null) return null;
@@ -2683,6 +2709,10 @@ pub const ProvisionedTableWriteCache = struct {
             state.ttl_binding.set(group_id, self.coordinated_ttl);
             db.setCoordinatedTtl(state.ttl_binding.port());
             db.setPromotionOwner(state.owner());
+            if (state.context_host != self.context_host or state.context_table_name.ptr != table_name.ptr) {
+                state.context_host = self.context_host;
+                state.installContext(db, table_name);
+            }
         } else {
             db.setCoordinatedTtl(null);
             db.setPromotionOwner(null);
@@ -7167,6 +7197,7 @@ pub const ProvisionedTableWriteSource = struct {
     /// leader-planned records instead of mutating graphs locally.
     leann_replication: bool = false,
     resolution_candidate_source: ?db_mod.CandidateSource = null,
+    context_host: ?*@import("context_host.zig").Host = null,
     entity_sink: ?db_mod.EntitySink = null,
     promotion_leadership_source: ?PromotionLeadershipSource = null,
     coordinated_ttl: ?server_coordinated_ttl.Port = null,
@@ -7708,6 +7739,12 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    pub fn withContextHost(self: *ProvisionedTableWriteSource, host: ?*@import("context_host.zig").Host) *ProvisionedTableWriteSource {
+        self.context_host = host;
+        self.syncRuntimeHooksToCaches();
+        return self;
+    }
+
     pub fn withEntitySink(
         self: *ProvisionedTableWriteSource,
         entity_sink: ?db_mod.EntitySink,
@@ -7843,6 +7880,10 @@ pub const ProvisionedTableWriteSource = struct {
         defer cache.unlockOpenMutex();
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
+        if (cache.context_host != self.context_host) {
+            cache.context_host = self.context_host;
+            cache.refreshRuntimeHooksLocked();
+        }
         cache.setRuntimeHooksLocked(
             self.resolution_candidate_source,
             self.entity_sink,
@@ -7863,6 +7904,8 @@ pub const ProvisionedTableWriteSource = struct {
         owner_state.group_id = group_id;
         owner_state.leadership_source = self.promotion_leadership_source;
         db.setPromotionOwner(owner_state.owner());
+        owner_state.context_host = self.context_host;
+        owner_state.installContext(db, table_name);
         // Cold repair owners must report the same durable pending/clear edges
         // as resident writers. DB.close() clears this hook with a callback
         // barrier before table_name leaves the caller's scope.

@@ -18356,6 +18356,122 @@ export interface components {
              */
             limit?: number;
         };
+        EnrichmentContextDocument: {
+            /** @description Table holding the referenced document; omitted means the enrichment's own table. Resolved to an immutable table identity at admission, so renaming or recreating a table cannot retarget the dependency. */
+            table?: string;
+            /** @description JSON pointer into the source document yielding the referenced key. */
+            key_from: string;
+        };
+        EnrichmentContextQuery: {
+            /** @description Table queried; omitted means the enrichment's own table. */
+            table?: string;
+            /** @description An Antfly `filter_query` (Query shape): `bool` (`must`/`filter`/`should`/`must_not`/`minimum_should_match`, filter-context semantics), `conjuncts`, `disjuncts` (`min`), `match_all`, `match_none`, and leaves. Leaves evaluated by context resolution itself: `term`/`terms` (equality; at the top of the conjunction they form indexed subscriptions, at most one bound `terms` set), `range` (`gt`/`gte`/`lt`/`lte`), `numeric_range`/`term_range` (`min`/`max`/`inclusive_*`), `prefix`, `match` and `match_phrase` (pinned `antfly.context.simple.v1` analyzer: lowercase ASCII words; `operator` and|or), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}` over a vector stored in a document field). Every other row-decidable leaf (wildcard, regexp, fuzzy, date and IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches`) is lowered at admission into the storage engine's per-row filter and evaluated per changed row. Values are literals or typed bindings `{"$source":"/json/pointer"}` from the source document (in storage-evaluated leaves, string-valued positions only). Corpus-relative text queries (`query_string`, `multi_match`, analyzer-specific `match`) are rejected for live tracking; use a snapshot `search.request`. */
+            filter_query: Record<string, never>;
+            /** @description Top-N by a field (ties by key); `max_documents` is N. Invalidation tracks the current boundary. */
+            order_by?: {
+                field: string;
+                /**
+                 * @default asc
+                 * @enum {string}
+                 */
+                order?: "asc" | "desc";
+            };
+        };
+        /** @description Bounded breadth-first traversal over the edges of a graph index. By default only explicitly written edges are traversed; `include_generated` also follows field-derived and enrichment-generated edges, whose changes invalidate dependents when their edge artifacts are written or removed. Generated edges must not depend on the consuming enrichment. Members render with depth, edge type, and direction. */
+        EnrichmentContextGraph: {
+            table?: string;
+            graph_index: string;
+            /** @description JSON pointer to the start node key; omitted means the dependent row itself. */
+            start_from?: string;
+            edge_types?: string[];
+            /**
+             * @default out
+             * @enum {string}
+             */
+            direction?: "out" | "in" | "both";
+            /** @default 1 */
+            depth?: number;
+            /**
+             * @description Maximum edges per visited node; exceeding it fails explicitly.
+             * @default 100
+             */
+            max_fanout?: number;
+            /**
+             * @description Also traverse field-derived and enrichment-generated edges.
+             * @default false
+             */
+            include_generated?: boolean;
+        };
+        /** @description Ranked retrieval (requires `tracking: snapshot`): a full `request`, or the shorthands full-text relevance (`text` + `text_field`) or dense k-NN (`vector` binding + `vector_index`). Members render in rank order. */
+        EnrichmentContextSearch: {
+            table?: string;
+            /** @description A full public QueryRequest (`full_text_search`, `semantic_search` with `indexes`, hybrid `merge_config`, `reranker`, `filter_query`, `exclusion_query`, `order_by`, `graph_queries`, ...) with `{"$source":"/pointer"}` bindings anywhere, executed by the table's query engine. `limit` (at most 1000) is the member count. `table`, paging (`offset`, `search_after`, `search_before`), `count`, and `aggregations` are rejected. */
+            request?: Record<string, never>;
+            /** @description Query text literal or `{"$source":"/pointer"}`. */
+            text?: unknown;
+            text_field?: string;
+            /** @description `{"$source":"/pointer"}` to the query vector in the dependent row. */
+            vector?: Record<string, never>;
+            vector_index?: string;
+            /** @default 10 */
+            k?: number;
+        };
+        /** @description One named context source: exactly one of `document` (a referenced row), `query` (the matching set of a parameterized filter, including the empty set), `graph` (bounded traversal over directly written edges), or `search` (ranked retrieval, snapshot only). Live sources are invalidated exactly: every admitted predicate decides a row's membership from that row alone. Ranked retrieval depends on the whole corpus and is only available as an explicitly unverified snapshot. */
+        EnrichmentContextSource: {
+            document?: components["schemas"]["EnrichmentContextDocument"];
+            query?: components["schemas"]["EnrichmentContextQuery"];
+            graph?: components["schemas"]["EnrichmentContextGraph"];
+            search?: components["schemas"]["EnrichmentContextSearch"];
+            /** @description Projected fields consumed by the producer (dotted paths). Only these fields, predicate fields, and the order field participate in fingerprints and invalidation. `_artifacts.<artifact>[.<path>]` reads a row's generated output (asset: parsed JSON or text; chunk: array of chunk payloads; embedding: document vector) and may be used in projections and predicates; when the artifact is regenerated, dependents are invalidated like for a field change. Admission rejects artifacts that depend on the consuming enrichment (directly, through artifact streams, through other context sources, or across tables). Other fields starting with `_` are reserved and rejected. */
+            fields: string[];
+            /**
+             * @description Document sources only: a missing referenced document fails the rebuild explicitly instead of rendering null.
+             * @default false
+             */
+            required?: boolean;
+            /**
+             * Format: uint32
+             * @description Query and graph sources: maximum members. Exceeding it fails explicitly; with `order_by` it is the declared top-N.
+             * @default 100
+             */
+            max_documents?: number;
+            /**
+             * Format: uint32
+             * @description Query sources with residual predicates (range, prefix, match, similar) or `order_by`: maximum candidate rows examined after equality filtering. Exceeding it fails explicitly.
+             * @default 1000
+             */
+            max_candidates?: number;
+            /**
+             * Format: uint64
+             * @description Maximum rendered bytes for this source.
+             * @default 1048576
+             */
+            max_bytes?: number;
+            /**
+             * @default error
+             * @enum {string}
+             */
+            overflow?: "error";
+            /**
+             * @description `live` registers subscriptions and keeps dependents current. `snapshot` registers nothing: dependents publish with freshness `unverified` (never `current`), rebuild on `refresh_interval` or manually, and `require_current` reads refuse them. Required for `search`.
+             * @default live
+             * @enum {string}
+             */
+            tracking?: "live" | "snapshot";
+            /** @description Snapshot sources only: rebuild interval (at least 1s). */
+            refresh_interval?: string;
+        };
+        /** @description Rebuild policy for context-source invalidation. Invalidation (stale freshness) is always reported immediately; debounce only coalesces rebuild work. */
+        EnrichmentRefreshConfig: {
+            /**
+             * @description `background` journals rebuilds automatically; `manual` only marks dependents stale (rebuild with the reprocess endpoints).
+             * @default background
+             * @enum {string}
+             */
+            mode?: "background" | "manual";
+            /** @description Coalescing delay before a background rebuild (for example `2s`). */
+            debounce?: string;
+        };
         /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
         ExecutionPolicy: {
             /** @description Maximum items to process in one batch for this operation. */
@@ -18482,6 +18598,11 @@ export interface components {
             producer_json?: string;
             /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
             neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
+            /** @description Named cross-document context consumed by this asset producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. */
+            context_sources?: {
+                [key: string]: components["schemas"]["EnrichmentContextSource"];
+            };
+            refresh?: components["schemas"]["EnrichmentRefreshConfig"];
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
             /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json. */

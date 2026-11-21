@@ -263,6 +263,12 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_enrichment_scoped_retries;
     _ = @import("antfly_local_sources").storage_db_enrichment_scoped_retry_source;
     _ = @import("antfly_local_sources").storage_db_enrichment_vector_labels;
+    _ = @import("antfly_local_sources").storage_db_context_host_json;
+    _ = @import("antfly_local_sources").storage_db_enrichment_context_dependency_command;
+    _ = @import("antfly_local_sources").storage_db_enrichment_context_dependency_store;
+    _ = @import("antfly_local_sources").storage_db_enrichment_context_notices;
+    _ = @import("antfly_local_sources").storage_db_enrichment_context_resolution;
+    _ = @import("antfly_local_sources").storage_db_enrichment_context_sources;
     _ = @import("antfly_local_sources").storage_db_enrichment_neighbor_context;
     _ = @import("antfly_local_sources").storage_db_enrichment_utf8_text;
     _ = @import("antfly_local_sources").storage_db_generation_lifecycle;

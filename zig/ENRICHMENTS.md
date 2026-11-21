@@ -847,6 +847,329 @@ the group convergence-authority watermark form one mandatory v15 admission-
 safety profile and wait until every current metadata voter supports v15.
 Activity never enters that codec.
 
+## Context Sources And Dependency Tracking
+
+Asset enrichments whose producer consumes prompt text may declare named
+`context_sources` (#1634): one referenced document (`document`) or the bounded
+matching set of a parameterized equality query (`query`, including the empty
+set). Producers receive one documented input contract appended to their
+rendered source: `[context sha256:<fingerprint>]` followed by
+`{"context":{<name>:{"key","value"}|null|{"count","members":[...]}}}`. Members
+are ordered by key and values are canonical projections of the declared
+`fields`, so equivalent inputs fingerprint identically and the block is part of
+the producer skip state.
+
+Code map (`zig/pkg/antfly-embedded/src/storage/db/`):
+
+- `enrichment/context_sources.zig`: grammar, typed `$source` bindings,
+  canonical projection/rendering, fingerprints, subscription tuples, and the
+  row-change to touched-tuple function.
+- `enrichment/context_dependency_store.zig`: durable state and planners.
+- `enrichment/context_resolution.zig`: reads through a host `Reader`,
+  recall-safe prefilter plus exact re-verification, budgets, lineage capture.
+- `enrichment/context_notices.zig`: source-side shadows, outbox notices, and
+  dependent-side indexed invalidation.
+- `context_dependency_db.zig`, `context_source_db_reader.zig`: DB glue.
+- `capi/context_dependencies.zig`: multi-table Lite host and C ABI.
+
+### Which queries can be tracked live
+
+A live `query` source takes Antfly's own `filter_query` shape: `bool`
+(`must`, `filter`, `should`, `must_not`, `minimum_should_match`, with the
+storage engine's filter-context semantics), `conjuncts`, `disjuncts`, and
+leaves, with `$source` bindings in place of literals. Native leaves (`term`,
+`terms`, ranges, `prefix`, `match`, `match_phrase`, `similar`) are evaluated
+by context resolution; the members of the top-level conjunction index
+subscriptions as described below. Every other row-decidable leaf (wildcard,
+regexp, fuzzy, date and IP ranges, geo, bool fields, `exists`, doc ids,
+`equals`/`contains`/`matches`) is lowered once at admission, by the same
+normalization queries use, into the storage engine's per-document filter.
+That filter is stored with the declaration and evaluated for every changed
+row on the dependent side (`PreparedPatternFilter`), and pushed into the
+resolution scan. Everything outside the top-level conjunction is a residual
+tree evaluated per subscriber, so negations and disjunctions stay exact. The
+public form of the declaration is kept verbatim for reads.
+
+Snapshot `search` sources take either the shorthands or a full public
+`QueryRequest` (`search.request`): scored full-text, semantic and hybrid
+search, rerankers, filters, and ordering, with `$source` bindings anywhere.
+The host's query engine runs the bound request; members render in rank order
+and publish `unverified`.
+
+A predicate is admitted for live tracking only when a single row's
+membership can be decided from that row alone, so a changed row's previous
+and next values determine exactly which dependents change:
+
+| Source | Live | Mechanism |
+| --- | --- | --- |
+| `term`, `terms` | yes | equality values form the indexed subscription tuple |
+| `range`, `prefix` | yes | dyadic interval blocks subscribed per dependent, exact residual test at block edges; numeric bounds pushed into the storage scan filter |
+| `match` (filter mode) | yes | token-indexed subscriptions, exact residual test with the pinned `antfly.context.simple.v1` analyzer (part of the source identity) |
+| `similar` (threshold) | yes | cosine: pivot-distance blocks, exact residual test; dot: spec-wide tuple filtered per subscriber. The vector is read from a document field; `model` names the embedding space and is part of the source identity |
+| `order_by` top-N | yes | interval blocks from the recorded boundary; relevant only if the row ranks at or above it (ties by key) |
+| `graph`, depth 1-3 | yes | adjacency tuple per visited node plus document tuple per member; generated and field-derived edges with `include_generated` |
+| `_artifacts.<name>` fields and predicates | yes | logical rows include generated artifacts; generated records stage notices |
+| `bool`/`should`/`must_not`/`disjuncts` | yes | residual tree evaluated per subscriber on the previous and next row |
+| wildcard, regexp, fuzzy, date/IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches` | yes | lowered at admission to the storage per-row filter; evaluated per subscriber and pushed into resolution scans |
+| scored full-text, `query_string`, `multi_match`, nearest-k, hybrid, reranked | snapshot only (`search.request`) | membership is relative to the corpus |
+
+Equality conjuncts build the tuple a dependent subscribes to. Every other
+conjunct is *residual*: the dependent's resolved parameters (range bounds,
+prefix, query tokens, query vector, top-N boundary) are stored as the value of
+its subscription row. Source tables ship the row's previous and next
+projection of the relevant fields with each notice, and the dependent side
+evaluates both against each subscriber, so a change entirely outside one
+dependent's window, below its top-N boundary, or under its similarity
+threshold invalidates nothing.
+
+Range, prefix, and top-N conjuncts are also *indexed*, not only filtered.
+Values map to an order-preserving 64-bit key (IEEE sign-flipped numbers, the
+first eight bytes of strings, booleans), and a dependent subscribes to the
+dyadic blocks covering its interval: at most 16 blocks per equality tuple,
+coarsened outward (never narrower) when the exact cover would be larger. A
+changed row touches only the 65 blocks containing its old and new values, and
+one notice per row change carries every touched block, so a write outside
+every window reaches nobody and a write inside one reaches only dependents
+whose block contains it; the stored residual still decides exactly at the
+block edges. Prefix conjuncts index the prefix's key interval; top-N
+dependents subscribe to `[boundary, max]` (descending) or `[min, boundary]`
+(ascending) once the result is full.
+
+`match` is token-indexed: with `operator: and` every satisfying row contains
+each query token, so a dependent subscribes to one of them (the longest);
+with `or`, to each query token (up to 64, else the spec-wide tuple). A
+changed row touches one tuple per distinct analyzed token of its field.
+
+Cosine `similar` is bucketed by distance to pivots, exactly rather than by
+LSH. For unit vectors `cos(q, x) >= t` means `|x - q| <= r = sqrt(2 - 2t)`,
+so by the triangle inequality every satisfying row lies within `r` of the
+query's distance to any pivot. Pivots are unit vectors stored per spec in the
+dependent table's dependency store, append-only, taken from dependents' own
+queries when no existing pivot is within their radius (at most 8). A
+dependent subscribes to the dyadic cover (fixed-point distance keys) of its
+window around its nearest pivot. The source table ships one carrier tuple per
+equality value with the row's vectors in the notice, and the dependent table
+expands it into the row's distance blocks on every pivot before and after the
+change. A notice that cannot be expanded (unknown previous vector, missing
+declaration) falls back to the spec-wide fan-out. On clustered 256-dimension
+test data this leaves 54%, 100%, and 89% of non-matching rows reaching no
+subscriber at thresholds 0.5, 0.8, and 0.95. `dot` has no norm bound and
+keeps the spec-wide tuple, filtered per subscriber.
+
+Reads push predicates into storage. With a full-text index, string equality
+is served as an index prefilter; otherwise, and for range-only queries, the
+resolver hands the scan a storage-evaluated filter (`terms` for string
+equality, `numeric_range` for numeric bounds) so relational tables prune
+columnar blocks and other tables skip non-matching rows before decoding into
+the resolver. Every candidate is still verified against the exact predicate.
+Residual and ordered queries examine at most `max_candidates` rows after the
+pushed-down filter and fail explicitly beyond it.
+
+Graph traversal discovers its subscriptions while reading. The runtime
+registers the bound tuples, reads, registers what the traversal discovered,
+re-reads, and publishes only if both reads render identically; afterwards
+every change finds a registration and advances the fenced generation.
+Field-derived and generated edges are traversed only with
+`include_generated`; their edge artifacts drive adjacency notices. Admission
+also rejects a context source reading a table that this table's
+resolvers promote into from the enrichment's own output (directly or through
+downstream artifacts).
+
+`tracking: snapshot` sources (required for `search`, optional for any other
+kind) register no subscriptions. Their dependents publish with freshness
+`unverified` and `validated_at_ms`, rebuild on `refresh_interval` through the
+due-ordered refresh queue or manually, and keep full lineage, so audit and
+impact analysis still work.
+
+### Generated data as context input
+
+Context sources can consume what other enrichments produced, as long as they
+are strictly downstream of it:
+
+- `_artifacts.<artifact>[.<path>]` exposes a row's generated output in
+  projections and predicates: an asset renders as parsed JSON (or text), a
+  chunk stream as the array of its chunk payloads, and a document embedding as
+  its vector (so `similar` can run over generated embeddings).
+- Graph sources with `include_generated` also traverse field-derived and
+  enrichment-generated edges.
+
+On the source side the shadow and every notice row are *logical rows*: the
+document fields plus `_artifacts` for the artifacts dependents read. A
+document write reads the current artifacts; a generated record (the runtime's
+publication of new artifact bytes or graph edge artifacts) stages notices for
+the artifacts and edges it changed, using the shadow's fields with the new
+artifact values substituted. A durable marker is written before such a record
+and cleared when its notices are staged; a leftover marker after a crash runs a
+bounded, resumable reconcile that compares every row's logical value with its
+shadow and stages exactly the differences. Field-derived edge artifacts staged
+by ordinary commits are routed the same way. Freshness converges: a dependent
+that read an artifact before it was regenerated is invalidated when the new
+bytes publish.
+
+Admission rejects feedback: an artifact (or a graph index's generated edge
+source) is readable only if it does not depend on the consuming enrichment
+through upstream artifact streams, other enrichments' context sources, or
+promotion into the read table. The embedded Lite host checks the same across
+tables before admitting a declaration.
+
+### Indexed invalidation
+
+A dependent subscribes to the digests of its bound predicate tuples
+(`spec || bound values`); a document source subscribes to the referenced key.
+Every table read by some context source keeps a per-row *shadow* (the
+canonical projection of only the declared predicate and projected fields).
+Inside the primary commit batch, each write or delete compares shadow and new
+row, computes the tuples it leaves, enters, or changes, updates the shadow, and
+stages compact notices in a durable outbox. Unchanged projections and rows
+matching no tuple stage nothing, so unrelated tenants and unconsumed fields
+never reach dependents. Dependents resolve notices with a prefix lookup on
+`(spec, tuple)`; no write scans dependent artifacts. Rows written before a
+declaration existed have no covering shadow and notify spec-wide (safe
+over-invalidation) until the bounded, resumable shadow backfill completes.
+
+### Lost-change protocol and fencing
+
+1. Bind the source row and **register** the subscriptions (unioned with any
+   previous binding) durably, capturing the dependency generation.
+2. Read and render the context.
+3. Publish the artifact, state record, and lineage in **one guarded batch**
+   that re-checks the captured generation under the dependency lock.
+
+Any input change committed after the read is applied after the registration
+and therefore finds it; applying a notice advances the generation, so the
+superseded computation fails its fence (`EnrichmentSourceChanged`) and the
+re-queued rebuild publishes instead. A changed declaration is itself an
+invalidation. Rebinding keeps old tuples until the new publication replaces
+them. Notice application and publication serialize on a per-DB dependency
+lock, which keeps the fence linearizable on stores whose batches are not
+serializable transactions.
+
+### Durable state
+
+Authoritative records are document scoped and move with the row through
+splits, restore, and replication:
+
+- one state record per `(document, artifact)`: generation, freshness
+  (`pending`, `current`, `stale`, `failed`), queued rebuild, input
+  fingerprint, configuration digest, opaque frontier vector (one position per
+  source table identity, never a scalar across tables), registered tuples, and
+  bounded, coalesced invalidation reasons;
+- immutable lineage manifests per published version (consumed input
+  identities and projected-content revisions, query identity and membership
+  fingerprint, absent optional references, producer recipe, frontier), pruned
+  beyond `retain_versions`.
+
+Global subscription, impact, and debounce rows are *verified hints*: they are
+only acted on after the authoritative record confirms them, stale hints are
+collected lazily, and split preparation copies the moved range's hints so a
+destination never misses invalidation. Deleting a dependent row retires its
+live subscriptions and its lineage.
+
+### Delivery and scheduling
+
+The outbox is drained after each commit (and on demand). Own-table notices
+apply locally; foreign ones go to the host dispatcher. An entry is deleted only
+after the dependent applied it, so delivery survives crashes, restarts, and
+unavailable dependents. Rebuilds become ordinary generated-enrichment replay
+refs (the native work journal). `refresh.mode = manual` only reports
+staleness; `refresh.debounce` defers the rebuild through a due-ordered queue
+while staleness is reported immediately. Large fan-out is paged
+(512 dependents per step) with a durable continuation.
+
+Budgets fail explicitly: `max_documents`, `max_bytes`, a bounded prefilter scan,
+and missing `required` documents record a request failure and mark freshness
+`failed` while the last successful artifact stays retained (not current).
+
+### Lineage and impact
+
+Reverse queries read impact hints by `(input table, key[, revision])`,
+confirm each against its retained manifest (so retention racing a lookup can
+only omit a pruned version, never fabricate one), distinguish historical
+versions from the current one, and optionally follow same-document artifact
+chains transitively as live rebuild *candidates*. Results are bounded and
+report `complete=false` whenever a budget stopped them. A dependency
+establishes possible impact, not that regenerated output differs, and it is
+not a decision explanation.
+
+### Capability by runtime
+
+| Runtime | Context sources |
+| --- | --- |
+| Embedded single DB | own-table document, query (all live predicates, top-N), graph, and snapshot sources |
+| Embedded Lite (multi-table) | cross-table sources, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
+| Ordered (Raft) publication | dependency state commits with the artifact through replicated publish intents |
+| Distributed server tables | every source kind (document, query with all live predicates and top-N, graph, `_artifacts` fields, snapshot search), own table and across tables; declared through the enrichment endpoint |
+
+### Distributed tables
+
+A distributed table is many Raft groups, each a replicated embedded DB, so
+context dependencies follow two rules: every replica holds byte-identical
+dependency state, and only a group's leader plans changes to it.
+
+- Table identities are `srv:<table_id>`, the immutable metadata incarnation;
+  the enrichment endpoint resolves names, lowers storage-evaluated filters,
+  and rejects generated-input cycles across tables against the catalog.
+- The leader plans each dependency-store change against a recording reader
+  and proposes a private `context_dependency` command (data Raft batch
+  protocol 31) with the exact effects and a digest of everything it read.
+  Every replica validates the read set at the same log position and applies
+  the effects verbatim, or applies nothing (the leader re-plans). Replicas
+  never plan, so planning needs no determinism.
+- Source rows stage notices in the commit itself, on every replica, from a
+  replicated topology (the table's identity and its inbound dependents).
+  The leader fetches the topology from the host and proposes it when it
+  changes; a newly inbound dependent receives one spec-wide notice in the
+  same commit, so a dependent that read the table before its declaration was
+  live is rebuilt.
+- Only the leader delivers outbox notices, to every group of the dependent
+  table (own table included), as idempotent inbox appends keyed by notice
+  digest; it acknowledges by content so every replica deletes the same
+  entries whatever their local keys. The leader applies its inbox through a
+  plan that consumes the entries it applied.
+- Enrichments publish through ordered artifact publication; the dependency
+  publication (freshness, subscriptions, lineage) is recorded as a
+  replicated intent for the exact output digest and promoted inside the
+  publication's commit on every replica.
+- Automatic post-commit drains are disabled on replicated owners (they would
+  run on the apply path); the data server runs one bounded, leader-only
+  maintenance job per control round instead.
+- Resolution reads every table, the own one included, through the routed
+  read path: point lookups; key-cursor scans with the storage filter
+  evaluated by every group and documents hydrated in exact-ID batches of 64
+  (a continuation resumes after the previous page's last key, never
+  re-scanning); graph adjacency and generated-artifact values from the
+  group owning the key (a group-local `context_read`); and ranked retrieval
+  as a `QueryRequest` (the `text` and `vector` shorthands become a
+  `full_text_search` match and a precomputed `embeddings` entry).
+- Leader maintenance plans inside the owner call but never proposes there:
+  the owner returns its plans and pending deliveries, and the data server
+  proposes them, delivers, and acknowledges by content outside any owner
+  call (plans that went stale meanwhile are no-ops and are re-planned).
+- Splits carry the replicated topology, the shadow-completion marker,
+  generated-record crash intents, the delivered-notice inbox (each group
+  applies a notice to the dependents in its own range), and publish
+  intents for the moved documents; the source keeps and delivers its own
+  outbox.
+
+### Remaining work
+
+- Distributed tables: context sources are declared through the enrichment
+  endpoint, not inline at table creation (resolution needs the table's
+  catalog identity).
+- HTTP surface: artifact `freshness`, the per-artifact dependency manifest,
+  `POST /dependencies/impact`, and `freshness=require_current&wait_timeout=`
+  reads (the storage and C ABI primitives exist).
+- Execution identity: context reads currently use the host's internal read
+  path; row/field authorization filters and revocation semantics for retained
+  artifacts still need a policy hook.
+- Downstream propagation across tables (an artifact consumed by another
+  table's context) and graph selectors (#1635).
+- Fan-out benchmarks (invalidation latency, rebuild latency, producer calls,
+  subscription storage, bulk-update work).
+- `similar` with `metric: dot` still fans out to every dependent of the
+  declaration (no norm bound to bucket by); declare `cosine` where the
+  embedding space allows it.
+
 ## Full-Text Routing From Enrichments
 
 Generated lexical content is configured at the enrichment level. Full-text

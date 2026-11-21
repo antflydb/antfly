@@ -445,13 +445,29 @@ from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
+from .enrichment_config_context_sources import EnrichmentConfigContextSources
 from .enrichment_config_embedding_input import EnrichmentConfigEmbeddingInput
+from .enrichment_context_document import EnrichmentContextDocument
+from .enrichment_context_graph import EnrichmentContextGraph
+from .enrichment_context_graph_direction import EnrichmentContextGraphDirection
+from .enrichment_context_query import EnrichmentContextQuery
+from .enrichment_context_query_filter_query import EnrichmentContextQueryFilterQuery
+from .enrichment_context_query_order_by import EnrichmentContextQueryOrderBy
+from .enrichment_context_query_order_by_order import EnrichmentContextQueryOrderByOrder
+from .enrichment_context_search import EnrichmentContextSearch
+from .enrichment_context_search_request import EnrichmentContextSearchRequest
+from .enrichment_context_search_vector import EnrichmentContextSearchVector
+from .enrichment_context_source import EnrichmentContextSource
+from .enrichment_context_source_overflow import EnrichmentContextSourceOverflow
+from .enrichment_context_source_tracking import EnrichmentContextSourceTracking
 from .enrichment_kind import EnrichmentKind
 from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
 from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
 from .enrichment_producer_config import EnrichmentProducerConfig
 from .enrichment_producer_config_config_type_2 import EnrichmentProducerConfigConfigType2
 from .enrichment_producer_config_type import EnrichmentProducerConfigType
+from .enrichment_refresh_config import EnrichmentRefreshConfig
+from .enrichment_refresh_config_mode import EnrichmentRefreshConfigMode
 from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
 from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
@@ -3149,13 +3165,29 @@ __all__ = (
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
+    "EnrichmentConfigContextSources",
     "EnrichmentConfigEmbeddingInput",
+    "EnrichmentContextDocument",
+    "EnrichmentContextGraph",
+    "EnrichmentContextGraphDirection",
+    "EnrichmentContextQuery",
+    "EnrichmentContextQueryFilterQuery",
+    "EnrichmentContextQueryOrderBy",
+    "EnrichmentContextQueryOrderByOrder",
+    "EnrichmentContextSearch",
+    "EnrichmentContextSearchRequest",
+    "EnrichmentContextSearchVector",
+    "EnrichmentContextSource",
+    "EnrichmentContextSourceOverflow",
+    "EnrichmentContextSourceTracking",
     "EnrichmentKind",
     "EnrichmentNeighborContextConfig",
     "EnrichmentNeighborContextConfigDirection",
     "EnrichmentProducerConfig",
     "EnrichmentProducerConfigConfigType2",
     "EnrichmentProducerConfigType",
+    "EnrichmentRefreshConfig",
+    "EnrichmentRefreshConfigMode",
     "EnrichmentRuntimeStatus",
     "EnrichmentRuntimeStatusActivePhase",
     "EnrichmentRuntimeStatusStallReason",

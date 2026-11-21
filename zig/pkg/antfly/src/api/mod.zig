@@ -69,6 +69,7 @@ pub const table_writes = @import("antfly_source_root").antfly_sources.table_writ
 pub const kernel_owner_source = @import("kernel_owner_source.zig");
 pub const storage_maintenance_source = @import("storage_maintenance_source.zig");
 pub const distributed_candidate_source = @import("distributed_candidate_source.zig");
+pub const context_host = @import("context_host.zig");
 pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
 pub const join_planning = @import("join_planning.zig");
 pub const distributed_join = @import("distributed_join.zig");
@@ -292,6 +293,7 @@ test "api module compiles" {
     _ = table_reads;
     _ = table_writes;
     _ = distributed_candidate_source;
+    _ = context_host;
     _ = distributed_entity_sink;
     _ = distributed_join;
     _ = distributed_graph;

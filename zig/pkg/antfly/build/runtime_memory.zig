@@ -170,9 +170,11 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         profile.optimize == .fast and profile.strip and profile.cpu_inference and !profile.sanitize_thread)
     {
         // Better Auth run 40820082669: Nix/glibc LLVM API peaked at
-        // 6,698,409,984 bytes against the old 5 GiB claim, forcing a retry.
-        // 8 GiB retains >=25% headroom and overlaps storage within 20 GiB.
-        return 8 * 1024 * 1024 * 1024;
+        // 6,698,409,984 bytes against the old 5 GiB claim. Cold builds of
+        // origin/main 1e032ed8 now peak at 11,522,453,504 bytes, and with
+        // context sources at up to 12,886,036,480 bytes. Peak + 10%, rounded
+        // up to whole GiB.
+        return 14 * 1024 * 1024 * 1024;
     }
     if (profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
         target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
@@ -200,13 +202,20 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
             .cli => 3,
         } else switch (unit) {
             .api_kernel => 5,
-            .distributed => 5,
+            // Zig 0.17.0 cold build peaked at 6,841,577,472 bytes (6.37 GiB),
+            // over the old 5 GiB claim; 8 GiB keeps >=25% headroom.
+            .distributed => 8,
             .local_query => unreachable,
-            .storage_kernel => 8,
+            // Zig 0.17.0 cold build with context sources peaked at
+            // 8,626,855,936 bytes, over the old 8 GiB claim. Peak + 10%.
+            .storage_kernel => 10,
             .enrichment_compute => 2,
-            .serverless => 4,
+            // Same build: serverless peaked at 4,377,563,136 bytes. Peak + 10%.
+            .serverless => 5,
             .inference => 8,
-            .cli => 2,
+            // Zig 0.17.0 cold build of origin/main 1e032ed8 peaked at
+            // 2,149,195,776 bytes, just over the old 2 GiB claim.
+            .cli => 3,
         };
         return gib * 1024 * 1024 * 1024;
     }
@@ -248,13 +257,15 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // v0.2.1-rc0 release build, while the integrated HA API kernel
         // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
         // build. The v0.3 RC ARM64 GNU API peaked at 10,983,571,456 bytes;
-        // reserve 12 GiB on Linux, retaining about 17% headroom. October's
+        // reserve 12 GiB on Linux, retaining about 17% headroom. Native x86
+        // API builds now reach 12,886,036,480 bytes; unmeasured Linux
+        // profiles reserve 15 GiB so they stay above that peak. October's
         // native lake codegen reached 27,085,701,120 bytes on macOS with
         // logical input commitments. Reserve 28 GiB, over 10% above that
         // measured peak, while fitting a 36 GiB host's 28.8 GiB compiler
         // budget. Further headroom requires partitioning the API owner;
         // overlapping this unit with another large compile is unsafe.
-        .api_kernel => @as(usize, if (target.os.tag == .macos) 28 else 12) * 1024 * 1024 * 1024,
+        .api_kernel => @as(usize, if (target.os.tag == .macos) 28 else 15) * 1024 * 1024 * 1024,
         // September's macOS 20 GiB claim is below the reported 22–23 GB
         // compiler peak. 28 GiB includes >=25% headroom at 23 decimal GB.
         // Keep the measured Linux profiles separate. The other macOS bumps
@@ -642,13 +653,13 @@ test "native Linux LLVM Debug claims cover measured peaks and account for overla
     try std.testing.expect(api <= api_peak + api_peak / 10 + 128 * 1024 * 1024);
     var fallback = profile;
     fallback.host = macos;
-    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    try std.testing.expectEqual(15 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
     fallback = profile;
     fallback.target = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
-    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    try std.testing.expectEqual(15 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
     fallback = profile;
     fallback.strip = true;
-    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    try std.testing.expectEqual(15 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
     // Without CPU inference this is the production-archive build, which
     // claims its own measured peak instead of the fallback.
     fallback = profile;
@@ -659,10 +670,10 @@ test "native Linux LLVM Debug claims cover measured peaks and account for overla
     try std.testing.expect(archive <= archive_peak + archive_peak / 10 + 128 * 1024 * 1024);
     fallback = profile;
     fallback.sanitize_thread = true;
-    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    try std.testing.expectEqual(15 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
     fallback = profile;
     fallback.target.cpu.features.addFeature(@backingInt(std.Target.x86.Feature.avx2));
-    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    try std.testing.expectEqual(15 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
 }
 
 test "native aarch64 Linux Debug API claim covers the measured CUDA build peak" {
@@ -676,7 +687,7 @@ test "native aarch64 Linux Debug API claim covers the measured CUDA build peak" 
     try std.testing.expect(claim >= peak + peak / 5);
     var cross = profile;
     cross.host = macos;
-    try std.testing.expectEqual(@as(usize, 12 * 1024 * 1024 * 1024), runtimeCompileMaxRss(.api_kernel, cross));
+    try std.testing.expectEqual(@as(usize, 15 * 1024 * 1024 * 1024), runtimeCompileMaxRss(.api_kernel, cross));
 }
 
 test "linked LLVM Debug test reservations cover native peaks without lowering authored claims" {
@@ -772,13 +783,13 @@ test "Linux release API reservations cover ARM64 GNU and musl peaks within the r
         try std.testing.expect(claim + runtimeCompileMaxRss(.enrichment_compute, profile) <= 20 * gib);
         var unmeasured = profile;
         unmeasured.optimize = .debug;
-        try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
+        try std.testing.expectEqual(15 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
         unmeasured = profile;
         unmeasured.strip = false;
-        try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
+        try std.testing.expectEqual(15 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
         unmeasured = profile;
         unmeasured.sanitize_thread = true;
-        try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
+        try std.testing.expectEqual(15 * gib, runtimeCompileMaxRss(.api_kernel, unmeasured));
         try std.testing.expectEqual(20 * gib, runtimeCompileMaxRss(.storage_kernel, profile));
     }
 }
@@ -885,11 +896,17 @@ test "native Linux LLVM fast API covers measured peak and preserves overlap" {
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
     const gib = 1024 * 1024 * 1024;
     var profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .fast, .strip = true, .cpu_inference = true };
-    const peak: usize = 6_698_409_984;
+    const peak: usize = 12_886_036_480;
     const claim = runtimeCompileMaxRss(.api_kernel, profile);
-    try std.testing.expectEqual(8 * gib, claim);
-    try std.testing.expect(claim >= peak + peak / 4);
-    try std.testing.expect(claim + runtimeCompileMaxRss(.storage_kernel, profile) + 2 * gib <= 20 * gib);
+    try std.testing.expectEqual(14 * gib, claim);
+    try std.testing.expect(claim >= peak + peak / 10);
+    // The measured API no longer overlaps storage in a 20 GiB lane; the
+    // scheduler serializes them rather than understating either claim.
+    try std.testing.expect(claim + runtimeCompileMaxRss(.storage_kernel, profile) > 20 * gib);
+    try std.testing.expect(claim + runtimeCompileMaxRss(.cli, profile) <= 20 * gib);
+    try std.testing.expect(runtimeCompileMaxRss(.cli, profile) >= 2_149_195_776 + 2_149_195_776 / 10);
+    const distributed_peak: usize = 6_841_577_472;
+    try std.testing.expect(runtimeCompileMaxRss(.distributed, profile) >= distributed_peak + distributed_peak / 4);
     profile.optimize = .safe;
     try std.testing.expectEqual(7 * gib, runtimeCompileMaxRss(.api_kernel, profile));
     profile.optimize = .fast;
@@ -925,7 +942,7 @@ test "native Linux ARM64 CPU Debug API claim covers its measured peak" {
         // reservation; this CPU qualification must not lower that floor.
         const expected_gib: usize = switch (i) {
             0, 1, 2, 6 => 18,
-            else => 12,
+            else => 15,
         };
         try std.testing.expectEqual(expected_gib * gib, runtimeCompileMaxRss(.api_kernel, fallback));
     }

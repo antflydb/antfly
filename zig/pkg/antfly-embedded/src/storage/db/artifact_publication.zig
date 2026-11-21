@@ -376,9 +376,16 @@ pub const Command = struct {
     /// codecs and catalog consumer authorization are checked by the owner too.
     pub fn validate(self: Command, alloc: std.mem.Allocator) !void {
         if (self.execution_identity != null) {
-            if (self.mode != .publish or self.producer_kind != .index or
+            // Index vectors bind the deployed model revision; enrichment
+            // assets built from context sources bind the rendered context.
+            const family: @FieldType(Mutation, "family") = switch (self.producer_kind) {
+                .index => if (self.producer_scope_key.len == 0) .base_vector else .derived_vector,
+                .enrichment => .document_artifact,
+                else => return error.InvalidBatchRequest,
+            };
+            if (self.mode != .publish or (self.producer_kind == .enrichment and self.producer_scope_key.len != 0) or
                 (self.producer_scope_key.len == 0 and self.sources.len != 1) or self.mutation_preconditions.len != 1 or self.mutations.len != 1 or
-                self.mutations[0].family != (if (self.producer_scope_key.len == 0) @as(@FieldType(Mutation, "family"), .base_vector) else @as(@FieldType(Mutation, "family"), .derived_vector)) or !std.mem.eql(u8, self.mutations[0].key, self.mutation_preconditions[0].key)) return error.InvalidBatchRequest;
+                self.mutations[0].family != family or !std.mem.eql(u8, self.mutations[0].key, self.mutation_preconditions[0].key)) return error.InvalidBatchRequest;
         }
         if (self.authority_epoch == 0 or std.mem.allEqual(u8, &self.namespace, 0) or
             std.mem.allEqual(u8, &self.catalog_digest, 0)) return error.InvalidBatchRequest;

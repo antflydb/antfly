@@ -535,6 +535,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const capi_default_filters = [_][]const u8{
         "lite write amplification",
         "capi lite standalone snapshots",
+        "capi Lite cross-table context sources",
         "issue1015",
         "capi SQL",
         "capi path gate",

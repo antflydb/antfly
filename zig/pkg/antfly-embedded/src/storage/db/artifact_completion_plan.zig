@@ -224,7 +224,7 @@ fn compileWithChildren(alloc: std.mem.Allocator, catalog: publication.Digest, te
         if (root_chunk_scopes.getPtr(request.artifact_name)) |existing| {
             existing.* = .ambiguous;
         } else {
-            try root_chunk_scopes.put(a, try a.dupe(u8, request.artifact_name), if (try generatedChunkScope(alloc, templates, enrichment_configs, request.upstream_artifact_name) == .document and request.neighbor_context_json.len == 0) .closed else .open);
+            try root_chunk_scopes.put(a, try a.dupe(u8, request.artifact_name), if (try generatedChunkScope(alloc, templates, enrichment_configs, request.upstream_artifact_name) == .document and (request.neighbor_context_json.len == 0 and request.context_sources_json.len == 0)) .closed else .open);
         }
     }
     var enrichment_kinds: std.StringHashMapUnmanaged(enrichments.EnrichmentType) = .empty;

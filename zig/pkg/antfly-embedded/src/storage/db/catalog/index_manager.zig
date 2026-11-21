@@ -58,6 +58,7 @@ const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
 const graph_edge_contender = @import("../graph_edge_contender.zig");
 const enrichment_config_validation = @import("../enrichment/config_validation.zig");
+const enrichment_context_sources = @import("../enrichment/context_sources.zig");
 const enrichment_neighbor_context = @import("../enrichment/neighbor_context.zig");
 const asset_producer_mod = @import("../enrichment/asset_producer.zig");
 const backfill_state_mod = @import("../backfill_state.zig");
@@ -355,6 +356,10 @@ pub const ReplacementSwapBoundary = enum { before_commit, after_commit };
 pub var test_replacement_swap_boundary: ?*const fn (ReplacementSwapBoundary) void = null;
 pub var test_text_backfill_batch_size: ?usize = null;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
+/// Named (not anonymous) so `IndexManager`'s ABI layout id matches between
+/// the separately compiled storage owner and its clients.
+pub const ContextDrainHook = struct { ptr: *anyopaque, drain_fn: *const fn (*anyopaque) void };
+
 pub var test_text_backfill_invocations: usize = 0;
 pub var test_graph_contributor_migrations: std.atomic.Value(usize) = .init(0);
 pub var test_inject_index_open_error: ?anyerror = null;
@@ -1647,6 +1652,29 @@ pub const IndexManager = struct {
     graph_retirement_closed: std.atomic.Value(bool) = .init(false),
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
     enrichments: std.ArrayListUnmanaged(enrichment_catalog.EnrichmentConfig),
+    /// Host-supplied context-dependency topology (in memory; hosts re-supply
+    /// it on open). `context_table_id` names this table; `context_inbound`
+    /// lists foreign enrichments whose context sources read this table.
+    context_host_arena: ?*std.heap.ArenaAllocator = null,
+    /// Serializes read-modify-write of context dependency state between the
+    /// enrichment runtime (register/publish) and notice application, so the
+    /// dependency-generation fence is linearizable even on stores whose
+    /// batches are not serializable transactions.
+    context_dependency_mutex: std.atomic.Mutex = .unlocked,
+    /// Delivers staged context notices after generated records commit
+    /// (installed by the owning DB; outside every apply lock when invoked).
+    context_drain: ?ContextDrainHook = null,
+    /// Replicated (Raft) owners: dependency-store mutations become leader
+    /// proposals validated by every replica (installed by the host).
+    context_replication: ?@import("../context_dependency_db.zig").Replication = null,
+    /// Serializes the owner leader's proposals. Never taken on the apply
+    /// path, so a proposer waiting for its entry cannot block apply.
+    context_proposal_mutex: std.atomic.Mutex = .unlocked,
+    /// Plans and commits context-dependency changes for components without
+    /// the primary store (the enrichment runtime), installed by the DB.
+    context_committer: ?@import("../context_dependency_db.zig").Committer = null,
+    context_table_id: []const u8 = "",
+    context_inbound: []const @import("../enrichment/context_notices.zig").DeclaredConfig = &.{},
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     retired_resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     cached_has_generated_enrichment_targets: std.atomic.Value(bool),
@@ -7673,6 +7701,11 @@ pub const IndexManager = struct {
 
     fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
         self.waitForGraphMetricSchedulePins();
+        if (self.context_host_arena) |arena| {
+            arena.deinit();
+            self.alloc.destroy(arena);
+            self.context_host_arena = null;
+        }
         self.leann_reembed_cache.deinit(self.alloc);
         if (self.write_plan_cache) |cached| {
             self.write_plan_cache = null;
@@ -16342,6 +16375,181 @@ pub const IndexManager = struct {
         }
     };
 
+    /// Replace the host context-dependency topology. Callers hold the apply
+    /// lock so commits observe one consistent topology.
+    pub fn setContextDependencyHost(self: *IndexManager, table_id: []const u8, inbound: []const @import("../enrichment/context_notices.zig").DeclaredConfig) !void {
+        const arena = try self.alloc.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(self.alloc);
+        errdefer {
+            arena.deinit();
+            self.alloc.destroy(arena);
+        }
+        const a = arena.allocator();
+        const copy = try a.alloc(@import("../enrichment/context_notices.zig").DeclaredConfig, inbound.len);
+        for (inbound, copy) |d, *c| c.* = .{
+            .dependent_table_id = try a.dupe(u8, d.dependent_table_id),
+            .artifact = try a.dupe(u8, d.artifact),
+            .stored_json = try a.dupe(u8, d.stored_json),
+        };
+        const owned_table_id = try a.dupe(u8, table_id);
+        if (self.context_host_arena) |old| {
+            old.deinit();
+            self.alloc.destroy(old);
+        }
+        self.context_host_arena = arena;
+        self.context_table_id = owned_table_id;
+        self.context_inbound = copy;
+    }
+
+    pub fn lockContextDependencies(self: *IndexManager) void {
+        self.lockAtomicWithBackoff(&self.context_dependency_mutex);
+    }
+
+    pub fn unlockContextDependencies(self: *IndexManager) void {
+        self.context_dependency_mutex.unlock();
+    }
+
+    pub fn lockContextProposals(self: *IndexManager) void {
+        self.lockAtomicWithBackoff(&self.context_proposal_mutex);
+    }
+
+    pub fn unlockContextProposals(self: *IndexManager) void {
+        self.context_proposal_mutex.unlock();
+    }
+
+    /// Whether context-dependency state is replicated and this replica may
+    /// not mutate it (a follower).
+    pub fn contextFollower(self: *const IndexManager) bool {
+        const replication = self.context_replication orelse return false;
+        return !replication.isOwner();
+    }
+
+    /// Whether writes to this table can affect any context dependency (own
+    /// enrichments or registered foreign dependents). Cheap: no allocation.
+    pub fn hasContextDependents(self: *const IndexManager) bool {
+        return self.context_inbound.len != 0 or self.hasAssetContextSources();
+    }
+
+    /// Own and inbound declarations, for building source-side specs.
+    pub fn contextDeclarationsAlloc(self: *const IndexManager, alloc: Allocator) ![]@import("../enrichment/context_notices.zig").DeclaredConfig {
+        var out = std.ArrayListUnmanaged(@import("../enrichment/context_notices.zig").DeclaredConfig).empty;
+        errdefer out.deinit(alloc);
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset or entry.context_sources_json.len == 0) continue;
+            try out.append(alloc, .{ .dependent_table_id = "", .artifact = entry.name, .stored_json = entry.context_sources_json });
+        }
+        try out.appendSlice(alloc, self.context_inbound);
+        return try out.toOwnedSlice(alloc);
+    }
+
+    /// Reject a context source that reads a table this table's resolvers
+    /// promote into from this enrichment's own output (directly or through
+    /// downstream artifacts): its rebuild would rewrite its own input.
+    fn rejectContextSourceFeedback(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
+        var parsed = enrichment_context_sources.parseStoredJson(self.alloc, cfg.context_sources_json) catch return error.InvalidEnrichmentConfig;
+        defer parsed.deinit();
+        for (parsed.sources) |source| {
+            // Promotion: resolvers writing the read table from this output.
+            if (source.table.len != 0) for (self.resolvers.items) |resolver| {
+                if (!std.mem.eql(u8, resolver.table, source.table)) continue;
+                if (self.contextDependsOn(resolver.source_artifact, cfg)) return error.ContextSourceFeedbackCycle;
+            };
+            // Generated inputs on this table must be strictly upstream.
+            if (!source.targetsOwnTable()) continue;
+            for (source.artifact_names) |artifact| {
+                if (self.contextDependsOn(artifact, cfg)) return error.ContextSourceFeedbackCycle;
+            }
+            if (source.kind == .graph and source.graph.include_generated) {
+                for (self.graph_indexes.items) |entry| {
+                    if (!std.mem.eql(u8, entry.config.name, source.graph.graph_index)) continue;
+                    for (entry.artifact_sources) |artifact_source| {
+                        if (self.contextDependsOn(artifact_source.artifact_name, cfg)) return error.ContextSourceFeedbackCycle;
+                    }
+                }
+            }
+        }
+        // Admitting `cfg` must not close a cycle for an existing consumer.
+        for (self.enrichments.items) |entry| {
+            if (entry.context_sources_json.len == 0 or std.mem.eql(u8, entry.name, cfg.name)) continue;
+            var other = enrichment_context_sources.parseStoredJson(self.alloc, entry.context_sources_json) catch continue;
+            defer other.deinit();
+            for (other.sources) |source| {
+                if (!source.targetsOwnTable()) continue;
+                for (source.artifact_names) |artifact| {
+                    if (std.mem.eql(u8, artifact, cfg.name) and self.contextDependsOnWith(cfg.name, entry.name, cfg)) return error.ContextSourceFeedbackCycle;
+                }
+            }
+        }
+    }
+
+    /// Whether producing `artifact` (transitively) requires `root`'s output:
+    /// through upstream artifact streams and through other enrichments'
+    /// context sources that read generated artifacts on this table.
+    fn contextDependsOn(self: *const IndexManager, artifact: []const u8, root: enrichment_catalog.EnrichmentConfig) bool {
+        return self.contextDependsOnWith(artifact, root.name, root);
+    }
+
+    fn contextDependsOnWith(self: *const IndexManager, artifact: []const u8, target: []const u8, candidate: enrichment_catalog.EnrichmentConfig) bool {
+        var stack: [64][]const u8 = undefined;
+        var depth: usize = 1;
+        stack[0] = artifact;
+        var visited: usize = 0;
+        while (depth > 0) {
+            depth -= 1;
+            const current = stack[depth];
+            if (std.mem.eql(u8, current, target)) return true;
+            visited += 1;
+            if (visited > 4 * (self.enrichments.items.len + 1)) return true;
+            const entry: ?enrichment_catalog.EnrichmentConfig = if (std.mem.eql(u8, current, candidate.name)) candidate else blk: {
+                for (self.enrichments.items) |e| if (std.mem.eql(u8, e.name, current)) break :blk e;
+                break :blk null;
+            };
+            const node = entry orelse continue;
+            if (node.source_artifact_name.len != 0 and depth < stack.len) {
+                stack[depth] = node.source_artifact_name;
+                depth += 1;
+            }
+            if (node.context_sources_json.len == 0) continue;
+            var parsed = enrichment_context_sources.parseStoredJson(self.alloc, node.context_sources_json) catch continue;
+            defer parsed.deinit();
+            for (parsed.sources) |source| {
+                if (!source.targetsOwnTable()) continue;
+                for (source.artifact_names) |name| {
+                    if (std.mem.eql(u8, name, target)) return true;
+                    for (self.enrichments.items) |e| if (std.mem.eql(u8, e.name, name) and depth < stack.len) {
+                        stack[depth] = e.name;
+                        depth += 1;
+                    };
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Cheap gate for generated-record staging: does any declaration (own or
+    /// inbound) read generated artifacts or generated graph edges?
+    pub fn contextReadsGenerated(self: *const IndexManager) bool {
+        for (self.enrichments.items) |entry| {
+            if (std.mem.indexOf(u8, entry.context_sources_json, "_artifacts.") != null or
+                std.mem.indexOf(u8, entry.context_sources_json, "\"include_generated\":true") != null) return true;
+        }
+        for (self.context_inbound) |d| {
+            if (std.mem.indexOf(u8, d.stored_json, "_artifacts.") != null or
+                std.mem.indexOf(u8, d.stored_json, "\"include_generated\":true") != null) return true;
+        }
+        return false;
+    }
+
+    /// Whether any admitted asset enrichment declares context sources. The
+    /// commit path consults this before computing dependency notices so tables
+    /// without dependents pay nothing.
+    pub fn hasAssetContextSources(self: *const IndexManager) bool {
+        for (self.enrichments.items) |entry| {
+            if (entry.kind == .asset and entry.context_sources_json.len != 0) return true;
+        }
+        return false;
+    }
+
     pub fn hasAssetNeighborContext(self: *const IndexManager) bool {
         for (self.enrichments.items) |entry| {
             if (entry.kind == .asset and entry.neighbor_context_json.len != 0) return true;
@@ -16808,6 +17016,7 @@ pub const IndexManager = struct {
                     .group_source_json = entry.group_source_json,
                     .prior_context_json = entry.prior_context_json,
                     .neighbor_context_json = if (entry.neighbor_context_json.len > 0) entry.neighbor_context_json else "",
+                    .context_sources_json = entry.context_sources_json,
                     .execution_json = if (entry.execution_json.len > 0) entry.execution_json else "",
                 });
             }
@@ -26384,6 +26593,7 @@ pub const IndexManager = struct {
                 !std.mem.eql(u8, existing.group_source_json, cfg.group_source_json) or
                 !std.mem.eql(u8, existing.prior_context_json, cfg.prior_context_json) or
                 !std.mem.eql(u8, existing.neighbor_context_json, cfg.neighbor_context_json) or
+                !std.mem.eql(u8, existing.context_sources_json, cfg.context_sources_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -26425,6 +26635,10 @@ pub const IndexManager = struct {
                 if (cfg.neighbor_context_json.len > 0) {
                     var context = try enrichment_neighbor_context.parseConfigJson(self.alloc, cfg.neighbor_context_json);
                     context.deinit(self.alloc);
+                }
+                if (cfg.context_sources_json.len > 0) {
+                    try validateContextSourcesConfig(self.alloc, cfg);
+                    try self.rejectContextSourceFeedback(cfg);
                 }
                 if (cfg.source_artifact_name.len > 0) {
                     // Asset-consumes-asset: the upstream chain must resolve
@@ -36617,7 +36831,7 @@ pub fn onlineDirectVectorConfig(alloc: Allocator, cfg: types.IndexConfig) !bool 
 /// and protocol-15 transfer readiness are separate admission requirements.
 pub fn onlineBaseEmbeddingProducer(cfg: enrichment_catalog.EnrichmentConfig) bool {
     return cfg.kind == .embedding and cfg.embedding_input == .text and
-        cfg.source_artifact_name.len == 0 and cfg.neighbor_context_json.len == 0 and
+        cfg.source_artifact_name.len == 0 and (cfg.neighbor_context_json.len == 0 and cfg.context_sources_json.len == 0) and
         cfg.chunk_size == 0 and cfg.chunk_overlap == 0 and cfg.chunker_json.len == 0 and
         (cfg.source_field.len != 0 or cfg.source_template.len != 0);
 }
@@ -36713,7 +36927,7 @@ pub fn consumesGeneratedChunkVector(alloc: Allocator, cfg: types.IndexConfig, pr
     const producer = for (producers) |entry| {
         if (entry.kind == .embedding and std.mem.eql(u8, entry.name, embedding_name)) break entry;
     } else return false;
-    if (producer.embedding_input != .text or producer.expected_dims != dims or producer.neighbor_context_json.len != 0 or
+    if (producer.embedding_input != .text or producer.expected_dims != dims or (producer.neighbor_context_json.len != 0 or producer.context_sources_json.len != 0) or
         !std.mem.eql(u8, producer.source_artifact_name, chunk_name)) return false;
     return for (producers) |entry| {
         if (entry.kind == .chunk and std.mem.eql(u8, entry.name, chunk_name)) break true;
@@ -37010,6 +37224,26 @@ fn publicEnrichmentKindToInternal(kind: types.EnrichmentKind) enrichment_catalog
     };
 }
 
+/// Context sources feed rendered prompt text, so only asset producers that
+/// consume prompt text may declare them (as with neighbor context). Unsupported
+/// predicates, budgets, and reserved fields were rejected by the grammar.
+fn validateContextSourcesConfig(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig) !void {
+    if (cfg.kind != .asset) return error.InvalidEnrichmentConfig;
+    var parsed = enrichment_context_sources.parseStoredJson(alloc, cfg.context_sources_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEnrichmentConfig,
+    };
+    defer parsed.deinit();
+    var producer = try @import("../enrichment/asset_producer.zig").parseProducerConfig(alloc, cfg.producer_json);
+    defer producer.deinit(alloc);
+    if (!enrichment_config_validation.producerConsumesPromptText(producer.type)) return error.InvalidEnrichmentConfig;
+    for (parsed.sources) |source| {
+        // A named foreign table must have been resolved to an immutable
+        // identity by the host before reaching the catalog.
+        if (source.table.len != 0 and source.table_id.len == 0) return error.UnresolvedContextSourceTable;
+    }
+}
+
 fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichment_catalog.EnrichmentConfig {
     const execution_json = if (cfg.execution) |execution| blk: {
         const json = try std.json.Stringify.valueAlloc(alloc, execution, .{});
@@ -37026,6 +37260,14 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         break :blk json;
     } else "";
     errdefer if (neighbor_context_json.len > 0) alloc.free(neighbor_context_json);
+    const context_sources_json = if (cfg.context_sources_json.len > 0) blk: {
+        // Re-canonicalize: the stored form is the only accepted shape here,
+        // public objects are converted (and table names resolved) at the edge.
+        var parsed = try enrichment_context_sources.parseStoredJson(alloc, cfg.context_sources_json);
+        defer parsed.deinit();
+        break :blk try parsed.canonicalJsonAlloc(alloc);
+    } else "";
+    errdefer if (context_sources_json.len > 0) alloc.free(context_sources_json);
     const group_source_json = if (cfg.source) |source| try canonicalEnrichmentPart(alloc, source) else "";
     errdefer if (group_source_json.len > 0) alloc.free(group_source_json);
     const prior_context_json = if (cfg.prior_context) |context| try canonicalEnrichmentPart(alloc, context) else "";
@@ -37048,6 +37290,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .content_type = if (cfg.kind == .group) try alloc.dupe(u8, "application/json") else if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.kind == .group) try alloc.dupe(u8, "{\"type\":\"copy\"}") else if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
         .neighbor_context_json = neighbor_context_json,
+        .context_sources_json = context_sources_json,
         .execution_json = execution_json,
     };
 }
@@ -37070,6 +37313,7 @@ fn internalEnrichmentConfigsEqual(alloc: Allocator, a: enrichment_catalog.Enrich
         std.mem.eql(u8, a.content_type, b.content_type) and
         try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
         std.mem.eql(u8, a.neighbor_context_json, b.neighbor_context_json) and
+        std.mem.eql(u8, a.context_sources_json, b.context_sources_json) and
         std.mem.eql(u8, a.execution_json, b.execution_json);
 }
 
@@ -37111,6 +37355,7 @@ pub fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentCo
         .content_type = if (cfg.group_source_json.len > 0) "" else if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.group_source_json.len > 0) "" else if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
         .neighbor_context = neighbor_context,
+        .context_sources_json = if (cfg.context_sources_json.len > 0) try alloc.dupe(u8, cfg.context_sources_json) else "",
         .execution = execution,
     };
     errdefer out.deinit(alloc);

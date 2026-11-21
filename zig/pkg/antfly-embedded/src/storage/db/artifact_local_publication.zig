@@ -35,10 +35,26 @@ pub fn recipe(entry: anytype) [32]u8 {
         h.update(&length);
         h.update(value);
     }
+    // Context sources joined the recipe after receipts were persisted; fold
+    // them in only when declared so existing receipts keep their identity.
+    const Entry = switch (@typeInfo(@TypeOf(entry))) {
+        .pointer => |info| info.child,
+        else => @TypeOf(entry),
+    };
+    if (@hasField(Entry, "context_sources_json")) {
+        const value: []const u8 = entry.context_sources_json;
+        if (value.len != 0) {
+            h.update("context_sources_json");
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, value.len, .little);
+            h.update(&length);
+            h.update(value);
+        }
+    }
     return h.finalResult();
 }
 pub fn requestRecipe(request: anytype) [32]u8 {
-    return recipe(.{ .producer_json = request.producer_json, .source_field = request.source_field, .source_template = request.source_template, .source_artifact_name = request.upstream_artifact_name, .content_type = request.content_type, .neighbor_context_json = request.neighbor_context_json, .prior_context_json = request.prior_context_json, .group_source_json = request.group_source_json, .execution_json = request.execution_json });
+    return recipe(.{ .producer_json = request.producer_json, .source_field = request.source_field, .source_template = request.source_template, .source_artifact_name = request.upstream_artifact_name, .content_type = request.content_type, .neighbor_context_json = request.neighbor_context_json, .prior_context_json = request.prior_context_json, .group_source_json = request.group_source_json, .execution_json = request.execution_json, .context_sources_json = request.context_sources_json });
 }
 pub fn encode(definition: [32]u8, parent: []const u8, output: []const u8) [96]u8 {
     var result: [96]u8 = undefined;

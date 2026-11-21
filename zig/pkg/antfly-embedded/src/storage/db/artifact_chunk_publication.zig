@@ -457,7 +457,7 @@ pub fn authorizeUnitChild(alloc: std.mem.Allocator, txn: anytype, parent_request
     // immutable template, then select its configured child, rather than invent
     // a top-level worker template or accept caller-provided chunker settings.
     const bound = (try @import("artifact_producer_input.zig").authorizeTemplate(alloc, txn, parent_request, plan)) orelse return null;
-    if (parent_request.kind != .asset or bound.requirement.scope != .producer_defined or parent_request.neighbor_context_json.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+    if (parent_request.kind != .asset or bound.requirement.scope != .producer_defined or (parent_request.neighbor_context_json.len != 0 or parent_request.context_sources_json.len != 0)) return error.OnlineMergeArtifactTailsUnsupported;
     const completion = if (plan.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
     const child = try completion.unitChild(producer_name);
     if (child.kind != .unit_children or child.scope != .upstream_units) return error.ArtifactCatalogDrift;
@@ -666,7 +666,7 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
         if (std.mem.eql(u8, value.name, command.producer_name)) break value;
     } else return error.EnrichmentSourceChanged;
     if (config.kind != .chunk) return error.InvalidBatchRequest;
-    if (config.neighbor_context_json.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+    if ((config.neighbor_context_json.len != 0 or config.context_sources_json.len != 0)) return error.OnlineMergeArtifactTailsUnsupported;
     const unit_source = if (config.source_artifact_name.len != 0) blk: {
         const upstream = for (configs) |candidate| {
             if (std.mem.eql(u8, candidate.name, config.source_artifact_name)) break candidate;

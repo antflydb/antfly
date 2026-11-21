@@ -4724,6 +4724,9 @@ pub const EnrichmentConfig = struct {
     producer_json: ?[]const u8 = null,
     /// Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission.
     neighbor_context: ?EnrichmentNeighborContextConfig = null,
+    /// Named cross-document context consumed by this asset producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles.
+    context_sources: ?std.json.ArrayHashMap(EnrichmentContextSource) = null,
+    refresh: ?EnrichmentRefreshConfig = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
     /// Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json.
@@ -4750,6 +4753,8 @@ pub const EnrichmentConfig = struct {
         .{ "producer", "producer", true },
         .{ "producer_json", "producer_json", true },
         .{ "neighbor_context", "neighbor_context", true },
+        .{ "context_sources", "context_sources", true },
+        .{ "refresh", "refresh", true },
         .{ "execution", "execution", true },
         .{ "transcriber", "transcriber", true },
     };
@@ -4839,12 +4844,332 @@ pub const EnrichmentConfig = struct {
             try jw.objectField("neighbor_context");
             try jw.write(value);
         }
+        if (self.context_sources) |value| {
+            try jw.objectField("context_sources");
+            try jw.write(value);
+        }
+        if (self.refresh) |value| {
+            try jw.objectField("refresh");
+            try jw.write(value);
+        }
         if (self.execution) |value| {
             try jw.objectField("execution");
             try jw.write(value);
         }
         if (self.transcriber) |value| {
             try jw.objectField("transcriber");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const EnrichmentContextDocument = struct {
+    /// Table holding the referenced document; omitted means the enrichment's own table. Resolved to an immutable table identity at admission, so renaming or recreating a table cannot retarget the dependency.
+    table: ?[]const u8 = null,
+    /// JSON pointer into the source document yielding the referenced key.
+    key_from: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", true },
+        .{ "key_from", "key_from", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.objectField("key_from");
+        try jw.write(self.key_from);
+        try jw.endObject();
+    }
+};
+
+/// Bounded breadth-first traversal over the edges of a graph index. By default only explicitly written edges are traversed; `include_generated` also follows field-derived and enrichment-generated edges, whose changes invalidate dependents when their edge artifacts are written or removed. Generated edges must not depend on the consuming enrichment. Members render with depth, edge type, and direction.
+pub const EnrichmentContextGraph = struct {
+    table: ?[]const u8 = null,
+    graph_index: []const u8,
+    /// JSON pointer to the start node key; omitted means the dependent row itself.
+    start_from: ?[]const u8 = null,
+    edge_types: ?[]const []const u8 = null,
+    direction: ?[]const u8 = null,
+    depth: ?i64 = null,
+    /// Maximum edges per visited node; exceeding it fails explicitly.
+    max_fanout: ?i64 = null,
+    /// Also traverse field-derived and enrichment-generated edges.
+    include_generated: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", true },
+        .{ "graph_index", "graph_index", false },
+        .{ "start_from", "start_from", true },
+        .{ "edge_types", "edge_types", true },
+        .{ "direction", "direction", true },
+        .{ "depth", "depth", true },
+        .{ "max_fanout", "max_fanout", true },
+        .{ "include_generated", "include_generated", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.objectField("graph_index");
+        try jw.write(self.graph_index);
+        if (self.start_from) |value| {
+            try jw.objectField("start_from");
+            try jw.write(value);
+        }
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        if (self.depth) |value| {
+            try jw.objectField("depth");
+            try jw.write(value);
+        }
+        if (self.max_fanout) |value| {
+            try jw.objectField("max_fanout");
+            try jw.write(value);
+        }
+        if (self.include_generated) |value| {
+            try jw.objectField("include_generated");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const EnrichmentContextQuery = struct {
+    /// Table queried; omitted means the enrichment's own table.
+    table: ?[]const u8 = null,
+    /// An Antfly `filter_query` (Query shape): `bool` (`must`/`filter`/`should`/`must_not`/`minimum_should_match`, filter-context semantics), `conjuncts`, `disjuncts` (`min`), `match_all`, `match_none`, and leaves. Leaves evaluated by context resolution itself: `term`/`terms` (equality; at the top of the conjunction they form indexed subscriptions, at most one bound `terms` set), `range` (`gt`/`gte`/`lt`/`lte`), `numeric_range`/`term_range` (`min`/`max`/`inclusive_*`), `prefix`, `match` and `match_phrase` (pinned `antfly.context.simple.v1` analyzer: lowercase ASCII words; `operator` and|or), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}` over a vector stored in a document field). Every other row-decidable leaf (wildcard, regexp, fuzzy, date and IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches`) is lowered at admission into the storage engine's per-row filter and evaluated per changed row. Values are literals or typed bindings `{"$source":"/json/pointer"}` from the source document (in storage-evaluated leaves, string-valued positions only). Corpus-relative text queries (`query_string`, `multi_match`, analyzer-specific `match`) are rejected for live tracking; use a snapshot `search.request`.
+    filter_query: std.json.ArrayHashMap(std.json.Value),
+    /// Top-N by a field (ties by key); `max_documents` is N. Invalidation tracks the current boundary.
+    order_by: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", true },
+        .{ "filter_query", "filter_query", false },
+        .{ "order_by", "order_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.objectField("filter_query");
+        try jw.write(self.filter_query);
+        if (self.order_by) |value| {
+            try jw.objectField("order_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Ranked retrieval (requires `tracking: snapshot`): a full `request`, or the shorthands full-text relevance (`text` + `text_field`) or dense k-NN (`vector` binding + `vector_index`). Members render in rank order.
+pub const EnrichmentContextSearch = struct {
+    table: ?[]const u8 = null,
+    /// A full public QueryRequest (`full_text_search`, `semantic_search` with `indexes`, hybrid `merge_config`, `reranker`, `filter_query`, `exclusion_query`, `order_by`, `graph_queries`, ...) with `{"$source":"/pointer"}` bindings anywhere, executed by the table's query engine. `limit` (at most 1000) is the member count. `table`, paging (`offset`, `search_after`, `search_before`), `count`, and `aggregations` are rejected.
+    request: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Query text literal or `{"$source":"/pointer"}`.
+    text: OpenApiOptionalNullable(std.json.Value) = .absent,
+    text_field: ?[]const u8 = null,
+    /// `{"$source":"/pointer"}` to the query vector in the dependent row.
+    vector: ?std.json.ArrayHashMap(std.json.Value) = null,
+    vector_index: ?[]const u8 = null,
+    k: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", true },
+        .{ "request", "request", true },
+        .{ "text", "text", false },
+        .{ "text_field", "text_field", true },
+        .{ "vector", "vector", true },
+        .{ "vector_index", "vector_index", true },
+        .{ "k", "k", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        if (self.request) |value| {
+            try jw.objectField("request");
+            try jw.write(value);
+        }
+        switch (self.text) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("text");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("text");
+                try jw.write(value);
+            },
+        }
+        if (self.text_field) |value| {
+            try jw.objectField("text_field");
+            try jw.write(value);
+        }
+        if (self.vector) |value| {
+            try jw.objectField("vector");
+            try jw.write(value);
+        }
+        if (self.vector_index) |value| {
+            try jw.objectField("vector_index");
+            try jw.write(value);
+        }
+        if (self.k) |value| {
+            try jw.objectField("k");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// One named context source: exactly one of `document` (a referenced row), `query` (the matching set of a parameterized filter, including the empty set), `graph` (bounded traversal over directly written edges), or `search` (ranked retrieval, snapshot only). Live sources are invalidated exactly: every admitted predicate decides a row's membership from that row alone. Ranked retrieval depends on the whole corpus and is only available as an explicitly unverified snapshot.
+pub const EnrichmentContextSource = struct {
+    document: ?EnrichmentContextDocument = null,
+    query: ?EnrichmentContextQuery = null,
+    graph: ?EnrichmentContextGraph = null,
+    search: ?EnrichmentContextSearch = null,
+    /// Projected fields consumed by the producer (dotted paths). Only these fields, predicate fields, and the order field participate in fingerprints and invalidation. `_artifacts.<artifact>[.<path>]` reads a row's generated output (asset: parsed JSON or text; chunk: array of chunk payloads; embedding: document vector) and may be used in projections and predicates; when the artifact is regenerated, dependents are invalidated like for a field change. Admission rejects artifacts that depend on the consuming enrichment (directly, through artifact streams, through other context sources, or across tables). Other fields starting with `_` are reserved and rejected.
+    fields: []const []const u8,
+    /// Document sources only: a missing referenced document fails the rebuild explicitly instead of rendering null.
+    required: ?bool = null,
+    /// Query and graph sources: maximum members. Exceeding it fails explicitly; with `order_by` it is the declared top-N.
+    max_documents: ?u32 = null,
+    /// Query sources with residual predicates (range, prefix, match, similar) or `order_by`: maximum candidate rows examined after equality filtering. Exceeding it fails explicitly.
+    max_candidates: ?u32 = null,
+    /// Maximum rendered bytes for this source.
+    max_bytes: ?u64 = null,
+    overflow: ?[]const u8 = null,
+    /// `live` registers subscriptions and keeps dependents current. `snapshot` registers nothing: dependents publish with freshness `unverified` (never `current`), rebuild on `refresh_interval` or manually, and `require_current` reads refuse them. Required for `search`.
+    tracking: ?[]const u8 = null,
+    /// Snapshot sources only: rebuild interval (at least 1s).
+    refresh_interval: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "document", "document", true },
+        .{ "query", "query", true },
+        .{ "graph", "graph", true },
+        .{ "search", "search", true },
+        .{ "fields", "fields", false },
+        .{ "required", "required", true },
+        .{ "max_documents", "max_documents", true },
+        .{ "max_candidates", "max_candidates", true },
+        .{ "max_bytes", "max_bytes", true },
+        .{ "overflow", "overflow", true },
+        .{ "tracking", "tracking", true },
+        .{ "refresh_interval", "refresh_interval", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.document) |value| {
+            try jw.objectField("document");
+            try jw.write(value);
+        }
+        if (self.query) |value| {
+            try jw.objectField("query");
+            try jw.write(value);
+        }
+        if (self.graph) |value| {
+            try jw.objectField("graph");
+            try jw.write(value);
+        }
+        if (self.search) |value| {
+            try jw.objectField("search");
+            try jw.write(value);
+        }
+        try jw.objectField("fields");
+        try jw.write(self.fields);
+        if (self.required) |value| {
+            try jw.objectField("required");
+            try jw.write(value);
+        }
+        if (self.max_documents) |value| {
+            try jw.objectField("max_documents");
+            try jw.write(value);
+        }
+        if (self.max_candidates) |value| {
+            try jw.objectField("max_candidates");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        if (self.overflow) |value| {
+            try jw.objectField("overflow");
+            try jw.write(value);
+        }
+        if (self.tracking) |value| {
+            try jw.objectField("tracking");
+            try jw.write(value);
+        }
+        if (self.refresh_interval) |value| {
+            try jw.objectField("refresh_interval");
             try jw.write(value);
         }
         try jw.endObject();
@@ -4955,6 +5280,41 @@ pub const EnrichmentProducerConfig = struct {
         try jw.write(self.type);
         if (self.config) |value| {
             try jw.objectField("config");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Rebuild policy for context-source invalidation. Invalidation (stale freshness) is always reported immediately; debounce only coalesces rebuild work.
+pub const EnrichmentRefreshConfig = struct {
+    /// `background` journals rebuilds automatically; `manual` only marks dependents stale (rebuild with the reprocess endpoints).
+    mode: ?[]const u8 = null,
+    /// Coalescing delay before a background rebuild (for example `2s`).
+    debounce: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", true },
+        .{ "debounce", "debounce", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.debounce) |value| {
+            try jw.objectField("debounce");
             try jw.write(value);
         }
         try jw.endObject();

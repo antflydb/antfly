@@ -403,7 +403,9 @@ fn cloneStorageConsumer(b: *std.Build, original: *std.Build.Module, copies: *std
 pub fn addStorageProbe(b: *std.Build, module: *std.Build.Module, name: []const u8) *std.Build.Step.Run {
     const target = module.resolved_target.?.result;
     if (target.os.tag != .macos) {
-        const executable = b.addExecutable(.{ .name = name, .root_module = module, .use_llvm = llvmBackend(target), .max_rss = 4 * 1024 * 1024 * 1024 });
+        // Linux x86_64 stripped ReleaseFast storage owner-linkage probes
+        // peaked at 5,472,174,080 bytes (5.10 GiB); 7 GiB keeps >=25% headroom.
+        const executable = b.addExecutable(.{ .name = name, .root_module = module, .use_llvm = llvmBackend(target), .max_rss = 7 * 1024 * 1024 * 1024 });
         return b.addRunArtifact(executable);
     }
     module.link_libc = true;

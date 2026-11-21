@@ -240,6 +240,8 @@ pub const VTable = struct {
     setResolutionCandidateSource: *const fn (self: *DB, src: ?@import("db/resolution_runtime.zig").CandidateSource) Outcome(void),
     setEntitySink: *const fn (self: *DB, sink: ?@import("db/promotion_runtime.zig").EntitySink) Outcome(void),
     setPromotionOwner: *const fn (self: *DB, owner: ?@import("db/promotion_runtime.zig").PromotionOwner) Outcome(void),
+    installContextHost: *const fn (self: *DB, config: DB.ContextHostConfig) Outcome(void),
+    runContextMaintenance: *const fn (self: *DB) Outcome(bool),
     advanceGeneratedArtifactCleanupPage: *const fn (self: *DB, index_name: ?[]const u8) Outcome(DB.GeneratedArtifactCleanupAdvanceResult),
     loadIndexRepairState: *const fn (self: *const DB, alloc: std.mem.Allocator) Outcome(@import("db/derived/index_repair_state.zig").State),
     getRange: *const fn (self: *DB) Outcome(types.ByteRange),

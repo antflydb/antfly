@@ -34,7 +34,7 @@ fn configFor(a: Allocator, command: publication.Command, catalogs: inventory.Cat
     const config = for (configs) |value| {
         if (value.kind == .chunk and std.mem.eql(u8, value.name, command.producer_name)) break value;
     } else return error.EnrichmentSourceChanged;
-    if (config.neighbor_context_json.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+    if ((config.neighbor_context_json.len != 0 or config.context_sources_json.len != 0)) return error.OnlineMergeArtifactTailsUnsupported;
     if (config.source_artifact_name.len != 0) {
         const upstream = for (configs) |value| {
             if (value.kind == .asset and std.mem.eql(u8, value.name, config.source_artifact_name)) break value;

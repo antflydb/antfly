@@ -26,7 +26,11 @@ const keys = @import("../internal_keys.zig");
 
 pub fn authorize(alloc: std.mem.Allocator, txn: anytype, request: requests.GeneratedEnrichmentRequest, plan: *const manager.IndexManager.WritePlanSnapshot) !?producer_input.TemplateAuthority {
     if (try publication.authority(txn) == null) return null;
-    if ((request.kind != .asset and request.kind != .chunk_text) or request.neighbor_context_json.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+    // Context sources are fenced by a replicated publish intent that every
+    // replica promotes at apply. Neighbor context has no such fence, and
+    // chunk text has no context-source block.
+    if ((request.kind != .asset and request.kind != .chunk_text) or request.neighbor_context_json.len != 0 or
+        (request.kind != .asset and request.context_sources_json.len != 0)) return error.OnlineMergeArtifactTailsUnsupported;
     const bound = (try producer_input.authorizeTemplate(alloc, txn, request, plan)) orelse return error.ArtifactCatalogDrift;
     if (request.kind == .asset and bound.requirement.scope != .document) return error.OnlineMergeArtifactTailsUnsupported;
     return bound;

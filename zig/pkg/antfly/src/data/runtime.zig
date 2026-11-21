@@ -5828,6 +5828,13 @@ pub const DataServer = struct {
     /// `write_source.source()` and is handed to the write source(s) so the
     /// promoter upserts canonical entities into whichever shard owns them.
     distributed_entity_sink: ?antfly.public_api.DistributedEntitySink = null,
+    /// Context-source host (#1634): replicated dependency commands, cross-group
+    /// notice delivery, routed reads, and table topology for every owner.
+    context_host: ?antfly.public_api.context_host.Host = null,
+    /// Some table declared context sources since this process started.
+    context_sources_seen: bool = false,
+    context_maintenance_running: std.atomic.Value(bool) = .init(false),
+    context_maintenance_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
     owned_incoming_graph_route_backend: ?lsm_backend_mod.BackendHandle = null,
@@ -6730,6 +6737,175 @@ pub const DataServer = struct {
     /// proposes it. Every replica (this one included) applies committed
     /// records in log order; see storage/leann_replicated.zig. Dispatch
     /// only, like graph endpoint cleanup.
+    // ---- Context-source host primitives (#1634) ----
+
+    fn contextPropose(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, command: @import("antfly_local_sources").storage_db_enrichment_context_dependency_command.Command, remote: bool) anyerror!void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        const req: antfly.db.types.BatchRequest = .{ .context_dependency = command, .sync_level = .write };
+        if (self.data_raft == null) {
+            const applied = try self.write_source.source().batchGroupLocal(alloc, group_id, table_name, req);
+            if (applied == null) return error.StorageKernelOwnerUnavailable;
+            return;
+        }
+        // Returns once the entry applied on the local leader (owner plans) or
+        // on the forwarded group's leader (cross-group inbox delivery).
+        try self.proposeRaftBatchGroupWithLeaderWait(alloc, group_id, table_name, req, .{
+            .discovery = .cached,
+            .allow_remote_forward = remote,
+            .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown),
+            .admission_deadline_ns = self.dataRaftMonotonicNs() +| 5 * std.time.ns_per_s,
+        }, 5 * std.time.ns_per_s);
+    }
+
+    fn contextIsLeader(ptr: *anyopaque, group_id: u64) bool {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.data_raft == null) return true;
+        const leadership = self.group_leadership_source orelse return false;
+        return leadership.isLocalLeader(group_id);
+    }
+
+    fn contextGroups(ptr: *anyopaque, a: std.mem.Allocator, table_name: []const u8) anyerror![]const u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const catalog = antfly.public_api.table_catalog;
+        var routes = try catalog.routedSpanSnapshotUntil(a, self.write_source.catalog, table_name, "", "", self.write_source.catalog.deadlineFrom(.{ .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s }));
+        defer routes.deinit(a);
+        return a.dupe(u64, routes.group_ids);
+    }
+
+    fn contextGroupForKey(ptr: *anyopaque, a: std.mem.Allocator, table_name: []const u8, key: []const u8) anyerror!u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const catalog = antfly.public_api.table_catalog;
+        const route = try catalog.routedGroupSnapshotUntil(a, self.write_source.catalog, table_name, key, self.write_source.catalog.deadlineFrom(.{ .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s }));
+        const selected = route.route orelse return error.TopologyChanged;
+        return selected.group_id;
+    }
+
+    fn contextTables(ptr: *anyopaque, a: std.mem.Allocator) anyerror![]const antfly.public_api.context_host.TableInfo {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+        const out = try a.alloc(antfly.public_api.context_host.TableInfo, snapshot.tables.len);
+        for (snapshot.tables, out) |t, *o| o.* = .{ .table_id = t.table_id, .name = try a.dupe(u8, t.name), .indexes_json = try a.dupe(u8, t.indexes_json) };
+        return out;
+    }
+
+    fn contextReads(ptr: *anyopaque) antfly.public_api.TableReadSource {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.read_source.source();
+    }
+
+    fn contextCollect(a: std.mem.Allocator, indexes_json: []const u8) anyerror![]const antfly.db.types.EnrichmentConfig {
+        return antfly.public_api.indexes.collectArtifactEnrichmentsFromTableIndexesJson(a, indexes_json);
+    }
+
+    fn contextParseQuery(_: *anyopaque, a: std.mem.Allocator, table_name: []const u8, body: []const u8) anyerror!antfly.db.types.SearchRequest {
+        // Arena-owned: the parsed request lives as long as `a`.
+        const owned = try @import("antfly_local_sources").api_query_contract.parseQueryRequest(a, null, table_name, body);
+        return owned.req;
+    }
+
+    /// Leader-only context maintenance: one bounded job per round, for the
+    /// next led group (reconcile, shadow backfill, topology, inbox, and
+    /// outbox delivery run inside the owner and propose their effects).
+    fn runContextMaintenanceRound(self: *DataServer) !void {
+        const runtime = self.backend_runtime orelse return;
+        if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
+        if (self.context_host == null) return;
+        // Skip the per-group sweep entirely while no table has ever declared
+        // context sources (checked against a cached catalog digest at most
+        // once a second). Once any has, keep sweeping so removals still
+        // refresh each group's topology.
+        if (!self.context_sources_seen) {
+            const any = self.context_host.?.anyContextSources(self.alloc, platform_time.monotonicNs(), std.time.ns_per_s) catch true;
+            if (!any) return;
+            self.context_sources_seen = true;
+        }
+        if (self.context_maintenance_running.swap(true, .acq_rel)) return;
+        var scheduled = false;
+        defer if (!scheduled) self.context_maintenance_running.store(false, .release);
+        const catalog = self.write_source.catalog;
+        const deadline = catalog.budget(null).nowNs() +| 100 * std.time.ns_per_ms;
+        for (0..8) |_| {
+            const visit = (try self.context_maintenance_sweep.next(self.alloc, catalog, deadline)) orelse return;
+            if (self.data_raft) |raft| {
+                lockAtomic(&self.data_raft_mutex);
+                const leader = raft.host.http_host.host.isLocalLeader(visit.range.group_id);
+                self.data_raft_mutex.unlock();
+                if (!leader) continue;
+            }
+            const table = visit.table orelse continue;
+            // Only tables taking part in context dependencies (declaring
+            // context sources, or read by another table's) need a pass; the
+            // owner returns immediately otherwise.
+            const job = try self.alloc.create(ContextMaintenanceJob);
+            errdefer self.alloc.destroy(job);
+            const name = try self.alloc.dupe(u8, table.name);
+            errdefer self.alloc.free(name);
+            job.* = .{ .server = self, .table = name, .group_id = visit.range.group_id };
+            try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = job, .run = runContextMaintenanceJob, .deinit = deinitContextMaintenanceJob });
+            scheduled = true;
+            return;
+        }
+    }
+
+    const ContextMaintenanceJob = struct { server: *DataServer, table: []const u8, group_id: u64 };
+
+    fn deinitContextMaintenanceJob(ptr: *anyopaque) void {
+        const job: *ContextMaintenanceJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        server.alloc.free(job.table);
+        server.alloc.destroy(job);
+        server.context_maintenance_running.store(false, .release);
+    }
+
+    fn runContextMaintenanceJob(ptr: *anyopaque) !void {
+        const job: *ContextMaintenanceJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        const budget_end = platform_time.monotonicNs() +| 2 * std.time.ns_per_s;
+        const command_mod = @import("antfly_local_sources").storage_db_enrichment_context_dependency_command;
+        for (0..64) |_| {
+            if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+            if (server.hotStandbyWriteGate()) |gate| try gate.check();
+            if (server.group_leadership_source) |leadership| if (!leadership.isLocalLeader(job.group_id)) return error.NotLeader;
+            var arena = std.heap.ArenaAllocator.init(server.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            // The owner only plans; every proposal and delivery happens here,
+            // outside the owner call, so no proposal ever waits on an owner
+            // the caller holds.
+            var response = (try server.read_source.source().lookupGroupLocal(server.alloc, job.group_id, job.table, "", .{ .relational_topology_json = "{\"mode\":\"context_maintenance\"}", .execution_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&server.background_jobs_shutdown) }, .leader_lease)) orelse return;
+            defer response.deinit(server.alloc);
+            const status = try std.json.parseFromSliceLeaky(struct {
+                more: bool = false,
+                proposals: []const []const u8 = &.{},
+                deliveries: []const struct { dependent: []const u8, notice: []const u8 } = &.{},
+            }, a, response.json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+            for (status.proposals) |encoded| {
+                const command = try std.json.parseFromSliceLeaky(command_mod.Command, a, encoded, .{ .allocate = .alloc_always });
+                try contextPropose(server, a, job.group_id, job.table, command, false);
+            }
+            if (status.deliveries.len != 0) {
+                const host = if (server.context_host) |*value| value else return;
+                var acks = std.ArrayListUnmanaged([]const u8).empty;
+                for (status.deliveries) |d| {
+                    const request = try std.json.Stringify.valueAlloc(a, .{ .dependent = d.dependent, .notice = d.notice }, .{});
+                    const out = host.call(a, @backingInt(@import("antfly_local_sources").storage_db_context_host_wire.Op.deliver), job.group_id, job.table, request) catch |err| {
+                        // Undelivered entries stay in the outbox for the next pass.
+                        std.log.warn("context notice delivery deferred table={s} group_id={d} err={s}", .{ job.table, job.group_id, @errorName(err) });
+                        continue;
+                    };
+                    _ = out;
+                    try acks.append(a, try command_mod.ackDigestHexAlloc(a, d.notice));
+                }
+                if (acks.items.len != 0) try contextPropose(server, a, job.group_id, job.table, .{ .acks = acks.items }, false);
+            }
+            if (!status.more) return;
+            if (platform_time.monotonicNs() >= budget_end) return;
+        }
+    }
+
     fn runLeannReplicationRound(self: *DataServer) !void {
         const raft = self.data_raft orelse return;
         const runtime = self.backend_runtime orelse return;
@@ -7162,12 +7338,26 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withEntitySink(entity_sink);
         }
+        self.context_host = .{ .primitives = .{
+            .ptr = self,
+            .propose_fn = contextPropose,
+            .is_leader_fn = contextIsLeader,
+            .groups_fn = contextGroups,
+            .group_for_key_fn = contextGroupForKey,
+            .tables_fn = contextTables,
+            .reads_fn = contextReads,
+            .collect = .{ .collect_fn = contextCollect },
+            .parse_query_fn = contextParseQuery,
+        } };
+        _ = self.write_source.withContextHost(&self.context_host.?);
+        if (self.data_raft_apply) |apply_sm| _ = apply_sm.write_source.withContextHost(&self.context_host.?);
         if (comptime linked_storage) {
             _ = self.kernel_owner_source.?.withRuntimeHooks(
                 candidate_source,
                 entity_sink,
                 promotion_leadership,
             );
+            _ = self.kernel_owner_source.?.withContextHost(&self.context_host.?);
         }
         self.syncInferenceRuntimeConfig();
         // Request allocations must share identity with the process allocator
@@ -9604,6 +9794,9 @@ pub const DataServer = struct {
         self.runGraphEndpointCleanupRound() catch |err| {
             std.log.warn("graph endpoint cleanup deferred err={s}", .{@errorName(err)});
         };
+        self.runContextMaintenanceRound() catch |err| {
+            std.log.warn("context maintenance round deferred err={s}", .{@errorName(err)});
+        };
         self.runLeannReplicationRound() catch |err| {
             std.log.warn("leann replication deferred err={s}", .{@errorName(err)});
         };
@@ -9851,6 +10044,7 @@ pub const DataServer = struct {
             @panic("data server provider shutdown barrier failed");
         };
         if (self.hot_standby_admin_server) |*server| server.deinit();
+        if (self.context_host) |*host| host.deinit();
         if (self.hot_standby_promoted_primary) |*primary| primary.close();
         if (self.hot_standby_standby_replication_http_executor) |*executor| executor.deinit();
         // Safe only now: every replication round has been quiesced above, so
@@ -12682,7 +12876,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.row_policy_publication != null) return proposal_req;
+        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.context_dependency != null or proposal_req.row_policy_publication != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -12732,6 +12926,7 @@ pub const DataServer = struct {
     }
 
     pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.context_dependency != null) return @import("../common/data_raft_protocol.zig").batch_context_dependency_protocol_version;
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
