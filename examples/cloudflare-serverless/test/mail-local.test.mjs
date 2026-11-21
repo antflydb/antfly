@@ -22,7 +22,7 @@ import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JSDOM } from "jsdom";
-import { MailSyncLog, syncMessage, syncLimits } from "../mail-core.mjs";
+import { MailSyncLog, MailDeletion, ownedObjects, syncMessage, syncLimits } from "../mail-core.mjs";
 import worker, { contentSecurityPolicy } from "../mail-worker.mjs";
 import { localSchema, documentFor, searchRequest, hitsFrom, embeddingText } from "../mail-public/local-schema.js";
 import { stripSafetensors, prepare, MEDIA_TENSOR } from "../publish-local-model.mjs";
@@ -92,6 +92,74 @@ test("sync log assigns one ordered sequence per message and backfills old mailbo
   // A replica ahead of the log (e.g. after a restore) is told to rebuild.
   const ahead = await log.page(String(Number(cursor) + 1));
   assert.deepEqual([ahead.reset, ahead.cursor, ahead.ids.length, ahead.more], [true, "", 0, true]);
+});
+
+test("deletion hides a message at once, tombstones it for replicas and purges what it owns", async () => {
+  const store = new Store(),
+    log = new MailSyncLog(store),
+    deletion = new MailDeletion(store, log, { clock: () => 42 }),
+    id = crypto.randomUUID(),
+    other = crypto.randomUUID(),
+    prefix = "mail/" + crypto.randomUUID() + "/";
+  const receipt = {
+    id,
+    state: "indexed",
+    received_at: 1_700_000_000_000,
+    key: prefix + "raw/" + id,
+    projection: { key: prefix + "projections/" + "a".repeat(64), sha256: "a".repeat(64) },
+    prepared: {
+      attachments: [
+        { index: 0, key: prefix + "attachments/" + id + "/0" },
+        { index: 1, key: prefix + "attachments/" + "b".repeat(64) }, // legacy, may be shared
+      ],
+    },
+  };
+  const order = "mail/v1/order/" + String(9999999999999 - receipt.received_at).padStart(13, "0") + "/" + id;
+  await store.transaction(async (tx) => {
+    tx.put("mail/v1/receipt/" + id, receipt);
+    tx.put(order, id);
+    await log.record(tx, id);
+    await log.record(tx, other);
+  });
+  const before = await log.page("");
+  assert.deepEqual(before.ids, [id, other]);
+
+  const marked = await deletion.mark(id);
+  assert.equal(marked.key, receipt.key, "mark returns the receipt to purge");
+  assert.equal(await deletion.isDeleted(id), true);
+  assert.equal(await deletion.isDeleted(other), false);
+  assert.equal(await store.transaction((tx) => tx.get(order)), undefined, "gone from the listing at once");
+  assert.equal(await deletion.mark(id), null, "deleting twice is a no-op");
+  await assert.rejects(deletion.mark(crypto.randomUUID()), /UnknownMessage/);
+
+  // Replicas get exactly one tombstone after the earlier upsert entries.
+  const after = await log.page(before.cursor);
+  assert.deepEqual([after.ids, after.deleted], [[], [id]]);
+  assert.deepEqual((await log.page("")).deleted, [id]);
+
+  // Only per-message objects are purged; legacy content-addressed ones may be shared.
+  assert.deepEqual(ownedObjects(prefix, await deletion.purging(id)), [
+    prefix + "raw/" + id,
+    prefix + "projections/" + "a".repeat(64),
+    prefix + "attachments/" + id + "/0",
+  ]);
+  assert.deepEqual(ownedObjects(prefix, { ...receipt, key: prefix + "raw/" + "c".repeat(64) }).includes(prefix + "raw/" + "c".repeat(64)), false);
+  assert.deepEqual(ownedObjects("mail/other/", receipt), [], "never another mailbox's objects");
+  assert.deepEqual(await deletion.pending(), [id]);
+
+  await deletion.finish(id);
+  assert.equal(await deletion.purging(id), null);
+  assert.deepEqual(await deletion.pending(), []);
+  const tombstone = await store.transaction((tx) => tx.get("mail/v1/receipt/" + id));
+  assert.deepEqual(tombstone, { id, state: "deleted", deleted_at: 42, purge_attempt: 0 }, "object keys are dropped");
+
+  // An ingest that indexed the message after its purge re-arms it with a new
+  // attempt number, since purge mutations are idempotent by operation id.
+  await store.transaction((tx) => deletion.requirePurge(tx, id));
+  assert.equal((await deletion.purging(id)).purge_attempt, 1);
+  await deletion.finish(id);
+  await store.transaction((tx) => deletion.requirePurge(tx, id));
+  assert.equal((await deletion.purging(id)).purge_attempt, 2, "attempts never repeat");
 });
 
 test("sync export is text-only, bounded and drops attachment storage details", () => {
@@ -198,6 +266,50 @@ test("sync and model routes are scoped to the signed-in mailbox", async () => {
   assert.equal((await get("/local/models/catalog.json", signedOut)).status, 401);
   const noModels = env({ MAIL_MODELS: undefined });
   assert.equal((await get("/local/models/catalog.json", noModels)).status, 404);
+});
+
+test("DELETE removes a message through the session's mailbox and queues its purge", async () => {
+  const mailbox = { id: crypto.randomUUID(), address: "me@example.test" },
+    calls = [],
+    hints = [];
+  const e = {
+    AUTH_ORIGIN: "https://mail.example.test",
+    AUTH_SERVICE: { session: async () => ({ session: { user: { id: "alice" }, mailbox }, cookies: [] }) },
+    MAIL_QUEUE: { send: async (body) => hints.push(body) },
+    MAILBOXES: {
+      getByName: (actor) => ({
+        delete: async (box, id) => {
+          calls.push({ actor, box, id });
+          if (id === "00000000-0000-4000-8000-000000000000") throw Error("UnknownMessage");
+          return { id, deleted: true };
+        },
+        purge: async (box, id) => {
+          calls.push({ purge: id });
+          return { done: true };
+        },
+        pending: async () => ({ inbound: [], outbound: [], purge: ["11111111-1111-4111-8111-111111111111"], publish: false }),
+      }),
+    },
+  };
+  const id = crypto.randomUUID();
+  const del = (path, origin = e.AUTH_ORIGIN) =>
+    worker.fetch(new Request(e.AUTH_ORIGIN + path, { method: "DELETE", headers: { Origin: origin } }), e);
+  const response = await del("/mail/messages/" + id);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { id, deleted: true });
+  assert.deepEqual(calls[0], { actor: mailbox.id, box: mailbox.id, id });
+  assert.deepEqual(hints[0], { mailbox: mailbox.id, kind: "purge", id });
+  assert.equal((await del("/mail/messages/" + id, "https://attacker.test")).status, 403, "cross-site deletes are refused");
+  assert.equal((await del("/mail/messages/00000000-0000-4000-8000-000000000000")).status, 404);
+  assert.equal((await del("/mail/messages/" + id + "/attachments/0")).status, 404, "attachments are not deleted alone");
+  // Queue and the scheduled sweep drive outstanding purges.
+  const acked = [];
+  await worker.queue({ messages: [{ body: { mailbox: mailbox.id, kind: "purge", id }, ack: () => acked.push(1), retry() {} }] }, e);
+  assert.deepEqual(calls.at(-1), { purge: id });
+  assert.equal(acked.length, 1);
+  hints.length = 0;
+  await worker.scheduled({}, { ...e, AUTH_SERVICE: { ...e.AUTH_SERVICE, mailboxes: async () => [mailbox.id] } });
+  assert.deepEqual(hints, [{ mailbox: mailbox.id, kind: "purge", id: "11111111-1111-4111-8111-111111111111" }]);
 });
 
 test("static assets allow WASM and workers but stay same-origin; runtimes are immutable", async () => {
@@ -599,4 +711,43 @@ test("service worker never caches mail, auth or model weights", async () => {
   assert.deepEqual(fetched, [], "immutable runtime is cache-first");
   assert.ok(await request("/local/config.json"));
   assert.ok(await request("/local/models/catalog.json"));
+});
+
+test("a message can be deleted from the UI after confirmation", async () => {
+  const dom = new JSDOM(html, { url: "https://mail.example.test/", runScripts: "outside-only" });
+  const { window } = dom;
+  const id = crypto.randomUUID(),
+    requests = [];
+  let present = true,
+    confirmAnswer = false;
+  window.confirm = () => confirmAnswer;
+  const message = { id, subject: "Invoice", from: "a@example.net", to: "me@example.test", text: "x", received_at: 1, attachments: [] };
+  window.fetch = async (url, options = {}) => {
+    requests.push([options.method ?? "GET", url]);
+    if (url === "/api/me")
+      return Response.json({ user: { id: "u", email: "me@example.test" }, mailbox: { id: crypto.randomUUID(), address: "me@example.test" } });
+    if (url === "/mail/messages") return Response.json({ messages: present ? [message] : [], cursor: null });
+    if (url === "/mail/messages/" + id && options.method === "DELETE") {
+      present = false;
+      return Response.json({ id, deleted: true });
+    }
+    if (url === "/mail/messages/" + id) return Response.json(message);
+    throw Error("UnexpectedUiRequest " + url);
+  };
+  try {
+    await window.eval("(async()=>{" + script + "\n})()");
+    const $ = (name) => window.document.getElementById(name);
+    await $("messages").querySelector("button").onclick();
+    const remove = [...$("message").querySelectorAll("button")].find((b) => b.textContent === "Delete");
+    assert.ok(remove, "server-backed messages offer Delete");
+    await remove.onclick();
+    assert.ok(!requests.some(([method]) => method === "DELETE"), "nothing is deleted without confirmation");
+    confirmAnswer = true;
+    await remove.onclick();
+    assert.deepEqual(requests.filter(([method]) => method === "DELETE"), [["DELETE", "/mail/messages/" + id]]);
+    assert.equal($("message").textContent, "Message deleted.");
+    assert.equal($("messages").textContent, "No messages.", "the list is refreshed");
+  } finally {
+    window.close();
+  }
 });

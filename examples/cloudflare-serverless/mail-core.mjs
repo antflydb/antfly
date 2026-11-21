@@ -299,6 +299,14 @@ export class MailSyncLog {
     await tx.put(marker, sequence);
     return true;
   }
+  /** Append a deletion tombstone for `id`. Call inside the deleting transaction. */
+  async recordDelete(tx, id) {
+    if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    const sequence = ((await tx.get(this.prefix + "head")) ?? 0) + 1;
+    await tx.put(this.prefix + "head", sequence);
+    await tx.put(this.entryKey(sequence), { id, deleted: true });
+    return sequence;
+  }
   /** Append up to `limit` pre-existing messages; true when none remain. */
   async backfill(limit = syncLimits.backfill) {
     return this.store.transaction(async (tx) => {
@@ -329,12 +337,14 @@ export class MailSyncLog {
         limit,
       });
       const ids = [];
+      const deleted = [];
       let last = after;
-      for (const [key, id] of page) {
-        ids.push(id);
+      for (const [key, entry] of page) {
+        if (typeof entry === "string") ids.push(entry);
+        else if (entry?.deleted && uuid(entry.id)) deleted.push(entry.id);
         last = Number(key.slice(this.prefix.length + 4));
       }
-      return { ids, cursor: String(last), head, more: last < head };
+      return { ids, deleted, cursor: String(last), head, more: last < head };
     });
   }
 }
@@ -357,4 +367,94 @@ export function syncMessage(message) {
     text,
     text_truncated: truncated,
   };
+}
+
+// Objects in private R2 that belong to exactly one message and can be removed
+// with it. Deliveries now store raw MIME and attachments under the receipt id;
+// older content-addressed objects ("raw/<sha256>", "attachments/<sha256>") may
+// be shared by identical deliveries, so deletion leaves them in place.
+export function ownedObjects(prefix, receipt) {
+  if (!uuid(receipt?.id)) return [];
+  const keys = [];
+  if (receipt.key === prefix + "raw/" + receipt.id) keys.push(receipt.key);
+  const projection = receipt.projection?.key;
+  if (typeof projection === "string" && projection.startsWith(prefix + "projections/")) keys.push(projection);
+  for (const part of receipt.prepared?.attachments ?? [])
+    if (typeof part?.key === "string" && part.key.startsWith(prefix + "attachments/" + receipt.id + "/")) keys.push(part.key);
+  return keys;
+}
+const orderKey = (receipt) =>
+  "mail/v1/order/" + String(9999999999999 - receipt.received_at).padStart(13, "0") + "/" + receipt.id;
+
+// Deleting a message is a transactional mark followed by an idempotent purge.
+// The mark hides the message everywhere at once (list order, lookups, search
+// results) and appends a sync tombstone so on-device copies drop it too; the
+// purge removes the search document and the message's own R2 objects, and is
+// retried from a durable marker until it completes.
+export class MailDeletion {
+  constructor(store, syncLog, { clock = Date.now, prefix = "mail/v1/" } = {}) {
+    this.store = store;
+    this.syncLog = syncLog;
+    this.clock = clock;
+    this.prefix = prefix;
+  }
+  receiptKey(id) {
+    if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    return this.prefix + "receipt/" + id;
+  }
+  /** Returns the receipt (with object keys) to purge, or null if already deleted. */
+  async mark(id) {
+    return this.store.transaction(async (tx) => {
+      const receipt = await tx.get(this.receiptKey(id));
+      if (!receipt) throw Error("UnknownMessage");
+      if (receipt.state === "deleted") return null;
+      if (Number.isFinite(receipt.received_at)) await tx.delete(orderKey(receipt));
+      await tx.delete(this.prefix + "pending/" + id);
+      await tx.put(this.receiptKey(id), { ...receipt, state: "deleted", deleted_at: this.clock() });
+      await tx.put(this.prefix + "purge/" + id, id);
+      await this.syncLog.recordDelete(tx, id);
+      return receipt;
+    });
+  }
+  async isDeleted(id) {
+    if (!uuid(id)) return true;
+    const receipt = await this.store.transaction((tx) => tx.get(this.receiptKey(id)));
+    return receipt?.state === "deleted";
+  }
+  /** Receipt still holding object keys, while its purge is outstanding. */
+  async purging(id) {
+    return this.store.transaction(async (tx) => {
+      if (!(await tx.get(this.prefix + "purge/" + id))) return null;
+      return (await tx.get(this.receiptKey(id))) ?? null;
+    });
+  }
+  /**
+   * Re-arm the purge (e.g. an ingest indexed a message after it was deleted).
+   * Each attempt gets a new number: purge mutations are idempotent by
+   * operation id, so a repeated id would not delete a re-indexed document.
+   */
+  async requirePurge(tx, id) {
+    const receipt = await tx.get(this.receiptKey(id));
+    if (receipt) await tx.put(this.receiptKey(id), { ...receipt, purge_attempt: (receipt.purge_attempt ?? 0) + 1 });
+    await tx.put(this.prefix + "purge/" + id, id);
+  }
+  async pending(limit = 16) {
+    return this.store.transaction(async (tx) => [
+      ...(await tx.list({ prefix: this.prefix + "purge/", limit })).values(),
+    ]);
+  }
+  /** Drop the marker and keep only a small tombstone receipt. */
+  async finish(id) {
+    return this.store.transaction(async (tx) => {
+      const receipt = await tx.get(this.receiptKey(id));
+      await tx.delete(this.prefix + "purge/" + id);
+      if (receipt)
+        await tx.put(this.receiptKey(id), {
+          id,
+          state: "deleted",
+          deleted_at: receipt.deleted_at,
+          purge_attempt: receipt.purge_attempt ?? 0,
+        });
+    });
+  }
 }

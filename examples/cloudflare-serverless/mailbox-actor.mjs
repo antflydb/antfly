@@ -19,6 +19,8 @@ import { buildKernel, sharedCache } from "./kernels.mjs";
 import {
   MailOutbox,
   MailSyncLog,
+  MailDeletion,
+  ownedObjects,
   syncMessage,
   syncLimits,
   uuid,
@@ -52,6 +54,7 @@ export class Mailbox extends R2CommitCoordinator {
       maxPerHour: Number(env.MAIL_SENDS_PER_HOUR ?? 20),
     });
     this.syncLog = new MailSyncLog(this.serviceStore);
+    this.deletion = new MailDeletion(this.serviceStore, this.syncLog);
   }
   scope(id) {
     if (!uuid(id) || !this.env.MAILBOXES.idFromName(id).equals(this.ctx.id))
@@ -71,7 +74,8 @@ export class Mailbox extends R2CommitCoordinator {
     if (
       !uuid(receipt.id) ||
       !sha(receipt.sha256) ||
-      receipt.key !== prefix + "raw/" + receipt.sha256
+      // Raw MIME is stored per delivery so deleting a message can remove it.
+      receipt.key !== prefix + "raw/" + receipt.id
     )
       throw Error("InvalidInboundReceipt");
     if (receipt.from !== "") address(receipt.from);
@@ -93,7 +97,7 @@ export class Mailbox extends R2CommitCoordinator {
     const prefix = this.scope(mailbox);
     let receipt = await this.transaction((tx) => tx.get(this.receiptKey(id)));
     if (!receipt) throw Error("UnknownInboundReceipt");
-    if (receipt.state === "indexed") return { done: true };
+    if (receipt.state === "indexed" || receipt.state === "deleted") return { done: true };
     if (!receipt.projection) {
       const object = await this.env.MAIL_OBJECTS.get(receipt.key);
       if (!object || object.size > 5 * 1024 * 1024) throw Error("MailRawObjectMissing");
@@ -133,7 +137,7 @@ export class Mailbox extends R2CommitCoordinator {
       const attachments = [];
       for (const part of parsed.attachments) {
         const checksum = await digest(part.bytes),
-          key = prefix + "attachments/" + checksum;
+          key = prefix + "attachments/" + id + "/" + part.index;
         await this.env.MAIL_OBJECTS.put(key, part.bytes, {
           onlyIf: { etagDoesNotMatch: "*" },
           httpMetadata: { contentType: "application/octet-stream" },
@@ -150,6 +154,12 @@ export class Mailbox extends R2CommitCoordinator {
       // projections are prepared in R2 outside its critical section, then adopted.
       const metadata = await this.transaction(async (tx) => {
         const current = await tx.get(this.receiptKey(id));
+        if (current.state === "deleted") {
+          // Deleted mid-ingest: hand the attachments just written to the purge.
+          await tx.put(this.receiptKey(id), { ...current, prepared: { attachments } });
+          await this.deletion.requirePurge(tx, id);
+          return null;
+        }
         if (current.prepared) return current.prepared;
         let thread = id;
         if (parsed.in_reply_to) {
@@ -178,6 +188,7 @@ export class Mailbox extends R2CommitCoordinator {
         await tx.put(this.receiptKey(id), { ...current, prepared: metadata });
         return metadata;
       });
+      if (!metadata) return { done: true, purge: true };
       const body = JSON.stringify({ ...metadata, text: parsed.text }),
         checksum = await digest(body),
         key = prefix + "projections/" + checksum;
@@ -190,8 +201,11 @@ export class Mailbox extends R2CommitCoordinator {
         if (current.projection) return current;
         const next = { ...current, projection: { key, sha256: checksum } };
         await tx.put(this.receiptKey(id), next);
+        // Deleted meanwhile: the purge must also remove this projection.
+        if (current.state === "deleted") await this.deletion.requirePurge(tx, id);
         return next;
       });
+      if (receipt.state === "deleted") return { done: true, purge: true };
     }
     if (!receipt.projection.key.startsWith(prefix + "projections/"))
       throw Error("InvalidProjectionScope");
@@ -205,8 +219,13 @@ export class Mailbox extends R2CommitCoordinator {
       operation_id: "mail/ingest/" + id,
       mutations: [{ kind: "upsert", doc_id: "message/" + id, body }],
     });
-    await this.transaction(async (tx) => {
+    const deletedMeanwhile = await this.transaction(async (tx) => {
       const current = await tx.get(this.receiptKey(id));
+      if (current.state === "deleted") {
+        // The upsert above may have landed after the purge's delete: purge again.
+        await this.deletion.requirePurge(tx, id);
+        return true;
+      }
       await tx.put(this.receiptKey(id), { ...current, state: "indexed" });
       await tx.delete("mail/v1/pending/" + id);
       await tx.put("mail/v1/publish", crypto.randomUUID());
@@ -216,7 +235,33 @@ export class Mailbox extends R2CommitCoordinator {
       );
       // Offline replicas learn about the message in the same commit that lists it.
       await this.syncLog.record(tx, id);
+      return false;
     });
+    if (deletedMeanwhile) return { done: true, purge: true };
+    return this.publish(mailbox);
+  }
+  // Hide the message at once (one transaction), then purge it. A failed or
+  // interrupted purge is retried by the queue and the scheduled sweep.
+  async delete(mailbox, id) {
+    this.scope(mailbox);
+    if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    const marked = await this.deletion.mark(id);
+    if (marked) await this.purge(mailbox, id);
+    return { id, deleted: true };
+  }
+  async purge(mailbox, id) {
+    const prefix = this.scope(mailbox);
+    const receipt = await this.deletion.purging(id);
+    if (!receipt) return { done: true };
+    await this.run({
+      op: "mutate",
+      operation_id: "mail/delete/" + id + "/" + (receipt.purge_attempt ?? 0),
+      mutations: [{ kind: "delete", doc_id: "message/" + id }],
+    });
+    await this.transaction((tx) => tx.put("mail/v1/publish", crypto.randomUUID()));
+    const keys = ownedObjects(prefix, receipt);
+    if (keys.length) await this.env.MAIL_OBJECTS.delete(keys);
+    await this.deletion.finish(id);
     return this.publish(mailbox);
   }
   async publish(mailbox) {
@@ -232,6 +277,8 @@ export class Mailbox extends R2CommitCoordinator {
   async message(mailbox, id) {
     this.scope(mailbox);
     if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    // A deleted message is hidden even before its purge removes the document.
+    if (await this.deletion.isDeleted(id)) return null;
     const result = await this.run({ op: "lookup", doc_id: "message/" + id });
     return result.body ? JSON.parse(result.body) : null;
   }
@@ -280,6 +327,7 @@ export class Mailbox extends R2CommitCoordinator {
     }
     return {
       messages,
+      deleted: page.deleted ?? [],
       cursor: page.cursor,
       ...(page.reset ? { reset: true } : {}),
       more: page.more || !backfilled,
@@ -328,6 +376,7 @@ export class Mailbox extends R2CommitCoordinator {
         ...(await tx.list({ prefix: "mail/v1/pending/", limit: 16 })).values(),
       ]),
       outbound: await this.outbox.pending(),
+      purge: await this.deletion.pending(),
       publish: !!(await this.transaction((tx) => tx.get("mail/v1/publish"))),
     };
   }

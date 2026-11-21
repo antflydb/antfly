@@ -179,6 +179,12 @@ export default {
       const match = /^\/mail\/messages\/([a-f0-9-]{36})(?:\/attachments\/(\d{1,2}))?$/.exec(
         url.pathname
       );
+      if (match && !match[2] && request.method === "DELETE") {
+        const result = await takeRpcData(stub.delete(mailbox.id, match[1]));
+        // The purge ran inline; a hint covers a failure part-way through it.
+        await hint(env, mailbox.id, "purge", match[1]);
+        return reply(result);
+      }
       if (match && request.method === "GET") {
         if (match[2]) {
           const part = await takeRpcData(stub.attachment(mailbox.id, match[1], Number(match[2])));
@@ -232,6 +238,7 @@ export default {
       }
       return reply({ error: "NotFound" }, 404);
     } catch (error) {
+      if (error?.message === "UnknownMessage") return reply({ error: "NotFound" }, 404);
       if (error?.message === "MailSendRateLimited")
         return reply({ error: "MailSendRateLimited" }, 429);
       const invalid =
@@ -256,10 +263,12 @@ export default {
     }
     // Each SMTP invocation receives a receipt. Content hashes deduplicate bytes,
     // never distinct deliveries; a repeated Message-ID cannot erase a message.
+    // Raw MIME is stored per delivery (not by content hash) so that deleting
+    // one message can remove its bytes without affecting identical deliveries.
     const raw = await boundedBytes(message.raw),
       checksum = await digest(raw),
-      key = objectPrefix(mailbox.id) + "raw/" + checksum,
-      id = crypto.randomUUID();
+      id = crypto.randomUUID(),
+      key = objectPrefix(mailbox.id) + "raw/" + id;
     await env.MAIL_OBJECTS.put(key, raw, {
       onlyIf: { etagDoesNotMatch: "*" },
       httpMetadata: { contentType: "message/rfc822" },
@@ -272,7 +281,7 @@ export default {
       const body = message.body;
       if (
         !uuid(body?.mailbox) ||
-        !["ingest", "send", "publish"].includes(body.kind) ||
+        !["ingest", "send", "publish", "purge"].includes(body.kind) ||
         (body.kind !== "publish" && !uuid(body.id))
       ) {
         message.ack();
@@ -285,7 +294,10 @@ export default {
               ? await takeRpcData(stub.ingest(body.mailbox, body.id))
               : body.kind === "send"
                 ? await takeRpcData(stub.dispatch(body.mailbox, body.id))
-                : await takeRpcData(stub.publish(body.mailbox));
+                : body.kind === "purge"
+                  ? await takeRpcData(stub.purge(body.mailbox, body.id))
+                  : await takeRpcData(stub.publish(body.mailbox));
+        if (result.purge) await hint(env, body.mailbox, "purge", body.id);
         if (result.done === false) await hint(env, body.mailbox, "publish");
         message.ack();
       } catch {
@@ -300,6 +312,7 @@ export default {
         const pending = await takeRpcData(actor(env, mailbox).pending(mailbox));
         for (const id of pending.inbound) await hint(env, mailbox, "ingest", id);
         for (const id of pending.outbound) await hint(env, mailbox, "send", id);
+        for (const id of pending.purge ?? []) await hint(env, mailbox, "purge", id);
         if (pending.publish) await hint(env, mailbox, "publish");
       } catch (error) {
         failures.push(error);

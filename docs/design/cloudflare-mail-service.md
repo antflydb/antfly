@@ -90,8 +90,8 @@ browser UI supports verified login/recovery, inbox/search, attachment download,
 compose/reply and outbox inspection. Outbound intent quotas are atomic per mailbox.
 
 Current ownership is one private mailbox per user. Shared memberships, labels,
-drafts, account/content deletion and delivery-event reconciliation remain future
-work. Account deletion is disabled in the application until that lifecycle is
+drafts, account deletion, retention policies and delivery-event reconciliation
+remain future work; message deletion is described below. Account deletion is disabled in the application until that lifecycle is
 implemented. Provider acceptance remains distinct from recipient delivery.
 
 Live SMTP events receive independent UUID receipts. Immutable content hashes
@@ -147,9 +147,38 @@ failing on every sync. `GET /mail/sync?cursor=<seq>` returns up to 25 messages
 after the cursor, oldest first: id, thread, subject, addresses, time, attachment names and
 sizes, and text truncated to 64 KiB. It omits attachment bytes, R2 keys and
 digests. The session selects the actor, as for every other route; a cursor is
-only a position and grants nothing. Deletion and edits are not synchronized,
-because the app has no message deletion yet. When it gains one, the log needs
-tombstone entries.
+only a position and grants nothing. Deleting a message appends a tombstone
+entry (`{id, deleted: true}`) in the same transaction that hides it; pages
+carry tombstones as `deleted` ids. A replica applies a page's upserts,
+deletions and next cursor as one database batch, so it never resurrects a
+message or skips one. Messages are immutable once delivered, so there are no
+edits to propagate.
+
+### Message deletion
+
+Raw MIME and attachments used to be content-addressed and shared by identical
+deliveries, which would have needed reference counting with races between a
+new delivery and object deletion. New deliveries store them per receipt
+(`raw/<receipt>`, `attachments/<receipt>/<index>`); projections were already
+per message. A message then owns its objects outright.
+
+`DELETE /mail/messages/:id` (session-scoped, same-origin) proceeds in two steps:
+
+1. **Mark.** One transaction marks the receipt `deleted`, removes its inbox
+   order key, appends the sync tombstone and records a durable purge intent.
+   Lookups check the mark, so the message vanishes from listing, search and
+   attachment routes immediately.
+2. **Purge.** Deletes the search document (`{kind: "delete"}` mutation),
+   deletes the owned R2 objects and reduces the receipt to a tombstone. It
+   runs inline; on failure the queue (`purge` hints) and the scheduled sweep
+   retry it from the intent.
+
+A deletion can race an ingest of the same message. Each ingest transaction
+checks for the mark. Objects the ingest wrote after the mark are recorded on
+the receipt, and the purge is re-armed if the ingest's upsert may have landed
+after the purge. Purge mutations are idempotent by operation id, so each
+re-arm uses a new attempt number. Legacy content-addressed objects may be
+shared and are retained.
 
 ### Embeddings
 
@@ -252,6 +281,8 @@ only the server APIs are stubbed.
 - Device-only searches ("how much do I owe the plumber", "when does my plane
   leave", "weekend noodle plans with friends") each ranked the right message
   first, in about 3 s.
+- Deleting a message in the UI removed it from on-device search at once. A
+  deletion made on another device reached this device as a sync tombstone.
 - After a reload the copy reopened from OPFS without re-indexing, and the
   next query was also correct.
 
@@ -294,5 +325,6 @@ Limits and remaining work:
   message on this host, so a large mailbox's first sync takes a long time.
   It runs in the background and resumes after reloads.
 - **Build memory.** The embedded database WASM link needs about 20 GiB.
-- **Deletes and edits** are not synchronized, because the app has no
-  deletion yet.
+- **Deletion is permanent.** There is no trash, undo or retention policy, and
+  objects stored before per-delivery keys are retained when their message is
+  deleted.

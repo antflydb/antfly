@@ -55,6 +55,9 @@ const mail = [
   })
 );
 let syncCalls = 0;
+// The server's sync log: message upserts, then deletion tombstones appended later.
+const log = mail.map((message) => ({ message }));
+const deletedIds = new Set();
 
 async function file(path) {
   try {
@@ -71,8 +74,24 @@ const server = createServer(async (request, response) => {
   if (url.pathname === "/mail/sync") {
     syncCalls++;
     const after = Number(url.searchParams.get("cursor") || 0);
-    const page = mail.slice(after, after + 3);
-    return send(200, JSON.stringify({ messages: page, cursor: String(after + page.length), more: after + page.length < mail.length }));
+    const entries = log.slice(after, after + 3);
+    return send(200, JSON.stringify({
+      messages: entries.filter((e) => e.message && !deletedIds.has(e.message.id)).map((e) => e.message),
+      deleted: entries.filter((e) => e.deleted).map((e) => e.deleted),
+      cursor: String(after + entries.length),
+      more: after + entries.length < log.length,
+    }));
+  }
+  const messageRoute = /^\/mail\/messages\/([a-f0-9-]{36})$/.exec(url.pathname);
+  if (messageRoute) {
+    const message = mail.find((m) => m.id === messageRoute[1] && !deletedIds.has(m.id));
+    if (!message) return send(404, JSON.stringify({ error: "NotFound" }));
+    if (request.method === "DELETE") {
+      deletedIds.add(message.id);
+      log.push({ deleted: message.id });
+      return send(200, JSON.stringify({ id: message.id, deleted: true }));
+    }
+    return send(200, JSON.stringify(message));
   }
   if (url.pathname.startsWith("/local/models/")) {
     const body = await file(join(modelDir, url.pathname.slice("/local/models/".length)));
@@ -136,6 +155,32 @@ try {
   const [first] = await deviceSearch("do I have mandatory compliance training");
   assert.equal(first, "Quarterly security training reminder");
   console.log(`[${elapsed()}] after reload, from OPFS: "do I have mandatory compliance training" -> ${first}`);
+  // Deleting in the UI removes the message from this device at once.
+  await deviceSearch("how much do I owe the plumber");
+  await page.click("#messages .mail-row");
+  await page.waitForSelector("#message button.danger");
+  await page.click("#message button.danger");
+  await page.waitForFunction(() => document.getElementById("message").textContent === "Message deleted.");
+  let results = await deviceSearch("how much do I owe the plumber");
+  assert.ok(!results.includes("Invoice #4471 from Rapid Plumbing"), `deleted message is gone: ${results.join(" / ")}`);
+  assert.match(await page.textContent("#local-badge"), /4 messages on this device/);
+  console.log(`[${elapsed()}] deleted in the UI -> gone from on-device search (${results.length} left)`);
+
+  // A deletion made elsewhere (another device) arrives as a sync tombstone.
+  const flight = mail.find((m) => m.subject.startsWith("Your flight")).id;
+  deletedIds.add(flight);
+  log.push({ deleted: flight });
+  await page.evaluate(() => (document.getElementById("local").open = true)); // collapsed after the reload
+  await page.click("#local-sync");
+  await page
+    .waitForFunction(() => /3 messages on this device/.test(document.getElementById("local-badge").textContent), null, { timeout: 120_000 })
+    .catch(async (error) => {
+      const debug = await page.evaluate(() => [document.getElementById("local-status").textContent, document.getElementById("status").textContent, document.getElementById("local-badge").textContent]);
+      throw new Error(`tombstone sync did not finish: ${JSON.stringify(debug)} ${errors.join(" | ")}`, { cause: error });
+    });
+  results = await deviceSearch("when does my plane leave");
+  assert.ok(!results.includes("Your flight to Lisbon is confirmed"), `tombstoned message is gone: ${results.join(" / ")}`);
+  console.log(`[${elapsed()}] deleted on another device -> removed here by sync (${results.length} left)`);
   assert.deepEqual(errors.filter((e) => !/favicon/.test(e)), [], "no page or console errors");
 } finally {
   await browser.close();

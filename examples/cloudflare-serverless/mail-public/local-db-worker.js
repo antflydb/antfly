@@ -77,6 +77,14 @@ async function work(fn) {
   }
 }
 
+function localCopy(id) {
+  try {
+    return Boolean(api.lookup(localSchema.key(id))?._source);
+  } catch {
+    return false;
+  }
+}
+
 function state() {
   try {
     return api.lookup(STATE)._source ?? null;
@@ -125,16 +133,37 @@ const handlers = {
 
   // Apply one synced page. Messages and the next cursor are one batch, so a
   // reload resumes exactly after the last page the database committed.
-  async apply({ messages, vectors, cursor }) {
+  async apply({ messages, vectors, cursor, deleted = [] }) {
     if (!api) throw Error("LocalIndexClosed");
     if (messages.length !== vectors.length) throw Error("LocalVectorMismatch");
     const previous = state() ?? {};
-    const next = { ...previous, cursor, messages: (previous.messages ?? 0) + messages.length, synced_at: Date.now() };
+    // Count only copies that exist here, so the message total stays exact.
+    const removed = deleted.filter((id) => localCopy(id)).map((id) => localSchema.key(id));
+    const fresh = messages.filter((message) => !localCopy(message.id)).length;
+    const next = {
+      ...previous,
+      cursor,
+      messages: Math.max(0, (previous.messages ?? 0) + fresh - removed.length),
+      synced_at: Date.now(),
+    };
     const inserts = { [STATE]: next };
     messages.forEach((message, i) => {
       inserts[localSchema.key(message.id)] = documentFor(message, vectors[i]);
     });
-    await work(() => api.batch({ inserts }));
+    await work(() => api.batch({ inserts, ...(removed.length ? { deletes: removed } : {}) }));
+    await work(() => api.runUntilIdle());
+    return status(next);
+  },
+
+  // Drop messages the user just deleted, without waiting for the next sync
+  // (which will also carry their tombstones).
+  async forget({ ids = [] }) {
+    if (!api) throw Error("LocalIndexClosed");
+    const removed = ids.filter((id) => localCopy(id)).map((id) => localSchema.key(id));
+    if (!removed.length) return status();
+    const previous = state() ?? {};
+    const next = { ...previous, messages: Math.max(0, (previous.messages ?? 0) - removed.length) };
+    await work(() => api.batch({ inserts: { [STATE]: next }, deletes: removed }));
     await work(() => api.runUntilIdle());
     return status(next);
   },

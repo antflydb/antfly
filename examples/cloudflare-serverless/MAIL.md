@@ -18,12 +18,15 @@ Implemented:
   `MAIL_SENDS_PER_HOUR`). Unknown submissions are never automatically resent.
 - Queue replay and restart-safe receipt/projection state, with periodic bounded
   reconciliation of pending work.
+- Message deletion: a message disappears from the inbox, search and every
+  on-device copy, and its stored MIME, attachments and search document are
+  purged.
 - An installable PWA with opt-in on-device semantic search (see below).
 
 This is webmail, with no IMAP/POP server or Gmail synchronization. Mailboxes are
 currently private per-user inboxes; shared mailbox memberships, folders/drafts,
-mailbox deletion/retention controls and delivery-event reconciliation are future
-work. Account deletion is disabled in this app until the mailbox lifecycle is
+mailbox deletion/retention controls (trash, undo, automatic expiry) and
+delivery-event reconciliation are future work. Account deletion is disabled in this app until the mailbox lifecycle is
 implemented. The generic auth adapter retains its own account-deletion support.
 
 ## On-device search (PWA)
@@ -100,8 +103,8 @@ Limits:
   takes time. It runs in the background and resumes after reloads.
 - The on-device copy can be open in one tab at a time, because OPFS access
   handles are exclusive. Other tabs fall back to server search.
-- Deleted or edited messages are not synchronized yet, because the app has no
-  deletion.
+- Deletions reach a device at its next sync (immediately on the device that
+  deleted). Messages are never edited, so there is nothing else to propagate.
 
 ## Local setup
 
@@ -188,8 +191,25 @@ The queue adopts one immutable projection and submits an idempotent native WAL
 mutation keyed by the receipt, then publishes the index. A compare-and-delete
 publication hint prevents an older publisher from erasing a newer commit's work.
 
-SMTP invocations receive separate delivery receipts. Content hashes deduplicate
-bytes, not distinct deliveries. Repeated RFC Message-IDs and identical messages
+SMTP invocations receive separate delivery receipts. Raw MIME and attachments
+are stored per delivery (`raw/<receipt>`, `attachments/<receipt>/<index>`) so a
+deleted message's bytes can be removed without reference counting; content
+hashes still verify every object.
+
+Deleting a message (`DELETE /mail/messages/:id`) works in two steps:
+
+1. **Mark.** One metadata transaction marks the receipt deleted, removes it
+   from the inbox order, appends a sync tombstone and records a purge intent.
+   The message is then hidden from listing, lookup, search and attachment
+   download.
+2. **Purge.** The message's search document is removed and the R2 objects it
+   owns are deleted. Only then is the receipt reduced to a small tombstone.
+
+The purge runs inline, and the queue and the scheduled sweep retry it until it
+completes. A deletion racing an in-flight ingest re-arms the purge, with a new
+mutation id, for anything the ingest writes afterwards. Objects written before
+per-delivery keys (`raw/<sha256>`, `attachments/<sha256>`) may be shared by
+identical deliveries and are left in place. Repeated RFC Message-IDs and identical messages
 remain separate deliveries; absent a provider delivery ID, SMTP re-delivery
 cannot be distinguished perfectly from a legitimate identical message. Queue
 replays of an existing receipt do not duplicate it. Ambiguous thread parents

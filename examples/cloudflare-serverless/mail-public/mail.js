@@ -79,9 +79,9 @@ function status(text, error = false) {
   $("status").textContent = text;
   $("status").classList.toggle("error", error);
 }
-async function api(path, body) {
+async function api(path, body, method = body ? "POST" : "GET") {
   const result = await fetch(path, {
-    method: body ? "POST" : "GET",
+    method,
     headers: body ? { "Content-Type": "application/json" } : {},
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
@@ -181,6 +181,27 @@ async function openMessage(id) {
   const reply = text("button", "Reply");
   reply.onclick = () => edit(message);
   article.append(document.createElement("br"), reply);
+  // Deleting needs the server; an offline copy is read-only.
+  if (!message.offline) {
+    const remove = text("button", "Delete");
+    remove.className = "danger";
+    remove.onclick = guarded(() => deleteMessage(id));
+    article.append(remove);
+  }
+}
+async function deleteMessage(id) {
+  if (!confirm("Delete this message? It is removed from your mailbox, its attachments and every device's copy."))
+    return;
+  await api("/mail/messages/" + encodeURIComponent(id), null, "DELETE");
+  // The next sync also carries the deletion; drop the local copy right away.
+  if (local)
+    await local
+      .forget([id])
+      .then(() => localReady(local?.state))
+      .catch(() => {});
+  $("message").replaceChildren(text("p", "Message deleted."));
+  status("Message deleted.");
+  await load();
 }
 function edit(message) {
   replyTo = message?.id ?? null;

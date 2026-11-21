@@ -239,6 +239,7 @@ export class LocalMailIndex {
             this.state = await this.database.call("apply", {
               messages: page.messages,
               vectors,
+              deleted: page.deleted ?? [],
               cursor: page.cursor,
             });
           } catch (error) {
@@ -265,6 +266,12 @@ export class LocalMailIndex {
   async search(text, limit = 20) {
     const [vector] = await this.serial(() => this.embed([text], "RETRIEVAL_QUERY"));
     return this.database.call("search", { text, vector, limit });
+  }
+
+  /** Remove messages deleted on the server from this device right away. */
+  async forget(ids) {
+    this.state = await this.database.call("forget", { ids });
+    return this.state;
   }
 
   /** The locally stored message, for reading offline. */
