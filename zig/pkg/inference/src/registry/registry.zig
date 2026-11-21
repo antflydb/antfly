@@ -66,6 +66,7 @@ pub const ModelEntry = struct {
     /// Set when this candidate's manifest could not be read. The entry stays
     /// listed so one malformed directory never hides the others.
     load_error: ?anyerror = null,
+    installation_selection: ManagedSelection = .{},
 };
 
 const DiscoverKindMode = enum {
@@ -357,21 +358,35 @@ pub const ManagedSelection = struct {
     names: []const []const u8 = &.{},
     publication: ?[32]u8 = null,
     rejected: bool = false,
+    damaged: bool = false,
+    damaged_member: ?[]const u8 = null,
 };
 pub fn managedModelSelectorsAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) ![]const []const u8 {
     return (try managedModelSelectionAlloc(allocator, io, model_dir)).names;
 }
 pub fn managedModelSelectionAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) !ManagedSelection {
-    var receipt = (managed_receipt.loadValidated(allocator, io, model_dir) catch |err| {
+    return managedModelSelectionWithControl(allocator, io, model_dir, .{});
+}
+
+pub fn managedModelSelectionWithControl(allocator: std.mem.Allocator, io: Io, model_dir: []const u8, control: ExecutionControl) !ManagedSelection {
+    var receipt = (managed_receipt.loadValidatedWithControl(allocator, io, model_dir, control) catch |err| {
         // Candidate-local publication failures must not hide healthy models.
         // Allocation and operational I/O failures remain actionable.
         if (manifest_mod.isListingCandidateRejection(err)) return .{ .rejected = true };
         return err;
     }) orelse return .{};
     defer receipt.deinit();
-    const publication = receipt.publication_generation;
-    if (receipt.parsed.value.version != 2) return .{ .publication = publication };
-    const source = receipt.parsed.value.source orelse return .{ .publication = publication };
+    return managedModelSelectionFromReceipt(allocator, &receipt);
+}
+
+/// The caller owns a current, validated receipt for the selected installation.
+pub fn managedModelSelectionFromReceipt(allocator: std.mem.Allocator, receipt: *const managed_receipt.ValidatedReceipt) !ManagedSelection {
+    return managedModelSelectionFromDeclaration(allocator, receipt.parsed.value, receipt.publication_generation);
+}
+
+fn managedModelSelectionFromDeclaration(allocator: std.mem.Allocator, declaration: managed_receipt.DownloadReceipt, publication: [32]u8) !ManagedSelection {
+    if (declaration.version != 2) return .{ .publication = publication };
+    const source = declaration.source orelse return .{ .publication = publication };
     if (!hubRepoComponentIsSafe(source.owner) or !hubRepoComponentIsSafe(source.name) or !modelVariantIsSafe(source.variant)) return .{ .rejected = true };
     const selection = download.parseVariantRevision(source.variant) catch return .{ .rejected = true };
     var names = std.ArrayListUnmanaged([]const u8).empty;
@@ -427,27 +442,23 @@ pub const ModelRegistry = struct {
 
     /// Discover models in the models directory.
     pub fn discover(self: *ModelRegistry, io: Io) ![]ModelEntry {
-        return self.discoverWithKindMode(io, .manifest, .{});
+        return self.discoverWithKindMode(io, .manifest, null, .{});
     }
 
     /// Discover model paths without loading manifests to classify model kind.
     /// Callers that already load manifests should prefer this to avoid parsing
     /// every manifest twice on listing-style paths.
     pub fn discoverShallow(self: *ModelRegistry, io: Io) ![]ModelEntry {
-        return self.discoverWithKindMode(io, .path, .{});
+        return self.discoverWithKindMode(io, .path, null, .{});
     }
 
     /// Enumerate installation paths using literal storage names. Public
     /// selector ownership is derived separately, without parsing architecture.
-    pub fn discoverInstallations(self: *ModelRegistry, io: Io) ![]ModelEntry {
-        return self.discoverInstallationsWithControl(io, .{});
+    pub fn discoverInstallationsWithControl(self: *ModelRegistry, io: Io, selection_allocator: std.mem.Allocator, control: ExecutionControl) ![]ModelEntry {
+        return self.discoverWithKindMode(io, .installations, selection_allocator, control);
     }
 
-    pub fn discoverInstallationsWithControl(self: *ModelRegistry, io: Io, control: ExecutionControl) ![]ModelEntry {
-        return self.discoverWithKindMode(io, .installations, control);
-    }
-
-    fn discoverWithKindMode(self: *ModelRegistry, io: Io, kind_mode: DiscoverKindMode, control: ExecutionControl) ![]ModelEntry {
+    fn discoverWithKindMode(self: *ModelRegistry, io: Io, kind_mode: DiscoverKindMode, selection_allocator: ?std.mem.Allocator, control: ExecutionControl) ![]ModelEntry {
         var entries = std.ArrayListUnmanaged(ModelEntry).empty;
         errdefer {
             for (entries.items) |entry| {
@@ -463,8 +474,8 @@ pub const ModelRegistry = struct {
             seen.deinit(self.allocator);
         }
 
-        try self.discoverFlat(io, &entries, &seen, kind_mode, control);
-        try self.discoverLegacy(io, &entries, &seen, kind_mode, control);
+        try self.discoverFlat(io, &entries, &seen, kind_mode, selection_allocator, control);
+        try self.discoverLegacy(io, &entries, &seen, kind_mode, selection_allocator, control);
 
         return try entries.toOwnedSlice(self.allocator);
     }
@@ -475,6 +486,7 @@ pub const ModelRegistry = struct {
         entries: *std.ArrayListUnmanaged(ModelEntry),
         seen: *std.StringHashMapUnmanaged(void),
         kind_mode: DiscoverKindMode,
+        selection_allocator: ?std.mem.Allocator,
         control: ExecutionControl,
     ) !void {
         var dir = Dir.cwd().openDir(io, self.models_dir, .{ .iterate = true }) catch |err| switch (err) {
@@ -497,8 +509,8 @@ pub const ModelRegistry = struct {
             const entry_path = try std.fs.path.join(self.allocator, &.{ self.models_dir, entry.name });
             defer self.allocator.free(entry_path);
 
-            if (isModelDir(io, entry_path)) {
-                try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name, kind_mode, null);
+            if (try modelDirectorySelection(io, entry_path, selection_allocator, control)) |selection| {
+                try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name, kind_mode, null, selection);
                 continue;
             }
 
@@ -519,10 +531,10 @@ pub const ModelRegistry = struct {
                 if (model_entry_kind != .directory and model_entry_kind != .sym_link) continue;
                 const model_path = try std.fs.path.join(self.allocator, &.{ entry_path, model_entry.name });
                 defer self.allocator.free(model_path);
-                if (!isModelDir(io, model_path)) continue;
+                const selection = (try modelDirectorySelection(io, model_path, selection_allocator, control)) orelse continue;
                 const model_name = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ entry.name, model_entry.name });
                 defer self.allocator.free(model_name);
-                try self.appendDiscoveredModel(io, entries, seen, model_path, model_name, kind_mode, null);
+                try self.appendDiscoveredModel(io, entries, seen, model_path, model_name, kind_mode, null, selection);
             }
         }
     }
@@ -533,6 +545,7 @@ pub const ModelRegistry = struct {
         entries: *std.ArrayListUnmanaged(ModelEntry),
         seen: *std.StringHashMapUnmanaged(void),
         kind_mode: DiscoverKindMode,
+        selection_allocator: ?std.mem.Allocator,
         control: ExecutionControl,
     ) !void {
         const subdirs = [_]struct { dir: []const u8, kind: ModelKind }{
@@ -569,8 +582,8 @@ pub const ModelRegistry = struct {
                 if (entry_kind == .directory or entry_kind == .sym_link) {
                     const entry_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
                     defer self.allocator.free(entry_path);
-                    if (isModelDir(io, entry_path)) {
-                        try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name, kind_mode, subdir.kind);
+                    if (try modelDirectorySelection(io, entry_path, selection_allocator, control)) |selection| {
+                        try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name, kind_mode, subdir.kind, selection);
                     } else {
                         var owner_dir = Dir.cwd().openDir(io, entry_path, .{ .iterate = true }) catch |err| switch (err) {
                             error.FileNotFound, error.NotDir => continue,
@@ -589,12 +602,10 @@ pub const ModelRegistry = struct {
                             if (model_entry_kind == .directory or model_entry_kind == .sym_link) {
                                 const model_path = try std.fs.path.join(self.allocator, &.{ path, entry.name, model_entry.name });
                                 defer self.allocator.free(model_path);
-                                if (!isModelDir(io, model_path)) {
-                                    continue;
-                                }
+                                const selection = (try modelDirectorySelection(io, model_path, selection_allocator, control)) orelse continue;
                                 const model_name = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ entry.name, model_entry.name });
                                 defer self.allocator.free(model_name);
-                                try self.appendDiscoveredModel(io, entries, seen, model_path, model_name, kind_mode, subdir.kind);
+                                try self.appendDiscoveredModel(io, entries, seen, model_path, model_name, kind_mode, subdir.kind, selection);
                             }
                         }
                     }
@@ -883,6 +894,7 @@ pub const ModelRegistry = struct {
         display_name: []const u8,
         kind_mode: DiscoverKindMode,
         kind_hint: ?ModelKind,
+        selection: ManagedSelection,
     ) !void {
         if (seen.contains(model_path)) return;
 
@@ -926,6 +938,7 @@ pub const ModelRegistry = struct {
             .variant = "f32",
             .gliner_architecture = gliner_architecture,
             .load_error = load_error,
+            .installation_selection = selection,
         });
     }
 
@@ -2234,13 +2247,35 @@ fn synthesizePulledModelManifestJsonInternal(
 /// Check if a directory is a model directory (leaf) rather than an owner directory.
 /// A model dir contains config.json, tokenizer.json, genai_config.json, a GGUF file, or an onnx/ subdir.
 fn isModelDir(io: Io, path: []const u8) bool {
+    return (modelDirectorySelection(io, path, null, .{}) catch null) != null;
+}
+
+fn modelDirectorySelection(io: Io, path: []const u8, selection_allocator: ?std.mem.Allocator, control: ExecutionControl) !?ManagedSelection {
     const allocator = if (build_options.link_libc) std.heap.c_allocator else std.heap.smp_allocator;
-    var receipt = managed_receipt.loadValidated(allocator, io, path) catch return false;
+    var damaged: ?managed_receipt.DamagedReceipt = null;
+    defer if (damaged) |*candidate| candidate.parsed.deinit();
+    var receipt = (if (selection_allocator != null)
+        managed_receipt.loadValidatedForInventory(allocator, io, path, control, &damaged)
+    else
+        managed_receipt.loadValidatedWithControl(allocator, io, path, control)) catch |err| {
+        if (damaged) |candidate| {
+            var selection = try managedModelSelectionFromDeclaration(selection_allocator.?, candidate.parsed.value, candidate.publication);
+            if (selection.rejected) return null;
+            selection.damaged = true;
+            selection.damaged_member = if (candidate.member) |member| try selection_allocator.?.dupe(u8, member) else null;
+            return selection;
+        }
+        return switch (err) {
+            error.Cancelled, error.Timeout => err,
+            error.OutOfMemory => if (selection_allocator != null) err else null,
+            else => null,
+        };
+    };
     if (receipt) |*validated| {
-        validated.deinit();
+        defer validated.deinit();
         // Receipt validation already requires at least one supported model
         // payload, including payloads nested below the model root.
-        return true;
+        return if (selection_allocator) |a| try managedModelSelectionFromReceipt(a, validated) else .{};
     }
     const publicationStable = struct {
         fn check(alloc: std.mem.Allocator, check_io: Io, model_path: []const u8) bool {
@@ -2253,23 +2288,24 @@ fn isModelDir(io: Io, path: []const u8) bool {
         defer allocator.free(file_path);
         var f = Dir.cwd().openFile(io, file_path, .{}) catch continue;
         f.close(io);
-        return publicationStable(allocator, io, path);
+        return if (publicationStable(allocator, io, path)) .{} else null;
     }
     // Check for top-level .gguf file
-    var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return false;
+    var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return null;
     defer dir.close(io);
     var iter = dir.iterate();
     while (iter.next(io) catch null) |entry| {
+        try control.check();
         const entry_kind = resolvedEntryKind(dir, io, entry) catch continue;
         if (entry_kind == .file and std.mem.endsWith(u8, entry.name, ".gguf"))
-            return publicationStable(allocator, io, path);
+            return if (publicationStable(allocator, io, path)) .{} else null;
     }
     // Check for onnx/ subdirectory
-    const onnx_path = std.fs.path.join(allocator, &.{ path, "onnx" }) catch return false;
+    const onnx_path = std.fs.path.join(allocator, &.{ path, "onnx" }) catch return null;
     defer allocator.free(onnx_path);
-    var onnx_dir = Dir.cwd().openDir(io, onnx_path, .{}) catch return false;
+    var onnx_dir = Dir.cwd().openDir(io, onnx_path, .{}) catch return null;
     onnx_dir.close(io);
-    return publicationStable(allocator, io, path);
+    return if (publicationStable(allocator, io, path)) .{} else null;
 }
 
 test "parse model ref" {

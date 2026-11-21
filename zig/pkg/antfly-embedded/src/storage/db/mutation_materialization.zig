@@ -1916,6 +1916,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendDocumentUnitStoredChunkFullTextDocuments(alloc, view, doc_key, unit, documents);
         }
 
+        fn generatedDenseArtifactOrigin(source_hash: ?u64, text_input: bool, model_revision: ?[32]u8) EmbeddingArtifactOrigin {
+            if (model_revision) |revision| return .{ .pinned = .{ .source_hash = source_hash, .text_input = text_input, .revision = revision } };
+            return if (text_input) .{ .generated_text = source_hash } else .{ .generated = source_hash };
+        }
+
         pub fn appendEmbeddingArtifactWrite(
             alloc: Allocator,
             artifact_writes: anytype,
@@ -1940,6 +1945,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .authored => try enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(alloc, vector),
                 .generated => |hash| try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, vector),
                 .generated_text => |hash| try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, hash, true, vector),
+                .pinned => |pin| try enrichment_artifact_codec.encodeProducedDenseEmbeddingAtRevisionAlloc(alloc, pin.source_hash, pin.text_input, pin.revision, vector),
             };
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
@@ -3080,6 +3086,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const payload = switch (origin) {
                 .authored => try enrichment_artifact_codec.encodeAuthoredSparseEmbeddingAlloc(alloc, indices, values),
                 .generated, .generated_text => |hash| try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, indices, values),
+                .pinned => return error.InvalidBatchRequest,
             };
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
@@ -7317,6 +7324,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Every dense path participates in the preparation-wide generation
             // fence, including materialized and inline chunk batches.
             const generation = if (memo) |cache_memo| try cache_memo.generation(dense_embedder, embedding_name) else try dense_embedder.captureTextGeneration(alloc, embedding_name);
+            if (request.model_revision != null and !std.meta.eql(request.model_revision, generation.revision))
+                return error.EnrichmentSourceChanged;
             const pinned_embedder = dense_embedder.withTextGeneration(generation);
 
             if (requestUsesChunkSource(request)) {
@@ -7396,7 +7405,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (skip_unchanged_artifacts) {
                         const retained_key = try embeddingArtifactKeyForBaseAlloc(alloc, request.doc_key, embedding_name);
                         defer alloc.free(retained_key);
-                        if (try storedOrPendingEmbeddingSourceHashImpl(db, shared_pending_writes, retained_key, request.expected_dims)) |existing_hash| {
+                        if (try storedOrPendingEmbeddingSourceHashImpl(db, shared_pending_writes, retained_key, request.expected_dims, request.model_revision)) |existing_hash| {
                             if (existing_hash == source_hash) {
                                 try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
                                 try appendForConsumers(alloc, dense_embeddings, request.doc_key, null, retained_key, &.{}, consumer_indexes);
@@ -7415,10 +7424,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         embedding_name,
                         request.source_field,
                         null,
-                        if (enrichment_runtime_mod.partsAreText(parts) and try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value))
-                            .{ .generated_text = source_hash }
-                        else
-                            .{ .generated = source_hash },
+                        generatedDenseArtifactOrigin(source_hash, enrichment_runtime_mod.partsAreText(parts) and try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value), request.model_revision),
                         vector,
                     );
                     defer alloc.free(artifact_key);
@@ -7446,7 +7452,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, request.doc_key, embedding_name);
                 defer alloc.free(artifact_key);
                 const source_hash = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision);
-                if (try storedOrPendingEmbeddingSourceHashImpl(db, shared_pending_writes, artifact_key, request.expected_dims)) |existing_hash| {
+                if (try storedOrPendingEmbeddingSourceHashImpl(db, shared_pending_writes, artifact_key, request.expected_dims, request.model_revision)) |existing_hash| {
                     if (existing_hash == source_hash) {
                         try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
                         try appendForConsumers(alloc, dense_embeddings, request.doc_key, null, artifact_key, &.{}, consumer_indexes);
@@ -7491,7 +7497,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 embedding_name,
                 request.source_field,
                 null,
-                if (try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value)) .{ .generated_text = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision) } else .{ .generated = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision) },
+                generatedDenseArtifactOrigin(enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision), try @import("../../template_inspection.zig").canReplayLocally(alloc, request.source_template, doc_value), request.model_revision),
                 vector,
             );
             defer alloc.free(artifact_key);
@@ -13443,7 +13449,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             pending_writes: ?*const PendingArtifactWriteIndex,
             artifact_key: []const u8,
         ) !?u64 {
-            return storedOrPendingEmbeddingSourceHashImpl(db, pending_writes, artifact_key, null);
+            return storedOrPendingEmbeddingSourceHashImpl(db, pending_writes, artifact_key, null, null);
         }
 
         fn storedOrPendingEmbeddingSourceHashImpl(
@@ -13451,12 +13457,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             pending_writes: ?*const PendingArtifactWriteIndex,
             artifact_key: []const u8,
             expected_dims: ?u32,
+            model_revision: ?[32]u8,
         ) !?u64 {
             if (pending_writes) |index| {
                 if (index.get(artifact_key)) |value| {
                     if (expected_dims) |dims| {
                         const metadata = @import("../artifact_payload.zig").Metadata.decode(value) catch return null;
-                        if (metadata.dense_dimensions != dims) return null;
+                        if (metadata.dense_dimensions != dims or (model_revision != null and !std.meta.eql(metadata.model_revision, model_revision))) return null;
                     }
                     return enrichment_artifact_codec.sourceHash(value) catch null;
                 }
@@ -13472,7 +13479,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 => return null,
                 else => return err,
             };
-            if (expected_dims) |dims| if (metadata.dense_dimensions != dims) return null;
+            if (expected_dims) |dims| if (metadata.dense_dimensions != dims or (model_revision != null and !std.meta.eql(metadata.model_revision, model_revision))) return null;
             return metadata.sourceHash();
         }
 

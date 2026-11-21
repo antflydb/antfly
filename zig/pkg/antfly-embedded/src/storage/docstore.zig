@@ -3920,6 +3920,7 @@ pub const DocStore = struct {
 
     pub const ScanOptions = struct {
         physical_payloads: bool = false,
+        keys_only: bool = false,
         /// Return true to skip this key (callback not invoked).
         skip_fn: ?*const fn (key: []const u8) bool = null,
         reverse: bool = false,
@@ -4137,6 +4138,20 @@ pub const DocStore = struct {
         max_items: usize,
         max_bytes: usize,
     ) !backend_scan.RangePage {
+        return self.scanReadTxnPageWithOptions(alloc, txn, lower, lower_exclusive, upper, max_items, max_bytes, .{});
+    }
+
+    pub fn scanReadTxnPageWithOptions(
+        self: *DocStore,
+        alloc: Allocator,
+        txn: *Txn,
+        lower: []const u8,
+        lower_exclusive: bool,
+        upper: []const u8,
+        max_items: usize,
+        max_bytes: usize,
+        options: ScanOptions,
+    ) !backend_scan.RangePage {
         if (max_items == 0 or max_bytes == 0) return error.InvalidArgument;
         const Context = struct {
             alloc: Allocator,
@@ -4175,7 +4190,7 @@ pub const DocStore = struct {
             }
             ctx.items.deinit(alloc);
         }
-        try self.scanReadTxnWithContext(txn, lower, upper, .{}, &ctx, Context.visit);
+        try self.scanReadTxnWithContext(txn, lower, upper, options, &ctx, Context.visit);
         return .{ .items = try ctx.items.toOwnedSlice(alloc), .reached_end = ctx.reached_end };
     }
 
@@ -4189,7 +4204,12 @@ pub const DocStore = struct {
         callback: ScanWithContextCallback,
     ) !void {
         _ = self;
-        var cur = if (options.physical_payloads) try txn.openPhysicalCursorAdapter() else try txn.openCursor();
+        var cur = if (options.keys_only)
+            try txn.openPhysicalKeyCursorAdapter()
+        else if (options.physical_payloads)
+            try txn.openPhysicalCursorAdapter()
+        else
+            try txn.openCursor();
         defer cur.close();
         if (!options.reverse) {
             cur.setUpperBound(if (upper.len > 0) upper else null);

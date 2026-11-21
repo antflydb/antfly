@@ -36125,6 +36125,8 @@ components:
 
             Use when you've already generated embeddings on the client side to avoid redundant embedding
             calls.
+
+            Revision-pinned embedding indexes require semantic_search and reject pre-computed vectors.
           additionalProperties:
             $ref: '#/components/schemas/Embedding'
         search_effort:
@@ -42327,6 +42329,12 @@ components:
 
         Models are loaded from the `models/embedders/{name}/` directory.
       properties:
+        model_revision:
+          type: string
+          pattern: ^[0-9a-fA-F]{64}$
+          description: Physical hosted embedding model revision advertised by scoped inference discovery.
+            Supported for managed dense embeddings with distributed ordered vector publication. To change
+            revisions, build a new index and finish backfill before switching the serving alias.
         model_identity:
           type: string
           pattern: ^[0-9a-f]{64}$

@@ -102,6 +102,24 @@ pub const ExternalDataInfo = struct {
     location: []const u8 = "", // path relative to model directory
     offset: i64 = 0,
     length: i64 = -1, // -1 means read all remaining
+
+    pub fn apply(self: *ExternalDataInfo, key: []const u8, value: []const u8) void {
+        if (std.mem.eql(u8, key, "location")) {
+            self.location = value;
+        } else if (std.mem.eql(u8, key, "offset")) {
+            self.offset = std.fmt.parseInt(i64, value, 10) catch 0;
+        } else if (std.mem.eql(u8, key, "length")) {
+            self.length = std.fmt.parseInt(i64, value, 10) catch -1;
+        }
+    }
+
+    pub fn validateRange(self: ExternalDataInfo, file_size: u64) !void {
+        if (self.offset < 0) return error.InvalidExternalOffset;
+        const offset: u64 = @intCast(self.offset);
+        if (offset > file_size) return error.ExternalRegionOutOfBounds;
+        if (self.length >= 0 and @as(u64, @intCast(self.length)) > file_size - offset)
+            return error.ExternalRegionOutOfBounds;
+    }
 };
 
 pub const TensorProto = struct {
@@ -140,15 +158,7 @@ pub const TensorProto = struct {
     /// Parse external_data key-value pairs into structured info.
     pub fn externalDataInfo(self: *const TensorProto) ExternalDataInfo {
         var info = ExternalDataInfo{};
-        for (self.external_data) |entry| {
-            if (std.mem.eql(u8, entry.key, "location")) {
-                info.location = entry.value;
-            } else if (std.mem.eql(u8, entry.key, "offset")) {
-                info.offset = std.fmt.parseInt(i64, entry.value, 10) catch 0;
-            } else if (std.mem.eql(u8, entry.key, "length")) {
-                info.length = std.fmt.parseInt(i64, entry.value, 10) catch -1;
-            }
-        }
+        for (self.external_data) |entry| info.apply(entry.key, entry.value);
         return info;
     }
 

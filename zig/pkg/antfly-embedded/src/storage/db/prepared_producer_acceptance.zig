@@ -271,6 +271,15 @@ pub const Prepared = struct {
                 source_record.* = .{ .document_key = request.doc_key, .content_digest = source_digest, .timestamp = timestamp, .input_position = null };
                 const name = if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requests.requestEmbeddingName(request) else requests.requestArtifactName(request);
                 const mutations = by_scope.get(scopeIdentity(request.doc_key, name)) orelse std.ArrayList(publication.Mutation).empty;
+                if (request.model_revision) |pin| {
+                    if (!std.meta.eql(revision, request.model_revision)) return error.EnrichmentSourceChanged;
+                    for (mutations.items) |mutation| {
+                        const value = mutation.value orelse continue;
+                        if (mutation.family != .base_vector or
+                            !std.meta.eql(try @import("enrichment/artifact_codec.zig").denseEmbeddingModelRevision(value), @as(?[32]u8, pin)))
+                            return error.InvalidBatchRequest;
+                    }
+                }
                 std.mem.sort(publication.Mutation, mutations.items, {}, struct {
                     fn less(_: void, x: publication.Mutation, y: publication.Mutation) bool {
                         return std.mem.order(u8, x.key, y.key) == .lt;

@@ -1663,7 +1663,6 @@ pub const Backend = struct {
     root_writer_lock: ?storage_io.NativePathLock = null,
     wal_operation_lock_file: ?storage_io.NativePathLockFile = null,
     storage_owner: ?*storage_io.NativeStorage = null,
-    native_storage_owner_transferred: bool = false,
     storage: ?storage_io.Storage = null,
     manifest_backing: ?[]u8 = null,
     recovered_manifest: ?@import("lsm_backend/manifest_replay.zig").RecoveryState = null,
@@ -1982,12 +1981,16 @@ pub const Backend = struct {
     }
 
     pub fn close(self: *Backend) void {
+        self.closeWithNativeStorageDestination(null);
+    }
+
+    fn closeWithNativeStorageDestination(self: *Backend, destination: ?*?*storage_io.NativeStorage) void {
         self.closing.store(true, .release);
         self.detachLocalBlockCacheReclaimer();
         self.background_executor.drain();
         self.waitForGenerationReadersToDrain();
         self.releaseTrackedResourceUsage();
-        recovery_mod.close(Backend, self);
+        recovery_mod.close(Backend, self, destination);
     }
 
     pub fn abandonAfterCrash(self: *Backend) void {
@@ -2806,22 +2809,11 @@ pub const Backend = struct {
         return owner.snapshotStats();
     }
 
-    /// Retains the internally-created native storage after this LSM backend is
-    /// closed. Backends using a caller-owned Storage return null; that caller
-    /// already owns the required lifetime.
+    /// Supplies a shareable native storage view for the successor backend.
+    /// The owner must also move at close to continue admitting new handles.
     pub fn acquireNativeStorageLease(self: *Backend) !?storage_io.NativeStorage.Lease {
         const owner = self.storage_owner orelse return null;
         return try owner.acquireLease();
-    }
-
-    /// Move destruction responsibility to a successor while the LSM still
-    /// borrows the runtime during its shutdown. The successor must outlive
-    /// shutdown and close the transferred owner with the page allocator.
-    pub fn transferNativeStorageOwnership(self: *Backend) ?*storage_io.NativeStorage {
-        const owner = self.storage_owner orelse return null;
-        std.debug.assert(!self.native_storage_owner_transferred);
-        self.native_storage_owner_transferred = true;
-        return owner;
     }
 
     pub fn maintenanceDebtHint(self: *const Backend) u64 {
@@ -9416,6 +9408,12 @@ pub const BackendHandle = struct {
     }
 
     pub fn close(self: *BackendHandle) void {
+        self.closeWithNativeStorageDestination(null);
+    }
+
+    /// Transfer locally allocated storage after draining legacy users. The
+    /// destination becomes responsible for destroying it with the page allocator.
+    pub fn closeWithNativeStorageDestination(self: *BackendHandle, destination: ?*?*storage_io.NativeStorage) void {
         if (self.internal_flush_worker) |worker| {
             worker.stopAndJoin(true);
             self.backend.options.maintenance_waker = null;
@@ -9423,7 +9421,7 @@ pub const BackendHandle = struct {
             self.allocator.destroy(worker);
             self.internal_flush_worker = null;
         }
-        self.backend.close();
+        self.backend.closeWithNativeStorageDestination(destination);
         self.allocator.destroy(self.backend);
         if (self.background_runtime) |*runtime| runtime.deinit();
         self.* = undefined;

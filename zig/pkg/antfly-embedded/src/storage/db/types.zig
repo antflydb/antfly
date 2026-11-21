@@ -1230,8 +1230,19 @@ pub const TextQuery = union(enum) {
     }
 };
 
+/// Optional physical model revision carried by a durable embedding producer.
+pub fn embeddingProducerModelRevision(object: std.json.ObjectMap) !?[32]u8 {
+    const revision = object.get("model_revision") orelse return null;
+    if (revision != .string or revision.string.len != 64) return error.InvalidEmbeddingArtifactProducer;
+    var digest: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, revision.string) catch return error.InvalidEmbeddingArtifactProducer;
+    return digest;
+}
+
 pub const DenseKnnQuery = struct {
     vector: []const f32,
+    // Pinned indexes require a managed query planned for the same model revision.
+    model_revision_fence: ?[32]u8 = null,
     k: u32 = 10,
 };
 

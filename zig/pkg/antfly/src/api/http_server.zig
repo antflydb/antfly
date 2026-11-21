@@ -1942,6 +1942,7 @@ pub const SemanticStatusResolver = struct {
             .ptr = self,
             .vtable = &.{
                 .bind_index_aliases = bindIndexAliases,
+                .validate_dense_inputs = validateDenseInputs,
                 .resolve_dense_query = resolveDenseQuery,
             },
         };
@@ -1982,6 +1983,40 @@ pub const SemanticStatusResolver = struct {
             try fence.object.put(a, "incarnation", .{ .integer = @intCast(identity.incarnation) });
         };
         return .{ .body = try std.json.Stringify.valueAlloc(alloc, query, .{}), .indexes_json = if (owned_compact) compact else null };
+    }
+
+    fn validateDenseInputs(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest) !void {
+        const unverified_primary = if (req.dense) |dense| dense.model_revision_fence == null else false;
+        const unverified_knn = req.query == .dense_knn and req.query.dense_knn.model_revision_fence == null;
+        const unverified_named = for (req.dense_queries) |dense| {
+            if (dense.query.model_revision_fence == null) break true;
+        } else false;
+        if (!unverified_primary and !unverified_knn and !unverified_named) return;
+
+        const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const indexes_json = self.pinned_indexes_json orelse self.statement_indexes_json orelse indexes: {
+            const server = self.server orelse return;
+            const table = (try server.queryTableDefinition(if (self.catalog_resolver) |resolver| resolver.arena else a, self.catalog_resolver, table_name, .{
+                .deadline_ns = self.query_embedding_deadline_ns,
+                .cancellation = self.query_cancellation orelse .none,
+            })) orelse return;
+            break :indexes table.indexes_json;
+        };
+        if (!table_index_config.mayContainModelRevision(indexes_json)) return;
+        const catalog = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
+        if (catalog != .object) return error.InvalidTableIndexMetadata;
+        if (unverified_primary or unverified_knn) if (req.index_name) |name| {
+            if (catalog.object.get(name)) |config| if (try table_index_config.indexHasModelRevisionPin(a, config))
+                return error.PinnedIndexRequiresSemanticSearch;
+        };
+        for (req.dense_queries) |dense| {
+            if (dense.query.model_revision_fence != null) continue;
+            if (catalog.object.get(dense.index_name)) |config| if (try table_index_config.indexHasModelRevisionPin(a, config))
+                return error.PinnedIndexRequiresSemanticSearch;
+        }
     }
 
     fn resolveDenseQuery(
@@ -4752,7 +4787,16 @@ pub const ApiHttpServer = struct {
         request: api_operation.RequestContext,
         uses_artifact_sources: bool,
     ) ArtifactSourcesAdmissionError!void {
-        if (!uses_artifact_sources) return;
+        return self.admitArtifactSourcesForModelPin(request, uses_artifact_sources, false);
+    }
+
+    fn admitArtifactSourcesForModelPin(
+        self: *ApiHttpServer,
+        request: api_operation.RequestContext,
+        uses_artifact_sources: bool,
+        model_pin: bool,
+    ) ArtifactSourcesAdmissionError!void {
+        if (!uses_artifact_sources and !model_pin) return;
         if (self.cfg.deployment_mode == .serverless)
             return error.UnsupportedArtifactIndexSources;
         if (self.cfg.deployment_mode != .distributed) return;
@@ -4765,6 +4809,13 @@ pub const ApiHttpServer = struct {
         defer self.source.freeAdminSnapshot(&snapshot);
         if (!artifactSourcesSupportedBySnapshot(&snapshot))
             return error.ArtifactIndexSourcesTemporarilyUnavailable;
+        if (model_pin) for (snapshot.stores) |store| {
+            if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
+            if (!metadata_table_manager.pinnedEmbeddingProtocolSupported(
+                store.reporter_incarnation,
+                store.artifact_sources_protocol_version,
+            )) return error.ArtifactIndexSourcesTemporarilyUnavailable;
+        };
     }
 
     pub fn ensureIndexAliasAdmission(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
@@ -15342,6 +15393,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedNodeFilterQuery => return error.UnsupportedNodeFilterQuery,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
+            error.PinnedIndexRequiresSemanticSearch => return error.PinnedIndexRequiresSemanticSearch,
             error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.Timeout => return error.Timeout,
@@ -15721,6 +15773,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedNodeFilterQuery,
                 error.UnsupportedFilterQueryRequest,
                 error.UnsupportedExclusionQueryRequest,
+                error.PinnedIndexRequiresSemanticSearch,
                 => return err,
                 // Seeded personalization is a request-shape contract: seeds
                 // require fresh reads and a pagerank metric. Surface both as
@@ -15934,6 +15987,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedNodeFilterQuery,
             error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest,
+            error.PinnedIndexRequiresSemanticSearch,
             => return err,
             // Seeded personalization is a request-shape contract: seeds
             // require fresh reads and a pagerank metric. Surface both as
@@ -18268,6 +18322,8 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(expanded_index_json);
+        const model_pin = table_index_config.hasModelRevisionPin(alloc, expanded_index_json, false) catch return error.InvalidIndexRequest;
+        if (model_pin and (self.cfg.deployment_mode != .distributed or external_table or table_before.storage.engine != .local)) return error.InvalidIndexRequest;
         const normalized_index_json = table_index_config.normalizeManagedEmbeddingIndexDimensionForCatalogJsonWithOptions(
             alloc,
             index_name,
@@ -18321,7 +18377,7 @@ pub const ApiHttpServer = struct {
         };
 
         const uses_artifact_sources = indexes_api.indexConfigUsesArtifactSources(alloc, normalized_index_json) catch return error.InvalidIndexRequest;
-        try self.admitArtifactSources(request, uses_artifact_sources);
+        try self.admitArtifactSourcesForModelPin(request, uses_artifact_sources, model_pin);
 
         const destination_principal = if (request.destination_authorization_principal.len > 0)
             request.destination_authorization_principal
@@ -18346,7 +18402,7 @@ pub const ApiHttpServer = struct {
         // through consensus and used as the projection expectation, making the
         // operation idempotent across retries and leadership changes.
         const assembled_indexes_json = indexes_api.addIndexToTableIndexesJsonWithIo(alloc, self.inferenceIo(), table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
-            error.IndexAliasNameConflict, error.IndexReferencedByAlias => return error.Conflict,
+            error.IndexAliasNameConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex => return error.Conflict,
             error.PrivacyManagedGraph => return error.Conflict,
             error.PrivacyUnsupportedIndexType,
             error.PrivacyExternalEmbeddingsUnsupported,
@@ -18442,7 +18498,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -18845,7 +18901,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject, error.UnsupportedOperation => return error.MethodNotAllowed,
             else => return if (metadata_authority.isRetryableError(err)) error.NotLeader else error.InternalFailure,
         };
@@ -18880,7 +18936,7 @@ pub const ApiHttpServer = struct {
                 external_table = schema.external_base_source != null;
             }
             if (@import("relational_index_mutation.zig").drop(alloc, before, index_name) catch |err| switch (err) {
-                error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+                error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
                 else => return error.InternalFailure,
             }) |replacement| {
                 defer metadata_table_manager.freeTable(alloc, replacement);
@@ -18902,7 +18958,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
-            error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.PrivacyUnknownArtifactSource,
@@ -19097,7 +19153,7 @@ pub const ApiHttpServer = struct {
         self.source.replaceTableDefinition(table_before, replacement) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
@@ -19159,7 +19215,7 @@ pub const ApiHttpServer = struct {
         self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
-            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexModelRevisionChangeRequiresNewIndex, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidEnrichmentConfig,
@@ -23473,6 +23529,16 @@ pub const ApiHttpServer = struct {
         };
         if (request.schema_json) |old| self.alloc.free(old);
         request.schema_json = bound_schema;
+        const model_pin = table_index_config.hasModelRevisionPin(self.alloc, request.indexes_json orelse tables_api.default_indexes_json, true) catch
+            return try contextual_operations.textAlloc(self.alloc, 400, "invalid table index configuration");
+        if (model_pin) {
+            var pinned_schema = schema_mod.parseValidatedTableSchema(self.alloc, bound_schema) catch
+                return try contextual_operations.textAlloc(self.alloc, 400, "invalid table schema");
+            defer pinned_schema.deinit(self.alloc);
+            if (self.cfg.deployment_mode != .distributed or pinned_schema.external_base_source != null or
+                (request.storage != null and request.storage.?.engine != .local))
+                return try contextual_operations.textAlloc(self.alloc, 400, "model revision pinning requires distributed ordered vector publication");
+        }
         const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
             self.alloc,
             request.indexes_json orelse tables_api.default_indexes_json,
@@ -23527,7 +23593,7 @@ pub const ApiHttpServer = struct {
             self.alloc,
             request.indexes_json orelse tables_api.default_indexes_json,
         ) catch return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
-        self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
+        self.admitArtifactSourcesForModelPin(.{}, uses_artifact_sources, model_pin) catch |err| return switch (err) {
             error.UnsupportedArtifactIndexSources => try contextualUnsupportedArtifactSourcesResponse(self.alloc),
             error.ArtifactIndexSourcesTemporarilyUnavailable => try contextualArtifactSourcesUpgradePendingResponse(self.alloc),
             error.Canceled, error.DeadlineExceeded => return err,
@@ -24394,6 +24460,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedNodeFilterQuery => try contextual_operations.textAlloc(self.alloc, 400, "unsupported graph node_filter.filter_query"),
             error.UnsupportedFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .unsupported),
             error.UnsupportedExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .unsupported),
+            error.PinnedIndexRequiresSemanticSearch => try contextual_operations.textAlloc(self.alloc, 400, public_table_http.pinned_index_query_message),
             error.UnsupportedExactSort => try contextualUnsupportedExactSortResponse(self.alloc),
             error.GraphMetricGlobalMaterializationRequired => contextual_operations.jsonWithStatus(
                 422,
@@ -31516,7 +31583,8 @@ fn normalizePublicQueryParseError(err: anyerror) anyerror {
         err == error.InvalidFilterQueryRequest or
         err == error.InvalidExclusionQueryRequest or
         err == error.UnsupportedFilterQueryRequest or
-        err == error.UnsupportedExclusionQueryRequest)
+        err == error.UnsupportedExclusionQueryRequest or
+        err == error.PinnedIndexRequiresSemanticSearch)
     {
         return err;
     }
@@ -64841,4 +64909,22 @@ test "api http query binding generation races return retryable unavailable" {
         try std.testing.expect(parsed.value.object.get("retryable").?.bool);
         try std.testing.expectEqualStrings("storage_read_temporarily_unavailable", parsed.value.object.get("code").?.string);
     }
+}
+
+test "index alias query admission rejects precomputed vectors for a physical model pin" {
+    const alloc = std.testing.allocator;
+    var resolver: SemanticStatusResolver = .{
+        .source = undefined,
+        .statement_indexes_json =
+        \\{"semantic":{"type":"embeddings","embedder":{"provider":"antfly","model":"embed","model_revision":"1111111111111111111111111111111111111111111111111111111111111111"}}}
+        ,
+    };
+    for ([_][]const u8{
+        "{\"embeddings\":{\"semantic\":[1,2]}}",
+        "{\"embeddings\":{\"semantic\":\"AACAPwAAAEA=\"}}",
+    }) |body| {
+        try std.testing.expectError(error.PinnedIndexRequiresSemanticSearch, query_contract.parsePublicQueryRequest(alloc, resolver.iface(), "docs", body));
+    }
+    var allowed = try query_contract.parsePublicQueryRequest(alloc, resolver.iface(), "docs", "{\"embeddings\":{\"other\":[1,2]}}");
+    defer allowed.deinit(alloc);
 }

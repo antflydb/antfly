@@ -10560,8 +10560,7 @@ pub const HBCIndex = struct {
         // finishExperimentalPostingMutationCapture may have lazily replaced
         // the writer handle. Native activation also deliberately closes that
         // LSM-borrowing handle while detaching the legacy backend, so reopen
-        // it from the retained native storage lease before applying the tail
-        // policy.
+        // it through the native backend before applying the tail policy.
         if (self.experimental_posting_write_store == null) {
             self.experimental_posting_write_store = try self.openExperimentalPostingStore();
         }
@@ -13009,14 +13008,13 @@ pub const HBCIndex = struct {
         };
         self.legacy_lsm_detach_pending = false;
 
-        // Drop handles tied to the LSM before closing it. NativeBackend now
-        // owns the storage runtime and can open new posting handles after the
-        // LSM has shut down.
+        // Drop LSM-bound handles before closing it. The native backend owns
+        // locally allocated storage and can open fresh posting handles.
         self.closeExperimentalPostingWalWriter();
         if (self.experimental_posting_write_store) |*store| store.deinit();
         self.experimental_posting_write_store = null;
         self.store.deinit();
-        self.env_owner.lsm.close();
+        self.env_owner.lsm.closeWithNativeStorageDestination(&native.storage_owner);
         self.env_owner = .{ .native = native };
         self.store = nativeNamespaceStore(self.alloc, native);
         std.log.info("HBC native generation released legacy LSM backend", .{});

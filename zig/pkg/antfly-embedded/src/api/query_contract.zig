@@ -1669,6 +1669,10 @@ fn appendAlgebraicVectorWorkerQuery(
             try appendJsonFieldUsize(alloc, out, &first, "k", dense.k);
             try appendJsonFieldName(alloc, out, &first, "vector");
             try appendF32Array(alloc, out, dense.vector);
+            if (dense.model_revision_fence) |revision| {
+                try appendJsonFieldName(alloc, out, &first, "_model_revision");
+                try appendJsonString(alloc, out, &std.fmt.bytesToHex(revision, .lower));
+            }
         },
         .sparse => |sparse| {
             try appendJsonFieldString(alloc, out, &first, "kind", "sparse");
@@ -1920,8 +1924,10 @@ fn parseAlgebraicVectorWorkerQueryAlloc(
     const k = try parseOptionalU32Json(value.object.get("k"), 10);
     if (std.mem.eql(u8, kind_value.string, "dense")) {
         if (layout != .dense_vector) return error.InvalidQueryRequest;
+        const revision = if (value.object.get("_model_revision")) |raw| try parseEmbeddingRevisionFence(raw) else null;
         return .{ .dense = .{
             .vector = try parseF32JsonArrayAlloc(alloc, value.object.get("vector") orelse return error.InvalidQueryRequest),
+            .model_revision_fence = revision,
             .k = k,
         } };
     }
@@ -2013,6 +2019,15 @@ fn parseF32JsonArrayAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]co
         if (!std.math.isFinite(out[i])) return error.InvalidQueryRequest;
     }
     return out;
+}
+
+test "api query contract algebraic vector worker rejects an invalid model revision without leaking its vector" {
+    const alloc = std.testing.allocator;
+    var input = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"kind":"dense","vector":[1,2,3],"_model_revision":"invalid"}
+    , .{});
+    defer input.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicVectorWorkerQueryAlloc(alloc, .dense_vector, input.value));
 }
 
 fn parseU32JsonArrayAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]const u32 {
@@ -2484,6 +2499,7 @@ pub const SemanticResolver = struct {
     pub const VTable = struct {
         /// Coordinator-only catalog binding, before parsing or embedding.
         bind_index_aliases: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!?BoundIndexAliases = null,
+        validate_dense_inputs: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, db_mod.types.SearchRequest) anyerror!void = null,
         resolve_dense_query: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2989,7 +3005,7 @@ const query_body_contract_fields_empty: QueryBodyContractFields = .{
     .has_graph_metric = false,
 };
 
-fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBodyContractFields {
+fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8, fences: ?*?std.json.Parsed(std.json.Value)) !QueryBodyContractFields {
     // perf/lwa-search-overhead: this runs on every query admission (see
     // `parseQueryRequestWithDeadlineCore`) and today always pays for a
     // full `std.json.Value` parse plus a graph-query validation pass,
@@ -3018,12 +3034,19 @@ fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBod
         return query_body_contract_fields_empty;
     }
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
-    defer parsed.deinit();
+    var retain = false;
+    defer if (!retain) parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     for ([_][]const u8{ "lake_read", "lake_visibility", "value_search_execution" }) |removed| {
         if (parsed.value.object.contains(removed)) return error.InvalidQueryRequest;
     }
     try validateRawGraphQueriesValueAlloc(alloc, parsed.value);
+    if (fences) |target| {
+        if (parsed.value.object.contains("_embedding_model_revisions")) {
+            retain = true;
+            target.* = parsed;
+        }
+    }
     return .{
         .has_internal_shard_fields = objectHasInternalShardField(parsed.value.object),
         .has_embedding_limits = objectHasNonNullField(parsed.value.object, "_embedding_limits"),
@@ -3141,7 +3164,44 @@ pub fn parseQueryRequestWithDeadline(
             owned.req.privacy_policy_version = try parsePrivacyPolicyVersion(value);
         };
     }
+    if (semantic_resolver) |resolver| if (resolver.vtable.validate_dense_inputs) |validate|
+        try validate(resolver.ptr, alloc, table_name, owned.req);
     return owned;
+}
+
+fn applyEmbeddingRevisionFences(req: *db_mod.types.SearchRequest, revisions: std.json.Value) !void {
+    if (revisions != .object or revisions.object.count() == 0) return error.InvalidQueryRequest;
+    var fields = revisions.object.iterator();
+    while (fields.next()) |field| {
+        const revision = try parseEmbeddingRevisionFence(field.value_ptr.*);
+        var matched = false;
+        if (req.index_name) |name| {
+            if (std.mem.eql(u8, name, field.key_ptr.*)) {
+                if (req.dense) |*dense| {
+                    dense.model_revision_fence = revision;
+                    matched = true;
+                }
+                if (req.query == .dense_knn) {
+                    req.query.dense_knn.model_revision_fence = revision;
+                    matched = true;
+                }
+            }
+        }
+        for (@constCast(req.dense_queries)) |*dense| {
+            if (std.mem.eql(u8, dense.index_name, field.key_ptr.*)) {
+                dense.query.model_revision_fence = revision;
+                matched = true;
+            }
+        }
+        if (!matched) return error.InvalidQueryRequest;
+    }
+}
+
+fn parseEmbeddingRevisionFence(value: std.json.Value) ![32]u8 {
+    if (value != .string or value.string.len != 64) return error.InvalidQueryRequest;
+    var revision: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&revision, value.string) catch return error.InvalidQueryRequest;
+    return revision;
 }
 
 pub fn parsePrivacyPolicyVersion(value: std.json.Value) ![64]u8 {
@@ -3195,7 +3255,9 @@ fn parseQueryRequestWithDeadlineCore(
     // Inspect the generated-contract extensions in one semantic parse. Besides
     // honoring escaped member names, this avoids repeatedly materializing the
     // same request tree on the query admission hot path.
-    const contract_fields = try queryBodyContractFields(alloc, effective_body);
+    var fence_body: ?std.json.Parsed(std.json.Value) = null;
+    defer if (fence_body) |*parsed| parsed.deinit();
+    const contract_fields = try queryBodyContractFields(alloc, effective_body, &fence_body);
     try ensureQueryDeadline(execution_deadline_ns);
     const contract_body = try queryBodyForGeneratedContractAlloc(alloc, effective_body, .{
         .strip_internal_shard_fields = contract_fields.has_internal_shard_fields,
@@ -3352,6 +3414,7 @@ fn parseQueryRequestWithDeadlineCore(
     }
     try validateScoreSortHasScoreBearingSource(req);
 
+    if (fence_body) |parsed_fences| try applyEmbeddingRevisionFences(&req, parsed_fences.value.object.get("_embedding_model_revisions").?);
     if (worker_projection_fields != null) try prepareSourceOnlyProjection(alloc, &req, &projection_owner, true);
     return .{
         .projection_plan = projection_owner,
@@ -3439,6 +3502,24 @@ test "api query contract live read encoding owns failures and annotates typed de
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, liveReadEncodingScenario, .{});
 }
 
+test "api query contract preserves pinned dense revisions on the storage owner wire" {
+    const alloc = std.testing.allocator;
+    const pinned: [32]u8 = @splat(0x23);
+    const codec = @import("query_execution_contract.zig");
+    for ([_]?[32]u8{ null, pinned }) |revision| {
+        const wire = try codec.encodeStorageKernelQueryRequest(alloc, .{
+            .index_name = "semantic",
+            .dense = .{ .vector = &.{ 1, 2 }, .k = 2, .model_revision_fence = revision },
+        });
+        defer alloc.free(wire);
+        var decoded = try parseQueryRequest(alloc, null, "docs", wire);
+        defer decoded.deinit(alloc);
+        const dense_query = if (decoded.req.dense) |dense| dense else decoded.req.dense_queries[0].query;
+        try std.testing.expectEqual(revision, dense_query.model_revision_fence);
+        if (revision == null) try std.testing.expect(std.mem.indexOf(u8, wire, "_embedding_model_revisions") == null);
+    }
+}
+
 test "api query contract hierarchy worker wire preserves explicit deferred projection" {
     const alloc = std.testing.allocator;
     for ([_][]const u8{
@@ -3511,6 +3592,7 @@ pub fn isPublicQueryValidationError(err: anyerror) bool {
         error.InvalidExclusionQueryRequest,
         error.UnsupportedFilterQueryRequest,
         error.UnsupportedExclusionQueryRequest,
+        error.PinnedIndexRequiresSemanticSearch,
         error.RerankerCandidateLimitExceeded,
         error.InvalidDecisionSpecification,
         error.InvalidFunctionExpression,
@@ -4068,6 +4150,7 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"_filter_query_json\"",
         "\"_exclusion_query_json\"",
         "\"_index_name\"",
+        "\"_embedding_model_revisions\"",
         "\"_primary_text_index_name\"",
         "\"_embedding_limits\"",
         "\"execution\"",
@@ -12986,6 +13069,7 @@ const internal_shard_field_names = [_][]const u8{
     "_index_name",
     "_primary_text_index_name",
     "_embedding_limits",
+    "_embedding_model_revisions",
     "_hierarchy_parent_admitted",
     "_defer_hierarchy_child_hydration",
     "_require_algebraic_filter_resolution",
@@ -13363,30 +13447,7 @@ fn validateCanonicalHierarchyExecutionBudget(req: db_mod.types.SearchRequest) !v
 }
 
 fn removeInternalShardFields(object: *std.json.ObjectMap) void {
-    const internal_fields = [_][]const u8{
-        "_projection_source_fields",
-        "_distributed_text_stats",
-        "native_doc_id_constraints",
-        "_filter_query_json",
-        "_exclusion_query_json",
-        "_identity_read_generation",
-        "_native_cut",
-        "_index_alias_fences",
-        "_response_live_read",
-        "_document_authority",
-        "_privacy_policy_version",
-        "_index_name",
-        "_primary_text_index_name",
-        "_embedding_limits",
-        "_hierarchy_parent_admitted",
-        "_defer_hierarchy_child_hydration",
-        "_require_algebraic_filter_resolution",
-        db_mod.doc_filter_wire.field_name,
-        "_filter_doc_ids",
-        "_filter_doc_ids_positive",
-        "_exclude_doc_ids",
-    };
-    inline for (internal_fields) |field| {
+    inline for (internal_shard_field_names) |field| {
         _ = object.orderedRemove(field);
     }
 }
@@ -14187,7 +14248,7 @@ fn consumerTests() type {
         test "public query envelope rejects an explicitly empty graph_queries object" {
             try std.testing.expectError(
                 error.InvalidQueryRequest,
-                queryBodyContractFields(std.testing.allocator, "{\"graph_queries\":{}}"),
+                queryBodyContractFields(std.testing.allocator, "{\"graph_queries\":{}}", null),
             );
         }
 

@@ -936,6 +936,7 @@ pub const HfTokenizer = struct {
         /// implemented. Generic loaders retain their existing compatibility
         /// behavior for legacy profiles such as SentencePiece Precompiled.
         strict_unigram_normalizer: bool = false,
+        validate_root: ?*const fn (std.mem.Allocator, std.json.Value) anyerror!void = null,
     };
 
     pub fn loadFromBytesWithOptions(allocator: std.mem.Allocator, json_bytes: []const u8, options: LoadOptions) !*HfTokenizer {
@@ -957,6 +958,7 @@ pub const HfTokenizer = struct {
 
         const root = parsed.value;
         if (root != .object) return error.InvalidTokenizerJson;
+        if (options.validate_root) |validate| try validate(allocator, root);
 
         const self = try allocator.create(HfTokenizer);
         self.* = .{

@@ -33,7 +33,7 @@ pub fn firstScopeWins(task: []const u8) bool {
     return std.mem.eql(u8, task, "deciders");
 }
 
-const Owner = struct { path: ?[]const u8, priority: u2 = 0 };
+const Owner = struct { index: ?usize, priority: u2 = 0 };
 const Stamp = struct { inode: u64, size: u64, modified: i128 };
 const Watch = struct { path: []const u8, stamp: ?Stamp };
 
@@ -70,6 +70,8 @@ pub const Inventory = struct {
     models_dir: []const u8,
     discovered: []const registry.ModelEntry,
     names: []const []const []const u8,
+    publications: []const ?[32]u8 = &.{},
+    damaged_installations: []const usize = &.{},
     owners: [tasks.len]std.StringHashMapUnmanaged(Owner) = @splat(.empty),
     watches: []const Watch = &.{},
     generation: catalog_publication.Generation = .{},
@@ -128,23 +130,31 @@ pub const Inventory = struct {
                 }
             }
         }
-        const found = try source.discoverInstallationsWithControl(io, control);
+        const found = try source.discoverInstallationsWithControl(io, a, control);
         for (found) |entry| {
             try watchInstallation(&paths, a, io, entry.path);
         }
 
         const entries = try a.alloc(registry.ModelEntry, found.len);
         const names = try a.alloc([]const []const u8, found.len);
-        for (found, entries, names) |entry, *out, *selectors| {
+        const publications = try a.alloc(?[32]u8, found.len);
+        var damaged_installations: std.ArrayList(usize) = .empty;
+        for (found, entries, names, publications, 0..) |entry, *out, *selectors, *publication, index| {
             try control.check();
-            var candidate = std.heap.ArenaAllocator.init(allocator);
-            defer candidate.deinit();
-            const managed = try registry.managedModelSelectorsAlloc(candidate.allocator(), io, entry.path);
-            selectors.* = try a.alloc([]const u8, if (managed.len > 0) managed.len else if (std.mem.indexOfAny(u8, entry.name, ":@") == null) @as(usize, 1) else 0);
-            if (managed.len > 0) {
-                for (managed, @constCast(selectors.*)) |name, *owned| owned.* = try a.dupe(u8, name);
-            } else if (selectors.len > 0) @constCast(selectors.*)[0] = try a.dupe(u8, entry.name);
+            const proof = entry.installation_selection;
+            const managed = proof.names;
+            publication.* = if (proof.rejected) null else proof.publication;
+            selectors.* = if (proof.damaged) &.{} else if (managed.len != 0)
+                managed
+            else if (std.mem.indexOfAny(u8, entry.name, ":@") == null) names: {
+                const literal = try a.alloc([]const u8, 1);
+                literal[0] = try a.dupe(u8, entry.name);
+                break :names literal;
+            } else &.{};
             out.* = entry;
+            if (proof.damaged) {
+                try damaged_installations.append(a, index);
+            } else out.installation_selection = .{};
             out.path = try a.dupe(u8, entry.path);
             // Qualified, immutable keys keep distinct capability descriptors.
             const canonical = if (managed.len == 4) managed[2] else if (managed.len > 0) managed[managed.len - 1] else entry.name;
@@ -152,6 +162,8 @@ pub const Inventory = struct {
         }
         result.discovered = entries;
         result.names = names;
+        result.publications = publications;
+        result.damaged_installations = try damaged_installations.toOwnedSlice(a);
         try result.buildOwners(control);
         const watches = try a.alloc(Watch, paths.count());
         var iterator = paths.iterator();
@@ -187,7 +199,7 @@ pub const Inventory = struct {
             const physical: []const []const u8 = if (aliases.len > 0) aliases else &.{task};
             for (physical) |scope| {
                 var local = std.StringHashMapUnmanaged(Owner).empty;
-                for (self.discovered, self.names) |entry, selectors| {
+                for (self.discovered, self.names, 0..) |entry, selectors, index| {
                     try control.check();
                     if (!registry.modelInTaskScope(self.models_dir, entry.path, scope)) continue;
                     for (selectors) |selector| {
@@ -197,27 +209,52 @@ pub const Inventory = struct {
                         const priority: u2 = if (bare and std.mem.eql(u8, root, entry.path)) 2 else if (bare and std.mem.eql(u8, legacy, entry.path)) 1 else 0;
                         const owner = try local.getOrPut(a, selector);
                         if (!owner.found_existing or priority > owner.value_ptr.priority) {
-                            owner.value_ptr.* = .{ .path = entry.path, .priority = priority };
-                        } else if (priority == 0 and (owner.value_ptr.path == null or !std.mem.eql(u8, owner.value_ptr.path.?, entry.path))) owner.value_ptr.path = null;
+                            owner.value_ptr.* = .{ .index = index, .priority = priority };
+                        } else if (priority == 0 and (owner.value_ptr.index == null or !std.mem.eql(u8, self.discovered[owner.value_ptr.index.?].path, entry.path))) owner.value_ptr.index = null;
                     }
                 }
                 var iterator = local.iterator();
                 while (iterator.next()) |candidate| {
                     const owner = try owners.getOrPut(a, candidate.key_ptr.*);
                     if (owner.found_existing and firstScopeWins(task)) continue;
-                    if (!owner.found_existing) owner.value_ptr.* = candidate.value_ptr.* else if (owner.value_ptr.path == null or candidate.value_ptr.path == null or !std.mem.eql(u8, owner.value_ptr.path.?, candidate.value_ptr.path.?)) owner.value_ptr.path = null;
+                    if (!owner.found_existing) owner.value_ptr.* = candidate.value_ptr.* else if (owner.value_ptr.index == null or candidate.value_ptr.index == null or !std.mem.eql(u8, self.discovered[owner.value_ptr.index.?].path, self.discovered[candidate.value_ptr.index.?].path)) owner.value_ptr.index = null;
                 }
             }
         }
     }
 
+    pub fn lookupIndex(self: *const Inventory, selector: []const u8, task: []const u8) !?usize {
+        for (tasks, self.owners) |name, owners| if (std.mem.eql(u8, name, task)) {
+            const found = owners.get(selector) orelse return null;
+            return found.index orelse error.AmbiguousModelIdentifier;
+        };
+        return null;
+    }
+
+    /// A valid owner always takes precedence over a damaged declaration.
+    /// Scoped replica probes can revalidate a damaged installation directly.
+    pub fn lookupDamagedIndex(self: *const Inventory, selector: []const u8, task: []const u8) !?usize {
+        var result: ?usize = null;
+        for (self.damaged_installations) |index| {
+            const entry = self.discovered[index];
+            const candidate = entry.installation_selection;
+            if (!registry.modelInTaskScope(self.models_dir, entry.path, task)) continue;
+            const matched = if (candidate.names.len == 0)
+                std.mem.indexOfAny(u8, selector, ":@") == null and std.mem.eql(u8, entry.name, selector)
+            else for (candidate.names) |name| {
+                if (std.mem.eql(u8, name, selector)) break true;
+            } else false;
+            if (!matched) continue;
+            if (result != null) return error.InvalidManagedDownload;
+            result = index;
+        }
+        return result;
+    }
+
     pub fn lookup(self: *const Inventory, selector: []const u8, task: ?[]const u8) !?[]const u8 {
         if (task) |scope| {
-            for (tasks, self.owners) |name, owners| if (std.mem.eql(u8, name, scope)) {
-                const found = owners.get(selector) orelse return null;
-                return found.path orelse error.AmbiguousModelIdentifier;
-            };
-            return null;
+            const index = (try self.lookupIndex(selector, scope)) orelse return null;
+            return self.discovered[index].path;
         }
         var selected: ?[]const u8 = null;
         for (self.discovered, self.names) |entry, selectors| for (selectors) |name| {
@@ -259,12 +296,21 @@ pub const Inventory = struct {
             out.* = entry;
             out.name = try a.dupe(u8, entry.name);
             out.path = try a.dupe(u8, entry.path);
+            if (entry.installation_selection.damaged) {
+                const damaged_names = try a.alloc([]const u8, entry.installation_selection.names.len);
+                for (entry.installation_selection.names, damaged_names) |name, *value| value.* = try a.dupe(u8, name);
+                out.installation_selection.names = damaged_names;
+                if (entry.installation_selection.damaged_member) |member|
+                    out.installation_selection.damaged_member = try a.dupe(u8, member);
+            }
             const strings = try a.alloc([]const u8, selectors.len);
             for (selectors, strings) |name, *value| value.* = try a.dupe(u8, name);
             owned.* = strings;
         }
         copy.discovered = entries;
         copy.names = names;
+        copy.publications = try a.dupe(?[32]u8, self.publications);
+        copy.damaged_installations = try a.dupe(usize, self.damaged_installations);
         // Full catalogs retain legacy watch evidence until serialization ends.
         const watches = try a.alloc(Watch, self.watches.len);
         for (self.watches, watches) |watch, *owned| owned.* = .{ .path = try a.dupe(u8, watch.path), .stamp = watch.stamp };
@@ -295,6 +341,11 @@ pub const Cache = struct {
         io: std.Io,
         pub fn inventory(self: Lease) *const Inventory {
             return &self.slot.inventory;
+        }
+        pub fn invalidateIfCurrent(self: Lease) void {
+            self.cache.mutex.lockUncancelable(self.io);
+            defer self.cache.mutex.unlock(self.io);
+            if (self.cache.current == self.slot and self.cache.epoch == self.slot.epoch) self.cache.epoch +%= 1;
         }
 
         pub fn release(self: Lease) void {
@@ -392,6 +443,18 @@ pub const Cache = struct {
         self.epoch +%= 1;
     }
 
+    pub fn borrowForSelector(self: *Cache, io: std.Io, root: []const u8, selector: []const u8, task: []const u8, control: ExecutionControl) !Lease {
+        const lease = try self.acquire(io, root, false, control);
+        errdefer lease.release();
+        // Preserve the bounded raw-filesystem import backstop on misses only.
+        if ((lease.inventory().lookupIndex(selector, task) catch return lease) != null) return lease;
+        const age = std.Io.Timestamp.now(io, .awake).nanoseconds - lease.slot.rebuilt_at.nanoseconds;
+        if (age < 5 * std.time.ns_per_s) return lease;
+        const refreshed = try self.acquire(io, root, true, control);
+        lease.release();
+        return refreshed;
+    }
+
     pub fn snapshot(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8) !Inventory {
         const lease = try self.acquire(io, root, true, .{});
         defer lease.release();
@@ -403,13 +466,34 @@ pub const Cache = struct {
         return if (try self.resolveSelection(allocator, io, root, requested, task)) |selected| @constCast(selected.path) else null;
     }
     pub fn resolveSelection(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8, requested: []const u8, task: ?[]const u8) !?ResolvedModel {
+        return self.resolveSelectionWithResident(allocator, io, root, requested, task, null);
+    }
+
+    pub const ResidentPublication = struct {
+        context: *anyopaque,
+        matches: ?*const fn (*anyopaque, std.Io, []const u8, [32]u8) anyerror!bool = null,
+        prepare: ?*const fn (*anyopaque, std.Io, []const u8, []const u8, ?[32]u8) anyerror![32]u8 = null,
+        control: ExecutionControl = .{},
+    };
+
+    pub fn resolveSelectionWithResident(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8, requested: []const u8, task: ?[]const u8, resident: ?ResidentPublication) !?ResolvedModel {
         // Full catalogs and misses get a bounded backstop for raw filesystem
         // imports. Existing coordinated pinned hits never scan other models.
+        const control: ExecutionControl = if (resident) |candidate| candidate.control else .{};
         var retried_catalog = false;
         const lookup = blk: while (true) {
-            const lease = try self.acquire(io, root, retried_catalog, .{});
+            const lease = try self.acquire(io, root, retried_catalog, control);
             defer lease.release();
-            const selected = (try lease.slot.inventory.lookup(requested, task)) orelse {
+            const inventory = lease.inventory();
+            const index = if (task) |scope| scoped: {
+                if (try inventory.lookupIndex(requested, scope)) |valid| break :scoped valid;
+                if (resident) |candidate| {
+                    if (candidate.prepare != null) break :scoped try inventory.lookupDamagedIndex(requested, scope);
+                }
+                break :scoped null;
+            } else null;
+            const path = if (index) |i| inventory.discovered[i].path else if (task == null) try inventory.lookup(requested, null) else null;
+            const selected = path orelse {
                 if (!std.meta.eql(lease.slot.inventory.generation, try catalog_publication.read(allocator, io, root))) return error.ModelArtifactsChanging;
                 const age = std.Io.Timestamp.now(io, .awake).nanoseconds - lease.slot.rebuilt_at.nanoseconds;
                 if (!retried_catalog and age >= 5 * std.time.ns_per_s) {
@@ -418,10 +502,34 @@ pub const Cache = struct {
                 }
                 return null;
             };
-            break :blk .{ .path = try allocator.dupe(u8, selected), .generation = lease.slot.inventory.generation };
+            break :blk .{
+                .path = try allocator.dupe(u8, selected),
+                .generation = inventory.generation,
+                .publication = if (index) |i| inventory.publications[i] else null,
+            };
         };
         const path = lookup.path;
         errdefer allocator.free(path);
+        if (resident) |candidate| {
+            if (candidate.prepare) |prepare| {
+                const publication = prepare(candidate.context, io, path, requested, lookup.publication) catch |err| switch (err) {
+                    error.ModelNotFound => {
+                        allocator.free(path);
+                        self.invalidate(io);
+                        return null;
+                    },
+                    else => return err,
+                };
+                try catalog_publication.require(allocator, io, root, lookup.generation);
+                return .{ .path = path, .publication = publication };
+            }
+            if (candidate.matches) |matches| if (lookup.publication) |publication| {
+                if (try matches(candidate.context, io, path, publication)) {
+                    try catalog_publication.require(allocator, io, root, lookup.generation);
+                    return .{ .path = path, .publication = publication };
+                }
+            };
+        }
         var temporary = std.heap.ArenaAllocator.init(allocator);
         defer temporary.deinit();
         const proof = try registry.managedModelSelectionAlloc(temporary.allocator(), io, path);

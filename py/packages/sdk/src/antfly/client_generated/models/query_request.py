@@ -216,6 +216,7 @@ class QueryRequest:
             LE)
 
             Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
+            Revision-pinned embedding indexes require semantic_search and reject pre-computed vectors.
         search_effort (float | Unset): Controls the vector search recall/latency tradeoff for semantic searches.
 
             - `0.0` = fastest, lowest recall

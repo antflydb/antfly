@@ -3699,6 +3699,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
             };
         },
         .create_restore_job_with_staging => |record| {
+            required = @max(required, try metadata_topology_protocol.pinnedEmbeddingDecoderVersion(a, record.plan_json, true));
             const guard = @import("restore_staging.zig").PlanGuard.read(a, record.plan_json) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return metadata_topology_protocol.current_version,
@@ -3718,7 +3719,9 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
                 required = @max(required, if (command == .apply_sql_policy_publication) metadata_topology_protocol.guarded_publication_version else metadata_topology_protocol.bound_catalog_incarnation_version);
         },
         .register_store, .upsert_store, .upsert_store_heartbeat => |record| {
-            if (record.artifact_sources_protocol_version >= 4) {
+            if (record.artifact_sources_protocol_version >= metadata_table_manager.pinned_embedding_store_protocol) {
+                required = @max(required, metadata_topology_protocol.pinned_embedding_revision_version);
+            } else if (record.artifact_sources_protocol_version >= 4) {
                 required = @max(required, metadata_topology_protocol.index_alias_lifecycle_version);
             } else if (record.artifact_sources_protocol_version >= 3) required = @max(required, 90);
         },
@@ -3741,6 +3744,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
 fn tableDecoderVersion(a: std.mem.Allocator, table: metadata_table_manager.TableRecord) !u16 {
     var required: u16 = 0;
     required = @max(required, try metadata_topology_protocol.indexAliasDecoderVersion(a, table.indexes_json, false));
+    required = @max(required, try metadata_topology_protocol.pinnedEmbeddingDecoderVersion(a, table.indexes_json, false));
     if (table.storage.engine == .object) required = @max(required, metadata_topology_protocol.object_table_engine_version);
     if (table.lake_index_catalog_json.len != 0) required = @max(required, metadata_topology_protocol.lake_index_catalog_version);
     if (metadata_topology_protocol.usesPrivacy(table.indexes_json)) required = @max(required, metadata_topology_protocol.privacy_version);
@@ -3770,7 +3774,7 @@ test "index alias decoder floor composes with table features and preserves CAS h
     const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
     const floor = metadata_topology_protocol.index_aliases_version;
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = aliases })));
-    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = aliases } } }, .{});
+    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = aliases } } }, .{});
     defer std.testing.allocator.free(envelope);
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = envelope })));
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = aliases, .replacement = plain } })));
@@ -3786,8 +3790,25 @@ test "index alias decoder floor composes with table features and preserves CAS h
         }
     };
     const escaped: metadata_table_manager.TableRecord = .{ .table_id = 2, .name = "plain", .indexes_json = "{\"text\":{\"type\":\"full_text\",\"description\":\"line\\nnext\"}}" };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .upsert_table = escaped }, @as(u16, 0) });
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .apply_system_catalog = envelope }, floor });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .upsert_table = escaped }, @as(u16, 0) });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .apply_system_catalog = envelope }, floor });
+}
+
+test "index alias and pinned embedding metadata changes enforce their own decoder floors" {
+    const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
+    var pinned = plain;
+    pinned.indexes_json =
+        \\{"semantic":{"type":"embeddings","embedder":{"provider":"antfly","model":"embed","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
+    ;
+    const pin_floor = metadata_topology_protocol.pinned_embedding_revision_version;
+    try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = pinned }));
+    try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = pinned, .replacement = plain } }));
+    const pin_envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = pinned } } }, .{});
+    defer std.testing.allocator.free(pin_envelope);
+    try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = pin_envelope }));
+    const plan = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .targets = .{.{ .table = pinned }} }, .{});
+    defer std.testing.allocator.free(plan);
+    try std.testing.expectEqual(pin_floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .create_restore_job_with_staging = .{ .key = "job", .value = "{}", .plan_json = plan } }));
 }
 
 test "relation mutation admission gates bound transaction sessions independently of ordinary sessions" {
@@ -3809,6 +3830,8 @@ fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.
         else => "",
     };
     if ((command == .apply_restore_staging or command == .apply_system_catalog) and namespace_indexes.len != 0) {
+        const pin_version = try metadata_topology_protocol.pinnedEmbeddingDecoderVersion(a, namespace_indexes, true);
+        if (pin_version != 0) return pin_version;
         const alias_version = try metadata_topology_protocol.indexAliasDecoderVersion(a, namespace_indexes, true);
         if (alias_version != 0) return alias_version;
     }

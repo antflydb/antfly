@@ -216,6 +216,8 @@ fn normalizeServerlessCreateIndexConfig(
     expanded_index_json: []const u8,
     options: managed_embedder.InitOptions,
 ) ![]u8 {
+    if (try table_writes.hasModelRevisionPin(alloc, expanded_index_json, false))
+        return error.UnsupportedCreateTableRequest;
     return try table_writes.normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
         alloc,
         index_name,
@@ -4374,12 +4376,14 @@ pub const HttpHandler = struct {
             if (runtime.hasDenseEntries()) {
                 // Object vector segments do not carry an accepted producer
                 // revision. A pin in catalog metadata cannot certify them.
+                if (runtime.queryModelRevision(index_name) != null) return error.UnsupportedQueryRequest;
                 plan.request.vector = try internal_query_operations.computeManagedQueryVector(&runtime, self.alloc, index_name, semantic_search, plan.request.embedding_template, options);
                 return;
             }
         }
 
         const runtime = self.managed_query_embedder orelse return error.InvalidQueryRequest;
+        if (runtime.queryModelRevision(index_name) != null) return error.UnsupportedQueryRequest;
         plan.request.vector = try internal_query_operations.computeManagedQueryVector(runtime, self.alloc, index_name, semantic_search, plan.request.embedding_template, options);
     }
 
@@ -9958,6 +9962,8 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
             continue;
         }
         if (std.mem.eql(u8, kind, "embeddings")) {
+            if (try table_writes.indexHasModelRevisionPin(alloc, entry.value_ptr.*))
+                return error.UnsupportedCreateTableRequest;
             const sparse = if (entry.value_ptr.object.get("sparse")) |value| switch (value) {
                 .bool => |flag| flag,
                 else => return error.InvalidTableIndexMetadata,
@@ -12783,6 +12789,10 @@ test "serverless create index normalization resolves and persists one probed emb
     const alloc = std.testing.allocator;
     var provider = FakeProvider{};
     const options = managed_embedder.InitOptions{ .antfly_provider = provider.provider() };
+    try std.testing.expectError(error.UnsupportedCreateTableRequest, normalizeServerlessCreateIndexConfig(alloc, "semantic_idx",
+        \\{"type":"embeddings","field":"body","embedder":{"provider":"antfly","model":"antflydb/clipclap","model_revision":"1111111111111111111111111111111111111111111111111111111111111111"}}
+    , options));
+    try std.testing.expectEqual(@as(usize, 0), provider.calls);
     const normalized = try normalizeServerlessCreateIndexConfig(alloc, "semantic_idx",
         \\{"type":"embeddings","field":"body","embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
     , options);

@@ -2387,6 +2387,7 @@ pub const IndexManager = struct {
             source_sequence: u64,
         } = null,
         config: types.IndexConfig,
+        model_revision: ?[32]u8 = null,
         field_name: []u8,
         dims: u32,
         metric: vector_mod.DistanceMetric,
@@ -6317,6 +6318,7 @@ pub const IndexManager = struct {
         text_fields: [][]u8 = &.{},
         dense_fields: []DenseFieldWritePlan,
         external_vector_spaces: std.StringHashMapUnmanaged([]u8) = .empty,
+        pinned_embedding_names: std.StringHashMapUnmanaged(void) = .empty,
         sparse_fields: []SparseFieldWritePlan,
         graph_fields: []GraphFieldWritePlan,
         /// Catalog-derived provider work compiled once for this generation.
@@ -6343,6 +6345,9 @@ pub const IndexManager = struct {
                 self.alloc.free(entry.value_ptr.*);
             }
             self.external_vector_spaces.deinit(self.alloc);
+            var pinned_names = self.pinned_embedding_names.keyIterator();
+            while (pinned_names.next()) |name| self.alloc.free(name.*);
+            self.pinned_embedding_names.deinit(self.alloc);
             if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
@@ -6963,6 +6968,21 @@ pub const IndexManager = struct {
             errdefer alloc.free(identity);
             try external_spaces.put(alloc, name, identity);
         }
+        var pinned_embedding_names: std.StringHashMapUnmanaged(void) = .empty;
+        errdefer {
+            var names = pinned_embedding_names.keyIterator();
+            while (names.next()) |name| alloc.free(name.*);
+            pinned_embedding_names.deinit(alloc);
+        }
+        for (self.dense_indexes.items) |entry| {
+            if (entry.model_revision == null) continue;
+            for ([_][]const u8{ entry.config.name, entry.embedding_name orelse entry.config.name }) |name| {
+                if (pinned_embedding_names.contains(name)) continue;
+                const owned_name = try alloc.dupe(u8, name);
+                errdefer alloc.free(owned_name);
+                try pinned_embedding_names.put(alloc, owned_name, {});
+            }
+        }
         var generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
         errdefer generated_definitions.deinit(alloc);
         var pdf_page_outputs: PdfPageOutputs = .empty;
@@ -6987,6 +7007,7 @@ pub const IndexManager = struct {
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
             .external_vector_spaces = external_spaces,
+            .pinned_embedding_names = pinned_embedding_names,
             .artifact_catalogs = .{ .indexes = catalog_indexes, .enrichments = catalog_enrichments, .resolvers = catalog_resolvers },
             .catalog_empty = .{ self.count() == 0, self.enrichments.items.len == 0, self.resolvers.items.len == 0 and self.retired_resolvers.items.len == 0 },
             .has_text_consumers = blk: {
@@ -16840,9 +16861,11 @@ pub const IndexManager = struct {
 
         for (self.dense_indexes.items) |entry| {
             if (hasExplicitDenseEmbedding(explicit_dense, entry.config.name)) continue;
-            if (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) |vector| {
-                alloc.free(vector);
-                continue;
+            if (entry.model_revision == null) {
+                if (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) |vector| {
+                    alloc.free(vector);
+                    continue;
+                }
             }
 
             if (try parseDenseGeneratorConfig(alloc, entry.config.config_json)) |generator| {
@@ -16878,6 +16901,7 @@ pub const IndexManager = struct {
                         .source_field = chunk_cfg.source_field,
                         .source_template = if (chunk_cfg.source_template.len > 0) chunk_cfg.source_template else "",
                         .expected_dims = entry.dims,
+                        .model_revision = entry.model_revision,
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
@@ -20575,10 +20599,19 @@ pub const IndexManager = struct {
 
     /// Caller holds the catalog read/apply fence. The immutable write plan owns
     /// indexed expected identities; ordinary writes do no index/config scans.
+    fn validateNoAuthoredPinnedEmbeddings(plan: *const WritePlanSnapshot, embeddings: []const mapper.DenseEmbeddingWrite) !void {
+        if (plan.pinned_embedding_names.count() == 0) return;
+        for (embeddings) |embedding| {
+            if (embedding.artifact_key == null and plan.pinned_embedding_names.contains(embedding.index_name))
+                return error.InvalidEmbedding;
+        }
+    }
+
     pub fn validateExternalVectorSpaces(self: *IndexManager, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document_json: []const u8) !void {
         var plan = try self.acquireWritePlanSnapshot();
         defer plan.release();
-        if (plan.plan().external_vector_spaces.count() == 0) return;
+        if (plan.plan().external_vector_spaces.count() == 0)
+            return validateNoAuthoredPinnedEmbeddings(plan.plan(), embeddings);
         const document = std.json.parseFromSlice(std.json.Value, alloc, document_json, .{}) catch return error.InvalidEmbedding;
         defer document.deinit();
         try validateExternalVectorSpacesInPlan(alloc, plan.plan(), embeddings, document.value);
@@ -20593,6 +20626,7 @@ pub const IndexManager = struct {
     /// Preparation borrows the pinned plan and parsed row before releasing its
     /// scratch. Commit revalidates that plan's generation before using effects.
     pub fn validateExternalVectorSpacesInPlan(alloc: Allocator, plan: *const WritePlanSnapshot, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
+        try validateNoAuthoredPinnedEmbeddings(plan, embeddings);
         if (plan.external_vector_spaces.count() == 0) return;
         // A receipt is an assertion about this authored row. Omitting vectors
         // retains native bytes, but must not retain an assertion for a new row.
@@ -22508,11 +22542,17 @@ pub const IndexManager = struct {
     }
 
     fn validateDenseEmbeddingWriteSources(entry: *const DenseIndex, writes: []const mapper.DenseEmbeddingWrite) !void {
-        if (entry.embedding_names.len == 0) return;
+        const pinned_source = if (entry.model_revision != null)
+            entry.embedding_name orelse return error.InvalidIndexConfig
+        else
+            null;
+        if (entry.embedding_names.len == 0 and pinned_source == null) return;
         for (writes) |write| {
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             const artifact_key = write.artifact_key orelse return error.InvalidEmbeddingArtifactSource;
-            if (!embeddingArtifactKeyMatchesAnySource(artifact_key, entry.embedding_names)) return error.InvalidEmbeddingArtifactSource;
+            if (pinned_source) |name| {
+                if (!embeddingArtifactKeyMatchesAnySource(artifact_key, &.{name})) return error.InvalidEmbeddingArtifactSource;
+            } else if (!embeddingArtifactKeyMatchesAnySource(artifact_key, entry.embedding_names)) return error.InvalidEmbeddingArtifactSource;
         }
     }
 
@@ -24500,6 +24540,9 @@ pub const IndexManager = struct {
                 const cache_limits = self.resource_manager.?.hbcCacheLimits(dense_cfg.dims, self.hbc_cache != null);
                 const dense_generator = try parseDenseGeneratorConfig(self.alloc, cfg.config_json);
                 defer if (dense_generator) |generator| generator.deinit(self.alloc);
+                // Catalog installation precedes ordered publication activation.
+                // The producer and projection paths enforce that boundary.
+                if (dense_cfg.model_revision != null) try validatePinnedDenseLayout(dense_cfg, dense_generator);
                 const referenced_embedding = if (dense_generator == null and dense_cfg.embedding_name != null and !dense_cfg.external)
                     self.getEnrichment(.embedding, dense_cfg.embedding_name.?)
                 else
@@ -24796,6 +24839,7 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .capture_incarnation = self.allocateDenseCaptureIncarnation(),
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
+                    .model_revision = dense_cfg.model_revision,
                     .field_name = try self.alloc.dupe(u8, dense_cfg.field_name),
                     .dims = dense_cfg.dims,
                     .metric = dense_cfg.metric,
@@ -27858,21 +27902,46 @@ pub const IndexManager = struct {
         var cursor = try self.alloc.dupe(u8, lower);
         defer self.alloc.free(cursor);
         var lower_exclusive = false;
+        // A pinned page retains both encoded artifacts and decoded vectors
+        // through insertion. Charge both against the page budget.
+        const max_items = if (entry.model_revision != null)
+            @min(vector_backfill_page_items, @max(1, vector_backfill_page_bytes / (@as(usize, entry.dims) * (2 * @sizeOf(f32)) + 64)))
+        else
+            vector_backfill_page_items;
         while (true) {
-            var page = try store.scanReadTxnPage(
+            var page = try store.scanReadTxnPageWithOptions(
                 self.alloc,
                 source_txn,
                 cursor,
                 lower_exclusive,
                 if (upper) |buf| buf else "",
-                vector_backfill_page_items,
+                max_items,
                 vector_backfill_page_bytes,
+                .{ .keys_only = entry.model_revision != null },
             );
             defer page.deinit(self.alloc);
             if (page.items.len == 0) break;
             const next_cursor = try self.alloc.dupe(u8, page.items[page.items.len - 1].key);
             var next_cursor_owned = true;
             defer if (next_cursor_owned) self.alloc.free(next_cursor);
+
+            var page_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer page_arena.deinit();
+            const scratch = page_arena.allocator();
+            const document_keys = if (entry.model_revision != null) keys: {
+                const keys = try scratch.alloc(?[]const u8, page.items.len);
+                for (page.items, keys) |doc, *key| {
+                    key.* = null;
+                    if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
+                    const raw = (try internal_keys.decodeStoredDocumentRowKeyAlloc(scratch, doc.key)) orelse continue;
+                    if (self.keyInRange(raw)) key.* = raw;
+                }
+                break :keys keys;
+            } else null;
+            const accepted_values = if (document_keys) |keys|
+                try readPinnedDenseBackfillPage(scratch, source_txn, keys, denseVectorArtifactNameAt(entry, 0))
+            else
+                null;
 
             var items = std.ArrayListUnmanaged(hbc_mod.BatchInsertItem).empty;
             defer {
@@ -27889,17 +27958,26 @@ pub const IndexManager = struct {
             var mapping_batch = try runtime_store.store.beginBatch();
             errdefer mapping_batch.abort();
 
-            for (page.items) |doc| {
-                if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
-                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
-                defer self.alloc.free(raw_key);
+            for (page.items, 0..) |doc, i| {
+                const raw_key = if (document_keys) |keys| keys[i] orelse continue else ordinary: {
+                    if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
+                    break :ordinary (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
+                };
+                defer if (document_keys == null) self.alloc.free(raw_key);
                 if (!self.keyInRange(raw_key)) continue;
+                const vector_values = if (entry.model_revision) |revision| blk: {
+                    const accepted = accepted_values.?[i] orelse continue;
+                    const actual = enrichment_artifact_codec.denseEmbeddingModelRevision(accepted) catch return error.ArtifactRepairRequired;
+                    if (!std.meta.eql(actual, @as(?[32]u8, revision))) return error.ArtifactRepairRequired;
+                    if (try enrichment_artifact_codec.decodeDenseEmbeddingDims(accepted) != entry.dims)
+                        return error.ArtifactRepairRequired;
+                    break :blk try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(self.alloc, accepted);
+                } else (try self.extractDenseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name, entry.dims, &schema_views)) orelse continue;
+                errdefer self.alloc.free(vector_values);
                 try items.ensureUnusedCapacity(self.alloc, 1);
                 try pending_mappings.ensureUnusedCapacity(self.alloc, 1);
-                const vector_values = (try self.extractDenseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name, entry.dims, &schema_views)) orelse continue;
-                errdefer self.alloc.free(vector_values);
 
-                if (entry.embedding_names.len == 0) {
+                if (entry.model_revision == null and entry.embedding_names.len == 0) {
                     try self.writeDenseEmbeddingArtifactTxn(
                         &mapping_batch,
                         raw_key,
@@ -27944,6 +28022,39 @@ pub const IndexManager = struct {
             lower_exclusive = true;
             if (page.reached_end) break;
         }
+    }
+
+    fn readPinnedDenseBackfillPage(
+        alloc: Allocator,
+        source_txn: *docstore_mod.DocStore.Txn,
+        document_keys: []const ?[]const u8,
+        embedding_name: []const u8,
+    ) ![]?[]const u8 {
+        const Lookup = struct {
+            key: []const u8,
+            row: usize,
+
+            fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                return std.mem.lessThan(u8, lhs.key, rhs.key);
+            }
+        };
+        var lookups: std.ArrayList(Lookup) = .empty;
+        for (document_keys, 0..) |key, row| {
+            const raw = key orelse continue;
+            try lookups.append(alloc, .{
+                .key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, raw, embedding_name),
+                .row = row,
+            });
+        }
+        std.mem.sort(Lookup, lookups.items, {}, Lookup.lessThan);
+        const keys = try alloc.alloc([]const u8, lookups.items.len);
+        for (lookups.items, keys) |lookup, *key| key.* = lookup.key;
+        const values = try alloc.alloc(?[]u8, keys.len);
+        try source_txn.getManySortedOwnedScoped(alloc, keys, values);
+        const result = try alloc.alloc(?[]const u8, document_keys.len);
+        @memset(result, null);
+        for (lookups.items, values) |lookup, value| result[lookup.row] = value;
+        return result;
     }
 
     fn backfillSparseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, resume_from: ?[]const u8) !void {
@@ -29602,6 +29713,9 @@ pub const IndexManager = struct {
         skip: ?*const DenseSplitHandoff,
         batch_options: StoreBatchOptions,
     ) !void {
+        // A pinned model's members come only from accepted embedding
+        // artifacts. Raw vector fields cannot backfill this generation.
+        if (entry.model_revision != null) return;
         var store_batch = try store.beginWriteBatchWithOptions(batch_options);
         errdefer store_batch.abort();
         const store_txn = store_batch.asTxn();
@@ -30790,6 +30904,12 @@ pub const IndexManager = struct {
         });
     }
 
+    // A pinned index always projects the authoritative artifact. The caller's
+    // inline vector cannot establish its model revision.
+    fn denseReplayInlineVector(model_revision: ?[32]u8, write: mapper.DenseEmbeddingWrite) []const f32 {
+        return if (model_revision == null) write.vector else &.{};
+    }
+
     fn applyDenseEmbeddingWritesEntry(
         self: *IndexManager,
         store: *docstore_mod.DocStore,
@@ -31065,9 +31185,10 @@ pub const IndexManager = struct {
                 if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
                 const member_key = if (entry.embedding_names.len > 0) write.artifact_key.? else write.doc_key;
 
-                if (write.vector.len > 0) {
-                    if (entry.dims != write.vector.len) return error.InvalidVectorDimensions;
-                    const vector_fingerprint = denseVectorFingerprint(write.vector);
+                const inline_vector = denseReplayInlineVector(entry.model_revision, write);
+                if (inline_vector.len > 0) {
+                    if (entry.dims != inline_vector.len) return error.InvalidVectorDimensions;
+                    const vector_fingerprint = denseVectorFingerprint(inline_vector);
                     const assignment = try self.replaceDenseVectorIdFromPrefetchedState(
                         store_txn,
                         entry,
@@ -31080,19 +31201,19 @@ pub const IndexManager = struct {
                     );
                     if (entry.embedding_names.len == 0) {
                         const artifact_name = entry.embedding_name orelse entry.config.name;
-                        try self.writeDenseEmbeddingArtifactTxn(store_txn, write.doc_key, write.doc_key, artifact_name, "_embeddings", null, write.vector);
+                        try self.writeDenseEmbeddingArtifactTxn(store_txn, write.doc_key, write.doc_key, artifact_name, "_embeddings", null, inline_vector);
                     }
                     if (prefetched_mappings[write_index]) |mapping| {
                         if (!assignment.can_assume_absent and mapping.vector_fingerprint != null and std.mem.eql(u8, &mapping.vector_fingerprint.?, &vector_fingerprint)) continue;
                     }
                     all_vector_ids_new = all_vector_ids_new and assignment.can_assume_absent;
-                    try items.appendBorrowed(self.alloc, assignment.vector_id, write.vector, member_key);
+                    try items.appendBorrowed(self.alloc, assignment.vector_id, inline_vector, member_key);
                     if (assignment.can_assume_absent) {
                         try new_items.append(self.alloc, items.items.items[items.items.items.len - 1]);
                     } else {
                         try existing_items.append(self.alloc, items.items.items[items.items.items.len - 1]);
                     }
-                    item_vector_bytes += @as(u64, @intCast(write.vector.len * @sizeOf(f32)));
+                    item_vector_bytes += @as(u64, @intCast(inline_vector.len * @sizeOf(f32)));
                     item_metadata_bytes += @intCast(write.doc_key.len);
                     self.observeDenseApplyWorkingBytes(&dense_apply_working_bytes, preloaded_vector_bytes + item_vector_bytes + item_metadata_bytes);
                     try pending_mappings.append(self.alloc, .{
@@ -31263,6 +31384,7 @@ pub const IndexManager = struct {
         unreadable_artifact_keys: *std.ArrayListUnmanaged([]const u8),
         elided: ?*std.ArrayListUnmanaged(ElidedDenseArtifact),
     ) !bool {
+        const model_revision = if (self.denseIndex(index_name)) |entry| entry.model_revision else null;
         const dims_usize: usize = @intCast(dims);
         var pending = std.ArrayListUnmanaged(PendingDenseArtifactLoad).empty;
         defer pending.deinit(self.alloc);
@@ -31270,7 +31392,7 @@ pub const IndexManager = struct {
         for (writes, 0..) |write, write_index| {
             if (!keep_write[write_index]) continue;
             if (!std.mem.eql(u8, write.index_name, index_name)) continue;
-            if (write.vector.len > 0) continue;
+            if (denseReplayInlineVector(model_revision, write).len > 0) continue;
             const artifact_key = write.artifact_key orelse continue;
             try pending.append(self.alloc, .{
                 .write_index = write_index,
@@ -31299,6 +31421,10 @@ pub const IndexManager = struct {
                 try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                 continue;
             };
+            if (model_revision) |revision| {
+                if (!std.meta.eql(try enrichment_artifact_codec.denseEmbeddingModelRevision(raw), @as(?[32]u8, revision)))
+                    return error.ArtifactRepairRequired;
+            }
             if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
                 if (maybe_view) |view| {
                     if (view.len != dims_usize) {
@@ -31393,6 +31519,7 @@ pub const IndexManager = struct {
         unreadable_artifact_keys: *std.ArrayListUnmanaged([]const u8),
         elided: ?*std.ArrayListUnmanaged(ElidedDenseArtifact),
     ) !bool {
+        const model_revision = if (self.denseIndex(index_name)) |entry| entry.model_revision else null;
         const dims_usize: usize = @intCast(dims);
         var pending = std.ArrayListUnmanaged(PendingDenseArtifactLoad).empty;
         defer pending.deinit(self.alloc);
@@ -31400,7 +31527,7 @@ pub const IndexManager = struct {
         for (writes, 0..) |write, write_index| {
             if (!keep_write[write_index]) continue;
             if (!std.mem.eql(u8, write.index_name, index_name)) continue;
-            if (write.vector.len > 0) continue;
+            if (denseReplayInlineVector(model_revision, write).len > 0) continue;
             const artifact_key = write.artifact_key orelse continue;
             try pending.append(self.alloc, .{
                 .write_index = write_index,
@@ -31429,6 +31556,10 @@ pub const IndexManager = struct {
                 try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                 continue;
             };
+            if (model_revision) |revision| {
+                if (!std.meta.eql(try enrichment_artifact_codec.denseEmbeddingModelRevision(raw), @as(?[32]u8, revision)))
+                    return error.ArtifactRepairRequired;
+            }
             if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
                 if (maybe_view) |view| {
                     if (view.len != dims_usize) {
@@ -36526,6 +36657,7 @@ test "index catalog preserves malformed vector config for quarantine" {
 const DenseConfig = struct {
     field_name: []u8,
     dims: u32,
+    model_revision: ?[32]u8 = null,
     metric: vector_mod.DistanceMetric,
     split_algo: vector_mod.ClustAlgorithm = .kmeans,
     embedding_name: ?[]u8 = null,
@@ -36638,27 +36770,12 @@ pub fn onlineBaseGeneratedVectorConfig(alloc: Allocator, cfg: types.IndexConfig,
         try parseSparseGeneratorConfig(alloc, cfg.config_json);
     defer if (generator) |value| value.deinit(alloc);
     if (generator) |value| {
-        if (generatorHasChunking(value) or value.embedding_input != .text or
-            (value.source_field.len == 0 and value.source_template.len == 0)) return false;
+        if (!supportsOnlineBaseGenerator(value)) return false;
     }
     if (cfg.kind == .dense_vector) {
         const config = try parseDenseConfig(alloc, cfg.config_json);
         defer config.deinit(alloc);
-        if (config.external) return false;
-        if (generator) |value| {
-            // Managed translation also names the generator's own output at
-            // index scope. That selector is redundant, not another producer.
-            const output = value.embedding_name orelse cfg.name;
-            return config.embedding_names.len == 0 and (if (config.embedding_name) |name| std.mem.eql(u8, name, output) else true);
-        }
-        const names: []const []const u8 = if (config.embedding_names.len != 0) config.embedding_names else if (config.embedding_name) |name| &.{name} else return false;
-        for (names) |name| {
-            const found = for (producers) |producer| {
-                if (std.mem.eql(u8, producer.name, name)) break onlineBaseEmbeddingProducer(producer) and producer.expected_dims == config.dims;
-            } else false;
-            if (!found) return false;
-        }
-        return true;
+        return onlineBaseDenseVectorConfig(cfg.name, config, generator, producers);
     }
     const config = try parseSparseConfig(alloc, cfg.config_json);
     defer config.deinit(alloc);
@@ -36677,6 +36794,63 @@ pub fn onlineBaseGeneratedVectorConfig(alloc: Allocator, cfg: types.IndexConfig,
         if (!found) return false;
     }
     return true;
+}
+
+fn onlineBaseDenseVectorConfig(index_name: []const u8, config: DenseConfig, generator: ?GeneratorConfig, producers: []const enrichment_catalog.EnrichmentConfig) bool {
+    if (config.external) return false;
+    if (generator) |value| {
+        // Managed translation also names the generator's own output at
+        // index scope. That selector is redundant, not another producer.
+        const output = value.embedding_name orelse index_name;
+        return config.embedding_names.len == 0 and (if (config.embedding_name) |name| std.mem.eql(u8, name, output) else true);
+    }
+    const names: []const []const u8 = if (config.embedding_names.len != 0) config.embedding_names else if (config.embedding_name) |name| &.{name} else return false;
+    for (names) |name| {
+        const found = for (producers) |producer| {
+            if (std.mem.eql(u8, producer.name, name)) break onlineBaseEmbeddingProducer(producer) and producer.expected_dims == config.dims;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
+}
+
+pub const DenseBaseVectorPublicationConfig = struct {
+    dims: u32,
+    model_revision: ?[32]u8,
+    artifact_names: [][]u8,
+};
+
+pub fn denseBaseVectorPublicationConfig(
+    alloc: Allocator,
+    cfg: types.IndexConfig,
+    expected_dims: ?u32,
+    producer_catalog: ?[]const enrichment_catalog.EnrichmentConfig,
+) !?DenseBaseVectorPublicationConfig {
+    if (cfg.kind != .dense_vector) return error.InvalidIndexConfiguration;
+    const dense = try parseDenseConfig(alloc, cfg.config_json);
+    defer dense.deinit(alloc);
+    if (expected_dims) |dims| if (dense.dims != dims) return null;
+    if (producer_catalog != null and dense.external) return error.OnlineMergeArtifactTailsUnsupported;
+    const generator = try parseDenseGeneratorConfig(alloc, cfg.config_json);
+    defer if (generator) |value| value.deinit(alloc);
+    if (producer_catalog) |producers| {
+        if (generator) |value| {
+            if (!supportsOnlineBaseGenerator(value)) return error.OnlineMergeArtifactTailsUnsupported;
+        }
+        if (!onlineBaseDenseVectorConfig(cfg.name, dense, generator, producers)) return error.OnlineMergeArtifactTailsUnsupported;
+    }
+    const default_name = denseBaseVectorArtifactName(cfg.name, dense, generator);
+    const names: []const []const u8 = if (dense.embedding_names.len != 0) dense.embedding_names else &.{default_name};
+    return .{
+        .dims = dense.dims,
+        .model_revision = dense.model_revision,
+        .artifact_names = try cloneOwnedStrings(alloc, names),
+    };
+}
+
+fn supportsOnlineBaseGenerator(generator: GeneratorConfig) bool {
+    return !generatorHasChunking(generator) and generator.embedding_input == .text and
+        (generator.source_field.len != 0 or generator.source_template.len != 0);
 }
 
 /// Match a chunk vector's semantic source against immutable catalog bytes.
@@ -36739,6 +36913,44 @@ pub fn configUsesExternalCoverage(alloc: Allocator, cfg: types.IndexConfig) !boo
     };
 }
 
+pub fn validatePinnedDenseConfig(alloc: Allocator, cfg: types.IndexConfig) !void {
+    if (try denseConfigModelRevision(alloc, cfg) == null) return;
+    var dense = try parseDenseConfig(alloc, cfg.config_json);
+    defer dense.deinit(alloc);
+    var generator = try parseDenseGeneratorConfig(alloc, cfg.config_json);
+    defer if (generator) |*value| value.deinit(alloc);
+    try validatePinnedDenseLayout(dense, generator);
+}
+
+fn validatePinnedDenseLayout(dense: DenseConfig, generator: ?GeneratorConfig) !void {
+    const producer = generator orelse return error.InvalidIndexConfig;
+    if (dense.external or dense.leann != null or dense.embedding_names.len != 0 or
+        generatorHasChunking(producer) or producer.embedding_input != .text)
+        return error.InvalidIndexConfig;
+}
+
+fn mayContainDenseModelRevision(raw: []const u8) bool {
+    return std.mem.indexOf(u8, raw, "model_revision") != null or std.mem.indexOf(u8, raw, "\\u") != null;
+}
+
+pub fn denseConfigModelRevision(alloc: Allocator, cfg: types.IndexConfig) !?[32]u8 {
+    if (cfg.kind != .dense_vector or !mayContainDenseModelRevision(cfg.config_json)) return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cfg.config_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidIndexConfig;
+    return try denseModelRevisionFromConfig(alloc, parsed.value.object);
+}
+
+fn denseModelRevisionFromConfig(alloc: Allocator, root: std.json.ObjectMap) !?[32]u8 {
+    const producer = root.get("semantic_producer") orelse return null;
+    if (producer != .string) return error.InvalidIndexConfig;
+    if (!mayContainDenseModelRevision(producer.string)) return null;
+    var identity = try std.json.parseFromSlice(std.json.Value, alloc, producer.string, .{});
+    defer identity.deinit();
+    if (identity.value != .object) return error.InvalidIndexConfig;
+    return try types.embeddingProducerModelRevision(identity.value.object);
+}
+
 pub fn denseConfigDimensions(alloc: Allocator, cfg: types.IndexConfig) !u32 {
     if (cfg.kind != .dense_vector) return error.InvalidIndexConfiguration;
     const dense_cfg = try parseDenseConfig(alloc, cfg.config_json);
@@ -36781,13 +36993,14 @@ pub fn denseConfigArtifactNamesAlloc(alloc: Allocator, cfg: types.IndexConfig) !
     defer dense_cfg.deinit(alloc);
     const generator = try parseDenseGeneratorConfig(alloc, cfg.config_json);
     defer if (generator) |value| value.deinit(alloc);
-    const source_names: []const []const u8 = if (dense_cfg.embedding_names.len > 0)
-        dense_cfg.embedding_names
-    else if (generator) |value|
-        &.{value.embedding_name orelse cfg.name}
-    else
-        &.{dense_cfg.embedding_name orelse cfg.name};
+    const default_name = denseBaseVectorArtifactName(cfg.name, dense_cfg, generator);
+    const source_names: []const []const u8 = if (dense_cfg.embedding_names.len != 0) dense_cfg.embedding_names else &.{default_name};
     return try cloneOwnedStrings(alloc, source_names);
+}
+
+fn denseBaseVectorArtifactName(index_name: []const u8, dense: DenseConfig, generator: ?GeneratorConfig) []const u8 {
+    if (generator) |value| return value.embedding_name orelse index_name;
+    return dense.embedding_name orelse index_name;
 }
 
 const TextConfig = struct {
@@ -37462,6 +37675,8 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
     const dims = root.object.get("dims") orelse return error.InvalidIndexConfig;
     const metric = root.object.get("metric");
 
+    const model_revision = try denseModelRevisionFromConfig(alloc, root.object);
+
     const embedding_names = try parseArtifactSourcesAlloc(alloc, root.object);
     errdefer {
         for (embedding_names) |name| alloc.free(name);
@@ -37470,6 +37685,7 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
     if (embedding_names.len > 0 and root.object.get("embedding_name") != null) return error.InvalidIndexConfig;
 
     return .{
+        .model_revision = model_revision,
         .field_name = try alloc.dupe(u8, field.string),
         .dims = std.math.cast(u32, dims.integer) orelse return error.InvalidIndexConfig,
         .metric = if (metric) |value| try parseMetric(value.string) else .l2_squared,
@@ -40122,6 +40338,60 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
     var ready = try index_generation_manifest.load(alloc, active_path);
     defer ready.deinit(alloc);
     try std.testing.expectEqual(snapshot_sequence, ready.ready_applied_sequence);
+}
+
+test "ordered artifact inventory native backfill reconstructs pinned vectors from accepted bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    const accepted_doc = try internal_keys.documentKeyAlloc(alloc, "with-artifact");
+    defer alloc.free(accepted_doc);
+    const raw_only_doc = try internal_keys.documentKeyAlloc(alloc, "without-artifact");
+    defer alloc.free(raw_only_doc);
+    try store.put(accepted_doc, "{\"body\":\"text\"}");
+    try store.put(raw_only_doc, "{\"body\":[9,9]}");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "with-artifact", "semantic");
+    defer alloc.free(artifact_key);
+    const artifact = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAtRevisionAlloc(alloc, 1, true, @splat(0xaa), &.{ 1, 2 });
+    defer alloc.free(artifact);
+    try store.put(artifact_key, artifact);
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.add(&store, .{ .name = "semantic", .kind = .dense_vector, .config_json =
+        \\{"field":"body","dims":2,"embedding_name":"semantic","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"},"semantic_producer":"{\"provider\":\"antfly\",\"model\":\"embed\",\"model_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"}
+    });
+    const entry = manager.denseIndex("semantic") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
+    try std.testing.expect((try manager.lookupDenseVectorId(&store, "semantic", "with-artifact")) != null);
+    try std.testing.expect((try manager.lookupDenseVectorId(&store, "semantic", "without-artifact")) == null);
+
+    var index_name = "semantic".*;
+    var doc_key = "with-artifact".*;
+    var inline_vector = [_]f32{ 99, 99, 99 };
+    const replay = [_]mapper.DenseEmbeddingWrite{.{
+        .index_name = &index_name,
+        .doc_key = &doc_key,
+        .artifact_key = artifact_key,
+        .vector = &inline_vector,
+    }};
+    try manager.validateDenseEmbeddingArtifactsByName(&store, "semantic", &replay);
+    try entry.index.beginExperimentalPostingMutationCapture();
+    defer entry.index.cancelExperimentalPostingMutationCapture();
+    try manager.applyDenseEmbeddingWritesWithOptions(&store, &replay, .{});
+    try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
+    const wrong_revision = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAtRevisionAlloc(alloc, 1, true, @splat(0xbb), &.{ 1, 2 });
+    defer alloc.free(wrong_revision);
+    try store.put(artifact_key, wrong_revision);
+    try std.testing.expectError(error.ArtifactRepairRequired, manager.validateDenseEmbeddingArtifactsByName(&store, "semantic", &replay));
+    try std.testing.expectError(error.ArtifactRepairRequired, manager.applyDenseEmbeddingWritesWithOptions(&store, &replay, .{}));
 }
 
 test "fresh native dense backfill extends a shared vector generation without a source rescan" {

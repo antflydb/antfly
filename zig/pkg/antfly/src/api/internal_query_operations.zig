@@ -293,6 +293,7 @@ pub fn planSemanticQuery(
     defer runtime.deinit();
 
     return .{
+        .model_revision_fence = runtime.queryModelRevision(index_name),
         .vector = try computeManagedQueryVector(&runtime, alloc, index_name, semantic_search, embedding_template, .{
             .storage = if (planning.query_embedding_cache) |cache|
                 if (planning.query_embedding_budget) |budget| .{ .cache = cache, .budget = budget } else null

@@ -40,7 +40,9 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 30;
+pub const batch_protocol_version: u16 = 31;
+/// Version 31 persists exact model revision evidence for pinned embeddings.
+pub const batch_pinned_embedding_revision_protocol_version: u16 = 31;
 /// Version 30 applies immutable direct producer effects atomically with their
 /// source. Older members must reject the envelope before admitting the source.
 pub const batch_prepared_enrichments_protocol_version: u16 = 30;

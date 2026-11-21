@@ -43,19 +43,39 @@ pub const DownloadReceipt = struct {
     artifacts: []const ArtifactReceipt,
 };
 
+/// Used only to report a selected installation's artifact failure. The
+/// declaration never authorizes execution or participates in healthy ownership.
+pub const DamagedReceipt = struct {
+    parsed: std.json.Parsed(DownloadReceipt),
+    publication: [32]u8,
+    member: ?[]const u8,
+};
+
 pub const ValidatedArtifact = struct {
     path: []const u8,
     canonical_path: []u8,
     size: u64,
     sha256: ?[]const u8,
+    needs_binding_check: bool = false,
 };
 
 pub const ValidatedReceipt = struct {
     publication_generation: [32]u8 = @splat(0),
+    all_checksums_declared: bool = false,
+    effective_checksums_complete: ?bool = null,
     allocator: std.mem.Allocator,
     parsed: std.json.Parsed(DownloadReceipt),
     artifacts: []ValidatedArtifact,
     path_index: std.StringHashMapUnmanaged(usize),
+
+    pub fn hasCompleteChecksums(self: *const ValidatedReceipt) bool {
+        if (self.all_checksums_declared) return true;
+        if (self.effective_checksums_complete) |complete| return complete;
+        for (self.artifacts) |artifact| {
+            if (artifact.sha256 == null) return false;
+        }
+        return true;
+    }
 
     pub fn find(self: *const ValidatedReceipt, path: []const u8) ?*const ValidatedArtifact {
         const index = self.path_index.get(path) orelse return null;
@@ -113,6 +133,18 @@ pub const ArtifactStamp = struct {
     }
 };
 
+/// Coalesce checksum work while honoring execution deadlines of waiters.
+pub fn lockVerification(control: ExecutionControl, mutex: *std.Io.Mutex, io: std.Io) !void {
+    if (control.deadline_ns == null and control.cancellation == null and control.check_fn == null)
+        return mutex.lock(io);
+    while (!mutex.tryLock()) {
+        try control.check();
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    errdefer mutex.unlock(io);
+    try control.check();
+}
+
 pub fn verifyValidatedArtifactSha256AndStamp(io: std.Io, artifact: *const ValidatedArtifact, expected_hex: []const u8) !ArtifactStamp {
     return verifyValidatedArtifactSha256AndStampWithControl(io, artifact, expected_hex, .{});
 }
@@ -123,7 +155,8 @@ pub fn verifyValidatedArtifactSha256AndStampWithControl(io: std.Io, artifact: *c
     if (expected_hex.len != 64) return error.ChecksumMismatch;
     var expected: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&expected, expected_hex) catch return error.ChecksumMismatch;
-    var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
+    try control.check();
+    const file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
     defer file.close(io);
     return verifyOpenedArtifactSha256AndStampWithControl(io, file, artifact, expected_hex, control);
 }
@@ -158,6 +191,7 @@ pub fn verifyOpenedArtifactSha256AndStampWithControl(io: std.Io, file: std.Io.Fi
     if (!std.mem.eql(u8, &digest, &expected)) return error.ChecksumMismatch;
     const verified = ArtifactStamp.fromStat(try file.stat(io));
     if (!std.meta.eql(ArtifactStamp.fromStat(stat), verified)) return error.ModelArtifactsChanging;
+    try control.check();
     return verified;
 }
 
@@ -293,6 +327,21 @@ pub fn resolveContainedArtifactPath(
     return canonical_path;
 }
 
+/// Recheck the member that caused a strict inventory check to fail. Use
+/// the current contained target so repairing a missing symlink also counts.
+pub fn memberHasDeclaredSize(allocator: std.mem.Allocator, io: std.Io, canonical_root: []const u8, member: *const ValidatedArtifact) !bool {
+    const path = resolveContainedArtifactFromCanonicalRoot(allocator, io, canonical_root, member.path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.ModelArtifactOutsideRoot, error.InvalidModelArtifactPath => return false,
+        else => return err,
+    };
+    defer allocator.free(path);
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    return stat.kind == .file and stat.size == member.size;
+}
+
 /// Load and validate a managed completion receipt.
 ///
 /// `null` means the directory is unmanaged. A present but invalid, incomplete,
@@ -305,7 +354,11 @@ fn loadValidatedSource(
     io: std.Io,
     dest_dir: []const u8,
     source: ReceiptSource,
+    control: ExecutionControl,
+    damaged: ?*?DamagedReceipt,
+    selected_members: bool,
 ) !?ValidatedReceipt {
+    try control.check();
     const cwd = std.Io.Dir.cwd();
     const in_progress_path = try managedPath(allocator, dest_dir, in_progress_filename);
     defer allocator.free(in_progress_path);
@@ -343,6 +396,7 @@ fn loadValidatedSource(
         else => return err,
     };
     defer allocator.free(receipt_json);
+    try control.check();
 
     var parsed = std.json.parseFromSlice(
         DownloadReceipt,
@@ -358,7 +412,16 @@ fn loadValidatedSource(
         error.OutOfMemory => return err,
         else => return error.InvalidManagedDownload,
     };
-    errdefer parsed.deinit();
+    var artifact_damaged = false;
+    var damaged_member: ?[]const u8 = null;
+    errdefer {
+        if (artifact_damaged and damaged != null) {
+            var publication: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(receipt_json, &publication, .{});
+            damaged.?.* = .{ .parsed = parsed, .publication = publication, .member = damaged_member };
+        } else parsed.deinit();
+    }
+    try control.check();
     if ((parsed.value.version != 1 and parsed.value.version != 2) or
         parsed.value.artifacts.len == 0 or
         parsed.value.artifacts.len > max_artifact_count)
@@ -366,8 +429,17 @@ fn loadValidatedSource(
         return error.InvalidManagedDownload;
     }
 
+    // Legacy aliases may inherit their checksum from a physical sibling.
+    // Only a complete declaration can defer live checks to selected members.
+    const selective = selected_members and for (parsed.value.artifacts) |artifact| {
+        if (artifact.sha256 == null) break false;
+    } else true;
+
     const canonical_root = realPathAlloc(allocator, io, dest_dir) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return error.InvalidManagedDownload,
+        error.FileNotFound, error.NotDir => {
+            artifact_damaged = true;
+            return error.InvalidManagedDownload;
+        },
         else => return err,
     };
     defer allocator.free(canonical_root);
@@ -386,23 +458,47 @@ fn loadValidatedSource(
     try canonical_groups.ensureTotalCapacity(allocator, @intCast(parsed.value.artifacts.len));
 
     var has_supported_payload = false;
+    var all_checksums_declared = true;
     for (parsed.value.artifacts, 0..) |artifact, index| {
+        try control.check();
+        all_checksums_declared = all_checksums_declared and artifact.sha256 != null;
         const entry = path_index.getOrPutAssumeCapacity(artifact.path);
         if (entry.found_existing) return error.InvalidManagedDownload;
         entry.value_ptr.* = index;
+        if (!artifactPathIsSafe(artifact.path)) return error.InvalidManagedDownload;
+        var needs_binding_check = false;
         const canonical_path = resolveContainedArtifactFromCanonicalRoot(
             allocator,
             io,
             canonical_root,
             artifact.path,
         ) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => return error.InvalidManagedDownload,
-            error.InvalidModelArtifactPath => return error.InvalidManagedDownload,
+            error.FileNotFound, error.NotDir => if (selective) missing: {
+                needs_binding_check = true;
+                break :missing try std.fs.path.join(allocator, &.{ canonical_root, artifact.path });
+            } else {
+                artifact_damaged = true;
+                damaged_member = artifact.path;
+                return error.InvalidManagedDownload;
+            },
             else => return err,
         };
         errdefer allocator.free(canonical_path);
-        const stat = try cwd.statFile(io, canonical_path, .{ .follow_symlinks = false });
-        if (stat.kind != .file or stat.size != artifact.size) return error.InvalidManagedDownload;
+        if (!selective) {
+            const stat = cwd.statFile(io, canonical_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => {
+                    artifact_damaged = true;
+                    damaged_member = artifact.path;
+                    return error.InvalidManagedDownload;
+                },
+                else => return err,
+            };
+            if (stat.kind != .file or stat.size != artifact.size) {
+                artifact_damaged = true;
+                damaged_member = artifact.path;
+                return error.InvalidManagedDownload;
+            }
+        }
         const canonical = canonical_groups.getOrPutAssumeCapacity(canonical_path);
         if (canonical.found_existing) {
             const prior = &artifacts[canonical.value_ptr.*];
@@ -418,19 +514,25 @@ fn loadValidatedSource(
             .canonical_path = canonical_path,
             .size = artifact.size,
             .sha256 = artifact.sha256,
+            .needs_binding_check = needs_binding_check,
         };
         initialized += 1;
         if (std.mem.endsWith(u8, artifact.path, ".gguf") or
             std.mem.endsWith(u8, artifact.path, ".onnx") or
-            std.mem.endsWith(u8, artifact.path, ".safetensors"))
+            std.mem.endsWith(u8, artifact.path, ".safetensors") or
+            std.mem.eql(u8, artifact.path, "model.safetensors.index.json") or
+            std.mem.eql(u8, artifact.path, "pytorch_model.safetensors.index.json"))
         {
             has_supported_payload = true;
         }
     }
     if (!has_supported_payload) return error.InvalidManagedDownload;
     // A linear second pass also covers aliases encountered before a digest.
-    for (artifacts) |*artifact| {
+    var effective_checksums_complete = true;
+    for (artifacts, 0..) |*artifact, i| {
+        if (i % 256 == 0) try control.check();
         artifact.sha256 = artifacts[canonical_groups.get(artifact.canonical_path).?].sha256;
+        effective_checksums_complete = effective_checksums_complete and artifact.sha256 != null;
     }
     switch (source) {
         .completion => if (try publicationBlockedPaths(cwd, io, in_progress_path, plan_path)) {
@@ -445,8 +547,11 @@ fn loadValidatedSource(
 
     var publication_generation: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(receipt_json, &publication_generation, .{});
+    try control.check();
     return .{
         .publication_generation = publication_generation,
+        .all_checksums_declared = all_checksums_declared,
+        .effective_checksums_complete = effective_checksums_complete,
         .allocator = allocator,
         .parsed = parsed,
         .artifacts = artifacts,
@@ -459,7 +564,37 @@ pub fn loadValidated(
     io: std.Io,
     dest_dir: []const u8,
 ) !?ValidatedReceipt {
-    return loadValidatedSource(allocator, io, dest_dir, .completion);
+    return loadValidatedWithControl(allocator, io, dest_dir, .{});
+}
+
+pub fn loadValidatedWithControl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    control: ExecutionControl,
+) !?ValidatedReceipt {
+    return loadValidatedSource(allocator, io, dest_dir, .completion, control, null, false);
+}
+
+/// Load the immutable publication declaration for a pinned operation.
+/// Callers verify the live binding, size and checksum of selected members.
+pub fn loadForSelectedArtifacts(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    control: ExecutionControl,
+) !?ValidatedReceipt {
+    return loadValidatedSource(allocator, io, dest_dir, .completion, control, null, true);
+}
+
+pub fn loadValidatedForInventory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    control: ExecutionControl,
+    damaged: *?DamagedReceipt,
+) !?ValidatedReceipt {
+    return loadValidatedSource(allocator, io, dest_dir, .completion, control, damaged, false);
 }
 
 /// Load the validated artifact plan of a private staging transaction. This is
@@ -470,8 +605,34 @@ pub fn loadValidatedPlan(
     io: std.Io,
     dest_dir: []const u8,
 ) !ValidatedReceipt {
-    return (try loadValidatedSource(allocator, io, dest_dir, .plan)) orelse
+    return (try loadValidatedSource(allocator, io, dest_dir, .plan, .{}, null, false)) orelse
         error.IncompleteManagedDownload;
+}
+
+test "managed receipt validation observes cancellation during the artifact walk" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "payload" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = complete_filename,
+        // The second artifact is missing. Cancellation must take precedence.
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7},{\"path\":\"missing.gguf\",\"size\":1}]}",
+    });
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    try std.testing.expectError(error.InvalidManagedDownload, loadValidated(allocator, io, root));
+
+    const Stop = struct {
+        fn check(raw: ?*anyopaque) !void {
+            const checks: *usize = @ptrCast(@alignCast(raw));
+            checks.* += 1;
+            if (checks.* == 5) return error.Cancelled;
+        }
+    };
+    var checks: usize = 0;
+    try std.testing.expectError(error.Cancelled, loadValidatedWithControl(allocator, io, root, .{ .ptr = &checks, .check_fn = Stop.check }));
 }
 
 test "validated artifact checksum rehashes the opened file" {
@@ -650,6 +811,68 @@ pub fn publicationRootAlloc(a: std.mem.Allocator, io: std.Io, model: []const u8)
         }
     }
     return a.dupe(u8, model);
+}
+
+/// Local identity of a validated installation. A byte-identical reinstall
+/// keeps its portable receipt generation and receives a new local identity.
+pub const Installation = struct {
+    publication: [32]u8,
+    root_inode: @FieldType(std.Io.File.Stat, "inode"),
+    receipt_stamp: ArtifactStamp,
+    direct: ?ArtifactStamp,
+
+    fn hashStamp(stamp: ArtifactStamp, hash: *std.crypto.hash.sha2.Sha256) void {
+        hash.update(std.mem.asBytes(&stamp.inode));
+        hash.update(std.mem.asBytes(&stamp.modified.nanoseconds));
+        hash.update(std.mem.asBytes(&stamp.changed.nanoseconds));
+        hash.update(std.mem.asBytes(&stamp.size));
+    }
+
+    pub fn updateHash(self: Installation, hash: *std.crypto.hash.sha2.Sha256) void {
+        hash.update(&self.publication);
+        hash.update(std.mem.asBytes(&self.root_inode));
+        hashStamp(self.receipt_stamp, hash);
+        if (self.direct) |file| hashStamp(file, hash);
+    }
+};
+
+pub fn installationAtRoot(a: std.mem.Allocator, io: std.Io, root: []const u8, root_stat: std.Io.File.Stat, direct: ?[]const u8, publication: [32]u8) !Installation {
+    const path = try managedPath(a, root, complete_filename);
+    defer a.free(path);
+    const receipt = try std.Io.Dir.cwd().statFile(io, path, .{});
+    return .{
+        .publication = publication,
+        .root_inode = root_stat.inode,
+        .receipt_stamp = ArtifactStamp.fromStat(receipt),
+        .direct = if (direct) |member| ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(io, member, .{})) else null,
+    };
+}
+
+/// Read only the installation root, receipt stamp and any directly selected member.
+pub fn installationForPublication(a: std.mem.Allocator, io: std.Io, model: []const u8, publication: [32]u8) !Installation {
+    const direct = isDirectModelPath(model);
+    const root = if (direct) try publicationRootAlloc(a, io, model) else model;
+    defer if (direct) a.free(root);
+    const stat = try std.Io.Dir.cwd().statFile(io, root, .{});
+    return installationAtRoot(a, io, root, stat, if (direct) model else null, publication);
+}
+
+/// Recheck a previously hashed receipt against the current installation.
+/// Both marker reads are required because publication may start during stat.
+pub fn requireInstallation(a: std.mem.Allocator, io: std.Io, model: []const u8, expected: Installation) !void {
+    const direct = isDirectModelPath(model);
+    const root = if (direct) try publicationRootAlloc(a, io, model) else model;
+    defer if (direct) a.free(root);
+    const progress = try managedPath(a, root, in_progress_filename);
+    defer a.free(progress);
+    const plan = try managedPath(a, root, plan_filename);
+    defer a.free(plan);
+    const cwd = std.Io.Dir.cwd();
+    if (try publicationBlockedPaths(cwd, io, progress, plan)) return error.IncompleteManagedDownload;
+    const stat = try cwd.statFile(io, root, .{});
+    const current = try installationAtRoot(a, io, root, stat, if (direct) model else null, expected.publication);
+    if (try publicationBlockedPaths(cwd, io, progress, plan)) return error.IncompleteManagedDownload;
+    if (!std.meta.eql(expected, current)) return error.ModelArtifactsChanging;
 }
 
 /// Cheap publication identity for resident sessions and load flights. Receipt

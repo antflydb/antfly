@@ -52,7 +52,8 @@ pub fn requirePublicationDigest(txn: anytype, expected: [32]u8) !void {
 }
 
 pub const dense_artifact_flags_protocol: u16 = 19;
-pub const max_effect_protocol: u16 = dense_artifact_flags_protocol;
+pub const pinned_embedding_revision_protocol: u16 = 20;
+pub const max_effect_protocol: u16 = pinned_embedding_revision_protocol;
 
 pub const Binding = struct {
     epoch: u64,
@@ -103,7 +104,8 @@ pub const Catalogs = struct {
             const configs = try indexes.deserializeCatalog(alloc, self.indexes);
             defer @import("types.zig").freeIndexConfigs(alloc, configs);
             for (configs) |cfg| {
-                if (try indexes.denseArtifactFlagsRequired(alloc, cfg)) return dense_artifact_flags_protocol;
+                if (try indexes.denseConfigModelRevision(alloc, cfg) != null) return pinned_embedding_revision_protocol;
+                if (try indexes.denseArtifactFlagsRequired(alloc, cfg)) required = @max(required, dense_artifact_flags_protocol);
                 if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) required = @max(required, 18);
                 if (try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) required = @max(required, 17);
             }
@@ -223,6 +225,8 @@ test "grouped sources production ordered artifact inventory compatibility binds 
     extended.effect_protocol = 19;
     try std.testing.expect(extended.supportsProducerWitnesses());
     extended.effect_protocol = 20;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    extended.effect_protocol = 21;
     try std.testing.expect(!extended.supportsProducerWitnesses());
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }

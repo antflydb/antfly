@@ -2671,6 +2671,7 @@ pub const AntflyApiHandler = struct {
     fn sharedInternalHttpErrorSpec(err: anyerror) ?InternalHttpErrorSpec {
         return switch (err) {
             error.IndexRebuilding => .{ .status = 503, .message = "IndexRebuilding" },
+            error.PinnedIndexRequiresSemanticSearch => .{ .status = 409, .message = "PinnedIndexRequiresSemanticSearch" },
             error.IncompletePublishedSnapshot => .{ .status = 503, .message = "IncompletePublishedSnapshot" },
             error.ResourceBudgetExceeded => .{ .status = 413, .message = "inspection limit exceeded" },
             error.IndexGenerationMismatch => .{

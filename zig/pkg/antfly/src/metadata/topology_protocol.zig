@@ -138,7 +138,9 @@ pub const guarded_generation_admission_version: u16 = 98;
 pub const bound_create_parent_version: u16 = 99;
 /// Every prospective metadata session owner can recover incarnation-bound staged work.
 pub const bound_session_version: u16 = 100;
-pub const current_version: u16 = bound_session_version;
+/// Version 101 maintains durable hosted embedding revision admission.
+pub const pinned_embedding_revision_version: u16 = 101;
+pub const current_version: u16 = pinned_embedding_revision_version;
 
 pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
     const empty: [32]u8 = @splat(0);
@@ -155,6 +157,41 @@ pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelop
     const required = if (envelope) try aliases.requiredEnvelopeStoreProtocol(a, bytes) else try aliases.requiredStoreProtocol(a, bytes);
     return if (required >= 4) index_alias_lifecycle_version else if (required >= 3) index_aliases_version else 0;
 }
+pub fn pinnedEmbeddingDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelope: bool) std.mem.Allocator.Error!u16 {
+    const config = @import("antfly_local_sources").api_table_index_config;
+    if (!config.mayContainModelRevision(bytes)) return 0;
+    if (!envelope) return if (try hasPinnedEmbeddingCatalog(a, bytes)) pinned_embedding_revision_version else 0;
+    var parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return pinned_embedding_revision_version,
+    };
+    defer parsed.deinit();
+    return if (try hasPinnedEmbeddingEnvelope(a, parsed.value)) pinned_embedding_revision_version else 0;
+}
+
+fn hasPinnedEmbeddingCatalog(a: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!bool {
+    return @import("antfly_local_sources").api_table_index_config.hasModelRevisionPin(a, bytes, true) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return true,
+    };
+}
+
+fn hasPinnedEmbeddingEnvelope(a: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!bool {
+    switch (value) {
+        .object => |object| {
+            if (object.get("indexes_json")) |catalog| {
+                if (catalog == .string and try hasPinnedEmbeddingCatalog(a, catalog.string)) return true;
+            }
+            for (object.values()) |child| if (try hasPinnedEmbeddingEnvelope(a, child)) return true;
+        },
+        .array => |array| for (array.items) |child| {
+            if (try hasPinnedEmbeddingEnvelope(a, child)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
 pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
     return @import("antfly_local_sources").api_index_metadata.aliases.uses(a, indexes_json);
 }

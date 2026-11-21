@@ -13942,6 +13942,7 @@ export interface components {
              *     - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE)
              *
              *     Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
+             *     Revision-pinned embedding indexes require semantic_search and reject pre-computed vectors.
              */
             embeddings?: {
                 [key: string]: components["schemas"]["Embedding"];
@@ -17569,6 +17570,8 @@ export interface components {
          *     }
          */
         AntflyEmbedderConfig: {
+            /** @description Physical hosted embedding model revision advertised by scoped inference discovery. Supported for managed dense embeddings with distributed ordered vector publication. To change revisions, build a new index and finish backfill before switching the serving alias. */
+            model_revision?: string;
             /** @description Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication. */
             model_identity?: string;
             /**

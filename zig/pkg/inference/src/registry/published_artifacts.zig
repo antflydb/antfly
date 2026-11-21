@@ -19,93 +19,134 @@ const std = @import("std");
 const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const managed = @import("managed_receipt.zig");
 pub const Expected = struct { publication: ?[32]u8 };
-/// Process-owned successful checksum proofs. Keys own no pathname memory;
+/// Process-owned checksum outcomes. Keys own no pathname memory;
 /// publication, canonical member, declared digest and the complete file stamp
 /// must all match. No on-disk memo can authenticate a receipt member.
 pub const VerificationCache = struct {
     pub const capacity = 4096;
-    const Entry = struct { stamp: managed.ArtifactStamp, used: u64 };
+    const Key = struct { scope: [32]u8, member: [32]u8 };
+    const Entry = struct { stamp: managed.ArtifactStamp, used: u64, rejected: bool };
     /// Manager-owned caches outlive the allocators of borrowed acquisitions.
     owner_allocator: ?std.mem.Allocator = null,
     mutex: std.atomic.Mutex = .unlocked,
     builders: [16]std.Io.Mutex = @splat(.init),
-    entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
+    entries: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
+    rejected_scopes: std.AutoHashMapUnmanaged([32]u8, usize) = .empty,
     clock: u64 = 0,
 
     fn lock(self: *VerificationCache) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
-    fn keyFor(publication: [32]u8, artifact: *const managed.ValidatedArtifact) [32]u8 {
+    fn keyFor(scope: [32]u8, artifact: *const managed.ValidatedArtifact) Key {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update(&publication);
         hash.update(artifact.canonical_path);
         hash.update(&.{0});
         hash.update(std.mem.asBytes(&artifact.size));
         for (artifact.sha256.?) |byte| hash.update(&.{std.ascii.toLower(byte)});
-        return hash.finalResult();
+        return .{ .scope = scope, .member = hash.finalResult() };
     }
-    fn hit(self: *VerificationCache, key: [32]u8, stamp: managed.ArtifactStamp) bool {
+    fn hit(self: *VerificationCache, key: Key, stamp: managed.ArtifactStamp) !bool {
         self.lock();
         defer self.mutex.unlock();
         const entry = self.entries.getPtr(key) orelse return false;
         if (!std.meta.eql(entry.stamp, stamp)) return false;
         self.clock +|= 1;
         entry.used = self.clock;
+        if (entry.rejected) return error.ChecksumMismatch;
         return true;
     }
-    fn remember(self: *VerificationCache, a: std.mem.Allocator, key: [32]u8, stamp: managed.ArtifactStamp) !void {
+    fn remember(self: *VerificationCache, a: std.mem.Allocator, key: Key, stamp: managed.ArtifactStamp, rejected: bool) !void {
         self.lock();
         defer self.mutex.unlock();
+        const allocator = self.owner_allocator orelse a;
+        const previous = self.entries.get(key);
+        const prior_rejected = if (previous) |entry| entry.rejected else false;
+        const new_entry = previous == null;
+        if (new_entry and self.entries.count() < capacity) try self.entries.ensureUnusedCapacity(allocator, 1);
+        if (rejected and !prior_rejected and !self.rejected_scopes.contains(key.scope))
+            try self.rejected_scopes.ensureUnusedCapacity(allocator, 1);
         self.clock +|= 1;
-        if (!self.entries.contains(key) and self.entries.count() == capacity) {
-            var oldest: ?[32]u8 = null;
+        if (new_entry and self.entries.count() == capacity) {
+            var oldest: ?Key = null;
             var age: u64 = std.math.maxInt(u64);
             var it = self.entries.iterator();
             while (it.next()) |entry| if (entry.value_ptr.used <= age) {
                 oldest = entry.key_ptr.*;
                 age = entry.value_ptr.used;
             };
-            _ = self.entries.remove(oldest.?);
+            const evicted = self.entries.fetchRemove(oldest.?).?;
+            if (evicted.value.rejected) self.removeRejection(evicted.key.scope);
         }
-        try self.entries.put(self.owner_allocator orelse a, key, .{ .stamp = stamp, .used = self.clock });
+        self.entries.putAssumeCapacity(key, .{ .stamp = stamp, .used = self.clock, .rejected = rejected });
+        if (rejected and !prior_rejected) {
+            const count = self.rejected_scopes.getOrPutAssumeCapacity(key.scope);
+            if (!count.found_existing) count.value_ptr.* = 0;
+            count.value_ptr.* += 1;
+        } else if (!rejected and prior_rejected) {
+            self.removeRejection(key.scope);
+        }
     }
-    fn verify(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, initial: managed.ArtifactStamp, control: ExecutionControl) !managed.ArtifactStamp {
+
+    fn removeRejection(self: *VerificationCache, scope: [32]u8) void {
+        const count = self.rejected_scopes.getPtr(scope).?;
+        count.* -= 1;
+        if (count.* == 0) _ = self.rejected_scopes.remove(scope);
+    }
+
+    fn verify(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, scope: [32]u8, artifact: *const managed.ValidatedArtifact, initial: managed.ArtifactStamp, control: ExecutionControl) !managed.ArtifactStamp {
         try control.check();
-        const key = keyFor(publication, artifact);
-        if (self.hit(key, initial)) return initial;
-        const builder = &self.builders[key[0] % self.builders.len];
-        if (control.deadline_ns != null or control.cancellation != null or control.check_fn != null) {
-            while (!builder.tryLock()) {
-                try control.check();
-                try io.sleep(.fromMilliseconds(1), .awake);
-            }
-        } else try builder.lock(io);
+        const key = keyFor(scope, artifact);
+        if (try self.hit(key, initial)) return initial;
+        const builder = &self.builders[key.member[0] % self.builders.len];
+        try managed.lockVerification(control, builder, io);
         defer builder.unlock(io);
         try control.check();
         // Another acquisition may have verified or replaced the file while
         // this request waited. Never reuse the pre-wait filesystem stamp.
         const stamp = managed.ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(io, artifact.canonical_path, .{ .follow_symlinks = false }));
         if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
-        if (self.hit(key, stamp)) return stamp;
-        const verified = try managed.verifyValidatedArtifactSha256AndStampWithControl(io, artifact, artifact.sha256.?, control);
-        self.remember(a, key, verified) catch {}; // Cache pressure cannot deny a valid construction.
+        if (try self.hit(key, stamp)) return stamp;
+        const verified = managed.verifyValidatedArtifactSha256AndStampWithControl(io, artifact, artifact.sha256.?, control) catch |err| {
+            if (err == error.ChecksumMismatch) self.remember(a, key, stamp, true) catch {};
+            return err;
+        };
+        self.remember(a, key, verified, false) catch {}; // Cache pressure cannot deny a valid construction.
         return verified;
     }
-    fn verifyOpened(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, file: std.Io.File, initial: managed.ArtifactStamp) !managed.ArtifactStamp {
-        const key = keyFor(publication, artifact);
-        if (self.hit(key, initial)) return initial;
-        const builder = &self.builders[key[0] % self.builders.len];
-        try builder.lock(io);
+    fn verifyOpened(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, scope: [32]u8, artifact: *const managed.ValidatedArtifact, file: std.Io.File, initial: managed.ArtifactStamp, control: ExecutionControl) !managed.ArtifactStamp {
+        try control.check();
+        const key = keyFor(scope, artifact);
+        if (try self.hit(key, initial)) return initial;
+        const builder = &self.builders[key.member[0] % self.builders.len];
+        try managed.lockVerification(control, builder, io);
         defer builder.unlock(io);
         const stamp = managed.ArtifactStamp.fromStat(try file.stat(io));
         if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
-        if (self.hit(key, stamp)) return stamp;
-        const verified = try managed.verifyOpenedArtifactSha256AndStamp(io, file, artifact, artifact.sha256.?);
-        self.remember(a, key, verified) catch {};
+        if (try self.hit(key, stamp)) return stamp;
+        const verified = managed.verifyOpenedArtifactSha256AndStampWithControl(io, file, artifact, artifact.sha256.?, control) catch |err| {
+            if (err == error.ChecksumMismatch) self.remember(a, key, stamp, true) catch {};
+            return err;
+        };
+        self.remember(a, key, verified, false) catch {};
         return verified;
     }
+    fn hasRejections(self: *VerificationCache, scope: [32]u8) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.rejected_scopes.contains(scope);
+    }
+
+    fn rejectedStamp(self: *VerificationCache, key: Key) ?managed.ArtifactStamp {
+        self.lock();
+        defer self.mutex.unlock();
+        const entry = self.entries.get(key) orelse return null;
+        return if (entry.rejected) entry.stamp else null;
+    }
+
     pub fn deinit(self: *VerificationCache, a: std.mem.Allocator) void {
-        self.entries.deinit(self.owner_allocator orelse a);
+        const allocator = self.owner_allocator orelse a;
+        self.entries.deinit(allocator);
+        self.rejected_scopes.deinit(allocator);
     }
 };
 
@@ -125,8 +166,11 @@ pub const PublishedArtifacts = struct {
     direct_path: ?[]u8 = null,
     direct_index: ?usize = null,
     verification_cache: ?*VerificationCache = null,
+    verification_control: ExecutionControl = .{},
     receipt: ?managed.ValidatedReceipt,
     publication: ?[32]u8,
+    verification_scope: ?[32]u8,
+    installation: ?managed.Installation = null,
     verified_stamps: []?managed.ArtifactStamp = &.{},
     canonical_index: std.StringHashMapUnmanaged(usize) = .empty,
     opened_files: std.AutoHashMapUnmanaged(usize, OpenedArtifact) = .empty,
@@ -138,6 +182,19 @@ pub const PublishedArtifacts = struct {
     const ExternalDataReader = @import("onnx_graph").tensor.ExternalDataReader;
 
     pub fn init(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected) !PublishedArtifacts {
+        return initWithControl(a, io, root, expected, .{});
+    }
+
+    pub fn initWithControl(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected, control: ExecutionControl) !PublishedArtifacts {
+        return initWithValidation(a, io, root, expected, control, false);
+    }
+
+    pub fn initForSelectedArtifacts(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected, control: ExecutionControl) !PublishedArtifacts {
+        return initWithValidation(a, io, root, expected, control, true);
+    }
+
+    fn initWithValidation(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected, control: ExecutionControl, selected_members: bool) !PublishedArtifacts {
+        try control.check();
         const direct = managed.isDirectModelPath(root);
         const publication_root = try managed.publicationRootAlloc(a, io, root);
         defer a.free(publication_root);
@@ -158,13 +215,40 @@ pub const PublishedArtifacts = struct {
         const root_stat = try std.Io.Dir.cwd().statFile(io, physical_root, .{ .follow_symlinks = false });
         const physical_direct = if (direct) try managed.resolveRegularFilePath(a, io, root) else null;
         errdefer if (physical_direct) |path| a.free(path);
-        var receipt = if (standalone) null else try managed.loadValidated(a, io, physical_root);
+        const receipt_path = if (standalone) null else try std.fs.path.join(a, &.{ physical_root, managed.complete_filename });
+        defer if (receipt_path) |path| a.free(path);
+        const before: ?managed.ArtifactStamp = if (receipt_path) |path| stamp: {
+            const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => break :stamp null,
+                else => return err,
+            };
+            break :stamp managed.ArtifactStamp.fromStat(stat);
+        } else null;
+        var receipt = if (standalone) null else if (selected_members)
+            try managed.loadForSelectedArtifacts(a, io, physical_root, control)
+        else
+            try managed.loadValidatedWithControl(a, io, physical_root, control);
         errdefer if (receipt) |*value| value.deinit();
         const publication = if (receipt) |value| value.publication_generation else null;
+        const verification_scope = if (publication) |generation| scope: {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update(&generation);
+            hash.update(physical_root);
+            break :scope hash.finalResult();
+        } else null;
         if (expected) |value| if (!std.meta.eql(value.publication, publication)) return error.ModelArtifactsChanging;
+        const installation = if (publication) |generation| try managed.installationAtRoot(a, io, physical_root, root_stat, physical_direct, generation) else null;
+        const after = if (installation) |installed| installed.receipt_stamp else null;
+        if (!std.meta.eql(before, after)) return error.ModelArtifactsChanging;
         var index = std.StringHashMapUnmanaged(usize).empty;
         errdefer index.deinit(a);
-        if (receipt) |value| for (value.artifacts, 0..) |artifact, i| try index.put(a, artifact.canonical_path, i);
+        if (receipt) |value| {
+            try index.ensureTotalCapacity(a, @intCast(value.artifacts.len));
+            for (value.artifacts, 0..) |artifact, i| {
+                if (i % 256 == 0) try control.check();
+                index.putAssumeCapacity(artifact.canonical_path, i);
+            }
+        }
         const direct_index: ?usize = if (direct and receipt != null) blk: {
             const requested = try managed.resolveRequestedFilePath(a, io, root);
             defer a.free(requested);
@@ -177,9 +261,10 @@ pub const PublishedArtifacts = struct {
             if (!std.mem.eql(u8, canonical, receipt.?.artifacts[member].canonical_path)) return error.ModelArtifactNotPublished;
             break :blk member;
         } else null;
+        try control.check();
         const verified = try a.alloc(?managed.ArtifactStamp, if (receipt) |value| value.artifacts.len else 0);
         @memset(verified, null);
-        return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .physical_root = physical_root, .physical_root_inode = root_stat.inode, .physical_direct = physical_direct, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
+        return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .physical_root = physical_root, .physical_root_inode = root_stat.inode, .physical_direct = physical_direct, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .verification_scope = verification_scope, .installation = installation, .canonical_index = index, .verified_stamps = verified };
     }
     pub fn deinit(self: *PublishedArtifacts) void {
         var opened = self.opened_files.valueIterator();
@@ -296,6 +381,47 @@ pub const PublishedArtifacts = struct {
         }
         return error.InvalidManagedDownload;
     }
+    /// Check the current binding and size against the declared member.
+    pub fn requireCatalogMember(self: *const PublishedArtifacts, path: []const u8) !managed.ArtifactStamp {
+        const receipt = self.receipt orelse return error.InvalidManagedDownload;
+        const artifact = &receipt.artifacts[try self.indexForPath(path)];
+        // A manifest can store the resolved target rather than the receipt's
+        // logical name. Keep the binding to the logical member live as well.
+        const logical = try std.fs.path.join(self.allocator, &.{ self.physical_root, artifact.path });
+        defer self.allocator.free(logical);
+        if (!std.mem.eql(u8, path, logical) and !std.mem.eql(u8, path, artifact.canonical_path))
+            try self.verifyBinding(path, artifact.canonical_path);
+        const canonical = managed.resolveRegularFilePath(self.allocator, self.io, logical) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir, error.InvalidModelArtifactKind => return error.CatalogArtifactUnavailable,
+            else => return err,
+        };
+        defer self.allocator.free(canonical);
+        if (!std.mem.eql(u8, canonical, artifact.canonical_path)) return error.ModelArtifactsChanging;
+        const stat = std.Io.Dir.cwd().statFile(self.io, canonical, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return error.CatalogArtifactUnavailable,
+            else => return err,
+        };
+        if (stat.kind != .file or stat.size != artifact.size) return error.CatalogArtifactUnavailable;
+        const stamp = managed.ArtifactStamp.fromStat(stat);
+        if (artifact.sha256 != null) if (self.verification_cache) |cache| {
+            const key = VerificationCache.keyFor(self.verification_scope.?, artifact);
+            if (cache.rejectedStamp(key)) |rejected| {
+                if (std.meta.eql(rejected, stamp)) return error.ChecksumMismatch;
+            }
+        };
+        return stamp;
+    }
+
+    pub fn hasKnownChecksumRejections(self: *const PublishedArtifacts, cache: *VerificationCache) bool {
+        return if (self.verification_scope) |scope| cache.hasRejections(scope) else false;
+    }
+
+    /// Return the portable receipt name of a file selected by this acquisition.
+    pub fn receiptMemberPath(self: *const PublishedArtifacts, path: []const u8) ![]const u8 {
+        const receipt = self.receipt orelse return error.InvalidManagedDownload;
+        return receipt.artifacts[try self.indexForPath(path)].path;
+    }
+
     /// Read an already selected sidecar and authenticate its actual bytes
     /// against the original member's contract, even if the pathname changes.
     pub fn readPath(self: *const PublishedArtifacts, path: []const u8, max_bytes: usize) ![]u8 {
@@ -340,22 +466,32 @@ pub const PublishedArtifacts = struct {
         if (self.verified_stamps[index]) |prior| if (std.meta.eql(prior, stamp)) return;
         self.verified_stamps[index] = if (artifact.sha256) |expected|
             if (self.verification_cache) |cache|
-                try cache.verify(self.allocator, self.io, self.publication.?, artifact, stamp, control)
+                try cache.verify(self.allocator, self.io, self.verification_scope.?, artifact, stamp, control)
             else
                 try managed.verifyValidatedArtifactSha256AndStampWithControl(self.io, artifact, expected, control)
         else
             stamp;
     }
+    fn canonicalFileIndex(self: *const PublishedArtifacts, relative: []const u8) !?usize {
+        const receipt = if (self.receipt) |*value| value else return null;
+        const index = receipt.path_index.get(relative) orelse return error.InvalidManagedDownload;
+        return self.canonical_index.get(receipt.artifacts[index].canonical_path).?;
+    }
+
     pub fn verifyFile(self: *PublishedArtifacts, relative: []const u8) !void {
-        return self.verifyFileWithControl(relative, .{});
+        return self.verifyFileWithControl(relative, self.verification_control);
     }
 
     pub fn verifyFileWithControl(self: *PublishedArtifacts, relative: []const u8, control: ExecutionControl) !void {
-        if (self.receipt) |*receipt| {
-            const index = receipt.path_index.get(relative) orelse return error.InvalidManagedDownload;
-            // Every canonical alias now shares one normalized digest and proof.
-            try self.verifyIndex(self.canonical_index.get(receipt.artifacts[index].canonical_path).?, control);
-        }
+        const index = (try self.canonicalFileIndex(relative)) orelse return;
+        try self.verifyIndex(index, control);
+    }
+
+    /// Canonical aliases share the strongest verified checksum in the receipt.
+    pub fn verifiedFileDigest(self: *PublishedArtifacts, relative: []const u8) !?[]const u8 {
+        const index = (try self.canonicalFileIndex(relative)) orelse return null;
+        try self.verifyIndex(index, self.verification_control);
+        return self.receipt.?.artifacts[index].sha256;
     }
     /// ONNX external tensors are consumed by a component loader, not by
     /// read(). They must belong to the same receipt as the graph itself.
@@ -365,7 +501,7 @@ pub const PublishedArtifacts = struct {
             const canonical = try managed.resolveRegularFilePath(self.allocator, self.io, path);
             defer self.allocator.free(canonical);
             if (!std.mem.eql(u8, canonical, self.receipt.?.artifacts[index].canonical_path)) return error.ModelArtifactsChanging;
-            try self.verifyIndex(self.canonical_index.get(canonical).?, .{});
+            try self.verifyIndex(self.canonical_index.get(canonical).?, self.verification_control);
         }
     }
     /// Authenticate the complete graph dependency set before a pathname-based
@@ -462,9 +598,10 @@ pub const PublishedArtifacts = struct {
     }
 
     fn verifyOpened(self: *PublishedArtifacts, artifact: *const managed.ValidatedArtifact, file: std.Io.File, stamp: managed.ArtifactStamp) !managed.ArtifactStamp {
+        try self.verification_control.check();
         const digest = artifact.sha256 orelse return stamp;
-        if (self.verification_cache) |cache| return cache.verifyOpened(self.allocator, self.io, self.publication.?, artifact, file, stamp);
-        return managed.verifyOpenedArtifactSha256AndStamp(self.io, file, artifact, digest);
+        if (self.verification_cache) |cache| return cache.verifyOpened(self.allocator, self.io, self.verification_scope.?, artifact, file, stamp, self.verification_control);
+        return managed.verifyOpenedArtifactSha256AndStampWithControl(self.io, file, artifact, digest, self.verification_control);
     }
     /// Rebase metadata into the captured namespace without opening optional
     /// artifacts or granting execution permission. A backend must still call
@@ -520,7 +657,7 @@ pub const PublishedArtifacts = struct {
         defer self.allocator.free(current);
         if (!std.mem.eql(u8, current, expected)) return error.ModelArtifactsChanging;
     }
-    pub fn verify(self: *const PublishedArtifacts) !void {
+    pub fn verifyPublication(self: *const PublishedArtifacts) !void {
         try self.verifyBinding(self.storage_root, self.physical_root);
         const root_stat = try std.Io.Dir.cwd().statFile(self.io, self.physical_root, .{ .follow_symlinks = false });
         if (root_stat.inode != self.physical_root_inode) return error.ModelArtifactsChanging;
@@ -530,7 +667,15 @@ pub const PublishedArtifacts = struct {
             if (stat.kind != .directory or stat.inode != self.directory_scope_inode.?) return error.ModelArtifactsChanging;
         }
         if (self.direct_path) |path| try self.verifyBinding(path, self.physical_direct.?);
-        if (!std.meta.eql(self.publication, try managed.publicationGeneration(self.allocator, self.io, self.root))) return error.ModelArtifactsChanging;
+        if (self.installation) |expected| {
+            try managed.requireInstallation(self.allocator, self.io, self.root, expected);
+        } else if ((try managed.publicationGeneration(self.allocator, self.io, self.root)) != null) {
+            return error.ModelArtifactsChanging;
+        }
+    }
+
+    pub fn verify(self: *const PublishedArtifacts) !void {
+        try self.verifyPublication();
         var opened = self.opened_files.valueIterator();
         while (opened.next()) |value| {
             const stamp = managed.ArtifactStamp.fromStat(try value.file.stat(self.io));
@@ -824,6 +969,17 @@ test "model selection shared checksum proofs reject changed digests publications
         defer source.deinit();
         source.verification_cache = &cache;
         try std.testing.expectError(error.ChecksumMismatch, source.verifyFile("model.onnx"));
+        try std.testing.expect(source.hasKnownChecksumRejections(&cache));
+        const selected = (try source.resolveModel("model.onnx")).?;
+        defer a.free(selected);
+        try std.testing.expectError(error.ChecksumMismatch, source.requireCatalogMember(selected));
+
+        const first_path = try std.fs.path.join(a, &.{ root, "first" });
+        defer a.free(first_path);
+        var first = try PublishedArtifacts.init(a, io, first_path, null);
+        defer first.deinit();
+        try std.testing.expectEqual(first.publication, source.publication);
+        try std.testing.expect(!first.hasKnownChecksumRejections(&cache));
     }
     try tmp.dir.deleteFile(io, "current");
     try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
@@ -850,19 +1006,27 @@ test "model selection shared proof cache bounds residency and preserves recent e
     const stamp = managed.ArtifactStamp.fromStat(try tmp.dir.statFile(io, "model.onnx", .{}));
     var cache = VerificationCache{};
     defer cache.deinit(a);
-    const hot: [32]u8 = @splat(0);
-    try cache.remember(a, hot, stamp);
+    const hot: VerificationCache.Key = .{ .scope = @splat(0), .member = @splat(0) };
+    const rejected: VerificationCache.Key = .{ .scope = @splat(1), .member = @splat(1) };
+    try cache.remember(a, hot, stamp, false);
+    try cache.remember(a, rejected, stamp, true);
+    try std.testing.expect(cache.hasRejections(rejected.scope));
+    try std.testing.expect(!cache.hasRejections(hot.scope));
+    try cache.remember(a, rejected, stamp, false);
+    try std.testing.expect(!cache.hasRejections(rejected.scope));
+    try cache.remember(a, rejected, stamp, true);
     for (0..VerificationCache.capacity + 32) |i| {
-        var key: [32]u8 = @splat(1);
-        std.mem.writeInt(u64, key[0..8], @intCast(i), .little);
-        try cache.remember(a, key, stamp);
-        try std.testing.expect(cache.hit(hot, stamp));
+        var key: VerificationCache.Key = .{ .scope = @splat(2), .member = @splat(1) };
+        std.mem.writeInt(u64, key.member[0..8], @intCast(i), .little);
+        try cache.remember(a, key, stamp, false);
+        try std.testing.expect(try cache.hit(hot, stamp));
         try std.testing.expect(cache.entries.count() <= VerificationCache.capacity);
     }
     try std.testing.expectEqual(@as(usize, VerificationCache.capacity), cache.entries.count());
+    try std.testing.expect(!cache.hasRejections(rejected.scope));
     var changed = stamp;
     changed.size += 1;
-    try std.testing.expect(!cache.hit(hot, changed));
+    try std.testing.expect(!try cache.hit(hot, changed));
 }
 
 test "model selection concurrent acquisitions coalesce one checkpoint checksum" {
@@ -960,8 +1124,8 @@ test "model selection canceled checksum wait releases no borrowed ownership" {
     var artifacts = try PublishedArtifacts.init(a, canceled, root, null);
     defer artifacts.deinit();
     artifacts.verification_cache = &cache;
-    const key = VerificationCache.keyFor(artifacts.publication.?, &artifacts.receipt.?.artifacts[0]);
-    const builder = &cache.builders[key[0] % cache.builders.len];
+    const key = VerificationCache.keyFor(artifacts.verification_scope.?, &artifacts.receipt.?.artifacts[0]);
+    const builder = &cache.builders[key.member[0] % cache.builders.len];
     try builder.lock(io);
     var held = true;
     defer if (held) builder.unlock(io);

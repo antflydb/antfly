@@ -110,10 +110,14 @@ def generate(output):
         ),
     ]
     records = []
-    for spec, (fn, signature, constants, attrs, options) in zip(profiles("projection_top1"), jobs, strict=True):
+    for spec, (fn, signature, constants, attrs, options) in zip(
+        profiles("projection_top1"), jobs, strict=True
+    ):
         # Alignment positions remain ABI policy; resources and image identities
         # come from the same catalog used by serving launches.
-        data = compile_program(fn, signature, constants, (i[0] for i in attrs), spec, options)
+        data = compile_program(
+            fn, signature, constants, (i[0] for i in attrs), spec, options
+        )
         records.append(emit(output, spec, data))
     write_manifest(output, records)
 

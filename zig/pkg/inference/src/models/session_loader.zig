@@ -53,7 +53,7 @@ pub const Host = struct {
     context: *anyopaque,
     admission_enabled: bool,
     required_residency: runtime.tier.memory.Residency = .{},
-    unhealthy_fn: *const fn (*anyopaque, []const u8, backends.BackendType) bool,
+    unhealthy_fn: *const fn (*anyopaque, []const u8, ?@import("../registry/managed_receipt.zig").Installation, backends.BackendType) bool,
     limits_fn: *const fn (*anyopaque, ModelSource, backends.BackendRuntime, runtime.tier.memory.Limits) anyerror!runtime.tier.memory.Limits,
     reserve_fn: *const fn (*anyopaque, []const u8, backends.BackendRuntime, runtime.tier.memory.Limits, load_plan.ModelLoadAdmissionPlan, runtime.tier.memory.Residency, ?*runtime.tier.memory.AdmissionFailure) anyerror!Reservation,
     protect_close_fn: *const fn (*anyopaque, backends.BackendRuntime) anyerror!?backends.Session.CloseProtection,
@@ -271,7 +271,7 @@ fn loadPreferredWithArtifactsImpl(
         if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
         if (backend == .metal and laya_candidate and !laya_packed and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
         if (control) |active| try active.check();
-        if (host.unhealthy_fn(host.context, model_dir, backend)) {
+        if (host.unhealthy_fn(host.context, model_dir, proof.artifacts().installation, backend)) {
             rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);
             continue;
         }
@@ -654,6 +654,10 @@ pub const ComponentConstruction = struct {
     borrowed: ?*PublishedArtifacts,
 
     pub fn init(a: std.mem.Allocator, io: std.Io, selected: ResolvedModel, control: ?InferenceExecutionControl, borrowed: ?*PublishedArtifacts) !ComponentConstruction {
+        return initWithValidation(a, io, selected, control, borrowed, false);
+    }
+
+    pub fn initWithValidation(a: std.mem.Allocator, io: std.Io, selected: ResolvedModel, control: ?InferenceExecutionControl, borrowed: ?*PublishedArtifacts, selected_members: bool) !ComponentConstruction {
         if (control) |active| {
             try active.check();
             if (active.model_selection) |expected| {
@@ -667,7 +671,12 @@ pub const ComponentConstruction = struct {
             try selected.verify(a, io);
             return .{ .io = io, .lease = lease, .owned = null, .borrowed = provided };
         }
-        return .{ .io = io, .lease = lease, .owned = try PublishedArtifacts.init(a, io, selected.path, .{ .publication = selected.publication }), .borrowed = null };
+        const expected = @import("../registry/published_artifacts.zig").Expected{ .publication = selected.publication };
+        const owned = if (selected_members)
+            try PublishedArtifacts.initForSelectedArtifacts(a, io, selected.path, expected, control orelse .{})
+        else
+            try PublishedArtifacts.initWithControl(a, io, selected.path, expected, control orelse .{});
+        return .{ .io = io, .lease = lease, .owned = owned, .borrowed = null };
     }
     /// Reuse an externally owned publication lease and artifact catalog during
     /// synchronous preparation. This view never releases the caller's fence.
@@ -1027,7 +1036,7 @@ test "prepared optional CUDA mirrors retry mandatory admission before constructi
         controller: Memory.AdmissionController = .{},
         calls: usize = 0,
         fail: bool = false,
-        fn unhealthy(_: *anyopaque, _: []const u8, _: backends.BackendType) bool {
+        fn unhealthy(_: *anyopaque, _: []const u8, _: ?@import("../registry/managed_receipt.zig").Installation, _: backends.BackendType) bool {
             unreachable;
         }
         fn limits(_: *anyopaque, _: ModelSource, _: backends.BackendRuntime, _: Memory.Limits) !Memory.Limits {

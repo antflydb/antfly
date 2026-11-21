@@ -149,6 +149,8 @@ pub const NativeBackend = struct {
         return native;
     }
 
+    /// The caller closes the legacy handle into storage_owner after releasing
+    /// its LSM-bound views.
     pub fn detachFromLsm(alloc: Allocator, handle: *lsm_backend.BackendHandle) !*NativeBackend {
         const backend = handle.backend;
         const root = try alloc.dupe(u8, backend.root_dir orelse return error.MissingStorageRoot);
@@ -157,7 +159,7 @@ pub const NativeBackend = struct {
         const native = try alloc.create(NativeBackend);
         native.* = .{
             .storage = storage,
-            .storage_owner = backend.transferNativeStorageOwnership(),
+            .storage_owner = null,
             .root_dir = root,
         };
         return native;

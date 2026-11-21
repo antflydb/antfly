@@ -14,12 +14,23 @@
 # limitations under the License.
 
 """Shared BF16 projection dot/bias phase with explicit FP32 bias rounding."""
+
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def dot_bias(x, w, bias, rows, K: tl.constexpr, N: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def dot_bias(
+    x,
+    w,
+    bias,
+    rows,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
     m = tl.program_id(0) * BM + tl.arange(0, BM)
     n = tl.program_id(1) * BN + tl.arange(0, BN)
     kk = tl.arange(0, BK)
