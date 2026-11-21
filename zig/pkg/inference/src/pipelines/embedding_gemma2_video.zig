@@ -1532,8 +1532,12 @@ test "embeddinggemma2 video reader timestamps and cache binding survive independ
     reader.input = &source;
 
     var packets = [_]media.mp4.Packet{.{ .offset = 0, .size = group_max_input_bytes + 1, .dts = 0, .pts = 0, .media_pts = 0, .duration = 1, .sync = true }};
-    var range = media.source.Source{ .allocator = a, .identity = "packet-extent", .storage = .{ .range = .{ .context = &counter, .read_at = undefined, .length = packets[0].size } } };
-    var packet_reader = media.mp4.Reader{ .allocator = a, .input = &range, .track = .{ .id = 1, .width = 16, .height = 16, .timescale = 1, .avcc = &.{}, .nal_length_bytes = 4, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } }, .metadata = .{ .source = null, .bytes = &.{} }, .packets = &packets };
+    var range = media.source.Source{ .allocator = a, .identity = "packet-extent", .storage = .{ .range = .{ .context = &counter, .read_at = struct {
+        fn read(_: *anyopaque, _: u64, _: []u8, _: media.source.Control) !usize {
+            return error.TestUnexpectedResult;
+        }
+    }.read, .length = packets[0].size } } };
+    var packet_reader = media.mp4.Reader{ .allocator = a, .input = &range, .track = .{ .id = 1, .width = 16, .height = 16, .timescale = 1, .avcc = &.{}, .nal_length_bytes = 4, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } }, .metadata = .{ .source = null, .bytes = &.{} }, .packets = &packets, .limits = .{} };
     const group = @import("embedding_gemma2.zig");
     try group.validateGroup(.{ .content = &.{.{ .sampled_video = .{ .reader = &packet_reader, .sampling = .gemma4 } }} }, .{});
     try std.testing.expectError(error.ResourceLimitExceeded, packetBytes(&packet_reader));
