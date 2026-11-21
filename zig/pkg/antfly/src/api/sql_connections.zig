@@ -93,7 +93,9 @@ fn loadReconciledAt(
             error.SqlConnectionBusy => return owned,
             else => return err,
         };
-        _ = registry.removeBeforeExecution(alloc, txn_id);
+        if (session) |value| if (value.owner_node_id == owner_node_id) {
+            _ = registry.retireBeforeExecution(alloc, txn_id, value.version, false);
+        };
     } else if (session) |value| {
         if (value.terminal == null and !value.terminal_abort) return owned;
         _ = mutate(store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
@@ -488,10 +490,10 @@ test "HTTP connection keeps a referenced durable transaction through session GC"
     const txn_id = transactions.newSessionTxnId(7);
     _ = try mutate(&store, .{ .create = .{ .id = id, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 7, 1);
     _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = 1, .txn_id = txn_id } }, "alice", 7, 2);
-    _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
+    const begun = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
     _ = try mutate(&store, .{ .bind = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2);
     store.fail_writes_for_test = true;
-    try std.testing.expectError(error.InjectedSessionStoreFailure, registry.rollbackConnectionBeforeExecution(alloc, txn_id, id));
+    try std.testing.expectError(error.InjectedSessionStoreFailure, registry.rollbackConnectionBeforeExecution(alloc, txn_id, id, begun.version));
     store.fail_writes_for_test = false;
     var still_active = try load(&store, alloc, id, "alice", 7, 2);
     try std.testing.expectEqual(record.State.active, still_active.value.state);
@@ -502,7 +504,7 @@ test "HTTP connection keeps a referenced durable transaction through session GC"
     direct_route_details.deinit(alloc);
     var retained = (try registry.getSqlState(alloc, txn_id)) orelse return error.TestExpectedEqual;
     retained.deinit(alloc);
-    try registry.rollbackConnectionBeforeExecution(alloc, txn_id, id);
+    try registry.rollbackConnectionBeforeExecution(alloc, txn_id, id, begun.version);
     var idle = try load(&store, alloc, id, "alice", 7, 2);
     defer idle.deinit();
     try std.testing.expectEqual(record.State.idle, idle.value.state);

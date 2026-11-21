@@ -24,6 +24,7 @@ const Mock = struct {
     probe_change_at: ?usize = null,
     compatible_revision: bool = false,
     cancel_during_validation: bool = false,
+    cancel_during_pull: bool = false,
     cancel_during_open: bool = false,
     stream_without_detach: bool = false,
     session: ?*protocol.Session = null,
@@ -190,7 +191,6 @@ const Mock = struct {
         if (self.cancel_during_validation) {
             const session = self.session.?;
             if (session.executing.load(.acquire)) session.cancel_requested.store(true, .release);
-            try request.check();
         }
         if (self.cursor_revoked or self.deny_stream_validation) return error.Forbidden;
     }
@@ -198,6 +198,7 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         try request.check();
         self.stream_pulls += 1;
+        if (self.cancel_during_pull) self.session.?.cancel_requested.store(true, .release);
         if (self.stream_fail_at) |at| if (self.stream_offset >= at) return error.QueryCanceled;
         const count = @min(wanted, self.stream_rows - self.stream_offset);
         if (self.stream_cells) {
@@ -1761,6 +1762,26 @@ test "Describe Portal reuses a compatible revision across frames" {
     defer output.deinit();
     try std.testing.expectEqual(@as(usize, 2), mock.describes);
     try std.testing.expectEqual(@as(usize, 4), mock.probes);
+}
+
+test "FETCH checks cancellation after the final pull and zero-row validation" {
+    for ([_]bool{ true, false }) |pull| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "BEGIN\x00");
+        try frame(&input.writer, 'Q', "DECLARE rows CURSOR FOR SELECT n FROM t\x00");
+        try frame(&input.writer, 'Q', if (pull) "FETCH ALL FROM rows\x00" else "FETCH 0 FROM rows\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 1, .cancel_during_pull = pull, .cancel_during_validation = !pull };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expectEqual(@as(usize, @intFromBool(pull)), mock.stream_pulls);
+        try std.testing.expect(std.mem.endsWith(u8, observed, "CZEZ"));
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "57014") != null);
+    }
 }
 
 test "stream handoff preserves cancellation and retained portal authority" {

@@ -29,9 +29,9 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         std.log.warn("graph receipt admission failed err={s}", .{@errorName(err)});
         return err;
     };
-    var execution_sealed = false;
-    errdefer if (!execution_sealed) {
-        _ = registry.recordTerminalAbort(owned, id) catch null;
+    var unexecuted: ?sessions.DurableSessionStore.Version = info.version;
+    errdefer if (unexecuted) |version| {
+        _ = registry.retireBeforeExecution(owned, id, version, false);
     };
     const lease = registry.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
     defer lease.release();
@@ -54,6 +54,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     }
     var staged = (try registry.cloneOwnedCommitRequest(owned, id, server.localSessionNodeId(), &input)) orelse return error.InvalidTransactionSessionRecord;
     defer staged.deinit(owned);
+    unexecuted = staged.session_version;
     var prepared = server.preparePublicCommitWithIntegrity(alloc, tables, context) catch |err| {
         std.log.warn("graph receipt integrity preparation failed err={s}", .{@errorName(err)});
         return err;
@@ -65,7 +66,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         std.log.warn("graph receipt principal preparation failed err={s}", .{@errorName(err)});
         return err;
     };
-    execution_sealed = true;
+    unexecuted = null;
     var plan = (registry.sealExecutionPlan(owned, id, server.localSessionNodeId(), signed) catch return .{ .status = .unknown }) orelse return .{ .status = .unknown };
     defer plan.deinit();
     const writer = server.table_writes orelse return .{ .status = .unknown };

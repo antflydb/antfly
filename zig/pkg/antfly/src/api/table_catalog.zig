@@ -4035,6 +4035,30 @@ fn consumerTests() type {
             probe.replace = true;
             try std.testing.expectError(error.DecisionNotProposed, owner.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .committed, 1, decision, .write, .none));
             try std.testing.expectEqual(@as(usize, 1), probe.accepted);
+            // The kernel owner validates under its writer lease. The changed
+            // outer catalog catches a redundant check before this handoff.
+            const Local = struct {
+                epoch: u64,
+                calls: usize = 0,
+
+                fn resolve(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: types.TxnId, _: types.TxnStatus, _: u64, observed: u64, _: types.SyncLevel, cancellation: types.CancellationToken) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(self.epoch, observed);
+                    try std.testing.expectEqual(@as(u64, 2), group);
+                    try std.testing.expect(cancellation.ptr == raw);
+                    self.calls += 1;
+                    return {};
+                }
+            };
+            var local: Local = .{ .epoch = decision };
+            var delegated = writes.ProvisionedTableWriteSource.init("unused", source);
+            defer delegated.deinit();
+            const token: types.CancellationToken = .{ .ptr = &local };
+            _ = delegated.withLocalWriteSource(.{ .ptr = &local, .validates_local_decision_route = true, .vtable = &.{ .batch = undefined, .txn_resolve_group_local_with_cancellation = Local.resolve } });
+            try std.testing.expect((try delegated.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .aborted, 0, decision, .write, token)) != null);
+            delegated.local_write_source.?.validates_local_decision_route = false;
+            try std.testing.expectError(error.DecisionNotProposed, delegated.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .aborted, 0, decision, .write, token));
+            try std.testing.expectEqual(@as(usize, 1), local.calls);
             try std.testing.expectError(error.TopologyChanged, validateTransactionEpoch(std.testing.allocator, source, "rows", decision, true));
             try validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch);
             snapshot.status.metadata_incarnation = null;

@@ -36,14 +36,16 @@ pub const Coordinator = struct {
         const lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
         defer lease.release();
         const info = server.txn_sessions.getInfo(id) orelse return error.SqlTransactionNotActive;
+        if (info.version.owner != server.localSessionNodeId()) return error.SessionLeaseLost;
+        if (info.terminal_abort) return .{ .outcome = .aborted, .reconciliation_id = id };
         var lake_validation: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = self.identity, .context = self.context };
         lake_validation.validateAcceptedSerializable(alloc, id) catch |err| {
             if (err != error.SqlWriteConflict) return err;
-            if (!server.txn_sessions.removeBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
+            if (!server.txn_sessions.retireBeforeExecution(alloc, id, info.version, false)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .aborted, .reconciliation_id = id };
         };
         var request = (try server.txn_sessions.cloneOwnedCommitRequest(alloc, id, server.localSessionNodeId(), null)) orelse {
-            if (!server.txn_sessions.commitBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
+            if (!server.txn_sessions.retireBeforeExecution(alloc, id, info.version, true)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .committed, .reconciliation_id = id };
         };
         defer request.deinit(alloc);
@@ -53,11 +55,11 @@ pub const Coordinator = struct {
         const tables = tables_view.tables;
         try server.validateCommitTablesAgainstSchema(self.context, tables);
         if (try server.validateCommitReadSet(request) != null) {
-            if (!server.txn_sessions.removeBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
+            if (!server.txn_sessions.retireBeforeExecution(alloc, id, request.session_version.?, false)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .aborted, .reconciliation_id = id };
         }
         if (tables.len == 0) {
-            if (!server.txn_sessions.commitBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
+            if (!server.txn_sessions.retireBeforeExecution(alloc, id, request.session_version.?, true)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .committed, .reconciliation_id = id };
         }
         const source = server.table_writes orelse return error.UnsupportedSqlExecution;
@@ -173,7 +175,7 @@ pub const Adapter = struct {
             // No transaction ID has escaped to the caller. A proven local
             // rollback permits release; otherwise retain the beginning fence
             // for explicit recovery instead of allowing DISCARD to race it.
-            if (self.registry.removeBeforeExecution(self.alloc, info.txn_id))
+            if (self.registry.retireBeforeExecution(self.alloc, info.txn_id, info.version, false))
                 self.connectionMutation(scope, .{ .abort_begin = .{ .id = connection, .txn_id = info.txn_id } }) catch {};
             return err;
         };
@@ -213,8 +215,8 @@ pub const Adapter = struct {
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
         if (self.connection_id) |connection|
-            try self.registry.rollbackConnectionBeforeExecution(self.alloc, id, connection)
-        else if (!self.registry.removeBeforeExecution(self.alloc, id))
+            try self.registry.rollbackConnectionBeforeExecution(self.alloc, id, connection, state.version)
+        else if (!self.registry.retireBeforeExecution(self.alloc, id, state.version, false))
             return error.SqlTransactionOutcomeUnknown;
     }
 

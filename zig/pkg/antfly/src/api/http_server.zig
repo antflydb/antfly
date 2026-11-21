@@ -6618,7 +6618,6 @@ pub const ApiHttpServer = struct {
                 .commit => |*commit| {
                     const distributed_view = commit.request.distributedTables(self.alloc) catch |err| {
                         std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
                         continue;
                     };
                     defer distributed_view.deinit();
@@ -6678,8 +6677,7 @@ pub const ApiHttpServer = struct {
                         .conflict => {
                             // A replayed transaction ID can only conflict when
                             // the coordinator durably chose abort.
-                            _ = (self.txn_sessions.recordTerminalAbort(self.alloc, txn_id) catch continue) orelse continue;
-                            _ = self.txn_sessions.remove(self.alloc, txn_id);
+                            self.txn_sessions.publishAbortAndRetire(self.alloc, txn_id, null) catch continue;
                         },
                         .committed => |committed| {
                             const repair_required = commit.repair_required or committed.visibility_repair_required;
@@ -62917,7 +62915,7 @@ test "SQL pgwire native ordinary rollback leaves no permanent completion proofs"
     for (&ids) |*id| {
         const session = try registry.begin(a, .{}, 0);
         id.* = session.txn_id;
-        try std.testing.expect(registry.removeBeforeExecution(a, session.txn_id));
+        try std.testing.expect(registry.retireBeforeExecution(a, session.txn_id, session.version, false));
     }
     try std.testing.expectEqual(@as(usize, 0), registry.sessions.count());
     for (ids) |id| {

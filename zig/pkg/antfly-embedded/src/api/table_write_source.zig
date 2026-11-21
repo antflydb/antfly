@@ -80,6 +80,8 @@ pub const TableWriteSource = struct {
     /// Transaction-ID commits enforce owner-routed range guards atomically
     /// with primary writes, including read-only guard participants.
     supports_sql_range_guards: bool = false,
+    /// Resolve validates the epoch against the acquired storage owner before apply.
+    validates_local_decision_route: bool = false,
 
     pub const VTable = struct {
         activate_range_tracking: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("operation.zig").RequestContext) anyerror!void = null,
@@ -1139,8 +1141,10 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
-        const fn_ptr = self.vtable.txn_resolve_group_local_with_cancellation orelse
+        const fn_ptr = self.vtable.txn_resolve_group_local_with_cancellation orelse {
+            try cancellation.check();
             return try self.txnResolveGroupLocal(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
+        };
         return try BoundaryAbi.call("txn_resolve_group_local_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation });
     }
 

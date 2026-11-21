@@ -1119,6 +1119,7 @@ pub const Detail = enum(c_int) {
     object_table_definition_conflict,
     row_policy_limit_exceeded,
     decision_not_proposed,
+    pre_dispatch_catalog_generation_changed,
 };
 
 pub const Status = extern struct {
@@ -1758,6 +1759,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnknownGroup => status(.not_found, .unknown_group),
         error.TxnNotFound => status(.not_found, .txn_not_found),
         error.Conflict => status(.conflict, .conflict),
+        error.PreDispatchCatalogGenerationChanged => status(.conflict, .pre_dispatch_catalog_generation_changed),
         error.DecisionNotProposed => status(.conflict, .decision_not_proposed),
         error.DecisionConflict => status(.conflict, .decision_conflict),
         error.TableTransitionActive => status(.conflict, .table_transition_active),
@@ -2835,6 +2837,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .txn_not_found => "TxnNotFound",
         .conflict => "Conflict",
         .decision_conflict => "DecisionConflict",
+        .pre_dispatch_catalog_generation_changed => "PreDispatchCatalogGenerationChanged",
         .decision_not_proposed => "DecisionNotProposed",
         .table_transition_active => "TableTransitionActive",
         .schema_in_use => "SchemaInUse",

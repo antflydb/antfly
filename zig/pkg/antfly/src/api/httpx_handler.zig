@@ -6131,6 +6131,14 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    fn abortedSessionResponse(ctx: *httpx.Context, id: db_mod.types.TxnId) !httpx.Response {
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const response = try transactions_api.buildSessionCommitResponse(arena.allocator(), id, "aborted", null, null);
+        _ = ctx.status(409);
+        return ctx.openApiJson(response);
+    }
+
     pub fn commitTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
         if (try self.admitCompletion(ctx)) |response| return response;
         var authenticated_identity: ?AuthenticatedIdentity = null;
@@ -6158,6 +6166,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
+        if (session.version.owner != owner) return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
+        if (session.terminal_abort) return abortedSessionResponse(ctx, txn_id);
         var parsed_req: ?transactions_api.OwnedTransactionCommitRequest = null;
         defer if (parsed_req) |*commit_req| commit_req.deinit(alloc);
         if (!transactions_api.isEmptySessionCommitBody(body_data)) {
@@ -6175,6 +6185,7 @@ pub const AntflyApiHandler = struct {
         }
         var commit_req = (self.api_server.txn_sessions.cloneOwnedCommitRequest(alloc, txn_id, owner, if (parsed_req) |*value| value else null) catch |err| switch (err) {
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
+            error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
             error.TransactionCommitRequestMismatch => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit retry body does not match the sealed request");
@@ -6237,6 +6248,7 @@ pub const AntflyApiHandler = struct {
         }
 
         var execution_plan = self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id, owner) catch |err| switch (err) {
+            error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
             error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
             else => return err,
         };
@@ -6263,8 +6275,9 @@ pub const AntflyApiHandler = struct {
                 else => return err,
             };
             if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
-                if (!self.api_server.txn_sessions.removeBeforeExecution(alloc, txn_id)) {
+                if (!self.api_server.txn_sessions.retireBeforeExecution(alloc, txn_id, commit_req.session_version.?, false)) {
                     execution_plan = (self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id, owner) catch |err| switch (err) {
+                        error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
                         error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
                         else => return err,
                     }) orelse
@@ -6295,6 +6308,7 @@ pub const AntflyApiHandler = struct {
                 return self.transactionPreparationError(ctx, err);
             defer prepared.deinit();
             execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, txn_id, owner, prepared.tables) catch |err| switch (err) {
+                error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
                 error.SessionLeaseLost, error.TransactionCommitSealed => return textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
                 else => return self.transactionPreparationError(ctx, err),
             }) orelse return textResponse(ctx, 404, "not found");
@@ -6313,12 +6327,10 @@ pub const AntflyApiHandler = struct {
             if (rejection == .fresh) {
                 // Publish the abort and settle consumers before attempting
                 // payload retirement or returning a safe rejection to callers.
-                const published = self.api_server.txn_sessions.recordAttemptAbort(alloc, txn_id, execution_plan.?.publication) catch null;
-                if (published == null) return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
+                self.api_server.txn_sessions.publishAbortAndRetire(alloc, txn_id, execution_plan.?.publication) catch return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
             }
             break :rejected switch (err) {
                 error.TransactionTooLarge => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions");
                 },
                 error.InvalidBatchRequest,
@@ -6328,12 +6340,10 @@ pub const AntflyApiHandler = struct {
                 => {
                     // Participant validation terminally aborts this transaction
                     // ID, so retaining the session would only produce conflicts.
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     _ = ctx.status(400);
                     return ctx.text("invalid transaction commit request");
                 },
-                error.TopologyChanged => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
+                error.PreDispatchCatalogGenerationChanged, error.TopologyChanged => {
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -6347,7 +6357,6 @@ pub const AntflyApiHandler = struct {
                     return ctx.openApiJson(response);
                 },
                 error.DecisionConflict => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -6361,7 +6370,6 @@ pub const AntflyApiHandler = struct {
                     return ctx.openApiJson(response);
                 },
                 error.DocIdentityNamespaceMismatch => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -6375,17 +6383,14 @@ pub const AntflyApiHandler = struct {
                     return ctx.openApiJson(response);
                 },
                 error.UnsupportedOperation => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");
                 },
                 error.TableNotFound => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     _ = ctx.status(404);
                     return ctx.text("not found");
                 },
                 error.UnknownGroup => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -6533,7 +6538,8 @@ pub const AntflyApiHandler = struct {
                 return ctx.openApiJson(response);
             },
             .conflict => |conflict| {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
+                self.api_server.txn_sessions.publishAbortAndRetire(alloc, txn_id, null) catch
+                    return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id");
                 const enriched_conflict = try self.api_server.enrichCommitConflict(commit_req, conflict);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
@@ -6564,15 +6570,19 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        if (try self.api_server.txn_sessions.getTerminalCommit(self.api_server.alloc, txn_id)) |terminal_value| {
-            var terminal = terminal_value;
-            defer terminal.deinit(self.api_server.alloc);
-            _ = ctx.status(409);
-            return ctx.text("transaction is already committed");
-        }
-        if (!self.api_server.txn_sessions.remove(self.api_server.alloc, txn_id)) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
+        const registry = &self.api_server.txn_sessions;
+        const execution = try registry.acquireCommitExecution(txn_id, ctx.io);
+        defer execution.release();
+        const info = registry.getInfo(txn_id) orelse return textResponse(ctx, 404, "not found");
+        if (info.version.owner != self.api_server.localSessionNodeId())
+            return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
+        if (!info.terminal_abort and !registry.retireBeforeExecution(self.api_server.alloc, txn_id, info.version, false)) {
+            if (try registry.getTerminalCommit(self.api_server.alloc, txn_id)) |terminal_value| {
+                var terminal = terminal_value;
+                defer terminal.deinit(self.api_server.alloc);
+                return textResponse(ctx, 409, "transaction is already committed");
+            }
+            return textResponse(ctx, 503, "transaction changed; reconcile this transaction id");
         }
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
@@ -22813,11 +22823,14 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
         fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
             return error.TestUnexpectedResult;
         }
-        fn commit(_: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
+        fn commit(ptr: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
+            const calls: *usize = @ptrCast(@alignCast(ptr));
+            calls.* += 1;
             return error.TableNotFound;
         }
     };
-    var api = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, .{ .ptr = undefined, .vtable = &.{ .batch = Source.batch, .commit_transaction_with_id = Source.commit } });
+    var calls: usize = 0;
+    var api = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, .{ .ptr = &calls, .vtable = &.{ .batch = Source.batch, .commit_transaction_with_id = Source.commit } });
     defer api.deinit();
     var handler: AntflyApiHandler = .{ .api_server = &api };
     const session = try api.txn_sessions.begin(a, .{}, 0);
@@ -22850,6 +22863,15 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     const completion = try AntflyApiHandler.requestCompletion(&ctx);
     try std.testing.expect(!completion.unknown and completion.outcomes.items.len == 1);
     try std.testing.expect(!try @import("sql_completion.zig").settled(&api, a, .{ .outcomes = completion.outcomes.items }, .{}));
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    // The process can lose the response between publishing abort and retiring the session.
+    _ = (try api.txn_sessions.recordTerminalAbort(a, session.txn_id)).?;
+    var retry = httpx.Context.init(a, std.testing.io, &request);
+    defer retry.deinit();
+    var aborted = try handler.commitTransactionSession(&retry, &id);
+    defer aborted.deinit();
+    try std.testing.expectEqual(@as(u16, 409), aborted.status.code);
+    try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
 test "distributed SQL API worker RPC requires signed service authority even during legacy migration" {

@@ -1427,6 +1427,7 @@ pub const Session = struct {
                     return err;
                 };
                 defer page.result.deinit();
+                try req.check();
                 if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
                 if (page.result.rowCount() == 0 and !page.exhausted) return error.InvalidResult;
                 if (page.result.sql_nulls) |flags| if (flags.len != page.result.rowCount()) return error.InvalidResult;
@@ -1449,6 +1450,7 @@ pub const Session = struct {
             var validation = std.heap.ArenaAllocator.init(self.alloc);
             defer validation.deinit();
             try stream.validate.?(stream.context, validation.allocator(), req);
+            try req.check();
             if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
         }
         var tag: [64]u8 = undefined;
@@ -1485,6 +1487,7 @@ pub const Session = struct {
                 const wanted: u32 = @intCast(@min(through - spool.row_count, @min(self.limits.result_rows, 256)));
                 var page = try stream.next(stream.context, arena.allocator(), req, wanted);
                 defer page.result.deinit();
+                try req.check();
                 if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
                 if (page.result.rowCount() == 0 and !page.exhausted) return error.InvalidResult;
                 spool.append(page.result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
@@ -1505,6 +1508,7 @@ pub const Session = struct {
         var validation = std.heap.ArenaAllocator.init(self.alloc);
         defer validation.deinit();
         try self.validateSpooledCursor(cursor, validation.allocator(), req);
+        try req.check();
         const spool = &cursor.spool.?;
         if (fetch.direction == .absolute and fetch.offset < 0) try self.fillCursor(cursor, std.math.maxInt(usize));
         var target: i64 = switch (fetch.direction) {
@@ -1531,6 +1535,7 @@ pub const Session = struct {
             if (emitted != 0 and emitted % 256 == 0) {
                 _ = validation.reset(.retain_capacity);
                 try self.validateSpooledCursor(cursor, validation.allocator(), req);
+                try req.check();
             }
             if (!fetch.move) {
                 row_bytes.writer.end = 0;

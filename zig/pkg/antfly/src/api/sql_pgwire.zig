@@ -354,7 +354,9 @@ pub const Adapter = struct {
                 if (access != .allowed) return;
                 // Never erase a started distributed decision; durable session
                 // maintenance retains it after this connection disappears.
-                job.credential.session_cleanup_complete = job.server.txn_sessions.removeBeforeExecution(job.server.alloc, job.id);
+                const info = job.server.txn_sessions.getInfo(job.id) orelse return;
+                if (info.version.owner != job.server.localSessionNodeId()) return;
+                job.credential.session_cleanup_complete = job.server.txn_sessions.retireBeforeExecution(job.server.alloc, job.id, info.version, false);
             }
         };
         var job = Cleanup{ .server = self.server, .principal = credential.sessionPrincipal(), .id = id, .completion_io = network_io, .credential = credential };

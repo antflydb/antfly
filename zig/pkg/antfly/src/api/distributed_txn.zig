@@ -1368,7 +1368,11 @@ fn executeMultiTableCommitOnce(
         participants.deinit(alloc);
     }
 
-    const admitted = try routeParticipants(alloc, catalog, tables, &participants, options.retain_terminal);
+    const admitted = routeParticipants(alloc, catalog, tables, &participants, options.retain_terminal) catch |err| {
+        // Only this call site proves that BEGIN has not been dispatched.
+        if (options.fresh_retained_id and err == error.CatalogGenerationChanged) return error.PreDispatchCatalogGenerationChanged;
+        return err;
+    };
 
     const participant_ids = try alloc.alloc([]const u8, participants.items.len);
     var participant_ids_initialized: usize = 0;
@@ -1570,7 +1574,7 @@ fn executeMultiTableCommitOnce(
         validateParticipantEpochs(alloc, catalog, participants.items, admitted) catch |err| {
             abort_on_error = false;
             try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
-            return err;
+            return if (err == error.CatalogGenerationChanged and options.fresh_retained_id) error.TopologyChanged else err;
         };
     }
 
@@ -6062,6 +6066,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), recorder.semantic_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.activation_prepares);
             try std.testing.expectError(error.CatalogGenerationChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(2), 40_000, 40_001, &.{.{ .table_name = "docs", .bound_catalog_incarnation = @splat(0xaa), .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, null));
+            try std.testing.expectError(error.PreDispatchCatalogGenerationChanged, executeMultiTableCommitWithOptions(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(2), 40_000, 40_001, &.{.{ .table_name = "docs", .bound_catalog_incarnation = @splat(0xaa), .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, null, .{ .retain_terminal = true, .fresh_retained_id = true }));
             var routing = (try table_catalog.transactionRoutingSnapshot(std.testing.allocator, FakeCatalog.iface(), "docs")).?;
             defer routing.deinit(std.testing.allocator);
             const manager = @import("../metadata/table_manager.zig");

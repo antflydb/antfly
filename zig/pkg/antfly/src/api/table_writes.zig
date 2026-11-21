@@ -23829,7 +23829,8 @@ pub const ProvisionedTableWriteSource = struct {
         // durable decision has been applied.
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
-        if (topology_epoch != 0)
+        const local_owner = self.groupLocalWriteSource();
+        if (topology_epoch != 0 and (local_owner == null or !local_owner.?.validates_local_decision_route))
             _ = try table_catalog.localDecisionRoute(alloc, self.catalog, table_name, topology_epoch, group_id, cancellation);
         if (status == .committed) {
             lockAtomic(&self.local_db_mutex);
@@ -23843,8 +23844,8 @@ pub const ProvisionedTableWriteSource = struct {
                 self.invalidateWriteCache(table_name);
             }
         }
-        if (self.groupLocalWriteSource()) |owner| {
-            if ((try owner.txnResolveGroupLocal(
+        if (local_owner) |owner| {
+            if ((try owner.txnResolveGroupLocalWithCancellation(
                 alloc,
                 group_id,
                 table_name,
@@ -23853,6 +23854,7 @@ pub const ProvisionedTableWriteSource = struct {
                 commit_version,
                 topology_epoch,
                 sync_level,
+                cancellation,
             )) == null) return null;
             if (status == .committed) {
                 lockAtomic(&self.local_db_mutex);
@@ -27051,6 +27053,9 @@ pub const HostedProvisionedTableWriteSource = struct {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
             if (req.transaction) |transaction| if (transaction == .resolve and topology_epoch != 0) {
+                if (!local_source.validates_local_decision_route)
+                    _ = try table_catalog.localDecisionRoute(alloc, self.catalog, table_name, topology_epoch, group_id, context.cancellation);
+                try ensurePreDecisionContextActive(context);
                 const decision = transaction.resolve;
                 return local_source.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, decision.txn_id, decision.status, decision.commit_version, topology_epoch, req.sync_level, context.cancellation);
             };

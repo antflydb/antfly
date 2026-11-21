@@ -402,7 +402,7 @@ test "SQL prepared resource survives native store restart and transaction cleanu
         resource.session_id = std.fmt.bytesToHex(attached.txn_id, .lower);
         try create(opened.durableStore(), resource, 1);
         const transaction = try registry.beginForPrincipal(alloc, .{}, 7, "alice");
-        try std.testing.expect(registry.removeBeforeExecution(alloc, transaction.txn_id));
+        try std.testing.expect(registry.retireBeforeExecution(alloc, transaction.txn_id, registry.getInfo(transaction.txn_id).?.version, false));
     }
     {
         var reopened = try transactions.OpenedSessionStore.open(alloc, directory.path());
