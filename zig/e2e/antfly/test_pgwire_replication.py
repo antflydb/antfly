@@ -740,6 +740,7 @@ def test_pg_recvlogical_resume_after_restart(
                 assert resumed.read_bytes().count(b"after-node-failover") == 1
                 assert all(marker not in resumed.read_bytes() for marker in markers)
                 if topology:
+                    server.restart_crashed_node(metadata=False, index=0)
                     catalog = requests.get(
                         f"{server.data_api_urls[1]}/tables",
                         headers={"X-Antfly-Trusted-Principal": env["PGPASSWORD"]},
