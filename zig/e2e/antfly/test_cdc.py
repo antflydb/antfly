@@ -2955,3 +2955,66 @@ def test_public_changefeed_bootstraps_and_streams_native_sql_rows():
             _changefeed_call(client, "DELETE", feed)
     finally:
         server.stop()
+
+
+def test_public_changefeed_retains_ttl_tombstone():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            name = "changefeed_ttl"
+            table = f"{server.api_url}/tables/{name}"
+            feeds = f"{server.api_url}/changefeeds"
+            _changefeed_call(
+                client,
+                "POST",
+                table,
+                json={
+                    "num_shards": 1,
+                    "schema": {"ttl": {"field": "expires_at", "duration": "1s"}},
+                },
+            )
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": name},
+                json={"tables": [name], "include": "rows"},
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            _changefeed_call(
+                client,
+                "POST",
+                f"{table}/batch",
+                json={
+                    "inserts": {
+                        "expiring": {
+                            "value": "history",
+                            "expires_at": "2000-01-01T00:00:00Z",
+                        }
+                    }
+                },
+            )
+            cursor = created["cursor"]
+            events = []
+            deadline = time.monotonic() + 60
+            while len(events) < 2 and time.monotonic() < deadline:
+                page = _changefeed_call(
+                    client, "GET", f"{feed}/events", params={"after": cursor}
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                events.extend(page.json()["events"])
+                _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+                if not page.json()["events"]:
+                    time.sleep(0.2)
+            assert [event["operation"] for event in events] == ["insert", "delete"], (
+                server.debug_logs()
+            )
+            assert events[1]["before"]["value"] == "history"
+            assert events[1]["after"] is None
+            assert events[1]["key"] == events[0]["key"]
+            assert events[1]["event_id"] != events[0]["event_id"]
+            _changefeed_call(client, "DELETE", feed)
+    finally:
+        server.stop()

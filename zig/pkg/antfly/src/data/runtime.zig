@@ -7833,13 +7833,14 @@ pub const DataServer = struct {
             // eviction can close the original TTL worker without self-joining.
             const result = @import("../api/relational_ttl.zig").expireStep(
                 self.alloc,
-                self.write_source.catalog,
+                self.status_source,
                 self.read_source.source(),
                 self.write_source.source(),
                 observation.request,
                 .fromAtomic(&self.background_jobs_shutdown),
                 .{ .next_candidate = job.next_candidate },
             ) catch |err| {
+                std.log.debug("coordinated TTL observation failed table_id={d} group_id={d} err={s}", .{ observation.request.table_id, observation.request.group_id, @errorName(err) });
                 _ = self.relational_ttl_failed.fetchAdd(1, .monotonic);
                 switch (err) {
                     // A setup allocation/deadline failure did not attempt any
@@ -7855,6 +7856,8 @@ pub const DataServer = struct {
             };
             _ = self.relational_ttl_expired.fetchAdd(result.expired, .monotonic);
             _ = self.relational_ttl_failed.fetchAdd(result.failed, .monotonic);
+            if (result.last_error) |err|
+                std.log.debug("coordinated TTL mutation deferred table_id={d} group_id={d} err={s}", .{ observation.request.table_id, observation.request.group_id, @errorName(err) });
             if (result.next_candidate == observation.request.candidates.len) {
                 _ = self.relational_ttl_completed.fetchAdd(1, .monotonic);
                 return;

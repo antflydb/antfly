@@ -55546,7 +55546,16 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
     const ctx: *TtlCleanupContext = @ptrCast(@alignCast(ctx_ptr));
     var view = if (ctx.schema_registry) |registry| registry.acquire() else null;
     defer if (view) |*pinned| pinned.release();
-    if (view) |pinned| if (pinned.hasCoordinatedConstraints()) {
+    const retained_raft_history = blk: {
+        var txn = try ctx.batch.store.runtime_store.beginRead();
+        defer txn.abort();
+        const history = @import("../committed_history.zig");
+        const state = (try history.load(&txn)) orelse break :blk false;
+        if (!state.active() and try history.loadPolicy(&txn) == null) break :blk false;
+        const owner = (try @import("../source_authority.zig").load(&txn)) orelse return error.HistoryAuthorityRequired;
+        break :blk owner.kind == .raft;
+    };
+    if (view) |pinned| if (pinned.hasCoordinatedConstraints() or retained_raft_history) {
         const io = ctx.batch.io orelse std.Options.debug_io;
         ctx.hook_mutex.lockUncancelable(io);
         const port = ctx.coordinated_port;
@@ -55570,10 +55579,13 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
                     error.NotFound => continue,
                     else => return err,
                 };
-                if (timestamp_raw.len != 8) return error.InvalidTimestamp;
-                const timestamp = std.mem.readInt(u64, timestamp_raw[0..8], .little);
-                if (timestamp != candidate.timestamp_ns or
-                    !ttl_mod.isExpiredWithGrace(timestamp, schema.ttl_duration_ns, ctx.grace_period_ns, now)) continue;
+                const timestamp = ttl_mod.decodeTimestamp(timestamp_raw) orelse return error.InvalidTimestamp;
+                if (timestamp.source != candidate.timestamp_ns or
+                    !ttl_mod.isExpiredWithGrace(timestamp.source, schema.ttl_duration_ns, ctx.grace_period_ns, now)) continue;
+                // The callback receives an unsigned timestamp for its
+                // additional age check. Epoch zero is a conservative bound
+                // for a row already proven expired before the epoch.
+                const observed_source_ns = std.math.cast(u64, @max(timestamp.source, 0)) orelse continue;
                 const row_key = if (pinned.storageMode() == .relational)
                     try relational_store.keyAlloc(ctx.batch.alloc, candidate.key)
                 else
@@ -55587,8 +55599,8 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
                 std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
                 try prepared.append(ctx.batch.alloc, .{
                     .key = candidate.key,
-                    .row_version = timestamp,
-                    .ttl_timestamp_ns = timestamp,
+                    .row_version = timestamp.version,
+                    .ttl_timestamp_ns = observed_source_ns,
                     .expected_content_digest = digest,
                 });
             }
@@ -55605,6 +55617,7 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
             .candidates = prepared.items,
         });
     };
+    if (retained_raft_history) return error.HistoryAuthorityRequired;
     const loaded_schema = try schema_mod.loadSchema(ctx.batch.store, ctx.batch.alloc);
     defer if (loaded_schema) |schema| schema_mod.freeSchema(ctx.batch.alloc, schema);
 
@@ -130331,6 +130344,12 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
         .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "parent", .schema_version = 1 } } }},
     });
     try db.commitTransaction(transaction, 11);
+    // Revision-aware primary storage can use an independent TTL source time.
+    const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, "parent");
+    defer alloc.free(timestamp_key);
+    const timestamp = try ttl_mod.encodeTimestampAlloc(alloc, 11, 1);
+    defer alloc.free(timestamp);
+    try db.core.store.put(timestamp_key, timestamp);
     const Capture = struct {
         db: *DB,
         seen: bool = false,
@@ -130339,7 +130358,7 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
             try std.testing.expectEqual(@as(u64, 100), request.table_id);
             // The local observation carries table identity; routing is bound by its owner.
             try std.testing.expectEqual(@as(usize, 1), request.candidates.len);
-            try std.testing.expectEqual(@as(u64, 1), request.candidates[0].row_version);
+            try std.testing.expectEqual(@as(u64, 11), request.candidates[0].row_version);
             try std.testing.expectEqual(@as(u64, 1), request.candidates[0].ttl_timestamp_ns);
             try std.testing.expect(self.db.core.apply_mutex.tryLockExclusive());
             self.db.core.apply_mutex.unlockExclusive();

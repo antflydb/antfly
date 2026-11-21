@@ -324,7 +324,8 @@ fn workerStep(runtime: *TtlRuntime) ?u64 {
     if (!workDeferred(runtime)) {
         const now_ns = runtime.config.clock.nowRealtimeNs();
         if (ensureLease(runtime, now_ns)) {
-            const summary = collectAndDelete(runtime, now_ns) catch {
+            const summary = collectAndDelete(runtime, now_ns) catch |err| {
+                std.log.debug("TTL cleanup sweep failed: {s}", .{@errorName(err)});
                 recordRun(runtime, now_ns, .{}, true);
                 return @max(1, runtime.config.interval_ms);
             };
