@@ -6766,7 +6766,13 @@ pub const Store = struct {
             // This is under the writer lease and store mutex, so an empty
             // scope cannot acquire postings between the probe and the delete.
             const other_bytes = if (head.scope_delete_redo_bytes) |measure| measure(head.context, &self.file) else 0;
-            switch (try self.file.planIndexScopeDeletion(prefix, head.scope_delete_exact_key, other_bytes)) {
+            var probe_gate: SyncExclusiveGate = .{ .store = self };
+            const probe_hooks: native.SyncLockHooks = .{
+                .context = &probe_gate,
+                .release = releaseStoreMutexForSync,
+                .reacquire = reacquireStoreMutexAfterSync,
+            };
+            switch (try self.file.planIndexScopeDeletion(prefix, head.scope_delete_exact_key, other_bytes, probe_hooks)) {
                 .empty => if (head.scope_delete_only) {
                     // An earlier ride-along may be the reason this scope
                     // is empty. Honor the durable request even without edits.
@@ -10552,7 +10558,7 @@ test "lite durable empty index deletion syncs an earlier ride-along tombstone" {
         try store.file.commitTransactionWithDurability(false, null);
     }
     const pending = store.file.activeCheckpoint().commit_sequence;
-    try std.testing.expectEqual(native.NativeFile.IndexScopeDeletion.empty, try store.file.planIndexScopeDeletion(prefix, "/directory", 0));
+    try std.testing.expectEqual(native.NativeFile.IndexScopeDeletion.empty, try store.file.planIndexScopeDeletion(prefix, "/directory", 0, null));
     try std.testing.expect(store.file.durableSequence() < pending);
 
     try store.submitIndexTreeDeletion(prefix, "/directory");

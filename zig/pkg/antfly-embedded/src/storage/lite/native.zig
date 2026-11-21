@@ -4485,18 +4485,11 @@ pub const OwnedDocument = struct {
     value: []u8,
 };
 
-/// Optional hooks a caller passes into exactly one
-/// `commitTransactionWithDurability` call, to release an outer lock for the
-/// actual durability-barrier syscall and re-acquire it immediately after
-/// (WS2): everything `syncIfRequired` does before and after this pair --
-/// the preceding page/slot writes, and the checkpoint-slot publication that
-/// follows once it returns -- still runs under that lock, since those touch
-/// state other lock holders read. `context` is opaque here on purpose:
-/// NativeFile has no business knowing what kind of lock a caller above it
-/// uses. Threaded explicitly as a parameter (never stored on `NativeFile`)
-/// so two commits on the same file -- the group leader's, and any other
-/// caller's (reclaim, vacuum, `sync()`) that passes `null` -- can never
-/// observe or act on each other's hooks.
+/// Optional hooks to lend the outer store mutex during a durability
+/// barrier or a read-only overlay probe. The caller retains exclusive
+/// mutation authority while the mutex is lent. NativeFile prepares the
+/// operation and updates publication state with the lock held. A hook
+/// pair belongs to one invocation and is never stored on the file.
 pub const SyncLockHooks = struct {
     context: *anyopaque,
     release: *const fn (context: *anyopaque) void,
@@ -13732,7 +13725,7 @@ pub const NativeFile = struct {
 
     /// A keys-only preflight with the same byte threshold used by private
     /// flushes. Caller holds writer admission and the store mutation mutex.
-    pub fn planIndexScopeDeletion(self: *NativeFile, prefix: []const u8, exact_key: ?[]const u8, other_bytes: usize) !IndexScopeDeletion {
+    pub fn planIndexScopeDeletion(self: *NativeFile, prefix: []const u8, exact_key: ?[]const u8, other_bytes: usize, probe_hooks: ?SyncLockHooks) !IndexScopeDeletion {
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
         try self.refreshIfWriterBaseStale();
         try self.resyncRedoTailUnderAuthority();
@@ -13759,7 +13752,16 @@ pub const NativeFile = struct {
                 // A large companion batch can itself spill to physical
                 // writes outside the scope before deletion even starts.
                 if (other_bytes >= redo.large_txn_fallback_bytes) return .fold_first;
-                const overlaps = try redo.shared.hasLivePrefix(self.allocator, self.runtimeIo(), @backingInt(TransactionWrites.Root.index), prefix, exact_key, self.readMark(checkpoint), checkpoint.redo_folded_through);
+                // This phase only consults shared overlay state. Exclusive
+                // file operations still wait on the coordinator's gate,
+                // while ordinary writers can prepare and enqueue work.
+                const shared = redo.shared;
+                const allocator = self.allocator;
+                const io = self.runtimeIo();
+                const mark = self.readMark(checkpoint);
+                if (probe_hooks) |hooks| hooks.release(hooks.context);
+                defer if (probe_hooks) |hooks| hooks.reacquire(hooks.context);
+                const overlaps = try shared.hasLivePrefix(allocator, io, @backingInt(TransactionWrites.Root.index), prefix, exact_key, mark, checkpoint.redo_folded_through);
                 return if (overlaps) .fold_first else .inline_delete;
             }
             entry = (try cursor.next()) orelse return .inline_delete;
