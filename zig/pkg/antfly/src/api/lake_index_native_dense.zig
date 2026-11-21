@@ -342,7 +342,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         errdefer if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily")) {
             const owned_indexes = switch (index.env_owner) {
                 .lsm => |handle| handle.backend.run_index_cache.items.len,
-                .native => 0,
+                .native, .native_catalog => 0,
             };
             std.debug.print("PARQUET_BULK_FAILURE allocator_live={} allocator_peak={} owned_indexes={} commits={} cached_nodes={} node_limit={} pinned_nodes={} cached_quantized={}\n", .{ budget.live, budget.peak, owned_indexes, index.bulk_commit_rotation.commits, index.node_cache.count(), index.config.max_cached_nodes, index.pinned_node_cache.count(), index.quantized_cache.count() });
         };
@@ -541,7 +541,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const profile = index.getWriteProfile();
                 const report = try std.json.Stringify.valueAlloc(a, .{ .identity_census_verified = root.identities_verified, .identity_read_bytes = root.identity_read_bytes, .identity_written_bytes = root.identity_written_bytes, .identity_merge_inputs = root.identity_merge_inputs, .projection_cache_peak_bytes = if (projection_cache) |*value| value.snapshotStats().peak_used_bytes else 0, .owned_index_count = switch (index.env_owner) {
                     .lsm => |handle| handle.backend.run_index_cache.items.len,
-                    .native => 0,
+                    .native, .native_catalog => 0,
                 }, .partition_bytes = profile.bulk_spool_partition_bytes, .partition_read_bytes = profile.bulk_spool_partition_read_bytes, .compact_rows = profile.bulk_spool_compact_rows, .projection_commit_ns = profile.bulk_projection_commit_ns, .save_node_ns = profile.save_node_ns, .update_parent_ns = profile.update_parent_ns, .update_parent_calls = profile.update_parent_calls, .training_ns = profile.bulk_build_leaf_training_ns, .routing_ns = profile.bulk_build_leaf_route_ns, .allocator_peak_bytes = budget.peak }, .{});
                 defer a.free(report);
                 std.debug.print("PARQUET_BULK_WORK {s}\n", .{report});

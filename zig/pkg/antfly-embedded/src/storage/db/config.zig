@@ -313,9 +313,29 @@ pub const DenseNativeMigrationPolicySource = @import("runtime_callbacks.zig").De
 
 pub const IndexBackendOptions = struct {
     text_main_backend: persistent_mod.MainBackend = .lsm,
+    /// Required when `text_main_backend == .native_catalog` (Lite only). See
+    /// `storage/native_catalog_backend.zig:Sink`.
+    text_main_native_catalog_sink: ?persistent_mod.NativeCatalogSink = null,
     dense_storage_backend: hbc_mod.StorageBackend = .lsm,
+    /// Required when `dense_storage_backend == .native_catalog` (Lite
+    /// only). See `storage/native_catalog_backend.zig:Sink`.
+    dense_main_native_catalog_sink: ?hbc_mod.NativeCatalogSink = null,
     sparse_backend: sparse_mod.SparseBackend = .lsm,
+    /// Required when `sparse_backend == .native_catalog` (Lite only). See
+    /// `storage/native_catalog_backend.zig:Sink`.
+    sparse_main_native_catalog_sink: ?sparse_mod.NativeCatalogSink = null,
+    /// A real host directory for bounded staging spill on indexes that have
+    /// no file-backed `SegmentFileStore` -- always true for `.native_catalog`
+    /// (Lite only), which publishes segments inline through the catalog sink
+    /// rather than through file-backed artifacts. Lite's `Handle` sets this
+    /// to the directory containing its own on-disk file. See
+    /// `persistent.PersistentIndexOptions.scratch_dir`.
+    native_catalog_scratch_dir: ?[]const u8 = null,
     graph_reverse_backend: graph_mod.ReverseBackend = .lsm,
+    /// Required when `graph_reverse_backend == .native_catalog` (Lite only).
+    /// See `graph/graph.zig:NativeCatalogSink` and `storage/
+    /// native_catalog_backend.zig:Sink`.
+    graph_native_catalog_sink: ?graph_mod.NativeCatalogSink = null,
     text_lsm_storage: ?lsm_backend_mod.Storage = null,
     dense_lsm_storage: ?lsm_backend_mod.Storage = null,
     /// Raw durable file service for table-level native vector generations.
@@ -526,9 +546,14 @@ pub fn indexBackendOptionsForPrimary(
     const graph_storage_override = overrides.graph_lsm_storage != null;
     return .{
         .text_main_backend = if (text_storage_override) overrides.text_main_backend else textMainBackendForPrimary(kind),
+        .text_main_native_catalog_sink = overrides.text_main_native_catalog_sink,
         .dense_storage_backend = if (dense_storage_override) overrides.dense_storage_backend else denseStorageBackendForPrimary(kind),
+        .dense_main_native_catalog_sink = overrides.dense_main_native_catalog_sink,
         .sparse_backend = if (sparse_storage_override) overrides.sparse_backend else sparseBackendForPrimary(kind),
+        .sparse_main_native_catalog_sink = overrides.sparse_main_native_catalog_sink,
         .graph_reverse_backend = if (graph_storage_override) overrides.graph_reverse_backend else graphReverseBackendForPrimary(kind),
+        .graph_native_catalog_sink = overrides.graph_native_catalog_sink,
+        .native_catalog_scratch_dir = overrides.native_catalog_scratch_dir,
         .text_lsm_storage = overrides.text_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .dense_lsm_storage = overrides.dense_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .vector_block_storage = overrides.vector_block_storage orelse if (kind == .lsm) primary_lsm_storage else null,
@@ -732,6 +757,46 @@ test "index backend resolver honors explicit lsm storage over memory primary" {
     try std.testing.expectEqual(hbc_mod.StorageBackend.lsm, opts.dense_storage_backend);
     try std.testing.expectEqual(sparse_mod.SparseBackend.lsm, opts.sparse_backend);
     try std.testing.expectEqual(graph_mod.ReverseBackend.lsm, opts.graph_reverse_backend);
+}
+
+test "index backend resolver forwards the native catalog sink override" {
+    // Regression: indexBackendOptionsForPrimary's returned IndexBackendOptions
+    // literal must forward every override field, not just the backend kind
+    // enums. text_main_native_catalog_sink previously had no line in that
+    // literal, so Lite's `.native_catalog` override (set by
+    // lite/backend.zig's configureDbOpenOptions before DB.open merges
+    // primary-kind defaults with it) was silently reset to null here,
+    // breaking every real Lite open with error.MissingNativeCatalogSink.
+    const storage: lsm_backend_mod.Storage = undefined;
+    const TestSink = struct {
+        fn submit(_: *anyopaque, _: []const u8, _: []const @import("../native_catalog_backend.zig").Mutation, _: bool) anyerror!void {}
+        fn loadAllAlloc(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]@import("../native_catalog_backend.zig").Entry {
+            return allocator.alloc(@import("../native_catalog_backend.zig").Entry, 0);
+        }
+    };
+    var marker: u8 = 0;
+    const sink = persistent_mod.NativeCatalogSink{
+        .ptr = &marker,
+        .submit = TestSink.submit,
+        .loadAllAlloc = TestSink.loadAllAlloc,
+    };
+    const opts = indexBackendOptionsForPrimary(
+        .mem,
+        null,
+        null,
+        null,
+        0,
+        null,
+        true,
+        .{
+            .text_main_backend = .native_catalog,
+            .text_main_native_catalog_sink = sink,
+            .text_lsm_storage = storage,
+        },
+    );
+    try std.testing.expectEqual(persistent_mod.MainBackend.native_catalog, opts.text_main_backend);
+    try std.testing.expect(opts.text_main_native_catalog_sink != null);
+    try std.testing.expectEqual(@as(*anyopaque, &marker), opts.text_main_native_catalog_sink.?.ptr);
 }
 
 test "index lsm profiles inherit shared cache root generation and overrides" {

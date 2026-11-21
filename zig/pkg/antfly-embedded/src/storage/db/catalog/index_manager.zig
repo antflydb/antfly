@@ -25,12 +25,21 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const full_text_index_defaults = @import("../../../common/full_text_index_defaults.zig");
 const native_artifact_sink = @import("../../native_artifact_sink.zig");
+const native_catalog_backend = @import("../../native_catalog_backend.zig");
 const native_backup = @import("../native_backup.zig");
 const process_memory = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const backend_types = @import("../../backend_types.zig");
 const backend_erased = @import("../../backend_erased.zig");
+// Diagnostic-only (test-build-gated); see write_amplification_trace.zig.
+// Pushed around the dense-vector-id<->document-key mapping commit
+// (`commitDenseVectorMappingsWithRollback`) so the write-amplification
+// harness's dense mode can distinguish it from the primary document
+// commit it follows (both go through the same primary docstore, but are
+// two separate round trips today -- see lite-single-commit-write-path.md
+// §3.3a).
+const wal_trace = @import("../../write_amplification_trace.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const types = @import("../types.zig");
 const doc_identity = @import("../doc_identity.zig");
@@ -1411,6 +1420,7 @@ pub const IndexManager = struct {
     }
 
     pub const dense_native_backup_backend_id = "hbc-native-v1";
+    pub const default_status_persist_interval_ns: u64 = 5 * std.time.ns_per_s;
     const max_retired_lsm_owner_stats: usize = 1024;
     const retired_lsm_owner_overflow_name = "__retired_owner_overflow__";
     /// Stable-address lifetime admission shared by DB searches and background
@@ -1423,6 +1433,20 @@ pub const IndexManager = struct {
     resolver_catalog_projection_dictionary: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     base_path: []u8,
+    /// Owned copy of `IndexBackendOptions.native_catalog_scratch_dir`. See
+    /// `persistent.PersistentIndexOptions.scratch_dir`.
+    native_catalog_scratch_dir: ?[]u8 = null,
+    /// #1216 (creation side): borrowed, set only by `addWithOptions`
+    /// (never by anything reopen uses) for the duration of its one call
+    /// into `openConfiguredIndexWithAuthorization`, and cleared
+    /// immediately after. `openConfiguredIndexDetached`'s dense_vector
+    /// branch reads it to tell a genuinely fresh admission apart from a
+    /// normal reopen -- `self.get(cfg.name)` cannot make that distinction
+    /// from inside the shared open path, since the index being opened is,
+    /// by construction, absent from the open-indexes list in *either*
+    /// case at that point. Must be set/read/cleared only while
+    /// `catalog_mutex` is held, which both call sites already do.
+    fresh_admission_name: ?[]const u8 = null,
     byte_range: docstore_mod.ByteRange,
     relaxed_split_durability: bool,
     leann_replication: bool = false,
@@ -1438,19 +1462,23 @@ pub const IndexManager = struct {
     leann_reembed_cache: leann_store_mod.ManagedReembedCache = .{ .limit_bytes = 32 << 20 },
     leann_range_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     text_main_backend: persistent_mod.MainBackend,
+    text_main_native_catalog_sink: ?persistent_mod.NativeCatalogSink = null,
     text_lsm_storage: ?lsm_backend_mod.Storage,
     text_main_lsm_options: lsm_backend_mod.Options,
     text_wal_lsm_options: lsm_backend_mod.Options,
     dense_storage_backend: hbc_mod.StorageBackend,
+    dense_main_native_catalog_sink: ?hbc_mod.NativeCatalogSink = null,
     dense_lsm_storage: ?lsm_backend_mod.Storage,
     vector_block_storage: ?lsm_backend_mod.Storage,
     generation_storage: ?lsm_backend_mod.Storage,
     owned_vector_block_storage: ?*lsm_backend_mod.NativeStorage,
     dense_lsm_options: lsm_backend_mod.Options,
     sparse_backend: sparse_mod.SparseBackend,
+    sparse_main_native_catalog_sink: ?sparse_mod.NativeCatalogSink = null,
     sparse_lsm_storage: ?lsm_backend_mod.Storage,
     sparse_lsm_options: lsm_backend_mod.Options,
     graph_reverse_backend: graph_mod.ReverseBackend,
+    graph_native_catalog_sink: ?graph_mod.NativeCatalogSink = null,
     graph_lsm_storage: ?lsm_backend_mod.Storage,
     graph_reverse_lsm_options: lsm_backend_mod.Options,
     lsm_cache: ?*lsm_backend_mod.Cache,
@@ -1485,7 +1513,15 @@ pub const IndexManager = struct {
     // publication admission; explicit stable lifecycle fences do not consult
     // it. The backend outlives IndexManager in DBCore.
     primary_lsm_backend: ?*lsm_backend_mod.Backend = null,
-    applied_sequence_checkpoint_path: ?[]const u8,
+    /// Gate for how often the applied-sequence/progress write path also
+    /// persists a derived `IndexStatusSnapshot`. Status is cheap to recompute
+    /// from live state and is not needed for recovery (progress v2 is), so
+    /// outside a forced flush or close it piggybacks on an existing progress
+    /// commit at most once per `status_persist_interval_ns`. Shared by both
+    /// the sync (`BatchExecutionContext`) and async (`AsyncContext`) applied-
+    /// sequence paths, which both hold a pointer to this same `IndexManager`.
+    last_status_persist_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    status_persist_interval_ns: u64 = default_status_persist_interval_ns,
     vector_block_generation_mu: std.atomic.Mutex = .unlocked,
     // Captures retain manifest-named files before checkpoint publication can
     // retire them. This gate excludes only handoffs, never query readers or
@@ -1540,6 +1576,21 @@ pub const IndexManager = struct {
     /// Durable generated-artifact cleanup uses the same single-flight shape,
     /// but runs in bounded pages so it cannot monopolize structural locks.
     artifact_cleanup_state: std.atomic.Value(u8) = .init(0),
+    /// Bounds `db.zig`'s `onGeneratedArtifactCleanupGiveUp` resubmission: a
+    /// transient failure burst longer than one `cleanup_job_owner.drain`
+    /// run's 8-attempt budget (e.g. a rate-limited dependency) must still
+    /// clear, but a genuinely permanent failure must not resubmit forever.
+    /// Reset to 0 by `advanceArtifactCleanup`'s own non-error returns.
+    artifact_cleanup_giveup_rounds: std.atomic.Value(u32) = .init(0),
+    /// Set by every `db.zig` `scheduleGeneratedArtifactCleanupContext` call
+    /// (mirrors `attachHllMaintenance`'s `hll_maintenance_lane`/
+    /// `hll_maintenance_owner_id` pair below). `cleanup_job_owner.Port`'s
+    /// `on_give_up` callback only receives its own `ptr`
+    /// (`*execution_resources.AsyncContext`), not the lane/owner_id used to
+    /// schedule it, so `onGeneratedArtifactCleanupGiveUp` reads these back
+    /// from `ctx.index_manager` to resubmit a bounded number of times.
+    artifact_cleanup_lane: ?background_runtime_mod.DurableJobLane = null,
+    artifact_cleanup_owner_id: u64 = 0,
     // Bulk text backfill performs its own policy compaction at durable batch
     // boundaries. Keep the asynchronous scheduler from competing with it (or
     // compacting an older schema generation) for CPU, mmap residency, and the
@@ -3403,6 +3454,22 @@ pub const IndexManager = struct {
             self.manager.catalog_mutex.unlockShared();
             self.* = undefined;
         }
+
+        /// WS4 phase 2: enforces -- not just documents -- that a caller
+        /// holding this guard across a native commit (an inline
+        /// publication's prepare-to-install window) still holds it at
+        /// install/abort time, instead of some other path having already
+        /// released it. `std.atomic.Mutex` is not reentrant, so a
+        /// `tryLock` that succeeds here means nothing held it; restore
+        /// that (wrong) state immediately rather than leave it
+        /// double-locked, since the caller is about to assert and panic.
+        pub fn locked(self: *const ManagedIndexApplyGuard) bool {
+            if (self.mutex.tryLock()) {
+                self.mutex.unlock();
+                return false;
+            }
+            return true;
+        }
     };
 
     fn analysisContributionCache(self: *IndexManager, docs: []const introducer_mod.TextDocument) ?*introducer_mod.AnalyzedContributionCache {
@@ -3438,6 +3505,9 @@ pub const IndexManager = struct {
         const bind_cache_resource_manager = opts.bind_cache_resource_manager and owned_resource_manager == null;
         const native_read_scratch = try native_read_scratch_pool.Pool.create(alloc, resource_manager);
         errdefer native_read_scratch.destroy();
+
+        const native_catalog_scratch_dir: ?[]u8 = if (opts.native_catalog_scratch_dir) |dir| try alloc.dupe(u8, dir) else null;
+        errdefer if (native_catalog_scratch_dir) |dir| alloc.free(dir);
 
         var owned_vector_block_storage: ?*lsm_backend_mod.NativeStorage = null;
         errdefer if (owned_vector_block_storage) |storage| {
@@ -3499,23 +3569,28 @@ pub const IndexManager = struct {
         return .{
             .alloc = alloc,
             .base_path = try alloc.dupe(u8, base_path),
+            .native_catalog_scratch_dir = native_catalog_scratch_dir,
             .byte_range = .{ .start = "", .end = "" },
             .relaxed_split_durability = false,
             .leann_replication = opts.leann_replication,
             .text_main_backend = opts.text_main_backend,
+            .text_main_native_catalog_sink = opts.text_main_native_catalog_sink,
             .text_lsm_storage = opts.text_lsm_storage,
             .text_main_lsm_options = text_main_lsm_options,
             .text_wal_lsm_options = text_wal_lsm_options,
             .dense_storage_backend = opts.dense_storage_backend,
+            .dense_main_native_catalog_sink = opts.dense_main_native_catalog_sink,
             .dense_lsm_storage = opts.dense_lsm_storage,
             .vector_block_storage = vector_block_storage,
             .generation_storage = opts.generation_storage,
             .owned_vector_block_storage = owned_vector_block_storage,
             .dense_lsm_options = dense_lsm_options,
             .sparse_backend = opts.sparse_backend,
+            .sparse_main_native_catalog_sink = opts.sparse_main_native_catalog_sink,
             .sparse_lsm_storage = opts.sparse_lsm_storage,
             .sparse_lsm_options = sparse_lsm_options,
             .graph_reverse_backend = opts.graph_reverse_backend,
+            .graph_native_catalog_sink = opts.graph_native_catalog_sink,
             .graph_lsm_storage = opts.graph_lsm_storage,
             .graph_reverse_lsm_options = graph_reverse_lsm_options,
             .lsm_cache = opts.lsm_cache,
@@ -3531,7 +3606,6 @@ pub const IndexManager = struct {
             .dense_native_candidate_build_authorized = opts.dense_native_candidate_build_authorized,
             .primary_store = null,
             .relational_base_rows = false,
-            .applied_sequence_checkpoint_path = null,
             .vector_block_generation = null,
             .load_parallelism = null,
             .full_text_pending_bytes_accounted = 0,
@@ -3549,10 +3623,6 @@ pub const IndexManager = struct {
 
     pub fn setRelaxedSplitDurability(self: *IndexManager, enabled: bool) void {
         self.relaxed_split_durability = enabled;
-    }
-
-    pub fn setAppliedSequenceCheckpointPath(self: *IndexManager, path: ?[]const u8) void {
-        self.applied_sequence_checkpoint_path = path;
     }
 
     fn allocIndexApplyMutex(self: *IndexManager) !*std.atomic.Mutex {
@@ -7264,6 +7334,7 @@ pub const IndexManager = struct {
             .storage = self.effectiveDenseStorage(),
             .cache = self.lsm_cache,
             .root_generation = self.lsm_root_generation,
+            .native_catalog_sink = self.dense_main_native_catalog_sink,
         });
         errdefer entry.index.close();
 
@@ -7358,6 +7429,7 @@ pub const IndexManager = struct {
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
             .backend = self.sparse_backend,
+            .main_native_catalog_sink = self.sparse_main_native_catalog_sink,
             .lsm_storage = self.effectiveSparseStorage(),
             .lsm_cache = self.lsm_cache,
             .lsm_options = self.sparse_lsm_options,
@@ -7406,37 +7478,22 @@ pub const IndexManager = struct {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
 
-        var checkpoint = try apply_state.loadProjectionCheckpointWithSidecarWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name);
+        var checkpoint = try apply_state.loadProjectionCheckpoint(self.alloc, store, entry.config.name);
         checkpoint.status = .rebuilding;
         checkpoint.generation = std.math.add(u64, checkpoint.generation, 1) catch return error.ResourceLimitExceeded;
         checkpoint.config_hash = types.indexConfigHash(entry.config);
         // A crash anywhere after this boundary leaves explicit repair debt,
         // never an old clean watermark attached to an empty physical index.
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name, checkpoint);
+        try apply_state.saveProjectionCheckpoint(store, entry.config.name, checkpoint);
         try rebuild_state.updateWithIo(self.checkpointIo(), "");
         try entry.persistent.resetAllForRebuild();
         try self.backfillTextIndex(store, entry, null);
         try entry.persistent.sync(true);
         try self.saveBackfilledAppliedSequence(store, entry.config);
-        checkpoint = try apply_state.loadProjectionCheckpointWithSidecarWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            entry.config.name,
-        );
+        checkpoint = try apply_state.loadProjectionCheckpoint(self.alloc, store, entry.config.name);
         checkpoint.status = .clean;
         checkpoint.config_hash = types.indexConfigHash(entry.config);
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            entry.config.name,
-            checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(store, entry.config.name, checkpoint);
 
         const rebuilt = entry.persistent.snapshot().liveDocCount();
         const compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy());
@@ -7670,6 +7727,7 @@ pub const IndexManager = struct {
             self.alloc.destroy(storage);
         }
         self.alloc.free(self.base_path);
+        if (self.native_catalog_scratch_dir) |dir| self.alloc.free(dir);
         self.native_read_scratch.destroy();
         // PR #957 review on the #938 escalation commit: the process-wide
         // ResourceManager's replay-document-not-visible tracker is keyed in
@@ -10175,10 +10233,32 @@ pub const IndexManager = struct {
         }
     }
 
+    /// True when the owner should persist a derived `IndexStatusSnapshot`
+    /// now: always on a forced/close flush, otherwise at most once per
+    /// `status_persist_interval_ns`. Pure decision — does not touch storage
+    /// or update the gate; call `markStatusPersisted` after the write
+    /// actually commits.
+    pub fn statusPersistDue(self: *const IndexManager, now_ns: u64, force: bool) bool {
+        if (force) return true;
+        const last = self.last_status_persist_ns.load(.monotonic);
+        // Never persisted yet: due immediately, regardless of how large (or
+        // how close to the process/clock origin) `now_ns` happens to be.
+        // Comparing against an absolute clock reading here would make the
+        // very first persist depend on how much time has passed since
+        // whatever epoch the clock counts from, not on this gate's own
+        // state.
+        if (last == 0) return true;
+        return now_ns -| last >= self.status_persist_interval_ns;
+    }
+
+    pub fn markStatusPersisted(self: *IndexManager, now_ns: u64) void {
+        self.last_status_persist_ns.store(now_ns, .monotonic);
+    }
+
     pub const FullTextProjectionGuard = struct {
         alloc: Allocator,
         apply_guard: ManagedIndexApplyGuard,
-        snapshot: *const apply_state.ProjectionSnapshot,
+        snapshot: *apply_state.ProjectionSnapshot,
         admission_key: []u8,
         index_name: []const u8,
         seal: @import("../../projection_seal.zig").Seal,
@@ -10211,7 +10291,7 @@ pub const IndexManager = struct {
     pub fn tryValidateFullTextProjection(
         self: *IndexManager,
         alloc: Allocator,
-        snapshot: *const apply_state.ProjectionSnapshot,
+        snapshot: *apply_state.ProjectionSnapshot,
         index_name: []const u8,
         expected_generation: u64,
     ) !?FullTextProjectionGuard {
@@ -10224,7 +10304,7 @@ pub const IndexManager = struct {
     pub fn tryValidateFullTextProjectionWithAdoptionHint(
         self: *IndexManager,
         alloc: Allocator,
-        snapshot: *const apply_state.ProjectionSnapshot,
+        snapshot: *apply_state.ProjectionSnapshot,
         index_name: []const u8,
         expected_generation: u64,
         needs_adoption: ?*bool,
@@ -10327,15 +10407,13 @@ pub const IndexManager = struct {
     /// reads never mint certificates or inspect the live mutable cardinality.
     pub fn preserveCertifiedEmptyDenseCheckpoint(
         self: *IndexManager,
-        alloc: Allocator,
         store: anytype,
-        checkpoint_path: ?[]const u8,
         index_name: []const u8,
     ) !void {
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
         const checkpoint = self.denseProjectionCheckpointMetadata(index_name) orelse return error.InvalidDerivedApplyState;
         const certified = entry.certifiedEmptyNativeCheckpoint(checkpoint) orelse return;
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(self.generation_storage, alloc, self.checkpointIo(), store, checkpoint_path, index_name, certified);
+        try apply_state.saveProjectionCheckpoint(store, index_name, certified);
         _ = entry.validateServingCertificate(certified);
     }
 
@@ -13215,7 +13293,7 @@ pub const IndexManager = struct {
         defer self.alloc.free(key);
         const value = try std.json.Stringify.valueAlloc(self.alloc, job, .{});
         defer self.alloc.free(value);
-        try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, job.name, cfg.config_json, .{ .put = .{ .key = key, .value = value } });
+        try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, job.name, cfg.config_json, .{ .put = .{ .key = key, .value = value } }, null);
     }
 
     /// Remove reservation and enqueue existing bounded artifact cleanup in one
@@ -13235,7 +13313,7 @@ pub const IndexManager = struct {
             try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, name, cfg.config_json, .{ .put_delete = .{
                 .put = .{ .key = cleanup.key.?, .value = cleanup.value.? },
                 .delete = key,
-            } });
+            } }, null);
             return true;
         }
         return false;
@@ -13391,6 +13469,13 @@ pub const IndexManager = struct {
             try self.appendOpenedIndex(opened);
             entry.* = null;
         } else {
+            // #1216 (creation side): line 13109's `self.has(cfg.name)` check
+            // above already proved no live index of this name exists
+            // anywhere -- this call can only be reached by a fresh
+            // admission, never a reopen. See `fresh_admission_name`'s doc
+            // comment.
+            self.fresh_admission_name = stored_cfg.name;
+            defer self.fresh_admission_name = null;
             try self.openConfiguredIndexWithAuthorization(
                 store,
                 stored_cfg,
@@ -14669,13 +14754,14 @@ pub const IndexManager = struct {
     }
 
     fn clearAppliedSequenceAfterCatalogRemoval(self: *IndexManager, store: anytype, name: []const u8) void {
+        _ = self;
         if (builtin.is_test) {
             if (test_inject_index_removal_cleanup_error) |err| {
                 std.log.warn("index removal committed with injected stale applied-sequence metadata name={s} err={s}", .{ name, @errorName(err) });
                 return;
             }
         }
-        apply_state.clearAppliedSequenceWithCheckpointWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, name) catch |err| {
+        apply_state.clearAppliedSequence(store, name) catch |err| {
             std.log.warn("index removal committed with stale applied-sequence metadata name={s} err={s}", .{ name, @errorName(err) });
         };
     }
@@ -15326,14 +15412,7 @@ pub const IndexManager = struct {
         // The durable cleanup tombstone prevents same-name admission until
         // finalization succeeds, so checkpoint and filesystem I/O need not hold
         // the catalog lock used by unrelated indexes.
-        try apply_state.clearAppliedSequenceWithCheckpointWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            name,
-        );
+        try apply_state.clearAppliedSequence(store, name);
         // Algebraic keyspaces are drained in bounded, cursor-backed outbox
         // phases before finalization reaches this filesystem-only tail.
         if (active_path) |path| {
@@ -15412,8 +15491,30 @@ pub const IndexManager = struct {
                     owned_embedding_names.items,
                 );
                 defer artifact_cleanup.deinit();
+                // #1216: a native-catalog HBC index's own metadata (dims,
+                // root node, postings) lives under a fixed, name-derived
+                // scope, independent of the generated-artifact cleanup
+                // above. Its deletes commit in the same transaction as the
+                // catalog mutation below: a crash can never leave the
+                // catalog naming "img" over an erased scope, nor "img" gone
+                // while its stale dims survive underneath a later
+                // re-admission -- see `HBCIndex.nativeCatalogScopeDeletesForRemoval`.
+                // perf/lwa-maint-serialize: background maintenance must not
+                // write the scope between loading those deletes and the
+                // commit -- see `HBCIndex.pauseMaintenanceAcrossRemoval`.
+                entry.index.pauseMaintenanceAcrossRemoval();
+                // Only valid while `entry.index` itself still is --
+                // `retireDenseIndexEntry` below destroys it, so the
+                // success path below resumes explicitly, *before* that
+                // call, instead of via `defer`; this `errdefer` covers
+                // every early-return failure path above that point, where
+                // `entry.index` is still live.
+                errdefer entry.index.resumeMaintenanceAcrossRemoval();
+                var scope_deletes = try entry.index.nativeCatalogScopeDeletesForRemoval();
+                defer if (scope_deletes) |*deletes| deletes.deinit();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
-                try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
+                try self.persistCatalogExcludingWithConfigAndAtomicMutation(store, name, null, commit_mutation, if (scope_deletes) |*deletes| deletes else null);
+                entry.index.resumeMaintenanceAcrossRemoval();
                 const replicated_leann = if (entry.index.leann) |leann_store| leann_store.isReplicated() else false;
                 self.retireDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);
@@ -19444,6 +19545,17 @@ pub const IndexManager = struct {
                 applied_sequence,
                 @errorName(err),
             });
+            // Bug-3/open-risk diagnostic: the generic error name alone does
+            // not say which of persistExperimentalPostingSidecarAtApplied
+            // SequenceWithLease's internal calls (openExperimentalPostingStore,
+            // finishExperimentalPostingMutationCapture, publishExperimental
+            // PostingCheckpoint, posting_store.commitPrepared, ...) actually
+            // failed. Dump the Debug-build error-return trace captured at the
+            // point of failure so a real repro's log pinpoints the call site.
+            if (@errorReturnTrace()) |trace| {
+                std.debug.print("dense posting sidecar failure trace index={s} sequence={} err={s}:\n", .{ name, applied_sequence, @errorName(err) });
+                std.debug.dumpErrorReturnTrace(trace);
+            }
             entry.index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
                 std.log.warn("dense posting sidecar invalidation failed index={s} err={s}", .{ name, @errorName(invalidate_err) });
             };
@@ -20629,6 +20741,24 @@ pub const IndexManager = struct {
         return null;
     }
 
+    /// True when some graph index extracts relations from this asset (or
+    /// chunk) artifact. Graph edge construction keys its producer
+    /// provenance to the exact primary-document revision it observed
+    /// (`artifact_producer_context.Token`/ordered publication's authority
+    /// path), so a local, revision-blind reuse receipt cannot stand in for
+    /// it: `reusableLocalAsset`'s skip-the-producer check must key on the
+    /// whole primary document here, not just the producer's declared
+    /// source field, even though the narrower key is otherwise correct and
+    /// avoids redundant producer calls on an unrelated-field edit.
+    pub fn artifactFeedsGraph(self: *const IndexManager, artifact_name: []const u8) bool {
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.artifact_sources) |source| {
+                if (std.mem.eql(u8, source.artifact_name, artifact_name)) return true;
+            }
+        }
+        return false;
+    }
+
     pub fn graphIndexConsumesAssetArtifact(self: *const IndexManager, index_name: []const u8, artifact_name: []const u8) bool {
         return self.graphArtifactSourceForArtifact(index_name, artifact_name) != null;
     }
@@ -21710,6 +21840,17 @@ pub const IndexManager = struct {
 
     pub fn runTextMergeScheduler(self: *IndexManager, max_steps: usize) !usize {
         var completed: usize = 0;
+        // Indexes whose publication was refused this pass. A refusal
+        // (`EnrichmentWaitCanceled`) can be scoped to one index whose inputs
+        // changed under a maintenance snapshot; the other indexes still merge.
+        var refused: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (refused.items) |name| {
+                if (self.textIndexEntry(name)) |entry| TextMergeScheduler.schedule(entry);
+                self.alloc.free(name);
+            }
+            refused.deinit(self.alloc);
+        }
         while (completed < max_steps) {
             var task = (try self.beginTextMergeTask()) orelse break;
             defer task.deinit(self.alloc);
@@ -21723,19 +21864,32 @@ pub const IndexManager = struct {
                 else => return err,
             };
             defer result.deinit(self.alloc);
-            while (true) {
-                _ = self.finishTextMergeTask(&task, &result) catch |err| {
-                    if (err != error.TextMergePublicationLookupRequired) return err;
+            const published = while (true) {
+                _ = self.finishTextMergeTask(&task, &result) catch |err| switch (err) {
                     // This synchronous scheduler does not acquire the runtime's
                     // database-wide apply lock. Prepare outside IndexManager's
                     // short per-index publication critical section and retry.
-                    try prepareTextMergeTaskPublicationLookup(&task, &result);
-                    continue;
+                    error.TextMergePublicationLookupRequired => {
+                        try prepareTextMergeTaskPublicationLookup(&task, &result);
+                        continue;
+                    },
+                    error.EnrichmentWaitCanceled => break false,
+                    else => return err,
                 };
-                break;
+                break true;
+            };
+            if (!published) {
+                // Park the index (pending cleared) until the pass ends so
+                // `select` moves on; the deferred reschedule restores it.
+                try refused.ensureUnusedCapacity(self.alloc, 1);
+                refused.appendAssumeCapacity(try self.alloc.dupe(u8, task.index_name));
+                self.completeTextMergeTaskTracking(&task);
+                if (self.textIndexEntry(task.index_name)) |entry| TextMergeScheduler.noteComplete(entry);
+                continue;
             }
             completed += 1;
         }
+        if (completed == 0 and refused.items.len != 0) return error.EnrichmentWaitCanceled;
         return completed;
     }
 
@@ -22004,7 +22158,12 @@ pub const IndexManager = struct {
         }
     };
 
-    const DenseVectorIdAssignment = struct {
+    /// `pub` only so `mutation_materialization.zig`'s
+    /// `prepareInlineDensePublication` (lite-single-commit-write-path.md
+    /// §3.3a) can hold the `assignDenseVectorIdInlineTxn` result in a local
+    /// before copying out the one field (`vector_id`) it actually needs;
+    /// never otherwise named outside this file.
+    pub const DenseVectorIdAssignment = struct {
         vector_id: u64,
         needs_mapping: bool,
         can_assume_absent: bool,
@@ -23125,18 +23284,12 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
         sequence: u64,
     ) !void {
-        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            .{
-                .index_name = cfg.name,
-                .sequence = sequence,
-                .config_hash = types.indexConfigHash(cfg),
-            },
-        );
+        _ = self;
+        try apply_state.saveAppliedSequenceUpdate(store, .{
+            .index_name = cfg.name,
+            .sequence = sequence,
+            .config_hash = types.indexConfigHash(cfg),
+        });
     }
 
     /// Complete a fresh physical generation before the logical catalog makes
@@ -23215,15 +23368,7 @@ pub const IndexManager = struct {
             .generation = projection_checkpoint.generation,
             .config_hash = projection_checkpoint.config_hash,
         });
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            cfg.name,
-            projection_checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(store, cfg.name, projection_checkpoint);
         try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
             self.generation_storage,
             self.alloc,
@@ -23283,7 +23428,7 @@ pub const IndexManager = struct {
         self.invalidateIndexPathCaches(canonical_path);
         try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
         if (cfg.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, cfg.name);
-        try apply_state.clearAppliedSequenceWithCheckpointWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, cfg.name);
+        try apply_state.clearAppliedSequence(store, cfg.name);
     }
 
     fn invalidateIndexPathCaches(self: *const IndexManager, path: []const u8) void {
@@ -23993,18 +24138,11 @@ pub const IndexManager = struct {
         if (comptime storeSupportsLatestReplaySequenceForHint(@TypeOf(store))) {
             backfilled_sequence = try store.latestReplaySequenceForHint(replayHintForIndexKind(cfg.kind), backfilled_sequence);
         }
-        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            .{
-                .index_name = cfg.name,
-                .sequence = backfilled_sequence,
-                .config_hash = types.indexConfigHash(cfg),
-            },
-        );
+        try apply_state.saveAppliedSequenceUpdate(store, .{
+            .index_name = cfg.name,
+            .sequence = backfilled_sequence,
+            .config_hash = types.indexConfigHash(cfg),
+        });
     }
 
     fn storeSupportsLatestReplaySequenceForHint(comptime T: type) bool {
@@ -24202,6 +24340,7 @@ pub const IndexManager = struct {
                     .path = zpath,
                     .io = self.io,
                     .main_backend = self.text_main_backend,
+                    .main_native_catalog_sink = self.text_main_native_catalog_sink,
                     .main_lsm_storage = self.effectiveTextMainStorage(),
                     .wal_storage = self.effectiveTextWalStorage(),
                     .main_lsm_options = self.text_main_lsm_options,
@@ -24212,6 +24351,7 @@ pub const IndexManager = struct {
                     .main_no_sync = self.relaxed_split_durability,
                     .main_no_meta_sync = self.relaxed_split_durability,
                     .wal_no_sync = self.relaxed_split_durability,
+                    .scratch_dir = if (self.text_main_backend == .native_catalog) self.native_catalog_scratch_dir else null,
                 };
                 var persistent = openTextPersistentIndexWithRetry(self.alloc, persistent_opts) catch |err| {
                     std.log.warn("full_text open failed step=persistent_open name={s} err={s}", .{
@@ -24412,6 +24552,30 @@ pub const IndexManager = struct {
                 const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
 
+                // #1216 (creation side): a crash between a fresh admission's
+                // native-catalog metadata seed (just below, inside
+                // `HBCIndex.openWithLsmOptions`) and that admission's own
+                // catalog-config commit (back in `addWithOptions`, after
+                // this call returns) leaves scope records under this name
+                // with no catalog entry to own them. A later retry -- same
+                // name, any dims -- must not resurrect that orphaned
+                // generation's metadata as if it were live
+                // (`openWithLsmOptions`'s loaded-metadata path has no way
+                // to tell "orphan" from "legitimate", and a dims mismatch
+                // between the orphan and the retry's config surfaces as a
+                // spurious `DimensionMismatch`). Gated on
+                // `fresh_admission_name`, not `self.get`, precisely because
+                // a normal reopen reaches this same call with no way to
+                // tell it apart otherwise -- see that field's doc comment.
+                if (self.dense_storage_backend == .native_catalog and
+                    self.fresh_admission_name != null and
+                    std.mem.eql(u8, self.fresh_admission_name.?, cfg.name))
+                {
+                    if (self.dense_main_native_catalog_sink) |sink| {
+                        try native_catalog_backend.deleteAllForScope(self.alloc, sink, path);
+                    }
+                }
+
                 const index = try self.alloc.create(hbc_mod.HBCIndex);
                 var index_owned = true;
                 var index_open = false;
@@ -24456,6 +24620,7 @@ pub const IndexManager = struct {
                     .storage = self.effectiveDenseStorage(),
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
+                    .native_catalog_sink = self.dense_main_native_catalog_sink,
                     .retain_native_posting_startup_snapshot = dense_cfg.leann == null,
                 });
                 index_open = true;
@@ -24573,12 +24738,9 @@ pub const IndexManager = struct {
                             return error.PostingWalMutationStoreRequiresRebuild;
                         }
                     } else {
-                        const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-                            self.generation_storage,
+                        const applied_sequence = try apply_state.loadAppliedSequence(
                             self.alloc,
-                            self.checkpointIo(),
                             store,
-                            self.applied_sequence_checkpoint_path,
                             cfg.name,
                         );
                         posting_sequence = applied_sequence;
@@ -24748,6 +24910,7 @@ pub const IndexManager = struct {
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                     .backend = self.sparse_backend,
+                    .main_native_catalog_sink = self.sparse_main_native_catalog_sink,
                     .lsm_storage = self.effectiveSparseStorage(),
                     .lsm_cache = self.lsm_cache,
                     .lsm_options = self.sparse_lsm_options,
@@ -24875,6 +25038,7 @@ pub const IndexManager = struct {
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                     .reverse_backend = self.graph_reverse_backend,
+                    .native_catalog_sink = self.graph_native_catalog_sink,
                     .reverse_lsm_storage = self.effectiveGraphStorage(),
                     .reverse_lsm_cache = self.lsm_cache,
                     .reverse_lsm_options = self.graph_reverse_lsm_options,
@@ -24918,14 +25082,7 @@ pub const IndexManager = struct {
                 // projection and must not turn reopen into a full rebuild.
                 const reverse_edges = entry.index.edge_count;
 
-                const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-                    self.generation_storage,
-                    self.alloc,
-                    self.checkpointIo(),
-                    store,
-                    self.applied_sequence_checkpoint_path,
-                    cfg.name,
-                );
+                const applied_sequence = try apply_state.loadAppliedSequence(self.alloc, store, cfg.name);
                 const latest_replay_sequence = store.nextReplaySequence(1) -| 1;
                 const graph_replay_pending = applied_sequence < latest_replay_sequence;
                 const has_replay_history = latest_replay_sequence != 0;
@@ -25215,7 +25372,7 @@ pub const IndexManager = struct {
         excluded_name: []const u8,
         atomic_mutation: ?AtomicCatalogMutation,
     ) !void {
-        return self.persistCatalogExcludingWithConfigAndAtomicMutation(store, excluded_name, null, atomic_mutation);
+        return self.persistCatalogExcludingWithConfigAndAtomicMutation(store, excluded_name, null, atomic_mutation, null);
     }
 
     /// Compute reachability in the post-removal catalog. Preserve explicit
@@ -25303,7 +25460,8 @@ pub const IndexManager = struct {
         return kept.toOwnedSlice(self.alloc);
     }
 
-    fn persistCatalogExcludingWithConfigAndAtomicMutation(self: *IndexManager, store: anytype, excluded_name: []const u8, removed_config: ?[]const u8, atomic_mutation: ?AtomicCatalogMutation) !void {
+    /// `scope_deletes`, when given, commit in the same native transaction.
+    fn persistCatalogExcludingWithConfigAndAtomicMutation(self: *IndexManager, store: anytype, excluded_name: []const u8, removed_config: ?[]const u8, atomic_mutation: ?AtomicCatalogMutation, scope_deletes: ?*const native_catalog_backend.ScopeDeletes) !void {
         const data = if (self.get(excluded_name) != null)
             try serializeCatalogExcluding(self.alloc, self, excluded_name)
         else
@@ -25326,6 +25484,7 @@ pub const IndexManager = struct {
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
         try @import("../artifact_projection_certificate.zig").remove(&txn, excluded_name);
         try txn.put(index_catalog_key, data);
+        if (scope_deletes) |deletes| try txn.putIndexCatalogBatch(deletes.scope, deletes.mutations);
         var retiring_names: std.ArrayList([]const u8) = .empty;
         defer retiring_names.deinit(self.alloc);
         const primary_retiring = if (removed_config) |config|
@@ -27461,6 +27620,27 @@ pub const IndexManager = struct {
         return try text_index_maintenance.needsMerge(self.alloc, index, policy);
     }
 
+    /// WS4 phase 2's inline fast path (`mutation_materialization.
+    /// InlineTextPublication.install`) adds its one-document segment (and
+    /// any delete-tracking bitmap) directly, bypassing
+    /// `finalizeTextBatchMutations`'s own post-write bookkeeping entirely.
+    /// Call this once per inline publication that actually touched the
+    /// index (a new segment, a delete, or both) so `compaction_pending`
+    /// still gets set when the policy says so -- otherwise
+    /// `TextMergeScheduler.select` never considers this index and segments
+    /// (and the per-write cost of scanning them for deletes) accumulate
+    /// without bound. Mirrors `finalizeTextBatchMutations`/
+    /// `beginTextMergeTask`'s own needsMerge/schedule/noteComplete
+    /// sequence; never compacts synchronously here, since that would
+    /// defeat the inline path's whole point.
+    pub fn noteInlineTextPublicationSegments(self: *IndexManager, entry: *TextIndex) !void {
+        if (try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
+            TextMergeScheduler.schedule(entry);
+        } else {
+            TextMergeScheduler.noteComplete(entry);
+        }
+    }
+
     fn forceCompactTextIndexWithOptions(
         self: *IndexManager,
         entry: *TextIndex,
@@ -28032,6 +28212,52 @@ pub const IndexManager = struct {
                 .can_assume_absent = !candidate.vector_present,
             };
         }
+    }
+
+    /// lite-single-commit-write-path.md §3.3a's dense extension of the
+    /// inline publication fast path (mirrors `graphEdgeWriteEligibleFor
+    /// InlinePublication`'s own doc comment for the general shape this
+    /// family of functions follows). Runs the SAME three-step lookup
+    /// `ensureDenseVectorIdTxnWithMemo` does -- the durable reverse
+    /// doc_key->vector_id mapping, then legacy-ordinal compatibility, then
+    /// the deterministic hash -- but never falls into
+    /// `assignDenseVectorIdFromPreferredTxn`'s own collision-spill `while
+    /// (true)` loop: that loop's `reserveDenseVectorIdTxn` writes a durable
+    /// allocator counter through a MUTABLE store transaction, which the
+    /// inline path's read-only probe transaction (`store.beginProbeTxn()`,
+    /// mirroring `prepareInlineSparsePublication`'s own ordinal lookup) does
+    /// not provide and the generic `txn: anytype` plumbing could not use
+    /// even if it did. Returns `null` -- never an error -- whenever the
+    /// deterministic ID collides with another document's vector; the
+    /// caller must fall back to the slow path (`applyDenseEmbeddingWrites
+    /// ByNameWithOptions`), which DOES reach the spill loop. A genuine
+    /// identity inconsistency (corrupt dual-sided mapping) still surfaces
+    /// as `error.InvalidDenseVectorMetadata`, exactly as the slow path's
+    /// own `mappedDenseVectorIdAssignmentTxn`/`assignDenseVectorIdFromPreferredTxn`
+    /// would raise it for the identical occupancy state -- not swallowed
+    /// into a silent fallback.
+    pub fn assignDenseVectorIdInlineTxn(
+        self: *IndexManager,
+        txn: anytype,
+        entry: *DenseIndex,
+        index_name: []const u8,
+        doc_key: []const u8,
+    ) !?DenseVectorIdAssignment {
+        if (try self.lookupDenseVectorIdTxn(txn, index_name, doc_key)) |existing| {
+            return try self.mappedDenseVectorIdAssignmentTxn(txn, entry, index_name, doc_key, existing, null);
+        }
+        if (try self.legacyOrdinalDenseVectorIdAssignmentTxn(txn, entry, doc_key, null, null)) |assignment| {
+            return assignment;
+        }
+        const preferred_vector_id = deterministicDenseVectorId(doc_key);
+        const occupancy = try self.denseVectorIdOccupancyTxn(txn, entry, index_name, preferred_vector_id, doc_key, null);
+        if (occupancy.identity_inconsistent) return error.InvalidDenseVectorMetadata;
+        if (occupancy.state == .conflicts) return null;
+        return .{
+            .vector_id = preferred_vector_id,
+            .needs_mapping = false,
+            .can_assume_absent = !occupancy.vector_present,
+        };
     }
 
     fn mappedDenseVectorIdAssignmentTxn(
@@ -29996,6 +30222,236 @@ pub const IndexManager = struct {
         return false;
     }
 
+    /// WS4-for-graph (lite-single-commit-write-path.md §3.3a): whether
+    /// `write` (already matched to `entry` by `index_name`) is eligible for
+    /// the mutation_materialization.zig `prepareInlineGraphPublication`
+    /// fast path, which calls `entry.index.prepareInlineEdgePublication`
+    /// directly and therefore bypasses every `IndexManager`-layer side
+    /// effect `applyGraphMutationsEntryMode` would otherwise apply for this
+    /// write: the shard range check (`keyInRange`), TTL lifetime/tombstone
+    /// bookkeeping, and contributor-snapshot maintenance
+    /// (`appendGraphContributionSnapshot`/`replaceContributionSnapshots`,
+    /// gated there on `entry.ttl_duration_ns != 0 or
+    /// graphEntryHasContributors(entry)` -- exactly mirrored below). A
+    /// caller must fall back to `applyGraphMutationsByName` (the normal,
+    /// slow path) whenever this returns `false`; it must never skip the
+    /// write outright, since `false` can mean either "out of this shard's
+    /// range" (a legitimate skip there) or "needs bookkeeping this fast
+    /// path cannot replicate" (not a skip -- still needs applying, just not
+    /// inline).
+    pub fn graphEdgeWriteEligibleForInlinePublication(self: *const IndexManager, entry: *const GraphIndex, write: types.GraphEdgeWrite) bool {
+        if (entry.ttl_duration_ns != 0) {
+            wal_trace.recordOp(.graph_inline_eligibility_ttl);
+            return false;
+        }
+        if (graphEntryHasContributors(entry)) {
+            wal_trace.recordOp(.graph_inline_eligibility_contributors);
+            return false;
+        }
+        if (write.owner.len != 0 or write.owner_document.len != 0) {
+            wal_trace.recordOp(.graph_inline_eligibility_owner);
+            return false;
+        }
+        const range_key = if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source;
+        if (!self.keyInRange(range_key)) {
+            wal_trace.recordOp(.graph_inline_eligibility_out_of_range);
+            return false;
+        }
+        return true;
+    }
+
+    /// WS4-for-vectors' sparse extension of the fast path above, mirroring
+    /// `graphEdgeWriteEligibleForInlinePublication`'s own shape. The
+    /// caller (`mutation_materialization.zig`'s `prepareInlineSparse
+    /// Publication`) already knows `write.indices.len != 0` matters:
+    /// `write.artifact_key` is set on nearly every write regardless (it
+    /// names where the vector would live if it ever needs loading), and
+    /// `applySparseEmbeddingWritesEntry`'s own branch
+    /// (`write.artifact_key != null and indices.len == 0`) treats ONLY
+    /// `indices.len == 0` as "go load it from that artifact" -- an
+    /// artifact-backed write needing that read is exactly the
+    /// `indices.len == 0` case, which `SparseIndex.prepareInlineSparse
+    /// Publication`'s own narrower check (backend only) cannot see. This
+    /// gate covers everything about THIS INDEX'S CONFIGURATION that fast
+    /// path cannot see instead:
+    /// - `!entry.external`: this index also derives vectors from a
+    ///   document field (`collectSparseFieldWritesProfiled`/
+    ///   `indexSparsePreparedWritesByNameWithOptions`, a second commit the
+    ///   general path runs for the SAME batch), which this fast path
+    ///   never attempts.
+    /// - `entry.chunk_name != null` or `entry.embedding_names.len != 0`:
+    ///   these index shapes key writes by artifact/chunk identity, not the
+    ///   primary document ordinal `assignSparseWriteDocNumsFromIdentity`
+    ///   (mirrored by the caller) looks up.
+    /// - the shard-range check mirrors the graph gate's own.
+    /// A caller must fall back to `applySparseEmbeddingWritesByNameWith
+    /// Options` (the normal, slow path) whenever this returns `false`;
+    /// see that function's own doc comment for why `false` must never be
+    /// read as "skip the write outright".
+    pub fn sparseEmbeddingWriteEligibleForInlinePublication(self: *const IndexManager, entry: *const SparseIndex, write: derived_types.DerivedSparseEmbeddingWrite) bool {
+        if (!entry.external or entry.chunk_name != null or entry.embedding_names.len != 0) return false;
+        if (write.indices.len == 0) return false;
+        return self.keyInRange(write.doc_key);
+    }
+
+    /// WS4-for-vectors' dense extension of the fast path above, mirroring
+    /// `sparseEmbeddingWriteEligibleForInlinePublication`'s own shape (the
+    /// `!entry.external`/`chunk_name`/`embedding_names` triple means exactly
+    /// the same thing here: a non-`external` dense index also derives
+    /// vectors from a document field through `IndexManager`-layer
+    /// bookkeeping -- `indexDenseBatchByNameWithOptions`, a second commit
+    /// the general path runs for the SAME batch -- that this fast path
+    /// never attempts, and a chunk- or named-embedding-backed index keys
+    /// writes by artifact/chunk identity, not the primary document
+    /// identity `assignDenseVectorIdInlineTxn`'s ordinal fallback looks
+    /// up). `write.vector.len == 0` is the dense analogue of sparse's
+    /// `indices.len == 0`: an artifact-backed write with no inline payload
+    /// needs the slow path's own artifact read
+    /// (`preloadDenseEmbeddingArtifactVectorsTxn`). This is the common path
+    /// for EVERY caller-supplied-vector write, not a rare case:
+    /// `buildDerivedBatch` (mutation_materialization.zig) always zeroes
+    /// `.vector` once `.artifact_key` is set, and document-mapping
+    /// (`appendEmbeddingArtifactWrite`) always assigns an artifact_key for
+    /// a caller-supplied embedding, synchronously, before this write ever
+    /// reaches eligibility. `mutation_commit.zig`'s inline-dense block
+    /// resolves the real vector itself first -- from the embedding
+    /// artifact's own not-yet-committed bytes already staged in
+    /// `write_buffers.explicit_embedding_artifact_writes` (same primary
+    /// transaction, just not durable yet, so a read-only probe transaction
+    /// against the store cannot see it) -- and only reaches this check
+    /// with `write.vector` still empty when that resolution itself failed
+    /// (no matching staged artifact, or an elided/stub payload needing the
+    /// slow path's real artifact read). `write.parent_doc_key
+    /// != null` is defensive -- it should already be impossible once
+    /// `chunk_name`/`embedding_names` are excluded above, since only a
+    /// chunk-backed write ever sets it, but costs nothing to check
+    /// explicitly rather than lean on that invariant holding forever.
+    /// `entry.index.experimentalPostingWalAuthoritative()` excludes the
+    /// one case where `beginDensePostingSidecarCaptureLeaseByNameWithOptions`
+    /// is NOT a no-op for a `.native_catalog`-backed entry (see
+    /// `densePostingSidecarEnabledForEntry`: with the posting-WAL sidecar
+    /// off, as it is by default for every fresh `.native_catalog` dense
+    /// index, that lease call returns `null` immediately) -- a write to an
+    /// index that HAS been migrated onto the posting WAL sidecar still
+    /// falls back to the slow path, which carries that lease's effects
+    /// correctly today. A caller must fall back to
+    /// `applyDenseEmbeddingWritesByNameWithOptions` (the normal, slow
+    /// path) whenever this returns `false`; see
+    /// `graphEdgeWriteEligibleForInlinePublication`'s own doc comment for
+    /// why `false` must never be read as "skip the write outright".
+    ///
+    /// `entry.index.generationRepairPending()` is a defensive check, not
+    /// one this change's own crash_consistency_test.zig tests ever
+    /// actually observed firing (nor does `lite-write-amplification`'s
+    /// 128-write "dense" diagnostic, which never sees its own measured
+    /// commit count move off exactly 1.0 despite never warming up its
+    /// index with an unmeasured first write either): an exhaustive-
+    /// coverage dense search (`search_effort: 1.0`, or any query
+    /// `search_types.requiresExhaustiveCoverage` marks as needing the
+    /// complete-snapshot policy) can fail closed with
+    /// `error.IncompletePublishedSnapshot`/`error.IndexRebuilding`
+    /// (`hbc_index.zig`'s `scoreLeafMemberIds`/`CompleteCoverageTracker.
+    /// observe`) right after the very FIRST write ever made into a fresh
+    /// dense index -- a pre-existing bootstrap quirk this change's own
+    /// tests worked around with an unmeasured warm-up write rather than
+    /// chasing, since it reproduces identically whether that first write
+    /// took the inline path or the slow one (see
+    /// `crash_consistency_test.zig`'s "WS4-for-dense" test's own comment).
+    /// Checking the flag here costs nothing and is the only EXISTING,
+    /// authoritative signal for "this index's native posting checkpoint
+    /// needs (re)building" (the same one `db.zig`'s own startup rebuild
+    /// planning scan reads), so it stays as a cheap, correct safety net
+    /// for whatever future case does set it, even though it is not the
+    /// explanation for the bootstrap quirk above.
+    pub fn denseEmbeddingWriteEligibleForInlinePublication(self: *const IndexManager, entry: *const DenseIndex, write: derived_types.DerivedDenseEmbeddingWrite) bool {
+        if (!entry.external or entry.chunk_name != null or entry.embedding_names.len != 0) return false;
+        if (write.vector.len == 0 or write.parent_doc_key != null) return false;
+        if (entry.index.experimentalPostingWalAuthoritative()) return false;
+        if (entry.index.generationRepairPending()) return false;
+        return self.keyInRange(write.doc_key);
+    }
+
+    test "graphEdgeWriteEligibleForInlinePublication rejects TTL, contributors and owner-bearing writes" {
+        const alloc = std.testing.allocator;
+        var manager = try IndexManager.init(alloc, ".");
+        defer manager.deinit();
+
+        var plain_mutex: std.atomic.Mutex = .unlocked;
+        var plain_entry: GraphIndex = .{
+            .apply_mutex = &plain_mutex,
+            .config = .{ .name = "gr", .kind = .graph, .config_json = "{}" },
+            .edge_type_configs = &.{},
+            .metric_configs = &.{},
+            .rebuild_root_path = &.{},
+            .index = undefined,
+        };
+        const plain_write: types.GraphEdgeWrite = .{ .index_name = "gr", .source = "a", .target = "b", .edge_type = "links" };
+        try std.testing.expect(manager.graphEdgeWriteEligibleForInlinePublication(&plain_entry, plain_write));
+
+        const owner_write: types.GraphEdgeWrite = .{ .index_name = "gr", .source = "a", .target = "b", .edge_type = "links", .owner = "doc:1" };
+        try std.testing.expect(!manager.graphEdgeWriteEligibleForInlinePublication(&plain_entry, owner_write));
+
+        const owner_document_write: types.GraphEdgeWrite = .{ .index_name = "gr", .source = "a", .target = "b", .edge_type = "links", .owner_document = "doc:1" };
+        try std.testing.expect(!manager.graphEdgeWriteEligibleForInlinePublication(&plain_entry, owner_document_write));
+
+        var ttl_entry = plain_entry;
+        ttl_entry.ttl_duration_ns = 1;
+        try std.testing.expect(!manager.graphEdgeWriteEligibleForInlinePublication(&ttl_entry, plain_write));
+
+        var artifact_entry = plain_entry;
+        artifact_entry.artifact_sources = @constCast(&[_]GraphArtifactSource{undefined})[0..1];
+        try std.testing.expect(!manager.graphEdgeWriteEligibleForInlinePublication(&artifact_entry, plain_write));
+
+        var field_edge_types = [_]graph_mod.EdgeTypeConfig{.{ .name = "links", .field_name = "edges" }};
+        var field_entry = plain_entry;
+        field_entry.edge_type_configs = field_edge_types[0..];
+        try std.testing.expect(!manager.graphEdgeWriteEligibleForInlinePublication(&field_entry, plain_write));
+    }
+
+    test "denseEmbeddingWriteEligibleForInlinePublication rejects non-external, chunked, named-embedding and artifact-only writes" {
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        const path_z = try alloc.dupeSentinel(u8, path, 0);
+        defer alloc.free(path_z);
+        var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+        defer store.close();
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "dv_ext",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        }});
+        const external_entry = manager.denseIndex("dv_ext") orelse return error.IndexNotFound;
+        const plain_write: derived_types.DerivedDenseEmbeddingWrite = .{ .index_name = "dv_ext", .doc_key = "doc:1", .vector = &[_]f32{ 1.0, 0.0 } };
+        try std.testing.expect(manager.denseEmbeddingWriteEligibleForInlinePublication(external_entry, plain_write));
+
+        const artifact_only_write: derived_types.DerivedDenseEmbeddingWrite = .{ .index_name = "dv_ext", .doc_key = "doc:1", .artifact_key = "doc:1\x00\x00embedding", .vector = &.{} };
+        try std.testing.expect(!manager.denseEmbeddingWriteEligibleForInlinePublication(external_entry, artifact_only_write));
+
+        const parent_write: derived_types.DerivedDenseEmbeddingWrite = .{ .index_name = "dv_ext", .doc_key = "doc:1#chunk0", .parent_doc_key = "doc:1", .vector = &[_]f32{ 1.0, 0.0 } };
+        try std.testing.expect(!manager.denseEmbeddingWriteEligibleForInlinePublication(external_entry, parent_write));
+
+        var chunked_entry = external_entry.*;
+        chunked_entry.chunk_name = @constCast("chunk_v1");
+        try std.testing.expect(!manager.denseEmbeddingWriteEligibleForInlinePublication(&chunked_entry, plain_write));
+
+        var named_names = [_][]u8{@constCast("a")};
+        var named_entry = external_entry.*;
+        named_entry.embedding_names = named_names[0..];
+        try std.testing.expect(!manager.denseEmbeddingWriteEligibleForInlinePublication(&named_entry, plain_write));
+
+        var non_external_entry = external_entry.*;
+        non_external_entry.external = false;
+        try std.testing.expect(!manager.denseEmbeddingWriteEligibleForInlinePublication(&non_external_entry, plain_write));
+    }
+
     /// Older non-TTL projections did not retain contributor order. Populate
     /// it before publishing the opened index, using bounded per-artifact
     /// scratch space. Interrupted opens repeat this idempotent scan; the
@@ -31159,6 +31615,8 @@ pub const IndexManager = struct {
             self.rollbackPendingDenseVectors(entry, pending);
             return err;
         };
+        const trace_scope = wal_trace.scope(.hbc_metadata_commit);
+        defer trace_scope.end();
         batch.commit() catch |err| {
             if (active_dense_vector_load_session) |session| {
                 session.detachTxnOverrideAfterCommitFailure();
@@ -34707,45 +35165,42 @@ pub const IndexManager = struct {
             if (profile_enabled) profile.artifact_decode_ns = platform_time.monotonicNs() - decode_start_ns;
             if (unreadable_artifact_keys.items.len > 0) return error.ArtifactRepairRequired;
 
-            if (delete_keys.items.len > 0) {
-                const delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-                try entry.index.batchWithOptions(&.{}, delete_keys.items, .{
-                    .defer_term_range_updates = true,
-                    .backend_batch_options = batch_options,
-                });
-                if (profile_enabled) profile.delete_batch_ns = platform_time.monotonicNs() - delete_start_ns;
-            }
-            if (sparse_writes.items.len > 0) {
+            // Delete-before-insert for the same logical write (every entry
+            // appended to sparse_writes above also appended its own key to
+            // delete_keys) used to cost two separate native commits here --
+            // SparseIndex.batchWithOptions already accepts deletes and
+            // writes together in one transaction, so there is nothing
+            // sequencing-sensitive about combining them: both arms still
+            // process deletes before inserts internally.
+            if (delete_keys.items.len > 0 or sparse_writes.items.len > 0) {
                 const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-                try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
-                try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
+                if (sparse_writes.items.len > 0) try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
+                try entry.index.batchWithOptions(sparse_writes.items, delete_keys.items, .{
                     .defer_term_range_updates = true,
                     .backend_batch_options = batch_options,
                     .prefer_bulk_build = batch_options.mode == .bulk_ingest,
                     .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
                 });
-                if (profile_enabled) profile.sparse_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+                if (profile_enabled) {
+                    profile.delete_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+                    profile.sparse_batch_ns = profile.delete_batch_ns;
+                }
             }
         }
 
-        if (pending_artifact_loads.items.len == 0 and delete_keys.items.len > 0) {
-            const delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-            try entry.index.batchWithOptions(&.{}, delete_keys.items, .{
-                .defer_term_range_updates = true,
-                .backend_batch_options = batch_options,
-            });
-            if (profile_enabled) profile.delete_batch_ns = platform_time.monotonicNs() - delete_start_ns;
-        }
-        if (pending_artifact_loads.items.len == 0 and sparse_writes.items.len > 0) {
+        if (pending_artifact_loads.items.len == 0 and (delete_keys.items.len > 0 or sparse_writes.items.len > 0)) {
             const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-            try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
-            try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
+            if (sparse_writes.items.len > 0) try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
+            try entry.index.batchWithOptions(sparse_writes.items, delete_keys.items, .{
                 .defer_term_range_updates = true,
                 .backend_batch_options = batch_options,
                 .prefer_bulk_build = batch_options.mode == .bulk_ingest,
                 .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
             });
-            if (profile_enabled) profile.sparse_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+            if (profile_enabled) {
+                profile.delete_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+                profile.sparse_batch_ns = profile.delete_batch_ns;
+            }
         }
         if (profile_enabled and (pending_artifact_loads.items.len > 0 or sparse_writes.items.len > 0 or delete_keys.items.len > 0)) {
             std.log.info(
@@ -34793,6 +35248,31 @@ pub const IndexManager = struct {
         const ordinal_doc_key = parent_doc_key orelse doc_key;
         const ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, ordinal_doc_key);
         try self.writeDenseVectorMappingTxnOptionalOrdinal(mutable_txn, index_name, doc_key, vector_id, vector_fingerprint, ordinal);
+    }
+
+    /// Public seam for `mutation_materialization.zig`'s
+    /// `InlineDensePublication` (lite-single-commit-write-path.md §3.3a):
+    /// writes the SAME durable doc_key<->vector_id reverse mapping (plus
+    /// ordinal-keyed records, when an identity ordinal already exists)
+    /// `applyDenseEmbeddingWritesEntry`'s slow path writes unconditionally
+    /// for every assigned vector via `writeDenseVectorMappingTxn`+
+    /// `denseVectorFingerprint`, through an arbitrary txn-like view --
+    /// concretely, the inline path's `commit_participant.View`, whose
+    /// restricted `put` only accepts the `\x00\x00`-prefixed primary-
+    /// catalog keys this mapping lives under (`denseDocMappingKey`/
+    /// `denseVectorIdMappingKey`/the ordinal-keyed variants), so it is
+    /// never exposed by name here. `parent_doc_key` is always `null`:
+    /// `denseEmbeddingWriteEligibleForInlinePublication` already rejects
+    /// every write that could carry one.
+    pub fn writeDenseVectorMappingForInlinePublicationTxn(
+        self: *IndexManager,
+        txn: anytype,
+        index_name: []const u8,
+        doc_key: []const u8,
+        vector_id: u64,
+        vector: []const f32,
+    ) !void {
+        try self.writeDenseVectorMappingTxn(txn, index_name, doc_key, null, vector_id, denseVectorFingerprint(vector));
     }
 
     fn writeDenseVectorMappingTxnWithOrdinal(
@@ -43212,6 +43692,66 @@ test "dense vector id allocator spills preferred-id collisions without aliasing 
             &corruption_memo,
         ),
     );
+}
+
+test "assignDenseVectorIdInlineTxn falls back (returns null) on a deterministic-id collision" {
+    // The inline publication fast path (lite-single-commit-write-path.md
+    // §3.3a) must never reach `reserveDenseVectorIdTxn`'s durable counter
+    // write: `assignDenseVectorIdInlineTxn` returns `null` instead,
+    // telling `prepareInlineDensePublication` to fall back to the slow
+    // path (which DOES reach the spill loop and resolves the collision
+    // correctly). This plants another document's vector at exactly the
+    // victim key's deterministic id -- not a hash-generator collision, but
+    // the same occupancy state one would produce -- and proves the inline
+    // path backs off rather than aliasing it.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
+    defer alloc.free(cwd);
+    const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
+    defer alloc.free(absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, absolute_path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+
+    const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    const victim_doc_key = "doc:victim";
+    const colliding_id = deterministicDenseVectorId(victim_doc_key);
+
+    // A DIFFERENT document already occupies the exact id `victim_doc_key`
+    // would deterministically be assigned.
+    try entry.index.batchInsertWithMetadata(&.{.{
+        .vector_id = colliding_id,
+        .vector = &[_]f32{ 1.0, 0.0, 0.0 },
+        .metadata = "doc:occupant",
+    }});
+    try manager.writeDenseVectorMapping(&store, "dv_v1", "doc:occupant", colliding_id);
+
+    var probe_txn = try store.beginProbeTxn();
+    defer probe_txn.abort();
+    const assignment = try manager.assignDenseVectorIdInlineTxn(&probe_txn, entry, "dv_v1", victim_doc_key);
+    try std.testing.expect(assignment == null);
+
+    // The occupant's own (non-colliding) insert still resolves normally
+    // through the SAME inline path.
+    const occupant_assignment = (try manager.assignDenseVectorIdInlineTxn(&probe_txn, entry, "dv_v1", "doc:occupant")) orelse return error.UnexpectedNullAssignment;
+    try std.testing.expectEqual(colliding_id, occupant_assignment.vector_id);
 }
 
 test "dense metadata prefetch includes legacy ordinal vector ids" {

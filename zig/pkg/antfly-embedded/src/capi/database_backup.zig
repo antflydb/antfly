@@ -35,7 +35,7 @@ fn imageKey(key: []const u8) bool {
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_check_progress") or
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_index_progress:") or
-        std.mem.startsWith(u8, key, "\x00\x00__metadata__:document_mutation_revision_v1:") or
+        std.mem.startsWith(u8, key, "\x00\x00__metadata__:document_revision_v2:") or
         std.mem.startsWith(u8, key, "\x00\x00__columnar__:");
 }
 
@@ -243,7 +243,7 @@ pub fn populate(alloc: std.mem.Allocator, root: *h.db_mod.DB, backend: ?*h.lite_
         defer alloc.free(namespace);
         const child_path = if (backend != null) try alloc.dupe(u8, path) else try std.fs.path.join(alloc, &.{ path, namespace });
         defer alloc.free(child_path);
-        var opts = h.db_mod.OpenOptions{ .identity_namespace = identity, .prefer_existing_identity_namespace = false, .backend_runtime = root.backend_runtime, .external_derived_checkpoints = false };
+        var opts = h.db_mod.OpenOptions{ .identity_namespace = identity, .prefer_existing_identity_namespace = false, .backend_runtime = root.backend_runtime };
         if (backend) |selected| try selected.configureDbOpenOptionsForNamespace(&opts, namespace);
         var db = try h.db_mod.DB.open(alloc, child_path, opts);
         defer db.close();

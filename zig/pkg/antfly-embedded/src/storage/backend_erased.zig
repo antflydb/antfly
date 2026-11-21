@@ -28,6 +28,20 @@ pub const types = backend_types;
 pub const Entry = backend_adapter.Entry;
 pub const ReplayEntry = backend_types.ReplayEntry;
 
+/// Backend-agnostic mirror of `native_catalog_backend.Mutation`'s shape,
+/// without this file depending on that Lite-specific module (this erasure
+/// layer stays backend-agnostic; `native_catalog_backend.zig` already
+/// depends on it, so the reverse import would be circular). Populated only
+/// when the concrete backend behind a `NamespaceWriteTxn`/`NamespaceBatch`
+/// supports harvesting pending mutations before commit -- see
+/// `NamespaceWriteTxn.pendingMutations`.
+pub const PendingMutation = struct {
+    namespace: ?[]const u8,
+    key: []const u8,
+    value: []const u8 = "",
+    is_delete: bool = false,
+};
+
 fn Box(comptime T: type) type {
     return struct {
         allocator: Allocator,
@@ -800,8 +814,17 @@ pub const WriteTxn = struct {
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
         contains: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
+        put_index_catalog: ?*const fn (*anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    /// Stages index-catalog mutations to commit in this transaction's own
+    /// native commit, as `Batch.putIndexCatalogBatch` does. `error.Unsupported`
+    /// on every backend but Lite.
+    pub fn putIndexCatalogBatch(self: *WriteTxn, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
+        const put_index_catalog = self.vtable.put_index_catalog orelse return error.Unsupported;
+        try BoundaryAbi.call("put_index_catalog", self.boundary_dispatch, put_index_catalog, .{ self.ptr, scope, mutations });
+    }
 
     pub fn abort(self: *WriteTxn) void {
         const gate = self.write_gate;
@@ -891,6 +914,19 @@ pub const NamespaceWriteTxn = struct {
         append_put: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror!void,
         open_cursor: ?*const fn (Allocator, *anyopaque, backend_types.Namespace) anyerror!Cursor = null,
+        /// Optional: marks the pending commit as a background/ride-along
+        /// publication that must not force its own durable sync (it becomes
+        /// durable whenever the next real durable boundary runs). Absent for
+        /// backends with no such distinction (every commit is durable).
+        /// See `NamespaceWriteTxn.setDurableHint`.
+        set_durable: ?*const fn (*anyopaque, bool) void = null,
+        /// Optional: this transaction's staged mutations harvested before
+        /// any commit (lite-single-commit-write-path.md §3.3a's "stage,
+        /// then install" mode), to fold into an externally-owned commit.
+        /// Absent for every backend but one that can expose its own
+        /// pending-mutation list (today, `.native_catalog`). See
+        /// `NamespaceWriteTxn.pendingMutations`.
+        pending_mutations: ?*const fn (Allocator, *anyopaque) anyerror![]const PendingMutation = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -902,6 +938,29 @@ pub const NamespaceWriteTxn = struct {
     pub fn commit(self: *NamespaceWriteTxn) !void {
         try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
         self.* = undefined;
+    }
+
+    /// This transaction's staged mutations, to fold into an externally-
+    /// owned commit instead of calling `commit` on this transaction (the
+    /// caller must still `abort` it once it has harvested what it needs --
+    /// this never talks to the backend's durable sink). `null` when the
+    /// concrete backend has no such harvest mechanism. The returned slice
+    /// of structs is freshly allocated (caller-owned), but the byte slices
+    /// inside are still borrowed from this transaction's own storage and
+    /// must be deep-copied before `abort`.
+    pub fn pendingMutations(self: *NamespaceWriteTxn) !?[]const PendingMutation {
+        const f = self.vtable.pending_mutations orelse return null;
+        return try BoundaryAbi.call("pending_mutations", self.boundary_dispatch, f, .{ self.allocator, self.ptr });
+    }
+
+    /// Call before `commit()`. `durable = false` asks the backend to ride
+    /// this commit along on the next durable boundary instead of forcing
+    /// its own (safe only for background/maintenance work the caller can
+    /// afford to redo after a crash, never for a publication a caller is
+    /// waiting on). A no-op for backends that do not implement it, which
+    /// always commit durably regardless.
+    pub fn setDurableHint(self: *NamespaceWriteTxn, durable: bool) void {
+        if (self.vtable.set_durable) |f| f(self.ptr, durable);
     }
 
     pub fn get(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
@@ -939,6 +998,45 @@ pub const NamespaceWriteTxn = struct {
     }
 };
 
+/// A durability ticket returned by `Batch.commitStaged`. The write's effects
+/// are applied (and, for backends with a staged commit phase, enqueued into a
+/// group that some thread will drive to a shared fsync) by the time the
+/// ticket is returned; `wait` blocks only for that durability, not for
+/// applying the write itself. Backends with no staged-commit phase (the
+/// hosted LSM, hbc and in-memory backends, which fsync or otherwise durably
+/// apply inline) hand back a ticket whose `wait` is a no-op: WS3 §3.2.
+pub const Ticket = struct {
+    allocator: Allocator = undefined,
+    ptr: *anyopaque = undefined,
+    wait_fn: ?*const fn (Allocator, *anyopaque) anyerror!void = null,
+    /// Optional: set only by a backend whose staged-commit phase can report
+    /// the sequence its group committed at (currently just Lite's native
+    /// store -- see `lite/docstore.zig`'s `Store.Ticket.waitSequence` and
+    /// `batchFrom`'s `commitStaged` below). Regression-B test hook.
+    wait_sequence_fn: ?*const fn (Allocator, *anyopaque) anyerror!u64 = null,
+
+    /// A ticket for a write that is already durable (or needed no durability
+    /// phase of its own) by the time it is returned.
+    pub fn alreadyDurable() Ticket {
+        return .{};
+    }
+
+    /// A ticket must be waited on exactly once, via either `wait` or
+    /// `waitSequence`, never both.
+    pub fn wait(self: Ticket) !void {
+        if (self.wait_fn) |run| try run(self.allocator, self.ptr);
+    }
+
+    /// Like `wait`, also returning the commit sequence this ticket's own
+    /// group committed at -- 0 on a backend with no `wait_sequence_fn` (no
+    /// such concept, or `alreadyDurable()`'s empty ticket).
+    pub fn waitSequence(self: Ticket) !u64 {
+        if (self.wait_sequence_fn) |run| return try run(self.allocator, self.ptr);
+        try self.wait();
+        return 0;
+    }
+};
+
 pub const Batch = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -949,6 +1047,11 @@ pub const Batch = struct {
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
+        /// Optional: a backend that can separate "apply and enqueue for
+        /// durability" from "wait for durability" (Lite's group commit)
+        /// implements this. Backends without it fall back to `commit` plus
+        /// an already-durable ticket in `Batch.commitStaged`.
+        commit_staged: ?*const fn (Allocator, *anyopaque) anyerror!Ticket = null,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         has_prefix: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
@@ -959,8 +1062,48 @@ pub const Batch = struct {
         set_replay_opaque: ?*const fn (*anyopaque, u64, []const u8) anyerror!void = null,
         set_commit_participant: ?*const fn (*anyopaque, @import("commit_participant.zig").Participant) anyerror!void = null,
         contains_many_sorted: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
+        /// WS4 phase 2: optional second write surface into this handle's
+        /// index-catalog root (a catalog root separate from the primary
+        /// `get`/`put` keyspace above), applied in the SAME native
+        /// transaction as whatever else this `Batch` stages -- see
+        /// `native_catalog_backend.zig`'s `Mutation` and
+        /// `lite/native.zig`'s `putIndexCatalogBatch`. Only Lite's concrete
+        /// `Txn` handle implements this; every other backend leaves it
+        /// `null` (no `.native_catalog`-backed `PersistentIndex` exists on
+        /// those backends, so this is never called there).
+        put_index_catalog: ?*const fn (*anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    /// Installed by `commitStaged` once a ticket has been handed out: the
+    /// underlying handle is already owned by that ticket, so every method
+    /// is inert instead of touching `ptr` (which may itself be freed by the
+    /// time, if ever, one of these runs).
+    const consumed_vtable: VTable = .{
+        .abort = struct {
+            fn run(_: Allocator, _: *anyopaque) void {}
+        }.run,
+        .commit = struct {
+            fn run(_: Allocator, _: *anyopaque) anyerror!void {
+                return error.TransactionClosed;
+            }
+        }.run,
+        .get = struct {
+            fn run(_: *anyopaque, _: []const u8) anyerror![]const u8 {
+                return error.TransactionClosed;
+            }
+        }.run,
+        .put = struct {
+            fn run(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+                return error.TransactionClosed;
+            }
+        }.run,
+        .delete = struct {
+            fn run(_: *anyopaque, _: []const u8) anyerror!void {
+                return error.TransactionClosed;
+            }
+        }.run,
+    };
 
     pub fn abort(self: *Batch) void {
         const gate = self.write_gate;
@@ -969,10 +1112,37 @@ pub const Batch = struct {
         self.* = undefined;
     }
 
-    pub fn commit(self: *Batch) !void {
+    /// Apply the batch and enqueue it for durability, returning a ticket
+    /// instead of blocking for the fsync. Callers release locks scoped to
+    /// "a transaction is open" (an apply lock, a connection gate, a writer
+    /// slot) between this call and `Ticket.wait`, so independent writers can
+    /// share one group-commit fsync (WS3). `commit` is exactly this plus an
+    /// immediate wait, for callers that have no locks to drop in between.
+    pub fn commitStaged(self: *Batch) !Ticket {
+        if (self.vtable.commit_staged) |staged| {
+            const ticket = try BoundaryAbi.call("commit_staged", self.boundary_dispatch, staged, .{ self.allocator, self.ptr });
+            // Ownership of the underlying handle has moved into the ticket,
+            // which will tear it down once `wait` resolves -- whether that
+            // succeeds or fails, since a staged write cannot be recalled
+            // (WS3 design doc §3.2a). `self` must still tolerate a caller's
+            // `errdefer batch.abort()` firing later if `wait` itself fails
+            // (`commit` is exactly `commitStaged` then `wait`), so leave it
+            // pointed at an inert vtable instead of `undefined`: that keeps
+            // the pre-split contract that a failed `commit` leaves `self`
+            // safely abortable, even though there is nothing left to abort.
+            self.vtable = &consumed_vtable;
+            return ticket;
+        }
         try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
-        if (self.write_gate) |mutex| mutex.unlock();
+        const gate = self.write_gate;
         self.* = undefined;
+        if (gate) |mutex| mutex.unlock();
+        return Ticket.alreadyDurable();
+    }
+
+    pub fn commit(self: *Batch) !void {
+        var ticket = try self.commitStaged();
+        try ticket.wait();
     }
 
     pub fn get(self: *Batch, key: []const u8) ![]const u8 {
@@ -1047,6 +1217,15 @@ pub const Batch = struct {
         const attach = self.vtable.set_commit_participant orelse return error.Unsupported;
         try BoundaryAbi.call("set_commit_participant", self.boundary_dispatch, attach, .{ self.ptr, participant });
     }
+
+    /// WS4 phase 2: stage mutations into this handle's index-catalog root
+    /// (see `VTable.put_index_catalog`), to be applied in the same native
+    /// transaction as this `Batch`'s own primary-keyspace writes once it
+    /// commits. `error.Unsupported` on every backend but Lite.
+    pub fn putIndexCatalogBatch(self: *Batch, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
+        const put_index_catalog = self.vtable.put_index_catalog orelse return error.Unsupported;
+        try BoundaryAbi.call("put_index_catalog", self.boundary_dispatch, put_index_catalog, .{ self.ptr, scope, mutations });
+    }
 };
 
 test "ordered artifact inventory erased batches reject unsupported commit participants" {
@@ -1098,6 +1277,8 @@ pub const NamespaceBatch = struct {
         append_put: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror!void,
         staged_bytes: ?*const fn (*anyopaque) anyerror!u64 = null,
+        /// See `NamespaceWriteTxn.VTable.pending_mutations`.
+        pending_mutations: ?*const fn (Allocator, *anyopaque) anyerror![]const PendingMutation = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -1106,6 +1287,12 @@ pub const NamespaceBatch = struct {
     pub fn stagedBytes(self: *NamespaceBatch) !?u64 {
         const staged = self.vtable.staged_bytes orelse return null;
         return try BoundaryAbi.call("staged_bytes", self.boundary_dispatch, staged, .{self.ptr});
+    }
+
+    /// See `NamespaceWriteTxn.pendingMutations`.
+    pub fn pendingMutations(self: *NamespaceBatch) !?[]const PendingMutation {
+        const f = self.vtable.pending_mutations orelse return null;
+        return try BoundaryAbi.call("pending_mutations", self.boundary_dispatch, f, .{ self.allocator, self.ptr });
     }
 
     pub fn abort(self: *NamespaceBatch) void {
@@ -1228,6 +1415,7 @@ pub const Store = struct {
         abort_bulk_ingest_session: ?*const fn (*anyopaque) void = null,
         last_replay_sequence: ?*const fn (*anyopaque, u64) u64 = null,
         next_replay_sequence: ?*const fn (*anyopaque, u64) u64 = null,
+        adoption_epoch: ?*const fn (*anyopaque) u64 = null,
         append_replay_opaque: ?*const fn (Allocator, *anyopaque, u64, []const u8) anyerror!void = null,
         iterate_replay_from: ?*const fn (Allocator, *anyopaque, u64) anyerror![]ReplayEntry = null,
         for_each_replay_from: ?*const fn (*anyopaque, u64, ReplayVisitor) anyerror!void = null,
@@ -1379,6 +1567,14 @@ pub const Store = struct {
     pub fn nextReplaySequence(self: *Store, fallback_next: u64) u64 {
         if (self.vtable.next_replay_sequence) |f| return f(self.ptr, fallback_next);
         return fallback_next;
+    }
+
+    /// Changes whenever the backend adopts state it did not commit through
+    /// this store (another process's or instance's commits). 0 when the
+    /// backend never adopts.
+    pub fn adoptionEpoch(self: *Store) u64 {
+        if (self.vtable.adoption_epoch) |f| return f(self.ptr);
+        return 0;
     }
 
     pub fn appendReplayOpaque(self: *Store, alloc: Allocator, sequence: u64, payload: []const u8) !void {
@@ -1945,6 +2141,10 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             errdefer cursor.close();
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
+
+        pub fn putIndexCatalogBatch(ptr: *anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void {
+            return unbox(ptr).handle.putIndexCatalogBatch(scope, mutations);
+        }
     };
 
     return .{
@@ -1961,6 +2161,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             .delete = vt.delete,
             .open_cursor = vt.openCursor,
             .open_read_scope = if (@hasDecl(Handle, "openReadScope")) vt.openReadScope else null,
+            .put_index_catalog = if (@hasDecl(Handle, "putIndexCatalogBatch")) vt.putIndexCatalogBatch else null,
         },
     };
 }
@@ -2016,6 +2217,17 @@ pub fn namespaceWriteTxnFrom(
             errdefer cursor.close();
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
+
+        pub fn setDurable(ptr: *anyopaque, durable: bool) void {
+            unbox(ptr).handle.setDurable(durable);
+        }
+
+        pub fn pendingMutations(alloc: Allocator, ptr: *anyopaque) anyerror![]const PendingMutation {
+            const raw = unbox(ptr).handle.pendingMutations();
+            const out = try alloc.alloc(PendingMutation, raw.len);
+            for (raw, out) |m, *o| o.* = .{ .namespace = m.namespace, .key = m.key, .value = m.value, .is_delete = m.is_delete };
+            return out;
+        }
     };
 
     return .{
@@ -2030,6 +2242,8 @@ pub fn namespaceWriteTxnFrom(
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
+            .set_durable = if (@hasDecl(Handle, "setDurable")) vt.setDurable else null,
+            .pending_mutations = if (@hasDecl(Handle, "pendingMutations")) vt.pendingMutations else null,
         },
     };
 }
@@ -2050,6 +2264,91 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
 
         fn commit(_: Allocator, ptr: *anyopaque) anyerror!void {
             try unbox(ptr).commit();
+        }
+
+        /// Mirrors `ParentBox.commit`'s close guard, but the fsync-durability
+        /// wait moves into the returned ticket instead of running here. If
+        /// `Handle.commitStaged` itself fails synchronously, `finalizing` is
+        /// rolled back and the box is left alone, exactly like `commit`'s
+        /// error path (the caller may still call `abort`). Once a ticket is
+        /// handed out, the parent box is torn down only from the ticket's
+        /// `wait` callback below, whether that wait succeeds or fails.
+        fn commitStaged(ticket_allocator: Allocator, ptr: *anyopaque) anyerror!Ticket {
+            const parent = unbox(ptr);
+            platform.sync.lockYielding(&parent.mutex);
+            if (parent.owner_closed or parent.finalizing) {
+                parent.mutex.unlock();
+                return error.TransactionClosed;
+            }
+            if (parent.child_count != 0) {
+                parent.mutex.unlock();
+                return error.TransactionCursorActive;
+            }
+            parent.finalizing = true;
+            parent.mutex.unlock();
+
+            const payload = parent.handle.commitStaged() catch |err| {
+                platform.sync.lockYielding(&parent.mutex);
+                parent.finalizing = false;
+                parent.mutex.unlock();
+                return err;
+            };
+
+            const TicketBox = struct {
+                parent: *ParentBox(Handle),
+                payload: @TypeOf(payload),
+            };
+            const box = try ticket_allocator.create(TicketBox);
+            box.* = .{ .parent = parent, .payload = payload };
+            return .{
+                .allocator = ticket_allocator,
+                .ptr = box,
+                .wait_fn = struct {
+                    fn run(alloc: Allocator, raw: *anyopaque) anyerror!void {
+                        const typed: *TicketBox = @ptrCast(@alignCast(raw));
+                        const boxed_parent = typed.parent;
+                        const parent_allocator = boxed_parent.allocator;
+                        defer alloc.destroy(typed);
+                        defer parent_allocator.destroy(boxed_parent);
+                        typed.payload.wait() catch |err| {
+                            // (See the matching catch in `wait_sequence_fn`
+                            // below -- same contract, different return type.)
+                            // On success `payload.wait` (the backend's own
+                            // staged-commit type) already released/freed
+                            // everything it owns. On failure it deliberately
+                            // leaves the handle exactly as `commitStaged`
+                            // left it -- abortable, not yet torn down -- so
+                            // `OutcomeUnknown`/a rejected apply does not leak
+                            // the pending-write state. Finish that abort here
+                            // instead of in `Batch.abort` (which cannot reach
+                            // it any more: the caller's `backend_erased.Batch`
+                            // was already pointed at the inert `consumed_vtable`
+                            // once this ticket was handed out).
+                            boxed_parent.handle.abort();
+                            return err;
+                        };
+                    }
+                }.run,
+                // Regression-B test hook: only when `Handle.commitStaged`'s
+                // own result type (`@TypeOf(payload)`, Lite's `StagedCommit`)
+                // actually exposes `waitSequence` -- currently always true,
+                // since Lite is the only `Handle` with `commitStaged` at
+                // all, but guarded the same way every other optional vtable
+                // entry above is, in case that ever changes.
+                .wait_sequence_fn = if (@hasDecl(@TypeOf(payload), "waitSequence")) struct {
+                    fn run(alloc: Allocator, raw: *anyopaque) anyerror!u64 {
+                        const typed: *TicketBox = @ptrCast(@alignCast(raw));
+                        const boxed_parent = typed.parent;
+                        const parent_allocator = boxed_parent.allocator;
+                        defer alloc.destroy(typed);
+                        defer parent_allocator.destroy(boxed_parent);
+                        return typed.payload.waitSequence() catch |err| {
+                            boxed_parent.handle.abort();
+                            return err;
+                        };
+                    }
+                }.run else null,
+            };
         }
 
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
@@ -2107,6 +2406,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
         pub fn setCommitParticipant(ptr: *anyopaque, participant: @import("commit_participant.zig").Participant) anyerror!void {
             return unbox(ptr).handle.setCommitParticipant(participant);
         }
+
+        pub fn putIndexCatalogBatch(ptr: *anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void {
+            return unbox(ptr).handle.putIndexCatalogBatch(scope, mutations);
+        }
     };
 
     return .{
@@ -2115,6 +2418,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
         .vtable = &.{
             .abort = vt.abort,
             .commit = vt.commit,
+            .commit_staged = if (@hasDecl(Handle, "commitStaged")) vt.commitStaged else null,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
             .has_prefix = if (@hasDecl(Handle, "hasPrefix")) vt.hasPrefix else null,
@@ -2125,6 +2429,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .set_replay_opaque = if (@hasDecl(Handle, "setReplayOpaque")) vt.setReplayOpaque else null,
             .set_commit_participant = if (@hasDecl(Handle, "setCommitParticipant")) vt.setCommitParticipant else null,
             .contains_many_sorted = if (@hasDecl(Handle, "containsManySorted")) vt.containsManySorted else null,
+            .put_index_catalog = if (@hasDecl(Handle, "putIndexCatalogBatch")) vt.putIndexCatalogBatch else null,
         },
     };
 }
@@ -2183,6 +2488,13 @@ pub fn namespaceBatchFrom(
             if (comptime @hasDecl(Handle, "stagedLogicalBytes")) return inner.stagedLogicalBytes();
             return try inner.stagedBytes() orelse error.Unsupported;
         }
+
+        pub fn pendingMutations(alloc: Allocator, ptr: *anyopaque) anyerror![]const PendingMutation {
+            const raw = unbox(ptr).handle.pendingMutations();
+            const out = try alloc.alloc(PendingMutation, raw.len);
+            for (raw, out) |m, *o| o.* = .{ .namespace = m.namespace, .key = m.key, .value = m.value, .is_delete = m.is_delete };
+            return out;
+        }
     };
 
     const has_staged = comptime @hasDecl(Handle, "stagedLogicalBytes") or @hasDecl(Handle, "stagedBytes");
@@ -2198,6 +2510,7 @@ pub fn namespaceBatchFrom(
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
             .staged_bytes = if (has_staged) vt.stagedBytes else null,
+            .pending_mutations = if (@hasDecl(Handle, "pendingMutations")) vt.pendingMutations else null,
         },
     };
 }
@@ -2372,6 +2685,11 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return fallback_next;
         }
 
+        pub fn adoptionEpoch(ptr: *anyopaque) u64 {
+            if (@hasDecl(Handle, "adoptionEpoch")) return unbox(ptr).handle.adoptionEpoch();
+            return 0;
+        }
+
         pub fn appendReplayOpaque(alloc: Allocator, ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
             if (@hasDecl(Handle, "appendReplayOpaque")) {
                 return try unbox(ptr).handle.appendReplayOpaque(alloc, sequence, payload);
@@ -2488,6 +2806,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .abort_bulk_ingest_session = vt.abortBulkIngestSession,
             .last_replay_sequence = vt.lastReplaySequence,
             .next_replay_sequence = vt.nextReplaySequence,
+            .adoption_epoch = vt.adoptionEpoch,
             .append_replay_opaque = vt.appendReplayOpaque,
             .iterate_replay_from = vt.iterateReplayFrom,
             .for_each_replay_from = vt.forEachReplayFrom,

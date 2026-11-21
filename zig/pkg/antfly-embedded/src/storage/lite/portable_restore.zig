@@ -171,7 +171,7 @@ pub fn importPreparedIntoLiteDb(
     });
     var staged_backend_owned = true;
     errdefer if (staged_backend_owned) staged_backend.deinit();
-    var staged_opts = db_mod.OpenOptions{ .identity_namespace = root_identity, .prefer_existing_identity_namespace = false, .external_derived_checkpoints = false };
+    var staged_opts = db_mod.OpenOptions{ .identity_namespace = root_identity, .prefer_existing_identity_namespace = false };
     try staged_backend.configureDbOpenOptions(&staged_opts);
     var prepared = LiteDb{ .db = try db_mod.DB.open(allocator, tmp_path, staged_opts), .backend = staged_backend, .open_mode = .writer };
     staged_backend_owned = false;
@@ -201,6 +201,20 @@ pub fn importPreparedIntoLiteDb(
         },
         PreparedGenerationAdoption.adopt,
     );
+}
+
+/// Copied verbatim from the now-deleted `writer_queue.zig`'s own
+/// `queuePathAlloc`, kept only so `scavengePortableRestoreGenerations`
+/// can still recognize and remove a pre-§8.7-migration ticket-queue
+/// directory left behind by an abandoned generation. Never used to
+/// create a queue directory -- nothing does anymore.
+fn legacyWriterQueuePathAlloc(allocator: Allocator, sidecar_path: []const u8) ![]u8 {
+    const max_name_len = 255;
+    const base = std.fs.path.basename(sidecar_path);
+    if (base.len + ".q".len <= max_name_len) return std.fmt.allocPrint(allocator, "{s}.q", .{sidecar_path});
+    const dir_len = sidecar_path.len - base.len;
+    const keep = max_name_len - "-".len - 16 - ".q".len;
+    return std.fmt.allocPrint(allocator, "{s}{s}-{x:0>16}.q", .{ sidecar_path[0..dir_len], base[0..keep], std.hash.Wyhash.hash(0, base) });
 }
 
 pub fn deleteFileIfExists(io: std.Io, path: []const u8) !void {
@@ -264,8 +278,12 @@ pub fn scavengePortableRestoreGenerations(
         lease.close(io);
         lease_open = false;
         try deleteFileIfExists(io, lease_path);
-        // The writer FIFO directory next to the sidecar, if one was made.
-        const queue_path = try @import("writer_queue.zig").queuePathAlloc(allocator, lease_path);
+        // The writer FIFO directory next to the sidecar, if one was made
+        // by a pre-§8.7-migration build (the ticket queue this path
+        // computes was deleted along with `writer_queue.zig` itself;
+        // nothing creates one anymore, but an abandoned generation from
+        // before that migration shipped may still have one to clean up).
+        const queue_path = try legacyWriterQueuePathAlloc(allocator, lease_path);
         defer allocator.free(queue_path);
         std.Io.Dir.cwd().deleteTree(io, queue_path) catch {};
         std.log.info("removed abandoned Lite portable generation path={s}", .{candidate});
