@@ -2781,6 +2781,10 @@ fn classifyMutationFailure(status: u16, body: []const u8) MutationFailure {
     // A commit/unknown receipt contradicts any definite-abort error field.
     if (parsed.value.status) |state| if (std.mem.startsWith(u8, state, "committed") or std.mem.eql(u8, state, "unknown"))
         return .{ .err = error.SqlMutationOutcomeUnknown, .transaction_id = id };
+    if (status == 409 and parsed.value.transaction_id == null and parsed.value.status == null) {
+        if (parsed.value.code) |code| if (std.mem.eql(u8, code, "integrity_topology_busy"))
+            return .{ .err = error.SqlStatementReadUnavailable };
+    }
     if (status == 503) if (parsed.value.code) |code| {
         if (std.mem.eql(u8, code, "transaction_precommit_read_unavailable") and parsed.value.transaction_id == null and parsed.value.status == null)
             return .{ .err = error.SqlStatementReadUnavailable };
@@ -4307,6 +4311,8 @@ test "SQL unknown mutation keeps native reconciliation receipt without allocatio
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &receipt.transaction_id.?);
     try std.testing.expectEqual(error.DuplicateSqlRow, classifyMutationFailure(409, "{\"error\":\"UniqueConstraintViolation\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "write unavailable").err);
+    try std.testing.expectEqual(error.SqlStatementReadUnavailable, classifyMutationFailure(409, "{\"code\":\"integrity_topology_busy\"}").err);
+    try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(409, "{\"code\":\"integrity_topology_busy\",\"status\":\"unknown\"}").err);
     try std.testing.expectEqual(error.SqlStatementReadUnavailable, classifyMutationFailure(503, "{\"code\":\"transaction_precommit_read_unavailable\"}").err);
     inline for (.{
         "{\"code\":\"transaction_precommit_read_unavailable\",\"status\":\"committed_pending\"}",

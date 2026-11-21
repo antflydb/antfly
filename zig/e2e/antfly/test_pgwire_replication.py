@@ -136,7 +136,10 @@ def test_pg_recvlogical_resume_after_restart(
             if (
                 retry_uncommitted
                 and "ERROR:  53300: A consistent SQL statement read" in result.stderr
-                and len(result.stdout.splitlines()) < len(statements) - 1
+                and (
+                    len(statements) == 1
+                    or len(result.stdout.splitlines()) < len(statements) - 1
+                )
                 and time.monotonic() < expires
             ):
                 # ON_ERROR_STOP ends this psql connection before COMMIT can be sent.
@@ -829,10 +832,12 @@ def test_pg_recvlogical_resume_after_restart(
                         interval_s=0.5,
                     ), server.debug_logs()
                     sql(
-                        "INSERT INTO smoke (_id, id, content) VALUES ('a-left', 102, 'after-split-left')"
+                        "INSERT INTO smoke (_id, id, content) VALUES ('a-left', 102, 'after-split-left')",
+                        retry_uncommitted=True,
                     )
                     sql(
-                        "INSERT INTO smoke (_id, id, content) VALUES ('z-right', 103, 'after-split-right')"
+                        "INSERT INTO smoke (_id, id, content) VALUES ('z-right', 103, 'after-split-right')",
+                        retry_uncommitted=True,
                     )
                     floor = expect_markers(
                         [b"after-split-left", b"after-split-right"], floor
@@ -853,7 +858,8 @@ def test_pg_recvlogical_resume_after_restart(
                         interval_s=0.5,
                     ), server.debug_logs()
                     sql(
-                        "INSERT INTO smoke (_id, id, content) VALUES ('z-merged', 104, 'after-merge')"
+                        "INSERT INTO smoke (_id, id, content) VALUES ('z-merged', 104, 'after-merge')",
+                        retry_uncommitted=True,
                     )
                     expect_markers([b"after-merge"], floor)
                     assert all(marker not in resumed.read_bytes() for marker in markers)
