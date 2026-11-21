@@ -4764,7 +4764,12 @@ pub const ApiHttpClient = struct {
             405 => return error.UnsupportedOperation,
             408, 504 => return error.TimedOut,
             409 => return remoteGroupConflictError(resp.body),
-            503 => return error.GroupLeaderUnavailable,
+            503 => {
+                inline for (.{ error.TransitionOperationBusy, error.SplitSourceProjectionNotReady, error.SplitSourceProjectionAdvanced, error.DurableRootIncarnationUnavailable }) |retry| {
+                    if (std.mem.eql(u8, resp.body, @errorName(retry))) return retry;
+                }
+                return error.GroupLeaderUnavailable;
+            },
             else => return error.UnexpectedHttpStatus,
         }
     }
