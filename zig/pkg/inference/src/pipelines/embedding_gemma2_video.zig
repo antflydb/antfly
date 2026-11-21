@@ -1965,7 +1965,7 @@ pub fn sampledPacketByteCount(reader: *const media.mp4.Reader, sampling: Samplin
     return @intCast(total);
 }
 
-pub fn planWebmWindow(input: WebmInput, policy: video.sampling.TimestampPolicy, limit: usize, control: Control) !WebmInput {
+pub fn planWebmWindow(input: WebmInput, timestamp_policy: video.sampling.TimestampPolicy, limit: usize, control: Control) !WebmInput {
     const index = try input.boundIndex();
     if (input.timeline == null or input.window != null) return error.InvalidVideoIndex;
     try control.check();
@@ -1973,7 +1973,7 @@ pub fn planWebmWindow(input: WebmInput, policy: video.sampling.TimestampPolicy, 
     const adapter = control.imageWorkControl();
     const worker = media.source.Control{ .context = adapter.context, .check_fn = adapter.check_fn };
     const a = input.reader.allocator;
-    const selected = try selectWebm(a, index, .{ .timestamps = policy }, worker, input);
+    const selected = try selectWebm(a, index, .{ .timestamps = timestamp_policy }, worker, input);
     defer a.free(selected);
     if (selected.len == 0 or selected.len > 32) return error.InvalidVideoIndex;
     var first = selected[0];
@@ -2002,7 +2002,7 @@ pub fn planWebmWindow(input: WebmInput, policy: video.sampling.TimestampPolicy, 
         if (total > limit) return error.ResourceLimitExceeded;
     }
     var result = input;
-    result.window = .{ .index = input.index, .policy = policy, .count = selected.len, .first_packet = restart.packet, .coded_bytes = total };
+    result.window = .{ .index = input.index, .policy = timestamp_policy, .count = selected.len, .first_packet = restart.packet, .coded_bytes = total };
     @memcpy(result.window.?.ids[0..selected.len], selected);
     return result;
 }
