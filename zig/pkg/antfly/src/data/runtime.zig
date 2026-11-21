@@ -17427,6 +17427,8 @@ pub const DataServer = struct {
         destination_group_id: u64,
         table_contract: antfly.metadata.TransitionTableContract,
     ) !void {
+        var phase: []const u8 = "source handoff";
+        errdefer std.log.debug("split bootstrap failed transition_id={} phase={s}", .{ transition_id, phase });
         try self.requireReplicatedTransitionActionActive(source_group_id);
         const source_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, source_group_id);
         defer self.alloc.free(source_root_dir);
@@ -17467,13 +17469,17 @@ pub const DataServer = struct {
         defer integrity_arena.deinit();
         var integrity_manifest: ?IntegrityHandoff.Manifest = null;
         if (try transitionHasCoordinatedConstraints(work_alloc, table_contract)) {
+            phase = "source integrity fence";
             const source_fence = try self.ensureRelationalSplitFence(source_group_id, destination_group_id, transition_id, attempt_epoch, .split_source, table_contract);
+            phase = "destination integrity fence";
             const destination_fence = try self.ensureRelationalSplitFence(destination_group_id, source_group_id, transition_id, attempt_epoch, .split_destination, table_contract);
+            phase = "integrity manifest read";
             {
                 var source_db = try self.leaseReplicatedTransitionOwner(source_group_id, table_contract, .source, .exact);
                 defer source_db.release();
                 integrity_manifest = try source_db.relationalHandoffManifest(integrity_arena.allocator(), source_fence, destination_fence, handoff.byte_range.start, handoff.byte_range.end, handoff.base_delta_sequence);
             }
+            phase = "destination integrity transfer begin";
             try self.proposeRaftBatchGroup(work_alloc, destination_group_id, table_contract.table_name, .{ .relational_topology = .{ .action = .transfer, .fence = destination_fence, .transfer = .{ .begin = integrity_manifest.? } } }, .{ .discovery = .cached });
         }
 
@@ -17485,24 +17491,29 @@ pub const DataServer = struct {
             for (0..32) |slice| {
                 if (slice != 0 and platform_time.monotonicNs() >= deadline) return error.TransitionOperationBusy;
                 try self.requireReplicatedTransitionActionActive(source_group_id);
+                phase = "destination integrity transfer progress";
                 var progress = try self.readRelationalTopologyValue(IntegrityHandoff.Progress, work_alloc, destination_group_id, table_contract.table_name, transition_id, attempt_epoch, "handoff_progress");
                 defer progress.deinit();
                 if (progress.value.ready) break;
                 if (progress.value.exhausted) {
+                    phase = "destination integrity transfer finish";
                     try self.proposeRaftBatchGroup(work_alloc, destination_group_id, table_contract.table_name, .{ .relational_topology = .{ .action = .transfer, .fence = manifest.destination, .transfer = .{ .finish = .{ .sequence = progress.value.sequence, .digest = progress.value.digest } } } }, .{ .discovery = .cached });
                     continue;
                 }
                 var page_arena = std.heap.ArenaAllocator.init(work_alloc);
                 defer page_arena.deinit();
+                phase = "source integrity page read";
                 const page = blk: {
                     var source_db = try self.leaseReplicatedTransitionOwner(source_group_id, table_contract, .source, .exact);
                     defer source_db.release();
                     break :blk try source_db.relationalHandoffPage(page_arena.allocator(), manifest, progress.value);
                 };
+                phase = "destination integrity page apply";
                 try self.proposeRaftBatchGroup(work_alloc, destination_group_id, table_contract.table_name, .{ .relational_topology = .{ .action = .transfer, .fence = manifest.destination, .transfer = .{ .page = page } } }, .{ .discovery = .cached });
             } else return error.TransitionOperationBusy;
         }
         try self.requireReplicatedTransitionActionActive(source_group_id);
+        phase = "destination begin checkpoint";
         try self.replicateSplitDestinationCheckpoint(
             destination_group_id,
             table_contract.table_name,
@@ -17514,6 +17525,7 @@ pub const DataServer = struct {
             null,
         );
 
+        phase = "destination document copy";
         const max_writes_per_batch: usize = 128;
         const max_batch_bytes: usize = 2 * 1024 * 1024;
         var after_key: ?[]u8 = null;
@@ -17547,11 +17559,13 @@ pub const DataServer = struct {
             after_key = next_after;
             if (page.exhausted) break;
         }
+        phase = "source history policy";
         const history_policy = self.splitSourceHistoryPolicy(source_group_id, table_contract) catch |err| {
             std.log.debug("split history policy read failed group_id={} err={s}", .{ source_group_id, @errorName(err) });
             return err;
         };
         try self.requireReplicatedTransitionActionActive(source_group_id);
+        phase = "destination completion checkpoint";
         try self.replicateSplitDestinationCheckpoint(
             destination_group_id,
             table_contract.table_name,
@@ -17563,6 +17577,7 @@ pub const DataServer = struct {
             history_policy,
         );
         try self.requireReplicatedTransitionActionActive(source_group_id);
+        phase = "source acknowledgement";
         try self.replicateSplitSourceAcknowledgement(
             source_group_id,
             destination_group_id,
