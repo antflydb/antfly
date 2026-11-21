@@ -115,29 +115,19 @@ pub const Index = struct {
         }
         const order = try a.alloc(usize, self.pictures.len);
         defer a.free(order);
-        for (order, 0..) |*id, i| id.* = i;
+        var bounds = sampling.Bounds{};
+        for (order, self.pictures, 0..) |*id, picture, i| {
+            if (i % 256 == 0) try control.check();
+            id.* = i;
+            bounds.include(picture.pts, picture.duration);
+        }
         const Less = struct {
             fn less(pictures: []const Picture, l: usize, r: usize) bool {
                 return pictures[l].pts < pictures[r].pts or (pictures[l].pts == pictures[r].pts and l < r);
             }
         };
         std.mem.sort(usize, order, @as([]const Picture, self.pictures), Less.less);
-        const first = self.pictures[order[0]].pts;
-        const last = self.pictures[order[order.len - 1]];
-        // Without an explicit last duration, infer the final positive PTS step.
-        // If no rate can be established, upstream falls back to capped indices.
-        var tail = last.duration;
-        if (tail == null) {
-            var i = order.len - 1;
-            while (i > 0) : (i -= 1) {
-                const delta = @as(i128, last.pts) - self.pictures[order[i - 1]].pts;
-                if (delta > 0) {
-                    tail = std.math.cast(u64, delta) orelse return error.TimestampOverflow;
-                    break;
-                }
-            }
-        }
-        const span = @as(i128, last.pts) - first + (tail orelse 0);
+        const span = bounds.end(null) - bounds.first;
         const seconds: ?f64 = self.duration_seconds orelse if (span > 0) @as(f64, @floatFromInt(span)) / 1e9 else null;
         const selected = try sampling.embeddingGemma2(a, .{ .total_frames = order.len, .duration_seconds = seconds, .fps = if (seconds) |s| @as(f64, @floatFromInt(order.len)) / s else null }, .{});
         for (selected) |*id| id.* = order[id.*];
@@ -614,6 +604,11 @@ test "WebM picture sampling orders timestamps and falls back when duration is ab
     const selected = try index_value.select();
     defer a.free(selected);
     try std.testing.expectEqualSlices(usize, &.{1}, selected);
+    index_value.pictures[1].duration = 10 * std.time.ns_per_s;
+    const overlap = try index_value.select();
+    defer a.free(overlap);
+    try std.testing.expectEqual(@as(usize, 10), overlap.len);
+    index_value.pictures[1].duration = null;
     for (index_value.pictures) |*picture| picture.pts = 0;
     const no_rate = try index_value.select();
     defer a.free(no_rate);

@@ -358,6 +358,11 @@ pub const Group = struct {
             else => null,
         };
     }
+    pub fn referenceVideo(part: Part) ?SampledVideo {
+        const movie = encodedVideo(part) orelse return null;
+        return if (movie.sampling == .reference and movie.selection == null) movie else null;
+    }
+
     pub fn inspection(self: Group, movie: SampledVideo) ?*const @import("embedding_gemma2_video.zig").PixelInspection {
         const videos = self.videos orelse return null;
         return videos.find(movie.bytes, movie.sampling);
@@ -942,6 +947,19 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
     return .{ .bounds = bounds, .input_bytes = input_bytes, .has_video = has_video, .device_bytes = device_bytes, .commands = command_slots };
 }
 
+// Linked callers may lend an index outside the session's admission domain.
+fn admitGroupMetadata(session: Session, group: Group, control: Control) !?RunPermit {
+    const videos = group.videos orelse return null;
+    const admission = session.run_admission orelse return null;
+    var uncovered: usize = 0;
+    for (videos.items) |*item| {
+        const admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(item.memory.backing);
+        const funded = if (admitted) |owner| try owner.ownedHostBytesFor(admission.controller) else 0;
+        uncovered = try std.math.add(usize, uncovered, item.memory.live -| funded);
+    }
+    return if (uncovered != 0) try admitHostPreprocess(session, uncovered, control) else null;
+}
+
 fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllocator, session: Session, tokenizer: Tokenizer, group: Group, input_options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache, native_allocator: ?*@import("../backends/admitted_allocator.zig").AdmittedAllocator) !Result {
     var native_run: ?@import("../backends/admitted_allocator.zig").AdmittedAllocator.RunScope = null;
     defer if (native_run) |*run| run.deinit();
@@ -956,22 +974,11 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     options.video_inspection_scope = &inspection_scope;
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
     try validateGroupContent(group, options, session.backend() == .cuda);
-    // External callers may lend a plan created without this session's host
-    // admission. Cover its retained allocations until all workers have joined.
-    var metadata_permit: ?RunPermit = null;
+    var metadata_permit = try admitGroupMetadata(session, group, control orelse .{});
     defer if (metadata_permit) |*permit| permit.deinit();
-    if (group.videos) |videos| if (session.run_admission) |admission| {
-        var uncovered: usize = 0;
-        for (videos.items) |*item| {
-            const admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(item.memory.backing);
-            const funded = if (admitted) |owner| try owner.ownedHostBytesFor(admission.controller) else 0;
-            uncovered = try std.math.add(usize, uncovered, item.memory.live -| funded);
-        }
-        if (uncovered != 0) metadata_permit = try admitHostPreprocess(session, uncovered, control orelse .{});
-    };
     if (@import("build_options").enable_cuda and session.backend() == .cuda) {
         try validateCudaGroup(group, options);
-        if (group.content.len == 1 and group.content[0] == .video) return embedVideo(a, session, tokenizer, group.content[0].video, group.inspection(Group.encodedVideo(group.content[0]).?), options, lock, control);
+        if (group.content.len == 1) if (Group.referenceVideo(group.content[0])) |movie| return embedVideo(a, session, tokenizer, movie.bytes, group.inspection(movie), options, lock, control);
         if (!singleImageGroup(group) or !options.resident_images) return embedCudaGroup(a, session, tokenizer, group, options, lock, control);
     }
     if (options.video_ahead) |ahead| {
@@ -1405,6 +1412,30 @@ pub fn preparedCohortCountForBackend(lengths: []const usize, maximum: usize, com
     return count;
 }
 
+// Ticket-local planning memory and inspection leases outlive composition.
+const CohortGroupPlan = struct {
+    memory: @import("../runtime/bounded_allocator.zig").BoundedAllocator,
+    videos: @import("embedding_gemma2_video.zig").InspectionScope,
+    metadata: ?RunPermit = null,
+
+    fn init(self: *@This(), backing: std.mem.Allocator, group: Group) void {
+        self.* = .{ .memory = .{ .backing = backing, .limit = 512 * 1024 * 1024 }, .videos = undefined };
+        self.videos = .{ .allocator = self.memory.allocator(), .admitted = group.videos };
+    }
+
+    fn options(self: *@This(), base: Options) Options {
+        var result = base;
+        result.video_inspection_scope = &self.videos;
+        return result;
+    }
+
+    fn deinit(self: *@This()) void {
+        self.videos.deinit();
+        if (self.metadata) |*permit| permit.deinit();
+        std.debug.assert(self.memory.live == 0);
+    }
+};
+
 /// Cross-request prepared stages share one backbone call after length bucketing.
 /// Decode/tower admission is independent of padded encoder admission. Nothing
 /// owned by a submitter escapes this synchronous cohort; slots retain identity.
@@ -1438,13 +1469,19 @@ pub fn embedGroupCohort(out: std.mem.Allocator, session: Session, tokenizer: Tok
     var sequence: usize = 1;
     var has_video = false;
     var retained_rows: usize = 0;
-    for (groups, 0..) |group, index| {
+    var storage: [4]CohortGroupPlan = undefined;
+    const plans = storage[0..groups.len];
+    for (plans, groups) |*plan, group| plan.init(bounded.backing, group);
+    defer for (plans) |*plan| plan.deinit();
+    for (groups, plans, 0..) |group, *plan, index| {
         try control.check();
         validateGroup(group, options) catch |err| {
             errors[index] = err;
             continue;
         };
-        const view = inspectGroup(&bounded, session, cfg, group, options, control) catch |err| {
+        plan.metadata = try admitGroupMetadata(session, group, control);
+        const view = inspectGroup(&plan.memory, session, cfg, group, plan.options(options), control) catch |err| {
+            if (err == error.SharedAdmissionExceeded or (err == error.OutOfMemory and plan.memory.denied)) return error.MemoryBudgetExceeded;
             if (@import("audio_preparation.zig").abort(err)) return err;
             errors[index] = err;
             continue;
@@ -1492,8 +1529,9 @@ pub fn embedGroupCohort(out: std.mem.Allocator, session: Session, tokenizer: Tok
     const cb = &managed.backend;
     var cache = FrameCache{ .allocator = workspaceBackingAllocator(session.backend()), .session = session, .control = control };
     defer cache.deinit();
-    var scheduler = CohortReady{ .a = a, .out = out, .session = session, .cb = cb, .lane = &lane, .tokenizer = tokenizer, .groups = groups, .indexes = indexes[0..inspected], .options = options, .control = control, .errors = errors, .permit = &permit, .pool = &pool, .cache = &cache, .vectors = vectors, .counts = counts, .inputs = inputs, .host = host, .retained = retained };
-    var media_parts = projectCohortParts(a, session, cb, groups, indexes[0..inspected], options, control, &permit, errors, &scheduler) catch |err| {
+    var scheduler = CohortReady{ .a = a, .out = out, .session = session, .cb = cb, .lane = &lane, .tokenizer = tokenizer, .groups = groups, .indexes = indexes[0..inspected], .options = options, .plans = plans, .control = control, .errors = errors, .permit = &permit, .pool = &pool, .cache = &cache, .vectors = vectors, .counts = counts, .inputs = inputs, .host = host, .retained = retained };
+    var media_parts = projectCohortParts(a, session, cb, groups, indexes[0..inspected], options, control, &permit, errors, &scheduler) catch |failure| {
+        const err = if (failure == error.SharedAdmissionExceeded or (failure == error.OutOfMemory and bounded.denied)) error.MemoryBudgetExceeded else failure;
         if (!isPreparationPressure(err)) return err;
         preserveCompletedGroups(vectors, errors, indexes[0..inspected], err);
         return .{ .vectors = vectors, .input_tokens = counts, .execution = scheduler.observation.execution(scheduler.observation.native_items + scheduler.observation.serial_items) };
@@ -1537,6 +1575,7 @@ const CohortReady = struct {
     groups: []const Group,
     indexes: []const usize,
     options: Options,
+    plans: []CohortGroupPlan,
     control: Control,
     errors: []?anyerror,
     permit: *RunPermit,
@@ -1613,7 +1652,11 @@ const CohortReady = struct {
             try control.check();
             if (errors[index] != null) continue;
             if (cb.embedding_stage) |stage| try stage.workspace(null);
-            rows[prepared] = (if (cb.kind() == .cuda) prepareCudaProjectedGroup(a, cb, tokenizer, groups[index], options, control, parts.parts[index]) else prepareGroupCombined(a, cb, tokenizer, groups[index], options, control, pool, null, cache, parts.parts[index])) catch |err| {
+            rows[prepared] = (if (cb.kind() == .cuda) prepareCudaProjectedGroup(a, cb, tokenizer, groups[index], options, control, parts.parts[index]) else prepareGroupCombined(a, cb, tokenizer, groups[index], self.plans[index].options(options), control, pool, null, cache, parts.parts[index])) catch |err| {
+                if (err == error.SharedAdmissionExceeded) {
+                    errors[index] = error.MemoryBudgetExceeded;
+                    continue;
+                }
                 if (@import("audio_preparation.zig").abort(err)) return err;
                 errors[index] = err;
                 continue;
@@ -2323,7 +2366,7 @@ fn logCudaVideoAdmission(session: Session, request: @import("../backends/session
 
 pub fn videoInputError(err: anyerror) anyerror {
     return switch (err) {
-        error.UnexpectedEndOfSource, error.EmptyVideo, error.EmptyVideoTrack, error.MalformedMedia, error.MissingMovieMetadata, error.UnsupportedContainer, error.UnsupportedDataReference, error.UnsupportedDisplayGeometry, error.UnsupportedEncryptedMedia, error.UnsupportedFragmentedMp4, error.UnsupportedHybridMp4, error.UnsupportedInterlacedVideo, error.UnsupportedSampleDescription, error.UnsupportedSampleSize, error.UnsupportedTimeline, error.UnsupportedVideoCodec, error.InvalidTimebase, error.TimestampOverflow, error.NoRandomAccessPoint, error.InvalidVideoTimestamp, error.NonMonotonicVideoPresentation, error.UnsupportedVideoFormat, error.UnsupportedVideoContainerColor, error.InvalidVideoGeometry, error.InvalidVideoConfiguration, error.InvalidVideoPacket, error.VideoDecodeFailed => error.InvalidVideoInput,
+        error.UnexpectedEndOfSource, error.EmptyVideo, error.EmptyVideoTrack, error.MalformedMedia, error.MissingMovieMetadata, error.UnsupportedContainer, error.UnsupportedDataReference, error.UnsupportedDisplayGeometry, error.UnsupportedEncryptedMedia, error.UnsupportedFragmentedMp4, error.UnsupportedHybridMp4, error.UnsupportedInterlacedVideo, error.UnsupportedSampleDescription, error.UnsupportedSampleSize, error.UnsupportedTimeline, error.UnsupportedVideoCodec, error.UnsupportedVideoLacing, error.InvalidTimebase, error.TimestampOverflow, error.NoRandomAccessPoint, error.InvalidVideoTimestamp, error.NonMonotonicVideoPresentation, error.UnsupportedVideoFormat, error.UnsupportedVideoContainerColor, error.InvalidVideoGeometry, error.InvalidVideoConfiguration, error.InvalidVideoPacket, error.VideoDecodeFailed => error.InvalidVideoInput,
         else => err,
     };
 }
@@ -4146,8 +4189,11 @@ pub fn validateGroup(group: Group, options: Options) !void {
 fn validateCudaGroup(group: Group, options: Options) !void {
     try validateGroupContent(group, options, true);
     for (group.content) |part| switch (part) {
-        .video => if (group.content.len != 1 or group.title != null) return error.InvalidEmbeddingGroup,
-        .sampled_video, .pcm => return error.UnsupportedInput,
+        .video, .sampled_video => {
+            if (Group.referenceVideo(part) == null) return error.UnsupportedVideoSampling;
+            if (group.content.len != 1 or group.title != null) return error.InvalidEmbeddingGroup;
+        },
+        .pcm => return error.UnsupportedInput,
         else => {},
     };
 }
@@ -4167,6 +4213,7 @@ fn validateGroupContent(group: Group, options: Options, allow_manual_markers: bo
     for (group.content) |part| {
         const value = partBytes(part);
         if (part == .sampled_video) {
+            if (part.sampled_video.selection != null and part.sampled_video.reader == null) return error.InvalidVideoReaderSelection;
             switch (part.sampled_video.sampling) {
                 .timestamps, .source_timestamps => |policy| try policy.validate(),
                 .reference, .gemma4 => {},
@@ -4223,7 +4270,7 @@ fn validateGroupContent(group: Group, options: Options, allow_manual_markers: bo
     // any is present, every supplied media item must be referenced exactly
     // once; generated wrapper tokens remain forbidden in caller text.
     if (image_markers + audio_markers > 0 and (image_markers != images or audio_markers != audios)) return error.MediaPlaceholderMismatch;
-    if (bytes > (if (group.content.len == 1 and group.content[0] == .video) @as(usize, 256 * 1024 * 1024) else 64 * 1024 * 1024) or raster_bytes > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
+    if (bytes > (if (group.content.len == 1 and Group.referenceVideo(group.content[0]) != null) @as(usize, 256 * 1024 * 1024) else 64 * 1024 * 1024) or raster_bytes > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
     if (group.title) |title| if (!has_text or !std.mem.eql(u8, options.task_type, "RETRIEVAL_DOCUMENT") or !std.unicode.utf8ValidateSlice(title) or title.len > 8192 or std.mem.indexOf(u8, title, "<") != null) return error.InvalidEmbeddingTitle;
 }
 
@@ -4698,6 +4745,8 @@ test "embeddinggemma2 resident audio packing preserves clip isolation and reject
 
 test "embeddinggemma2 video rejects mixed groups and invalid limits before decoding" {
     try validateCudaGroup(.{ .content = &.{.{ .video = "clip" }} }, .{});
+    try validateCudaGroup(.{ .content = &.{.{ .sampled_video = .{ .bytes = "clip", .sampling = .reference } }} }, .{});
+    try std.testing.expectError(error.UnsupportedVideoSampling, validateCudaGroup(.{ .content = &.{.{ .sampled_video = .{ .bytes = "clip", .sampling = .{ .timestamps = .{} } } }} }, .{}));
     try std.testing.expectError(error.InvalidEmbeddingGroup, validateCudaGroup(.{ .content = &.{ .{ .text = "caption" }, .{ .video = "clip" } } }, .{}));
     try std.testing.expectError(error.InvalidEmbeddingTitle, validateCudaGroup(.{ .title = "clip", .content = &.{.{ .video = "clip" }} }, .{}));
     try std.testing.expectError(error.InvalidEmbeddingTokenLimit, validateCudaGroup(.{ .content = &.{.{ .video = "clip" }} }, .{ .max_tokens = 0 }));

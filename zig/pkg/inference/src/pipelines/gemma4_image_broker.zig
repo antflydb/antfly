@@ -67,7 +67,10 @@ pub fn shape(group: grouped.Group) !?micro.Shape {
 /// executor; callers already validated source policies and decoded-pixel limits.
 pub fn groupShape(group: grouped.Group) !micro.Shape {
     var result = micro.Shape{ .tokens = 128 };
-    if (group.title) |title| result.bytes = title.len;
+    if (group.title) |title| {
+        result.bytes = title.len;
+        result.tokens = @min(8192, result.tokens +| title.len);
+    }
     for (group.content) |part| switch (part) {
         .text => |text| {
             result.bytes = try std.math.add(usize, result.bytes, text.len);
@@ -87,13 +90,14 @@ pub fn groupShape(group: grouped.Group) !micro.Shape {
             result.bytes = try std.math.add(usize, result.bytes, try std.math.mul(usize, pcm.samples.len, @sizeOf(f32)));
             result.tokens = @min(@as(usize, 8192), result.tokens + try projector.embeddingGemma2PcmSequenceLength(pcm.samples.len, pcm.sample_rate));
         },
-        .video => |bytes| {
-            result.bytes = try std.math.add(usize, result.bytes, bytes.len);
-            result.tokens = 8192;
-        },
-        .sampled_video => |movie| {
-            result.bytes = try std.math.add(usize, result.bytes, if (movie.reader != null) 0 else movie.bytes.len);
-            result.tokens = 8192;
+        .video, .sampled_video => {
+            // Reader-backed windows without an admitted public request shape
+            // run in their owning executor. Never queue unmeasured pixels.
+            const movie = grouped.Group.encodedVideo(part) orelse return error.InvalidVideoReaderSelection;
+            const item = group.inspection(movie) orelse return error.InvalidVideoReaderSelection;
+            result.bytes = try std.math.add(usize, result.bytes, movie.bytes.len);
+            result.pixels = try std.math.add(u64, result.pixels, item.pixels);
+            result.tokens = if (item.portable) |entry| @min(8192, result.tokens + entry.plan.sequence_tokens) else 8192;
         },
     };
     return result;
@@ -114,7 +118,13 @@ const Ticket = struct {
 /// A 200-us server default is bounded further by the broker's earliest deadline.
 pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, model: []const u8, generation: usize, session: Session, tokenizer: Tokenizer, gate: ?*std.atomic.Mutex, control: Control, groups: []const grouped.Group, options: grouped.Options, max_wait_us: u64, max_bytes: usize, max_pixels: u64, max_batch: usize) !?Result {
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return null;
-    if (options.timings != null or groups.len == 0 or !options.prepare_ahead or options.video_ahead != null or options.video_prepared != null or options.video_decoder.telemetry != null or (session.backend() != .native and session.backend() != .metal and session.backend() != .cuda)) return null;
+    if (groups.len == 0 or !options.prepare_ahead or (session.backend() != .native and session.backend() != .metal and session.backend() != .cuda)) return null;
+    // Per-request hooks, borrowed state and result storage cannot be forwarded
+    // as shared options to an execution spanning multiple callers.
+    if (options.timings != null or options.video_decoder.telemetry != null or
+        options.video_ahead != null or options.video_prepared != null or options.video_prepared_frames != null or
+        options.video_observer != null or options.video_coefficients != null or options.video_inspection_scope != null or
+        options.video_cache_pins != null or options.video_encoded != null or options.video_composition != null) return null;
     var general = false;
     for (groups) |group| {
         grouped.validateGroup(group, options) catch return null;
@@ -153,8 +163,10 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
     var largest_sequence: usize = 0;
     var largest_decoded: usize = 0;
     for (groups, 0..) |group, index| {
-        grouped.validateGroup(group, options) catch return null;
         shapes[index] = if (general) (groupShape(group) catch return null) else (shape(group) catch return null) orelse return null;
+        // General queue bytes include captions and raw buffers. A valid item
+        // may fit the executor's encoded-media cap but exceed this queue cap.
+        if (general and shapes[index].bytes > max_bytes) return null;
         if (!general and (group.content[0] == .audio) != audio_mode) return null;
         const raw = group.content[0] == .raster;
         if (raster_mode) |mode| {
@@ -445,7 +457,26 @@ test "embeddinggemma2 prepared broker accounts mixed and video groups before dec
     try std.testing.expectEqual(@as(u64, 4), header.pixels);
     try std.testing.expect(header.tokens <= 8192);
     // Invalid coded payloads have not entered decode or acquired device scratch.
-    const video = try groupShape(.{ .content = &.{ .{ .video = "coded bytes" }, .{ .text = "caption" } } });
+    const parts = [_]grouped.Part{ .{ .video = "coded bytes" }, .{ .text = "caption" } };
+    try std.testing.expectError(error.InvalidVideoReaderSelection, groupShape(.{ .content = &parts }));
+    var items = [_]@import("embedding_gemma2_video.zig").PixelInspection{.{ .bytes = parts[0].video, .pixels = 320 * 240 }};
+    const videos = grouped.AdmittedVideos{ .items = &items };
+    const video = try groupShape(.{ .content = &parts, .videos = &videos });
+    try std.testing.expectEqual(@as(u64, 320 * 240), video.pixels);
     try std.testing.expectEqual(@as(usize, 8192), video.tokens);
     try std.testing.expectEqual(@as(usize, 18), video.bytes);
+
+    const Width = struct {
+        fn record(_: *anyopaque, batch: []const micro.ExecuteItem) void {
+            for (batch) |item| item.slot.setValue(usize, batch.len, .serial);
+        }
+    };
+    const a = std.testing.allocator;
+    var broker = micro.Broker.init(a);
+    defer broker.deinit();
+    for ([_]u64{ 2 * video.pixels - 1, 2 * video.pixels }, [_]usize{ 1, 2 }) |limit, expected_width| {
+        const results = try broker.submitBatchControlled(usize, usize, std.testing.io, a, .{ .model = "video", .task = .embed, .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_pixels = limit }, &.{ video, video }, &.{ .{}, .{} }, null, .{}, &.{ 0, 1 }, &broker, Width.record);
+        defer a.free(results);
+        for (results) |row| try std.testing.expectEqual(expected_width, row.result.value);
+    }
 }

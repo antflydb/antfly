@@ -359,6 +359,8 @@ short_dot:
     // A short dot stays in its owning lane. This keeps the scalar loads
     // and exact FMA order of the small-shape path.
     @!repair bra done;
+    mov.pred wide, 0;
+short_start:
     ld.param.u32 cols, [outputs];
     ld.param.u32 fmt, [bf16];
     setp.ne.u32 is_bf, fmt, 0;
@@ -373,18 +375,27 @@ short_dot:
     shl.b64 start, start, 1;
     add.u64 w, w, start;
     mov.u32 k, inner;
+    mov.f64 acc, 0d0000000000000000;
     mov.f32 sum, 0f00000000;
 short_term:
     ld.global.f32 x, [src];
     ld.global.b16 half, [w];
     @!is_bf cvt.f32.f16 y, half;
     @is_bf mov.b32 y, {0,half};
-    fma.rn.f32 sum, x, y, sum;
+    @!wide fma.rn.f32 sum, x, y, sum;
+    @wide cvt.f64.f32 xd, x;
+    @wide cvt.f64.f32 yd, y;
+    @wide fma.rn.f64 acc, xd, yd, acc;
     add.u64 src, src, 4;
     add.u64 w, w, 2;
     sub.u32 k, k, 1;
     setp.ne.u32 p, k, 0;
     @p bra short_term;
+    @wide cvt.rn.f32.f64 sum, acc;
+    testp.finite.f32 p, sum;
+    or.pred p, p, wide;
+    @!p mov.pred wide, 1;
+    @!p bra short_start;
     st.global.f32 [dst], sum;
 done:
     ret;

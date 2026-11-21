@@ -32,6 +32,10 @@ pub const Limits = struct {
     /// Consumers opt into codecs whose decoding route they support. Preserve
     /// the portable AVC/MJPEG envelope for existing readers.
     codecs: std.EnumSet(Codec) = std.EnumSet(Codec).initMany(&.{ .avc, .mjpeg }),
+
+    pub fn validateDimensions(self: Limits, track: Track) !void {
+        if (track.width > self.max_dimension or track.height > self.max_dimension) return self.track_limit_error;
+    }
 };
 pub const Codec = enum { avc, mjpeg, hevc, av1 };
 pub const Track = struct {
@@ -367,6 +371,7 @@ const Parser = struct {
                 if (t.handler == tag("vide") and t.track != null and selected == null) {
                     if (t.id == 0 or t.scale == 0) return error.MalformedMedia;
                     if (!t.self_contained) return error.UnsupportedDataReference;
+                    try self.limits.validateDimensions(t.track.?);
                     t.track.?.id = t.id;
                     t.track.?.timescale = t.scale;
                     t.track.?.display_matrix = t.matrix;
@@ -483,7 +488,6 @@ const Parser = struct {
                 const width = u16be(b.payload[24..26]);
                 const height = u16be(b.payload[26..28]);
                 if (width == 0 or height == 0) return error.MalformedMedia;
-                if (width > self.limits.max_dimension or height > self.limits.max_dimension) return self.limits.track_limit_error;
                 // External data references cannot safely resolve against this source.
                 if (u16be(b.payload[6..8]) != 1) return error.UnsupportedDataReference;
                 if (codec == .mjpeg and (u16be(b.payload[8..10]) != 0 or u16be(b.payload[40..42]) != 1)) return error.UnsupportedSampleDescription;

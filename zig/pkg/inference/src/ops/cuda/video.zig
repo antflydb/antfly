@@ -135,6 +135,20 @@ fn decodeLimits(sampling: Sampling) media.mp4.Limits {
     return limits;
 }
 
+test "model video NVDEC enforces geometry on the selected track" {
+    const a = std.testing.allocator;
+    const bytes = try a.dupe(u8, @embedFile("../../testdata/video/codecs/hevc-avc-tracks.mp4"));
+    defer a.free(bytes);
+    const config = std.mem.indexOf(u8, bytes, "avcC") orelse return error.InvalidTestFixture;
+    const entry = std.mem.lastIndexOf(u8, bytes[0..config], "avc1") orelse return error.InvalidTestFixture;
+    std.mem.writeInt(u16, bytes[entry + 28 ..][0..2], 5120, .big);
+    const selected = try inspectEmbedding(a, bytes, .{});
+    try std.testing.expectEqual(media.mp4.Codec.hevc, selected.codec);
+    const first = std.mem.indexOf(u8, bytes, "hev1") orelse return error.InvalidTestFixture;
+    std.mem.writeInt(u16, bytes[first + 28 ..][0..2], 5120, .big);
+    try std.testing.expectError(error.DecoderEnvelopeExceeded, inspectEmbedding(a, bytes, .{}));
+}
+
 test "model video NVDEC selects the admission track before checking codec support" {
     const a = std.testing.allocator;
     const bytes = try a.dupe(u8, @embedFile("../../testdata/video/codecs/hevc-avc-tracks.mp4"));
@@ -306,7 +320,7 @@ pub const PreparedEmbedding = struct {
         return self.source.storage.borrowed.len + std.mem.sliceAsBytes(self.reader.packets).len + (if (self.normalized) |config| config.len else 0);
     }
     pub fn deinit(self: *PreparedEmbedding) void {
-        if (self.normalized) |config| self.reader.allocator.free(config);
+        if (self.normalized) |config| self.source.allocator.free(config);
         if (self.owns_reader) self.reader.deinit();
     }
 };
@@ -524,8 +538,12 @@ pub const ReferencePlan = struct {
         if (source != .borrowed or source.borrowed.ptr != bytes.ptr or source.borrowed.len != bytes.len) return error.InvalidVideoReaderSelection;
         // Enforce CUDA geometry limits and the bound track identity without
         // expanding sample tables or selecting a different track.
-        const track = try media.mp4.probeTrack(bytes, limits, control);
-        if (track.codec != self.original.track.codec or track.id != self.original.track.id) return error.InvalidVideoReaderSelection;
+        try control.check();
+        if (!std.meta.eql(self.original.limits.codecs, limits.codecs)) {
+            const track = try media.mp4.probeTrack(bytes, limits, control);
+            if (track.codec != self.original.track.codec or track.id != self.original.track.id) return error.InvalidVideoReaderSelection;
+        }
+        try limits.validateDimensions(self.original.track);
         if (self.original.packets.len > limits.max_samples) return limits.track_limit_error;
         return self.original;
     }
