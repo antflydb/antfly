@@ -25,6 +25,8 @@ let me = null,
 const LOCAL_FLAGS = "antfly-mail-local-v1";
 // Minimal identity for opening an opted-in copy offline; removed on sign-out.
 const OFFLINE_IDENTITY = "antfly-mail-offline-identity-v1";
+// Set while a sign-out wipe is unfinished, so the next load retries it.
+const WIPE_PENDING = "antfly-mail-local-wipe-pending-v1";
 const localModule = () => import("/local-index.js");
 const localSupported = () =>
   typeof Worker !== "undefined" &&
@@ -40,20 +42,37 @@ function localFlags() {
 // Sign-out on a shared machine removes every on-device mailbox copy. This needs
 // no runtime download, so it works even when the local module cannot load.
 async function wipeLocal() {
-  local?.close();
-  local = null;
-  localReady(null);
+  // Never allow offline reopening after sign-out, even if deletion fails.
   try {
-    localStorage.removeItem(LOCAL_FLAGS);
     localStorage.removeItem(OFFLINE_IDENTITY);
+    localStorage.setItem(WIPE_PENDING, "1");
   } catch {
     /* Storage disabled: nothing was ever stored. */
   }
-  if (typeof navigator.storage?.getDirectory !== "function") return;
+  const current = local;
+  local = null;
+  localReady(null);
+  // The open copy's worker holds exclusive OPFS handles: have it release them
+  // and delete every copy before the worker is stopped.
+  if (current) {
+    try {
+      await current.wipeAll();
+    } finally {
+      await current.close();
+    }
+  } else if (typeof navigator.storage?.getDirectory === "function") {
+    try {
+      await (await navigator.storage.getDirectory()).removeEntry("antfly-mail-local", { recursive: true });
+    } catch (error) {
+      if (error?.name !== "NotFoundError") throw error;
+    }
+  }
+  // Forget the opt-in only once the data is gone, so a failed wipe is retried.
   try {
-    await (await navigator.storage.getDirectory()).removeEntry("antfly-mail-local", { recursive: true });
-  } catch (error) {
-    if (error?.name !== "NotFoundError") throw error;
+    localStorage.removeItem(LOCAL_FLAGS);
+    localStorage.removeItem(WIPE_PENDING);
+  } catch {
+    /* Storage disabled: nothing was ever stored. */
   }
 }
 function status(text, error = false) {
@@ -205,6 +224,18 @@ async function refresh() {
     me = error instanceof TypeError ? offlineIdentity() : null;
     offline = !!me;
   }
+  // A sign-out left a copy on disk (its wipe failed, e.g. another tab held it): retry.
+  let wipePending = false;
+  try {
+    wipePending = localStorage.getItem(WIPE_PENDING) === "1";
+  } catch {
+    /* Storage disabled: nothing was ever stored. */
+  }
+  // Finish it before anything can reopen the copy, whoever signs in next.
+  if (!offline && wipePending)
+    await wipeLocal().catch(() => {
+      /* Retried on the next load or sign-out. */
+    });
   $("account").hidden = !!me;
   $("mail").hidden = !me;
   $("logout").hidden = !me;
@@ -212,7 +243,14 @@ async function refresh() {
   if (me) {
     $("address").textContent = "Your mailbox: " + me.mailbox.address;
     $("local").hidden = !localSupported();
-    $("local-toggle").checked = localFlags()[me.mailbox.id] === true;
+    let stillPending = false;
+    try {
+      stillPending = localStorage.getItem(WIPE_PENDING) === "1";
+    } catch {
+      /* Storage disabled. */
+    }
+    $("local-toggle").checked = !stillPending && localFlags()[me.mailbox.id] === true;
+    if (stillPending) localStatus("A previous sign-out's on-device copy is still being removed. Close other tabs of this app.");
     if ($("local-toggle").checked) {
       rememberIdentity();
       startLocal(false);
@@ -330,10 +368,21 @@ $("login").onsubmit = guarded(async (event) => {
   status(me ? "Signed in." : "Check your email to verify your account, then sign in.");
 });
 $("logout").onclick = guarded(async () => {
-  if (local || Object.keys(localFlags()).length) await wipeLocal();
+  let wipeError = null;
+  if (local || Object.keys(localFlags()).length) await wipeLocal().catch((error) => (wipeError = error));
+  // Always end the session, even if the on-device copy could not be removed.
   await api("/api/auth/sign-out", {});
-  await refresh();
-  status("Signed out.");
+  await refresh(); // also retries a failed wipe once
+  let stillPending = false;
+  try {
+    stillPending = localStorage.getItem(WIPE_PENDING) === "1";
+  } catch {
+    /* Storage disabled. */
+  }
+  if (wipeError && stillPending)
+    status("Signed out, but this device's mailbox copy could not be removed: " + wipeError.message +
+      ". Close other tabs of this app and sign in and out again to retry.", true);
+  else status("Signed out.");
 });
 $("search").onsubmit = guarded(async (event) => {
   const e = event.currentTarget.elements,

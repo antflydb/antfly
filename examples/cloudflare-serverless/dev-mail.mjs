@@ -41,10 +41,12 @@ for (const role of ["app", "auth"]) {
   config.triggers = { crons: [] };
   delete config.version_metadata;
   if (config.assets) config.assets.directory = resolve(cwd, config.assets.directory);
-  if (role === "auth") {
+  {
+    // Auth signs sessions; the app signs on-device model download grants.
+    const name = role === "auth" ? "BETTER_AUTH_SECRET" : "LOCAL_MODEL_GRANT_SECRET";
     const secret = resolve(dir, ".dev.vars");
     try {
-      await writeFile(secret, "BETTER_AUTH_SECRET=" + randomBytes(32).toString("hex") + "\n", {
+      await writeFile(secret, name + "=" + randomBytes(32).toString("hex") + "\n", {
         flag: "wx",
         mode: 0o600,
       });

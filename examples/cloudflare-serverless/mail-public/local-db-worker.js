@@ -74,12 +74,14 @@ function status(current = state()) {
   return { ...(current ?? {}), mailbox, ...pool.stats() };
 }
 
+let lastOpen = null;
 const handlers = {
   // Open (or create) this mailbox's database. A copy built for another model
   // or vector size is discarded: vectors from different spaces never mix.
   async open({ mailboxId, runtime: urls, space }) {
     if (!/^[a-f0-9-]{36}$/.test(mailboxId ?? "")) throw Error("InvalidMailbox");
     close();
+    lastOpen = { mailboxId, runtime: urls, space };
     const { client, fs } = await loadRuntime(urls);
     const directory = await (await root()).getDirectoryHandle(mailboxId, { create: true });
     try {
@@ -98,7 +100,10 @@ const handlers = {
       return handlers.open({ mailboxId, runtime: urls, space });
     }
     if (!current) {
-      api.addIndex(localSchema.vectorIndex(space.dimensions));
+      // Setup is two commits; an interrupted first open may have added the
+      // index already, so only add what is missing.
+      const index = localSchema.vectorIndex(space.dimensions);
+      if (!api.listIndexes().some((existing) => existing.name === index.name)) api.addIndex(index);
       api.put(STATE, { space, cursor: "", messages: 0 });
     }
     return status();
@@ -135,6 +140,21 @@ const handlers = {
     } catch {
       return null;
     }
+  },
+
+  // The server's log no longer matches this copy: rebuild it from scratch.
+  async reset() {
+    if (!lastOpen) throw Error("LocalIndexClosed");
+    const args = lastOpen;
+    close();
+    await removeEntry(await root(), args.mailboxId);
+    return handlers.open(args);
+  },
+
+  // Release the database and the OPFS handles before the worker is stopped.
+  async close() {
+    close();
+    return true;
   },
 
   async status() {

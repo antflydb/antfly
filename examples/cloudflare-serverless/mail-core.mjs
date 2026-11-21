@@ -320,7 +320,9 @@ export class MailSyncLog {
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw Error("InvalidSyncLimit");
     return this.store.transaction(async (tx) => {
       const head = (await tx.get(this.prefix + "head")) ?? 0;
-      if (after > head) throw Error("InvalidSyncCursor");
+      // A cursor past the head means the log was restored or rebuilt since the
+      // replica synced: tell it to rebuild from the start, not fail forever.
+      if (after > head) return { ids: [], cursor: "", head, more: head > 0, reset: true };
       const page = await tx.list({
         prefix: this.prefix + "log/",
         startAfter: after ? this.entryKey(after) : "",

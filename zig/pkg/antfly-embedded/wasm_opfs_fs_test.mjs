@@ -20,6 +20,7 @@ import { openOpfsFileSystem, destroyOpfsFileSystem, status } from "./wasm_opfs_f
 
 const notFound = () => Object.assign(new Error("missing"), { name: "NotFoundError" });
 
+const faults = { quota: false };
 class FakeFile {
     constructor(bytes = new Uint8Array(0)) {
         this.durable = bytes.slice();
@@ -50,6 +51,7 @@ function syncHandle(file) {
         },
         write(bytes, { at = file.current.length } = {}) {
             live();
+            if (faults.quota) throw Object.assign(new Error("quota"), { name: "QuotaExceededError" });
             file.current = grow(file.current, at + bytes.length);
             file.current.set(bytes, at);
             return bytes.length;
@@ -236,6 +238,29 @@ function readAll(fs, path) {
     await assert.rejects(openOpfsFileSystem(dir), /OpfsBusy/);
     reopened.close();
     await destroyOpfsFileSystem({ removeEntry: async () => {} }, "pool");
+}
+
+// A create that fails partway (quota) returns its slot to the pool.
+{
+    const dir = directory();
+    const fs = await openOpfsFileSystem(dir, { initialSlots: 2, reserve: 0 });
+    faults.quota = true;
+    for (let i = 0; i < 5; i++) assert.equal(fs.write("/db/x", bytes("x"), false), status.noSpace);
+    faults.quota = false;
+    assert.equal(fs.stats().free, 2, "failed creates do not leak slots");
+    assert.equal(fs.size("/db/x"), status.notFound);
+    assert.equal(fs.write("/db/x", bytes("x"), false), 0);
+    fs.close();
+}
+
+// Overlapping capacity requests are serialized instead of racing for a file.
+{
+    const dir = directory();
+    const fs = await openOpfsFileSystem(dir, { initialSlots: 1, reserve: 0 });
+    await Promise.all([fs.ensureCapacity(4), fs.ensureCapacity(6), fs.ensureCapacity(5)]);
+    assert.equal(fs.stats().free, 6);
+    assert.equal(new Set(dir.files.keys()).size, fs.stats().slots);
+    fs.close();
 }
 
 console.log("antfly embedded OPFS file system tests passed");

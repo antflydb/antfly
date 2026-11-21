@@ -58,7 +58,10 @@ Enable it on a deployment:
 npx wrangler r2 bucket create antfly-mail-models
 ANTFLY_ZIG=/path/to/zig npm run build:local -- --upload
 
-# 2. Publish a text-only copy of EmbeddingGemma 2 to the same private bucket.
+# 2. Set the secret that signs short-lived model download grants.
+npx wrangler secret put LOCAL_MODEL_GRANT_SECRET --config wrangler.mail-app.jsonc
+
+# 3. Publish a text-only copy of EmbeddingGemma 2 to the same private bucket.
 antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
 npm run publish:local-model -- \
   --model-dir ~/.antfly/inference/models/google/embeddinggemma-2--antfly-... \
@@ -67,7 +70,10 @@ npm run publish:local-model -- \
 
 The publish script removes the image/audio towers, which the browser never
 loads, and writes a `catalog.json` with SHA-256 pins that the browser verifies.
-Files are served same-origin from `/local/models/` to signed-in users only. The
+Files are served same-origin from `/local/models/`. The browser's model cache
+downloads without cookies, so the signed-in catalog response gives each file a
+one-hour HMAC grant URL; files are never served without a session or a valid
+grant. `npm run dev:mail` generates a local grant secret. The
 weights keep their upstream license; serving them is subject to its terms. For
 `npm run dev:mail`, add `--local` to both upload commands to use the local
 Miniflare bucket.

@@ -62,6 +62,20 @@ function privatePath(pathname) {
   );
 }
 
+// Each deploy has a new content-addressed runtime directory. Once the current
+// build is known, drop cached files from every other build.
+async function pruneRuntime(configResponse) {
+  try {
+    const { build } = await configResponse.json();
+    if (!/^[a-f0-9]{16}$/.test(build ?? "")) return;
+    const cache = await caches.open(RUNTIME);
+    for (const request of await cache.keys())
+      if (!new URL(request.url).pathname.startsWith(`/local/${build}/`)) await cache.delete(request);
+  } catch {
+    /* Pruning is best effort; stale entries are retried on the next load. */
+  }
+}
+
 self.addEventListener("fetch", (event) => {
   const request = event.request;
   const url = new URL(request.url);
@@ -89,6 +103,7 @@ self.addEventListener("fetch", (event) => {
         if (response.ok && response.type === "basic") {
           const key = request.mode === "navigate" ? "/" : request;
           await cache.put(key, response.clone());
+          if (url.pathname === "/local/config.json") event.waitUntil(pruneRuntime(response.clone()));
         }
         return response;
       } catch (error) {

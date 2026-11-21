@@ -89,7 +89,9 @@ test("sync log assigns one ordered sequence per message and backfills old mailbo
   assert.equal(empty.cursor, cursor);
   for (const bad of ["x", "-1", "99999999999999", "1".repeat(14)])
     await assert.rejects(log.page(bad), /InvalidSyncCursor/);
-  await assert.rejects(log.page(String(Number(cursor) + 1)), /InvalidSyncCursor/);
+  // A replica ahead of the log (e.g. after a restore) is told to rebuild.
+  const ahead = await log.page(String(Number(cursor) + 1));
+  assert.deepEqual([ahead.reset, ahead.cursor, ahead.ids.length, ahead.more], [true, "", 0, true]);
 });
 
 test("sync export is text-only, bounded and drops attachment storage details", () => {
@@ -126,10 +128,18 @@ function env(overrides = {}) {
         },
       }),
     },
+    LOCAL_MODEL_GRANT_SECRET: "test-grant-secret",
     MAIL_MODELS: {
       async get(key) {
         calls.push({ model: key });
-        return key === "local-models/catalog.json" ? { body: "{}", size: 2 } : null;
+        const objects = {
+          "local-models/catalog.json": JSON.stringify({
+            id: "m",
+            files: [{ path: "model.safetensors", url: "/local/models/model.safetensors", sha256: "a".repeat(64), size_bytes: 4 }],
+          }),
+          "local-models/model.safetensors": "wgts",
+        };
+        return key in objects ? { body: objects[key], size: objects[key].length } : null;
       },
     },
     MAIL_ASSETS: {
@@ -152,8 +162,31 @@ test("sync and model routes are scoped to the signed-in mailbox", async () => {
   assert.equal(e.calls[1].id, e.mailbox.id);
   const catalog = await get("/local/models/catalog.json", e);
   assert.equal(catalog.status, 200);
-  assert.equal(catalog.headers.get("Cache-Control"), "private, no-cache");
+  assert.equal(catalog.headers.get("Cache-Control"), "private, no-store");
   assert.ok(e.calls.some((c) => c.model === "local-models/catalog.json"));
+  // The browser model cache downloads without cookies: the signed-in catalog
+  // hands out short-lived grant URLs, valid only for their own file.
+  const [pin] = (await catalog.json()).files;
+  assert.match(pin.url, /^\/local\/models\/model\.safetensors\?grant=\d+\.[a-f0-9]{64}$/);
+  const anonymous = env({ AUTH_SERVICE: { session: async () => ({ session: null, cookies: [] }) } });
+  const granted = await get(pin.url, anonymous);
+  assert.equal(granted.status, 200);
+  assert.equal(await granted.text(), "wgts");
+  const grant = new URL(pin.url, "https://x").searchParams.get("grant");
+  assert.equal((await get("/local/models/model.safetensors", anonymous)).status, 401, "no grant, no cookie");
+  assert.equal((await get("/local/models/other.bin?grant=" + grant, anonymous)).status, 401, "grant is per file");
+  const tampered = grant.slice(0, -1) + (grant.endsWith("0") ? "1" : "0");
+  assert.equal((await get("/local/models/model.safetensors?grant=" + tampered, anonymous)).status, 401);
+  const expired = "1." + grant.split(".")[1];
+  assert.equal((await get("/local/models/model.safetensors?grant=" + expired, anonymous)).status, 401);
+  assert.equal(
+    (await get(pin.url, env({ ...anonymous, LOCAL_MODEL_GRANT_SECRET: "rotated" }))).status,
+    401,
+    "rotating the secret revokes outstanding grants"
+  );
+  assert.equal((await get("/local/models/catalog.json?grant=" + grant, anonymous)).status, 401, "the catalog needs a session");
+  const noSecret = env({ LOCAL_MODEL_GRANT_SECRET: undefined });
+  assert.equal((await get("/local/models/catalog.json", noSecret)).status, 503);
   for (const path of ["/local/models/a//b", "/local/models/", "/local/models/a/./b", "/local/models/missing.bin"])
     assert.equal((await get(path, e)).status, 404, path);
   // URL parsing resolves dot segments before routing, so they never reach R2.
@@ -328,7 +361,7 @@ async function settled($, pattern) {
 }
 const html = await readFile(new URL("../mail-public/index.html", import.meta.url), "utf8"),
   script = await readFile(new URL("../mail-public/mail.js", import.meta.url), "utf8");
-async function ui({ supported = true, flags = null, online = true } = {}) {
+async function ui({ supported = true, flags = null, online = true, failRemoves = 0, storage = null } = {}) {
   const dom = new JSDOM(html, { url: "https://mail.example.test/", runScripts: "outside-only" }),
     { window } = dom,
     removed = [];
@@ -336,6 +369,7 @@ async function ui({ supported = true, flags = null, online = true } = {}) {
     user: { id: "alice", email: "alice@example.test" },
     mailbox: { id: crypto.randomUUID(), address: "me@example.test" },
   };
+  for (const [key, value] of Object.entries(storage ?? {})) window.localStorage.setItem(key, value);
   if (flags) window.localStorage.setItem("antfly-mail-local-v1", JSON.stringify(flags(me)));
   if (supported) {
     window.Worker = class {};
@@ -343,7 +377,11 @@ async function ui({ supported = true, flags = null, online = true } = {}) {
     Object.defineProperty(window.navigator, "storage", {
       value: {
         getDirectory: async () => ({
-          removeEntry: async (name, options) => removed.push([name, options]),
+          removeEntry: async (name, options) => {
+            if (failRemoves-- > 0)
+              throw Object.assign(new Error("locked by another tab"), { name: "NoModificationAllowedError" });
+            removed.push([name, options]);
+          },
         }),
       },
     });
@@ -399,6 +437,53 @@ test("on-device search is opt-in, hidden where unsupported, and wiped on sign-ou
   }
 });
 
+test("sign-out always completes; a failed on-device wipe is retried before any reopen", async () => {
+  // A transient failure is retried by the post-sign-out refresh.
+  const transient = await ui({ flags: (me) => ({ [me.mailbox.id]: true }), failRemoves: 1 });
+  try {
+    await settled(transient.$, /unavailable/);
+    await transient.$("logout").onclick();
+    assert.equal(transient.$("status").textContent, "Signed out.");
+    assert.equal(transient.removed.length, 1);
+    assert.equal(transient.window.localStorage.getItem("antfly-mail-local-wipe-pending-v1"), null);
+  } finally {
+    transient.dom.window.close();
+  }
+  // A persistent failure (another tab holds the copy) is reported and kept pending.
+  const f = await ui({ flags: (me) => ({ [me.mailbox.id]: true }), failRemoves: 2 });
+  let carried;
+  try {
+    f.window.localStorage.setItem(
+      "antfly-mail-offline-identity-v1",
+      JSON.stringify({ user: { email: "alice@example.test" }, mailbox: { id: f.me.mailbox.id, address: "me@example.test" } })
+    );
+    await settled(f.$, /unavailable/);
+    await f.$("logout").onclick();
+    assert.equal(f.$("account").hidden, false, "the session ended despite the failed wipe");
+    assert.match(f.$("status").textContent, /could not be removed/);
+    assert.equal(f.removed.length, 0);
+    // Offline reopening is impossible immediately; the opt-in stays for the retry.
+    assert.equal(f.window.localStorage.getItem("antfly-mail-offline-identity-v1"), null);
+    assert.equal(f.window.localStorage.getItem("antfly-mail-local-wipe-pending-v1"), "1");
+    assert.notEqual(f.window.localStorage.getItem("antfly-mail-local-v1"), null);
+    carried = Object.fromEntries(
+      ["antfly-mail-local-v1", "antfly-mail-local-wipe-pending-v1"].map((k) => [k, f.window.localStorage.getItem(k)])
+    );
+  } finally {
+    f.dom.window.close();
+  }
+  // The next load (here signed in again) finishes the wipe before reopening.
+  const next = await ui({ storage: carried });
+  try {
+    assert.equal(JSON.stringify(next.removed), JSON.stringify([["antfly-mail-local", { recursive: true }]]));
+    assert.equal(next.window.localStorage.getItem("antfly-mail-local-wipe-pending-v1"), null);
+    assert.equal(next.window.localStorage.getItem("antfly-mail-local-v1"), null);
+    assert.equal(next.$("local-toggle").checked, false, "the wiped copy is not reopened");
+  } finally {
+    next.dom.window.close();
+  }
+});
+
 test("offline start opens an opted-in copy instead of the sign-in screen", async () => {
   const mailbox = crypto.randomUUID();
   const dom = new JSDOM(html, { url: "https://mail.example.test/", runScripts: "outside-only" });
@@ -440,12 +525,27 @@ test("offline start opens an opted-in copy instead of the sign-in screen", async
 test("service worker never caches mail, auth or model weights", async () => {
   const source = await readFile(new URL("../mail-public/sw.js", import.meta.url), "utf8");
   const listeners = {},
-    stored = new Map(),
+    named = new Map(),
     fetched = [];
-  const cache = {
-    match: async (key) => stored.get(typeof key === "string" ? key : new URL(key.url).pathname),
-    put: async (key, response) => stored.set(typeof key === "string" ? key : new URL(key.url).pathname, response),
-    addAll: async () => {},
+  const keyOf = (key) => (typeof key === "string" ? key : new URL(key.url).pathname);
+  const open = async (name) => {
+    if (!named.has(name)) {
+      const entries = new Map();
+      named.set(name, {
+        entries,
+        match: async (key) => entries.get(keyOf(key)),
+        put: async (key, response) => entries.set(keyOf(key), response),
+        addAll: async () => {},
+        keys: async () => [...entries.keys()].map((path) => ({ url: "https://mail.example.test" + path })),
+        delete: async (key) => entries.delete(keyOf(key)),
+      });
+    }
+    return named.get(name);
+  };
+  // Every path stored in any cache.
+  const stored = {
+    keys: () => [...named.values()].flatMap((cache) => [...cache.entries.keys()]),
+    has: (path) => stored.keys().includes(path),
   };
   const self = {
     location: new URL("https://mail.example.test/sw.js"),
@@ -456,27 +556,34 @@ test("service worker never caches mail, auth or model weights", async () => {
   let online = true;
   new Function("self", "caches", "fetch", source)(
     self,
-    { open: async () => cache, keys: async () => [], delete: async () => true },
+    { open, keys: async () => [...named.keys()], delete: async (name) => named.delete(name) },
     async (request) => {
-      fetched.push(new URL(request.url).pathname);
+      const path = new URL(request.url).pathname;
+      fetched.push(path);
       if (!online) throw new TypeError("offline");
-      const response = new Response("ok");
+      const response = new Response(path === "/local/config.json" ? JSON.stringify({ build: "0123456789abcdef" }) : "ok");
       Object.defineProperty(response, "type", { value: "basic" });
       return response;
     }
   );
   async function request(path, mode = "cors") {
     let responded = null;
+    const background = [];
     listeners.fetch({
       request: { method: "GET", url: "https://mail.example.test" + path, mode },
       respondWith: (value) => (responded = value),
+      waitUntil: (promise) => background.push(promise),
     });
-    return responded ? await responded : null;
+    const result = responded ? await responded : null;
+    await Promise.all(background);
+    return result;
   }
   for (const path of ["/mail/messages", "/mail/sync?cursor=1", "/api/me", "/local/models/model.safetensors"])
     assert.equal(await request(path), null, path + " must bypass the service worker");
+  await request("/local/ffffffffffffffff/antfly/antfly.wasm"); // a previous deploy
   await request("/local/0123456789abcdef/antfly/antfly.wasm");
-  await request("/local/config.json");
+  assert.ok(stored.has("/local/ffffffffffffffff/antfly/antfly.wasm"));
+  await request("/local/config.json"); // names the current build: older ones are pruned
   await request("/local/models/catalog.json");
   await request("/mail.js");
   assert.deepEqual([...stored.keys()].sort(), [

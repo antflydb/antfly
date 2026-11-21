@@ -141,8 +141,10 @@ in the **same transaction** that marks a message indexed and lists it. A
 per-message marker makes recording idempotent across queue replay. Mailboxes
 created before the log existed are backfilled in bounded steps by walking the
 received-order index; markers prevent duplicates when new mail races the
-backfill. `GET /mail/sync?cursor=<seq>` returns up to 25 messages after the
-cursor, oldest first: id, thread, subject, addresses, time, attachment names and
+backfill. A cursor beyond the log's head, for example after a server-side
+restore, gets `reset: true` and the replica rebuilds from the start instead of
+failing on every sync. `GET /mail/sync?cursor=<seq>` returns up to 25 messages
+after the cursor, oldest first: id, thread, subject, addresses, time, attachment names and
 sizes, and text truncated to 64 KiB. It omits attachment bytes, R2 keys and
 digests. The session selects the actor, as for every other route; a cursor is
 only a position and grants nothing. Deletion and edits are not synchronized,
@@ -166,9 +168,14 @@ tensors (the regex the runtime uses to skip them). That roughly halves the
 download and keeps every file under `@antfly/web`'s 1 GiB catalog file limit.
 The bundle's own integrity receipt pins the unstripped weights, so it is
 replaced by catalog SHA-256 pins, which `downloadCatalogModel` verifies and
-caches in OPFS. Weights are served same-origin from a private R2 bucket, only to
-signed-in users. This keeps `connect-src 'self'` and avoids becoming an open
-mirror. The weights keep their upstream license.
+caches in OPFS. Weights are served same-origin from a private R2 bucket, which keeps
+`connect-src 'self'`. The deployment must not become an open mirror, but
+`@antfly/web` downloads pinned files with `credentials: "omit"`, so a cookie
+cannot authorize them. Instead, the session-authenticated catalog response
+rewrites each file URL with a one-hour grant: an HMAC-SHA-256 over the path and
+expiry, keyed by `LOCAL_MODEL_GRANT_SECRET`. The weight route accepts a session
+or a valid, unexpired grant for that exact path. Rotating the secret revokes
+outstanding grants. The weights keep their upstream license.
 
 Vectors are written as an **external** `dense_vector` index (cosine, 256 dims by
 default) through `_embeddings`, so the embedded database needs no embedder
@@ -217,8 +224,12 @@ bounded by the 2 GiB wasm32 memory.
 - **Text and vectors stay on the device.** The server sees only `/mail/sync`
   reads, the same data the inbox already shows that user.
 - **Sign-out removes every on-device copy** and the remembered offline identity,
-  for shared machines. This works without loading the runtime. The model cache
-  is kept because it contains no user data.
+  for shared machines. The database worker releases its exclusive OPFS handles
+  before the copy is deleted. The offline identity is removed first, so offline
+  reopening is impossible even if deletion fails (for example, while another
+  tab holds the copy). Sign-out always completes. A failed deletion is retried
+  on the next page load and blocks the copy from being reopened until it
+  succeeds. The model cache is kept because it contains no user data.
 - **"Remove from this device"** deletes one mailbox's copy.
 - **Offline.** The service worker caches the shell, the content-addressed runtime
   (immutable), and the runtime config and model catalog (network-first). It

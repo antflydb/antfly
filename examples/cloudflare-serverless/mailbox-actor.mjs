@@ -281,6 +281,7 @@ export class Mailbox extends R2CommitCoordinator {
     return {
       messages,
       cursor: page.cursor,
+      ...(page.reset ? { reset: true } : {}),
       more: page.more || !backfilled,
       limits: { text_bytes: syncLimits.textBytes },
     };

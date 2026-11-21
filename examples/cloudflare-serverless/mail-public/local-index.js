@@ -116,6 +116,11 @@ class DatabaseWorker {
   terminate() {
     this.worker.terminate();
   }
+  /** Close the database (releasing its OPFS handles), then stop the worker. */
+  async shutdown() {
+    await this.call("close").catch(() => {});
+    this.terminate();
+  }
 }
 
 export class LocalMailIndex {
@@ -126,39 +131,51 @@ export class LocalMailIndex {
   static async open(mailboxId, { onStatus = () => {}, config } = {}) {
     if (!supported()) throw Error("This browser cannot run on-device search");
     config ??= await localConfig();
-    const flags = readFlags();
-    flags[mailboxId] = true;
-    writeFlags(flags);
-    // Ask the browser not to evict the copy under storage pressure.
-    await navigator.storage.persist?.().catch(() => false);
-    const web = await import(config.runtime.web);
-    const inference = await web.Inference.create({ assets: config.runtime.inference });
-    onStatus({ stage: "model-download", loaded: 0, total: config.downloadBytes });
-    const files = await web.downloadCatalogModel(config.catalog, {
-      assets: config.runtime.inference,
-      onProgress: (p) => onStatus({ stage: "model-" + p.stage, loaded: p.loaded, total: p.total }),
-    });
-    onStatus({ stage: "model-load" });
-    const model = await inference.loadModel(files, {
-      backend: "wasm",
-      precision: config.catalog.precision,
-      onProgress: (p) => onStatus({ stage: "model-" + p.stage, loaded: p.loaded, total: p.total }),
-    });
-    if (!model.execution.tasks.includes("embed"))
-      throw Error("The published model cannot produce embeddings in this browser");
     const space = {
       model: config.catalog.id,
       files: config.catalog.files.map((f) => f.sha256).join(":"),
       dimensions: config.embedding.dimensions,
       max_tokens: config.embedding.max_tokens,
     };
+    // Open the database first: it is cheap and fails fast (for example when
+    // another tab holds the copy) before a large model download or load.
     const database = new DatabaseWorker();
-    const state = await database.call("open", { mailboxId, runtime: config.runtime.antfly, space });
-    return new LocalMailIndex(mailboxId, inference, database, config, state);
+    let inference = null;
+    try {
+      const state = await database.call("open", { mailboxId, runtime: config.runtime.antfly, space });
+      // Ask the browser not to evict the copy under storage pressure.
+      await navigator.storage.persist?.().catch(() => false);
+      const web = await import(config.runtime.web);
+      inference = await web.Inference.create({ assets: config.runtime.inference });
+      onStatus({ stage: "model-download", loaded: 0, total: config.downloadBytes });
+      const files = await web.downloadCatalogModel(config.catalog, {
+        assets: config.runtime.inference,
+        onProgress: (p) => onStatus({ stage: "model-" + p.stage, loaded: p.loaded, total: p.total }),
+      });
+      onStatus({ stage: "model-load" });
+      const model = await inference.loadModel(files, {
+        backend: "wasm",
+        precision: config.catalog.precision,
+        onProgress: (p) => onStatus({ stage: "model-" + p.stage, loaded: p.loaded, total: p.total }),
+      });
+      if (!model.execution.tasks.includes("embed"))
+        throw Error("The published model cannot produce embeddings in this browser");
+      // Record the opt-in only once the copy is usable.
+      const flags = readFlags();
+      flags[mailboxId] = true;
+      writeFlags(flags);
+      return new LocalMailIndex(mailboxId, inference, database, config, state, space);
+    } catch (error) {
+      // Release the model memory and the worker's OPFS handles.
+      inference?.dispose();
+      await database.shutdown();
+      throw error;
+    }
   }
 
-  constructor(mailboxId, inference, database, config, state) {
+  constructor(mailboxId, inference, database, config, state, space) {
     this.mailboxId = mailboxId;
+    this.space = space;
     this.inference = inference;
     this.database = database;
     this.config = config;
@@ -197,6 +214,11 @@ export class LocalMailIndex {
           if (response.status === 401) throw Error("Sign in again to continue syncing");
           if (!response.ok) throw Error("Sync is temporarily unavailable");
           const page = await response.json();
+          if (page.reset) {
+            onStatus({ stage: "reset" });
+            this.state = await this.database.call("reset");
+            continue;
+          }
           const vectors = [];
           for (let at = 0; at < page.messages.length; at += EMBED_BATCH) {
             signal?.throwIfAborted();
@@ -239,17 +261,22 @@ export class LocalMailIndex {
     return this.database.call("message", { id });
   }
 
+  /** Delete every mailbox copy on this device (sign-out). Call close() after. */
+  async wipeAll() {
+    await this.database.call("destroy", {});
+  }
+
   /** Stop, delete this mailbox's copy and opt out. Keeps the cached model. */
   async remove() {
     await this.database.call("destroy", { mailboxId: this.mailboxId });
-    this.close();
+    await this.close();
     const flags = readFlags();
     delete flags[this.mailboxId];
     writeFlags(flags);
   }
 
   close() {
-    this.database.terminate();
     this.inference.dispose();
+    return this.database.shutdown();
   }
 }

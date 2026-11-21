@@ -41,9 +41,6 @@ export const contentSecurityPolicy =
   "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; " +
   "connect-src 'self'; img-src 'self'; manifest-src 'self'; object-src 'none'; " +
   "base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
-// The on-device embedding model, published by the operator to a private R2
-// bucket (see publish-local-model.mjs). Served only to signed-in users so the
-// deployment is not an open mirror; never contains user data.
 // Content-addressed public runtime code (no user data), so no session needed.
 async function localRuntime(env, pathname) {
   const object = await env.MAIL_MODELS.get("local-runtime/" + pathname.slice("/local/".length));
@@ -55,27 +52,71 @@ async function localRuntime(env, pathname) {
       : "application/octet-stream";
   return new Response(object.body, { headers: { "Content-Type": type, "Content-Length": String(object.size) } });
 }
-async function localModel(env, pathname, method) {
+
+// The on-device embedding model, published by the operator to a private R2
+// bucket (see publish-local-model.mjs). It never contains user data, but the
+// deployment must not become an open mirror of licensed weights. The catalog
+// is served to signed-in users with short-lived grant URLs, because the
+// browser model cache downloads pinned files without cookies.
+const GRANT_SECONDS = 3600;
+const hex = (bytes) => Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, "0")).join("");
+async function grantSignature(env, path, expires) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(env.LOCAL_MODEL_GRANT_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  return hex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(path + "\n" + expires)));
+}
+export async function modelGrant(env, path, now = Date.now()) {
+  const expires = Math.floor(now / 1000) + GRANT_SECONDS;
+  return expires + "." + (await grantSignature(env, path, expires));
+}
+async function validGrant(env, path, grant, now = Date.now()) {
+  const match = /^(\d{1,12})\.([a-f0-9]{64})$/.exec(grant ?? "");
+  if (!match || !env.LOCAL_MODEL_GRANT_SECRET || Number(match[1]) < now / 1000) return false;
+  const expected = await grantSignature(env, path, match[1]);
+  // Constant-time comparison of equal-length hex strings.
+  let difference = 0;
+  for (let i = 0; i < expected.length; i++) difference |= expected.charCodeAt(i) ^ match[2].charCodeAt(i);
+  return difference === 0;
+}
+function modelPathOf(pathname) {
   const path = pathname.slice("/local/models/".length);
-  if (
-    method !== "GET" ||
-    !env.MAIL_MODELS ||
-    !path ||
-    path.length > 512 ||
-    path.split("/").some((part) => !part || part === "." || part === "..") ||
-    !/^[A-Za-z0-9._/-]+$/.test(path)
-  )
-    return new Response("not found", { status: 404 });
+  return path &&
+    path.length <= 512 &&
+    !path.split("/").some((part) => !part || part === "." || part === "..") &&
+    /^[A-Za-z0-9._/-]+$/.test(path)
+    ? path
+    : null;
+}
+async function localModel(env, url, method, signedIn) {
+  const path = modelPathOf(url.pathname);
+  if (method !== "GET" || !env.MAIL_MODELS || !path) return new Response("not found", { status: 404 });
+  if (path === "catalog.json") {
+    if (!signedIn) return Response.json({ error: "SignInRequired" }, { status: 401 });
+    if (!env.LOCAL_MODEL_GRANT_SECRET)
+      return Response.json({ error: "LocalModelGrantSecretMissing" }, { status: 503 });
+  } else if (!signedIn && !(await validGrant(env, path, url.searchParams.get("grant"))))
+    return Response.json({ error: "SignInRequired" }, { status: 401 });
   const object = await env.MAIL_MODELS.get((env.MAIL_MODEL_PREFIX ?? "local-models/") + path);
   if (!object) return new Response("not found", { status: 404 });
+  const headers = {
+    "Content-Type": path.endsWith(".json") ? "application/json" : "application/octet-stream",
+    "X-Content-Type-Options": "nosniff",
+  };
+  if (path === "catalog.json") {
+    const catalog = JSON.parse(await new Response(object.body).text());
+    for (const file of catalog.files ?? [])
+      if (typeof file.path === "string" && modelPathOf("/local/models/" + file.path))
+        file.url = "/local/models/" + file.path + "?grant=" + (await modelGrant(env, file.path));
+    return Response.json(catalog, { headers: { ...headers, "Cache-Control": "private, no-store" } });
+  }
+  // Pinned weight files are content-checked by the browser before use.
   return new Response(object.body, {
-    headers: {
-      "Content-Type": path.endsWith(".json") ? "application/json" : "application/octet-stream",
-      "Content-Length": String(object.size),
-      // The catalog can be republished; pinned weight files are content-checked.
-      "Cache-Control": path === "catalog.json" ? "private, no-cache" : "private, max-age=86400",
-      "X-Content-Type-Options": "nosniff",
-    },
+    headers: { ...headers, "Content-Length": String(object.size), "Cache-Control": "private, max-age=86400" },
   });
 }
 export default {
@@ -89,6 +130,9 @@ export default {
     }
     if (url.pathname.startsWith("/api/auth/")) return env.AUTH_SERVICE.fetch(request);
     const modelPath = url.pathname.startsWith("/local/models/");
+    // Granted weight downloads carry no cookies; they are authorized by URL.
+    if (modelPath && url.pathname !== "/local/models/catalog.json" && url.searchParams.has("grant"))
+      return localModel(env, url, request.method, false);
     if (!url.pathname.startsWith("/mail/") && url.pathname !== "/api/me" && !modelPath) {
       if (request.method !== "GET" || !env.MAIL_ASSETS)
         return new Response("not found", { status: 404 });
@@ -123,7 +167,7 @@ export default {
       if (request.method !== "GET" && request.headers.get("Origin") !== env.AUTH_ORIGIN)
         return reply({ error: "InvalidOrigin" }, 403);
       if (url.pathname === "/api/me" && request.method === "GET") return reply(session);
-      if (modelPath) return withCookies(await localModel(env, url.pathname, request.method));
+      if (modelPath) return withCookies(await localModel(env, url, request.method, true));
       if (url.pathname === "/mail/messages" && request.method === "GET")
         return reply(
           publicPage(await takeRpcData(stub.list(mailbox.id, url.searchParams.get("cursor") ?? "")))

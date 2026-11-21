@@ -215,8 +215,11 @@ function createHostImports(module, options = {}) {
     // numbers; 64-bit offsets and results cross as BigInt.
     const fs = options.fileSystem;
     const noFs = -5n;
-    const pathAt = (ptr, len) => readUtf8(ptr, len);
-    const bytesAt = (ptr, len) => new Uint8Array(requireExports().memory.buffer, Number(ptr), Number(len));
+    // wasm32 usize arrives as a signed i32: addresses at or above 2 GiB are
+    // negative numbers. (wasm64 passes BigInt.)
+    const address = (value) => (typeof value === "bigint" ? Number(value) : value >>> 0);
+    const bytesAt = (ptr, len) => new Uint8Array(requireExports().memory.buffer, address(ptr), address(len));
+    const pathAt = (ptr, len) => textDecoder.decode(bytesAt(ptr, len));
     const fsCall = (fn) => {
         if (!fs) return noFs;
         try {
