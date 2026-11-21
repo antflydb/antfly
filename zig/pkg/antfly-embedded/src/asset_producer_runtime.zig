@@ -8633,7 +8633,7 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
     var server_err: ?anyerror = null;
     const Serve = struct {
         fn run(s: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
-            for (0..3) |_| s.handleOne() catch |err| {
+            while (true) s.handleOne() catch |err| {
                 failure.* = err;
                 return;
             };
