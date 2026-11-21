@@ -249,6 +249,35 @@ pub fn configurePolicy(txn: anytype, value: Policy) !void {
     try txn.put(policy_key, &encoded);
 }
 
+/// Durable identity of the checkpoint that initialized a split successor.
+pub const SplitOrigin = struct {
+    pub const key = "\x00\x00__committed_history__:split_origin";
+    pub const encoded_size = 32;
+    transition: u64,
+    attempt: u64,
+    predecessor_group: u64,
+    successor_group: u64,
+
+    pub fn valid(self: SplitOrigin) bool {
+        return self.transition != 0 and self.attempt != 0 and self.predecessor_group != 0 and self.successor_group != 0 and
+            self.predecessor_group != self.successor_group;
+    }
+
+    pub fn encode(self: SplitOrigin) [encoded_size]u8 {
+        var bytes: [encoded_size]u8 = undefined;
+        std.mem.writeInt(u64, bytes[0..8], self.transition, .big);
+        std.mem.writeInt(u64, bytes[8..16], self.attempt, .big);
+        std.mem.writeInt(u64, bytes[16..24], self.predecessor_group, .big);
+        std.mem.writeInt(u64, bytes[24..32], self.successor_group, .big);
+        return bytes;
+    }
+
+    pub fn require(self: SplitOrigin, txn: anytype) !void {
+        const raw = (try optional(txn, key)) orelse return error.HistoryResynchronizationRequired;
+        if (!self.valid() or !std.mem.eql(u8, raw, &self.encode())) return error.HistoryResynchronizationRequired;
+    }
+};
+
 /// Prepare a fresh history journal for the destination's atomic split checkpoint.
 pub const SplitJournalSeed = struct {
     state: [state_size]u8,
@@ -270,7 +299,7 @@ pub const SplitJournalSeed = struct {
         const state: State = .{
             .namespace = namespace,
             .limit = inherited.limit,
-            .retained_bytes = policy_key.len + Policy.encoded_size,
+            .retained_bytes = policy_key.len + Policy.encoded_size + SplitOrigin.key.len + SplitOrigin.encoded_size,
         };
         _ = try authority.require(txn, .raft, namespace);
         const policy: Policy = .{

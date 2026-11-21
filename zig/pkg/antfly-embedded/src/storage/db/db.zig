@@ -162466,6 +162466,25 @@ test "db ordered empty split destination seeds history before its first write" {
     checkpoint.history_policy = .{ .namespace = namespace, .authority = @splat(1), .previous_revision = 0, .revision = 1, .limit = history.default_limit };
     try db.applyOrderedCommittedMutation(.{ .split_replication = replication, .split_checkpoint = checkpoint }, .{ .term = 1, .index = 2 }, false);
     try db.applyOrderedTimestampedMutation(.{ .source_producer = .ordinary, .writes = &.{.{ .key = "doc:z", .value = "{\"value\":1}" }} }, .{ .term = 1, .index = 3 }, 100, false);
+    try db.clearSplitBootstrapMarker();
+    const consumers = @import("../history_consumer.zig");
+    var grant: consumers.Grant = .{
+        .namespace = namespace,
+        .authority = @splat(1),
+        .sequence = 1,
+        .consumer = @splat(2),
+        .definition = @splat(3),
+        .expires_at_seconds = 200,
+        .policy_revision = 1,
+        .retained_start = 0,
+        .split_origin = .{ .transition = 4, .attempt = 2, .predecessor_group = 2, .successor_group = 5 },
+    };
+    const wrong = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 4 }, false);
+    try std.testing.expect(wrong == .rejected and wrong.rejected == .resynchronization);
+    grant.split_origin.?.attempt = 1;
+    const enrolled = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 5 }, false);
+    try std.testing.expect(enrolled == .applied);
+    try std.testing.expectEqual(@as(u64, 0), enrolled.applied.consumer.?.start);
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectEqual(@as(u64, 1), (try history.load(&read)).?.latest);

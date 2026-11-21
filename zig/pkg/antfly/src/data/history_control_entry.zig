@@ -24,7 +24,9 @@ pub fn requiredProtocol(command: control.Command) u16 {
     return switch (command) {
         .capture_bootstrap, .release_bootstrap => @import("../common/data_raft_protocol.zig").batch_history_bootstrap_protocol_version,
         .configure_policy, .inspect_policy => @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version,
-        .enroll => |grant| if (grant.retained_start != null)
+        .enroll => |grant| if (grant.split_origin != null)
+            @import("../common/data_raft_protocol.zig").batch_split_origin_enrollment_protocol_version
+        else if (grant.retained_start != null)
             @import("../common/data_raft_protocol.zig").batch_history_retained_enrollment_protocol_version
         else if (grant.require_commit_clock)
             @import("../common/data_raft_protocol.zig").batch_history_clock_enrollment_protocol_version

@@ -46,6 +46,7 @@ pub const Grant = struct {
     /// Establish the timestamped row-write protocol before recording the cut.
     require_commit_clock: bool = false,
     retained_start: ?u64 = null,
+    split_origin: ?history.SplitOrigin = null,
 
     pub fn jsonStringify(self: Grant, jw: anytype) !void {
         try jw.beginObject();
@@ -61,11 +62,19 @@ pub const Grant = struct {
             try jw.objectField("retained_start");
             try jw.write(start);
         }
+        if (self.split_origin) |origin| {
+            try jw.objectField("split_origin");
+            try jw.write(origin);
+        }
         try jw.endObject();
     }
 
     pub fn validate(self: Grant) !void {
         if (!nonzero(self.namespace) or !nonzero(self.authority) or self.sequence == 0 or !nonzero(self.consumer) or !nonzero(self.definition) or self.expires_at_seconds == 0 or self.policy_revision == 0) return error.InvalidHistoryAdmission;
+        if (self.split_origin) |origin| {
+            if (!origin.valid() or self.retained_start == null or self.retained_start.? != 0)
+                return error.InvalidHistoryAdmission;
+        }
     }
 };
 pub const Lease = struct {
@@ -138,6 +147,12 @@ fn stateFor(txn: anytype, namespace: Namespace, incarnation: Digest) !State {
 /// refresh the same immutable definition, never silently reset history position.
 pub fn enroll(txn: anytype, grant: Grant) !history.Consumer {
     try grant.validate();
+    if (grant.split_origin) |origin| {
+        try origin.require(txn);
+        const policy = (try history.loadPolicy(txn)) orelse return error.HistoryResynchronizationRequired;
+        if (!same(policy.authority, grant.authority) or !same(policy.namespace, grant.namespace))
+            return error.HistoryResynchronizationRequired;
+    }
     var state = try stateFor(txn, grant.namespace, grant.authority);
     const existing = state.find(grant.consumer);
     if (existing) |lease| {

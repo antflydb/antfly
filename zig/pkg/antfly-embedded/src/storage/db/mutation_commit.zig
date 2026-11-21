@@ -3132,6 +3132,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const history = @import("../committed_history.zig");
             var split_history_seed: ?history.SplitJournalSeed = null;
             var split_history_namespace: history.frame.Namespace = undefined;
+            var split_history_origin: [history.SplitOrigin.encoded_size]u8 = undefined;
             var split_sequence_buf: [8]u8 = undefined;
             var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
             var persisted_range: ?types.ByteRange = null;
@@ -3154,7 +3155,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     var read = try S.ownerField(self, "core").*.store.beginReadTxn();
                     defer read.abort();
                     const namespace = @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace);
+                    const origin: history.SplitOrigin = .{
+                        .transition = checkpoint.transition_id,
+                        .attempt = checkpoint.attempt_epoch,
+                        .predecessor_group = checkpoint.source_group_id,
+                        .successor_group = checkpoint.destination_group_id,
+                    };
+                    if (!origin.valid()) return error.InvalidHistoryAdmission;
                     split_history_seed = try history.SplitJournalSeed.prepare(&read, policy, namespace);
+                    if (split_history_seed == null) try origin.require(&read);
                     if (split_history_seed != null) {
                         if (try doc_identity.loadNamespaceTxn(&read)) |persisted| {
                             if (!persisted.eql(S.ownerField(self, "core").*.identity_namespace)) return error.HistoryResynchronizationRequired;
@@ -3165,6 +3174,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                         try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = history.state_key, .value = &split_history_seed.?.state });
                         try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = history.policy_key, .value = &split_history_seed.?.policy });
+                        split_history_origin = origin.encode();
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = history.SplitOrigin.key, .value = &split_history_origin });
                     }
                 }
                 if (coordinated_handoff and checkpoint.kind == .destination_complete) {

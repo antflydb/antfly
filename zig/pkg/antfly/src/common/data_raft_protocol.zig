@@ -40,7 +40,8 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 53;
+pub const batch_protocol_version: u16 = 54;
+pub const batch_split_origin_enrollment_protocol_version: u16 = 54;
 pub const batch_split_history_seed_protocol_version: u16 = 53;
 
 pub const batch_history_retained_enrollment_protocol_version: u16 = 52;
