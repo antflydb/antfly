@@ -15,6 +15,7 @@
 
 //! Bounded shared receipt snapshots for scoped, read-only model discovery.
 const std = @import("std");
+const builtin = @import("builtin");
 const managed = @import("../registry/managed_receipt.zig");
 const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
 const manifest_mod = @import("../models/manifest.zig");
@@ -42,6 +43,8 @@ const unavailable_dependency: CompatibilitySummary = .{
     .message = "a required model dependency is unavailable",
 };
 const dependency_retry_ns = std.time.ns_per_s;
+
+pub var onnx_compatibility_checks_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
 
 pub const Cache = struct {
     slots: [16]Slot = @splat(.{}),
@@ -227,16 +230,17 @@ pub const Cache = struct {
                 return false;
             }
         };
-        const BackendAssessment = struct {
+        const Assessment = struct {
             lock: std.Io.Mutex = .init,
             available: std.atomic.Value(bool) = .init(false),
-            summary: CompatibilitySummary = undefined,
+            summary: ?CompatibilitySummary = undefined,
         };
 
         arena: std.heap.ArenaAllocator,
         members: []const Member,
         dependencies_by_role: [std.enums.values(Dependency).len]DependencyCache,
-        backends_by_type: [std.enums.values(backends.BackendType).len]BackendAssessment,
+        backends_by_type: [std.enums.values(backends.BackendType).len]Assessment,
+        onnx_by_slot: [std.enums.values(model_manager.CompatibilityOnnxSlot).len]Assessment,
         execution_manifest: manifest_mod.ModelManifest,
 
         fn create(owner: std.mem.Allocator, artifacts: *const PublishedArtifacts, path: []const u8, failure: *?FailedMember, control: ExecutionControl) !*Inspection {
@@ -258,22 +262,25 @@ pub const Cache = struct {
             };
             result.dependencies_by_role = @splat(.{});
             result.backends_by_type = @splat(.{});
+            result.onnx_by_slot = @splat(.{});
             result.execution_manifest = execution_manifest;
             return result;
         }
 
         fn backendSummary(self: *Inspection, artifacts: *const PublishedArtifacts, path: []const u8, backend: backends.BackendType, roles: []const Dependency, control: ExecutionControl) !CompatibilitySummary {
             const entry = &self.backends_by_type[@backingInt(backend)];
-            if (entry.available.load(.acquire)) return entry.summary;
+            if (entry.available.load(.acquire)) return entry.summary.?;
             try managed.lockVerification(control, &entry.lock, artifacts.io);
             defer entry.lock.unlock(artifacts.io);
-            if (entry.available.load(.acquire)) return entry.summary;
-            const summary = (try model_manager.compatibilitySummaryForBackendWithControl(
+            if (entry.available.load(.acquire)) return entry.summary.?;
+            var check = OnnxCheck{ .inspection = self, .artifacts = artifacts };
+            const summary = (try model_manager.compatibilitySummaryForBackendWithOnnxCheck(
                 artifacts.allocator,
                 path,
                 &self.execution_manifest,
                 backend,
                 control,
+                .{ .context = &check, .check = OnnxCheck.check },
             )) orelse no_compatible_backend;
 
             // Publish an assessment only for the stamps checked before
@@ -291,6 +298,32 @@ pub const Cache = struct {
             }
             return summary;
         }
+
+        const OnnxCheck = struct {
+            inspection: *Inspection,
+            artifacts: *const PublishedArtifacts,
+
+            fn check(raw: *anyopaque, slot: model_manager.CompatibilityOnnxSlot, path: []const u8, logical_path: ?[]const u8, control: ExecutionControl) !?CompatibilitySummary {
+                const self: *OnnxCheck = @ptrCast(@alignCast(raw));
+                const entry = &self.inspection.onnx_by_slot[@backingInt(slot)];
+                if (entry.available.load(.acquire)) return entry.summary;
+                try managed.lockVerification(control, &entry.lock, self.artifacts.io);
+                defer entry.lock.unlock(self.artifacts.io);
+                if (entry.available.load(.acquire)) return entry.summary;
+                if (comptime builtin.is_test) onnx_compatibility_checks_for_test += 1;
+                const summary = try model_manager.inspectOnnxCompatibility(self.artifacts.allocator, path, logical_path, control);
+                if (slot == .primary) {
+                    const cache = &self.inspection.dependencies_by_role[@backingInt(Dependency.onnx)];
+                    const stamps = cache.available.load(.acquire) orelse return summary;
+                    try validate(stamps.members, self.artifacts, control);
+                } else {
+                    try validate(self.inspection.members, self.artifacts, control);
+                }
+                entry.summary = summary;
+                entry.available.store(true, .release);
+                return summary;
+            }
+        };
 
         fn collectCommon(collector: *MemberCollector, manifest: *const manifest_mod.ModelManifest, control: ExecutionControl) !void {
             inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {

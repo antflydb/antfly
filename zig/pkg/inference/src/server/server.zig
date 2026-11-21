@@ -27066,11 +27066,12 @@ pub const Node = struct {
                 const manifest = if (cached_model) |*handle| &handle.get().manifest else inspected_manifest orelse &cold_manifest.?;
                 const dense_output = manifest.denseEmbeddingOutput();
                 var durable_revision: ?[32]u8 = null;
-                var declared = if (embedding and manifest.managed_publication != null and (cached_model == null or include_revisions or requested_revision != null or inspected_manifest != null))
-                    (if (scoped_artifacts) |artifacts|
-                        self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, control, artifacts)
-                    else
-                        self.model_manager.declaredEmbeddingRevisions(path, manifest.*, control)) catch |err| {
+                const pin_scope = if (embedding and manifest.managed_publication != null)
+                    if (scoped_publication) |*scope| (if (scope.inspection_valid) scope else null) else null
+                else
+                    null;
+                var declared = if (pin_scope) |scope|
+                    self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, control, &scope.artifacts) catch |err| {
                         if (isPinnedCatalogArtifactFailure(err)) {
                             // A checksum refusal can arrive after discovery
                             // captured healthy-looking size and path stamps.
@@ -27081,26 +27082,20 @@ pub const Node = struct {
                     }
                 else
                     model_manager_mod.ModelManager.EmbeddingRevisions{};
-                const rejected = if (scoped_publication) |*captured|
-                    if (captured.inspection_valid)
-                        captured.borrow.filterEmbeddingRevisions(&captured.artifacts, &declared, self.config.allow_unknown_models, control) catch |err| return modelLoadFailureResponse(ctx, err)
-                    else
-                        model_manager_mod.ModelManager.EmbeddingRevisions{}
+                const rejected = if (pin_scope) |scope|
+                    scope.borrow.filterEmbeddingRevisions(&scope.artifacts, &declared, self.config.allow_unknown_models, control) catch |err| return modelLoadFailureResponse(ctx, err)
                 else
                     model_manager_mod.ModelManager.EmbeddingRevisions{};
                 if (declared.len == 0 and rejected.len != 0) return embeddingArtifactFailureResponse(ctx);
                 var revision: ?[32]u8 = if (cached_model) |*handle| loaded: {
                     // The held runtime supplies both geometry and revision.
                     const serving = handle.get();
-                    if (embedding) {
-                        durable_revision = serving.durable_embedding_revision;
-                        if (serving.managed_publication != null) {
-                            if (replica_probe or rejected.len != 0) {
-                                const retained = if (durable_revision) |active| declared.contains(active) else false;
-                                if (!retained) durable_revision = if (declared.len > 0) declared.revisions[0] else null;
-                            }
-                            break :loaded durable_revision;
+                    if (embedding and serving.managed_publication != null) {
+                        if (serving.durable_embedding_revision) |active| {
+                            if (declared.contains(active)) durable_revision = active;
                         }
+                        if (durable_revision == null and declared.len > 0) durable_revision = declared.revisions[0];
+                        break :loaded durable_revision;
                     }
                     if (serving.resolution_revision) |loaded_revision| break :loaded loaded_revision;
                     if (embedding) return error.InvalidEmbeddingIdentity;
@@ -51294,6 +51289,10 @@ test "scoped model discovery caches an unavailable auxiliary ONNX dependency" {
     try testScopedShardedDiscovery(.auxiliary, .sharded);
 }
 
+test "scoped model discovery shares auxiliary ONNX compatibility across backends" {
+    try testScopedShardedDiscovery(.auxiliary_compatible_extent, .sharded);
+}
+
 test "scoped model discovery withholds revision pinning for sharded EmbeddingGemma 2" {
     try testScopedShardedDiscovery(.none, .gemma_sharded);
 }
@@ -51304,7 +51303,7 @@ test "scoped model discovery refuses an EmbeddingGemma 2 pin with missing recipe
 
 const scoped_catalog_test_safetensors = "\x4e\x00\x00\x00\x00\x00\x00\x00{\"model.embed_tokens.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
 
-fn testScopedShardedDiscovery(comptime graph_role: enum { none, primary, auxiliary }, comptime fixture: enum { sharded, gemma_sharded, gemma_incomplete }) !void {
+fn testScopedShardedDiscovery(comptime graph_role: enum { none, primary, auxiliary, auxiliary_compatible_extent }, comptime fixture: enum { sharded, gemma_sharded, gemma_incomplete }) !void {
     const gemma = fixture != .sharded;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -51321,7 +51320,8 @@ fn testScopedShardedDiscovery(comptime graph_role: enum { none, primary, auxilia
     const dir = try tmp.dir.openDir(io, path, .{});
     defer dir.close(io);
     // The external tensor points beyond the end of a valid receipt member.
-    const graph = "\x3a\x2c\x2a\x2a\x6a\x17\x0a\x08location\x12\x0btensors.bin\x6a\x0d\x0a\x06offset\x12\x03999\x70\x01";
+    const graph = "\x3a\x2c\x2a\x2a\x6a\x17\x0a\x08location\x12\x0btensors.bin\x6a\x0d\x0a\x06offset\x12\x03" ++
+        (if (graph_role == .auxiliary_compatible_extent) "000" else "999") ++ "\x70\x01";
     const native_files = if (fixture == .gemma_incomplete)
         .{
             .{ "config.json", config },
@@ -51333,7 +51333,7 @@ fn testScopedShardedDiscovery(comptime graph_role: enum { none, primary, auxilia
         }
     else
         .{ .{ "config.json", config }, .{ index_path, index }, .{ shard_path, weights } };
-    const graph_name = if (graph_role == .auxiliary) "visual_model.onnx" else "model.onnx";
+    const graph_name = if (graph_role == .auxiliary or graph_role == .auxiliary_compatible_extent) "visual_model.onnx" else "model.onnx";
     const files = if (graph_role != .none) native_files ++ .{ .{ graph_name, graph }, .{ "tensors.bin", "tensor data" } } else native_files;
     var entries: [files.len]managed.ArtifactReceipt = undefined;
     var sums: [files.len][64]u8 = undefined;
@@ -51358,6 +51358,13 @@ fn testScopedShardedDiscovery(comptime graph_role: enum { none, primary, auxilia
         const model_dir = try std.fs.path.join(a, &.{ root, path });
         defer a.free(model_dir);
         try testScopedAuxiliaryFailure(a, io, dir, model_dir);
+        try testScopedAuxiliaryPinGate(a, io, root);
+        return;
+    }
+    if (graph_role == .auxiliary_compatible_extent) {
+        const model_dir = try std.fs.path.join(a, &.{ root, path });
+        defer a.free(model_dir);
+        try testScopedAuxiliarySharing(a, io, model_dir);
         return;
     }
     var node = try Node.init(a, .{ .models_dir = root });
@@ -51525,6 +51532,53 @@ fn testScopedAuxiliaryFailure(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir,
     Probe.graph_stats = 0;
     try std.testing.expectError(error.InvalidManagedDownload, publication.borrow.compatibility(&publication.artifacts, model_dir, &.{.native}, control));
     try std.testing.expect(Probe.graph_stats > 0);
+}
+
+fn testScopedAuxiliaryPinGate(a: std.mem.Allocator, io: std.Io, root: []const u8) !void {
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    try node.attachIo(io);
+
+    const url = "/ai/v1/models?model=acme%2Fsharded&task=embed";
+    var ordinary_request = try httpx.Request.init(a, .GET, url);
+    defer ordinary_request.deinit();
+    var ordinary_ctx = httpx.Context.init(a, io, &ordinary_request);
+    defer ordinary_ctx.deinit();
+    var ordinary = try node.listModels(&ordinary_ctx);
+    defer ordinary.deinit();
+    try std.testing.expectEqual(@as(u16, 200), ordinary.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, ordinary.body.?, .{});
+    defer parsed.deinit();
+    const model = parsed.value.object.get("embedders").?.object.get("acme/sharded").?.object;
+    try std.testing.expect(!model.get("model_revision_pinning").?.bool);
+    try std.testing.expect(!model.contains("model_revision"));
+
+    var pinned_request = try httpx.Request.init(a, .GET, url ++ "&model_revision_candidates=1");
+    defer pinned_request.deinit();
+    var pinned_ctx = httpx.Context.init(a, io, &pinned_request);
+    defer pinned_ctx.deinit();
+    var pinned = try node.listModels(&pinned_ctx);
+    defer pinned.deinit();
+    try std.testing.expectEqual(@as(u16, 503), pinned.status.code);
+    try std.testing.expectEqualStrings("true", pinned.headers.get("X-Antfly-Embedding-Artifact-Unavailable").?);
+}
+
+fn testScopedAuxiliarySharing(a: std.mem.Allocator, io: std.Io, model_dir: []const u8) !void {
+    const managed = @import("../registry/managed_receipt.zig");
+    const scoped = @import("scoped_catalog_cache.zig");
+    const control = InferenceExecutionControl{ .io = io };
+    var cache: ScopedCatalogCache = .{};
+    defer cache.deinit();
+    var publication = (try ScopedCatalogPublication.open(&cache, a, a, io, model_dir, try managed.publicationGeneration(a, io, model_dir), control)).?;
+    defer publication.deinit();
+    const before = scoped.onnx_compatibility_checks_for_test;
+    _ = try publication.borrow.compatibility(&publication.artifacts, model_dir, &.{.native}, control);
+    var candidates: model_manager_mod.ModelManager.EmbeddingRevisions = .{};
+    candidates.backends[0..2].* = .{ .native, .metal };
+    candidates.revisions[0..2].* = .{ @splat(1), @splat(2) };
+    candidates.len = 2;
+    _ = try publication.borrow.filterEmbeddingRevisions(&publication.artifacts, &candidates, true, control);
+    try std.testing.expectEqual(before + 1, scoped.onnx_compatibility_checks_for_test);
 }
 
 test "scoped model discovery isolates a missing or malformed Jina adapter from CPU GGUF" {
