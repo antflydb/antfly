@@ -162410,20 +162410,30 @@ test "db split finalization records the predecessor committed history frontier t
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedSplitHistoryCut(request, second_entry.index + 1));
     request.successor_group += 1;
     try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedSplitHistoryCut(request, second_entry.index));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const cut = (try history.SplitCut.load(&read, split.transition_id, split.attempt_epoch)).?;
+        try std.testing.expectEqual(namespace, cut.namespace);
+        try std.testing.expectEqual(split.transition_id, cut.transition);
+        try std.testing.expectEqual(split.destination_group_id, cut.successor_group);
+        try std.testing.expectEqual(entry.index, cut.index);
+        try std.testing.expectEqual(history.frame.digest(split.split_key), cut.boundary);
+        try std.testing.expectEqual(@as(u64, 1), cut.latest);
+        const successor_cut = (try history.SplitCut.load(&read, second_split.transition_id, second_split.attempt_epoch)).?;
+        try std.testing.expectEqual(second_entry.index, successor_cut.index);
+        try std.testing.expectEqual(@as(u64, 2), successor_cut.latest);
+        try std.testing.expect((try history.SplitCut.load(&read, split.transition_id, split.attempt_epoch + 1)) == null);
+        try std.testing.expectEqual(@as(u64, 2), (try history.load(&read)).?.latest);
+    }
+    const merge: types.MergeSourceTransitionMutation = .{ .kind = .finalize, .transition_id = 20, .receiver_group_id = 10 };
+    try db.applyOrderedCommittedMutation(.{ .merge_source_transition = merge }, .{ .term = 2, .index = 12 }, false);
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
-    const cut = (try history.SplitCut.load(&read, split.transition_id, split.attempt_epoch)).?;
-    try std.testing.expectEqual(namespace, cut.namespace);
-    try std.testing.expectEqual(split.transition_id, cut.transition);
-    try std.testing.expectEqual(split.destination_group_id, cut.successor_group);
-    try std.testing.expectEqual(entry.index, cut.index);
-    try std.testing.expectEqual(history.frame.digest(split.split_key), cut.boundary);
-    try std.testing.expectEqual(@as(u64, 1), cut.latest);
-    const successor_cut = (try history.SplitCut.load(&read, second_split.transition_id, second_split.attempt_epoch)).?;
-    try std.testing.expectEqual(second_entry.index, successor_cut.index);
-    try std.testing.expectEqual(@as(u64, 2), successor_cut.latest);
-    try std.testing.expect((try history.SplitCut.load(&read, split.transition_id, split.attempt_epoch + 1)) == null);
-    try std.testing.expectEqual(@as(u64, 2), (try history.load(&read)).?.latest);
+    const donor = (try history.MergeCut.load(&read, merge.transition_id)).?;
+    try std.testing.expectEqual(merge.receiver_group_id, donor.receiver_group);
+    try std.testing.expectEqual(@as(u64, 12), donor.index);
+    try std.testing.expectEqual(@as(u64, 2), donor.latest);
 }
 
 test "db ordered empty split destination seeds history before its first write" {

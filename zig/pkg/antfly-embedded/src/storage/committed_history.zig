@@ -122,6 +122,61 @@ pub const SplitCut = struct {
     }
 };
 
+/// The ordered end of a merge donor's committed journal.
+pub const MergeCut = struct {
+    const prefix = "\x00\x00__committed_history__:merge_cut:";
+    pub const Key = [prefix.len + 8]u8;
+    pub const encoded_size = 124;
+    namespace: frame.Namespace,
+    transition: u64,
+    receiver_group: u64,
+    term: u64,
+    index: u64,
+    latest: u64,
+    reclaimed: u64,
+    root_generation: u64,
+    reserved_bytes: u64,
+
+    pub fn key(transition: u64) Key {
+        var bytes: Key = undefined;
+        bytes[0..prefix.len].* = prefix.*;
+        std.mem.writeInt(u64, bytes[prefix.len..][0..8], transition, .big);
+        return bytes;
+    }
+
+    pub fn encode(self: MergeCut) [encoded_size]u8 {
+        var bytes: [encoded_size]u8 = undefined;
+        bytes[0..4].* = "HMC1".*;
+        bytes[4..28].* = self.namespace;
+        for ([_]u64{ self.transition, self.receiver_group, self.term, self.index, self.latest, self.reclaimed, self.root_generation, self.reserved_bytes }, 0..) |value, i| {
+            std.mem.writeInt(u64, bytes[28 + 8 * i ..][0..8], value, .big);
+        }
+        bytes[92..124].* = frame.digest(bytes[0..92]);
+        return bytes;
+    }
+
+    pub fn load(txn: anytype, transition: u64) !?MergeCut {
+        const bytes = (try optional(txn, &key(transition))) orelse return null;
+        if (bytes.len != encoded_size or !std.mem.eql(u8, bytes[0..4], "HMC1") or
+            !std.mem.eql(u8, bytes[92..124], &frame.digest(bytes[0..92]))) return error.HistoryCorrupt;
+        var values: [8]u64 = undefined;
+        for (&values, 0..) |*value, i| value.* = std.mem.readInt(u64, bytes[28 + 8 * i ..][0..8], .big);
+        if (values[0] != transition or std.mem.indexOfScalar(u64, values[0..4], 0) != null or values[5] > values[4] or
+            std.mem.allEqual(u8, bytes[4..28], 0)) return error.HistoryCorrupt;
+        return .{
+            .namespace = bytes[4..28].*,
+            .transition = values[0],
+            .receiver_group = values[1],
+            .term = values[2],
+            .index = values[3],
+            .latest = values[4],
+            .reclaimed = values[5],
+            .root_generation = values[6],
+            .reserved_bytes = values[7],
+        };
+    }
+};
+
 pub const consumer_authority_key = "\x00\x00__committed_history__:consumer_authority";
 const record_prefix = "\x00\x00__committed_history__:record:";
 const chunk_prefix = "\x00\x00__committed_history__:chunk:";

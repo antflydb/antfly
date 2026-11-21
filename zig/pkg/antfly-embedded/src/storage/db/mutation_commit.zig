@@ -3130,6 +3130,36 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").resolver_cursor_key);
             }
             const history = @import("../committed_history.zig");
+            var merge_history_key: history.MergeCut.Key = undefined;
+            var merge_history_cut: [history.MergeCut.encoded_size]u8 = undefined;
+            if (req.merge_source_transition) |transition| {
+                if (transition.kind == .finalize and opts.ordered_apply_receipt != null) {
+                    const receipt = opts.ordered_apply_receipt.?;
+                    const core = S.ownerField(self, "core").*;
+                    const namespace = @import("online_source_contract.zig").namespaceBytes(core.identity_namespace);
+                    var read = try core.store.beginReadTxn();
+                    defer read.abort();
+                    if (try history.MergeCut.load(&read, transition.transition_id)) |previous| {
+                        if (!std.mem.eql(u8, &previous.namespace, &namespace) or previous.receiver_group != transition.receiver_group_id)
+                            return error.HistoryResynchronizationRequired;
+                    } else if (try history.load(&read)) |frontier| {
+                        if (!std.mem.eql(u8, &frontier.namespace, &namespace)) return error.HistoryResynchronizationRequired;
+                        merge_history_key = history.MergeCut.key(transition.transition_id);
+                        merge_history_cut = (history.MergeCut{
+                            .namespace = namespace,
+                            .transition = transition.transition_id,
+                            .receiver_group = transition.receiver_group_id,
+                            .term = receipt.term,
+                            .index = receipt.index,
+                            .latest = frontier.latest,
+                            .reclaimed = frontier.reclaimed,
+                            .root_generation = core.root_generation,
+                            .reserved_bytes = frontier.reserved_bytes,
+                        }).encode();
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = &merge_history_key, .value = &merge_history_cut });
+                    }
+                }
+            }
             var split_history_seed: ?history.SplitJournalSeed = null;
             var split_history_namespace: history.frame.Namespace = undefined;
             var split_history_origin: [history.SplitOrigin.encoded_size]u8 = undefined;
