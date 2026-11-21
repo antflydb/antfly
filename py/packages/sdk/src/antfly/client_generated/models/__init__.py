@@ -2651,6 +2651,7 @@ from .transaction_stage_read_snapshot import TransactionStageReadSnapshot
 from .transaction_stage_write_request import TransactionStageWriteRequest
 from .transaction_stage_write_request_document import TransactionStageWriteRequestDocument
 from .transaction_status_response import TransactionStatusResponse
+from .transaction_write_error import TransactionWriteError
 from .transcriber_enrichment_config import TranscriberEnrichmentConfig
 from .transform import Transform
 from .transform_op import TransformOp
@@ -5133,6 +5134,7 @@ __all__ = (
     "TransactionStageWriteRequest",
     "TransactionStageWriteRequestDocument",
     "TransactionStatusResponse",
+    "TransactionWriteError",
     "TranscriberEnrichmentConfig",
     "Transform",
     "TransformOp",

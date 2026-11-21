@@ -398,6 +398,7 @@ pub const TransactionStageReadResponse = types.TransactionStageReadResponse;
 pub const TransactionStageReadSnapshot = types.TransactionStageReadSnapshot;
 pub const TransactionStageWriteRequest = types.TransactionStageWriteRequest;
 pub const TransactionStatusResponse = types.TransactionStatusResponse;
+pub const TransactionWriteError = types.TransactionWriteError;
 pub const Transform = types.Transform;
 pub const TransformOp = types.TransformOp;
 pub const TransformOpType = types.TransformOpType;

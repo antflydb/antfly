@@ -11,6 +11,7 @@ from fix_generated_client import (
     SCOPED_MERGE,
     SCOPED_MERGE_HEADER,
     SQL_OPERATIONS,
+    WRITE_OPERATIONS,
     fix_generated_client,
 )
 
@@ -31,6 +32,20 @@ def write_generated_files(root: Path, signature_count: int) -> None:
             ]
         )
     )
+    for operation in WRITE_OPERATIONS:
+        path = root / f"api/data_operations/{operation}.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "def parse(response) -> Error | TransactionWriteError:\n"
+            "    if response.status_code == 403:\n        return TransactionWriteError.from_dict(response.json())\n"
+            "    if response.status_code == 500:\n        return Error.from_dict(response.json())\n"
+            "    if response.status_code == 503:\n        return TransactionWriteError.from_dict(response.json())\n"
+            + (
+                "    if response.status_code == 409:\n        return TransactionSessionCommitResponse.from_dict(response.json())\n"
+                if operation in {"multi_batch_write", "commit_transaction", "commit_transaction_session"}
+                else ""
+            )
+        )
     path = root / SCOPED_MERGE
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(

@@ -78,18 +78,6 @@ fn attachedSettingOverlay(source: SettingOverlaySource, caller: []const setting_
     };
 }
 
-fn refreshAttachedSettingOverlay(
-    registry: *@import("transactions.zig").SessionRegistry,
-    alloc: std.mem.Allocator,
-    id: db_types.TxnId,
-    source: SettingOverlaySource,
-    caller: []const setting_catalog.OverlayEntry,
-    retained: *?@import("transactions.zig").SessionRegistry.SqlState,
-) ![]const setting_catalog.OverlayEntry {
-    retained.* = (try registry.getSqlState(alloc, id)) orelse return error.SqlTransactionNotActive;
-    return attachedSettingOverlay(source, caller, retained.*.?.setting_active.items);
-}
-
 test "SQL attached setting overlay keeps HTTP durable authority separate from pgwire connection state" {
     const caller = [_]setting_catalog.OverlayEntry{.{ .identity = .{ .id = 1, .generation = 1 }, .value = .{ .integer = 99 } }};
     const durable = [_]setting_catalog.OverlayEntry{.{ .identity = .{ .id = 1, .generation = 1 }, .value = .{ .integer = 5 } }};
@@ -119,7 +107,8 @@ test "SQL attached setting overlay refresh observes a setting committed after at
     var marker: u8 = 0;
     const owner: setting_catalog.Owner = .{ .ptr = &marker, .load = Fixture.load };
     const begun = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice");
-    try registry.setSqlSetting(alloc, begun.txn_id, "alice", owner, "app.limit", .{ .integer = 5 }, false);
+    const guard = try registry.mutation(alloc, begun.txn_id, 7);
+    try registry.setSqlSetting(alloc, guard, "alice", owner, "app.limit", .{ .integer = 5 }, false);
     // Model an attachment that precedes another request's committed SET;
     // the lease-held read must not reuse this earlier owned snapshot.
     var attached = (try registry.getSqlState(alloc, begun.txn_id)).?;
@@ -127,13 +116,14 @@ test "SQL attached setting overlay refresh observes a setting committed after at
     {
         const mutation_lease = registry.tryAcquireCommitExecution(begun.txn_id) orelse return error.TestExpectedSessionLease;
         defer mutation_lease.release();
-        try registry.setSqlSetting(alloc, begun.txn_id, "alice", owner, "app.limit", .{ .integer = 7 }, false);
+        try registry.setSqlSetting(alloc, guard, "alice", owner, "app.limit", .{ .integer = 7 }, false);
     }
     const lease = registry.tryAcquireCommitExecution(begun.txn_id) orelse return error.TestExpectedSessionLease;
     defer lease.release();
-    var refreshed: ?@import("transactions.zig").SessionRegistry.SqlState = null;
-    defer if (refreshed) |*state| state.deinit(alloc);
-    const overlay = try refreshAttachedSettingOverlay(&registry, alloc, begun.txn_id, .durable_session, attached.setting_active.items, &refreshed);
+    var refreshed = try registry.admitSqlStatement(alloc, alloc, guard, "alice", null);
+    defer refreshed.state.deinit(alloc);
+    defer refreshed.staged.deinit(alloc);
+    const overlay = try attachedSettingOverlay(.durable_session, attached.setting_active.items, refreshed.state.setting_active.items);
     try std.testing.expectEqual(@as(i64, 5), attached.setting_active.items[0].value.integer);
     try std.testing.expectEqual(@as(i64, 7), overlay[0].value.integer);
 }
@@ -192,6 +182,8 @@ pub const Adapter = struct {
     result_session_id: ?[32]u8 = null,
     transaction_status: @import("antfly_local_sources").sql_session.Status = .idle,
     active_transaction: ?[16]u8 = null,
+    connection_mutation: ?@import("transactions.zig").Mutation = null,
+    admitted_mutation: ?@import("transactions.zig").Mutation = null,
     accepted_lake_repeatable: bool = false,
     staged: ?*@import("transactions.zig").OwnedTransactionCommitRequest = null,
     range_reads: ?*@import("transactions.zig").OwnedTransactionCommitRequest = null,
@@ -262,6 +254,7 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
+        self.admitted_mutation = null;
         const previous_graph_parameters = self.graph_parameters;
         self.graph_parameters = parameters;
         defer self.graph_parameters = previous_graph_parameters;
@@ -316,25 +309,13 @@ pub const Adapter = struct {
                 zig017_return_error = error.SqlTransactionNotActive;
                 break :zig017_failure error.SqlTransactionNotActive;
             };
-            if ((self.server.txn_sessions.principalAccess(self.server.alloc, id, http_server.transactionPrincipal(self.identity.*)) catch |zig017_err| {
-                zig017_return_error = zig017_err;
-                return zig017_err;
-            }) != .allowed) return zig017_failure: {
-                zig017_return_error = error.SqlTransactionNotActive;
-                break :zig017_failure error.SqlTransactionNotActive;
+            const admission = self.server.txn_sessions.admitSql(self.server.alloc, id, http_server.transactionPrincipal(self.identity.*), self.server.localSessionNodeId(), self.connection_id, self.connection_mutation) catch |err| {
+                if (err == error.SessionLeaseLost) self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
+                return err;
             };
-            inherited = ((self.server.txn_sessions.getSqlState(self.server.alloc, id) catch |zig017_err| {
-                zig017_return_error = zig017_err;
-                return zig017_err;
-            })) orelse return zig017_failure: {
-                zig017_return_error = error.SqlTransactionNotActive;
-                break :zig017_failure error.SqlTransactionNotActive;
-            };
+            self.admitted_mutation = admission.guard;
+            inherited = admission.state;
             if (inherited.?.metadata.accepted_lake_reads) self.lake_visibility = .accepted;
-            if (!std.meta.eql(inherited.?.connection_id, self.connection_id)) return zig017_failure: {
-                zig017_return_error = error.SqlConnectionNotFound;
-                break :zig017_failure error.SqlConnectionNotFound;
-            };
             if (self.inherit_session_database) self.database = inherited.?.metadata.database;
             if (self.inherit_session_namespace) self.namespace = inherited.?.metadata.namespace;
             self.setting_overlay = (attachedSettingOverlay(self.setting_overlay_source, self.setting_overlay, inherited.?.setting_active.items) catch |zig017_err| {
@@ -343,22 +324,18 @@ pub const Adapter = struct {
             });
         }
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context };
-        var owner = session_api.Adapter{ .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay };
+        var owner = session_api.Adapter{ .admitted = self.admitted_mutation, .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
-        if (self.session_id) |encoded| {
-            const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
-                zig017_return_error = error.SqlTransactionNotActive;
-                break :zig017_failure error.SqlTransactionNotActive;
-            };
-            session.attach(id) catch |err| {
-                if (err == error.SessionLeaseLost) self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
-                return err;
-            };
+        if (inherited) |state| {
+            if (!std.mem.eql(u8, state.metadata.database, session.scope.database) or !std.mem.eql(u8, state.metadata.namespace, session.scope.namespace)) return error.SqlTransactionNotActive;
+            const id = self.admitted_mutation.?.id;
+            try session.attachInspected(id, session_api.Adapter.inspected(id, state));
         }
         // A request only borrows the durable session. Dropping an HTTP request
         // must not abandon it; pgwire disconnect is the explicit owner release.
         defer {
             self.transaction_status = session.status() catch .failed;
+            self.admitted_mutation = owner.admitted;
             self.result_session_id = if (session.transaction_id) |id| std.fmt.bytesToHex(id, .lower) else null;
         }
         errdefer if (zig017_return_error) |err| if (err != error.SqlWriteCapacityUnavailable) session.statementFailed() catch {};
@@ -371,7 +348,7 @@ pub const Adapter = struct {
                 zig017_return_error = error.InvalidSqlParameters;
                 break :zig017_failure error.InvalidSqlParameters;
             };
-            const id = session.transaction_id orelse return zig017_failure: {
+            const guard = owner.admitted orelse return zig017_failure: {
                 zig017_return_error = error.SqlTransactionNotActive;
                 break :zig017_failure error.SqlTransactionNotActive;
             };
@@ -381,7 +358,7 @@ pub const Adapter = struct {
             });
             errdefer result.deinit();
             const timing = compiled.statement.set_constraints;
-            (@import("sql_constraint_timing.zig").set(self.server, alloc, self.identity.*, self.context, session.scope, self.namespace, id, timing.names, timing.deferred) catch |zig017_err| {
+            (@import("sql_constraint_timing.zig").set(self.server, alloc, self.identity.*, self.context, session.scope, self.namespace, guard, timing.names, timing.deferred) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
@@ -437,8 +414,9 @@ pub const Adapter = struct {
                     break :zig017_failure error.SqlTransactionOutcomeUnknown;
                 };
                 if (commit.outcome == .aborted and !already_failed) return zig017_failure: {
-                    zig017_return_error = error.SqlWriteConflict;
-                    break :zig017_failure error.SqlWriteConflict;
+                    const cause = commit.abort_cause orelse error.SqlWriteConflict;
+                    zig017_return_error = cause;
+                    break :zig017_failure cause;
                 };
                 if (commit.outcome == .aborted) result.output.command_tag = "ROLLBACK";
                 result.output.mutation_outcome = switch (commit.outcome) {
@@ -485,36 +463,28 @@ pub const Adapter = struct {
                 return zig017_err;
             });
             const id = session.transaction_id.?;
+            self.admitted_mutation = owner.admitted orelse try self.server.txn_sessions.mutation(self.server.alloc, id, self.server.localSessionNodeId());
             var result = statement: {
                 const execution_lease = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return zig017_failure: {
                     zig017_return_error = error.SqlWriteCapacityUnavailable;
                     break :zig017_failure error.SqlWriteCapacityUnavailable;
                 };
                 defer execution_lease.release();
-                // A concurrent HTTP SET/RESET may have committed after the
-                // initial session attachment but before this statement's
-                // execution lease. Refresh the overlay while holding the
-                // same lease that serializes session setting mutations.
-                var leased_settings: ?@import("transactions.zig").SessionRegistry.SqlState = null;
-                defer if (leased_settings) |*state| state.deinit(self.server.alloc);
-                if (self.session_id != null and compiled.uses_current_setting) {
-                    self.setting_overlay = (refreshAttachedSettingOverlay(&self.server.txn_sessions, self.server.alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings) catch |zig017_err| {
-                        zig017_return_error = zig017_err;
-                        return zig017_err;
-                    });
-                }
-                _ = (session.statement(switch (compiled.statement) {
-                    .select, .explain => false,
-                    else => true,
-                }) catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                });
-                var staged = (self.server.txn_sessions.cloneSqlStaged(alloc, id) catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                });
+                // Re-admit after acquiring the execution lease. A concurrent SET
+                // or staged write must be observed on the same transaction cut.
+                var admitted = self.server.txn_sessions.admitSqlStatement(self.server.alloc, alloc, self.admitted_mutation.?, http_server.transactionPrincipal(self.identity.*), self.connection_id) catch |err| {
+                    zig017_return_error = err;
+                    return err;
+                };
+                defer admitted.state.deinit(self.server.alloc);
+                var staged = admitted.staged;
                 defer staged.deinit(alloc);
+                if (self.session_id != null and compiled.uses_current_setting) {
+                    self.setting_overlay = attachedSettingOverlay(self.setting_overlay_source, previous_setting_overlay, admitted.state.setting_active.items) catch |err| {
+                        zig017_return_error = err;
+                        return err;
+                    };
+                }
                 var read_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
                 defer read_guards.deinit(self.server.alloc);
                 self.range_reads = if (transaction.isolation != .read_committed) &read_guards else null;
@@ -588,7 +558,7 @@ pub const Adapter = struct {
                 });
                 errdefer output.deinit();
                 if (!self.ranges_staged and read_guards.tables.len != 0) {
-                    _ = ((self.server.txn_sessions.stage(self.server.alloc, id, &read_guards) catch |zig017_err| {
+                    _ = ((self.server.txn_sessions.stage(self.server.alloc, self.admitted_mutation.?, &read_guards) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
                     })) orelse return zig017_failure: {
@@ -618,8 +588,9 @@ pub const Adapter = struct {
                     .committed_pending => .committed_pending,
                     .committed_repair_required => .committed_repair_required,
                     .aborted => return zig017_failure: {
-                        zig017_return_error = error.SqlWriteConflict;
-                        break :zig017_failure error.SqlWriteConflict;
+                        const cause = commit.abort_cause orelse error.SqlWriteConflict;
+                        zig017_return_error = cause;
+                        break :zig017_failure cause;
                     },
                     .unknown => return zig017_failure: {
                         zig017_return_error = error.SqlTransactionOutcomeUnknown;
@@ -1558,7 +1529,7 @@ pub const Adapter = struct {
         return cut;
     }
     fn saveSqlLakeCut(self: *Adapter, a: std.mem.Allocator, table: catalog.Table, cut: @import("lake_sql_retained_cut.zig").Descriptor, options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !void {
-        const id = self.active_transaction orelse return error.SqlTransactionNotActive;
+        const guard = self.admitted_mutation orelse return error.SqlTransactionNotActive;
         var opened = try @import("../serverless/lake_ingestion.zig").openQueue(a, table.external_base_source.?.binding, options);
         defer opened.deinit();
         const pins = @import("../serverless/lake_snapshot_pins.zig");
@@ -1571,7 +1542,7 @@ pub const Adapter = struct {
         try self.server.retainLakeQueryStore(a, &store, table.id, self.context);
         var artifacts = store.artifactStore();
         const token = try @import("lake_sql_retained_cut.zig").save(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), self.server.embedding_provider_runtime.io, cut, self.context.cancellation);
-        try self.server.txn_sessions.bindLakeCut(self.server.alloc, id, table.physical_name, table.id, try std.json.Stringify.valueAlloc(a, token, .{}));
+        try self.server.txn_sessions.bindLakeCut(self.server.alloc, guard, table.physical_name, table.id, try std.json.Stringify.valueAlloc(a, token, .{}));
     }
 
     /// Wait before opening or persisting a new snapshot. A retained transaction
@@ -2229,7 +2200,7 @@ pub const Adapter = struct {
             } else false;
             if (!ordinary_scan) try prunable_tables.put(owned, table.physical_name, {});
         };
-        const role_revision = if (self.identity.*) |principal| if (principal.live_user_manager) |manager| @as(?u64, manager.rowPolicyRoleRevision()) else null else null;
+        const role_revision = try @import("graph_execution.zig").captureRoleRevision(self.identity.*);
         // Bind once before cohort planning, then reuse those exact values in
         // each graph cursor. A prepared SQL query never stores bound domains.
         const parameter_rows = try owned.alloc([]const cypher.value.Entry, requests.len);
@@ -2673,7 +2644,7 @@ pub const Adapter = struct {
             var bindings = [_]txn.CatalogBinding{.{ .logical = logical, .physical = table.physical_name }};
             const statement = txn.OwnedTransactionCommitRequest{ .bound_catalog_incarnation = self.context.bound_catalog_incarnation, .tables = &tables, .catalog_bindings = .{ .items = &bindings, .capacity = 1, .pointer_stability = .{} } };
             if (!(try self.server.transactionRequestAuthorized(self.identity.*, statement))) return error.Forbidden;
-            _ = (try self.server.txn_sessions.stageValidated(self.server.alloc, id, &statement, .{ .ptr = self, .validate = validateStaged })) orelse return error.SqlTransactionNotActive;
+            _ = (try self.server.txn_sessions.stageValidated(self.server.alloc, self.admitted_mutation.?, &statement, .{ .ptr = self, .validate = validateStaged })) orelse return error.SqlTransactionNotActive;
             self.ranges_staged = true;
             self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
             return .committed;
