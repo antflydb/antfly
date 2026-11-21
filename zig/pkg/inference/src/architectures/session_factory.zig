@@ -1840,6 +1840,22 @@ pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !
     return createCudaSessionWithKernelJit(allocator, model_path, .{});
 }
 
+/// The offline core benchmark can exercise the compact projector on the GB10
+/// before the first media request. Serving uses the release device policy.
+pub fn createGemma4CudaQualificationSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
+    const session = try createCudaSession(allocator, model_path);
+    errdefer session.close();
+    if (comptime build_options.enable_cuda) {
+        const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        const compute = &self.backend_data.cuda.compute;
+        const cfg = getGptConfig(session) orelse return error.WrongArchitecture;
+        if (compute.gemma4_dense_qualified and @import("../ops/cuda/ple_host.zig").eligibleConfig(cfg) and
+            compute.ctx.info.compute_major == 12 and compute.ctx.info.compute_minor == 1)
+            try compute.configureGemma4Projector(true);
+    }
+    return session;
+}
+
 pub const GlinerCudaPrecision = enum { auto, fp32, fp16, bf16 };
 
 /// Explicit precision for qualification and model owners. Automatic selection

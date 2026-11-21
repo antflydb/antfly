@@ -202,7 +202,7 @@ pub fn main(init: std.process.Init) !void {
     const validation = suite.cases[0].logits_path != null;
     for (suite.cases) |case| if ((case.logits_path != null) != validation) return error.MixedValidationSuite;
     for (suite.cases) |case| if (case.ple_input_path != null and case.logits_path == null) return error.PleCaptureNeedsValidation;
-    const session = try factory.createCudaSession(a, args[1]);
+    const session = try factory.createGemma4CudaQualificationSession(a, args[1]);
     defer session.close();
     factory.attachIo(session, init.io);
     var cb = try factory.getComputeBackend(session, a);
