@@ -4235,7 +4235,12 @@ pub const Runtime = struct {
                     json_only = true;
                     continue;
                 },
-                error.InferenceDiscoveryShapeRejected => return if (framed_failure != null and framed_failure.? == error.InferenceDiscoveryTooManyItems) error.InferenceDiscoveryTooManyItems else err,
+                error.InferenceDiscoveryShapeRejected => {
+                    if (framed_failure) |failure| {
+                        if (failure == error.InferenceDiscoveryTooManyItems) return failure;
+                    }
+                    return err;
+                },
                 error.InferenceDiscoveryRequiresExactGeometry, error.InferenceDiscoveryTooManyItems, error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryRejected => {
                     if (rounded) {
                         rounded = false;
@@ -4250,7 +4255,10 @@ pub const Runtime = struct {
                         complete = false;
                         continue;
                     }
-                    return if (framed_failure != null and framed_failure.? == error.InferenceDiscoveryTooManyItems) framed_failure.? else err;
+                    if (framed_failure) |failure| {
+                        if (failure == error.InferenceDiscoveryTooManyItems) return failure;
+                    }
+                    return err;
                 },
                 else => return err,
             };
@@ -8538,7 +8546,8 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
             try std.testing.expectEqualStrings("Bearer reader-bearer", request.header("Authorization") orelse return error.MissingHeader);
             if (request.method == .GET) {
                 if (request.header(remote_capabilities.discovery_shape_header)) |shape|
-                    try std.testing.expectEqualStrings("2:2:2:-", shape);
+                    // Planning may probe one item before binding the full batch.
+                    try std.testing.expect(std.mem.eql(u8, shape, "2:1:2:-") or std.mem.eql(u8, shape, "2:2:2:-"));
             }
             if (framed and request.method == .POST) {
                 try std.testing.expectEqualStrings(httpx.attachment_envelope.content_type, request.header("Content-Type") orelse return error.MissingHeader);
@@ -8554,7 +8563,7 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
             }
         }
     };
-    const catalog = if (framed) "{\"readers\":{\"florence\":{\"inputs\":[\"image\"],\"inference_capabilities\":{\"version\":4,\"task\":\"read\",\"input_modalities\":[\"image\"],\"accepted_mime_types\":[\"image/png\"],\"input_granularity\":\"page\",\"output\":\"read_result\",\"result_cardinality\":\"one_per_item\",\"prompt_policy\":\"explicit\",\"borrowed_attachments\":false,\"framed_attachments\":true,\"task_limits\":{\"max_text_bytes_per_item\":81920,\"max_input_tokens_per_item\":null,\"max_output_tokens_per_item\":1024,\"max_candidates_per_request\":null,\"max_schema_bytes\":null},\"transport_limits\":{\"json\":{\"max_request_bytes\":8388608},\"framed_attachments\":{\"max_request_bytes\":134217728,\"max_metadata_bytes\":16777216,\"max_attachments\":1024,\"max_mime_bytes\":1024}},\"batch\":{\"mode\":\"native\",\"preferred_items\":2,\"max_items\":2,\"max_encoded_media_bytes\":104857600,\"max_decoded_pixels\":1000000,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}" else "{\"readers\":{\"florence\":{\"inputs\":[\"text\",\"image\"],\"inference_capabilities\":{\"task\":\"read\",\"batch\":{\"mode\":\"native\",\"preferred_items\":2,\"max_items\":2,\"max_encoded_bytes\":33554432,\"max_decoded_pixels\":0,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}";
+    const catalog = if (framed) "{\"readers\":{\"florence\":{\"inputs\":[\"image\"],\"inference_capabilities\":{\"version\":4,\"task\":\"read\",\"input_modalities\":[\"image\"],\"accepted_mime_types\":[\"image/png\"],\"input_granularity\":\"page\",\"output\":\"read_result\",\"result_cardinality\":\"one_per_item\",\"prompt_policy\":\"explicit\",\"borrowed_attachments\":false,\"framed_attachments\":true,\"task_limits\":{\"max_text_bytes_per_item\":81920,\"max_input_tokens_per_item\":null,\"max_output_tokens_per_item\":1024,\"max_candidates_per_request\":null,\"max_schema_bytes\":null},\"transport_limits\":{\"json\":{\"max_request_bytes\":8388608},\"framed_attachments\":{\"max_request_bytes\":134217728,\"max_metadata_bytes\":16777216,\"max_attachments\":1024,\"max_mime_bytes\":1024}},\"batch\":{\"mode\":\"native\",\"preferred_items\":2,\"max_items\":2,\"max_encoded_media_bytes\":104857600,\"max_decoded_pixels\":1000000,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}" else "{\"readers\":{\"florence\":{\"inputs\":[\"image\"],\"inference_capabilities\":{\"version\":4,\"task\":\"read\",\"input_modalities\":[\"image\"],\"accepted_mime_types\":[\"image/png\"],\"input_granularity\":\"page\",\"output\":\"read_result\",\"result_cardinality\":\"one_per_item\",\"prompt_policy\":\"explicit\",\"borrowed_attachments\":false,\"framed_attachments\":false,\"task_limits\":{\"max_text_bytes_per_item\":81920,\"max_input_tokens_per_item\":null,\"max_output_tokens_per_item\":1024,\"max_candidates_per_request\":null,\"max_schema_bytes\":null},\"transport_limits\":{\"json\":{\"max_request_bytes\":8388608},\"framed_attachments\":{\"max_request_bytes\":134217728,\"max_metadata_bytes\":16777216,\"max_attachments\":1024,\"max_mime_bytes\":1024}},\"batch\":{\"mode\":\"native\",\"preferred_items\":2,\"max_items\":2,\"max_encoded_media_bytes\":104857600,\"max_decoded_pixels\":1000000,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}";
     const resolved = (try remote_capabilities.parseModelCapabilities(alloc, catalog, "florence", .read)).?;
     try resolved.validate();
     var server = try httpx.TestServer.start(alloc, io, &.{
@@ -8599,6 +8608,7 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
     var result: ?asset_producer.ProducedBatch = null;
     var run_err: ?anyerror = null;
     var group = std.Io.Group.init;
+    defer group.cancel(io);
     const Fiber = struct {
         fn run(
             a: Allocator,
@@ -8618,10 +8628,25 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
         }
     };
     try group.concurrent(io, Fiber.run, .{ alloc, producer, &requests, &result, &run_err });
-    try server.handleOne(); // planning
-    try server.handleOne(); // invocation
-    try server.handleOne(); // execution
+    var serving = std.Io.Group.init;
+    defer serving.cancel(io);
+    var server_err: ?anyerror = null;
+    const Serve = struct {
+        fn run(s: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+            while (true) s.handleOne() catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    try serving.concurrent(io, Serve.run, .{ &server, &server_err });
     try group.await(io);
+    // Capability leases can reuse discovery, so the fixture must not wait for
+    // a fixed request count after the producer has completed successfully.
+    serving.cancel(io);
+    if (server_err) |err| {
+        if (err != error.Canceled) return err;
+    }
     if (run_err) |err| return err;
     var batch = result.?;
     defer batch.deinit(alloc);
