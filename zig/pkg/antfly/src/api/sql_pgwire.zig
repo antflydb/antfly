@@ -1159,7 +1159,7 @@ pub const ReplicationFactory = struct {
     const VTable = struct { open: @FieldType(ReplicationFactory, "open_fn") };
 
     fn open(self: ReplicationFactory, alloc: std.mem.Allocator, identity: ReplicationIdentity, request: wire.Request) !wire.ReplicationSession {
-        return Boundary.call("open", self.boundary_dispatch, self.open_fn, .{ self.context, alloc, identity, request });
+        return Boundary.callRemote("open", self.boundary_dispatch, self.open_fn, .{ self.context, alloc, identity, request });
     }
 };
 

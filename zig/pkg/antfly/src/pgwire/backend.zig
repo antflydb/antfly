@@ -233,7 +233,7 @@ pub const Backend = struct {
 
     pub fn openReplicationSession(self: Backend, a: std.mem.Allocator, identity: Identity, request: Request) !ReplicationSession {
         const open = self.vtable.open_replication_session orelse return error.UnsupportedReplicationMode;
-        return ReplicationBoundary.call("open_replication_session", self.replication_dispatch, open, .{ self.context, a, identity, request });
+        return ReplicationBoundary.callRemote("open_replication_session", self.replication_dispatch, open, .{ self.context, a, identity, request });
     }
 
     pub const VTable = struct {
@@ -325,16 +325,16 @@ pub const ReplicationSession = struct {
     });
 
     pub fn authorizeRequest(self: ReplicationSession, a: std.mem.Allocator, request: Request, command: ?replication_commands.Command) !void {
-        return Boundary.call("authorize", self.boundary_dispatch, self.authorize, .{ self.context, a, request, command });
+        return Boundary.callRemote("authorize", self.boundary_dispatch, self.authorize, .{ self.context, a, request, command });
     }
 
     pub fn executeCommand(self: ReplicationSession, a: std.mem.Allocator, request: Request, command: replication_commands.Command) !Result {
-        return Boundary.call("command", self.boundary_dispatch, self.command, .{ self.context, a, request, command });
+        return Boundary.callRemote("command", self.boundary_dispatch, self.command, .{ self.context, a, request, command });
     }
 
     pub fn openStream(self: ReplicationSession, a: std.mem.Allocator, request: Request, start: replication_commands.Start) !ReplicationStream {
         const open = self.open_stream orelse return error.UnsupportedReplicationMode;
-        return Boundary.call("open_stream", self.boundary_dispatch, open, .{ self.context, a, request, start });
+        return Boundary.callRemote("open_stream", self.boundary_dispatch, open, .{ self.context, a, request, start });
     }
 };
 
@@ -362,11 +362,11 @@ pub const ReplicationStream = struct {
     });
 
     pub fn readMessage(self: ReplicationStream, a: std.mem.Allocator, request: Request, after: pgoutput.Lsn, max_bytes: u32) !ReplicationPoll {
-        return Boundary.call("poll", self.boundary_dispatch, self.poll, .{ self.context, a, request, after, max_bytes });
+        return Boundary.callRemote("poll", self.boundary_dispatch, self.poll, .{ self.context, a, request, after, max_bytes });
     }
 
     pub fn applyFeedback(self: ReplicationStream, a: std.mem.Allocator, request: Request, value: pgoutput.Feedback) !void {
-        return Boundary.call("feedback", self.boundary_dispatch, self.feedback, .{ self.context, a, request, value });
+        return Boundary.callRemote("feedback", self.boundary_dispatch, self.feedback, .{ self.context, a, request, value });
     }
 };
 pub const ReplicationPoll = struct {
