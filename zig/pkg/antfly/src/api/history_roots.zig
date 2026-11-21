@@ -391,7 +391,7 @@ pub const Source = struct {
         var session = try catalog_api.RoutingSession.initWithBudget(a, self.catalog, budget);
         errdefer session.deinit();
         var roots: std.ArrayList(Root) = .empty;
-        errdefer roots.deinit(a);
+        defer roots.deinit(a);
         for (definition.tables) |expected| {
             try budget.checkpoint();
             const index = session.table_id_indexes.get(expected.table_id) orelse return error.ChangefeedResynchronizationRequired;
@@ -443,7 +443,7 @@ pub const Source = struct {
         }
         try budget.checkpoint();
         try context.ensureActive();
-        return .{ .allocator = a, .session = session, .roots = try roots.toOwnedSlice(a) };
+        return .{ .allocator = a, .session = session, .roots = try a.dupe(Root, roots.items) };
     }
     pub const RelationalFrameRead = struct {
         root_index: usize,
