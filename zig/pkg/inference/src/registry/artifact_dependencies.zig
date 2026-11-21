@@ -15,6 +15,7 @@
 
 //! Artifact references are authoritative: never guess shard or external-data names.
 const std = @import("std");
+const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const wire = @import("protobuf").wire;
 const receipt = @import("managed_receipt.zig");
 
@@ -43,6 +44,11 @@ pub const Paths = struct {
 };
 
 pub fn safetensors(allocator: std.mem.Allocator, filename: []const u8, bytes: []const u8) !Paths {
+    return safetensorsWithControl(allocator, filename, bytes, .{});
+}
+
+pub fn safetensorsWithControl(allocator: std.mem.Allocator, filename: []const u8, bytes: []const u8, control: ExecutionControl) !Paths {
+    try control.check();
     var paths: Paths = .{ .allocator = allocator };
     errdefer paths.deinit();
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
@@ -51,6 +57,7 @@ pub fn safetensors(allocator: std.mem.Allocator, filename: []const u8, bytes: []
     const weights = parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
     if (weights != .object or weights.object.count() == 0) return error.InvalidSafetensorsIndex;
     for (weights.object.values()) |value| {
+        try control.check();
         if (value != .string or !std.mem.endsWith(u8, value.string, ".safetensors")) return error.InvalidSafetensorsIndex;
         try paths.add(filename, value.string);
     }
@@ -124,10 +131,11 @@ fn externalLocation(bytes: []const u8) !?[]const u8 {
     return if (std.mem.eql(u8, key, "location")) value else null;
 }
 
-fn visit(paths: *Paths, filename: []const u8, bytes: []const u8, kind: Message, depth: usize) anyerror!void {
+fn visit(paths: *Paths, filename: []const u8, bytes: []const u8, kind: Message, depth: usize, control: ExecutionControl) anyerror!void {
     if (depth > 64) return error.OnnxGraphNestingTooDeep;
     var pos: usize = 0;
     while (pos < bytes.len) {
+        try control.check();
         const tag = try wire.readTag(bytes, &pos);
         if (tag.field == 0) return error.InvalidOnnxModel;
         if (tag.wire_type != .length_delimited) {
@@ -138,15 +146,19 @@ fn visit(paths: *Paths, filename: []const u8, bytes: []const u8, kind: Message, 
         if (kind == .tensor and tag.field == 13) {
             if (try externalLocation(payload)) |location| try paths.add(filename, location);
         } else if (childMessage(kind, tag.field)) |child| {
-            try visit(paths, filename, payload, child, depth + 1);
+            try visit(paths, filename, payload, child, depth + 1, control);
         }
     }
 }
 
 pub fn onnx(allocator: std.mem.Allocator, filename: []const u8, bytes: []const u8) !Paths {
+    return onnxWithControl(allocator, filename, bytes, .{});
+}
+
+pub fn onnxWithControl(allocator: std.mem.Allocator, filename: []const u8, bytes: []const u8, control: ExecutionControl) !Paths {
     var paths: Paths = .{ .allocator = allocator };
     errdefer paths.deinit();
-    try visit(&paths, filename, bytes, .model, 0);
+    try visit(&paths, filename, bytes, .model, 0, control);
     return paths;
 }
 

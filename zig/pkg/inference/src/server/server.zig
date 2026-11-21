@@ -2918,6 +2918,7 @@ fn addArtifactIdentityToSignature(
         };
         for (offsets, 0..) |offset, index| {
             if (index > 0 and offset == offsets[index - 1]) continue;
+            if (comptime builtin.is_test) request_work_test_counters.compatibility_checkpoint_samples += 1;
             const bytes = c_file.readRegion(allocator, artifact_path, offset, sample_len) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 signature.update("sample-unreadable");
@@ -3614,6 +3615,7 @@ const ScopedCatalogPublication = struct {
     lease: PublicationLease,
     artifacts: PublishedArtifacts,
     borrow: ScopedCatalogCache.Borrow,
+    inspection_valid: bool = false,
 
     fn open(cache: *ScopedCatalogCache, owner: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, path: []const u8, publication: ?[32]u8, control: InferenceExecutionControl) !?ScopedCatalogPublication {
         try control.check();
@@ -4097,6 +4099,7 @@ const RequestWorkTestCounters = struct {
     model_resolution_attempts: usize = 0,
     model_load_attempts: usize = 0,
     scoped_execution_manifest_loads: usize = 0,
+    compatibility_checkpoint_samples: usize = 0,
     media_fetch_attempts: usize = 0,
     batch_materialized_items: usize = 0,
     batch_peak_materialized_items: usize = 0,
@@ -27045,7 +27048,11 @@ pub const Node = struct {
                 else
                     self.model_manager.acquireLoadedModelWithControl(path, control) catch |err| return modelLoadFailureResponse(ctx, err);
                 defer if (cached_model) |*handle| handle.releaseObservation();
-                var cold_manifest: ?manifest_mod.ModelManifest = if (cached_model == null) cold: {
+                const inspected_manifest = if (scoped_publication) |captured|
+                    (if (captured.inspection_valid) captured.borrow.executionManifest() else null)
+                else
+                    null;
+                var cold_manifest: ?manifest_mod.ModelManifest = if (cached_model == null and inspected_manifest == null) cold: {
                     if (comptime builtin.is_test) request_work_test_counters.scoped_execution_manifest_loads += 1;
                     break :cold (if (scoped_artifacts) |artifacts|
                         manifest_mod.loadFromPublishedArtifacts(ctx.allocator, path, artifacts, false)
@@ -27056,7 +27063,7 @@ pub const Node = struct {
                     };
                 } else null;
                 defer if (cold_manifest) |*manifest| manifest.deinit();
-                const manifest = if (cached_model) |*handle| &handle.get().manifest else &cold_manifest.?;
+                const manifest = if (cached_model) |*handle| &handle.get().manifest else inspected_manifest orelse &cold_manifest.?;
                 const dense_output = manifest.denseEmbeddingOutput();
                 var durable_revision: ?[32]u8 = null;
                 const declared = if (embedding and manifest.managed_publication != null and (cached_model == null or include_revisions or requested_revision != null))
@@ -27254,8 +27261,18 @@ pub const Node = struct {
             const model_kind = @tagName(manifest.model_type);
             const qwen3vl_reader = isGenerativeReadModel(&manifest);
             const reader_candidate = manifestMatchesModelListingTask("readers", model_kind, &manifest);
-            const shared_artifacts: ?*const PublishedArtifacts = if (scoped_publication) |scope| if (scope.*) |*captured| &captured.artifacts else null else null;
-            const compatibility_summary = self.compatibilitySummaryWithPublication(a, entry.path, if (shared_artifacts != null) &manifest else null, shared_artifacts, control) catch |err| switch (err) {
+            const compatibility_summary: CompatibilitySummary = (if (scoped_publication != null and scoped_publication.?.* != null) scoped: {
+                const captured = &scoped_publication.?.*.?;
+                var required_scratch: [1]backends_mod.BackendType = undefined;
+                const backend_order = try compatibilityBackendsForSessionManager(&self.session_manager, &required_scratch);
+                if (captured.borrow.compatibility(&captured.artifacts, entry.path, &manifest, backend_order, control)) |summary| {
+                    captured.inspection_valid = true;
+                    break :scoped summary;
+                } else |err| {
+                    if (replica_probe) return err;
+                    break :scoped err;
+                }
+            } else self.compatibilitySummaryWithPublication(a, entry.path, null, null, control)) catch |err| switch (err) {
                 error.Timeout, error.Cancelled, error.Canceled => return err,
                 else => CompatibilitySummary{
                     .level = .unknown,
@@ -51235,6 +51252,79 @@ test "model selection reuses the verified resident installation for embedding re
     try model_dir.rename(managed.complete_filename, model_dir, ".old-receipt", io);
     try model_dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = receipt });
     try std.testing.expectEqual(@as(?[32]u8, null), try node.model_manager.residentManagedPublication(io, selected.path, selected.publication));
+}
+
+test "scoped model discovery reuses compatibility and refuses a truncated nested shard" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const managed = @import("../registry/managed_receipt.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = "embedders/acme/sharded";
+    const shard_path = "parts/weight.safetensors";
+    const index_path = "model.safetensors.index.json";
+    const config = @embedFile("../architectures/embedding_gemma2_config.json");
+    const index = "{\"weight_map\":{\"model.embed_tokens.weight\":\"" ++ shard_path ++ "\"}}";
+    const weights = "scoped catalog shard fixture";
+    try tmp.dir.createDirPath(io, path ++ "/parts");
+    const dir = try tmp.dir.openDir(io, path, .{});
+    defer dir.close(io);
+    const files = .{ .{ "config.json", config }, .{ index_path, index }, .{ shard_path, weights } };
+    var entries: [files.len]managed.ArtifactReceipt = undefined;
+    var sums: [files.len][64]u8 = undefined;
+    inline for (files, 0..) |file, i| {
+        try dir.writeFile(io, .{ .sub_path = file[0], .data = file[1] });
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(file[1], &digest, .{});
+        sums[i] = std.fmt.bytesToHex(digest, .lower);
+        entries[i] = .{ .path = file[0], .size = file[1].len, .sha256 = &sums[i] };
+    }
+    const receipt = try std.json.Stringify.valueAlloc(a, managed.DownloadReceipt{
+        .version = 2,
+        .source = .{ .owner = "acme", .name = "sharded", .variant = "safetensors", .selected_format = "safetensors" },
+        .artifacts = &entries,
+    }, .{});
+    defer a.free(receipt);
+    try dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = receipt });
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    try node.attachIo(io);
+    var request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=acme%2Fsharded&task=embed&model_revision_candidates=1");
+    defer request.deinit();
+
+    for (0..2) |_| {
+        var ctx = httpx.Context.init(a, io, &request);
+        defer ctx.deinit();
+        const before = request_work_test_counters.compatibility_checkpoint_samples;
+        var response = try node.listModels(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        const model = parsed.value.object.get("embedders").?.object.get("acme/sharded").?;
+        try std.testing.expect(model.object.get("model_revision_pinning").?.bool);
+        try std.testing.expectEqual(before, request_work_test_counters.compatibility_checkpoint_samples);
+    }
+
+    // An in-place write to a nested shard leaves the model root and completion
+    // receipt untouched. The cached dependency check must still see it.
+    try dir.writeFile(io, .{ .sub_path = shard_path, .data = weights[0..1] });
+    var stale_ctx = httpx.Context.init(a, io, &request);
+    defer stale_ctx.deinit();
+    var stale = try node.listModels(&stale_ctx);
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(u16, 503), stale.status.code);
+    try std.testing.expectEqualStrings("true", stale.headers.get("X-Antfly-Embedding-Artifact-Unavailable").?);
+
+    try dir.writeFile(io, .{ .sub_path = shard_path, .data = weights });
+    var repaired_ctx = httpx.Context.init(a, io, &request);
+    defer repaired_ctx.deinit();
+    var repaired = try node.listModels(&repaired_ctx);
+    defer repaired.deinit();
+    try std.testing.expectEqual(@as(u16, 200), repaired.status.code);
 }
 
 test "scoped model discovery resolves dense geometry without loading weights" {

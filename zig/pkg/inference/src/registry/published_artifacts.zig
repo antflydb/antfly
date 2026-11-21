@@ -371,27 +371,35 @@ pub const PublishedArtifacts = struct {
         }
         return error.InvalidManagedDownload;
     }
+    /// Check the current binding and size against the declared member.
+    pub fn requireCatalogMember(self: *const PublishedArtifacts, path: []const u8) !managed.ArtifactStamp {
+        const receipt = self.receipt orelse return error.InvalidManagedDownload;
+        const artifact = &receipt.artifacts[try self.indexForPath(path)];
+        // A manifest can store the resolved target rather than the receipt's
+        // logical name. Keep the binding to the logical member live as well.
+        const logical = try std.fs.path.join(self.allocator, &.{ self.physical_root, artifact.path });
+        defer self.allocator.free(logical);
+        if (!std.mem.eql(u8, path, logical) and !std.mem.eql(u8, path, artifact.canonical_path))
+            try self.verifyBinding(path, artifact.canonical_path);
+        const canonical = managed.resolveRegularFilePath(self.allocator, self.io, logical) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return error.InvalidManagedDownload,
+            else => return err,
+        };
+        defer self.allocator.free(canonical);
+        if (!std.mem.eql(u8, canonical, artifact.canonical_path)) return error.ModelArtifactsChanging;
+        const stat = std.Io.Dir.cwd().statFile(self.io, canonical, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return error.InvalidManagedDownload,
+            else => return err,
+        };
+        if (stat.kind != .file or stat.size != artifact.size) return error.InvalidManagedDownload;
+        return managed.ArtifactStamp.fromStat(stat);
+    }
+
     /// Return the portable receipt name of a file selected by this acquisition.
     pub fn receiptMemberPath(self: *const PublishedArtifacts, path: []const u8) ![]const u8 {
         const receipt = self.receipt orelse return error.InvalidManagedDownload;
-        const artifact = &receipt.artifacts[try self.indexForPath(path)];
-        if (self.revalidate_catalog_members) {
-            // A catalog snapshot authenticates the declaration, not the
-            // current contents of a mutable installation. Recheck the members
-            // used by the declared model before issuing this revision.
-            const canonical = managed.resolveRegularFilePath(self.allocator, self.io, path) catch |err| switch (err) {
-                error.FileNotFound, error.NotDir => return error.InvalidManagedDownload,
-                else => return err,
-            };
-            defer self.allocator.free(canonical);
-            if (!std.mem.eql(u8, canonical, artifact.canonical_path)) return error.ModelArtifactsChanging;
-            const stat = std.Io.Dir.cwd().statFile(self.io, canonical, .{ .follow_symlinks = false }) catch |err| switch (err) {
-                error.FileNotFound, error.NotDir => return error.InvalidManagedDownload,
-                else => return err,
-            };
-            if (stat.kind != .file or stat.size != artifact.size) return error.InvalidManagedDownload;
-        }
-        return artifact.path;
+        if (self.revalidate_catalog_members) _ = try self.requireCatalogMember(path);
+        return receipt.artifacts[try self.indexForPath(path)].path;
     }
 
     /// Read an already selected sidecar and authenticate its actual bytes
