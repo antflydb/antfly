@@ -380,10 +380,9 @@ pub const Session = struct {
                     // resolution hint carried to the authorized backend.
                     if (database) |value| self.database = try self.alloc.dupe(u8, value);
                     if (self.replication_mode == .logical) {
-                        const open = self.source.vtable.open_replication_session orelse return error.UnsupportedReplicationMode;
-                        self.replication = try open(self.source.context, self.alloc, self.identity.?, self.request("", &.{}, &.{}));
+                        self.replication = try self.source.openReplicationSession(self.alloc, self.identity.?, self.request("", &.{}, &.{}));
                         const owner = self.replication.?;
-                        try owner.authorize(owner.context, self.alloc, self.request("", &.{}, &.{}), null);
+                        try owner.authorizeRequest(self.alloc, self.request("", &.{}, &.{}), null);
                     }
                     if (self.hooks) |hooks| try hooks.register(hooks.context, self);
                     try self.message('R', &.{ 0, 0, 0, 0 });
@@ -1043,15 +1042,14 @@ pub const Session = struct {
         try self.replicationWrite(bytes, deadline);
     }
     fn replicationCopy(self: *Session, a: std.mem.Allocator, statement: []const u8, owner: backend.ReplicationSession, command_value: replication_commands.Command) !void {
-        const open = owner.open_stream orelse return error.UnsupportedReplicationMode;
         const limits = self.limits;
         if (limits.replication_timeout_ms == 0 or limits.replication_keepalive_ms == 0 or limits.replication_keepalive_ms >= limits.replication_timeout_ms or limits.replication_poll_ms == 0 or limits.replication_callback_ms == 0 or limits.replication_write_ms == 0 or limits.frame_bytes < 31 or limits.frame_bytes > pgoutput.max_message_bytes + 30) return error.InvalidParameter;
         var deadline = self.replicationNow() +| @as(i64, limits.replication_timeout_ms) * std.time.ns_per_ms;
         var request_value = self.replicationRequest(statement, deadline);
-        const stream = try open(owner.context, a, request_value, command_value.start);
+        const stream = try owner.openStream(a, request_value, command_value.start);
         defer stream.close(stream.context);
         if (@backingInt(stream.initial_lsn) == 0 or @backingInt(stream.resume_lsn) < @backingInt(stream.initial_lsn) or @backingInt(stream.resume_lsn) > @backingInt(stream.initial_end_lsn)) return error.InvalidResult;
-        try owner.authorize(owner.context, a, request_value, command_value);
+        try owner.authorizeRequest(a, request_value, command_value);
         var sent = stream.initial_lsn;
         var observed_end = stream.initial_end_lsn;
         var feedback_ceiling = stream.resume_lsn;
@@ -1090,7 +1088,7 @@ pub const Session = struct {
                         .renew => |bytes| {
                             const renew = self.source.vtable.refresh orelse return error.Unauthorized;
                             try renew(self.source.context, self.alloc, self.identity.?, bytes[0 .. bytes.len - 1]);
-                            try owner.authorize(owner.context, a, request_value, command_value);
+                            try owner.authorizeRequest(a, request_value, command_value);
                         },
                         .feedback => |feedback| {
                             // LSNs are untrusted peer claims. Do not pass a
@@ -1100,13 +1098,13 @@ pub const Session = struct {
                             var scratch = std.heap.ArenaAllocator.init(self.alloc);
                             defer scratch.deinit();
                             self.replicationDeadline(deadline);
-                            try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
-                            stream.feedback(stream.context, scratch.allocator(), self.replicationRequest(statement, deadline), feedback) catch |err| {
+                            try owner.authorizeRequest(scratch.allocator(), request_value, command_value);
+                            stream.applyFeedback(scratch.allocator(), self.replicationRequest(statement, deadline), feedback) catch |err| {
                                 if (err != error.ReplicationFeedbackDeferred or self.cancel_requested.load(.acquire) or self.replicationNow() >= deadline) return err;
                                 try select.concurrent(.input, replication_input.read, .{ self.alloc, self.reader, self.identity.?.renewable });
                                 continue;
                             };
-                            try owner.authorize(owner.context, scratch.allocator(), self.replicationRequest(statement, deadline), command_value);
+                            try owner.authorizeRequest(scratch.allocator(), self.replicationRequest(statement, deadline), command_value);
                             deadline = self.replicationNow() +| @as(i64, limits.replication_timeout_ms) * std.time.ns_per_ms;
                             self.replicationDeadline(deadline);
                             if (feedback.request_reply) {
@@ -1125,8 +1123,8 @@ pub const Session = struct {
                     // out must not trigger the connection watchdog before the
                     // reader can report a retryable result.
                     self.replicationDeadline(deadline);
-                    try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
-                    var poll = stream.poll(stream.context, scratch.allocator(), self.replicationRequest(statement, deadline), sent, limits.frame_bytes - 30) catch |err| {
+                    try owner.authorizeRequest(scratch.allocator(), request_value, command_value);
+                    var poll = stream.readMessage(scratch.allocator(), self.replicationRequest(statement, deadline), sent, limits.frame_bytes - 30) catch |err| {
                         if (err == error.ReplicationReadDeferred and !self.cancel_requested.load(.acquire) and self.replicationNow() < deadline) {
                             // The backend guarantees that this failure moved
                             // no cursor. Require a fresh authorized read before
@@ -1141,7 +1139,7 @@ pub const Session = struct {
                     defer poll.deinit();
                     if (@backingInt(poll.end_lsn) < @backingInt(observed_end)) return error.InvalidResult;
                     observed_end = poll.end_lsn;
-                    try owner.authorize(owner.context, scratch.allocator(), self.replicationRequest(statement, deadline), command_value);
+                    try owner.authorizeRequest(scratch.allocator(), self.replicationRequest(statement, deadline), command_value);
                     self.replicationDeadline(deadline);
                     if (poll.chunk) |chunk| {
                         if (@backingInt(chunk.start_lsn) != @backingInt(sent) or chunk.bytes.len == 0 or chunk.bytes.len > limits.frame_bytes - 30) return error.InvalidResult;
@@ -1190,7 +1188,7 @@ pub const Session = struct {
         self.replication_administration = true;
         const request_value = self.request(statement, &.{}, &.{});
         try request_value.check();
-        try owner.authorize(owner.context, a, request_value, command_value);
+        try owner.authorizeRequest(a, request_value, command_value);
         if (command_value == .start) {
             try self.replicationCopy(a, statement, owner, command_value);
             return;
@@ -1198,7 +1196,7 @@ pub const Session = struct {
         const mutates = command_value != .identify_system;
         // Logical slot administration does not create a SQL transaction
         // completion receipt. The replication owner handles uncertain outcomes.
-        var result = try owner.command(owner.context, a, request_value, command_value);
+        var result = try owner.executeCommand(a, request_value, command_value);
         defer result.deinit();
         self.mutation_ack_pending = mutates and result.mutation_outcome == .committed;
         const expected: []const u8 = switch (command_value) {
@@ -1239,7 +1237,7 @@ pub const Session = struct {
                 .use_snapshot, .nothing => if (!snapshot.sql_null) return error.InvalidResult,
             }
         }
-        owner.authorize(owner.context, a, request_value, command_value) catch |err| {
+        owner.authorizeRequest(a, request_value, command_value) catch |err| {
             if (mutates) self.diagnostic.set("40003", "replication command committed; authorization changed before reply; inspect slot state", null, null);
             return err;
         };
@@ -1268,7 +1266,7 @@ pub const Session = struct {
                     if (self.replication_mode == .logical and self.status == .idle and (clear_path or directory_mode)) {
                         const owner = self.replication orelse return error.UnsupportedReplicationMode;
                         const request_value = self.request(statement, &.{}, &.{});
-                        try owner.authorize(owner.context, arena.allocator(), request_value, null);
+                        try owner.authorizeRequest(arena.allocator(), request_value, null);
                         if (clear_path) self.namespace_setting = .{};
                         const result: backend.Result = if (clear_path) .{
                             .columns = &.{.{ .name = "set_config", .type = .string }},
