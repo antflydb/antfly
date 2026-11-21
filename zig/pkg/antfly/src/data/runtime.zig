@@ -17820,6 +17820,7 @@ pub const DataServer = struct {
         };
         const outcome = received.outcome orelse return error.RaftBatchWriteOutcomeUnknown;
         return switch (outcome) {
+            .superseded => error.RaftBatchWriteOutcomeUnknown,
             .rejected => |rejection| if (rejection == .resynchronization) null else rejection.asError(),
             .applied => |applied| if (applied.policy) |policy| .{
                 .namespace = namespace,

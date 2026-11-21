@@ -1840,6 +1840,48 @@ fn releaseStreamingSnapshot(client: *config.Client, policy: anytype, a: A, state
 
 pub fn retireOne(client: *config.Client, policy: anytype, a: A, state: control.State, request: Context) !bool {
     const definition = state.definition.?;
+    for (state.roots) |item| {
+        const handoff = item.split_handoff orelse continue;
+        try policy.authorizeRoot(state, item.namespace, request);
+        if (item.split_grant_sequence) |grant| {
+            const source = policy.source;
+            var discovered = try source.capturePhysical(a, definition, request);
+            defer discovered.deinit();
+            const table_id = std.mem.readInt(u64, item.namespace[0..8], .big);
+            const route = try discovered.findPhysical(table_id, handoff.successor.group_id, handoff.successor.range_id);
+            if (!std.meta.eql(route.namespace, item.storageNamespace())) return error.ChangefeedResynchronizationRequired;
+            const command: @import("history_control_operations.zig").wire.Request = .{
+                .version = 1,
+                .operation = .submit,
+                .command = .{ .retire = .{
+                    .namespace = item.storageNamespace(),
+                    .authority = state.authority,
+                    .consumer = state.consumerId(),
+                    .definition = definition.identity(),
+                    .sequence = state.authority_sequence,
+                    .grant = grant,
+                } },
+            };
+            const result = try source.controls.execute(a, route.fence, route.table_name, command, request);
+            if (!result.confirmed()) return error.MetadataMutationOutcomeUnknown;
+            if (result.outcome.? == .rejected) return result.outcome.?.rejected.asError();
+            const collect: @import("history_control_operations.zig").wire.Request = .{
+                .version = 1,
+                .operation = .submit,
+                .command = .{ .collect = .{ .namespace = item.storageNamespace(), .authority = state.authority, .max_frames = 32 } },
+            };
+            const collected = try source.controls.execute(a, route.fence, route.table_name, collect, request);
+            if (!collected.confirmed()) return error.MetadataMutationOutcomeUnknown;
+            if (collected.outcome.? == .rejected) return collected.outcome.?.rejected.asError();
+            if (collected.outcome.?.applied.reclaimed_frames == collect.command.collect.max_frames) return true;
+        }
+        try change(client, a, state, .{ .release_split_successor = .{
+            .namespace = item.namespace,
+            .grant_sequence = item.split_grant_sequence orelse 0,
+            .transition = handoff.cut.transition,
+        } }, request);
+        return true;
+    }
     for (state.roots) |root| {
         if (!root.released or root.snapshot_released) continue;
         const pin = root.snapshot orelse continue;

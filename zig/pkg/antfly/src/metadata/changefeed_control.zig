@@ -676,6 +676,7 @@ pub const Mutation = union(enum) {
     release_merge_donor: struct { namespace: Namespace, transition: u64, receipt_term: u64, receipt_index: u64 },
     stage_merge_drain: struct { namespace: Namespace, ownership_epoch: u64, drain: MergeDrain },
     stage_split_handoff: struct { namespace: Namespace, ownership_epoch: u64, handoff: SplitHandoff },
+    release_split_successor: struct { namespace: Namespace, grant_sequence: u64, transition: u64 },
     confirm_split_successor: struct { namespace: Namespace, grant_sequence: u64, consumer_epoch: u64 },
     activate_split_successor: struct { namespace: Namespace, grant_sequence: u64 },
     refresh_grant: struct { namespace: Namespace, previous: u64 },
@@ -703,7 +704,7 @@ pub const Mutation = union(enum) {
             .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
             .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
             .stage_catalog_start, .renew_catalog => return provider_history_protocol_version,
-            .prune_merge_donor, .release_merge_donor, .stage_merge_drain, .stage_split_handoff, .confirm_split_successor, .activate_split_successor => return physical_history_protocol_version,
+            .prune_merge_donor, .release_merge_donor, .stage_merge_drain, .stage_split_handoff, .release_split_successor, .confirm_split_successor, .activate_split_successor => return physical_history_protocol_version,
             .plan_roots => |plans| for (plans) |plan| {
                 if (plan.physical != null) return physical_history_protocol_version;
             },
@@ -752,6 +753,7 @@ pub const Mutation = union(enum) {
                 if (!std.mem.eql(u8, value.namespace[0..8], value.handoff.cut.namespace[0..8])) return error.InvalidChangefeed;
             },
             .activate_split_successor => |value| if (!nz(value.namespace) or value.grant_sequence == 0) return error.InvalidChangefeed,
+            .release_split_successor => |value| if (!nz(value.namespace) or value.transition == 0) return error.InvalidChangefeed,
             .confirm_split_successor => |value| {
                 if (!nz(value.namespace) or value.grant_sequence == 0 or value.consumer_epoch == 0) return error.InvalidChangefeed;
             },
@@ -1082,6 +1084,19 @@ pub const Mutation = union(enum) {
                 roots[index].split_grant_sequence = stamp.sequence;
                 next.roots = roots;
             },
+            .release_split_successor => |released| {
+                if (state.phase != .closing and state.phase != .reset_required) return error.ChangefeedConflict;
+                const index = try state.rootIndex(released.namespace);
+                const predecessor = state.roots[index];
+                const handoff = predecessor.split_handoff orelse return state;
+                if (handoff.cut.transition != released.transition or (predecessor.split_grant_sequence orelse 0) != released.grant_sequence)
+                    return error.ChangefeedConflict;
+                const roots = try a.dupe(Root, state.roots);
+                roots[index].split_handoff = null;
+                roots[index].split_grant_sequence = null;
+                roots[index].split_consumer_epoch = null;
+                next.roots = roots;
+            },
             .confirm_split_successor => |confirmed| {
                 if (state.phase != .streaming) return error.ChangefeedConflict;
                 const index = try state.rootIndex(confirmed.namespace);
@@ -1400,7 +1415,7 @@ pub const Mutation = union(enum) {
             },
             .finish_close => {
                 if (state.phase != .closing) return error.ChangefeedConflict;
-                for (state.roots) |root| if (!root.released or root.pending_control != null or (root.snapshot != null and !root.snapshot_released)) return error.ChangefeedConflict;
+                for (state.roots) |root| if (!root.released or root.pending_control != null or root.split_handoff != null or (root.snapshot != null and !root.snapshot_released)) return error.ChangefeedConflict;
                 if (state.slot) |slot| if (slot.spool.records.len != 0) return error.ChangefeedConflict;
                 next.phase = .deleted;
             },
@@ -1799,6 +1814,16 @@ test "changefeed stages a split proof without changing retained cursor positions
     const ready = try step(a, staged, confirmation);
     try std.testing.expectEqual(@as(?u64, 7), ready.roots[0].split_consumer_epoch);
     try std.testing.expectEqual(staged.latest_cursor, ready.latest_cursor);
+    const closed = try step(a, ready, .close);
+    const cleanup: Mutation = .{ .release_split_successor = .{
+        .namespace = namespace,
+        .grant_sequence = staged.roots[0].split_grant_sequence.?,
+        .transition = mutation.stage_split_handoff.handoff.cut.transition,
+    } };
+    try std.testing.expectError(error.ChangefeedConflict, step(a, ready, cleanup));
+    const cleaned = try step(a, closed, cleanup);
+    try std.testing.expectEqual(@as(?SplitHandoff, null), cleaned.roots[0].split_handoff);
+    try std.testing.expectEqual(@as(?u64, null), cleaned.roots[0].split_consumer_epoch);
     try std.testing.expectEqual(ready.revision, (try step(a, ready, confirmation)).revision);
     const activation: Mutation = .{ .activate_split_successor = .{
         .namespace = namespace,
