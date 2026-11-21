@@ -714,12 +714,10 @@ pub fn replayBounded(
 
         const payload_len: u64 = header.payload_len;
         if (record_header_len + payload_len > remaining) {
-            // A damaged length cannot locate the trailer. Search the
-            // remaining extent for independent evidence of a complete
-            // record. Without that evidence, old or torn tails still open.
-            const salt = run_salt orelse header.salt;
-            const corrupt = salt != 0 and try laterRunEvidence(file, io, base_offset, capacity, pos + record_header_len, salt, @max(last_sequence orelse 0, header.commit_sequence), header.commit_sequence);
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (corrupt) .corrupt_record else .torn_tail };
+            // A decoded header from this run cannot claim bytes past
+            // the extent. Fail closed even for old records that were
+            // allowed to fill the extent without an end trailer.
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
         }
 
         payload_buf.clearRetainingCapacity();
@@ -848,7 +846,7 @@ fn unclearStop(file: File, io: Io, base_offset: u64, capacity: u64, pos: u64, re
     const salt = run_salt orelse return .corrupt_record;
     if (!restartable or salt == 0 or pos == 0) return .corrupt_record;
     if (try damagedRecordAt(file, io, base_offset, capacity, pos, salt, last_sequence orelse 0)) return .corrupt_record;
-    return if (try laterRunEvidence(file, io, base_offset, capacity, pos + 1, salt, last_sequence orelse 0, null)) .corrupt_record else .end_of_region;
+    return if (try laterRunHeader(file, io, base_offset, capacity, pos + 1, salt, last_sequence orelse 0)) .corrupt_record else .end_of_region;
 }
 
 /// Whether the bytes at `pos`, read as a header whatever its damage, lead
@@ -867,15 +865,13 @@ fn damagedRecordAt(file: File, io: Io, base_offset: u64, capacity: u64, pos: u64
     return trailer.salt == salt and trailer.sequence == header.commit_sequence;
 }
 
-/// Searches the remainder of the extent for a later header or for an
-/// independently checksummed trailer matching the damaged header's sequence.
-fn laterRunEvidence(file: File, io: Io, base_offset: u64, capacity: u64, from: u64, salt: u64, after: u64, trailer_sequence: ?u64) !bool {
+/// Whether a version 2 header with `salt` and a sequence past `after`
+/// appears anywhere in `[from, capacity)`.
+fn laterRunHeader(file: File, io: Io, base_offset: u64, capacity: u64, from: u64, salt: u64, after: u64) !bool {
     var prefix: [8]u8 = undefined;
     std.mem.writeInt(u32, prefix[0..4], magic, .little);
     std.mem.writeInt(u16, prefix[4..6], format_version, .little);
     std.mem.writeInt(u16, prefix[6..8], @intCast(header_len), .little);
-    var trailer_prefix = prefix;
-    std.mem.writeInt(u32, trailer_prefix[0..4], trailer_magic, .little);
     var chunk: [64 * 1024]u8 = undefined;
     var start = from;
     while (start + header_len <= capacity) {
@@ -883,14 +879,6 @@ fn laterRunEvidence(file: File, io: Io, base_offset: u64, capacity: u64, from: u
         const got = try file.readPositionalAll(io, chunk[0..want], base_offset + start);
         if (got < header_len) return false;
         var at: usize = 0;
-        if (trailer_sequence) |sequence| {
-            while (std.mem.indexOfPos(u8, chunk[0..got], at, &trailer_prefix)) |found| : (at = found + 1) {
-                if (found + header_len > got) break;
-                const trailer = Trailer.decode(chunk[found..][0..header_len]) orelse continue;
-                if (trailer.salt == salt and trailer.sequence == sequence) return true;
-            }
-        }
-        at = 0;
         while (std.mem.indexOfPos(u8, chunk[0..got], at, &prefix)) |found| : (at = found + 1) {
             if (found + header_len > got) break;
             const header = RecordHeader.decode(chunk[found..][0..header_len]);
@@ -1292,7 +1280,7 @@ test "replay rejects a damaged salt inside a run, not a short log" {
     try testing.expectEqual(clean.tail, ended.valid_bytes);
 }
 
-test "replay detects an oversized corrupted length using the final trailer" {
+test "replay rejects a corrupted length even without a final trailer" {
     const io = testing.io;
     const capacity: u64 = 2 * (header_len + 1) + header_len;
     var region = try makeTempRegion(io, capacity);
@@ -1302,9 +1290,9 @@ test "replay detects an oversized corrupted length using the final trailer" {
     const last = writer.tail;
     try writer.append(12, "b");
 
-    // Flip a high bit in the payload length, leaving the trailer intact.
+    // Older writers could fill the extent without writing a trailer.
     try region.file.writePositionalAll(io, &.{0x80}, last + 11);
-    const outcome = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    const outcome = try replayBounded(testing.allocator, region.file, io, 0, capacity - header_len, 10, null, null, null, null);
     try testing.expectEqual(StopReason.corrupt_record, outcome.stop_reason);
     try testing.expectEqual(last, outcome.valid_bytes);
 

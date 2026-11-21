@@ -61,7 +61,7 @@ pub fn durableKeyAlloc(allocator: Allocator, scope: []const u8, namespace: ?[]co
     });
 }
 
-fn scopePrefixAlloc(allocator: Allocator, scope: []const u8) ![]u8 {
+pub fn scopePrefixAlloc(allocator: Allocator, scope: []const u8) ![]u8 {
     return try std.mem.concat(allocator, u8, &.{ reserved_prefix, scope, &.{0} });
 }
 
@@ -209,6 +209,7 @@ pub const Sink = struct {
             .submit = submit,
             .loadAllAlloc = loadAllAlloc,
             .loadKeysAlloc = loadKeysAlloc,
+            .deleteScope = deleteScope,
             .submitDeferred = submitDeferred,
             .pauseMaintenance = pauseMaintenance,
             .resumeMaintenance = resumeMaintenance,
@@ -288,6 +289,21 @@ pub const Sink = struct {
     }
 
     fn completedWait(_: *anyopaque) anyerror!void {}
+
+    fn deleteScope(ptr: *anyopaque, scope: []const u8) anyerror!void {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        const prefix = try scopePrefixAlloc(self.allocator, scope);
+        defer self.allocator.free(prefix);
+        const Request = struct {
+            prefix: []const u8,
+            fn run(context: *anyopaque, file: *native.NativeFile) !void {
+                const request: *@This() = @ptrCast(@alignCast(context));
+                try file.deleteIndexCatalogPrefix(request.prefix, null);
+            }
+        };
+        var request = Request{ .prefix = prefix };
+        try self.store.submitIndexMutationForScope(scope, &request, Request.run, true);
+    }
 
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
         return loadEntriesAlloc(ptr, allocator, scope, false);

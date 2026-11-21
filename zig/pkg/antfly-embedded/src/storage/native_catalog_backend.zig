@@ -109,6 +109,7 @@ pub const Sink = struct {
     loadAllAlloc: *const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry,
     /// Like loadAllAlloc, with empty values allocated by the same allocator.
     loadKeysAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry = null,
+    deleteScope: ?*const fn (ptr: *anyopaque, scope: []const u8) anyerror!void = null,
     /// Optional (`null` for a `Sink` with no deferred path, e.g. the test
     /// fakes below): like `submit`, but for `durable = false` only, and
     /// never blocks waiting for the underlying group commit to apply --
@@ -149,6 +150,7 @@ pub const Sink = struct {
 /// saying the index is gone while its stale scope survives underneath a
 /// later re-admission. A no-op when nothing is committed under `scope`.
 pub fn deleteAllForScope(allocator: Allocator, sink: Sink, scope: []const u8) !void {
+    if (sink.deleteScope) |delete_scope| return delete_scope(sink.ptr, scope);
     var deletes = try ScopeDeletes.load(allocator, sink, scope);
     defer deletes.deinit();
     if (deletes.mutations.len == 0) return;

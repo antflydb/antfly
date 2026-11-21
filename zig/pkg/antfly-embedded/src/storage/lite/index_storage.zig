@@ -364,67 +364,16 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     try self.docs.submitIndexMutation(&request, Context.apply, true);
 }
 
-// Subtree deletion stays one atomic native transaction. Each private flush
-// releases keys and editor scratch; the cursor retains the original immutable
-// root so subsequent batches cannot skip entries as the active tree shrinks.
-const CatalogDeleteBatch = struct {
-    const max_keys = 64;
-    const max_key_bytes = 16 * 1024;
-    allocator: Allocator,
-    file: *native.NativeFile,
-    mutations: std.ArrayListUnmanaged(native.CatalogMutation) = .empty,
-    key_bytes: usize = 0,
-
-    fn clear(self: *@This()) void {
-        for (self.mutations.items) |mutation| self.allocator.free(mutation.key);
-        self.mutations.clearRetainingCapacity();
-        self.key_bytes = 0;
-    }
-
-    pub fn deinit(self: *@This()) void {
-        self.clear();
-        self.mutations.deinit(self.allocator);
-    }
-
-    fn add(self: *@This(), key: []const u8) !void {
-        if (self.mutations.items.len != 0 and
-            (self.mutations.items.len >= max_keys or self.key_bytes + key.len > max_key_bytes)) try self.flush();
-        const owned = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(owned);
-        try self.mutations.append(self.allocator, .{ .key = owned, .is_delete = true });
-        self.key_bytes += owned.len;
-    }
-
-    fn flush(self: *@This()) !void {
-        if (self.mutations.items.len == 0) return;
-        try self.file.putIndexCatalogBatch(self.mutations.items);
-        _ = try self.file.materializeTransactionCheckpoint();
-        self.clear();
-    }
-};
-
 fn deleteTreeLocked(self: *Store, path: []const u8) !void {
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
     const file = &self.docs.file;
-    // Include earlier callbacks in this group before pinning the scan root.
-    const checkpoint = try file.materializeTransactionCheckpoint();
-    var batch = CatalogDeleteBatch{ .allocator = self.allocator, .file = file };
-    defer batch.deinit();
-    // Include the exact file, but never a neighboring name such as /a-other.
-    if (try file.getIndexCatalogRecordSizeAtCheckpoint(directory, checkpoint) != null) try batch.add(directory);
     const prefix = if (std.mem.eql(u8, directory, "/"))
         try self.allocator.dupe(u8, "/")
     else
         try std.fmt.allocPrint(self.allocator, "{s}/", .{directory});
     defer self.allocator.free(prefix);
-    var cursor = try file.indexCatalogCursor(checkpoint, prefix);
-    defer cursor.deinit();
-    while (try cursor.next()) |record| {
-        defer file.allocator.free(record.key);
-        if (!std.mem.eql(u8, record.key, directory)) try batch.add(record.key);
-    }
-    try batch.flush();
+    try file.deleteIndexCatalogPrefix(prefix, directory);
 }
 
 fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {

@@ -13699,6 +13699,66 @@ pub const NativeFile = struct {
         return try self.putCatalogBatchForRoot(.index, mutations, .{});
     }
 
+    /// Apply a prefix delete in bounded private batches. The caller's
+    /// transaction publishes the scope removal together with its other writes.
+    pub fn deleteIndexCatalogPrefix(self: *NativeFile, prefix: []const u8, exact_key: ?[]const u8) !void {
+        const checkpoint = try self.materializeTransactionCheckpoint();
+        var batch = CatalogDeleteBatch{ .allocator = self.allocator, .file = self };
+        defer batch.deinit();
+        if (exact_key) |key| {
+            if (try self.getIndexCatalogRecordSizeAtCheckpoint(key, checkpoint) != null) try batch.add(key);
+        }
+        var cursor = try self.indexCatalogCursor(checkpoint, prefix);
+        defer cursor.deinit();
+        while (try cursor.next()) |record| {
+            defer self.allocator.free(record.key);
+            if (exact_key) |key| {
+                if (std.mem.eql(u8, record.key, key)) continue;
+            }
+            try batch.add(record.key);
+        }
+        try batch.flush();
+    }
+
+    // Subtree deletion stays one atomic native transaction. Each private flush
+    // releases keys and editor scratch; the cursor retains the original immutable
+    // root so subsequent batches cannot skip entries as the active tree shrinks.
+    const CatalogDeleteBatch = struct {
+        const max_keys = 64;
+        const max_key_bytes = 16 * 1024;
+        allocator: Allocator,
+        file: *NativeFile,
+        mutations: std.ArrayListUnmanaged(CatalogMutation) = .empty,
+        key_bytes: usize = 0,
+
+        fn clear(self: *@This()) void {
+            for (self.mutations.items) |mutation| self.allocator.free(mutation.key);
+            self.mutations.clearRetainingCapacity();
+            self.key_bytes = 0;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.clear();
+            self.mutations.deinit(self.allocator);
+        }
+
+        fn add(self: *@This(), key: []const u8) !void {
+            if (self.mutations.items.len != 0 and
+                (self.mutations.items.len >= max_keys or self.key_bytes + key.len > max_key_bytes)) try self.flush();
+            const owned = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(owned);
+            try self.mutations.append(self.allocator, .{ .key = owned, .is_delete = true });
+            self.key_bytes += owned.len;
+        }
+
+        fn flush(self: *@This()) !void {
+            if (self.mutations.items.len == 0) return;
+            try self.file.putIndexCatalogBatch(self.mutations.items);
+            _ = try self.file.materializeTransactionCheckpoint();
+            self.clear();
+        }
+    };
+
     const CatalogRoots = struct { history: u64, index: u64 = 0, indexed: bool = false };
 
     fn readCatalogRoots(self: *NativeFile, page: u64, checkpoint: CheckpointSlot) !CatalogRoots {

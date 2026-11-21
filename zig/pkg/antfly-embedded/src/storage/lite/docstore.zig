@@ -7345,6 +7345,7 @@ pub const Txn = struct {
     // `PrimaryCommitContext.apply`). Encoded keys are owned by
     // `index_catalog_arena`, created lazily on first use.
     index_catalog_pending: std.ArrayListUnmanaged(native.CatalogMutation) = .empty,
+    index_catalog_delete_prefix: ?[]const u8 = null,
     index_catalog_arena: ?std.heap.ArenaAllocator = null,
     read_only: bool = true,
     writer_reserved: bool = false,
@@ -7595,10 +7596,12 @@ pub const Txn = struct {
         // as `mutations` above. Empty for every write that does not use
         // `Txn.putIndexCatalogBatch`.
         index_catalog_mutations: []const native.CatalogMutation = &.{},
+        index_catalog_delete_prefix: ?[]const u8 = null,
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
             try file.putDocumentBatch(context.mutations);
             if (context.index_catalog_mutations.len != 0) try file.putIndexCatalogBatch(context.index_catalog_mutations);
+            if (context.index_catalog_delete_prefix) |prefix| try file.deleteIndexCatalogPrefix(prefix, null);
         }
     };
 
@@ -7695,7 +7698,7 @@ pub const Txn = struct {
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0) {
+        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0 and self.index_catalog_delete_prefix == null) {
             self.abort();
             return .{};
         }
@@ -7724,7 +7727,7 @@ pub const Txn = struct {
         // `StagedCommit.wait()`/`abort()`, both of which run after the
         // group's `apply` callback has already consumed it, mirroring how
         // `mutations` above borrows `self.pending`'s own buffers.
-        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items };
+        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .index_catalog_delete_prefix = self.index_catalog_delete_prefix };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
@@ -8543,10 +8546,18 @@ pub const Txn = struct {
         }
     }
 
+    pub fn deleteIndexCatalogScope(self: *Txn, scope: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (self.index_catalog_delete_prefix != null) return error.InvalidBatch;
+        if (self.index_catalog_arena == null) self.index_catalog_arena = std.heap.ArenaAllocator.init(self.allocator);
+        self.index_catalog_delete_prefix = try @import("native_catalog_sink.zig").scopePrefixAlloc(self.index_catalog_arena.?.allocator(), scope);
+    }
+
     fn freeIndexCatalogPending(self: *Txn) void {
         if (self.index_catalog_arena) |*arena| arena.deinit();
         self.index_catalog_arena = null;
         self.index_catalog_pending = .empty;
+        self.index_catalog_delete_prefix = null;
     }
 
     fn pendingNode(node: *PendingTree.Node) *PendingNode {
@@ -10406,6 +10417,63 @@ test "lite native docstore putIndexCatalogBatch publishes primary and index-cata
     const active_value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_active_key)).?;
     defer allocator.free(active_value);
     try std.testing.expectEqualStrings("1", active_value);
+}
+
+test "lite native docstore deletes a large index scope in one publication" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-scope-delete.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put("catalog", "present");
+        for (0..150) |i| {
+            var key: [160]u8 = @splat('k');
+            std.mem.writeInt(u64, key[0..8], i, .big);
+            try txn.putIndexCatalogBatch("idx", &.{.{ .namespace = null, .key = &key, .value = "posting" }});
+        }
+        try txn.putIndexCatalogBatch("idx-neighbor", &.{.{ .namespace = null, .key = "keep", .value = "neighbor" }});
+        try txn.commit();
+    }
+
+    {
+        var txn = try store.beginWrite();
+        defer txn.abort();
+        try txn.delete("catalog");
+        try txn.deleteIndexCatalogScope("idx");
+    }
+    const prefix = try @import("native_catalog_sink.zig").scopePrefixAlloc(allocator, "idx");
+    defer allocator.free(prefix);
+    {
+        var cursor = try store.file.indexCatalogCursor(store.file.activeCheckpoint(), prefix);
+        defer cursor.deinit();
+        const first = (try cursor.next()).?;
+        store.file.allocator.free(first.key);
+    }
+
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.delete("catalog");
+        try txn.deleteIndexCatalogScope("idx");
+        try txn.commit();
+    }
+    var cursor = try store.file.indexCatalogCursor(store.file.activeCheckpoint(), prefix);
+    defer cursor.deinit();
+    try std.testing.expect((try cursor.next()) == null);
+    const keep = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "idx-neighbor", null, "keep");
+    defer allocator.free(keep);
+    const value = (try store.file.getIndexCatalogRecordAlloc(allocator, keep)).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("neighbor", value);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get("catalog"));
 }
 
 test "lite native docstore putIndexCatalogBatch alone (no primary writes) still commits once" {

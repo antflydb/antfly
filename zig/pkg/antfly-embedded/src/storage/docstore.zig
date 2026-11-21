@@ -216,7 +216,7 @@ const ReplayCreditScan = struct {
 fn scanReplayJournalCredits(txn: anytype) !ReplayCreditScan {
     var scan: ReplayCreditScan = .{};
     for (replay_credit_lanes, 0..) |kind, i| {
-        const head = scan.heads[i * 8 ..][0..8];
+        const head = replayCreditLaneHead(&scan.heads, i);
         var cursor = try txn.openCursor();
         defer cursor.close();
         const lower = internal_keys.replayRangeLower(kind, 0);
@@ -230,6 +230,11 @@ fn scanReplayJournalCredits(txn: anytype) !ReplayCreditScan {
             if (std.mem.readInt(u64, head, .little) == 0) std.mem.writeInt(u64, head, seq + 1, .little);
             scan.ledger = scan.ledger.charged(replay_journal_format.entryCharge(current.key.len, current.value.len), 1);
         }
+    }
+    const next = try replayCreditNextSequence(txn);
+    for (0..replay_credit_lanes.len) |i| {
+        if (std.mem.readInt(u64, replayCreditLaneHead(&scan.heads, i), .little) == 0)
+            std.mem.writeInt(u64, replayCreditLaneFloor(&scan.heads, i), next, .little);
     }
     return scan;
 }
@@ -245,22 +250,42 @@ const replay_hint_ordinals = blk: {
 const replay_credit_lanes = [_]u8{internal_keys.replay_all_kind} ++ replay_hint_ordinals;
 // The first key in each lane is enough to detect base retirement, which
 // only removes prefixes. A base append is detected separately by its head.
-const ReplayCreditLaneHeads = [replay_credit_lanes.len * 8]u8;
+// Keep the sequence at which an empty lane was observed. Its next seek
+// can start there, even if tombstones for the retired prefix still exist.
+const ReplayCreditLaneHeads = [replay_credit_lanes.len * 16]u8;
 
-fn readReplayCreditLaneHeads(txn: anytype) !ReplayCreditLaneHeads {
-    var heads: ReplayCreditLaneHeads = @splat(0);
-    for (replay_credit_lanes, 0..) |kind, i| {
-        const lower = internal_keys.replayRangeLower(kind, 0);
-        const upper = internal_keys.replayRangeUpper(kind);
-        var cursor = try txn.openPhysicalCursorAdapter();
-        defer cursor.close();
-        cursor.setKeysOnly();
-        cursor.setUpperBound(&upper);
-        const entry = (try cursor.seekAtOrAfter(&lower)) orelse continue;
-        const seq = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse continue;
-        std.mem.writeInt(u64, heads[i * 8 ..][0..8], seq + 1, .little);
-    }
-    return heads;
+fn replayCreditLaneHead(heads: *ReplayCreditLaneHeads, lane: usize) *[8]u8 {
+    return heads[lane * 16 ..][0..8];
+}
+
+fn replayCreditLaneFloor(heads: *ReplayCreditLaneHeads, lane: usize) *[8]u8 {
+    return heads[lane * 16 + 8 ..][0..8];
+}
+
+fn replayCreditLaneStart(heads: *const ReplayCreditLaneHeads, lane: usize) u64 {
+    const head = std.mem.readInt(u64, heads[lane * 16 ..][0..8], .little);
+    if (head != 0) return head - 1;
+    return std.mem.readInt(u64, heads[lane * 16 + 8 ..][0..8], .little);
+}
+
+fn replayCreditNextSequence(txn: anytype) !u64 {
+    const raw = replay_journal_format.getNextSequence(txn) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    return std.mem.readInt(u64, &raw, .little);
+}
+
+fn seekReplayCreditLaneHead(txn: anytype, kind: u8, from: u64) !u64 {
+    const lower = internal_keys.replayRangeLower(kind, from);
+    const upper = internal_keys.replayRangeUpper(kind);
+    var cursor = try txn.openPhysicalCursorAdapter();
+    defer cursor.close();
+    cursor.setKeysOnly();
+    cursor.setUpperBound(&upper);
+    const entry = (try cursor.seekAtOrAfter(&lower)) orelse return 0;
+    const seq = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse return 0;
+    return seq + 1;
 }
 
 fn storedReplayCreditLaneHeads(txn: anytype) !?ReplayCreditLaneHeads {
@@ -268,6 +293,7 @@ fn storedReplayCreditLaneHeads(txn: anytype) !?ReplayCreditLaneHeads {
         error.NotFound => return null,
         else => return err,
     };
+    if (raw.len == replay_credit_lanes.len * 8) return null;
     if (raw.len != @sizeOf(ReplayCreditLaneHeads)) return error.CorruptReplayMetadata;
     return raw[0..@sizeOf(ReplayCreditLaneHeads)].*;
 }
@@ -275,8 +301,11 @@ fn storedReplayCreditLaneHeads(txn: anytype) !?ReplayCreditLaneHeads {
 fn replayCreditsNeedRepair(txn: anytype) !bool {
     if (try replay_journal_format.baseWroteSince(txn)) return true;
     const stored = try storedReplayCreditLaneHeads(txn) orelse return true;
-    const actual = try readReplayCreditLaneHeads(txn);
-    return !std.mem.eql(u8, &stored, &actual);
+    for (replay_credit_lanes, 0..) |kind, i| {
+        const expected = std.mem.readInt(u64, stored[i * 16 ..][0..8], .little);
+        if (try seekReplayCreditLaneHead(txn, kind, replayCreditLaneStart(&stored, i)) != expected) return true;
+    }
+    return false;
 }
 
 fn upgradeLegacyReplayJournal(txn: anytype, keep_base_layout: bool) !void {
@@ -415,9 +444,16 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
                 var heads = previous_heads;
                 for (replay_credit_lanes, 0..) |kind, i| {
                     if (i != 0 and (mask & (@as(u8, 1) << @intCast(kind))) == 0) continue;
-                    const slot = heads[i * 8 ..][0..8];
-                    if (std.mem.readInt(u64, slot, .little) == 0) std.mem.writeInt(u64, slot, sequence + 1, .little);
+                    const slot = replayCreditLaneHead(&heads, i);
+                    if (std.mem.readInt(u64, slot, .little) == 0) {
+                        std.mem.writeInt(u64, slot, sequence + 1, .little);
+                        std.mem.writeInt(u64, replayCreditLaneFloor(&heads, i), 0, .little);
+                    }
                 }
+                if (!already_initialized) for (0..replay_credit_lanes.len) |i| {
+                    if (std.mem.readInt(u64, replayCreditLaneHead(&heads, i), .little) == 0)
+                        std.mem.writeInt(u64, replayCreditLaneFloor(&heads, i), sequence + 1, .little);
+                };
                 if (!std.mem.eql(u8, &heads, &previous_heads)) try txn.put(&internal_keys.journal_credit_lane_heads_key, &heads);
             }
         }
@@ -1089,6 +1125,11 @@ pub const DocStore = struct {
 
         /// Stages index-catalog mutations into this write's own native
         /// commit (`backend_erased.WriteTxn.putIndexCatalogBatch`).
+        pub fn deleteIndexCatalogScope(self: *Txn, scope: []const u8) !void {
+            if (self.write) |*write| return write.deleteIndexCatalogScope(scope);
+            return error.ReadOnly;
+        }
+
         pub fn putIndexCatalogBatch(self: *Txn, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
             if (self.write) |*write| return write.putIndexCatalogBatch(scope, mutations);
             return error.ReadOnly;
@@ -3703,6 +3744,13 @@ pub const DocStore = struct {
         }
         try deletes.ensureTotalCapacityPrecise(alloc, @min(budget.max_keys, replay_truncate_batch_keys));
 
+        const track_heads = !self.sharedReplayLane();
+        const initial_heads = if (track_heads) blk: {
+            var probe = try self.beginProbeTxn();
+            defer probe.abort();
+            break :blk try storedReplayCreditLaneHeads(&probe);
+        } else null;
+        var deleted_through: [replay_credit_lanes.len]u64 = @splat(0);
         var planned_bytes: u64 = 0;
         var any_retired = false;
         var max_retired_sequence: u64 = 0;
@@ -3711,18 +3759,22 @@ pub const DocStore = struct {
 
         // Replay lanes are append-only. Scanning each lane independently is
         // sufficient below an acknowledged retirement watermark.
-        for (0..replay_hints.len + 1) |lane| {
-            const ordinal = if (lane < replay_hints.len) replayHintOrdinal(replay_hints[lane]) else internal_keys.replay_all_kind;
+        // Keep hinted lanes ahead of the all-record lane as before.
+        for (1..replay_credit_lanes.len + 1) |turn| {
+            const lane = turn % replay_credit_lanes.len;
+            const ordinal = replay_credit_lanes[lane];
             if (budget_exhausted) {
                 all_lanes_done = false;
                 continue;
             }
 
-            var txn = try self.beginReplayLaneScanTxn(ordinal, 0);
+            const from = if (initial_heads) |heads| replayCreditLaneStart(&heads, lane) else 0;
+            if (from > up_to_sequence) continue;
+            var txn = try self.beginReplayLaneScanTxn(ordinal, from);
             defer txn.abort();
             var cur = try txn.openCursor();
             defer cur.close();
-            const lower = internal_keys.replayRangeLower(ordinal, 0);
+            const lower = internal_keys.replayRangeLower(ordinal, from);
             const upper = internal_keys.replayRangeUpper(ordinal);
             cur.setUpperBound(&upper);
             var entry = try cur.seekAtOrAfter(&lower);
@@ -3734,6 +3786,7 @@ pub const DocStore = struct {
                 errdefer alloc.free(key);
                 try deletes.append(alloc, key);
                 planned_bytes += kv.key.len + kv.value.len;
+                deleted_through[lane] = sequence + 1;
                 if (!any_retired or sequence > max_retired_sequence) max_retired_sequence = sequence;
                 any_retired = true;
                 if (deletes.items.len >= budget.max_keys or planned_bytes >= budget.max_bytes) {
@@ -3761,9 +3814,22 @@ pub const DocStore = struct {
         var ledger = try loadJournalCreditLedger(&batch);
         ledger = ledger.released(planned_bytes, @intCast(deletes.items.len));
         try storeJournalCreditLedger(&batch, ledger);
-        if (!self.sharedReplayLane()) {
-            const heads = try readReplayCreditLaneHeads(batch.asTxn());
-            try batch.put(&internal_keys.journal_credit_lane_heads_key, &heads);
+        if (track_heads) {
+            const txn = batch.asTxn();
+            if (try storedReplayCreditLaneHeads(txn)) |old_heads| {
+                var heads = old_heads;
+                const next = try replayCreditNextSequence(txn);
+                for (replay_credit_lanes, deleted_through, 0..) |kind, from, i| {
+                    if (from == 0) continue;
+                    const slot = replayCreditLaneHead(&heads, i);
+                    const start = replayCreditLaneStart(&heads, i);
+                    if (start >= from) continue;
+                    const head = try seekReplayCreditLaneHead(txn, kind, from);
+                    std.mem.writeInt(u64, slot, head, .little);
+                    std.mem.writeInt(u64, replayCreditLaneFloor(&heads, i), if (head == 0) @max(from, next) else 0, .little);
+                }
+                try txn.put(&internal_keys.journal_credit_lane_heads_key, &heads);
+            }
         }
 
         try batch.commit();
@@ -6411,6 +6477,8 @@ test "WS5 DocStore journal credit ledger is charged on append and released on re
     var read = try store.beginReadTxn();
     defer read.abort();
     try std.testing.expect(!try replayCreditsNeedRepair(&read));
+    const heads = (try storedReplayCreditLaneHeads(&read)).?;
+    try std.testing.expectEqual(@as(u64, 2), replayCreditLaneStart(&heads, 0));
 }
 
 test "docstore relational bulk appends retain direct ingest and atomic dirty tokens" {
