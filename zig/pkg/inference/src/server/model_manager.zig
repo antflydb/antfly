@@ -1554,7 +1554,7 @@ pub const ModelLoadPolicy = struct {
 const CudaGemmaPolicy = @import("../ops/cuda/embedding_gemma2_policy.zig").Policy;
 const CudaGemmaPolicyProbe = struct {
     lock: std.Io.Mutex = .init,
-    expires: std.Io.Timestamp = .{ .nanoseconds = 0 },
+    expires: std.Io.Timestamp = .zero,
     policy: ?CudaGemmaPolicy = null,
 
     fn resolve(self: *CudaGemmaPolicyProbe, a: std.mem.Allocator, io: std.Io, control: InferenceExecutionControl) !?CudaGemmaPolicy {
@@ -1571,8 +1571,8 @@ const CudaGemmaPolicyProbe = struct {
         };
         try control.check();
         self.policy = policy;
-        const lifetime: i128 = if (policy == null) std.time.ns_per_s else 60 * std.time.ns_per_s;
-        self.expires = .{ .nanoseconds = std.Io.Timestamp.now(io, .awake).nanoseconds + lifetime };
+        const lifetime = std.Io.Duration.fromSeconds(if (policy == null) 1 else 60);
+        self.expires = std.Io.Timestamp.now(io, .awake).addDuration(lifetime);
         return policy;
     }
 };
