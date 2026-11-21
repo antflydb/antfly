@@ -74,6 +74,43 @@ pub const Batch = struct {
 /// submission is not GPU completion. Await labels describe only the actual
 /// readback/driver-await return; completed kernel totals remain unavailable.
 pub const PendingInterval = struct {
+    /// Sum of instrumented synchronous callbacks for this exact pending owner.
+    /// Work between callbacks, opaque provider internals and GPU completion
+    /// remain outside these counters. Never sum per-phase peaks or shared deltas.
+    pub const ObservedPhases = struct {
+        count: u64 = 0,
+        uploads: u64 = 0,
+        upload_bytes: u64 = 0,
+        downloads: u64 = 0,
+        download_bytes: u64 = 0,
+        device_copies: ?u64 = null,
+        device_copy_bytes: ?u64 = null,
+        native_assigned_dispatches: u64 = 0,
+        metal_encoded_dispatches: ?u64 = null,
+        metal_command_submissions: ?u64 = null,
+        metal_command_waits: ?u64 = null,
+        cuda_accepted_launch_calls: ?u64 = null,
+
+        pub fn join(self: *ObservedPhases, transfers: @import("transfer_audit.zig").Measurements, submission: observation.Counters, cuda_launch_calls: ?u64) void {
+            self.uploads +|= transfers.upload_calls;
+            self.upload_bytes +|= transfers.upload_bytes;
+            self.downloads +|= transfers.download_calls;
+            self.download_bytes +|= transfers.download_bytes;
+            self.device_copies = sum(self.count, self.device_copies, transfers.device_copy_calls);
+            self.device_copy_bytes = sum(self.count, self.device_copy_bytes, transfers.device_copy_bytes);
+            self.native_assigned_dispatches +|= submission.native_assigned_dispatches;
+            self.metal_encoded_dispatches = sum(self.count, self.metal_encoded_dispatches, submission.metal_encoded_dispatches);
+            self.metal_command_submissions = sum(self.count, self.metal_command_submissions, submission.metal_command_submissions);
+            self.metal_command_waits = sum(self.count, self.metal_command_waits, submission.metal_command_waits);
+            self.cuda_accepted_launch_calls = sum(self.count, self.cuda_accepted_launch_calls, cuda_launch_calls);
+            self.count +|= 1;
+        }
+
+        fn sum(count: u64, old: ?u64, delta: ?u64) ?u64 {
+            if (count == 0) return delta;
+            return (old orelse return null) +| (delta orelse return null);
+        }
+    };
     pub const Phase = enum { acquire, submit, encode_next, await_readback, cancel, drain };
     pub const Completion = enum { unavailable, readback_returned, driver_await_returned };
     identity: u64,
@@ -85,6 +122,7 @@ pub const PendingInterval = struct {
     prior_failure: ?Text = null,
     counters_scope: enum { synchronous_phase_only } = .synchronous_phase_only,
     whole_interval_counters: enum { unavailable } = .unavailable,
+    observed_phases: ?ObservedPhases = null,
 };
 pub const PublicationScope = enum { program_execution, session_numerical_dispatch, shared_batch_numerical_dispatch, session_preparation };
 

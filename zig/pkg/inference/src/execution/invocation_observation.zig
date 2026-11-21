@@ -35,6 +35,7 @@ pub const Binding = struct {
     /// Synchronous observation borrow only; publication copies all metadata.
     batch: ?*const diagnostics_mod.Batch = null,
     pending_interval: ?*const diagnostics_mod.PendingInterval = null,
+    pending_counters: ?*diagnostics_mod.PendingInterval.ObservedPhases = null,
     capture_programs: bool = false,
     native_definition_templates: ?diagnostics_mod.NativeDefinitionTemplates = null,
     native_program_construction: ?diagnostics_mod.NativeProgramConstruction = null,
@@ -306,6 +307,11 @@ const Invocation = struct {
         snapshot.scope = self.binding.publication_scope;
         snapshot.batch = if (self.binding.batch) |cohort| cohort.* else null;
         snapshot.pending_interval = if (self.binding.pending_interval) |interval| interval.* else null;
+        if (snapshot.pending_interval) |*interval| if (self.binding.pending_counters) |counters| {
+            const calls = if (comptime build_options.enable_cuda) snapshot.runtime.resolved_project_cuda_launches.?.total_calls else null;
+            counters.join(snapshot.runtime.transfers.?, snapshot.runtime.submission.?, calls);
+            interval.observed_phases = counters.*;
+        };
         self.scope.deinit();
         self.binding.diagnostics.publish(snapshot);
     }

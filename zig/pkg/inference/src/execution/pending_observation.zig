@@ -41,6 +41,7 @@ pub const Span = struct {
     identity: u64 = 0,
     sequence: u64 = 0,
     first_failure: ?diagnostics.Text = null,
+    counters: diagnostics.PendingInterval.ObservedPhases = .{},
     pub fn begin(source: ?Source) Span {
         const selected = source orelse return .{};
         if (!selected.publisher.isEnabled()) return .{};
@@ -66,7 +67,7 @@ pub const Span = struct {
     noinline fn observed(self: *Span, source: Source, backend: *const ops.ComputeBackend, operation: diagnostics.Operation, phase: diagnostics.PendingInterval.Phase, completion: diagnostics.PendingInterval.Completion, comptime classify: anytype, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
         self.sequence +|= 1;
         var interval = diagnostics.PendingInterval{ .identity = self.identity, .request_id = source.request_id, .sequence = self.sequence, .phase = phase, .prior_failure = self.first_failure };
-        const binding = invocation.Binding{ .diagnostics = source.publisher, .operation = operation, .capture_programs = true, .model_allocator = source.model_allocator, .stable_backend = backend.*, .context_runtime_scope = .borrowed_execution_backend_context, .pending_interval = &interval };
+        const binding = invocation.Binding{ .diagnostics = source.publisher, .operation = operation, .capture_programs = true, .model_allocator = source.model_allocator, .stable_backend = backend.*, .context_runtime_scope = .borrowed_execution_backend_context, .pending_interval = &interval, .pending_counters = &self.counters };
         return invocation.callClassified(binding, classify, phaseCall, .{ &interval, &self.first_failure, completion, callback, args });
     }
 };
