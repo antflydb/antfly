@@ -288,6 +288,7 @@ const Invocation = struct {
         snapshot.runtime.native_activation_programs = self.kernels.activation_programs;
         snapshot.runtime.authored_native_programs = self.kernels.native_programs;
         snapshot.runtime.authored_native_program_bank = self.kernels.native_program_bank;
+        snapshot.runtime.metal_serial_workspace = self.kernels.metal_serial_workspace;
         if (self.binding.native_definition_templates) |value| snapshot.native_definition_templates = value;
         if (self.binding.native_program_construction) |value| snapshot.native_program_construction = value;
         snapshot.runtime.owned_native_fallbacks = self.kernels.native_fallbacks;
@@ -309,7 +310,7 @@ const Invocation = struct {
         snapshot.pending_interval = if (self.binding.pending_interval) |interval| interval.* else null;
         if (snapshot.pending_interval) |*interval| if (self.binding.pending_counters) |counters| {
             const calls = if (comptime build_options.enable_cuda) snapshot.runtime.resolved_project_cuda_launches.?.total_calls else null;
-            counters.join(snapshot.runtime.transfers.?, snapshot.runtime.submission.?, calls);
+            counters.join(snapshot.runtime.transfers.?, snapshot.runtime.submission.?, calls, interval.callback_wall_ns);
             interval.observed_phases = counters.*;
         };
         self.scope.deinit();

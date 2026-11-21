@@ -693,8 +693,9 @@ preparation API do not by themselves complete these remaining requirements:
   and wait units, specialization decisions, selected Native bodies and workers,
   known fallback producers, and registered host/device allocation owners. Batch
   participants and pending outcomes survive model retirement. Each pending
-  owner sums the instrumented transfer and submission counters from its observed
-  callbacks through readback and cleanup. Reports retain the initiating failure
+  owner sums the instrumented transfer, submission and callback host wall time
+  through readback and cleanup. A ready Metal serial audio schedule reports its
+  actual eager/replay choice and latest planned, bound and charged bank sizes. Reports retain the initiating failure
   and count the observed callbacks. Inter-phase work and GPU completion remain
   outside the sums. Registered owner intervals can include concurrent activity,
   and lifetime peaks are labelled as such.

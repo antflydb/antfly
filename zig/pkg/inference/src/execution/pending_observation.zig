@@ -72,6 +72,12 @@ pub const Span = struct {
     }
 };
 fn phaseCall(interval: *diagnostics.PendingInterval, first_failure: *?diagnostics.Text, completion: diagnostics.PendingInterval.Completion, comptime callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
+    const clock = @import("antfly_platform").time;
+    const started = clock.monotonicNs();
+    defer {
+        const ended = clock.monotonicNs();
+        if (started != 0 and ended >= started) interval.callback_wall_ns = ended - started;
+    }
     const result = @call(.auto, callback, args) catch |err| {
         // The invocation report records this phase's error independently.
         // Retirement must retain the initiating failure even if cleanup fails.
@@ -114,4 +120,5 @@ test "pending retirement preserves the initiating error when cleanup fails" {
     interval.sequence += 1;
     try std.testing.expectError(error.CleanupFailure, phaseCall(&interval, &first_failure, .unavailable, Call.fail, .{error.CleanupFailure}));
     try std.testing.expectEqualStrings("SubmissionFailure", interval.prior_failure.?.view());
+    try std.testing.expect(interval.callback_wall_ns != null);
 }

@@ -668,6 +668,7 @@ test "pending readback observations retain publication only and separate submiss
                 try std.testing.expect(ready.pending_interval.?.whole_interval_counters == .unavailable);
                 const joined = ready.pending_interval.?.observed_phases.?;
                 try std.testing.expectEqual(@as(u64, 2), joined.count);
+                try std.testing.expect(joined.callback_wall_ns.? >= ready.pending_interval.?.callback_wall_ns.?);
                 try std.testing.expectEqual(@as(u64, 1), joined.uploads);
                 try std.testing.expectEqual(@as(u64, 8), joined.upload_bytes);
                 try std.testing.expectEqual(@as(u64, 1), joined.downloads);

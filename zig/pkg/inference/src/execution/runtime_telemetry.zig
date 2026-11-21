@@ -226,6 +226,7 @@ pub const Snapshot = struct {
     device_owners: ?@import("device_owner_registry.zig").Summary = null,
     cuda: ?Cuda = null,
     cuda_periodic_workspace: ?PeriodicWorkspace = null,
+    metal_serial_workspace: ?@import("runtime_observation.zig").SerialWorkspaceObservation = null,
     memory: Memory = .{},
     /// Invocation interval on its submitting thread, including CPU fallbacks.
     submission: ?@import("runtime_observation.zig").Counters = null,
@@ -252,6 +253,7 @@ pub const Snapshot = struct {
             .counters = self.counters.since(before.counters),
             .memory = self.memory,
             .cuda_periodic_workspace = self.cuda_periodic_workspace,
+            .metal_serial_workspace = self.metal_serial_workspace,
             .cuda = if (self.cuda) |after| if (before.cuda) |start| after.since(start) else after else null,
             .native_allocations = if (self.native_allocations) |after| if (before.native_allocations) |start| after.since(start) else after else null,
             .process = if (self.process) |after| if (before.process) |start| after.since(start) else after else null,

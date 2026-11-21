@@ -22394,6 +22394,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
             plan.selection.record(replay, elapsed);
             if (replay) plan.replay_ns = elapsed else plan.eager_ns = elapsed;
+            @import("../execution/runtime_observation.zig").metalSerialWorkspace(replay, .{
+                .planned_output_bytes = plan.arena_recipe.outputs_bytes,
+                .planned_scratch_bytes = plan.arena_recipe.input_workspace_bytes,
+                .arena_backing_bytes = plan.arena_size,
+                .bound_scratch_bytes = plan.input_workspace_bytes,
+                .charged_backend_bytes = plan.backend_bytes,
+            });
             if (stats) std.debug.print("metal_audio_schedule replay={} replays={d} encode_ns={d} encoders={d} arena_bytes={d} input_workspace_bytes={d} backend_bytes={d}\n", .{ replay, plan.replays, elapsed, metal_runtime.runtimeMemorySnapshot(p.raw_decode_runtime).compute_encoder_count -| before_encoders, plan.arena_size, plan.input_workspace_bytes, plan.backend_bytes });
             return out;
         }
@@ -51795,8 +51802,21 @@ test "embeddinggemma2 Metal audio instruction schedule binds fresh inputs and re
         try std.testing.expect(try cb.decoderRuntimeBeginFrame());
         defer cb.decoderRuntimeCancelFrame() catch {};
         var run = Run{ .cb = &cb };
+        var scope: @import("../execution/runtime_observation.zig").KernelScope = .{};
+        scope.begin();
+        defer if (scope.attached) {
+            _ = scope.finish();
+        };
         const result = (try cb.audioExecution(42, &.{ x, y }, &run, Run.call)) orelse try Run.call(&run, &.{ x, y });
         defer cb.free(result);
+        _ = scope.finish();
+        if (request >= 4) {
+            try std.testing.expect(scope.metal_serial_workspace != null);
+            const measured = scope.metal_serial_workspace.?;
+            try std.testing.expectEqual(@as(u64, 1), measured.successful_replays + measured.successful_eager_calls);
+            try std.testing.expect(measured.latest.arena_backing_bytes >= measured.latest.planned_output_bytes);
+            try std.testing.expect(measured.latest.charged_backend_bytes >= measured.latest.arena_backing_bytes);
+        }
         try cb.decoderRuntimeSubmitAndWaitFrame();
         const actual = try cb.toFloat32(result, a);
         defer a.free(actual);

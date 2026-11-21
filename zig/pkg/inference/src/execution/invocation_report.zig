@@ -105,6 +105,7 @@ pub const Report = struct {
     /// A compatibility reason is not a numerical fallback or a quota grant.
     payload_admission_coverage: ?PayloadAdmissionCoverage = null,
     metal_region_policy: ?MetalRegionPolicy = null,
+    metal_serial_workspace: ?@import("runtime_observation.zig").SerialWorkspaceObservation = null,
     /// Available from the corresponding successfully published physical Frame.
     assigned_regions: ?@import("stats.zig").AssignedRegions = null,
     owned_program_fallbacks: ?ProgramFallbacks = null,
@@ -136,6 +137,7 @@ pub const Report = struct {
         report.decoder_route = value.decoder_route;
         report.device_memory = value.runtime.device_memory;
         report.cuda_periodic_workspace = value.runtime.cuda_periodic_workspace;
+        report.metal_serial_workspace = value.runtime.metal_serial_workspace;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());
         if (value.program_error) |failure| {
