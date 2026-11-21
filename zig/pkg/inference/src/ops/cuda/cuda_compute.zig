@@ -28,7 +28,7 @@ const driver_mod = @import("driver.zig");
 const graph_mod = @import("graph.zig");
 const embedding_gemma2_global = @import("embedding_gemma2_global.zig");
 const embedding_gemma2_policy_mod = @import("embedding_gemma2_policy.zig");
-const execution_plan = @import("execution_plan.zig");
+const periodic_workspace = @import("../../execution/periodic_workspace.zig");
 const kernels_mod = @import("kernels.zig");
 const cublaslt_mod = @import("cublaslt.zig");
 const cudnn_sdpa_mod = @import("cudnn_sdpa.zig");
@@ -6183,7 +6183,7 @@ pub const CudaCompute = struct {
     temp_buffer_mutex: std.atomic.Mutex = .unlocked,
     temp_buffers: @import("buffer_cache.zig").Cache(buffer_mod.DeviceBuffer) = .empty,
     temp_pinned_slots: std.ArrayListUnmanaged(TempPinnedSlot) = .empty,
-    temp_arena_planner: execution_plan.TempArenaPlanner = .{},
+    temp_arena_planner: periodic_workspace.TempArenaPlanner = .{},
     temp_arena_generation: u64 = 1,
     deferred_device_frees: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     deferred_device_free_bytes: usize = 0,
@@ -17426,9 +17426,13 @@ fn ensureTempPinnedSlots(self: *CudaCompute, period: usize) !void {
     }
 }
 
+fn pinnedWorkspaceBytes(buffer: buffer_mod.DeviceBuffer) usize {
+    return @max(buffer.len, buffer.allocation_bytes);
+}
+
 fn findExactTempBufferIndex(self: *const CudaCompute, len: usize) ?usize {
     for (self.temp_buffers.buffers.items, 0..) |buffer, i| {
-        if (buffer.len == len) return i;
+        if (buffer.len == len and pinnedWorkspaceBytes(buffer) == len and !buffer.borrowed) return i;
     }
     return null;
 }
@@ -17452,13 +17456,16 @@ fn allocPinnedTempSlot(
         return null;
     }
     if ((slot.requested_len != 0 and slot.requested_len != len) or
-        (slot.buffer.ptr != 0 and slot.buffer.len != len))
+        (slot.buffer.ptr != 0 and (slot.buffer.len != len or pinnedWorkspaceBytes(slot.buffer) != len)))
     {
         if (self.temp_slot_config.autoplan_enabled) self.temp_arena_planner.markPinnedValidationFailure();
         traceCudaTempAlloc(self, seq, "alloc_slot_shape_fallback", len, .{});
         return null;
     }
     if (slot.buffer.ptr == 0) {
+        // Every captured slot was bound by a completed ordinary validation
+        // iteration. An empty slot means the plan changed before recording.
+        if (self.debug_cuda_graph_capture_active) return null;
         slot.requested_len = len;
         if (findExactTempBufferIndex(self, len)) |i| {
             slot.buffer = self.temp_buffers.orderedRemove(i);
@@ -17532,12 +17539,12 @@ fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute, reuse: TempSlotReuse) !voi
     const retained_budget = if (reuse == .none or max_buffers == 0) 0 else @min(cache_budget, cudaTempArenaAdmissionBudgetBytes(self));
     var retained_bytes: usize = 0;
     for (self.temp_pinned_slots.items, 0..) |*slot, index| {
+        const physical_bytes = pinnedWorkspaceBytes(slot.buffer);
         const requested_len: ?usize = switch (reuse) {
             .none => null,
             .idle => 0,
-            .plan => |lengths| if (index < lengths.len and slot.buffer.len == lengths[index]) lengths[index] else null,
+            .plan => |lengths| if (index < lengths.len and slot.buffer.len == lengths[index] and physical_bytes == lengths[index]) lengths[index] else null,
         };
-        const physical_bytes = @max(slot.buffer.len, slot.buffer.allocation_bytes);
         if (requested_len != null and slot.buffer.ptr != 0 and
             !slot.buffer.borrowed and physical_bytes <= retained_budget -| retained_bytes)
         {
@@ -19375,6 +19382,16 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     try std.testing.expectEqual(@as(usize, 64), self.temp_pinned_slots.items[0].requested_len);
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), self.temp_pinned_slots.items[1].buffer.ptr);
     try std.testing.expectEqual(@as(usize, 1), self.temp_buffers.buffers.items.len);
+    // A logical view can describe fewer bytes than its backing. The installed
+    // plan must charge, and bind, the physical bytes of each ordinal.
+    self.temp_buffers.buffers.items[0].len = 64;
+    self.temp_buffers.buffers.items[0].allocation_bytes = 128;
+    try std.testing.expect(findExactTempBufferIndex(&self, 64) == null);
+    self.temp_slot_config.configured_period = 2;
+    self.debug_cuda_graph_capture_active = true;
+    try std.testing.expect((try allocPinnedTempSlot(&self, 1, 64)) == null);
+    self.debug_cuda_graph_capture_active = false;
+
     // Discarding a plan unpins every backing through ordinary bounded
     // recycling, including buffers that matched the preceding plan.
     try recycleTempPinnedSlotsUnlocked(&self, .none);

@@ -13,6 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Physical workspace for fixed-address iteration replay. Each ordinal has
+//! an independent bank with its own backing lifetime. Providers bind the
+//! admitted lengths before capture and own fence and allocation retirement.
 const std = @import("std");
 
 /// Admission result for the current one-buffer-per-allocation arena layout.
