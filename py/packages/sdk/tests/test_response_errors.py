@@ -40,3 +40,75 @@ def test_successful_oversized_reply_is_typed():
         assert caught.value.status_code == 200
     finally:
         client.close()
+
+
+@pytest.mark.parametrize(
+    "status,code,retryable", [(403, "row_policy_denied", False), (503, "transaction_precommit_aborted", True)]
+)
+def test_generated_commit_errors_preserve_content_type(status, code, retryable):
+    from antfly.client_generated.api.data_operations import commit_transaction
+    from antfly.client_generated.client import Client
+    from antfly.client_generated.models import Error, TransactionWriteError
+
+    client = Client(base_url="http://test")
+    parsed = commit_transaction._parse_response(
+        client=client,
+        response=httpx.Response(
+            status, json={"status": "aborted", "code": code, "message": "rejected", "retryable": retryable}
+        ),
+    )
+    assert isinstance(parsed, TransactionWriteError)
+    assert (parsed.status, parsed.code, parsed.retryable) == ("aborted", code, retryable)
+    legacy = commit_transaction._parse_response(
+        client=client, response=httpx.Response(status, json={"error": "unavailable"})
+    )
+    assert isinstance(legacy, Error)
+    assert (
+        commit_transaction._parse_response(client=client, response=httpx.Response(status, text="unavailable"))
+        == "unavailable"
+    )
+
+
+def test_generated_session_commit_conflict_preserves_retry_diagnostic():
+    from antfly.client_generated.api.data_operations import commit_transaction_session
+    from antfly.client_generated.client import Client
+
+    client = Client(base_url="http://test")
+    message = "transaction commit retry body does not match the sealed request"
+    assert (
+        commit_transaction_session._parse_response(client=client, response=httpx.Response(409, text=message)) == message
+    )
+    outcome = commit_transaction_session._parse_response(
+        client=client, response=httpx.Response(409, json={"transaction_id": "123", "status": "aborted"})
+    )
+    assert outcome.transaction_id == "123"
+
+
+@pytest.mark.parametrize("operation", ["commit_transaction", "multi_batch_write"])
+def test_generated_commit_preparation_conflict_preserves_diagnostic(operation):
+    from importlib import import_module
+
+    from antfly.client_generated.client import Client
+
+    module = import_module(f"antfly.client_generated.api.data_operations.{operation}")
+    response = httpx.Response(409, text="PreparedGenerationChanged")
+    assert module._parse_response(client=Client(base_url="http://test"), response=response) == response.text
+
+
+@pytest.mark.parametrize(
+    "operation", ["batch_write", "batch_namespace_table", "commit_transaction", "multi_batch_write"]
+)
+def test_generated_stateless_unknown_outcome_preserves_response(operation):
+    from importlib import import_module
+
+    from antfly.client_generated.client import Client
+    from antfly.client_generated.models import Error
+
+    module = import_module(f"antfly.client_generated.api.data_operations.{operation}")
+    client = Client(base_url="http://test")
+    message = "transaction outcome is unknown; do not retry this stateless request"
+    response = module._build_response(client=client, response=httpx.Response(500, text=message))
+    assert response.status_code == 500
+    assert response.parsed == message
+    json_error = module._build_response(client=client, response=httpx.Response(500, json={"error": "internal"}))
+    assert isinstance(json_error.parsed, Error)

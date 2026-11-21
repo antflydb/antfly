@@ -124,8 +124,7 @@ pub const BackendType = enum {
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
-            .native, .metal, .cuda, .wasm => true,
-            .pjrt => false,
+            .native, .metal, .cuda, .wasm, .pjrt => true,
         };
     }
 };
@@ -171,10 +170,21 @@ pub fn clampPhysicalMemoryLimits(backend: BackendType, limits: memory_policy.Lim
     return out;
 }
 
+/// Explicit provenance travels with serving/private child load policy; a
+/// populated numeric limit alone must never opt into operator-envelope sizing.
+pub fn clampPhysicalMemoryLimitsWithProcessPolicy(backend: BackendType, limits: memory_policy.Limits, process_limit: usize, provenance: memory_policy.ProcessMemoryLimitProvenance) memory_policy.Limits {
+    const bytes = cudaDeviceMemoryBytes(backend);
+    var out = memory_policy.clampDiscreteDeviceLimitsWithProcessPolicy(limits, bytes, process_limit, provenance);
+    if (bytes != 0 and cuda_unified_memory.load(.acquire))
+        out = memory_policy.clampUnifiedDeviceLimits(out, memory_policy.defaultSharedAdmissionLimitsWithProcessPolicy(process_limit, provenance).host_limit_bytes);
+    return out;
+}
+
 /// The backend that determines a session's resource domain and interruption
 /// policy.
 pub const BackendRuntime = struct {
     backend: BackendType,
+    pjrt_memory_policy: ?session_factory.PjrtSessionOptions.MemoryPolicy = null,
 
     pub fn hasUninterruptibleCalls(self: BackendRuntime) bool {
         return self.loadInterruption() == .uninterruptible or
@@ -190,10 +200,27 @@ pub const BackendRuntime = struct {
     }
 
     pub fn usesGpuHostedSession(self: BackendRuntime) bool {
-        return switch (self.backend) {
-            .metal, .cuda => true,
-            else => false,
+        if (self.backend == .pjrt) return if (self.pjrt_memory_policy) |policy| policy == .cuda else false;
+        return self.backend.usesGpuHostedSession();
+    }
+
+    pub fn memoryLimits(self: BackendRuntime, process_limit: usize) memory_policy.Limits {
+        if (self.backend == .pjrt) if (self.pjrt_memory_policy) |policy| if (policy == .cuda) {
+            const defaults = memory_policy.defaultLimitsForBackendWithProcessLimit(.gpu, process_limit);
+            var limits = memory_policy.limitsForDiscreteDevice(defaults, policy.cuda.device_bytes, process_limit);
+            if (policy.cuda.unified_memory) limits = memory_policy.clampUnifiedDeviceLimits(limits, limits.host_limit_bytes);
+            return limits;
         };
+        return defaultMemoryLimits(self.backend, process_limit);
+    }
+
+    pub fn clampMemoryLimits(self: BackendRuntime, limits: memory_policy.Limits, process_limit: usize, provenance: memory_policy.ProcessMemoryLimitProvenance) memory_policy.Limits {
+        if (self.backend == .pjrt) if (self.pjrt_memory_policy) |policy| if (policy == .cuda) {
+            var result = memory_policy.clampDiscreteDeviceLimitsWithProcessPolicy(limits, policy.cuda.device_bytes, process_limit, provenance);
+            if (policy.cuda.unified_memory) result = memory_policy.clampUnifiedDeviceLimits(result, memory_policy.defaultSharedAdmissionLimitsWithProcessPolicy(process_limit, provenance).host_limit_bytes);
+            return result;
+        };
+        return clampPhysicalMemoryLimitsWithProcessPolicy(self.backend, limits, process_limit, provenance);
     }
 
     pub fn executionInterruption(self: BackendRuntime) Interruption {
@@ -248,15 +275,20 @@ const RequiredBackendConfig = struct {
 /// SessionManager selects the best available backend and creates sessions.
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
+    execution_diagnostics: @import("../execution/diagnostic_policy.zig").Policy = .{},
     preferred_backends: []const BackendType,
     required_backend: ?BackendType = null,
     required_backend_invalid: bool = false,
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
+    /// Provider allocator quantities are fixed at load, independently of format.
+    pjrt_memory_policy: ?session_factory.PjrtSessionOptions.MemoryPolicy = null,
+    pjrt_precision: @import("../execution/precision.zig").Policy = .f32,
+    pjrt_gemm: @import("../execution/precision.zig").Gemm = .provider_default,
     kernel_jit: kernel_jit_mod.Config = .{},
     kernel_jit_load_context: kernel_jit_mod.LoadContext = .dynamic,
     /// Construction-only move slot. CUDA consumes the independent pinned-host
     /// lease before upload; sessions never retain a pointer to this stack slot.
-    cuda_host_weight_lease: ?*?@import("../runtime/tier/memory.zig").AdmissionLease = null,
+    cuda_load_options: session_factory.CudaLoadOptions = .{},
     /// Load-time A4B policy. It is copied into the created session and is
     /// never consulted as mutable process-global state during inference.
     a4b_inference_request: ?backend_contracts.A4bInferenceRequest = null,
@@ -285,6 +317,7 @@ pub const SessionManager = struct {
         return .{
             .allocator = allocator,
             .preferred_backends = configuredPreferredBackends(),
+            .execution_diagnostics = @import("../execution/diagnostic_policy.zig").Policy.fromEnvironment(),
             .required_backend = required.backend,
             .required_backend_invalid = required.invalid,
         };
@@ -295,6 +328,7 @@ pub const SessionManager = struct {
         return .{
             .allocator = allocator,
             .preferred_backends = configuredPreferredBackends(),
+            .execution_diagnostics = @import("../execution/diagnostic_policy.zig").Policy.fromEnvironment(),
             .required_backend = required.backend,
             .required_backend_invalid = required.invalid,
             .io = io,
@@ -315,8 +349,8 @@ pub const SessionManager = struct {
     /// Validate the process-level required backend before a server publishes
     /// readiness or an artifact path begins execution. Required backends must
     /// be compiled into this binary and support the direct session-loading
-    /// contract used by the inference runtime. PJRT is intentionally rejected
-    /// until the runtime has a consistent compiled-only loading path.
+    /// contract used by the inference runtime. Explicit compiled targets retain
+    /// their own provider and model capability errors instead of falling back.
     pub fn validateRequiredBackendPolicy(self: *const SessionManager) !void {
         try validateBackendEnvironment();
         if (self.required_backend_invalid) return error.InvalidRequiredBackend;
@@ -341,6 +375,19 @@ pub const SessionManager = struct {
     }
 
     pub fn loadModelSource(self: *SessionManager, source: ModelSource, shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext) !Session {
+        if (!self.execution_diagnostics.enabled) return self.loadModelSourceConfigured(source, shared_backend_ctx);
+        const observer = try @import("../execution/allocation_observer.zig").State.create(self.allocator, .from_owner_creation);
+        defer observer.release();
+        var observed = self.*;
+        observed.allocator = observer.allocator();
+        const session = try observed.loadModelSourceConfigured(source, shared_backend_ctx);
+        errdefer session.close();
+        if (!session.configureExecutionDiagnostics(true)) return error.ExecutionDiagnosticsUnavailable;
+        if (session.invocation_diagnostics) |binding| binding.diagnostics.configureExport();
+        return session;
+    }
+
+    fn loadModelSourceConfigured(self: *SessionManager, source: ModelSource, shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext) !Session {
         const model_path = source.path;
         var manifest: ?manifest_mod.ModelManifest = if (source.manifest) |provided| provided.* else manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (source.manifest == null) {
@@ -479,12 +526,14 @@ pub const SessionManager = struct {
                     continue,
                 .native => if (imported_onnx)
                     self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
+                        if (err == error.OutOfMemory) return err;
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
                     }
                 else
                     self.createDirectSession(source, .native) catch |err| {
+                        if (err == error.OutOfMemory) return err;
                         std.log.err("native session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
@@ -497,7 +546,16 @@ pub const SessionManager = struct {
                     }
                 else
                     continue,
-                .pjrt => continue,
+                .pjrt => if (!imported_onnx)
+                    self.createDirectSession(source, .pjrt) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        first_err = first_err orelse err;
+                        continue;
+                    }
+                else {
+                    first_err = first_err orelse error.UnsupportedPjrtArtifact;
+                    continue;
+                },
             };
             // For sessions produced by session_factory (native/Metal
             // direct loads -- not the imported_onnx path which already
@@ -563,10 +621,17 @@ pub const SessionManager = struct {
     }
 
     fn createDirectSession(self: *SessionManager, source: ModelSource, backend: BackendType) !Session {
-        if (source.manifest) |manifest| return session_factory.createSessionFromManifestWithHostLease(self.allocator, source.path, manifest, backend, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request, self.gliner_cuda_precision, if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false, if (backend == .cuda) self.cuda_host_weight_lease else null);
+        if (backend == .pjrt) {
+            const options = session_factory.PjrtSessionOptions{ .memory_policy = self.pjrt_memory_policy, .precision = self.pjrt_precision, .gemm = self.pjrt_gemm };
+            return if (source.manifest) |manifest|
+                session_factory.createPjrtSessionFromManifestWithOptions(self.allocator, source.path, manifest, options)
+            else
+                session_factory.createPjrtSessionWithOptions(self.allocator, source.path, options);
+        }
+        if (source.manifest) |manifest| return session_factory.createSessionFromManifestWithCudaOptions(self.allocator, source.path, manifest, backend, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request, self.gliner_cuda_precision, if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false, if (backend == .cuda) self.cuda_load_options else .{});
         // A discounted managed load must use the selected manifest constructor
         // that moves its pinned-host lease before any physical allocation.
-        if (backend == .cuda) if (self.cuda_host_weight_lease) |slot| {
+        if (backend == .cuda) if (self.cuda_load_options.host_lease) |slot| {
             if (slot.* != null) return error.InvalidCudaState;
         };
         return switch (backend) {
@@ -655,8 +720,7 @@ pub const SessionManager = struct {
         self: *const SessionManager,
         backend: BackendType,
     ) !BackendRuntime {
-        _ = self;
-        return .{ .backend = backend };
+        return .{ .backend = backend, .pjrt_memory_policy = if (backend == .pjrt) self.pjrt_memory_policy else null };
     }
 };
 
@@ -728,7 +792,7 @@ fn defaultImportedOnnxBackend() BackendType {
     return if (build_options.enable_wasm) .wasm else .native;
 }
 
-fn isOnnxFilePath(path: []const u8) bool {
+pub fn isOnnxFilePath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".onnx");
 }
 
@@ -1043,7 +1107,7 @@ test "required backend gates backend-specific fast paths" {
     try std.testing.expectError(error.InvalidRequiredBackend, manager.allowsDirectBackend(.native));
 }
 
-test "required backend policy rejects unavailable and compiled-only backends" {
+test "required backend policy admits compiled loading and rejects unavailable builds" {
     var manager = SessionManager.init(std.testing.allocator);
     manager.required_backend = null;
     manager.required_backend_invalid = false;
@@ -1057,10 +1121,10 @@ test "required backend policy rejects unavailable and compiled-only backends" {
 
     manager.required_backend_invalid = false;
     manager.required_backend = .pjrt;
-    try std.testing.expectError(
-        error.RequiredBackendUnavailable,
-        manager.validateRequiredBackendPolicy(),
-    );
+    manager.native_call_policy = .in_process;
+    if (BackendType.pjrt.available()) {
+        try manager.validateRequiredBackendPolicy();
+    } else try std.testing.expectError(error.RequiredBackendUnavailable, manager.validateRequiredBackendPolicy());
 
     manager.required_backend = .native;
     if (BackendType.native.available()) {
@@ -1081,6 +1145,7 @@ test "invalid required backend fails before model loading" {
 }
 
 test "unavailable required backend does not fall back" {
+    if (comptime build_options.enable_pjrt) return error.SkipZigTest;
     var manager = SessionManager.init(std.testing.allocator);
     manager.required_backend = .pjrt;
     manager.required_backend_invalid = false;
@@ -1348,6 +1413,20 @@ test "backend names parse canonical values aliases and optional auto" {
     try std.testing.expectError(error.InvalidArguments, BackendType.parseOptional("unknown"));
 }
 
+test "PJRT admission runtime retains provider placement and physical device limits" {
+    var manager = SessionManager{ .allocator = std.testing.allocator, .preferred_backends = &.{.pjrt}, .pjrt_memory_policy = .cpu };
+    const cpu = try manager.resolveBackendRuntime(.pjrt);
+    try std.testing.expect(!cpu.usesGpuHostedSession());
+    manager.pjrt_memory_policy = .{ .cuda = .{ .capacity_bytes = 1024, .device_bytes = 4096, .unified_memory = true } };
+    const gpu = try manager.resolveBackendRuntime(.pjrt);
+    try std.testing.expect(gpu.usesGpuHostedSession());
+    try std.testing.expectEqual(@as(usize, 1024), gpu.pjrt_memory_policy.?.cuda.capacity_bytes);
+    const limits = gpu.memoryLimits(0);
+    try std.testing.expect(limits.backend_limit_bytes <= 4096);
+    try std.testing.expect(limits.combined_limit_bytes <= limits.host_limit_bytes);
+    try std.testing.expect(!(try manager.resolveBackendRuntime(.native)).usesGpuHostedSession());
+}
+
 test "Gemma4 CUDA host PLE discounted loads cannot bypass manifest lease transfer" {
     const memory = @import("../runtime/tier/memory.zig");
     var controller = memory.AdmissionController{};
@@ -1356,7 +1435,7 @@ test "Gemma4 CUDA host PLE discounted loads cannot bypass manifest lease transfe
     var manager = SessionManager{
         .allocator = std.testing.allocator,
         .preferred_backends = &.{.cuda},
-        .cuda_host_weight_lease = &pinned,
+        .cuda_load_options = .{ .host_lease = &pinned },
     };
     try std.testing.expectError(error.InvalidCudaState, manager.createDirectSession(.{ .path = "/never-opened.gguf", .kind = .gguf }, .cuda));
     try std.testing.expect(pinned != null);

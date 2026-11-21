@@ -49,18 +49,11 @@ __device__ __forceinline__ float termite_q4_0_value_nibble(
 }
 
 __device__ __forceinline__ float termite_decoder_activation_f32(float x, unsigned int activation) {
-    if (activation == 0u) {
-        return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    } else if (activation == 1u) {
-        return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    } else if (activation == 2u) {
-        return x / (1.0f + expf(-x));
-    } else if (activation == 3u) {
-        return fmaxf(x, 0.0f);
-    } else if (activation == 4u) {
-        return x / (1.0f + expf(-1.702f * x));
-    }
-    float r = fmaxf(x, 0.0f);
+    if (activation <= 1u) return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+    if (activation == 2u) return x / (1.0f + expf(-x));
+    if (activation == 3u) return fmaxf(x, 0.0f);
+    if (activation == 4u) return x / (1.0f + expf(-1.702f * x));
+    const float r = fmaxf(x, 0.0f);
     return r * r;
 }
 

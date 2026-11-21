@@ -82,7 +82,7 @@ fn compile(client: *const pjrt.Client, io: std.Io, base: []const u8, file: []con
     defer A.free(path);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, A, .limited(64 * 1024 * 1024));
     defer A.free(bytes);
-    return if (options.len == 0) client.compile(bytes, outputs) else client.compileWithOptions(bytes, outputs, options);
+    return if (options.len == 0) client.compile(bytes, outputs) else client.compileWithSerializedOptions(bytes, outputs, options);
 }
 fn forward(exec: *const pjrt.LoadedExecutable, params: []const pjrt.Buffer, state: []const pjrt.Buffer, ids: pjrt.Buffer, position: pjrt.Buffer) ![]pjrt.Buffer {
     const inputs = try A.alloc(pjrt.Buffer, params.len + state.len + 2);

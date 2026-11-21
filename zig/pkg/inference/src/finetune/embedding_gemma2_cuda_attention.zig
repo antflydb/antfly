@@ -18,7 +18,7 @@
 const std = @import("std");
 const cuda_compute = @import("../ops/cuda/cuda_compute.zig");
 const buffer_mod = @import("../ops/cuda/buffer.zig");
-const module_mod = @import("../ops/cuda/embedding_gemma2.zig");
+const module_mod = @import("../ops/cuda/encoder_multimodal.zig");
 
 const CudaCompute = cuda_compute.CudaCompute;
 const DeviceBuffer = buffer_mod.DeviceBuffer;
@@ -60,7 +60,7 @@ pub fn forward(compute: *CudaCompute, q_bf16: DeviceBuffer, k_bf16: DeviceBuffer
 /// Reuse existing arenas: Q occupies the output until QK finishes, K and V
 /// share the F32-sized context arena, and PV overwrites the dead packed K.
 fn forwardPacked(compute: *CudaCompute, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, mask: DeviceBuffer, shape: Shape, buffers: ForwardBuffers) !void {
-    const module = try compute.embeddingGemma2Module();
+    const module = try compute.encoderMultimodalModule();
     const ctx = compute.embeddingGemma2TrainingContext();
     const lt = try compute.embeddingGemma2TrainingCublasLt();
     const elements = try tensorElements(shape.batch, shape.sequence, shape.query_heads, shape.head_dim);
@@ -108,7 +108,7 @@ pub fn backward(compute: *CudaCompute, q_bf16: DeviceBuffer, k_bf16: DeviceBuffe
 }
 
 fn backwardPacked(compute: *CudaCompute, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, probabilities: DeviceBuffer, dcontext: DeviceBuffer, shape: Shape, buffers: BackwardBuffers) !void {
-    const module = try compute.embeddingGemma2Module();
+    const module = try compute.encoderMultimodalModule();
     const ctx = compute.embeddingGemma2TrainingContext();
     const lt = try compute.embeddingGemma2TrainingCublasLt();
     const elements = try tensorElements(shape.batch, shape.sequence, shape.query_heads, shape.head_dim);

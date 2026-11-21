@@ -21,28 +21,119 @@ const arena = @import("execution_arena.zig");
 pub const limit = arena.limit;
 pub const Plan = arena.Plan;
 pub const Scope = arena.Scope;
-pub const Entry = struct { key: u64 = 0, stamp: u64 = 0, warmed: bool = false, disabled: bool = false, plan: ?*Plan = null };
+const Cleanup = @import("../../execution/cleanup_context.zig").Context;
+const Quota = @import("cache_quota.zig").Quota;
+const retirement = @import("../../execution/resource_retirement.zig");
+const platform = @import("antfly_platform");
+
+/// Independently allocated pure metadata. No CUDA/model/Io/epoch is captured.
+/// Both this exact backing and its old Domain quota live through actual B.
+pub const Owner = struct {
+    allocator: std.mem.Allocator,
+    plan: Plan = .{},
+    quota: Quota = .none,
+    retiring: bool = false,
+    node: retirement.Node = undefined,
+
+    pub fn createOutsideExecution(a: std.mem.Allocator) !*Owner {
+        const self = try a.create(Owner);
+        self.* = .{ .allocator = a };
+        return self;
+    }
+    pub fn destroyUnusedOutsideExecution(self: *Owner) void {
+        std.debug.assert(!self.retiring and self.quota == .none);
+        self.allocator.destroy(self);
+    }
+    pub fn validateCleanup(self: *const Owner, current: Cleanup) !void {
+        if (self.retiring) return error.AudioPlanAlreadyRetired;
+        try self.quota.validateCleanup(current);
+        if (!current.outside_execution) {
+            const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+            if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        }
+    }
+    fn destroyOutside(raw: *anyopaque) callconv(.c) void {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        var quota = self.quota;
+        const a = self.allocator;
+        a.destroy(self); // actual metadata death precedes external refund
+        quota.releaseOutsideExecution();
+    }
+    pub fn retire(self: *Owner, current: Cleanup) !void {
+        try self.validateCleanup(current);
+        self.retiring = true;
+        errdefer self.retiring = false;
+        if (current.outside_execution) {
+            destroyOutside(self);
+        } else {
+            const boundary = try current.boundary.?.boundary();
+            self.node = .{ .context = self, .release_fn = destroyOutside };
+            try boundary.register(boundary.context, boundary.nonce, &self.node);
+        }
+    }
+};
+pub const Entry = struct { key: u64 = 0, stamp: u64 = 0, warmed: bool = false, disabled: bool = false, plan: ?*Plan = null, owner: ?*Owner = null };
 pub const Cache = struct {
     entries: [8]Entry = @splat(.{}),
     clock: u64 = 0,
-    pub fn get(self: *Cache, key: u64) *Entry {
-        self.clock +|= 1;
+    fn retireEntry(entry: *Entry, current: Cleanup) !void {
+        if (entry.owner) |owner| try owner.validateCleanup(current);
+        const previous = entry.*;
+        entry.* = .{}; // consume before any callback-capable outside death
+        if (previous.owner) |owner| {
+            owner.retire(current) catch |err| {
+                entry.* = previous; // registration failed before transfer
+                return err;
+            };
+        } else if (previous.plan) |plan| std.heap.c_allocator.destroy(plan);
+    }
+    pub fn getWithCleanup(self: *Cache, key: u64, current: Cleanup) !*Entry {
         var oldest: usize = 0;
-        for (&self.entries, 0..) |*e, i| {
-            if (e.stamp != 0 and e.key == key) {
-                e.stamp = self.clock;
-                return e;
+        for (&self.entries, 0..) |*entry, index| {
+            if (entry.stamp != 0 and entry.key == key) {
+                self.clock +|= 1;
+                entry.stamp = self.clock;
+                return entry;
             }
-            if (e.stamp < self.entries[oldest].stamp) oldest = i;
+            if (entry.stamp < self.entries[oldest].stamp) oldest = index;
         }
-        const e = &self.entries[oldest];
-        if (e.plan) |p| std.heap.c_allocator.destroy(p);
-        e.* = .{ .key = key, .stamp = self.clock };
-        return e;
+        const entry = &self.entries[oldest];
+        // Actual numerical use always supplies current B. Existing raw callers
+        // may keep raw metadata, but cannot retire a managed owner without it.
+        if (entry.owner) |owner| try owner.validateCleanup(current);
+        var previous = entry.*;
+        self.clock +|= 1;
+        entry.* = .{ .key = key, .stamp = self.clock };
+        retireEntry(&previous, current) catch |err| {
+            entry.* = previous; // no callback/transfer happened on error
+            return err;
+        };
+        if (entry.key != key or entry.stamp == 0) return error.AudioPlanChanged;
+        return entry;
+    }
+    pub fn get(self: *Cache, key: u64) *Entry {
+        return self.getWithCleanup(key, .{}) catch platform.inference_process_supervisor.restartWorker();
+    }
+    pub fn validateCleanup(self: *const Cache, current: Cleanup) !void {
+        for (self.entries) |entry| if (entry.owner) |owner| {
+            if (entry.plan != &owner.plan) return error.InvalidAudioPlanOwner;
+            try owner.validateCleanup(current);
+        };
+    }
+    pub fn clearWithCleanup(self: *Cache, current: Cleanup) !void {
+        try self.validateCleanup(current);
+        // Detach the whole cache before outside supplier reentry. An actual
+        // boundary registration allocates nothing after the validation above.
+        var previous = self.*;
+        self.* = .{};
+        for (&previous.entries) |*entry| retireEntry(entry, current) catch platform.inference_process_supervisor.restartWorker();
+    }
+    pub fn clearLegacy(self: *Cache) !void {
+        for (self.entries) |entry| if (entry.owner != null) return error.MissingCurrentCleanupEpoch;
+        try self.clearWithCleanup(.{});
     }
     pub fn clear(self: *Cache) void {
-        for (self.entries) |e| if (e.plan) |p| std.heap.c_allocator.destroy(p);
-        self.* = .{};
+        self.clearLegacy() catch platform.inference_process_supervisor.restartWorker();
     }
 };
 test "embeddinggemma2 CUDA audio lifetime plan reuses dead regions and rejects allocation drift" {

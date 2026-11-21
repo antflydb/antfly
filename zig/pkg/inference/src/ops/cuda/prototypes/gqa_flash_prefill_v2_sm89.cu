@@ -42,10 +42,8 @@
 #endif
 
 // Reuse the qualified scalar reference implementation under the symbols the
-// standalone harness already expects.  The accompanying Flash-v1 entry points
-// are intentionally named "unused" and never selected by runtime.
+// standalone harness already expects, without instantiating a Flash-v1 kernel.
 #define ANTFLY_FLASH_NAMESPACE antfly_flash_prefill_v2_reference_hd256
-#define ANTFLY_FLASH_KERNEL antfly_gqa_attention_prefill_flash_f16_sm89_hd256_swa512_f32_v1_unused
 #define ANTFLY_FLASH_REFERENCE_KERNEL antfly_gqa_attention_prefill_reference_f16_hd256_swa512_f32_prototype
 #define ANTFLY_FLASH_HEAD_DIM 256
 #define ANTFLY_FLASH_SLIDING_WINDOW 512
@@ -53,11 +51,9 @@
 #undef ANTFLY_FLASH_SLIDING_WINDOW
 #undef ANTFLY_FLASH_HEAD_DIM
 #undef ANTFLY_FLASH_REFERENCE_KERNEL
-#undef ANTFLY_FLASH_KERNEL
 #undef ANTFLY_FLASH_NAMESPACE
 
 #define ANTFLY_FLASH_NAMESPACE antfly_flash_prefill_v2_reference_hd512
-#define ANTFLY_FLASH_KERNEL antfly_gqa_attention_prefill_flash_f16_sm89_hd512_global_f32_v1_unused
 #define ANTFLY_FLASH_REFERENCE_KERNEL antfly_gqa_attention_prefill_reference_f16_hd512_global_f32_prototype
 #define ANTFLY_FLASH_HEAD_DIM 512
 #define ANTFLY_FLASH_SLIDING_WINDOW 0
@@ -65,7 +61,6 @@
 #undef ANTFLY_FLASH_SLIDING_WINDOW
 #undef ANTFLY_FLASH_HEAD_DIM
 #undef ANTFLY_FLASH_REFERENCE_KERNEL
-#undef ANTFLY_FLASH_KERNEL
 #undef ANTFLY_FLASH_NAMESPACE
 
 namespace antfly_flash_prefill_v2 {

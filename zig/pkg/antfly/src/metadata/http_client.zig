@@ -490,6 +490,18 @@ pub const MetadataHttpClient = struct {
         };
     }
 
+    pub fn fetchDecisionAdmission(self: *MetadataHttpClient, base_uri: []const u8, request: metadata_api.DecisionAdmissionRequest, budget: ?RequestBudget) !std.json.Parsed(metadata_api.DecisionAdmission) {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(body);
+        const path = if (request.table_batch != null) routes.Routes.internal_transaction_admission else routes.Routes.internal_decision_admission;
+        return self.fetchCatalogReadAt(metadata_api.DecisionAdmission, base_uri, .POST, path, body, budget) catch |err| switch (err) {
+            error.OutOfMemory, error.CatalogRoutingSnapshotTimeout, error.Canceled, error.DeadlineExceeded, error.UnsupportedOperation => return err,
+            error.Cancelled => return error.Canceled,
+            // Older peers cannot certify transition stability.
+            else => return error.StorageReadTemporarilyUnavailable,
+        };
+    }
+
     pub fn fetchPrivacyPolicyBinding(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.PrivacyPolicyBinding) {
         const body = try std.json.Stringify.valueAlloc(self.alloc, metadata_api.CatalogTableRoutingSnapshotRequest{ .table_name = table_name }, .{});
         defer self.alloc.free(body);
@@ -520,7 +532,7 @@ pub const MetadataHttpClient = struct {
             .method = method,
             .uri = uri,
             .timeout_ms = default_request_timeout_ms,
-            .max_response_bytes = if (Result == metadata_api.CatalogRoutingChangeToken or Result == metadata_api.PrivacyPolicyBinding or Result == metadata_api.OwnerReadiness) 4096 else null,
+            .max_response_bytes = if (Result == metadata_api.CatalogRoutingChangeToken or Result == metadata_api.PrivacyPolicyBinding or Result == metadata_api.OwnerReadiness or Result == metadata_api.DecisionAdmission) 4096 else null,
         };
         if (method == .POST) {
             request.body = body orelse "{}";

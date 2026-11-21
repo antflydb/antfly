@@ -89,7 +89,16 @@ pub const Trace = struct {
         };
     }
 
+    pub fn finishOwned(self: *Trace, vectors: anytype) void {
+        self.writeRows(vectors) catch {
+            std.log.warn("embedding trace could not be written; check the opt-in capture directory", .{});
+        };
+    }
+
     fn write(self: *Trace, vectors: ?[]const []const f32) !void {
+        return self.writeRows(vectors);
+    }
+    fn writeRows(self: *Trace, vectors: anytype) !void {
         const elapsed = now() -| self.started_ns;
         const data = try std.json.Stringify.valueAlloc(self.allocator, .{
             .version = 1,
@@ -100,7 +109,7 @@ pub const Trace = struct {
             .task_type = self.task_type,
             .instruction = self.instruction,
             .backend = self.backend,
-            .success = vectors != null,
+            .success = if ((@TypeOf(vectors) == @import("backends/session.zig").OwnedHostVectors or @TypeOf(vectors) == @import("backends/session.zig").OwnedHostRows)) true else vectors != null,
             .vectors = vectors,
             .attempts = self.attempts,
             .shapes = self.shapes[0..self.shape_count],

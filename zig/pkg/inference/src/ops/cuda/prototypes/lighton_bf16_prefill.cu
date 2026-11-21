@@ -55,36 +55,46 @@ struct Claim {
   uintptr_t state_view = 0;
   int64_t state_pointers[16]{};
 };
-static bool claim(const Ragged *p, Claim &c) {
-  if (!p || p->base.items < 1 || p->base.items > 64 ||
-      p->base.key_heads != 16 ||
-      (p->base.value_heads != 16 && p->base.value_heads != 32))
-    return false;
-  c.p = *p;
+// Additive metadata ABI: one pure geometry implementation serves BOTH the
+// cold export and the original actual packet validator. No SDK pointers are
+// fabricated to ask the selected library for its exact retained workspace.
+struct PrefillGeometry {
+  int key_heads, value_heads, items;
+  int offsets[64], lengths[64];
+};
+static_assert(sizeof(PrefillGeometry) == 524, "prefill cold metadata ABI");
+static bool claim_geometry(const PrefillGeometry *p, Claim &c) {
+  if (!p || p->items < 1 || p->items > 64 || p->key_heads != 16 ||
+      (p->value_heads != 16 && p->value_heads != 32)) return false;
   int total = 0;
-  for (int i = 0; i < p->base.items; ++i) {
+  for (int i = 0; i < p->items; ++i) {
     if (p->offsets[i] != total || p->lengths[i] < 1 ||
-        p->lengths[i] > 4096 - total)
-      return false;
+        p->lengths[i] > 4096 - total) return false;
     total += p->lengths[i];
     if (p->lengths[i] > 1) {
-      if (c.count == 16)
-        return false;
+      if (c.count == 16) return false;
       c.indices[c.count] = i;
       c.offsets[c.count++] = c.rows;
       c.rows += p->lengths[i];
     }
   }
   c.offsets[c.count] = c.rows;
+  return true;
+}
+static bool claim(const Ragged *p, Claim &c) {
+  if (!p) return false;
+  PrefillGeometry geometry{p->base.key_heads, p->base.value_heads, p->base.items};
+  std::copy_n(p->offsets, 64, geometry.offsets);
+  std::copy_n(p->lengths, 64, geometry.lengths);
+  if (!claim_geometry(&geometry, c)) return false;
+  c.p = *p;
   if (c.count) {
     // Every table entry names an independently owned native K,V state. The
     // one-page DLTensor supplies only the common layout; the CuTe kernel uses
     // the selected page pointer directly, never an offset across allocations.
     for (int i = 0; i < c.count; ++i) {
-      uintptr_t state =
-          reinterpret_cast<uintptr_t>(p->base.pages[c.indices[i]].state);
-      if (!state || (state & 255))
-        return false;
+      uintptr_t state = reinterpret_cast<uintptr_t>(p->base.pages[c.indices[i]].state);
+      if (!state || (state & 255)) return false;
       c.state_pointers[i] = static_cast<int64_t>(state);
     }
     c.state_view = static_cast<uintptr_t>(c.state_pointers[0]);
@@ -304,6 +314,15 @@ static int prefill_run(const Ragged *p, void *scratch, size_t bytes, int device,
     return 6;
   scatter_output<<<(rows * h * d + 255) / 256, 256, 0, stream>>>(c, s);
   return cudaGetLastError() == cudaSuccess ? 0 : 7;
+}
+
+extern "C" uint64_t antfly_recurrent_prefill_workspace_geometry_abi() {
+  return (uint64_t(1) << 32) | sizeof(PrefillGeometry);
+}
+extern "C" size_t antfly_recurrent_prefill_workspace_geometry(const PrefillGeometry *p) {
+  Claim c;
+  if (!claim_geometry(p, c)) return SIZE_MAX;
+  return c.count ? Scratch(nullptr, c.rows, c.count, p->value_heads).size : 0;
 }
 
 extern "C" uint64_t antfly_lighton_prefill_abi() {

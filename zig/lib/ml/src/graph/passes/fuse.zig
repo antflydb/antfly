@@ -47,6 +47,7 @@ const NodeId = node_mod.NodeId;
 const null_node = node_mod.null_node;
 const OpCode = node_mod.OpCode;
 const Shape = shape_mod.Shape;
+const DType = shape_mod.DType;
 
 pub const FuseResult = struct {
     graph: Graph,
@@ -95,76 +96,100 @@ pub fn fuse(allocator: std.mem.Allocator, graph: *const Graph) !FuseResult {
     // as a div. The pipeline fixed-point loop in `pipeline.zig` re-runs
     // fuse, which lets SDPA match on iteration 2 once the fused_softmax
     // node has been baked into the graph by the previous iteration.
+    var phase1_redirects_live = true;
     var softmax_rewrites = try fuseSoftmaxFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) softmax_rewrites.redirects.deinit(allocator);
     num_rewrites += softmax_rewrites.num_rewrites;
 
     var silu_rewrites = try fuseSiLUFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) silu_rewrites.redirects.deinit(allocator);
     num_rewrites += silu_rewrites.num_rewrites;
 
     var gelu_rewrites = try fuseGELUFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) gelu_rewrites.redirects.deinit(allocator);
     num_rewrites += gelu_rewrites.num_rewrites;
 
     var quick_gelu_rewrites = try fuseQuickGELUFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) quick_gelu_rewrites.redirects.deinit(allocator);
     num_rewrites += quick_gelu_rewrites.num_rewrites;
 
     var rms_norm_rewrites = try fuseRMSNormFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) rms_norm_rewrites.redirects.deinit(allocator);
     num_rewrites += rms_norm_rewrites.num_rewrites;
 
     var layer_norm_rewrites = try fuseLayerNormFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) layer_norm_rewrites.redirects.deinit(allocator);
     num_rewrites += layer_norm_rewrites.num_rewrites;
 
     var linear_bias_rewrites = try fuseLinearBias(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) linear_bias_rewrites.redirects.deinit(allocator);
     num_rewrites += linear_bias_rewrites.num_rewrites;
 
     var matmul_no_bias_rewrites = try fuseMatmulNoBias(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) matmul_no_bias_rewrites.redirects.deinit(allocator);
     num_rewrites += matmul_no_bias_rewrites.num_rewrites;
 
     var rope_rewrites = try fuseRopeFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) rope_rewrites.redirects.deinit(allocator);
     num_rewrites += rope_rewrites.num_rewrites;
 
     // Algebraic / shape canonicalizations. These run alongside the
     // primitive→fused matchers in Phase 1 because they synthesize new
     // nodes (Phase 2 only does redirects).
     var hoist_rewrites = try fuseHoistUnaryAboveBroadcast(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) hoist_rewrites.redirects.deinit(allocator);
     num_rewrites += hoist_rewrites.num_rewrites;
 
     var chain_reshape_rewrites = try fuseChainReshape(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) chain_reshape_rewrites.redirects.deinit(allocator);
     num_rewrites += chain_reshape_rewrites.num_rewrites;
 
     var chain_broadcast_rewrites = try fuseChainBroadcast(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) chain_broadcast_rewrites.redirects.deinit(allocator);
     num_rewrites += chain_broadcast_rewrites.num_rewrites;
 
     var chain_transpose_rewrites = try fuseChainTranspose(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) chain_transpose_rewrites.redirects.deinit(allocator);
     num_rewrites += chain_transpose_rewrites.num_rewrites;
 
     var transpose_into_dot_rewrites = try fuseTransposeIntoDot(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) transpose_into_dot_rewrites.redirects.deinit(allocator);
     num_rewrites += transpose_into_dot_rewrites.num_rewrites;
 
     var reduce_merge_rewrites = try fuseReduceAxisMerge(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) reduce_merge_rewrites.redirects.deinit(allocator);
     num_rewrites += reduce_merge_rewrites.num_rewrites;
 
     var neg_normalize_rewrites = try fuseNegNormalize(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) neg_normalize_rewrites.redirects.deinit(allocator);
     num_rewrites += neg_normalize_rewrites.num_rewrites;
 
     var slice_chain_rewrites = try fuseSliceChain(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) slice_chain_rewrites.redirects.deinit(allocator);
     num_rewrites += slice_chain_rewrites.num_rewrites;
 
     var slice_concat_rewrites = try fuseSliceOfConcat(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) slice_concat_rewrites.redirects.deinit(allocator);
     num_rewrites += slice_concat_rewrites.num_rewrites;
 
     var canon_commute_rewrites = try fuseCanonicalizeCommutative(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) canon_commute_rewrites.redirects.deinit(allocator);
     num_rewrites += canon_commute_rewrites.num_rewrites;
 
     var self_pair_rewrites = try fuseAlgebraicSelfPairs(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) self_pair_rewrites.redirects.deinit(allocator);
     num_rewrites += self_pair_rewrites.num_rewrites;
 
     var add_mul_scalar_rewrites = try fuseAddMulScalar(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) add_mul_scalar_rewrites.redirects.deinit(allocator);
     num_rewrites += add_mul_scalar_rewrites.num_rewrites;
 
     var pair_rewrites = try fuseLinearPairs(allocator, &work);
+    errdefer if (phase1_redirects_live) pair_rewrites.redirects.deinit(allocator);
     num_rewrites += pair_rewrites.num_rewrites;
 
     var sdpa_rewrites = try fuseSDPA(allocator, &work);
+    errdefer if (phase1_redirects_live) sdpa_rewrites.redirects.deinit(allocator);
     num_rewrites += sdpa_rewrites.num_rewrites;
 
     // Phase 2: Simple redirect patterns.
@@ -237,6 +262,7 @@ pub fn fuse(allocator: std.mem.Allocator, graph: *const Graph) !FuseResult {
     self_pair_rewrites.redirects.deinit(allocator);
     pair_rewrites.redirects.deinit(allocator);
     sdpa_rewrites.redirects.deinit(allocator);
+    phase1_redirects_live = false;
 
     // Apply algebraic patterns in topological order (original nodes only;
     // synthetic nodes from phase 1 are correct by construction).
@@ -403,10 +429,9 @@ fn resolve(redirect: []const NodeId, id: NodeId) NodeId {
     return cur;
 }
 
-/// Walk through shape-only / dtype-only ops (convert_dtype, reshape)
-/// to find the underlying op. Used by primitive→fused matchers so that
-/// FP16 ONNX exports — which routinely surround Softmax / LayerNorm with
-/// `Cast(f32) → … → Cast(f16)` for numerical stability — still match.
+/// Walk through layout wrappers and identity casts, preserving all changes
+/// of arithmetic dtype. Rounding casts and F32 widening views are semantic
+/// inputs; fusing across either changes low-precision numerical contracts.
 fn skipShapeOps(graph: *const Graph, id: NodeId) NodeId {
     var cur = id;
     var depth: u32 = 0;
@@ -414,7 +439,11 @@ fn skipShapeOps(graph: *const Graph, id: NodeId) NodeId {
         if (cur == null_node or cur >= graph.nodeCount()) return cur;
         const tag = std.meta.activeTag(graph.node(cur).op);
         if (tag != .convert_dtype and tag != .reshape) return cur;
-        cur = graph.node(cur).inputs[0];
+        const node = graph.node(cur);
+        const input = node.inputs[0];
+        if (input == null_node or input >= graph.nodeCount()) return cur;
+        if (tag == .convert_dtype and node.output_shape.dtype != graph.node(input).output_shape.dtype) return cur;
+        cur = input;
     }
     return cur;
 }
@@ -511,7 +540,7 @@ fn fuseAddMulScalar(allocator: std.mem.Allocator, work: *Graph, reachable: []con
             continue;
 
         const fused_id = try work.addNode(.{
-            .op = .{ .fused_add_mul_scalar = {} },
+            .op = .{ .fused_add_mul_scalar = .{} },
             .output_shape = n.output_shape,
             .inputs = .{ matched.add_lhs, matched.add_rhs, matched.scalar, null_node },
             .num_inputs = 3,
@@ -595,6 +624,18 @@ fn fuseLinearPairs(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult
     var num_rewrites: u32 = 0;
 
     const count = work.nodeCount();
+    // Changing a GEMM's output geometry can change F32 accumulation and flip
+    // a subsequent low-precision rounding decision. Such publications retain
+    // their independent projections until a grouped schedule is qualified.
+    const rounded = try allocator.alloc(bool, count);
+    defer allocator.free(rounded);
+    @memset(rounded, false);
+    for (work.nodes.items) |node| if (node.op == .convert_dtype and
+        (node.op.convert_dtype.target == .bf16 or node.op.convert_dtype.target == .f16))
+    {
+        const input = node.inputs[0];
+        if (input != null_node and input < count) rounded[input] = true;
+    };
 
     // Group by (input_id, rows, in_dim) — out_dim is intentionally NOT
     // part of the key so GQA-style Q/K/V (with different out_dim) end
@@ -621,6 +662,7 @@ fn fuseLinearPairs(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult
         const n = work.node(@intCast(i));
         switch (n.op) {
             .fused_linear_no_bias => |attrs| {
+                if (rounded[i]) continue;
                 const key = GroupKey{
                     .input_id = n.inputs[0],
                     .rows = attrs.rows,
@@ -3361,6 +3403,7 @@ fn rebuild(
 
     // Build old->new ID mapping in topological order.
     const id_map = try allocator.alloc(NodeId, count);
+    errdefer allocator.free(id_map);
     @memset(id_map, null_node);
 
     var new_count: u32 = 0;
@@ -3415,6 +3458,10 @@ fn rebuild(
             try new_graph.parameters.append(allocator, id_map[redir]);
         }
     }
+
+    // External bindings follow redirects too. Representatives redirect to
+    // themselves, so their final IDs remain stable during this in-place fill.
+    for (0..count) |i| id_map[i] = id_map[resolve(redirect, @intCast(i))];
 
     return .{ .graph = new_graph, .id_map = id_map, .num_rewrites = num_rewrites };
 }
@@ -3638,7 +3685,7 @@ test "fuse detects add multiplied by scalar" {
     try std.testing.expectEqual(@as(u32, 1), result.num_rewrites);
     const out_id = result.graph.outputs.items[0];
     try std.testing.expectEqual(@as(usize, 3), result.graph.node(out_id).num_inputs);
-    try std.testing.expectEqualDeep(OpCode{ .fused_add_mul_scalar = {} }, result.graph.node(out_id).op);
+    try std.testing.expectEqualDeep(OpCode{ .fused_add_mul_scalar = .{} }, result.graph.node(out_id).op);
 }
 
 test "fuse skips add multiplied by non-scalar tensor" {
@@ -4595,14 +4642,19 @@ test "fuse detects primitive softmax pattern" {
     try std.testing.expectEqual(@as(u32, 5), result.graph.node(out_id).op.fused_softmax.dim);
 }
 
-test "fuse detects softmax surrounded by Cast(f32→f16→f32)" {
+test "fuse detects softmax while preserving F16 and BF16 rounding and F32 arithmetic" {
+    for ([_]DType{ .f16, .bf16 }) |dtype| for ([_]bool{ false, true }) |internal_round| try checkSoftmaxPrecision(dtype, internal_round);
+}
+
+fn checkSoftmaxPrecision(dtype: DType, internal_round: bool) !void {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
     var b = Builder.init(&g);
 
-    // FP16 LLM stability pattern: x is f16, the softmax body runs in f32.
-    const x_f16 = try b.parameter("x", Shape.init(.f16, &.{ 2, 5 }));
+    // Preserve the input rounding while the softmax body runs in F32.
+    const raw = try b.parameter("x", Shape.init(.f32, &.{ 2, 5 }));
+    const x_f16 = try b.convertDtype(raw, dtype);
     const x = try b.convertDtype(x_f16, .f32);
     const in_shape = g.node(x).output_shape;
 
@@ -4618,12 +4670,11 @@ test "fuse detects softmax surrounded by Cast(f32→f16→f32)" {
         .inputs = .{ max_val, null_node, null_node, null_node },
         .num_inputs = 1,
     });
-    // Cast in the middle of the chain — should be transparently
-    // walked through by skipShapeOps.
+    // Identity casts are transparent; value-changing internal casts are not.
     const max_bc_cast = try b.convertDtype(max_bc, .f32);
     const shifted = try b.sub(x, max_bc_cast);
     const exp_v = try b.expOp(shifted);
-    const exp_cast = try b.convertDtype(exp_v, .f32);
+    const exp_cast = if (internal_round) try b.convertDtype(try b.convertDtype(exp_v, dtype), .f32) else try b.convertDtype(exp_v, .f32);
     const sum_v = try g.addNode(.{
         .op = .{ .reduce_sum = .{ .axes = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .num_axes = 1 } },
         .output_shape = Shape.init(.f32, &.{ 2, 1 }),
@@ -4636,9 +4687,9 @@ test "fuse detects softmax surrounded by Cast(f32→f16→f32)" {
         .inputs = .{ sum_v, null_node, null_node, null_node },
         .num_inputs = 1,
     });
-    const out = try b.div(exp_v, sum_bc);
+    const out = try b.div(exp_cast, sum_bc);
     // Cast result back to f16 — the matcher should still fire.
-    const out_f16 = try b.convertDtype(out, .f16);
+    const out_f16 = try b.convertDtype(out, dtype);
     try g.markOutput(out_f16);
 
     var result = try fuse(allocator, &g);
@@ -4647,11 +4698,12 @@ test "fuse detects softmax surrounded by Cast(f32→f16→f32)" {
     var found = false;
     for (0..result.graph.nodeCount()) |i| {
         if (std.meta.activeTag(result.graph.node(@intCast(i)).op) == .fused_softmax) {
+            try expectPrecisionInput(&result.graph, result.graph.node(@intCast(i)).inputs[0], dtype);
             found = true;
             break;
         }
     }
-    try std.testing.expect(found);
+    try std.testing.expectEqual(!internal_round, found);
 }
 
 test "fuse detects primitive silu pattern" {
@@ -4885,13 +4937,18 @@ test "fuse detects QuickGELU pattern" {
     try std.testing.expectEqual(@as(std.meta.Tag(node_mod.OpCode), .fused_quick_gelu), std.meta.activeTag(result.graph.node(out_id).op));
 }
 
-test "fuse detects primitive RMSNorm pattern" {
+test "fuse detects primitive RMSNorm pattern preserves floating-point casts" {
+    for ([_]DType{ .f32, .f16, .bf16 }) |dtype| try checkRmsNormPrecision(dtype);
+}
+
+fn checkRmsNormPrecision(dtype: DType) !void {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
     var b = Builder.init(&g);
 
-    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 8 }));
+    const raw = try b.parameter("x", Shape.init(.f32, &.{ 2, 8 }));
+    const x = if (dtype == .f32) raw else try b.convertDtype(try b.convertDtype(raw, dtype), .f32);
     const w = try b.parameter("w", Shape.init(.f32, &.{8}));
     const x_shape = g.node(x).output_shape;
     const eps_val: f32 = 1e-5;
@@ -4924,15 +4981,21 @@ test "fuse detects primitive RMSNorm pattern" {
     const a = result.graph.node(out_id).op.fused_rms_norm;
     try std.testing.expectEqual(@as(u32, 8), a.dim);
     try std.testing.expectApproxEqAbs(@as(f32, eps_val), a.eps, 1e-9);
+    try expectPrecisionInput(&result.graph, result.graph.node(out_id).inputs[0], dtype);
 }
 
-test "fuse detects primitive LayerNorm pattern" {
+test "fuse detects primitive LayerNorm pattern preserves floating-point casts" {
+    for ([_]DType{ .f32, .f16, .bf16 }) |dtype| try checkLayerNormPrecision(dtype);
+}
+
+fn checkLayerNormPrecision(dtype: DType) !void {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
     var b = Builder.init(&g);
 
-    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 8 }));
+    const raw = try b.parameter("x", Shape.init(.f32, &.{ 2, 8 }));
+    const x = if (dtype == .f32) raw else try b.convertDtype(try b.convertDtype(raw, dtype), .f32);
     const gamma = try b.parameter("gamma", Shape.init(.f32, &.{8}));
     const beta = try b.parameter("beta", Shape.init(.f32, &.{8}));
     const x_shape = g.node(x).output_shape;
@@ -4980,6 +5043,7 @@ test "fuse detects primitive LayerNorm pattern" {
     const a = result.graph.node(out_id).op.fused_layer_norm;
     try std.testing.expectEqual(@as(u32, 8), a.dim);
     try std.testing.expectApproxEqAbs(@as(f32, eps_val), a.eps, 1e-9);
+    try expectPrecisionInput(&result.graph, result.graph.node(out_id).inputs[0], dtype);
 }
 
 // ── Tests for algebraic / shape canonicalizations ─────────────────────
@@ -5661,4 +5725,46 @@ test "SDPA key fusion preserves a composed token to head transpose" {
     try std.testing.expectEqualDeep(Shape.init(.f32, &.{ -1, 16, -1, 64 }), key.output_shape);
     const unsupported = try builder.transpose(token_keys, &.{ 2, 0, 3, 1 });
     try std.testing.expectEqual(null_node, (try findScaledTransposeTensor(&graph, unsupported)).k_id);
+}
+
+fn expectPrecisionInput(g: *const Graph, input: NodeId, dtype: DType) !void {
+    const node = g.node(input);
+    try std.testing.expectEqual(DType.f32, node.output_shape.dtype);
+    if (dtype == .f32) {
+        try std.testing.expectEqual(.parameter, std.meta.activeTag(node.op));
+    } else {
+        try std.testing.expectEqual(.convert_dtype, std.meta.activeTag(node.op));
+        try std.testing.expectEqual(DType.f32, node.op.convert_dtype.target);
+        const narrow = g.node(node.inputs[0]);
+        try std.testing.expectEqual(.convert_dtype, std.meta.activeTag(narrow.op));
+        try std.testing.expectEqual(dtype, narrow.op.convert_dtype.target);
+    }
+}
+
+test "rounded linear publications preserve independent GEMM geometry" {
+    const a = std.testing.allocator;
+    for ([_]DType{ .f16, .bf16 }) |dtype| for ([_]usize{ 2, 3 }) |count| {
+        var g = Graph.init(a);
+        defer g.deinit();
+        var b = Builder.init(&g);
+        const x = try b.parameter("x", Shape.init(.f32, &.{ 3, 8 }));
+        const names = [_][]const u8{ "q", "k", "v" };
+        for (names[0..count]) |name| {
+            const w = try b.parameter(name, Shape.init(.f32, &.{ 8, 8 }));
+            const projection = try addBareFusedLinearNoBias(&g, x, w, 3, 8, 8);
+            try g.markOutput(try b.convertDtype(try b.convertDtype(projection, dtype), .f32));
+        }
+        var result = try fuse(a, &g);
+        defer result.deinit();
+        var projections: usize = 0;
+        for (result.graph.nodes.items) |node| switch (node.op) {
+            .fused_linear_no_bias_pair => return error.UnexpectedRoundedProjectionPair,
+            .fused_linear_no_bias => |attrs| {
+                try std.testing.expectEqual(@as(u32, 8), attrs.out_dim);
+                projections += 1;
+            },
+            else => {},
+        };
+        try std.testing.expectEqual(count, projections);
+    };
 }

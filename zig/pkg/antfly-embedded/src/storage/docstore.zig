@@ -1111,6 +1111,12 @@ pub const DocStore = struct {
             return std.mem.startsWith(u8, row.key, prefix);
         }
 
+        pub fn countPrefix(self: *Txn, prefix: []const u8) !u64 {
+            var cursor = try self.openPhysicalCursorAdapter();
+            defer cursor.close();
+            return cursor.countPrefix(prefix);
+        }
+
         pub fn openPhysicalKeyCursorAdapter(self: *Txn) !CursorAdapter {
             var cursor = try self.openPhysicalCursorAdapter();
             cursor.setKeysOnly();

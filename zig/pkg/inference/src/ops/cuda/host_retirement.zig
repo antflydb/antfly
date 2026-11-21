@@ -246,9 +246,7 @@ test "Gemma4 CUDA host PLE retirement survives wrapper teardown and failed drain
         .device_ptr = 0x5678,
         .owner = owner,
     };
-    var ctx: @import("context.zig").CudaContext = undefined;
-    ctx.ctx = owner.primary;
-    ctx.stream = null;
+    var ctx = @import("context.zig").CudaContext{ .driver = undefined, .ctx = owner.primary, .stream = null, .device = 0, .info = .{} };
     ctx.driver.fns.cuCtxSetCurrent = Fake.setCurrent;
     ctx.driver.fns.cuStreamSynchronize = Fake.streamWait;
     Fake.fail_wait = true;
