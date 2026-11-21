@@ -500,7 +500,7 @@ test "HTTP connection keeps a referenced durable transaction through session GC"
     const begun = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
     _ = try mutate(&store, .{ .bind = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2);
     store.fail_writes_for_test = true;
-    try std.testing.expectError(error.InjectedSessionStoreFailure, registry.rollbackConnectionBeforeExecution(alloc, txn_id, id, begun.version));
+    try std.testing.expectError(error.InjectedSessionStoreFailure, registry.rollbackConnectionBeforeExecution(alloc, txn_id, id, begun.version, .active));
     store.fail_writes_for_test = false;
     var still_active = try load(&store, alloc, id, "alice", 7, 2);
     try std.testing.expectEqual(record.State.active, still_active.value.state);
