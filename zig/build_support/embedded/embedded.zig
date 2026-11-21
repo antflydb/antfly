@@ -584,6 +584,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi get edges json does not double free a non-empty edge slice",
         "capi native memory",
         "capi native short lived writers",
+        "capi native separate writer processes",
         "capi native marker sweep",
         "capi native unbounded writer admits reusable pool before a large request",
         "capi native allocator proof",

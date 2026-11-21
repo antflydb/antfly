@@ -7958,7 +7958,7 @@ pub const NativeFile = struct {
         };
         var apply: Apply = .{ .overlay = overlay, .io = io };
         const start_after = @max(floor, overlay.appliedThrough(), overlay.decodedThrough());
-        if (start_offset > file.header.redo_log_capacity) return error.NativeRedoLogCorrupt;
+        if (start_offset > file.header.redo_log_capacity) return redoLogCorrupt(@src());
         var outcome = try redo_log.replayBounded(file.allocator, file.file, io, file.header.redo_log_offset + start_offset, file.header.redo_log_capacity - start_offset, start_after, ceiling, unlogged_through, Apply.onRecord, &apply);
         outcome.valid_bytes += start_offset;
         if (outcome.valid_count != 0) _ = overlay.replay_epoch.fetchAdd(1, .acq_rel);
@@ -8027,7 +8027,7 @@ pub const NativeFile = struct {
             if (outcome.stop_reason == .corrupt_record and
                 (scan.durable_ceiling_offset == null or outcome.valid_bytes < scan.durable_ceiling_offset.?))
             {
-                return error.NativeRedoLogCorrupt;
+                return redoLogCorrupt(@src());
             }
             const region = scan.region orelse {
                 // No region to publish a bound: a sidecar writer that
@@ -8054,7 +8054,7 @@ pub const NativeFile = struct {
                     if (region.readLogStateChecked()) |again| {
                         if (again.checkpoint_sequence > scan.observed_checkpoint) return error.ColdScanRetry;
                     }
-                    return error.NativeRedoLogCorrupt;
+                    return redoLogCorrupt(@src());
                 }
             }
         }
@@ -8638,7 +8638,7 @@ pub const NativeFile = struct {
                 outcome: redo_log.ReplayOutcome = undefined,
                 fn run(ctx: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
                     ctx.outcome = try replayIntoSharedOverlayFrom(ctx.file, ctx.io, overlay, ctx.start_offset, ctx.floor, ctx.max_sequence, ctx.unlogged_through);
-                    if (ctx.outcome.stop_reason == .corrupt_record and (ctx.ceiling == null or ctx.outcome.valid_bytes < ctx.ceiling.?)) return error.NativeRedoLogCorrupt;
+                    if (ctx.outcome.stop_reason == .corrupt_record and (ctx.ceiling == null or ctx.outcome.valid_bytes < ctx.ceiling.?)) return redoLogCorrupt(@src());
                 }
             };
             var catch_up: Catch = .{
@@ -9770,7 +9770,7 @@ pub const NativeFile = struct {
                         // prefix), not lost data. See `recoverRedoLog`'s own
                         // `durable_ceiling_offset` for the full reasoning and
                         // the live repro that exposed it.
-                        if (rc.outcome.stop_reason == .corrupt_record and rc.outcome.valid_bytes < rc.durable_ceiling_offset) return error.NativeRedoLogCorrupt;
+                        if (rc.outcome.stop_reason == .corrupt_record and rc.outcome.valid_bytes < rc.durable_ceiling_offset) return redoLogCorrupt(@src());
                     }
                 };
                 // Records at or below the adopted checkpoint's fold boundary are
@@ -9810,12 +9810,12 @@ pub const NativeFile = struct {
                 const covered = @max(redo.checkpoint_sequence, self.activeCheckpoint().commit_sequence);
                 if (@max(outcome.last_sequence orelse 0, covered) < published.durable_sequence) {
                     attempts += 1;
-                    const again = region.readLogStateChecked() orelse return error.NativeRedoLogCorrupt;
+                    const again = region.readLogStateChecked() orelse return redoLogCorrupt(@src());
                     if (attempts < 3 and again.checkpoint_sequence > published.checkpoint_sequence) {
                         published = again;
                         continue :catch_up;
                     }
-                    return error.NativeRedoLogCorrupt;
+                    return redoLogCorrupt(@src());
                 }
                 // Another instance on this inode in the same process records its
                 // commits in the shared overlay directly, so replay finds nothing
@@ -10423,7 +10423,7 @@ pub const NativeFile = struct {
         const floor = if (probe) (redo.writer.last_sequence orelse redo.checkpoint_sequence) else redo.checkpoint_sequence;
         if (probe) covered = @max(covered, floor);
         const capacity = self.header.redo_log_capacity;
-        if (start_offset > capacity) return error.NativeRedoLogCorrupt;
+        if (start_offset > capacity) return redoLogCorrupt(@src());
 
         // One validated pass decodes the suffix straight into the shared
         // overlay. Nothing reads it yet: no instance's read mark passes its
@@ -10460,7 +10460,7 @@ pub const NativeFile = struct {
                 };
                 var visit: Visit = .{ .overlay = overlay, .have_through = @max(overlay.appliedThrough(), overlay.decodedThrough()) };
                 const file = ctx.file;
-                if (ctx.start_offset > file.header.redo_log_capacity) return error.NativeRedoLogCorrupt;
+                if (ctx.start_offset > file.header.redo_log_capacity) return redoLogCorrupt(@src());
                 ctx.outcome = try redo_log.replayBounded(file.allocator, file.file, ctx.io, file.header.redo_log_offset + ctx.start_offset, file.header.redo_log_capacity - ctx.start_offset, ctx.floor, null, ctx.unlogged_through, Visit.onRecord, &visit);
                 ctx.outcome.valid_bytes += ctx.start_offset;
                 ctx.compact = visit.compact;
@@ -10472,14 +10472,14 @@ pub const NativeFile = struct {
         const scan = scan_ctx.outcome;
         const published = if (region) |r| r.readLogStateChecked() else null;
         if (scan.stop_reason == .corrupt_record) {
-            if (!try discardTornRedoAppend(self.file, io, self.header.redo_log_offset, capacity, scan, covered, published)) return error.NativeRedoLogCorrupt;
+            if (!try discardTornRedoAppend(self.file, io, self.header.redo_log_offset, capacity, scan, covered, published)) return redoLogCorrupt(@src());
         }
         // Whatever stopped the scan (zeros, a short read, corruption), the
         // log must still hold everything the watermark promised as durable.
         // A torn watermark's raw fields each hold a value once published.
         const promised: ?shared_lock_region.Region.LogState = if (region) |r| (published orelse r.readLogStateRaw()) else null;
         if (promised) |state| {
-            if (@max(scan.last_sequence orelse 0, covered) < state.durable_sequence) return error.NativeRedoLogCorrupt;
+            if (@max(scan.last_sequence orelse 0, covered) < state.durable_sequence) return redoLogCorrupt(@src());
         }
 
         const found = scan.valid_count != 0 or (!probe and scan.valid_bytes != redo.writer.tail);
@@ -10675,7 +10675,7 @@ pub const NativeFile = struct {
                 // same physical, cross-process file either of the other
                 // two races on.
                 const ceiling = if (self.regionForInode() catch null) |r| publishedDurableCeiling(r, r.readLogState()) else null;
-                if (outcome.stop_reason == .corrupt_record and (ceiling == null or outcome.valid_bytes < ceiling.?)) return error.NativeRedoLogCorrupt;
+                if (outcome.stop_reason == .corrupt_record and (ceiling == null or outcome.valid_bytes < ceiling.?)) return redoLogCorrupt(@src());
                 redo.writer.tail = outcome.valid_bytes;
                 // Another handle may have restarted the log since: learn the
                 // salt of the run this tail belongs to.
@@ -23022,7 +23022,7 @@ fn recoverCrashedWriterRedoState(allocator: Allocator, io: std.Io, file: std.Io.
     const outcome = try redo_log.replayBounded(allocator, file, io, header.redo_log_offset, header.redo_log_capacity, folded_through, null, checkpoint.commit_sequence, null, null);
     const published = region.readLogStateChecked();
     if (outcome.stop_reason == .corrupt_record) {
-        if (!try discardTornRedoAppend(file, io, header.redo_log_offset, header.redo_log_capacity, outcome, checkpoint.commit_sequence, published)) return error.NativeRedoLogCorrupt;
+        if (!try discardTornRedoAppend(file, io, header.redo_log_offset, header.redo_log_capacity, outcome, checkpoint.commit_sequence, published)) return redoLogCorrupt(@src());
     }
     // Whatever stopped the scan (zeros, a short read, corruption), the log
     // must still hold everything the old watermark promised as durable,
@@ -23030,7 +23030,7 @@ fn recoverCrashedWriterRedoState(allocator: Allocator, io: std.Io, file: std.Io.
     // would erase acknowledged commits. A torn watermark's raw fields each
     // hold a value once published.
     const promised = published orelse region.readLogStateRaw();
-    if (@max(outcome.last_sequence orelse 0, checkpoint.commit_sequence) < promised.durable_sequence) return error.NativeRedoLogCorrupt;
+    if (@max(outcome.last_sequence orelse 0, checkpoint.commit_sequence) < promised.durable_sequence) return redoLogCorrupt(@src());
     const durable_sequence = @max(outcome.last_sequence orelse 0, checkpoint.commit_sequence);
     if (published) |current| {
         if (current.durable_sequence == durable_sequence and current.durable_offset == outcome.valid_bytes and current.checkpoint_sequence == folded_through) return;
@@ -38905,6 +38905,13 @@ test "lite redo log mixed solo-and-bulk commit survives a log-full nested fold" 
 
 test "lite redo log mixed solo-and-bulk commit reads back when the log has room" {
     try expectMixedBatchCommitSurvivesCheckAndReopen("redo-bulk-alloc-roomy.aflite", 4 * 1024 * 1024);
+}
+
+/// Reports which check found the redo log corrupt: the error alone does
+/// not say, and a corrupt log is never routine.
+fn redoLogCorrupt(src: std.builtin.SourceLocation) error{NativeRedoLogCorrupt} {
+    std.log.warn("redo log corrupt: {s}:{d} in {s}", .{ src.file, src.line, src.fn_name });
+    return error.NativeRedoLogCorrupt;
 }
 
 fn expectRedoDocument(file: *NativeFile, key: []const u8, expected: ?[]const u8) !void {

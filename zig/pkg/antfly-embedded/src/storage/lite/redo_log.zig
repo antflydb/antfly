@@ -644,6 +644,33 @@ pub fn replayBounded(
     on_record: ?Callback,
     ctx: ?*anyopaque,
 ) anyerror!ReplayOutcome {
+    const outcome = try replayBoundedUnlogged(allocator, file, io, base_offset, capacity, start_after_sequence, max_sequence, unlogged_through, on_record, ctx);
+    if (outcome.stop_reason == .corrupt_record) {
+        std.log.warn("redo replay stopped corrupt: base={d} at={d} last={?d} after={?d} unlogged={?d} rule={s}", .{ base_offset, outcome.valid_bytes, outcome.last_sequence, start_after_sequence, unlogged_through, last_corrupt_rule });
+    }
+    return outcome;
+}
+
+/// Which rule last stopped a replay as corrupt (diagnostics only).
+threadlocal var last_corrupt_rule: []const u8 = "";
+
+fn corruptRule(rule: []const u8) StopReason {
+    last_corrupt_rule = rule;
+    return .corrupt_record;
+}
+
+fn replayBoundedUnlogged(
+    allocator: Allocator,
+    file: File,
+    io: Io,
+    base_offset: u64,
+    capacity: u64,
+    start_after_sequence: ?u64,
+    max_sequence: ?u64,
+    unlogged_through: ?u64,
+    on_record: ?Callback,
+    ctx: ?*anyopaque,
+) anyerror!ReplayOutcome {
     var pos: u64 = 0;
     var count: u64 = 0;
     var last_sequence = start_after_sequence;
@@ -680,7 +707,7 @@ pub fn replayBounded(
             .trailer => |trailer| return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = stop: {
                 const salt = run_salt orelse break :stop .end_of_region;
                 if (trailer.salt == salt) break :stop if (trailer.sequence == (last_sequence orelse 0)) .end_of_region else try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence);
-                break :stop if (restartable) .end_of_region else .corrupt_record;
+                break :stop if (restartable) .end_of_region else corruptRule("foreign trailer in an unrestarted log");
             } },
             // A log restart zeroes only the first header, so a restarted
             // log keeps the retired log's bytes past its live tail; a crash
@@ -736,7 +763,7 @@ pub fn replayBounded(
         }
 
         if (header.checksum(payload_buf.items) != header.crc32) {
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = corruptRule("checksum") };
         }
 
         // Superseded, not corrupt: a structurally valid, correctly
@@ -788,13 +815,13 @@ pub fn replayBounded(
             const baseline = start_after_sequence.?;
             const covered_jump = header.commit_sequence > baseline + 1 and unlogged_through != null and header.commit_sequence - 1 <= unlogged_through.?;
             if (header.commit_sequence != baseline + 1 and !covered_jump) {
-                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = corruptRule("gap after superseded run") };
             }
             in_superseded_run = false;
         } else if (last_sequence) |last| {
             const covered_jump = header.commit_sequence > last + 1 and unlogged_through != null and header.commit_sequence - 1 <= unlogged_through.?;
             if (header.commit_sequence != last + 1 and !covered_jump) {
-                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = corruptRule("sequence gap") };
             }
         }
 
@@ -849,10 +876,10 @@ fn recordIntact(allocator: Allocator, file: File, io: Io, offset: u64, available
 /// damage, corrupt. With none, `pos` is the run's end. A log that was never
 /// restarted (or a version 1 run, salt 0) holds no retired bytes: corrupt.
 fn unclearStop(file: File, io: Io, base_offset: u64, capacity: u64, pos: u64, restartable: bool, run_salt: ?u64, last_sequence: ?u64) !StopReason {
-    const salt = run_salt orelse return .corrupt_record;
-    if (!restartable or salt == 0 or pos == 0) return .corrupt_record;
-    if (try damagedRecordAt(file, io, base_offset, capacity, pos, salt, last_sequence orelse 0)) return .corrupt_record;
-    return if (try laterRunHeader(file, io, base_offset, capacity, pos + 1, salt, last_sequence orelse 0)) .corrupt_record else .end_of_region;
+    const salt = run_salt orelse return corruptRule("unclear stop before any record");
+    if (!restartable or salt == 0 or pos == 0) return corruptRule("unclear stop in an unrestarted log");
+    if (try damagedRecordAt(file, io, base_offset, capacity, pos, salt, last_sequence orelse 0)) return corruptRule("damaged record leads to its trailer");
+    return if (try laterRunHeader(file, io, base_offset, capacity, pos + 1, salt, last_sequence orelse 0)) corruptRule("later header of this run") else .end_of_region;
 }
 
 /// Whether the bytes at `pos`, read as a header whatever its damage, lead

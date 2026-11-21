@@ -1040,6 +1040,13 @@ pub const DocStore = struct {
             return error.ReadOnly;
         }
 
+        /// One index-catalog record at this write's tip
+        /// (`backend_erased.WriteTxn.getIndexCatalogAlloc`).
+        pub fn getIndexCatalogAlloc(self: *Txn, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+            if (self.write) |*write| return write.getIndexCatalogAlloc(allocator, scope, namespace, key);
+            return error.ReadOnly;
+        }
+
         pub fn delete(self: *Txn, key: []const u8) anyerror!void {
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, null);
             try removeGraphRetirementReference(self, self.alloc, key, &self.graph_retirements_maybe);
@@ -1368,6 +1375,11 @@ pub const DocStore = struct {
             /// transaction as this batch's own primary-keyspace writes.
             pub fn putIndexCatalogBatch(self: @This(), scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
                 try self.runtime.?.putIndexCatalogBatch(scope, mutations);
+            }
+
+            /// One index-catalog record at this batch's tip.
+            pub fn getIndexCatalogAlloc(self: @This(), allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+                return try self.runtime.?.getIndexCatalogAlloc(allocator, scope, namespace, key);
             }
         };
 

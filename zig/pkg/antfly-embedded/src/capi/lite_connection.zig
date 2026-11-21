@@ -8446,6 +8446,108 @@ test "capi native two genuinely separate writer processes do not lose each other
     children_reaped = true;
 }
 
+// The SQLite comparison benchmark's indexed multi-process case: writer
+// processes overwrite their own keys at `full_index`. Every acknowledged
+// overwrite must have removed its old token, and every live token must be
+// found, from a fresh handle, before anything drains.
+test "capi native separate writer processes keep full-text deletes at full_index" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("xproc-fts-overwrites");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(h.handleLockIo(), tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    {
+        const wrapper = try open(path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, true);
+        const id = try api.publishHandle(wrapper);
+        defer api.antfly_db_close(id);
+        var deleted = false;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(id, .fromSlice("full_text_index_v0"), &deleted));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(
+            "{\"name\":\"matched_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+        )));
+    }
+
+    const workers = 8;
+    const slots = 16;
+    const writes_per_worker = 10 * slots;
+    const Child = struct {
+        fn run(child_path: []const u8, worker: usize, result_fd: std.c.fd_t) noreturn {
+            const wrapper = open(child_path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, false) catch xprocParkForever();
+            const id = api.publishHandle(wrapper) catch xprocParkForever();
+            var request_buffer: [256]u8 = undefined;
+            for (0..writes_per_worker) |sequence| {
+                const request = std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"worker-{d}-{d}\":{{\"text\":\"matchedworker{d}sequence{d}\"}}}},\"sync_level\":\"full_index\"}}", .{ worker, sequence % slots, worker, sequence }) catch xprocParkForever();
+                var out: h.capi.Buffer = .{};
+                const code = api.antfly_db_batch_json(id, .fromSlice(request), &out);
+                api.antfly_buffer_free_zero(&out);
+                if (code != .ok) {
+                    const report: [1]u8 = .{@intCast(@min(@as(c_int, @backingInt(code)) + 1, 255))};
+                    _ = std.c.write(result_fd, &report, report.len);
+                    xprocParkForever();
+                }
+            }
+            api.antfly_db_close(id);
+            const report: [1]u8 = .{0};
+            _ = std.c.write(result_fd, &report, report.len);
+            xprocParkForever();
+        }
+    };
+
+    var result_fds: [workers][2]std.c.fd_t = undefined;
+    for (&result_fds) |*fds| try std.testing.expectEqual(0, std.c.pipe(fds));
+    var child_pids: [workers]std.c.pid_t = undefined;
+    for (0..workers) |worker| {
+        const pid = std.c.fork();
+        if (pid == 0) {
+            for (0..workers) |other| {
+                if (other != worker) _ = std.posix.system.close(result_fds[other][1]);
+            }
+            _ = std.posix.system.close(result_fds[worker][0]);
+            Child.run(path, worker, result_fds[worker][1]);
+        }
+        try std.testing.expect(pid > 0);
+        child_pids[worker] = pid;
+    }
+    for (&result_fds) |*fds| _ = std.posix.system.close(fds[1]);
+    defer for (child_pids) |pid| {
+        _ = std.c.kill(pid, std.c.SIG.KILL);
+        _ = std.c.waitpid(pid, null, 0);
+    };
+    defer for (&result_fds) |*fds| {
+        _ = std.posix.system.close(fds[0]);
+    };
+    for (&result_fds) |*fds| {
+        var report: [1]u8 = undefined;
+        try xprocReadBounded(fds[0], &report, 120_000);
+        try std.testing.expectEqual(@as(u8, 0), report[0]);
+    }
+
+    const wrapper = try open(path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, false);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    var query_buffer: [256]u8 = undefined;
+    var expected_buffer: [64]u8 = undefined;
+    for (0..workers) |worker| {
+        for (writes_per_worker - slots..writes_per_worker) |sequence| {
+            for ([_]struct { u64, bool }{ .{ sequence, true }, .{ sequence - slots, false } }) |case| {
+                const query = try std.fmt.bufPrint(&query_buffer, "{{\"full_text_search\":{{\"match\":{{\"field\":\"text\",\"text\":\"matchedworker{d}sequence{d}\"}}}},\"limit\":16}}", .{ worker, case[0] });
+                var response: h.capi.Buffer = .{};
+                defer api.antfly_buffer_free_zero(&response);
+                try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_search_json(id, .fromSlice(query), &response));
+                const body = response.ptr.?[0..response.len];
+                const expected = try std.fmt.bufPrint(&expected_buffer, "\"worker-{d}-{d}\"", .{ worker, sequence % slots });
+                const found = std.mem.indexOf(u8, body, expected) != null;
+                if (found != case[1]) {
+                    std.debug.print("token matchedworker{d}sequence{d}: expected visible={}, response {s}\n", .{ worker, case[0], case[1], body });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+}
+
 // perf/lwa-xproc-writers item 4: a cold-opened writer whose opportunistic
 // lock attempt in `open()`'s `!create` path loses its race leaves
 // `self.current` null when `Owner.maintenanceLoop` spawns. Before this fix,

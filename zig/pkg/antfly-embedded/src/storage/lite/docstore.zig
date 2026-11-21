@@ -8543,6 +8543,26 @@ pub const Txn = struct {
         }
     }
 
+    /// One index-catalog record as this transaction sees it: what it staged
+    /// with `putIndexCatalogBatch` (the latest staging wins; a staged delete
+    /// hides the committed record), over the committed index-catalog root at
+    /// the transaction's checkpoint. Writer authority makes that checkpoint
+    /// the file's tip, so a write's read-modify-write of index state never
+    /// depends on any process's in-memory copy.
+    pub fn getIndexCatalogAlloc(self: *Txn, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+        const durable_key = try @import("native_catalog_sink.zig").durableKeyAlloc(self.allocator, scope, namespace, key);
+        defer self.allocator.free(durable_key);
+        var i = self.index_catalog_pending.items.len;
+        while (i > 0) {
+            i -= 1;
+            const staged = self.index_catalog_pending.items[i];
+            if (!std.mem.eql(u8, staged.key, durable_key)) continue;
+            return if (staged.is_delete) null else try allocator.dupe(u8, staged.value);
+        }
+        const file = try self.readFile();
+        return try file.getIndexCatalogRecordAtCheckpointAlloc(allocator, durable_key, self.checkpoint);
+    }
+
     fn freeIndexCatalogPending(self: *Txn) void {
         if (self.index_catalog_arena) |*arena| arena.deinit();
         self.index_catalog_arena = null;
@@ -10406,6 +10426,45 @@ test "lite native docstore putIndexCatalogBatch publishes primary and index-cata
     const active_value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_active_key)).?;
     defer allocator.free(active_value);
     try std.testing.expectEqualStrings("1", active_value);
+}
+
+// A write reads index state at its own tip: committed records, then what
+// it staged itself, latest staging first and deletes hiding records.
+test "lite native docstore reads index-catalog records at the transaction tip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-index-catalog-tip.aflite");
+    defer allocator.free(path);
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+
+    {
+        var txn = try store.beginWrite();
+        try txn.putIndexCatalogBatch("idx1", &.{
+            .{ .namespace = "meta", .key = "next_seg_id", .value = "7" },
+            .{ .namespace = "docmap", .key = "doc:a", .value = "seg1" },
+        });
+        try txn.commit();
+    }
+
+    var txn = try store.beginWrite();
+    defer txn.abort();
+    const committed = (try txn.getIndexCatalogAlloc(allocator, "idx1", "meta", "next_seg_id")).?;
+    defer allocator.free(committed);
+    try std.testing.expectEqualStrings("7", committed);
+    // Scope and namespace are part of the key.
+    try std.testing.expect((try txn.getIndexCatalogAlloc(allocator, "idx2", "meta", "next_seg_id")) == null);
+    try std.testing.expect((try txn.getIndexCatalogAlloc(allocator, "idx1", "docmap", "next_seg_id")) == null);
+
+    try txn.putIndexCatalogBatch("idx1", &.{.{ .namespace = "meta", .key = "next_seg_id", .value = "8" }});
+    try txn.putIndexCatalogBatch("idx1", &.{.{ .namespace = "meta", .key = "next_seg_id", .value = "9" }});
+    const staged = (try txn.getIndexCatalogAlloc(allocator, "idx1", "meta", "next_seg_id")).?;
+    defer allocator.free(staged);
+    try std.testing.expectEqualStrings("9", staged);
+
+    try txn.putIndexCatalogBatch("idx1", &.{.{ .namespace = "docmap", .key = "doc:a", .is_delete = true }});
+    try std.testing.expect((try txn.getIndexCatalogAlloc(allocator, "idx1", "docmap", "doc:a")) == null);
 }
 
 test "lite native docstore putIndexCatalogBatch alone (no primary writes) still commits once" {

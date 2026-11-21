@@ -815,6 +815,7 @@ pub const WriteTxn = struct {
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
         contains: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         put_index_catalog: ?*const fn (*anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void = null,
+        get_index_catalog: ?*const fn (*anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -824,6 +825,14 @@ pub const WriteTxn = struct {
     pub fn putIndexCatalogBatch(self: *WriteTxn, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
         const put_index_catalog = self.vtable.put_index_catalog orelse return error.Unsupported;
         try BoundaryAbi.call("put_index_catalog", self.boundary_dispatch, put_index_catalog, .{ self.ptr, scope, mutations });
+    }
+
+    /// One index-catalog record at this transaction's tip (its own staged
+    /// `putIndexCatalogBatch` mutations over the committed root), owned by
+    /// `allocator`. `error.Unsupported` on every backend but Lite.
+    pub fn getIndexCatalogAlloc(self: *@This(), allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+        const get_index_catalog = self.vtable.get_index_catalog orelse return error.Unsupported;
+        return try BoundaryAbi.call("get_index_catalog", self.boundary_dispatch, get_index_catalog, .{ self.ptr, allocator, scope, namespace, key });
     }
 
     pub fn abort(self: *WriteTxn) void {
@@ -1072,6 +1081,7 @@ pub const Batch = struct {
         /// `null` (no `.native_catalog`-backed `PersistentIndex` exists on
         /// those backends, so this is never called there).
         put_index_catalog: ?*const fn (*anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void = null,
+        get_index_catalog: ?*const fn (*anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -1225,6 +1235,14 @@ pub const Batch = struct {
     pub fn putIndexCatalogBatch(self: *Batch, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
         const put_index_catalog = self.vtable.put_index_catalog orelse return error.Unsupported;
         try BoundaryAbi.call("put_index_catalog", self.boundary_dispatch, put_index_catalog, .{ self.ptr, scope, mutations });
+    }
+
+    /// One index-catalog record at this transaction's tip (its own staged
+    /// `putIndexCatalogBatch` mutations over the committed root), owned by
+    /// `allocator`. `error.Unsupported` on every backend but Lite.
+    pub fn getIndexCatalogAlloc(self: *@This(), allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+        const get_index_catalog = self.vtable.get_index_catalog orelse return error.Unsupported;
+        return try BoundaryAbi.call("get_index_catalog", self.boundary_dispatch, get_index_catalog, .{ self.ptr, allocator, scope, namespace, key });
     }
 };
 
@@ -2145,6 +2163,10 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
         pub fn putIndexCatalogBatch(ptr: *anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void {
             return unbox(ptr).handle.putIndexCatalogBatch(scope, mutations);
         }
+
+        pub fn getIndexCatalogAlloc(ptr: *anyopaque, value_allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+            return unbox(ptr).handle.getIndexCatalogAlloc(value_allocator, scope, namespace, key);
+        }
     };
 
     return .{
@@ -2162,6 +2184,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             .open_cursor = vt.openCursor,
             .open_read_scope = if (@hasDecl(Handle, "openReadScope")) vt.openReadScope else null,
             .put_index_catalog = if (@hasDecl(Handle, "putIndexCatalogBatch")) vt.putIndexCatalogBatch else null,
+            .get_index_catalog = if (@hasDecl(Handle, "getIndexCatalogAlloc")) vt.getIndexCatalogAlloc else null,
         },
     };
 }
@@ -2410,6 +2433,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
         pub fn putIndexCatalogBatch(ptr: *anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void {
             return unbox(ptr).handle.putIndexCatalogBatch(scope, mutations);
         }
+
+        pub fn getIndexCatalogAlloc(ptr: *anyopaque, value_allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+            return unbox(ptr).handle.getIndexCatalogAlloc(value_allocator, scope, namespace, key);
+        }
     };
 
     return .{
@@ -2430,6 +2457,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .set_commit_participant = if (@hasDecl(Handle, "setCommitParticipant")) vt.setCommitParticipant else null,
             .contains_many_sorted = if (@hasDecl(Handle, "containsManySorted")) vt.containsManySorted else null,
             .put_index_catalog = if (@hasDecl(Handle, "putIndexCatalogBatch")) vt.putIndexCatalogBatch else null,
+            .get_index_catalog = if (@hasDecl(Handle, "getIndexCatalogAlloc")) vt.getIndexCatalogAlloc else null,
         },
     };
 }
