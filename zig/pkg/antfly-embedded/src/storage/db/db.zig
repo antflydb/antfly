@@ -27384,7 +27384,17 @@ pub const DB = struct {
         defer txn.abort();
         _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
         const applied = try orderedHistoryReadCut(&txn, minimum_applied_index);
-        const cut = (try MergeHistoryCut.load(&txn, request.transition)) orelse return null;
+        var cut = (try MergeHistoryCut.load(&txn, request.transition)) orelse return null;
+        const state = (try @import("../committed_history.zig").load(&txn)) orelse return error.HistoryCorrupt;
+        if (!std.mem.eql(u8, &state.namespace, &namespace) or state.latest != cut.latest)
+            return error.HistoryCorrupt;
+        var active: u8 = 0;
+        for (state.consumers) |consumer| {
+            if (consumer.epoch != 0) active += 1;
+        }
+        cut.floor = state.floor();
+        cut.active_consumers = active;
+        cut.outstanding_reservations = state.reserved_bytes;
         if (!request.matches(cut)) return error.HistoryResynchronizationRequired;
         if (cut.index > applied.index or cut.term > applied.term) return error.HistoryCorrupt;
         return cut;
@@ -162451,17 +162461,36 @@ test "db split finalization records the predecessor committed history frontier t
     }
     const merge: types.MergeSourceTransitionMutation = .{ .kind = .finalize, .transition_id = 20, .receiver_group_id = 10 };
     try db.applyOrderedCommittedMutation(.{ .merge_source_transition = merge }, .{ .term = 2, .index = 12 }, false);
-    var read = try db.core.store.beginReadTxn();
-    defer read.abort();
-    const donor = (try history.MergeCut.load(&read, merge.transition_id)).?;
+    const donor = cut: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        break :cut (try history.MergeCut.load(&read, merge.transition_id)).?;
+    };
     try std.testing.expectEqual(merge.receiver_group_id, donor.receiver_group);
     try std.testing.expectEqual(@as(u64, 12), donor.index);
     try std.testing.expectEqual(@as(u64, 2), donor.latest);
     var donor_request: history.MergeCut.Request = .{ .namespace = namespace, .transition = merge.transition_id, .receiver_group = merge.receiver_group_id, .root_generation = donor.root_generation };
-    try std.testing.expectEqualDeep(donor, (try db.orderedMergeHistoryCut(donor_request, donor.index)).?);
+    const observed_donor = (try db.orderedMergeHistoryCut(donor_request, donor.index)).?;
+    try std.testing.expectEqual(donor.encode(), observed_donor.encode());
+    try std.testing.expectEqual(@as(?u64, 0), observed_donor.floor);
+    try std.testing.expectEqual(@as(?u8, 1), observed_donor.active_consumers);
+    try std.testing.expect(!observed_donor.retirementReady());
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedMergeHistoryCut(donor_request, donor.index + 1));
     donor_request.receiver_group += 1;
     try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedMergeHistoryCut(donor_request, donor.index));
+
+    var retire = try db.core.store.beginWriteTxn();
+    errdefer retire.abort();
+    const native = (try history.load(&retire)).?;
+    const epoch = native.consumers[0].epoch;
+    try history.acknowledge(&retire, namespace, @splat(2), epoch, 0, 2);
+    try history.release(&retire, namespace, @splat(2), epoch);
+    try retire.commit();
+    donor_request.receiver_group = merge.receiver_group_id;
+    const drained = (try db.orderedMergeHistoryCut(donor_request, donor.index)).?;
+    try std.testing.expectEqual(@as(?u64, 2), drained.floor);
+    try std.testing.expectEqual(@as(?u8, 0), drained.active_consumers);
+    try std.testing.expect(drained.retirementReady());
 }
 
 test "db ordered empty split destination seeds history before its first write" {

@@ -135,7 +135,9 @@ pub const MergeCut = struct {
         pub fn matches(self: Request, cut: MergeCut) bool {
             return cut.term != 0 and cut.index != 0 and cut.reclaimed <= cut.latest and
                 std.mem.eql(u8, &self.namespace, &cut.namespace) and self.transition == cut.transition and
-                self.receiver_group == cut.receiver_group and self.root_generation == cut.root_generation;
+                self.receiver_group == cut.receiver_group and self.root_generation == cut.root_generation and
+                cut.floor != null and cut.floor.? <= cut.latest and cut.active_consumers != null and
+                cut.active_consumers.? <= max_consumers and cut.outstanding_reservations != null;
         }
     };
     pub const OrderedRead = struct { request: Request, minimum_applied_index: u64 };
@@ -150,6 +152,17 @@ pub const MergeCut = struct {
     reclaimed: u64,
     root_generation: u64,
     reserved_bytes: u64,
+
+    /// Qualified against the same Raft snapshot as the cut. These values are
+    /// observations of live retention and are never included in the cut digest.
+    floor: ?u64 = null,
+    active_consumers: ?u8 = null,
+    outstanding_reservations: ?u64 = null,
+
+    pub fn retirementReady(self: MergeCut) bool {
+        return self.active_consumers == 0 and self.outstanding_reservations == 0 and
+            self.floor != null and self.floor.? >= self.latest;
+    }
 
     pub fn key(transition: u64) Key {
         var bytes: Key = undefined;
