@@ -119,7 +119,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
     if (groups.len == 0 or !options.prepare_ahead or (session.backend() != .native and session.backend() != .metal and session.backend() != .cuda)) return null;
     // Per-request hooks, borrowed state and result storage cannot be forwarded
     // as shared options to an execution spanning multiple callers.
-    if (options.timings != null or options.video_decoder.telemetry != null or
+    if (options.execution_lane != null or options.timings != null or options.video_decoder.telemetry != null or
         options.video_ahead != null or options.video_prepared != null or options.video_prepared_frames != null or
         options.video_observer != null or options.video_coefficients != null or options.video_inspection_scope != null or
         options.video_cache_pins != null or options.video_encoded != null or options.video_composition != null) return null;
@@ -256,6 +256,14 @@ fn execute(_: *anyopaque, items: []const micro.ExecuteItem) void {
     };
 }
 
+fn embedSingleton(a: std.mem.Allocator, items: *const [1]micro.ExecuteItem, group: grouped.Group) !grouped.Result {
+    var execution = micro.ExecutionControl{ .items = items };
+    const ticket = items[0].payloadAs(Ticket);
+    const control = ticket.control.withCheckpoint(&execution, micro.ExecutionControl.check);
+    try control.check();
+    return grouped.embed(a, ticket.session, ticket.tokenizer, group, ticket.options, ticket.gate, control);
+}
+
 fn executeChecked(items: []const micro.ExecuteItem) !void {
     if (items.len == 0 or items.len > 4) return error.InvalidImageBatch;
     const first = items[0].payloadAs(Ticket);
@@ -289,12 +297,8 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
                 shared.free(vectors);
             }
             @memset(errors[0..items.len], null);
-            for (items, groups[0..items.len], 0..) |item, group, index| {
-                item.control.check() catch |failure| {
-                    errors[index] = failure;
-                    continue;
-                };
-                const singleton = grouped.embed(shared, first.session, first.tokenizer, group, first.options, first.gate, control) catch |failure| {
+            for (groups[0..items.len], 0..) |group, index| {
+                const singleton = embedSingleton(shared, items[index..][0..1], group) catch |failure| {
                     errors[index] = failure;
                     continue;
                 };
@@ -308,14 +312,10 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
         // The scheduler preserves finished peers and shrinks prepared encoder
         // cohorts before returning pressure errors. Once its prepared owners
         // drain, retry only the failed items; completed towers never replay.
-        for (items, groups[0..items.len], 0..) |item, group, index| {
+        for (groups[0..items.len], 0..) |group, index| {
             const failure = errors[index] orelse continue;
             if (failure != error.MemoryBudgetExceeded and failure != error.ResourceLimitExceeded and failure != error.ResourceTemporarilyUnavailable) continue;
-            item.control.check() catch |err| {
-                errors[index] = err;
-                continue;
-            };
-            const singleton = grouped.embed(shared, first.session, first.tokenizer, group, first.options, first.gate, control) catch |err| {
+            const singleton = embedSingleton(shared, items[index..][0..1], group) catch |err| {
                 errors[index] = err;
                 continue;
             };
@@ -365,6 +365,17 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
             .fallback => .fallback,
         });
     }
+}
+
+test "embeddinggemma2 image broker stops singleton fallback with a live peer" {
+    var ticket: Ticket = undefined;
+    ticket.control = .{};
+    var stopped = std.atomic.Value(bool).init(true);
+    var items: [2]micro.ExecuteItem = @splat(.{ .allocator = std.testing.allocator, .identity = .{}, .payload = &ticket, .slot = undefined });
+    items[0].control.cancel_requested = &stopped;
+    var cohort = micro.ExecutionControl{ .items = &items };
+    try micro.ExecutionControl.check(&cohort);
+    try std.testing.expectError(error.Canceled, embedSingleton(std.testing.allocator, items[0..1], .{ .content = &.{} }));
 }
 
 test "gemma4 image broker rejects mixed prompts and distinguishes rotated grids" {

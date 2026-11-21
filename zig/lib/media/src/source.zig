@@ -63,6 +63,29 @@ pub const Range = struct {
 };
 pub const Storage = union(enum) { borrowed: []const u8, range: Range };
 
+const Gate = struct {
+    state: std.atomic.Value(u32) = .init(0),
+    fn lock(self: *Gate, control: ?Control) !void {
+        if (self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        // A canceled waiter can consume the unlock wake before it acquires
+        // the gate. Pass that wake to another parked allocator or provider.
+        errdefer std.Io.futexWake(io, u32, &self.state.raw, 1);
+        while (true) {
+            if (control) |c| try c.check();
+            if (self.state.swap(2, .acquire) == 0) return;
+            if (control != null) {
+                try std.Io.futexWaitTimeout(io, u32, &self.state.raw, 2, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } });
+            } else std.Io.futexWaitUncancelable(io, u32, &self.state.raw, 2);
+        }
+    }
+
+    fn unlock(self: *Gate) void {
+        if (self.state.swap(0, .release) == 2)
+            std.Io.futexWake(std.Io.Threaded.global_single_threaded.io(), u32, &self.state.raw, 1);
+    }
+};
+
 /// A source is caller-owned and stays in place while leases or views exist.
 /// Give each worker a view to keep per-consumer I/O statistics.
 /// Provider context and borrowed bytes must outlive this source and its leases.
@@ -79,7 +102,8 @@ pub const Source = struct {
     reads: usize = 0,
 
     pending_bytes: u64 = 0,
-    provider_busy: std.atomic.Value(u32) = .init(0),
+    provider_gate: Gate = .{},
+    allocator_gate: Gate = .{},
     physical: ?*Source = null,
     mutex: std.Io.Mutex = .init,
 
@@ -143,8 +167,8 @@ pub const Source = struct {
         errdefer reservation.deinit();
         const range = self.storage.range;
         if (range.borrow_at) |borrow| {
-            if (serial) try owner.lockProvider(control);
-            defer if (serial) owner.unlockProvider();
+            if (serial) try owner.provider_gate.lock(control);
+            defer if (serial) owner.provider_gate.unlock();
             const result = borrow(range.context, offset, size, control) catch |err| {
                 first_call_used = true;
                 return err;
@@ -163,8 +187,8 @@ pub const Source = struct {
             break :retry try RangeAllocator.readBuffer(a, size, control);
         };
         errdefer a.free(owned);
-        if (serial) try owner.lockProvider(control);
-        defer if (serial) owner.unlockProvider();
+        if (serial) try owner.provider_gate.lock(control);
+        defer if (serial) owner.provider_gate.unlock();
         while (done < size) {
             try control.check();
             if (first_call_used) try self.chargeCall(owner);
@@ -177,23 +201,6 @@ pub const Source = struct {
         try control.check();
         return .{ .bytes = owned, .source = self, .owned = owned, .reservation = reservation };
     }
-    fn lockProvider(self: *Source, control: ?Control) !void {
-        if (self.provider_busy.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
-        const io = std.Io.Threaded.global_single_threaded.io();
-        while (true) {
-            if (control) |c| try c.check();
-            if (self.provider_busy.swap(2, .acquire) == 0) return;
-            if (control != null) {
-                try std.Io.futexWaitTimeout(io, u32, &self.provider_busy.raw, 2, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } });
-            } else std.Io.futexWaitUncancelable(io, u32, &self.provider_busy.raw, 2);
-        }
-    }
-
-    fn unlockProvider(self: *Source) void {
-        if (self.provider_busy.swap(0, .release) == 2)
-            std.Io.futexWake(std.Io.Threaded.global_single_threaded.io(), u32, &self.provider_busy.raw, 1);
-    }
-
     /// Range adapters may share the backing allocator with the original callbacks.
     /// Coordinate their buffers, scratch and lease releases with the physical source.
     /// Borrowed storage promises immutable bytes but makes no allocator guarantee.
@@ -213,33 +220,33 @@ pub const Source = struct {
             if (a.vtable != &vtable) return a.alloc(u8, size);
             const src: *Source = @ptrCast(@alignCast(a.ptr));
             const gate = src.physical orelse src;
-            try gate.lockProvider(control);
-            defer gate.unlockProvider();
+            try gate.allocator_gate.lock(control);
+            defer gate.allocator_gate.unlock();
             return src.allocator.alloc(u8, size);
         }
         fn lock(raw: *anyopaque) *Source {
             const src: *Source = @ptrCast(@alignCast(raw));
-            (src.physical orelse src).lockProvider(null) catch unreachable;
+            (src.physical orelse src).allocator_gate.lock(null) catch unreachable;
             return src;
         }
         fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
             const src = lock(raw);
-            defer (src.physical orelse src).unlockProvider();
+            defer (src.physical orelse src).allocator_gate.unlock();
             return src.allocator.rawAlloc(len, alignment, ra);
         }
         fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
             const src = lock(raw);
-            defer (src.physical orelse src).unlockProvider();
+            defer (src.physical orelse src).allocator_gate.unlock();
             return src.allocator.rawResize(bytes, alignment, len, ra);
         }
         fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
             const src = lock(raw);
-            defer (src.physical orelse src).unlockProvider();
+            defer (src.physical orelse src).allocator_gate.unlock();
             return src.allocator.rawRemap(bytes, alignment, len, ra);
         }
         fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
             const src = lock(raw);
-            defer (src.physical orelse src).unlockProvider();
+            defer (src.physical orelse src).allocator_gate.unlock();
             src.allocator.rawFree(bytes, alignment, ra);
         }
     };
@@ -586,11 +593,35 @@ test "waiting for a serialized range honors cancellation without charging a call
     for ([_]bool{ false, true }) |concurrent| {
         provider.checks = 0;
         source.storage.range.concurrent = concurrent;
-        source.provider_busy.store(1, .release);
+        source.allocator_gate.state.store(1, .release);
         var worker = source.view(arena.allocator(), null, .{ .context = &provider, .check_fn = Provider.check });
         try std.testing.expectError(error.Cancelled, worker.read(0, 1));
         try std.testing.expectEqual(@as(usize, 0), source.reads);
         try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
-        source.unlockProvider();
+        source.allocator_gate.unlock();
     }
+}
+
+test "serial range callbacks can allocate and release scratch through the source" {
+    const Provider = struct {
+        source: *Source,
+        fn borrow(raw: *anyopaque, _: u64, _: usize, _: Control) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const a = self.source.rangeAllocator();
+            const scratch = try a.alloc(u8, 8);
+            a.free(scratch);
+            return null;
+        }
+        fn read(raw: *anyopaque, _: u64, out: []u8, control: Control) !usize {
+            _ = try borrow(raw, 0, out.len, control);
+            @memset(out, 42);
+            return out.len;
+        }
+    };
+    var source: Source = undefined;
+    var provider = Provider{ .source = &source };
+    source = .{ .allocator = std.testing.allocator, .identity = "serial-scratch", .storage = .{ .range = .{ .length = 1, .context = &provider, .borrow_at = Provider.borrow, .read_at = Provider.read } } };
+    var lease = try source.read(0, 1);
+    defer lease.deinit();
+    try std.testing.expectEqual(@as(u8, 42), lease.bytes[0]);
 }

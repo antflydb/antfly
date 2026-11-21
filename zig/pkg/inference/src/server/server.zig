@@ -40453,7 +40453,17 @@ const GroupMediaInspections = struct {
             return .{ .address = @intFromPtr(bytes.ptr), .len = bytes.len, .sampling = sampling };
         }
     };
+    const ClipKey = struct {
+        address: usize,
+        len: usize,
+        gemma4_transport: bool,
+
+        fn init(bytes: []const u8, sampling: Sampling) ClipKey {
+            return .{ .address = @intFromPtr(bytes.ptr), .len = bytes.len, .gemma4_transport = sampling == .gemma4 and @import("antfly_media").transport_stream.isTransportStream(bytes) };
+        }
+    };
     const SharedVideo = struct {
+        clip_owner: ?*SharedVideo = null,
         references: usize = 1,
         inspection: Inspection = .{},
     };
@@ -40470,6 +40480,7 @@ const GroupMediaInspections = struct {
         }
     };
     owned: std.ArrayList(*Owned) = .empty,
+    clips: std.AutoHashMapUnmanaged(ClipKey, *SharedVideo) = .empty,
     videos: std.AutoHashMapUnmanaged(VideoKey, *SharedVideo) = .empty,
     // This request owner stays in place from the first prepare through deinit.
     // All unique clips draw from a single host admission reservation.
@@ -40496,7 +40507,15 @@ const GroupMediaInspections = struct {
         shared.* = .{};
         errdefer shared.inspection.deinit();
         shared.inspection.memory.backing = backing;
-        _ = shared.inspection.inspect(bytes, control, sampling) catch |err| return memory.admission_error orelse err;
+        const clip_key = ClipKey.init(bytes, sampling);
+        const owner = self.clips.get(clip_key);
+        _ = shared.inspection.inspectClip(bytes, control, sampling, if (owner) |root| root.inspection.portable else null) catch |err| return memory.admission_error orelse err;
+        if (shared.inspection.portable != null) {
+            if (owner) |root| {
+                root.references += 1;
+                shared.clip_owner = root;
+            } else try self.clips.putNoClobber(a, clip_key, shared);
+        }
         slot.value_ptr.* = shared;
         return &shared.inspection;
     }
@@ -40507,8 +40526,14 @@ const GroupMediaInspections = struct {
         if (shared.references != 0) return;
         const removed = self.videos.remove(VideoKey.init(item.bytes, item.sampling));
         std.debug.assert(removed);
+        const owner = shared.clip_owner;
+        if (owner == null and item.portable != null) {
+            const removed_clip = self.clips.remove(ClipKey.init(item.bytes, item.sampling));
+            std.debug.assert(removed_clip);
+        }
         shared.inspection.deinit();
         self.memory.?.allocator().destroy(shared);
+        if (owner) |root| self.releaseVideo(&root.inspection);
     }
 
     fn prepare(self: *GroupMediaInspections, node: *Node, a: std.mem.Allocator, group: *grouped.Group, control: InferenceExecutionControl) !void {
@@ -40555,6 +40580,8 @@ const GroupMediaInspections = struct {
         self.owned.deinit(a);
         std.debug.assert(self.videos.count() == 0);
         self.videos.deinit(a);
+        std.debug.assert(self.clips.count() == 0);
+        self.clips.deinit(a);
         if (self.memory) |*memory| memory.deinit();
     }
 };
@@ -52456,7 +52483,7 @@ test "embeddinggemma2 grouped video inspection admits actual parser storage and 
     var resampled = grouped.Group{ .content = &.{.{ .sampled_video = .{ .bytes = parts[1].video, .sampling = .{ .timestamps = .{} } } }} };
     try inspections.prepare(&node, a, &resampled, .{});
     try std.testing.expect(first.media.?.videos.items[0] != resampled.media.?.videos.items[0]);
-    inspections.discard(a, resampled.media);
+    try std.testing.expectEqual(first.media.?.videos.items[0].portable.?.clip(), resampled.media.?.videos.items[0].portable.?.clip());
     const entry = first.media.?.videos.items[0].portable.?;
     entry.source.limits.max_reads = entry.source.reads;
     try measured.validate(contract, 2);
@@ -52465,6 +52492,8 @@ test "embeddinggemma2 grouped video inspection admits actual parser storage and 
     inspections.discard(a, first.media);
     try std.testing.expect(second.media.?.videos.items[0].pixels != 0);
     inspections.discard(a, second.media);
+    try std.testing.expect(resampled.media.?.videos.items[0].portable.?.clip().webm_index.?.pictures.len != 0);
+    inspections.discard(a, resampled.media);
     try std.testing.expectEqual(@as(usize, 0), domain.admission.snapshot().hostTotalBytes());
 }
 

@@ -846,7 +846,7 @@ test "seekable transport builds within one physical scan under the cache-free pe
     }
 }
 
-test "seekable transport allocations and lease releases share the serial wire provider gate" {
+test "seekable transport allocations and lease releases share the wire allocator gate" {
     const Provider = struct {
         source: *media.source.Source,
         allocations: usize = 0,
@@ -854,7 +854,7 @@ test "seekable transport allocations and lease releases share the serial wire pr
 
         fn guarded(raw: *anyopaque) *@This() {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            std.debug.assert(self.source.provider_busy.load(.acquire) != 0);
+            std.debug.assert(self.source.allocator_gate.state.load(.acquire) != 0);
             return self;
         }
         fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
@@ -866,7 +866,8 @@ test "seekable transport allocations and lease releases share the serial wire pr
             std.testing.allocator.rawFree(bytes, alignment, ra);
         }
         fn read(raw: *anyopaque, _: u64, out: []u8, _: media.source.Control) !usize {
-            _ = guarded(raw);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.source.provider_gate.state.load(.acquire) != 0);
             @memset(out, 42);
             return out.len;
         }

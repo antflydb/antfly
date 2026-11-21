@@ -371,9 +371,9 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
     const timestamps = embedding_video.inspectedPresentationUs(a, bytes, null, control, configuration) catch |err| return inputError(err);
     defer a.free(timestamps);
     const inspected = inspection.find(bytes, null, configuration).?;
-    if (!inspected.webm and inspected.reader.track.codec == .hevc) {
+    if (!inspected.clip().webm and inspected.clip().reader.track.codec == .hevc) {
         if (@import("builtin").os.tag != .macos) return error.HevcDecoderUnavailable;
-        const required = try video.apple_hevc.surfaceBytesControlled(inspected.reader.track, source_control);
+        const required = try video.apple_hevc.surfaceBytesControlled(inspected.clip().reader.track, source_control);
         if (required > video.apple_hevc.max_surface_bytes) return error.SharedAdmissionExceeded;
         try permit.ensureSurfaces(admission, std.math.cast(usize, required) orelse return error.SharedAdmissionExceeded);
     }
