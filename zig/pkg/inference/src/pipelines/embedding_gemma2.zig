@@ -542,7 +542,7 @@ pub fn embedOwned(session: Session, tokenizer: Tokenizer, group: Group, options:
         return error.UnsupportedOwnedEmbeddingEntry;
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
     _ = cfg;
-    try validateExecutionGroup(group, options, session.backend());
+    try validateExecutionGroupControlled(group, options, session.backend(), control orelse .{});
     // The unchanged grouped route only supports these actual ordered parts.
     // In particular a video must keep its decoder/sequence Stage owner.
     for (group.content) |part| switch (part) {
@@ -797,7 +797,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     defer inspection_scope.deinit();
     options.video_inspection_scope = &inspection_scope;
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
-    try validateExecutionGroup(group, options, session.backend());
+    try validateExecutionGroupControlled(group, options, session.backend(), control orelse .{});
     var metadata_permit = try admitGroupMetadata(session, group, control orelse .{});
     defer if (metadata_permit) |*permit| permit.deinit();
     if (@import("build_options").enable_cuda and session.backend() == .cuda) {
@@ -1022,7 +1022,7 @@ fn appendCompiledMarkers(a: std.mem.Allocator, rendered: *std.ArrayListUnmanaged
 /// and pooled encoder execution form one captured program.
 fn embedCompiledMedia(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
     const effective = control orelse Control{};
-    try validateGroupContent(group, options, false);
+    try validateGroupContentControlled(group, options, false, effective);
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
     const scope = @import("antfly_image").work_control.Scope.enter(effective.imageWorkControl());
     defer scope.deinit();
@@ -1518,7 +1518,7 @@ pub fn embedGroupCohort(out: std.mem.Allocator, session: Session, tokenizer: Tok
     defer for (plans) |*plan| plan.deinit();
     for (groups, plans, 0..) |group, *plan, index| {
         try control.check();
-        validateExecutionGroup(group, options, session.backend()) catch |err| {
+        validateExecutionGroupControlled(group, options, session.backend(), control) catch |err| {
             errors[index] = err;
             continue;
         };
@@ -4342,7 +4342,11 @@ pub fn validateGroup(group: Group, options: Options) !void {
 }
 
 fn validateExecutionGroup(group: Group, options: Options, backend: @import("../backends/backends.zig").BackendType) !void {
-    try validateGroupContent(group, options, backend == .cuda);
+    return validateExecutionGroupControlled(group, options, backend, .{});
+}
+
+fn validateExecutionGroupControlled(group: Group, options: Options, backend: @import("../backends/backends.zig").BackendType, control: Control) !void {
+    try validateGroupContentControlled(group, options, backend == .cuda, control);
     if (backend != .cuda) return;
     for (group.content) |part| switch (part) {
         .video, .sampled_video => {
@@ -4355,6 +4359,12 @@ fn validateExecutionGroup(group: Group, options: Options, backend: @import("../b
 }
 
 fn validateGroupContent(group: Group, options: Options, allow_manual_markers: bool) !void {
+    return validateGroupContentControlled(group, options, allow_manual_markers, .{});
+}
+
+fn validateGroupContentControlled(group: Group, options: Options, allow_manual_markers: bool, control: Control) !void {
+    try control.check();
+    const video_input = @import("embedding_gemma2_video.zig");
     _ = try encoder.taskPrefix(options.task_type);
     if (!encoder.validDimension(options.dimensions)) return error.InvalidEmbeddingDimensions;
     if (options.max_tokens == 0 or options.max_tokens > encoder.max_tokens) return error.InvalidEmbeddingTokenLimit;
@@ -4378,10 +4388,11 @@ fn validateGroupContent(group: Group, options: Options, allow_manual_markers: bo
                 if (part.sampled_video.reader != null or part.sampled_video.selection != null or part.sampled_video.bytes.len != 0 or input.index.reader != input.reader or input.index.pictures.len == 0) return error.InvalidEmbeddingGroup;
                 if (input.continuation) |owner| if (owner.reader != input.reader) return error.InvalidEmbeddingGroup;
                 if (input.apple_continuation) |owner| if (owner.reader != input.reader) return error.InvalidEmbeddingGroup;
+                bytes = try std.math.add(usize, bytes, try video_input.webmPacketByteCount(input, part.sampled_video.sampling, control));
             }
             if (part.sampled_video.reader) |reader| {
                 if (part.sampled_video.bytes.len != 0) return error.InvalidEmbeddingGroup;
-                _ = try @import("embedding_gemma2_video.zig").sampledPacketBytes(reader, part.sampled_video.sampling, part.sampled_video.selection, .{});
+                bytes = try std.math.add(usize, bytes, try video_input.sampledPacketByteCount(reader, part.sampled_video.sampling, part.sampled_video.selection, control));
             }
         }
         if (part == .pcm) {
@@ -4426,7 +4437,8 @@ fn validateGroupContent(group: Group, options: Options, allow_manual_markers: bo
     // any is present, every supplied media item must be referenced exactly
     // once; generated wrapper tokens remain forbidden in caller text.
     if (image_markers + audio_markers > 0 and (image_markers != images or audio_markers != audios)) return error.MediaPlaceholderMismatch;
-    const encoded_limit: usize = if (group.content.len == 1 and Group.referenceVideo(group.content[0]) != null) @import("antfly_video").packet_sampling.reference_max_input_bytes else @import("embedding_gemma2_video.zig").group_max_input_bytes;
+    const standalone_gemma4 = group.content.len == 1 and group.content[0] == .sampled_video and group.content[0].sampled_video.sampling == .gemma4;
+    const encoded_limit: usize = if (group.content.len == 1 and (Group.referenceVideo(group.content[0]) != null or standalone_gemma4)) @import("antfly_video").packet_sampling.reference_max_input_bytes else video_input.group_max_input_bytes;
     if (bytes > encoded_limit or raster_bytes > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
     if (group.title) |title| if (!has_text or !std.mem.eql(u8, options.task_type, "RETRIEVAL_DOCUMENT") or !std.unicode.utf8ValidateSlice(title) or title.len > 8192 or std.mem.indexOf(u8, title, "<") != null) return error.InvalidEmbeddingTitle;
 }

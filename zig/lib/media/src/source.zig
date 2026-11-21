@@ -106,6 +106,7 @@ pub const Source = struct {
     provider_gate: Gate = .{},
     allocator_gate: Gate = .{},
     physical: ?*Source = null,
+    upstream_control: ?*const Source = null,
     mutex: std.Io.Mutex = .init,
 
     /// A worker keeps its allocator, cancellation and local statistics. All
@@ -123,6 +124,7 @@ pub const Source = struct {
         const owner = self.physical orelse self;
         const checks = ReadControl{ .source = owner.control, .worker = self.control };
         try checks.control().check();
+        if (owner.upstream_control) |upstream| try upstream.checkControl();
     }
 
     pub fn length(self: *const Source) u64 {
@@ -147,6 +149,7 @@ pub const Source = struct {
         const combined = ReadControl{ .source = controls.control(), .worker = caller };
         const control = combined.control();
         try control.check();
+        if (owner.upstream_control) |upstream| try upstream.checkControl();
         if (offset > self.length() or size > self.length() - offset) return error.UnexpectedEndOfSource;
         if (self.storage == .borrowed) {
             var token = try self.admitBytes(size, reclaimer);

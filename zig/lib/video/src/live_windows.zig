@@ -195,6 +195,7 @@ pub fn attachPrefixes(window: *Window, prefixes: []const PacketPrefix, options: 
     }
     const overlay = try a.create(ParameterOverlay);
     overlay.* = .{ .allocator = a, .original = reader.input.view(a, options.stream.admission_pool, options.stream.control), .bytes = bytes, .entries = entries, .reservation = reservation, .input = .{ .allocator = a, .identity = reader.input.identity, .limits = reader.input.limits, .control = options.stream.control, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .concurrent = true, .context = overlay, .read_at = ParameterOverlay.read, .length = offset } } } };
+    overlay.input.upstream_control = &overlay.original;
     // Forward outer read-buffer allocation to the same gate as nested reads.
     overlay.input.allocator = overlay.original.rangeAllocator();
     for (entries) |entry| {

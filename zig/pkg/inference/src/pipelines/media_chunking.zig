@@ -989,7 +989,7 @@ pub const Runner = struct {
         var apple_continuation = @import("embedding_gemma2_video.zig").WebmDecoderContinuation{ .allocator = self.allocator, .reader = reader };
         defer apple_continuation.deinit();
         var binding = @import("embedding_gemma2_video.zig").WebmProjectionBinding{ .reader = reader };
-        try self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, indexed.timescale(), null, .{ .reader = reader, .index = &indexed, .timeline = .{ .index = &indexed, .value = timeline }, .projection_binding = &binding, .continuation = &continuation, .apple_continuation = &apple_continuation });
+        try self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, indexed.timescale(), null, .{ .reader = reader, .index = &indexed, .timeline = .{ .index = &indexed, .value = timeline }, .coded_window_limit = self.request.limits.max_coded_window_bytes, .projection_binding = &binding, .continuation = &continuation, .apple_continuation = &apple_continuation });
     }
     const VideoSource = struct { bytes: []const u8, reader: ?*const media.mp4.Reader, origin: i64, timescale: u32, owner: ?*@import("media_chunking_video.zig").Owner, webm: ?@import("embedding_gemma2_video.zig").WebmInput };
     const VideoSlot = struct {

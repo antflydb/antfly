@@ -307,7 +307,7 @@ pub const View = struct {
     map: Mapping,
     wire: *media.source.Source,
     pub fn source(self: *View, identity: []const u8, limits: media.source.Limits) media.source.Source {
-        return .{ .allocator = self.wire.rangeAllocator(), .identity = identity, .control = self.wire.control, .admission_pool = self.wire.admission_pool, .limits = limits, .storage = .{ .range = .{ .concurrent = true, .context = self, .length = self.map.len, .read_at = read } } };
+        return .{ .allocator = self.wire.rangeAllocator(), .identity = identity, .control = self.wire.control, .upstream_control = self.wire, .admission_pool = self.wire.admission_pool, .limits = limits, .storage = .{ .range = .{ .concurrent = true, .context = self, .length = self.map.len, .read_at = read } } };
     }
     fn read(raw: *anyopaque, start: u64, out: []u8, control: media.source.Control) !usize {
         const self: *View = @ptrCast(@alignCast(raw));

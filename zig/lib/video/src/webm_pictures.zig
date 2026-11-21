@@ -47,6 +47,7 @@ pub const Index = struct {
     restarts: []Restart = &.{},
     reader: ?*const media.webm.Reader = null,
     apple_packet_layout: bool = false,
+    coded_bytes: ?usize = null,
     frame_units: usize = 0,
     largest_picture: u64 = 0,
     operating_point: u5 = 0,
@@ -166,9 +167,24 @@ const Collect = struct {
         self.pictures.appendAssumeCapacity(picture);
     }
 };
+pub fn codedBytes(reader: *const media.webm.Reader, control: media.source.Control) !usize {
+    const length = reader.input.length();
+    var total: usize = 0;
+    for (reader.packets, 0..) |packet, i| {
+        if (i % 256 == 0) {
+            try control.check();
+            try reader.input.checkControl();
+        }
+        if (packet.offset > length or packet.size > length - packet.offset) return error.UnexpectedEndOfSource;
+        total = try std.math.add(usize, total, packet.size);
+    }
+    return total;
+}
+
 pub fn index(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options) !Index {
     if (options.max_pictures > std.math.maxInt(usize) / @sizeOf(Picture)) return error.ResourceLimitExceeded;
     if (reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
+    const coded_bytes = try codedBytes(reader, options.decoder.control);
     var memory = media.admission.TrackedAllocator{
         .backing = a,
         .reservation = if (options.decoder.admission_pool) |pool| try pool.acquire(.{}) else .{},
@@ -178,6 +194,7 @@ pub fn index(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options)
     var result = buildIndex(memory.allocator(), a, reader, options) catch |err|
         return if (err == error.OutOfMemory) memory.denied orelse err else err;
     result.allocator = a;
+    result.coded_bytes = coded_bytes;
     result.reservation = memory.reservation;
     return result;
 }
