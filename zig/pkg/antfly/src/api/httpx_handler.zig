@@ -1837,6 +1837,7 @@ pub const AntflyApiHandler = struct {
         try server.delete("/db/v1/changefeeds/:feed_id", httpx.Handler.bind(self, closeChangefeed));
         try server.get("/db/v1/changefeeds/:feed_id/events", httpx.Handler.bind(self, pullChangefeed));
         try server.post("/db/v1/changefeeds/:feed_id/ack", httpx.Handler.bind(self, acknowledgeChangefeed));
+        try server.post("/db/v1/changefeeds/:feed_id/renew", httpx.Handler.bind(self, renewChangefeed));
 
         const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*", routes.memory_mcp_v1, routes.memory_mcp_v1_agent };
         const mcp_handler = httpx.Handler.bind(self, mcpRoute);
@@ -5055,6 +5056,21 @@ pub const AntflyApiHandler = struct {
         if (ctx.query("max_bytes")) |value| limits.bytes = std.fmt.parseInt(u32, value, 10) catch
             return jsonErrorResponse(ctx, 400, "invalid changefeed byte limit");
         return self.changefeedRequest(ctx, ctx.query("after") orelse "", limits);
+    }
+
+    fn renewChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const id = feedId(ctx) orelse return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        const bytes = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing changefeed lease");
+        if (bytes.len > 256) return jsonErrorResponse(ctx, 400, "invalid changefeed lease");
+        const parsed = std.json.parseFromSlice(struct { expires_at: u64 }, ctx.allocator, bytes, .{}) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed lease");
+        defer parsed.deinit();
+        const expires_at = @import("changefeed_public.zig").renew(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, id, parsed.value.expires_at, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        try ctx.setHeader("cache-control", "no-store");
+        return ctx.json(.{ .expires_at = expires_at });
     }
 
     fn acknowledgeChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

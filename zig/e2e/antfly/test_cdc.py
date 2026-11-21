@@ -3074,3 +3074,56 @@ def test_public_changefeed_retains_direct_enrichment_transaction():
             _changefeed_call(client, "DELETE", feed)
     finally:
         server.stop()
+
+
+def test_public_changefeed_renew_retains_root_beyond_original_deadline():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            name = "changefeed_renewal"
+            table = f"{server.api_url}/tables/{name}"
+            feeds = f"{server.api_url}/changefeeds"
+            _changefeed_call(client, "POST", table, json={"num_shards": 1})
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": name},
+                json={"tables": [name], "include": "rows", "lease_seconds": 45},
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            expires_at = created["expires_at"] + 120
+            unauthenticated = requests.post(
+                f"{feed}/renew", json={"expires_at": expires_at}, timeout=15
+            )
+            assert unauthenticated.status_code == 403
+            for _ in range(2):
+                renewed = _changefeed_call(
+                    client, "POST", f"{feed}/renew", json={"expires_at": expires_at}
+                ).json()
+                assert renewed == {"expires_at": expires_at}
+            progress = _changefeed_call(client, "GET", feed).json()
+            assert progress["acknowledged_cursor"] == created["cursor"]
+            assert progress["expires_at"] == expires_at
+            time.sleep(max(0, created["expires_at"] + 1 - time.time()))
+            _changefeed_call(
+                client, "POST", f"{table}/batch", json={"inserts": {"after": {}}}
+            )
+            deadline = time.monotonic() + 15
+            cursor = created["cursor"]
+            while True:
+                page = _changefeed_call(
+                    client, "GET", f"{feed}/events", params={"after": cursor}
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                events = page.json()["events"]
+                if events or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.2)
+            assert [event["operation"] for event in events] == ["insert"]
+            _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+            _changefeed_call(client, "DELETE", feed)
+    finally:
+        server.stop()

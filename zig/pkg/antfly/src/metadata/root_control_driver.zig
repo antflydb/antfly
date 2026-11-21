@@ -13,10 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Private bounded owner for ordered root controls. Only a confirmed begin CAS
-//! permits one submit. Recovered dispatching work is ambiguous and never gets
-//! submitted again. Accepted work uses its original receipt for read-only
-//! recovery. A known receipt is returned even when metadata persistence fails.
+//! Private bounded owner for ordered root controls. A confirmed begin CAS
+//! permits one submit. An unproven renewal can repeat its native expiration
+//! CAS. Accepted work uses its original receipt for read-only recovery.
+//! A known receipt is returned even when metadata persistence fails.
 const std = @import("std");
 const control = @import("changefeed_control.zig");
 const outcome = @import("root_control_outcome.zig");
@@ -149,6 +149,22 @@ pub fn drive(svc: anytype, policy: anytype, port: operations.Port, a: A, id: con
         },
     }
 }
+/// Renewal is a native compare-and-set on the same grant, epoch, and
+/// previous expiration. It can be submitted again after an unproven read:
+/// racing submissions either advance to the same target or lose the CAS.
+pub fn resumeRenewal(svc: anytype, policy: anytype, port: operations.Port, a: A, id: control.Id, namespace: control.Namespace, sequence: u64, request: anytype) !Result {
+    var current = try load(svc, a, id, request);
+    defer current.deinit();
+    const state = current.value;
+    try policy.authorizeRoot(state, namespace, request);
+    const item = state.roots[try state.rootIndex(namespace)];
+    const pending = item.pending_control orelse return error.ChangefeedConflict;
+    if (state.phase != .streaming or pending.sequence != sequence or pending.stage != .dispatching) return error.ChangefeedConflict;
+    const validated = try outcome.validateRequest(a, state, namespace, pending.payload);
+    if (validated.input.command != .renew) return error.ChangefeedConflict;
+    return perform(svc, policy, port, a, state, namespace, true, request);
+}
+
 /// Read-only semantic recovery. No path through this function submits a
 /// control or promotes an observation into the original command's receipt.
 pub fn reconcile(svc: anytype, policy: anytype, port: grants.Port, a: A, id: control.Id, namespace: control.Namespace, request_context: anytype) !Result {

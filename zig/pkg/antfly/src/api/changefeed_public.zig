@@ -266,6 +266,52 @@ pub fn inspect(api: *http.ApiHttpServer, backing: A, credential: http.Authentica
     };
 }
 
+/// Extend a streaming feed to an absolute Unix timestamp. The same request
+/// can resume after a lost reply while the original root leases still exist.
+pub fn renew(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequest, id: control.Id, expires_at: u64, public: Context) !u64 {
+    try public.ensureActive();
+    var identity = try authenticate(api, credential);
+    defer identity.deinit(api.alloc);
+    const metadata = api.source.changefeeds orelse return error.ChangefeedCapabilityUnsupported;
+    const source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
+    const internal: Context = .{
+        .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" },
+        .deadline_ns = public.deadline_ns,
+        .deadline_io = public.deadline_io,
+        .cancellation = public.cancellation,
+    };
+    var client: config.Client = .{ .port = metadata };
+    var parsed = try load(&client, a, id, internal);
+    defer parsed.deinit();
+    const definition = parsed.value.definition orelse return error.Forbidden;
+    try requireOwner(identity, definition);
+    if (parsed.value.slot != null or parsed.value.phase != .streaming) return error.ChangefeedConflict;
+    const now = clock.realtimeNs() / std.time.ns_per_s;
+    if (parsed.value.expiryDue(now)) return error.ChangefeedLeaseExpired;
+    if (expires_at <= now or expires_at - now > control.max_lease_seconds) return error.InvalidChangefeed;
+
+    var captured = try source.capture(a, definition, internal);
+    defer captured.deinit();
+    try captured.validateInitialRoutes(parsed.value.roots);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const access = try authorizedTableAccess(api, arena.allocator(), identity, definition, &captured, internal);
+    var policy: RootPolicy(Policy) = .{ .access = .{ .api = api, .credential = credential, .tables = access }, .io = api.inferenceIo(), .source = source, .allocator = a };
+    try policy.access.authorize(parsed.value, internal);
+    const epoch = parsed.value.epoch;
+    const authority = parsed.value.authority;
+    if (expires_at > parsed.value.expires_at) {
+        try change(&client, a, parsed.value, .{ .renew = .{ .now = now, .expires_at = expires_at } }, internal);
+        const updated = try load(&client, a, id, internal);
+        parsed.deinit();
+        parsed = updated;
+        if (parsed.value.epoch != epoch or !same(parsed.value.authority, authority) or parsed.value.expires_at < expires_at)
+            return error.ChangefeedResynchronizationRequired;
+    }
+    for (captured.roots) |route| try source_api.renewRoot(&client, &policy, a, parsed.value, route, internal);
+    return parsed.value.expires_at;
+}
+
 /// Public cursors identify previously issued positions. Metadata maintenance
 /// and owner history reads only receive a locally constructed request context.
 pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequest, selection: Selection, limits: ?delivery.Limits, public: Context) !Result {
@@ -366,12 +412,15 @@ fn RootPolicy(comptime Access: type) type {
         source: source_api.Source,
         allocator: A,
         closing: bool = false,
+        renewing: bool = false,
         retirement_collected: bool = false,
 
         pub fn authorizeRoot(self: *@This(), state: control.State, _: control.Namespace, request: Context) !void {
             if (!self.closing) {
-                if (Access == void) return error.Forbidden;
-                return self.access.authorize(state, request);
+                if (Access != void) return self.access.authorize(state, request);
+                try requireMaintenancePrincipal(request);
+                if (!self.renewing or state.slot != null or state.phase != .streaming or state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) return error.Forbidden;
+                return;
             }
             try request.ensureActive();
             if (state.phase != .closing and state.phase != .reset_required)
@@ -694,6 +743,17 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
         return change(&client, a, state, .{ .finish_verified_bootstrap = .{ .proof = try state.bootstrapCompletionProof() } }, request);
     }
     if (state.phase == .streaming) {
+        if (state.renewal_pending and !state.expiryDue(clock.realtimeNs() / std.time.ns_per_s)) {
+            try requireMaintenancePrincipal(request);
+            var captured = try source.capture(a, state.definition.?, request);
+            defer captured.deinit();
+            try captured.validateInitialRoutes(state.roots);
+            var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a, .renewing = true };
+            for (state.roots, captured.roots) |item, route| {
+                if (item.renewed_through < state.expires_at) try source_api.renewRoot(&client, &policy, a, state, route, request);
+            }
+            return;
+        }
         for (state.roots) |item| {
             if (item.snapshot == null or item.snapshot_released) continue;
             try requireMaintenancePrincipal(request);

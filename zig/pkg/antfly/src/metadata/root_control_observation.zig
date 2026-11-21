@@ -168,12 +168,22 @@ pub const test_support = if (@import("builtin").is_test) struct {
         streaming = try fixture.apply(scratch, streaming, .{ .root_control = .{ .namespace = ns, .operation = .{ .reconciled = acknowledged } } });
         try std.testing.expectEqual(@as(u64, 10), streaming.roots[0].reclaimed_through);
         streaming = try fixture.apply(scratch, streaming, .{ .renew = .{ .now = 150, .expires_at = 1200 } });
+        try std.testing.expect(streaming.needsMaintenance(150));
+        const renewal_bytes = try control.encode(a, streaming);
+        defer a.free(renewal_bytes);
+        var reopened = try control.parse(a, renewal_bytes);
+        defer reopened.deinit();
+        try std.testing.expect(reopened.value.needsMaintenance(150));
         streaming = try pending(scratch, streaming, .{ .renew = .{ .reference = ref, .previous = 1000, .next = 1200 } }, state.roots[0].pending_control.?.payload.fence);
         active.active.consumer.expires_at_seconds = 1100;
         try std.testing.expect((try resolve(a, streaming, ns, active)) == null);
         active.active.consumer.expires_at_seconds = 1200;
         const renewed = (try resolve(a, streaming, ns, active)).?;
         try std.testing.expectEqual(@as(u64, 1200), renewed.effect.progress.renewed.expires_at);
+        streaming = try fixture.apply(scratch, streaming, .{ .root_control = .{ .namespace = ns, .operation = .{ .reconciled = renewed } } });
+        try std.testing.expectEqual(@as(u64, 1200), streaming.roots[0].renewed_through);
+        try std.testing.expect(!streaming.needsMaintenance(150));
+        try std.testing.expectEqual(@as(u64, 10), streaming.roots[0].reclaimed_through);
         try std.testing.checkAllAllocationFailures(a, checkAllocations, .{ state, ns });
     }
     fn pending(a: std.mem.Allocator, before: control.State, command: native.Command, frozen: []const u8) !control.State {

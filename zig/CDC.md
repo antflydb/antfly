@@ -114,6 +114,14 @@ Read `GET /db/v1/changefeeds/{id}/events?after={cursor}` and advance using
 cursor, current phase, outstanding delivery count and expiry with
 `GET /db/v1/changefeeds/{id}`. The outstanding count measures deliveries
 already issued to the client. Delete the feed to release its retention grants.
+
+Extend a streaming feed with `POST /db/v1/changefeeds/{id}/renew` and a
+JSON `expires_at` Unix timestamp in seconds. A successful reply confirms the
+expiry at every root. The metadata worker retries an interrupted renewal.
+Repeating the requested timestamp is safe and preserves the acknowledged cursor. Bootstrap deadlines stay
+fixed. Active pgoutput sessions renew their one-hour history lease before
+it expires. Disconnected slots remain subject to their recorded expiry.
+
 Expired or invalidated cuts require resynchronization. Each read rechecks
 current authorization.
 

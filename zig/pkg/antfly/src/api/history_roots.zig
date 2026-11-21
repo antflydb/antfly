@@ -325,6 +325,63 @@ pub fn qualifyEnrollmentCut(a: A, source: Source, policy: anytype, captured: *co
     return proof;
 }
 
+/// Reconcile a root to the metadata lease. An interrupted refresh can
+/// resume from the current native grant and the persisted control attempt.
+pub fn renewRoot(client: *MetadataClient, policy: anytype, a: A, expected: control.State, root: Root, request: Context) !void {
+    for (0..4) |_| {
+        const bytes = try client.readChangefeedState(a, expected.id, request);
+        defer a.free(bytes);
+        var parsed = try control.parse(a, bytes);
+        defer parsed.deinit();
+        const state = parsed.value;
+        try policy.authorizeRoot(state, root.namespace, request);
+        if (state.phase != .streaming or state.epoch != expected.epoch or !std.meta.eql(state.authority, expected.authority))
+            return error.ChangefeedResynchronizationRequired;
+        const item = state.roots[try state.rootIndex(root.namespace)];
+        if (item.pending_control != null) {
+            try driveRoot(client, policy, a, state, root.namespace, request);
+            continue;
+        }
+        try policy.validateRoot(state, root.namespace, root.fence, root.table_name, request);
+        const definition = state.definition orelse return error.ChangefeedResynchronizationRequired;
+        const table = for (definition.tables) |candidate| {
+            if (candidate.table_id == root.fence.table_id) break candidate;
+        } else return error.ChangefeedResynchronizationRequired;
+        const query: @import("history_grant_operations.zig").Request = .{ .version = 1, .identity = .{
+            .namespace = root.namespace,
+            .authority = state.authority,
+            .consumer = state.consumerId(),
+            .definition = definition.identity(),
+            .sequence = item.grant_sequence,
+            .policy_revision = table.policy_revision,
+        } };
+        const identity = query.identity;
+        const observation = try policy.source.grants.read(a, root.fence, root.table_name, query, request);
+        if (observation != .active) return error.ChangefeedResynchronizationRequired;
+        const consumer = observation.active.consumer;
+        if (consumer.epoch != item.consumer_epoch or consumer.start != item.start) return error.ChangefeedResynchronizationRequired;
+        if (consumer.expires_at_seconds > state.expires_at) continue;
+        if (consumer.expires_at_seconds >= expected.expires_at) return;
+        try prepareRoot(client, policy, a, state.id, root, .{
+            .version = 1,
+            .operation = .submit,
+            .command = .{ .renew = .{
+                .reference = .{
+                    .namespace = identity.namespace,
+                    .authority = identity.authority,
+                    .consumer = identity.consumer,
+                    .definition = identity.definition,
+                    .grant = identity.sequence,
+                    .epoch = consumer.epoch,
+                },
+                .previous = consumer.expires_at_seconds,
+                .next = state.expires_at,
+            } },
+        }, request);
+    }
+    return error.MetadataMutationOutcomeUnknown;
+}
+
 /// Propagate whole-frame client ACKs through receipt-qualified owner controls.
 /// Partial-frame cursors can be durable without moving the native floor.
 pub fn flushAcknowledged(client: *MetadataClient, policy: anytype, a: A, confirmed: control.State, root: Root, request: Context) !bool {
@@ -424,12 +481,14 @@ pub fn driveRoot(client: *MetadataClient, policy: anytype, a: A, state: control.
     const item = state.roots[try state.rootIndex(namespace)];
     const pending = item.pending_control.?;
     const driver_outcome = @import("../metadata/root_control_outcome.zig");
-    const is_capture = (try driver_outcome.validateRequest(a, state, namespace, pending.payload)).input.command == .capture_bootstrap;
+    const command = (try driver_outcome.validateRequest(a, state, namespace, pending.payload)).input.command;
     var result = if (pending.stage == .dispatching)
         try enrollment.reconcile(client, policy, policy.source.grants, a, state.id, namespace, request)
     else
         try enrollment.drive(client, policy, policy.source.controls, a, state.id, namespace, request);
-    if (is_capture and (result.status == .accepted or result.status == .superseded))
+    if (command == .renew and pending.stage == .dispatching and result.status == .unproven)
+        result = try enrollment.resumeRenewal(client, policy, policy.source.controls, a, state.id, namespace, pending.sequence, request);
+    if ((command == .capture_bootstrap or command == .renew) and (result.status == .accepted or result.status == .superseded))
         result = try enrollment.reconcile(client, policy, policy.source.grants, a, state.id, namespace, request);
     switch (result.status) {
         .settled => {

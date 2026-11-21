@@ -673,6 +673,7 @@ pub const CatalogRetainedStream = struct {
     const Bridge = @import("../pgwire/retained_stream.zig");
     const retained = @import("../metadata/pg_spool_stream.zig");
     const Registry = @import("../metadata/pg_spool_artifacts.zig").Registry;
+    const history_lease_seconds = 3600;
     const control = publication_control;
 
     allocator: std.mem.Allocator,
@@ -687,6 +688,7 @@ pub const CatalogRetainedStream = struct {
 
     publication_worker: ?*PublicationWorker = null,
     collected_history_delivery: ?u64 = null,
+    verified_history_expiry: u64 = 0,
     publication_group: std.Io.Group = .init,
 
     const PublicationWorker = struct {
@@ -763,11 +765,34 @@ pub const CatalogRetainedStream = struct {
             defer observed.deinit();
             const state = observed.value;
             try selected.authorizeCleanup(state, self.context);
-            if (state.acknowledged_delivery == 0 or host.collected_history_delivery == state.acknowledged_delivery) return;
+            const now = try selected.policy.nowSeconds(self.context);
+            if (state.expires_at -| now <= history_lease_seconds / 2) {
+                const definition = state.definition orelse return error.ChangefeedResynchronizationRequired;
+                try client.mutateChangefeedState(allocator, .{
+                    .id = state.id,
+                    .authority = state.authority,
+                    .owner = definition.owner,
+                    .authorization = definition.authorization,
+                    .expected_revision = state.revision,
+                    .expected_epoch = state.epoch,
+                    .mutation = .{ .renew = .{ .now = now, .expires_at = now +| history_lease_seconds } },
+                }, self.context);
+                // The next round observes the committed revision and drives
+                // any native renewals, including after an ambiguous reply.
+                return;
+            }
+            const renew = host.verified_history_expiry != state.expires_at;
+            const reclaim = state.acknowledged_delivery != 0 and host.collected_history_delivery != state.acknowledged_delivery;
+            if (!renew and !reclaim) return;
             var captured = try self.source.capture(allocator, state.definition.?, self.context);
             defer captured.deinit();
             try captured.validateInitialRoutes(state.roots);
             var history_policy: HistoryPolicy = .{ .source = self.source, .selected = selected, .io = selected.policy.io };
+            if (renew) {
+                for (captured.roots) |route| try @import("history_roots.zig").renewRoot(&client, &history_policy, allocator, state, route, self.context);
+                host.verified_history_expiry = state.expires_at;
+            }
+            if (!reclaim) return;
             for (state.roots, captured.roots) |root, route| {
                 if (root.acknowledged.sequence == root.start) continue;
                 const more = try @import("history_roots.zig").flushAcknowledged(&client, &history_policy, allocator, state, route, self.context);
@@ -906,6 +931,7 @@ pub const CatalogRetainedStream = struct {
         self.config = config;
         self.publication_worker = null;
         self.collected_history_delivery = null;
+        self.verified_history_expiry = 0;
         self.publication_group = .init;
         self.policy = .{ .allocator = retained_alloc, .io = request_value.io, .identity = slots.identity, .resolver = self.catalog_resolver.resolver(), .expected = expected };
         return Bridge.Bridge(CatalogRetainedStream).open(self, a, request_value, start);
@@ -1219,7 +1245,7 @@ pub const CatalogSlotEnrollment = struct {
             try policy.authorizeRoot(current, root.namespace, maintenance);
             var write: control.Write = .{ .id = id, .authority = authority, .owner = owner, .authorization = definition.authorization, .expected_revision = state.revision, .expected_epoch = state.epoch, .mutation = undefined };
             if (state.phase == .empty) {
-                write.mutation = .{ .create = .{ .id = id, .definition = definition, .now = now, .expires_at = now +| 3600, .bootstrap_expires_at = if (export_snapshot) now +| control.max_bootstrap_seconds else 0 } };
+                write.mutation = .{ .create = .{ .id = id, .definition = definition, .now = now, .expires_at = now +| CatalogRetainedStream.history_lease_seconds, .bootstrap_expires_at = if (export_snapshot) now +| control.max_bootstrap_seconds else 0 } };
             } else if (state.phase == .reset_required and state.slot == null and
                 state.reset_reason == .history_expired and !state.expiryDue(now))
             {

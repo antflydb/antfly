@@ -155,6 +155,7 @@ pub const Root = struct {
     /// Whole-frame ACK propagated to this native consumer. Other consumers
     /// may still retain these frames in the shared physical log.
     reclaimed_through: u64 = 0,
+    renewed_through: u64 = 0,
     snapshot: ?Snapshot = null,
     snapshot_delivered: BootstrapPosition = .{},
     snapshot_acknowledged: BootstrapPosition = .{},
@@ -208,6 +209,7 @@ pub const State = struct {
     created_at: u64 = 0,
     expires_at: u64 = 0,
     bootstrap_expires_at: u64 = 0,
+    renewal_pending: bool = false,
     cut: Digest = @splat(0),
     roots: []const Root = &.{},
     latest_delivery: u64 = 0,
@@ -246,7 +248,7 @@ pub const State = struct {
             .bootstrap => self.bootstrapComplete() or self.expiryDue(now),
             .streaming => for (self.roots) |root| {
                 if (root.snapshot != null and !root.snapshot_released) break true;
-            } else self.expiryDue(now),
+            } else self.renewal_pending or self.expiryDue(now),
             .reset_required => for (self.roots) |root| {
                 if (!root.released or (root.snapshot != null and !root.snapshot_released)) break true;
             } else if (self.slot) |slot| slot.spool.records.len != 0 else false,
@@ -325,7 +327,7 @@ pub const State = struct {
         if (self.version != 1 or self.roots.len > max_roots or self.cursors.len > max_cursors) return error.InvalidChangefeed;
         if (self.phase == .empty) {
             if (self.revision != 0 or self.epoch != 0 or nz(self.id) or nz(self.authority) or self.authority_sequence != 0 or self.definition != null or
-                self.created_at != 0 or self.expires_at != 0 or self.bootstrap_expires_at != 0 or nz(self.cut) or self.roots.len != 0 or self.cursors.len != 0 or
+                self.created_at != 0 or self.expires_at != 0 or self.bootstrap_expires_at != 0 or self.renewal_pending or nz(self.cut) or self.roots.len != 0 or self.cursors.len != 0 or
                 self.latest_delivery != 0 or self.acknowledged_delivery != 0 or nz(self.latest_cursor) or nz(self.acknowledged_cursor) or self.reset_reason != .none or self.latest_provider_context.len != 0 or self.acknowledged_provider_context.len != 0 or self.slot != null) return error.InvalidChangefeed;
             return;
         }
@@ -338,6 +340,7 @@ pub const State = struct {
         if ((definition.start == .snapshot_then_changes) != (self.bootstrap_expires_at != 0) or
             (self.bootstrap_expires_at != 0 and (self.bootstrap_expires_at <= self.created_at or self.bootstrap_expires_at > self.expires_at))) return error.InvalidChangefeed;
         if ((self.phase == .reset_required) != (self.reset_reason != .none)) return error.InvalidChangefeed;
+        if (self.renewal_pending and (self.phase != .streaming or self.slot != null)) return error.InvalidChangefeed;
         for (self.roots, 0..) |root, index| {
             if (root.last_reconciliation) |observed| {
                 try observed.validate();
@@ -354,6 +357,7 @@ pub const State = struct {
             if (!nz(root.namespace) or root.ownership_epoch == 0 or root.grant_sequence == 0 or root.grant_sequence > self.authority_sequence or
                 !definition.contains(std.mem.readInt(u64, root.namespace[0..8], .big)) or
                 (index != 0 and std.mem.order(u8, &self.roots[index - 1].namespace, &root.namespace) != .lt)) return error.InvalidChangefeed;
+            if (root.renewed_through > self.expires_at or (root.consumer_epoch == 0 and root.renewed_through != 0)) return error.InvalidChangefeed;
             if (root.consumer_epoch == 0) {
                 if (root.start != 0 or root.delivered.order(.{}) != .eq or root.acknowledged.order(.{}) != .eq or root.reclaimed_through != 0 or root.snapshot != null) return error.InvalidChangefeed;
             } else if (root.acknowledged.sequence < root.start or root.acknowledged.order(root.delivered) == .gt or root.reclaimed_through < root.start or root.reclaimed_through > root.acknowledged.sequence) return error.InvalidChangefeed;
@@ -908,6 +912,7 @@ pub const Mutation = union(enum) {
                 if (state.phase == .empty or state.phase == .reset_required or state.phase == .closing or state.phase == .deleted or renewal.now >= state.expires_at or renewal.expires_at <= state.expires_at) return error.ChangefeedLeaseExpired;
                 try lease(renewal.now, renewal.expires_at);
                 next.expires_at = renewal.expires_at;
+                next.renewal_pending = state.phase == .streaming and state.slot == null;
             },
             .expire => |now| {
                 if (state.phase == .empty or state.phase == .closing or state.phase == .deleted or state.phase == .reset_required) return state;
@@ -965,6 +970,11 @@ pub const Mutation = union(enum) {
         if (next.slot) |slot| if (next.phase == .closing or next.phase == .reset_required) {
             next.slot = try slot.retireSpools(a);
         };
+        if (next.renewal_pending) {
+            next.renewal_pending = next.phase == .streaming and for (next.roots) |root| {
+                if (root.renewed_through < next.expires_at) break true;
+            } else false;
+        }
         next.revision = std.math.add(u64, state.revision, 1) catch return error.ChangefeedConflict;
         next.authority_sequence = stamp.sequence;
         try next.validate();
@@ -1003,7 +1013,8 @@ fn applyRootControlEffect(state: State, target: *Root, pending: root_intent.Stat
             target.reclaimed_through = v.next;
         },
         .renewed => |v| {
-            if (before.consumer_epoch != v.consumer_epoch or v.expires_at > state.expires_at) return error.ChangefeedConflict;
+            if (before.consumer_epoch != v.consumer_epoch or v.expires_at < before.renewed_through or v.expires_at > state.expires_at) return error.ChangefeedConflict;
+            target.renewed_through = v.expires_at;
         },
         .retired => |v| {
             if ((state.phase != .closing and state.phase != .reset_required) or v.sequence <= before.grant_sequence or v.sequence >= pending.sequence) return error.ChangefeedConflict;

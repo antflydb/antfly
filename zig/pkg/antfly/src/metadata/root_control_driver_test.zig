@@ -74,7 +74,18 @@ const Root = struct {
             .unknown_accepted => null,
             .superseded => .superseded,
             .rejected => .{ .rejected = .checkpoint_conflict },
-            else => .{ .applied = .{ .consumer = .{ .id = input.command.enroll.consumer, .epoch = 7, .start = 3, .acknowledged = 3, .expires_at_seconds = 1000, .policy_revision = 1 } } },
+            else => .{ .applied = .{ .consumer = .{
+                .id = switch (input.command) {
+                    .enroll => |enroll| enroll.consumer,
+                    .renew => |renew| renew.reference.consumer,
+                    else => unreachable,
+                },
+                .epoch = 7,
+                .start = 3,
+                .acknowledged = 3,
+                .expires_at_seconds = if (input.command == .renew) input.command.renew.next else 1000,
+                .policy_revision = 1,
+            } } },
         };
         if (input.operation == .submit) if (self.cancel_after) |cancelled| {
             cancelled.* = true;
@@ -177,4 +188,57 @@ pub fn run() !void {
         if (case == .rejected) try std.testing.expectEqual(@as(u8, 5), state.value.roots[0].last_control.?.effect.rejected);
         if (case == .superseded or case == .ambiguous or case == .lose_begin_ack) try std.testing.expect(state.value.roots[0].pending_control != null);
     }
+
+    try recoverRenewal(a);
+}
+
+fn recoverRenewal(a: A) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root-renewal", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try Store.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    var svc: fixture.Service = .{ .store = &store, .id = @splat(4) };
+    var policy: Policy = .{};
+    var root: Root = .{ .svc = &svc };
+    try prepare(&svc, &policy, a);
+    var prepared = try svc.load(a);
+    defer prepared.deinit();
+    const route = prepared.value.roots[0].pending_control.?.payload.fence;
+    try std.testing.expectEqual(.settled, (try driver.drive(&svc, &policy, root.port(), a, svc.id, testNamespace(), Request{})).status);
+    try svc.mutate(a, .{ .seal = .{ .cut = @splat(9) } });
+    try svc.mutate(a, .{ .renew = .{ .now = 500, .expires_at = 1500 } });
+    var current = try svc.load(a);
+    defer current.deinit();
+    const item = current.value.roots[0];
+    const input: operations.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .renew = .{
+        .reference = .{
+            .namespace = item.namespace,
+            .authority = current.value.authority,
+            .consumer = current.value.consumerId(),
+            .definition = current.value.definition.?.identity(),
+            .grant = item.grant_sequence,
+            .epoch = item.consumer_epoch,
+        },
+        .previous = 1000,
+        .next = 1500,
+    } } };
+    const bytes = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(bytes);
+    try driver.prepare(&svc, &policy, a, svc.id, item.namespace, .{ .command = bytes, .fence = route, .table = "docs" }, Request{});
+    svc.lose_ack_at = svc.proposals + 1;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, driver.drive(&svc, &policy, root.port(), a, svc.id, item.namespace, Request{}));
+    try std.testing.expectEqual(@as(usize, 1), root.submits);
+    svc.lose_ack_at = null;
+    var interrupted = try svc.load(a);
+    defer interrupted.deinit();
+    const sequence = interrupted.value.roots[0].pending_control.?.sequence;
+    const result = try driver.resumeRenewal(&svc, &policy, root.port(), a, svc.id, item.namespace, sequence, Request{});
+    try std.testing.expectEqual(.settled, result.status);
+    try std.testing.expectEqual(@as(usize, 2), root.submits);
+    var renewed = try svc.load(a);
+    defer renewed.deinit();
+    try std.testing.expect(!renewed.value.renewal_pending);
+    try std.testing.expectEqual(@as(u64, 1500), renewed.value.roots[0].renewed_through);
 }
