@@ -815,7 +815,7 @@ test "admission native encoder allocations consume prepaid workspace and retain 
     defer for (outputs) |vector| if (vector) |values| a.free(values);
     for ([_]usize{ 135, 263, 391 }, 0..) |rows, index| {
         {
-            var scope = try admitted.admitRun(try @import("../pipelines/embedding_gemma2_admission.zig").nativeTextEncoderRequest(4096, rows, 768));
+            var scope = try admitted.admitRun(try @import("../execution/embedding_gemma2_admission.zig").nativeTextEncoderRequest(4096, rows, 768));
             defer scope.deinit();
             const charged = controller.snapshot().host_scratch_bytes;
             const compute = try a.alloc(u8, 80 * MiB);

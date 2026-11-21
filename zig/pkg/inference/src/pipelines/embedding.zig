@@ -43,6 +43,7 @@ const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const embedding_trace = @import("../embedding_trace.zig");
 const qwen_workspace = @import("../execution/qwen_embedding_workspace.zig");
+const gemma_text_admission = @import("../execution/embedding_gemma2_admission.zig");
 const qwen_batch = @import("qwen_embedding_batch.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const memory_admission = @import("../runtime/tier/memory.zig");
@@ -636,19 +637,18 @@ pub const EmbeddingPipeline = struct {
             const candidates = @min(@as(usize, 4), order.len - cursor);
             for (order[cursor..][0..candidates], sorted_lengths[0..candidates]) |i, *length| length.* = lengths[i];
             const compact_policy = @import("../architectures/embedding_gemma2.zig").compactRowsEnabled(self.session.backend() == .metal);
-            var count = @import("embedding_gemma2.zig").preparedCohortCountForBackend(sorted_lengths[0..candidates], candidates, compact_policy);
+            var count = gemma_text_admission.cohortCount(sorted_lengths[0..candidates], candidates, compact_policy);
+            if (count == 0) return error.EmbeddingInputTooLong;
             while (true) {
-                const seq = lengths[order[cursor + count - 1]];
-                var cohort_rows: usize = 0;
-                for (sorted_lengths[0..count]) |length| cohort_rows += length;
-                const request = session_mod.RunRequest{ .batch = if (compact_policy) 1 else count, .sequence = if (compact_policy) cohort_rows else seq, .input_bytes = count * seq * 24, .host_preprocess_bytes = count * seq * 32, .workspace_bytes = try @import("embedding_gemma2.zig").textEncoderWorkspace(if (compact_policy) cohort_rows else count * seq), .output_bytes = count * self.config.embedding_gemma2_dimensions * @sizeOf(f32) };
-                if (count > 1 and !try self.session.fitsRun(request)) {
+                const cohort = try gemma_text_admission.textCohort(sorted_lengths[0..count], self.config.embedding_gemma2_dimensions, compact_policy);
+                if (count > 1 and !try self.session.fitsRun(cohort.request)) {
                     count -= 1;
                     continue;
                 }
-                const ids = try a.alloc(i64, count * seq);
+                const seq = cohort.padded_sequence;
+                const ids = try a.alloc(i64, cohort.token_slots);
                 defer a.free(ids);
-                const mask = try a.alloc(i64, count * seq);
+                const mask = try a.alloc(i64, cohort.token_slots);
                 defer a.free(mask);
                 @memset(ids, 0);
                 @memset(mask, 0);
@@ -1710,7 +1710,7 @@ pub const EmbeddingPipeline = struct {
                 .input_bytes = text_plan.input_bytes,
                 .host_preprocess_bytes = if (preprocess_permit != null) text_plan.temporary_bytes else try std.math.add(usize, try std.math.mul(usize, total, 32), text_plan.temporary_bytes),
                 .workspace_bytes = if (session_factory.getEmbeddingGemma2Config(self.session) != null)
-                    try @import("embedding_gemma2.zig").textEncoderWorkspace(if (compact_policy) active_rows else total)
+                    try gemma_text_admission.textEncoderWorkspace(if (compact_policy) active_rows else total)
                 else
                     0,
             }, task_geometry, owned, false) catch |err| {
@@ -1825,7 +1825,7 @@ pub const EmbeddingPipeline = struct {
                 // the final pooled/export backing and original input bytes.
                 const rows = std.math.mul(usize, request.batch, request.sequence) catch return error.ResourceLimitExceeded;
                 planned.output_bytes = @max(request.output_bytes orelse 0, std.math.mul(usize, rows, gemma.embedding_dim * @sizeOf(f32)) catch return error.ResourceLimitExceeded);
-                planned.workspace_bytes = @max(request.workspace_bytes, try @import("embedding_gemma2.zig").textEncoderWorkspace(rows));
+                planned.workspace_bytes = @max(request.workspace_bytes, try gemma_text_admission.textEncoderWorkspace(rows));
             }
             if (workspace != null and session.backend() == .metal) {
                 const constructor = try @import("../backends/compute_factory.zig").metalConstructionLayout();
