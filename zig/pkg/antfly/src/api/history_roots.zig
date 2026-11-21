@@ -204,6 +204,49 @@ pub const Source = struct {
             error.ChangefeedResynchronizationRequired;
     }
 
+    /// Prepare a metadata handoff from a current routing generation and the
+    /// durable cut observed on the predecessor's data leader.
+    pub fn prepareSplitHandoff(self: Source, a: A, captured: *const Captured, stored: control.Root, split: SplitTransition, context: Context) !control.Mutation {
+        const physical = stored.physical orelse return error.ChangefeedResynchronizationRequired;
+        const table_id = std.mem.readInt(u64, stored.namespace[0..8], .big);
+        const predecessor = try captured.findPhysical(table_id, physical.group_id, physical.range_id);
+        const successor = try captured.findPhysical(table_id, split.destination_group_id, split.destination_group_id);
+        const boundary = split.split_key orelse return error.ChangefeedResynchronizationRequired;
+        const successor_index = captured.session.group_indexes.get(successor.fence.route.group_id) orelse return error.TopologyChanged;
+        const successor_range = captured.session.snapshot.value.ranges[successor_index];
+        if (!std.mem.eql(u8, &stored.namespace, &predecessor.namespace) or
+            !std.mem.eql(u8, &predecessor.namespace, &successor.namespace) or
+            !std.mem.eql(u8, boundary, successor_range.start_key))
+            return error.ChangefeedResynchronizationRequired;
+        const owners = self.artifact_owners orelse return error.ChangefeedCapabilityUnsupported;
+        const qualified = try owners.read(a, predecessor.fence, predecessor.table_name, .{
+            .version = 1,
+            .expected_table_binding = predecessor.table_binding,
+        }, context);
+        const cut = try self.readSplitCut(a, predecessor, qualified.owner.root_generation, split, context);
+        return .{ .stage_split_handoff = .{
+            .namespace = stored.namespace,
+            .ownership_epoch = stored.ownership_epoch,
+            .handoff = .{
+                .predecessor = physical,
+                .successor = successor.physicalIdentity().?,
+                .cut = .{
+                    .namespace = cut.namespace,
+                    .transition = cut.transition,
+                    .attempt = cut.attempt,
+                    .successor_group = cut.successor_group,
+                    .term = cut.term,
+                    .index = cut.index,
+                    .latest = cut.latest,
+                    .reclaimed = cut.reclaimed,
+                    .root_generation = cut.root_generation,
+                    .reserved_bytes = cut.reserved_bytes,
+                    .boundary = cut.boundary,
+                },
+            },
+        } };
+    }
+
     /// Authorization must precede capture. Returned locators borrow the owned
     /// generation, so they remain valid even after the publisher retires it.
     pub fn capture(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
@@ -708,6 +751,19 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectError(error.ChangefeedResynchronizationRequired, physical.find(parent.namespace));
         try std.testing.expectError(error.TopologyChanged, physical.initialPlans(a));
         try std.testing.expectError(error.TopologyChanged, split_fixture.source().capture(a, definition, .{}));
+        const stored: control.Root = .{ .namespace = parent.namespace, .ownership_epoch = 1, .grant_sequence = 2, .physical = parent.physicalIdentity() };
+        var transition: SplitTransition = .{
+            .transition_id = 19,
+            .attempt_epoch = 1,
+            .source_group_id = 71,
+            .destination_group_id = 72,
+            .phase = .finalized,
+            .split_key = "wrong",
+            .table_contract = .{ .table_id = 7, .table_name = "zeta", .source_identity = .{ .shard_id = 70, .range_id = 11 } },
+        };
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, split_fixture.source().prepareSplitHandoff(a, &physical, stored, transition, .{}));
+        transition.split_key = "m";
+        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, split_fixture.source().prepareSplitHandoff(a, &physical, stored, transition, .{}));
         var replaced = records;
         replaced[0].table_id = 9;
         var replacement_ranges = ranges;

@@ -169,7 +169,19 @@ pub const PhysicalRoot = struct {
 pub const SplitHandoff = struct {
     predecessor: PhysicalRoot,
     successor: PhysicalRoot,
-    cut: @import("antfly_local_sources").storage_committed_history.SplitCut,
+    cut: struct {
+        namespace: Namespace,
+        transition: u64,
+        attempt: u64,
+        successor_group: u64,
+        term: u64,
+        index: u64,
+        latest: u64,
+        reclaimed: u64,
+        root_generation: u64,
+        reserved_bytes: u64,
+        boundary: Digest,
+    },
 
     fn validate(self: SplitHandoff, namespace: Namespace) !void {
         if (!self.predecessor.valid() or !self.successor.valid() or self.predecessor.group_id == self.successor.group_id or
