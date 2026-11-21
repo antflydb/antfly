@@ -3933,6 +3933,19 @@ pub const DocStore = struct {
         }
     }
 
+    fn replayRetirementPrefixesUnchanged(txn: anytype, plan: *const ReplayRetirementPlan) !bool {
+        // Compatible writers can retire a lane without updating the
+        // witness. Verify the physical prefix while holding the gate.
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        cursor.setKeysOnly();
+        for (replay_credit_lanes, plan.first_deleted) |kind, first| {
+            const sequence = first orelse continue;
+            if (try seekReplayCreditLaneHead(&cursor, kind, 0) != sequence + 1) return false;
+        }
+        return true;
+    }
+
     /// Appends advance the sequence and retirement changes the first key
     /// of each affected lane. Validate both before publishing a read plan.
     /// If they changed, replan once under writer serialization.
@@ -3968,22 +3981,13 @@ pub const DocStore = struct {
         const next = try replayCreditNextSequence(txn);
         const append_preserves_range = observed_next == next or (next > observed_next and observed_next > up_to_sequence);
         var reusable = false;
-        if (!lanes_witnessed and append_preserves_range) {
-            // Retirement only removes lane prefixes. Verify the first
-            // planned key in each affected lane without reading its payload.
-            var cursor = try txn.openPhysicalCursorAdapter();
-            defer cursor.close();
-            cursor.setKeysOnly();
-            reusable = true;
-            for (replay_credit_lanes, plan.first_deleted) |kind, first| {
-                const sequence = first orelse continue;
-                if (try seekReplayCreditLaneHead(&cursor, kind, 0) != sequence + 1) {
-                    reusable = false;
-                    break;
-                }
-            }
+        const protected_credit = lanes_witnessed and try replay_journal_format.state(txn) == .protected_credit;
+        if (!protected_credit and append_preserves_range and
+            (!lanes_witnessed or (observed_heads != null and initial_heads != null)))
+        {
+            reusable = try replayRetirementPrefixesUnchanged(txn, &plan);
         }
-        if (observed_heads != null and initial_heads != null and append_preserves_range) {
+        if ((protected_credit or reusable) and observed_heads != null and initial_heads != null and append_preserves_range) {
             const before = observed_heads.?;
             const current = initial_heads.?;
             reusable = true;
@@ -6678,6 +6682,33 @@ test "docstore releases replay credit only once for overlapping retirement plans
     const ledger = try loadJournalCreditLedger(&read);
     try std.testing.expectEqual(@as(u64, 1), ledger.records);
     try std.testing.expectEqual(@as(u64, internal_keys.replay_key_len + "second".len), ledger.bytes);
+}
+
+test "compatible replay credit retirement detects an older writer changing the physical head" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.appendReplayOpaque(alloc, 1, "first");
+    try store.appendReplayOpaque(alloc, 2, "second");
+
+    var plan: DocStore.ReplayRetirementPlan = .{};
+    defer plan.deletes.deinit(alloc);
+    const heads = blk: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const observed = (try storedReplayCreditLaneHeads(&read)).?;
+        try DocStore.planReplayRetirement(&read, &plan, alloc, 1, .{}, observed, 3);
+        break :blk observed;
+    };
+    var batch = try store.beginWriteBatch();
+    defer batch.abort();
+    const txn = batch.asTxn();
+    try std.testing.expect(try DocStore.replayRetirementPrefixesUnchanged(txn, &plan));
+    try batch.delete(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1));
+    try std.testing.expectEqual(heads, (try storedReplayCreditLaneHeads(txn)).?);
+    try std.testing.expect(!try DocStore.replayRetirementPrefixesUnchanged(txn, &plan));
 }
 
 test "WS5 DocStore journal credit ledger is charged on append and released on retirement" {

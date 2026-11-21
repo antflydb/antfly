@@ -4767,8 +4767,11 @@ pub const Store = struct {
     // temporary second inode. Bound that image by its compact data and
     // target reservation, then enforce the normal cap on retained files
     // and the installed generation before the swap.
-    fn canUseRedoRewriteWorkspace(self: *Store) !bool {
-        if (!self.needsProtectedRedoUpgrade() or self.currentGenerationHasReaders()) return false;
+    fn canUseRedoRewriteWorkspace(self: *Store, temporary_total: u64) !bool {
+        const options = self.maintenance_policy.options;
+        if (options.redo_rewrite_workspace_overage_bytes == 0 or
+            temporary_total > options.max_storage_bytes +| options.redo_rewrite_workspace_overage_bytes or
+            !self.needsProtectedRedoUpgrade() or self.currentGenerationHasReaders()) return false;
         const region = (try self.file.regionForInode()) orelse return false;
         return region.minimumUncoveredPinnedSequence(antfly_platform.process.currentId() orelse 0, 0) == null;
     }
@@ -4785,9 +4788,8 @@ pub const Store = struct {
         const accounting = try self.reclamationStatusAssumeLockedWithCancel(cancel);
         const budget = self.maintenance_policy.options.max_storage_bytes;
         const workspace = self.vacuumWorkspaceBytes(compact);
-        const needs_exception = budget != 0 and accounting.totalBytes() +| workspace > budget;
-        const redo_rewrite = needs_exception and try self.canUseRedoRewriteWorkspace();
-        if (needs_exception and !redo_rewrite) {
+        const temporary_total = accounting.totalBytes() +| workspace;
+        if (budget != 0 and temporary_total > budget and !try self.canUseRedoRewriteWorkspace(temporary_total)) {
             self.maintenance_policy.status.state = .deferred;
             self.maintenance_policy.status.reason = .storage_budget;
             return null;
@@ -5198,8 +5200,9 @@ pub const Store = struct {
             const compact_estimate = if (compact != 0) compact else self.maintenance_policy.status.compact_size_estimate orelse workspace_reservation / 2;
             const occupied = status.current_file_bytes +| status.retired_file_bytes +| self.artifactBytes();
             const workspace = if (workspace_reservation != 0) workspace_reservation else self.vacuumWorkspaceBytes(compact_estimate);
-            redo_rewrite = budget != 0 and occupied +| workspace > budget;
-            if (redo_rewrite and !try self.canUseRedoRewriteWorkspace()) return error.LiteStorageBudgetExceeded;
+            const temporary_total = occupied +| workspace;
+            redo_rewrite = budget != 0 and temporary_total > budget;
+            if (redo_rewrite and !try self.canUseRedoRewriteWorkspace(temporary_total)) return error.LiteStorageBudgetExceeded;
             const estimated = compact_estimate +| if (budget != 0 and self.needsProtectedRedoUpgrade()) self.file.vacuumRedoReservation(budget) else 0;
             try self.admitEstimatedGenerationAssumeLocked(estimated, status.current_file_bytes);
             if (try self.availableDiskBytes()) |available| {
@@ -11316,6 +11319,9 @@ test "lite redo maintenance shrinks a segmented reservation under a lowered cap"
     try std.testing.expect((try store.file.file.stat(io)).size > cap);
 
     store.maintenance_policy.options.max_storage_bytes = cap;
+    try store.maintainOnce(true);
+    try std.testing.expect((try store.file.file.stat(io)).size > cap);
+    store.maintenance_policy.options.redo_rewrite_workspace_overage_bytes = 2 * 1024 * 1024;
     try store.maintainOnce(true);
     try std.testing.expectEqual(native.NativeFile.segmentedRedoCapacityForBudget(cap), store.file.header.redo_log_capacity);
     try std.testing.expect((try store.file.file.stat(io)).size < cap);

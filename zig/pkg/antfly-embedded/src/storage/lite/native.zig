@@ -8418,6 +8418,7 @@ pub const NativeFile = struct {
         // durability.
         const needs_barrier = !self.no_sync and (!self.read_only or !holds_authority);
         cold_scan: while (true) {
+            var torn_protected_watermark = false;
             // A fold that published between the catch-up above and this pin may
             // already have zero-filled the log from `folded_through`, and the
             // pin only defers folds after it. Catch up again under the pin until
@@ -8429,9 +8430,11 @@ pub const NativeFile = struct {
                 observed_checkpoint = published.checkpoint_sequence;
                 published_fold_start = if (checked) |state| state.fold_start_offset else 0;
                 published_reset_generation = published.reset_generation;
-                replay_ceiling = publishedReplayCeiling(r, checked);
+                torn_protected_watermark = self.header.protected_redo and !self.no_sync and checked == null;
+                replay_ceiling = if (torn_protected_watermark) null else publishedReplayCeiling(r, checked);
                 published_offset = published.durable_offset;
-                durable_ceiling_offset = publishedDurableCeiling(r, published);
+                durable_ceiling_offset = if (torn_protected_watermark) null else publishedDurableCeiling(r, published);
+                if (torn_protected_watermark) promised_durable = null;
                 if (published.checkpoint_sequence <= folded_through) {
                     if (checkpoint.redo_rotation) |rotation| {
                         if (checked != null and published.durable_sequence > folded_through and published.segment != rotation.active)
@@ -8469,7 +8472,8 @@ pub const NativeFile = struct {
             if (replay_ceiling == null and !holds_authority and sidecar_fence == null) {
                 switch (self.holdSidecarReadFence(io)) {
                     .held => |fence| sidecar_fence = fence,
-                    .absent, .own => {},
+                    .absent => {},
+                    .own => if (torn_protected_watermark) return error.FileBusy,
                     .busy => {
                         publish_waits += 1;
                         if (publish_waits >= cold_publish_wait_polls) return error.FileBusy;
@@ -10527,9 +10531,13 @@ pub const NativeFile = struct {
         if (self.durable_header != null) try self.sync();
         const redo = &self.redo.?;
         var next = self.activeCheckpoint();
-        const covered = next.redo_folded_through;
-        if (redo.writer.last_sequence != covered) return;
-        const selected = (try self.eligibleRedoSegmentRotation(covered)) orelse return;
+        // The caller established that no unfolded work remains. An
+        // allocator-only slot can cover a sequence that consumed no WAL
+        // record, so compare against the durable slot, not the fold floor.
+        const selected = (try self.eligibleRedoSegmentRotation(next.commit_sequence)) orelse return;
+        const durable = loadCheckpointSlot(self.file, self.runtimeIo(), self.header.page_size, try self.file.length(self.runtimeIo()), self.header.active_checkpoint);
+        if (durable.commit_sequence != next.commit_sequence or durable.redo_rotation == null or
+            !std.meta.eql(durable.redo_rotation, next.redo_rotation)) return;
         const previous = self.header;
         redo.checkpointing = true;
         defer redo.checkpointing = false;
@@ -18337,9 +18345,9 @@ pub const NativeFile = struct {
 
     /// Derive the cut from the selected extent without consulting a
     /// frontier that may already describe a newer checkpoint.
-    fn stableSnapshotRedoCut(self: *NativeFile, image: std.Io.File, capacity: u64, folded: u64, sequence: u64) !redo_log.Frontier {
+    fn stableSnapshotRedoCut(self: *NativeFile, image: std.Io.File, capacity: u64, folded: u64, sequence: u64, slot_sequence: u64) !redo_log.Frontier {
         if (sequence <= folded) return .{ .generation = 0, .sequence = folded, .end_offset = 0 };
-        const scan = try redo_log.replayBounded(self.allocator, image, self.runtimeIo(), self.header.redoOffset(), capacity, folded, sequence, folded, null, null);
+        const scan = try redo_log.replayBounded(self.allocator, image, self.runtimeIo(), self.header.redoOffset(), capacity, folded, sequence, slot_sequence, null, null);
         if (scan.last_sequence != sequence or scan.generation == null) return error.NativeRedoLogCorrupt;
         return .{ .generation = scan.generation.?, .sequence = sequence, .end_offset = scan.valid_bytes };
     }
@@ -18393,13 +18401,23 @@ pub const NativeFile = struct {
             return self.copyMaterializedSnapshot(dest_path, redo.syncedSequence(), source_size);
         }
 
-        const redo_cut = if (self.redo) |redo|
-            self.stableSnapshotRedoCut(self.file, self.header.redo_log_capacity, redo.checkpoint_sequence, redo.syncedSequence()) catch |err| {
-                if (err != error.NativeRedoLogCorrupt or !self.read_only) return err;
-                return self.copyMaterializedSnapshot(dest_path, redo.syncedSequence(), source_size);
+        var slot_sequence = checkpoint.commit_sequence;
+        const redo_cut = if (self.redo) |redo| cut: {
+            const sequence = redo.syncedSequence();
+            slot_sequence = redo.checkpoint_sequence;
+            const slots = loadCheckpointSlots(self.file, io, self.header.page_size, source_size);
+            for (slots) |slot| {
+                if (slot.redo_folded_through == redo.checkpoint_sequence and
+                    slot.commit_sequence <= sequence and std.meta.eql(slot.redo_rotation, checkpoint.redo_rotation))
+                {
+                    slot_sequence = @max(slot_sequence, slot.commit_sequence);
+                }
             }
-        else
-            null;
+            break :cut self.stableSnapshotRedoCut(self.file, self.header.redo_log_capacity, redo.checkpoint_sequence, sequence, slot_sequence) catch |err| {
+                if (err != error.NativeRedoLogCorrupt) return err;
+                return self.copyMaterializedSnapshot(dest_path, sequence, source_size);
+            };
+        } else null;
 
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-snapshot", .{dest_path});
         defer self.allocator.free(tmp_path);
@@ -18421,7 +18439,7 @@ pub const NativeFile = struct {
                 const active = self.header.redoOffset();
                 try self.copySnapshotRange(out_file, buffer, 0, reservation_start);
                 try self.copySnapshotRange(out_file, buffer, active, active + cut.end_offset);
-                const stable = self.stableSnapshotRedoCut(out_file, cut.end_offset, self.redo.?.checkpoint_sequence, cut.sequence) catch |err| {
+                const stable = self.stableSnapshotRedoCut(out_file, cut.end_offset, self.redo.?.checkpoint_sequence, cut.sequence, slot_sequence) catch |err| {
                     if (err != error.NativeRedoLogCorrupt or !self.read_only) return err;
                     break :raw_copy false;
                 };
@@ -18451,45 +18469,10 @@ pub const NativeFile = struct {
             // can never be mistaken for a later, now-truncated-away
             // generation's stale copied bytes.
             var snapshot_checkpoint = checkpoint;
-            // §9.3/§9.3a: under redo, `self.activeCheckpoint().commit_sequence`
-            // is not the real physical checkpoint on disk -- `stageMutation`'s
-            // own "track private changes" bump (its own doc comment)
-            // advances it on every ordinary, overlay-only commit so
-            // in-process callers can tell versions apart, while the real
-            // on-disk slot (and the physical tree this raw byte copy above
-            // just reproduced) stays at the last real `checkpointRedoLog`
-            // fold's sequence. Stamping the bumped value into the
-            // snapshot's own slot told a reopening `recoverRedoLog`
-            // "every record through this sequence is already in the
-            // tree," which is false under redo: every log record at or
-            // below that sequence is then treated as superseded and never
-            // replayed into the overlay, silently losing every write that
-            // only ever lived in the log (confirmed live: a reopened
-            // snapshot resolved a secret's "head" pointer back to
-            // revision 0 even though the live file it was copied from
-            // resolved it correctly). Use the real physical sequence
-            // instead, the same one `publishRedoLogState`/
-            // `checkpointRedoLog` already treat as authoritative.
-            //
-            // perf/lwa-fold-boundary: kept even now that recovery itself
-            // reads `redo_folded_through` (set right below, to the same
-            // value) rather than trusting `commit_sequence` as the fold
-            // boundary -- this still matters independently, because
-            // `commit_sequence` is also this slot's own *tip* (compared
-            // directly by `readMark`/`committedSequence`-style callers,
-            // and by `recoverRedoLog`'s own metadata pass whenever the
-            // copied log region happens to hold nothing past the fold to
-            // correct it from). Leaving it at the inflated, bumped-for-
-            // bookkeeping value would make the snapshot's reported tip
-            // disagree with what its own copied tree pages actually
-            // contain.
-            if (self.redo) |redo| snapshot_checkpoint.commit_sequence = redo.checkpoint_sequence;
-            // The fold boundary itself: this snapshot's tree pages are a
-            // raw byte copy, so they reflect real content only up to the
-            // source's last real fold -- exactly `redo.checkpoint_sequence`
-            // -- regardless of how much further the copied log region (if
-            // any was included in `snapshot_size`) advances the tip once
-            // replayed on reopen.
+            // The physical slot accounts for allocator-only sequences,
+            // while the fold boundary records which WAL mutations the
+            // copied tree already contains. The overlay tip is neither.
+            snapshot_checkpoint.commit_sequence = slot_sequence;
             if (self.redo) |redo| snapshot_checkpoint.redo_folded_through = redo.checkpoint_sequence;
             snapshot_checkpoint.presynced = true;
             snapshot_checkpoint.manifest_page = 0;
@@ -39793,13 +39776,14 @@ test "lite redo log dead-writer recovery keeps the published prefix past a torn 
 // A torn publication may belong to a live writer descheduled mid-publish,
 // which can append again while a cold reader scans. The reader still bounds
 // its replay, by the fields the publication left behind.
-test "lite redo log a cold reader bounds its replay while the watermark is torn" {
+test "lite redo log a cold reader uses the durable frontier while the watermark is torn" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "redo-torn-cold.aflite");
     defer a.free(path);
+    var damaged_offset: u64 = undefined;
     {
         var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
         defer writer.close();
@@ -39808,6 +39792,7 @@ test "lite redo log a cold reader bounds its replay while the watermark is torn"
         try writer.commitTransaction();
         const region = (try writer.regionForInode()).?;
         const published = region.readLogStateChecked().?;
+        damaged_offset = writer.header.redoOffset() + writer.redo.?.writer.tail;
         try writer.beginTransaction();
         try writer.putDocument("beta", "two");
         try writer.commitTransaction();
@@ -39815,10 +39800,17 @@ test "lite redo log a cold reader bounds its replay while the watermark is torn"
         region.publishLogState(published);
         region.tearLogStateForTest();
     }
-    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
-    defer reader.close();
-    try expectRedoDocument(&reader, "alpha", "one");
-    try expectRedoDocument(&reader, "beta", null);
+    {
+        var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+        defer reader.close();
+        try expectRedoDocument(&reader, "alpha", "one");
+        try expectRedoDocument(&reader, "beta", "two");
+    }
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    const zeros: [redo_log.header_len]u8 = @splat(0);
+    try file.writePositionalAll(io, &zeros, damaged_offset);
+    try std.testing.expectError(error.NativeRedoLogCorrupt, NativeFile.openWithIo(a, io, path, .{ .read_only = true }));
 }
 
 // The recovered suffix becomes the writer's own tail only once it is
@@ -40159,6 +40151,17 @@ test "lite redo segment rotation retries a folded extent after reader release" {
         try std.testing.expectEqual(@as(u1, 1), writer.activeCheckpoint().redo_rotation.?.active);
         try std.testing.expect(writer.redo.?.writer.tail != 0);
     }
+    // Model an allocator-only slot which advanced the tip without
+    // appending a record or changing the fold boundary.
+    var maintenance_slot = writer.activeCheckpoint();
+    maintenance_slot.commit_sequence += 1;
+    {
+        writer.redo.?.checkpointing = true;
+        defer writer.redo.?.checkpointing = false;
+        try writer.publishCheckpoint(maintenance_slot, false, null);
+        writer.resyncRedoSequenceAfterSlotCommit();
+    }
+    try std.testing.expect(writer.redo.?.writer.last_sequence.? > maintenance_slot.redo_folded_through);
     try writer.checkpointRedoLog();
     try std.testing.expectEqual(@as(u1, 0), writer.activeCheckpoint().redo_rotation.?.active);
     try std.testing.expectEqual(@as(u64, 0), writer.redo.?.writer.tail);
@@ -40380,6 +40383,13 @@ test "lite redo log a non-durable reclaim does not advance the durable watermark
     try writer.putDocument("beta", "two");
     try writer.commitTransaction();
     try std.testing.expect(writer.durableSequence() > reclaimed);
+    const backup = try testPath(a, tmp, "redo-ledger-gap-snapshot.aflite");
+    defer a.free(backup);
+    _ = try writer.copyStableSnapshotToPath(backup, false);
+    var reader = try NativeFile.openWithIo(a, io, backup, .{ .read_only = true });
+    defer reader.close();
+    try expectRedoDocument(&reader, "alpha", "value-7");
+    try expectRedoDocument(&reader, "beta", "two");
 }
 
 // A shrink makes its smaller header durable before the allocator releases
