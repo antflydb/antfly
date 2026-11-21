@@ -52,7 +52,7 @@ pub fn state(txn: anytype) !State {
     };
     const version = internal_keys.decodeReplayJournalFormatVersion(raw) orelse return error.UnsupportedReplayJournalFormat;
     if (version == internal_keys.replay_journal_format_v2) return .legacy;
-    if (version != internal_keys.replay_journal_format_current) return error.UnsupportedReplayJournalFormat;
+    if (version != internal_keys.replay_journal_format_current and version != internal_keys.replay_journal_format_protected_credit) return error.UnsupportedReplayJournalFormat;
     return .current;
 }
 

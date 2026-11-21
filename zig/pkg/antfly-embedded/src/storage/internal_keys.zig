@@ -219,6 +219,7 @@ pub const replay_journal_format_v2: u32 = 2;
 /// journal is upgraded with the index floor at its head.
 pub const replay_journal_format_v3: u32 = 3;
 pub const replay_journal_format_current: u32 = replay_journal_format_v3;
+pub const replay_journal_format_protected_credit: u32 = 4;
 pub const replay_journal_format_version_key = globalReplayPrefix(.journal_format_version);
 pub const journal_credit_ledger_key = globalReplayPrefix(.journal_credit_ledger);
 pub const journal_credit_lane_heads_key = globalReplayPrefix(.journal_credit_lane_heads);
@@ -258,7 +259,29 @@ pub const JournalCreditLedger = struct {
         return raw;
     }
 
+    pub const protected_len = encoded_len + 8 + 4;
+
+    pub fn encodeProtected(self: JournalCreditLedger, binding: u64) [protected_len]u8 {
+        var raw: [protected_len]u8 = undefined;
+        raw[0..encoded_len].* = self.encode();
+        std.mem.writeInt(u64, raw[encoded_len..][0..8], binding, .little);
+        std.mem.writeInt(u32, raw[protected_len - 4 ..], std.hash.Crc32.hash(raw[0 .. protected_len - 4]), .little);
+        return raw;
+    }
+
+    pub fn decodeProtected(raw: []const u8) ?JournalCreditLedger {
+        if (raw.len != protected_len) return null;
+        if (std.mem.readInt(u32, raw[protected_len - 4 ..][0..4], .little) != std.hash.Crc32.hash(raw[0 .. protected_len - 4])) return null;
+        return decode(raw[0..encoded_len]);
+    }
+
+    pub fn protectedBinding(raw: []const u8) ?u64 {
+        _ = decodeProtected(raw) orelse return null;
+        return std.mem.readInt(u64, raw[encoded_len..][0..8], .little);
+    }
+
     pub fn decode(raw: []const u8) ?JournalCreditLedger {
+        if (raw.len == protected_len) return decodeProtected(raw);
         if (raw.len != encoded_len) return null;
         return .{
             .bytes = std.mem.readInt(u64, raw[0..8], .little),
