@@ -26,9 +26,12 @@ function integer(n, max = Number.MAX_SAFE_INTEGER) {
 }
 function byteLength(shape, kind) {
   const block = blockTypes.get(kind);
-  if (!block || !shape.length || shape.length > 4 || shape.some(n => !Number.isSafeInteger(n) || n <= 0)) throw new Error('Unsupported tensor shape or precision');
+  // Scalars (shape []) hold one element; checkpoints use them for per-layer
+  // clip bounds, e.g. EmbeddingGemma 2's audio tower. Block-quantized types
+  // still need a block-aligned row.
+  if (!block || shape.length > 4 || shape.some(n => !Number.isSafeInteger(n) || n <= 0)) throw new Error('Unsupported tensor shape or precision');
   const n = shape.reduce((a, b) => integer(a * b), 1);
-  if (shape.at(-1) % block[0]) throw new Error('Quantized tensor row is not block-aligned');
+  if ((shape.length ? shape.at(-1) : 1) % block[0]) throw new Error('Quantized tensor row is not block-aligned');
   return integer(n / block[0] * block[1], LIMITS.tensor);
 }
 export function normalizeFiles(files) {

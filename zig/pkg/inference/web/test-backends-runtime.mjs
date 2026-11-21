@@ -198,6 +198,9 @@ async function embeddingFixture(directory) {
     for (const [name, shape] of [['self_attn.q_proj.weight', [4 * d, 512]], ['self_attn.k_proj.weight', [kv * d, 512]], ['self_attn.v_proj.weight', [kv * d, 512]], ['self_attn.o_proj.weight', [512, 4 * d]], ['mlp.gate_proj.weight', [2048, 512]], ['mlp.up_proj.weight', [2048, 512]], ['mlp.down_proj.weight', [512, 2048]], ['ple_block.per_layer_input_gate.weight', [512, 512]], ['ple_block.per_layer_projection.weight', [512, 512]]]) add(p + name, shape);
     for (const name of ['input_layernorm.weight', 'post_attention_layernorm.weight', 'pre_feedforward_layernorm.weight', 'post_feedforward_layernorm.weight', 'ple_block.post_per_layer_input_norm.weight', 'self_attn.q_norm.weight', 'self_attn.k_norm.weight', 'layer_scalar']) add(p + name, [name === 'layer_scalar' ? 1 : name.startsWith('self_attn') ? d : 512], name === 'layer_scalar' ? [0] : []);
   }
+  // The real checkpoint's media towers include scalar (shape []) clip bounds;
+  // the text adapter skips them, but the tensor directory must accept them.
+  add('audio_tower.layers.0.feed_forward1.ffw_layer_1.input_max', []);
   const bytes = Buffer.from(JSON.stringify(header)), prefix = Buffer.alloc(8); prefix.writeBigUInt64LE(BigInt(bytes.length));
   const path = join(directory, 'model.safetensors'), file = await open(path, 'w');
   try { await file.write(prefix); await file.write(bytes); await file.truncate(8 + bytes.length + offset); for (const position of writes) await file.write(Buffer.from([0x80, 0x3f]), 0, 2, 8 + bytes.length + position); } finally { await file.close(); }
