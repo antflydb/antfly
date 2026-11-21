@@ -416,7 +416,7 @@ test "replication transport preserves deferred errors through boundary dispatch"
         .parameters = &.{},
         .parameter_types = &.{},
         .limit = 1,
-        .deadline = std.Io.Clock.awake.now(std.testing.io),
+        .deadline = .{ .raw = std.Io.Clock.awake.now(std.testing.io), .clock = .awake },
         .cancel_requested = &canceled,
     };
     try std.testing.expectError(error.ReplicationReadDeferred, stream.readMessage(std.testing.allocator, request, @fromBackingInt(1), 64));
