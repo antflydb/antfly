@@ -40578,7 +40578,7 @@ test "CUDA physical capture scopes reject nesting and retain operand addresses" 
     var replay = PhysicalReplay{ .compute = &compute };
     // A reused context pointer does not identify the numerical provider.
     // Reject before sampling a CUDA context or retaining any storage.
-    try std.testing.expect(!try replay.begin(&.{&wrong_provider}));
+    try std.testing.expect(!try PhysicalReplay.begin(&replay, &.{&wrong_provider}));
     try std.testing.expectEqual(@as(usize, 0), compute.capturing_physical_storage.values.items.len);
     try physicalExecutionScopeOp(&compute, &leases);
     try std.testing.expectError(error.PhysicalExecutionScopeActive, physicalExecutionScopeOp(&compute, &leases));
