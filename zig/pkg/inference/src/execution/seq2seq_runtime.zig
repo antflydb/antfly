@@ -186,7 +186,8 @@ pub const State = struct {
                     self.cached_outputs[past.output_index].borrowedView(info.name),
             };
         }
-        const outputs = try @import("tensor_dispatch.zig").run(self.allocator, self.session, null, self.session.execution_gate, self.inputs, control, dispatch);
+        const tensor_dispatch = @import("tensor_dispatch.zig");
+        const outputs = try tensor_dispatch.run(self.allocator, self.session, null, self.session.execution_gate, self.inputs, control, dispatch);
         errdefer kv.freeTensorSlice(self.allocator, outputs);
         if (outputs.len != self.session.outputInfo().len) return error.InvalidDecoderOutput;
         for (outputs, self.session.outputInfo()) |output, info| {
@@ -200,13 +201,17 @@ pub const State = struct {
             .past => |past| {
                 const output = outputs[past.output_index];
                 if (output.shape.len != 4) return error.InvalidDecoderOutput;
-                if (!fresh and past.cross and output.data.len == 0) continue;
+                if (!fresh and past.cross and output.data.len == 0) {
+                    if (!tensor_dispatch.validTensor(output)) return error.InvalidDecoderOutput;
+                    continue;
+                }
                 const expected = [_]i64{ 1, past.empty_shape[1], @intCast(if (past.cross) self.mask.len else prefix.len), past.empty_shape[3] };
                 if (!std.mem.eql(i64, output.shape, &expected)) return error.InvalidDecoderOutput;
                 try validateOutputBytes(output);
             },
             else => {},
         };
+        if (control) |active| try active.check();
         // Every possible error precedes ownership transfer or advancement.
         // An empty cross output explicitly keeps this request's previous K/V.
         if (!fresh) {
