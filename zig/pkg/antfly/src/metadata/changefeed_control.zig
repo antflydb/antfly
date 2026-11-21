@@ -26,6 +26,7 @@ pub const verified_bootstrap_protocol_version: u16 = 122;
 pub const qualified_bootstrap_protocol_version: u16 = 123;
 pub const slot_snapshot_start_protocol_version: u16 = 124;
 pub const provider_history_protocol_version: u16 = 125;
+pub const physical_history_protocol_version: u16 = 126;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -156,6 +157,31 @@ pub const Position = struct {
 };
 pub const Snapshot = struct { id: Id, digest: Digest, expires_at: u64 };
 pub const BootstrapPosition = struct { page: u64 = 0, continuation: []const u8 = "", done: bool = false };
+pub const PhysicalRoot = struct {
+    group_id: u64,
+    range_id: u64,
+
+    pub fn valid(self: PhysicalRoot) bool {
+        return self.group_id != 0 and self.range_id != 0;
+    }
+};
+
+fn writePhysicalRootRecord(value: anytype, writer: anytype) @TypeOf(writer.*).Error!void {
+    try writer.beginObject();
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
+        if (comptime std.mem.eql(u8, name, "physical")) {
+            if (value.physical) |physical| {
+                try writer.objectField(name);
+                try writer.write(physical);
+            }
+        } else {
+            try writer.objectField(name);
+            try writer.write(@field(value, name));
+        }
+    }
+    try writer.endObject();
+}
+
 pub const Root = struct {
     namespace: Namespace,
     ownership_epoch: u64,
@@ -176,8 +202,21 @@ pub const Root = struct {
     pending_control: ?root_intent.State = null,
     last_control: ?root_intent.Settlement = null,
     last_reconciliation: ?root_intent.Reconciliation = null,
+    physical: ?PhysicalRoot = null,
+
+    pub fn jsonStringify(self: Root, writer: anytype) @TypeOf(writer.*).Error!void {
+        return writePhysicalRootRecord(self, writer);
+    }
 };
-pub const RootPlan = struct { namespace: Namespace, ownership_epoch: u64 };
+pub const RootPlan = struct {
+    namespace: Namespace,
+    ownership_epoch: u64,
+    physical: ?PhysicalRoot = null,
+
+    pub fn jsonStringify(self: RootPlan, writer: anytype) @TypeOf(writer.*).Error!void {
+        return writePhysicalRootRecord(self, writer);
+    }
+};
 
 /// Catalog-backed history has one logical root per table incarnation and
 /// remains stable across placement or index topology changes.
@@ -387,6 +426,7 @@ pub const State = struct {
                 if (pending.sequence > self.authority_sequence or pending.ownership_epoch != root.ownership_epoch or pending.grant_sequence != root.grant_sequence or root.released) return error.InvalidChangefeed;
             }
             if (!nz(root.namespace) or root.ownership_epoch == 0 or root.grant_sequence == 0 or root.grant_sequence > self.authority_sequence or
+                (root.physical != null and !root.physical.?.valid()) or
                 !definition.contains(std.mem.readInt(u64, root.namespace[0..8], .big)) or
                 (index != 0 and std.mem.order(u8, &self.roots[index - 1].namespace, &root.namespace) != .lt)) return error.InvalidChangefeed;
             if (root.renewed_through > self.expires_at or (root.consumer_epoch == 0 and root.renewed_through != 0)) return error.InvalidChangefeed;
@@ -550,6 +590,9 @@ pub const Mutation = union(enum) {
             .create => |create| if (create.definition.usesProviderHistory()) return provider_history_protocol_version,
             .restart => |restart| if (restart.definition.usesProviderHistory()) return provider_history_protocol_version,
             .stage_catalog_start, .renew_catalog => return provider_history_protocol_version,
+            .plan_roots => |plans| for (plans) |plan| {
+                if (plan.physical != null) return physical_history_protocol_version;
+            },
             .seal => |sealed| if (sealed.catalog_starts.len != 0) return provider_history_protocol_version,
             else => {},
         }
@@ -577,7 +620,7 @@ pub const Mutation = union(enum) {
             },
             .plan_roots => |plans| {
                 if (plans.len == 0 or plans.len > max_roots) return error.InvalidChangefeed;
-                for (plans, 0..) |plan, index| if (!nz(plan.namespace) or plan.ownership_epoch == 0 or (index != 0 and std.mem.order(u8, &plans[index - 1].namespace, &plan.namespace) != .lt)) return error.InvalidChangefeed;
+                for (plans, 0..) |plan, index| if (!nz(plan.namespace) or plan.ownership_epoch == 0 or (plan.physical != null and !plan.physical.?.valid()) or (index != 0 and std.mem.order(u8, &plans[index - 1].namespace, &plan.namespace) != .lt)) return error.InvalidChangefeed;
             },
             .enroll => |value| {
                 if (!nz(value.namespace) or value.ownership_epoch == 0 or value.grant_sequence == 0 or value.consumer_epoch == 0) return error.InvalidChangefeed;
@@ -819,7 +862,7 @@ pub const Mutation = union(enum) {
             .plan_roots => |plans| {
                 if (state.phase != .enrolling or state.roots.len != 0 or plans.len == 0 or plans.len > max_roots) return error.ChangefeedConflict;
                 const roots = try a.alloc(Root, plans.len);
-                for (plans, roots) |plan, *root| root.* = .{ .namespace = plan.namespace, .ownership_epoch = plan.ownership_epoch, .grant_sequence = stamp.sequence };
+                for (plans, roots) |plan, *root| root.* = .{ .namespace = plan.namespace, .ownership_epoch = plan.ownership_epoch, .grant_sequence = stamp.sequence, .physical = plan.physical };
                 next.roots = roots;
             },
             .enroll => |enrollment| {

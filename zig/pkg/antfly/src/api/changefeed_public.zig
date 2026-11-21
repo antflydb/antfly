@@ -1077,8 +1077,8 @@ fn createIceberg(a: A, policy: *Policy, meta: config.Port, key: []const u8, defi
     if (factory) |provider| {
         for (provider.captured.roots) |route| {
             if (!same(authority, try @import("history_policy_provisioning.zig").authority(route.fence))) return error.TopologyChanged;
-            try plans.append(scratch, .{ .namespace = route.namespace, .ownership_epoch = 1 });
         }
+        try plans.appendSlice(scratch, try provider.captured.initialPlans(scratch));
     }
     std.mem.sort(control.RootPlan, plans.items, {}, struct {
         fn less(_: void, left: control.RootPlan, right: control.RootPlan) bool {

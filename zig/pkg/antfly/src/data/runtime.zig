@@ -45499,7 +45499,7 @@ fn consumerTests() type {
                 defer a.destroy(meta_store);
                 meta_store.* = try FeedStore.init(a, .{ .root_dir = meta_path });
                 defer meta_store.deinit();
-                var feed_svc: feed_fixture.Service = .{ .store = meta_store, .id = @splat(6), .authority = grant.authority };
+                var feed_svc: feed_fixture.Service = .{ .store = meta_store, .id = @splat(6), .authority = grant.authority, .max_topology_protocol = feed_control.physical_history_protocol_version };
                 const feed_table: antfly.metadata.table_manager.TableRecord = .{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" };
                 try meta_store.applyStandaloneCommand(feed_svc.metadata_group_id, .{ .upsert_table = feed_table });
                 try feed_svc.mutate(a, .{ .create = .{ .id = feed_svc.id, .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = feed_control.tableBinding(feed_table), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } });
@@ -45990,7 +45990,6 @@ fn consumerTests() type {
                             result.* = PublicFeedHarness.run(allocator, svc, source, table, node, fence, true);
                         }
                     };
-                    feed_svc.max_topology_protocol = feed_control.qualified_bootstrap_protocol_version;
                     metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
                     defer metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     var outcome: anyerror!void = undefined;

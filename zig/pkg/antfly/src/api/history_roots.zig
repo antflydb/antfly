@@ -31,6 +31,15 @@ pub const Root = struct {
     table_name: []const u8,
     table_binding: control.Digest,
     fence: metadata.CatalogRouteFence,
+
+    fn physicalIdentity(self: Root) ?control.PhysicalRoot {
+        if (self.physical_range_id == 0) return null;
+        return .{ .group_id = self.fence.route.group_id, .range_id = self.physical_range_id };
+    }
+
+    fn matchesPhysical(self: Root, stored: control.Root) bool {
+        return stored.physical == null or std.meta.eql(stored.physical, self.physicalIdentity());
+    }
 };
 const SplitCut = @import("split_history_operations.zig").wire;
 const SplitTransition = @import("../metadata/transition_state.zig").SplitTransitionRecord;
@@ -99,7 +108,7 @@ pub const Captured = struct {
         errdefer a.free(plans);
         for (self.roots, plans, 0..) |root, *plan, index| {
             if (index != 0 and std.mem.eql(u8, &self.roots[index - 1].namespace, &root.namespace)) return error.TopologyChanged;
-            plan.* = .{ .namespace = root.namespace, .ownership_epoch = 1 };
+            plan.* = .{ .namespace = root.namespace, .ownership_epoch = 1, .physical = root.physicalIdentity() };
         }
         return plans;
     }
@@ -117,7 +126,7 @@ pub const Captured = struct {
                 if (!std.mem.eql(u8, &root.namespace, &control.catalogRootNamespace(table))) return error.ChangefeedResynchronizationRequired;
                 continue;
             }
-            if (route_index >= self.roots.len or !std.mem.eql(u8, &root.namespace, &self.roots[route_index].namespace))
+            if (route_index >= self.roots.len or !std.mem.eql(u8, &root.namespace, &self.roots[route_index].namespace) or !self.roots[route_index].matchesPhysical(root))
                 return error.ChangefeedResynchronizationRequired;
             route_index += 1;
         }
@@ -129,7 +138,7 @@ pub const Captured = struct {
     pub fn validateInitialRoutes(self: *const Captured, planned: []const control.Root) !void {
         if (planned.len != self.roots.len) return error.ChangefeedResynchronizationRequired;
         for (planned, self.roots) |root, route| {
-            if (!std.mem.eql(u8, &root.namespace, &route.namespace) or root.ownership_epoch != 1 or root.released)
+            if (!std.mem.eql(u8, &root.namespace, &route.namespace) or root.ownership_epoch != 1 or root.released or !route.matchesPhysical(root))
                 return error.ChangefeedResynchronizationRequired;
         }
     }
@@ -682,6 +691,9 @@ pub const test_support = if (@import("builtin").is_test) struct {
         defer a.free(plans);
         try std.testing.expectEqual(@as(usize, 3), plans.len);
         try std.testing.expectEqual(@as(u64, 1), plans[0].ownership_epoch);
+        try std.testing.expectEqual(control.PhysicalRoot{ .group_id = 71, .range_id = 71 }, plans[0].physical.?);
+        const mutation: control.Mutation = .{ .plan_roots = plans };
+        try std.testing.expectEqual(control.physical_history_protocol_version, mutation.requiredProtocol());
         try std.testing.expectEqual(@as(usize, 0), fixture.admin_calls);
         var split_ranges = ranges;
         split_ranges[0].doc_identity_range_id = split_ranges[2].doc_identity_range_id;
