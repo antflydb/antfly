@@ -44,7 +44,7 @@ pub const Pins = struct {
     webm_windows: [64]struct { key: WindowKey, apple: bool } = undefined,
     webm_window_count: usize = 0,
 
-    const WindowKey = struct { index: *const anyopaque, policy: @import("antfly_video").sampling.TimestampPolicy };
+    pub const WindowKey = struct { index: *const anyopaque, policy: @import("antfly_video").sampling.TimestampPolicy };
 
     pub fn webmApple(self: *const Pins, key: WindowKey) ?bool {
         for (self.webm_windows[0..self.webm_window_count]) |entry| {

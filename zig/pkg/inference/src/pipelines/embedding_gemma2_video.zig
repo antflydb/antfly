@@ -2189,7 +2189,7 @@ pub fn pinCachedPlan(original: Plan, bytes: []const u8, reader: ?*const media.mp
             misses[count] = id;
             count += 1;
         }
-        const key = .{ .index = input.index, .policy = window.policy };
+        const key = CachePins.WindowKey{ .index = input.index, .policy = window.policy };
         const possible = pins.?.webmApple(key) orelse (if (count != 0)
             try appleReplayPossible(input, input.index.*, misses[0..count], try webmReplayForMisses(input.index.*, misses[0..count], window.replay))
         else
