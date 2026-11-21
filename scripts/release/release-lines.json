@@ -3,12 +3,25 @@
   "lines": {
     "0.2": {
       "source_ref": "refs/heads/v0.2.x",
-      "trusted_source_refs": ["refs/heads/main", "refs/heads/v0.2.x"],
+      "trusted_source_refs": [
+        "refs/heads/main",
+        "refs/heads/v0.2.x"
+      ],
       "status": "active"
     },
     "0.3": {
+      "source_ref": "refs/heads/v0.3.x",
+      "trusted_source_refs": [
+        "refs/heads/main",
+        "refs/heads/v0.3.x"
+      ],
+      "status": "active"
+    },
+    "0.4": {
       "source_ref": "refs/heads/main",
-      "trusted_source_refs": ["refs/heads/main"],
+      "trusted_source_refs": [
+        "refs/heads/main"
+      ],
       "status": "active"
     }
   },
