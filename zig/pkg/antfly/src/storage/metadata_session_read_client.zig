@@ -100,6 +100,11 @@ const Read = struct {
             if (value.len != length) return error.StorageKernelFailure;
             return value;
         }
+        pub fn probePrefix(self: *@This(), key: []const u8, length: usize) ![]const u8 {
+            if (length > 128) return error.InvalidArgument;
+            return self.read.readValue(self.arena.allocator(), .{ .operation = .probe_prefix, .key = .fromSlice(key), .length = @intCast(length) });
+        }
+
         pub fn close(self: *@This()) void {
             self.arena.deinit();
             self.read.release();

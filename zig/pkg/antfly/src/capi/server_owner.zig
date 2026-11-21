@@ -2804,7 +2804,7 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
         return .ok;
     }
     const bounded = switch (request.operation) {
-        .get, .get_range, .count_prefix, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
+        .get, .get_range, .probe_prefix, .count_prefix, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
         else => false,
     };
     const upper_seek = request.operation == .seek_at_or_before and std.mem.eql(u8, key, upper_bound);
@@ -2816,8 +2816,9 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
         out_value.* = .{ .ptr = bytes.ptr, .len = 8 };
         return .ok;
     }
-    if (request.operation == .get or request.operation == .get_range) {
-        var scope = if (request.operation == .get_range) read.txn.openReadScope(read.alloc) catch |err| return storageOwnerStatusFromError(err) else null;
+    if (request.operation == .probe_prefix and (request.offset != 0 or request.length > 128)) return .invalid_argument;
+    if (request.operation == .get or request.operation == .get_range or request.operation == .probe_prefix) {
+        var scope = if (request.operation != .get) read.txn.openReadScope(read.alloc) catch |err| return storageOwnerStatusFromError(err) else null;
         defer if (scope) |*s| s.close();
         const value = if (scope) |*s| blk: {
             if (request.length > kernel_owner_abi.metadata_session_max_value_bytes) return .invalid_argument;
@@ -2828,9 +2829,7 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
             const logical = key[read.prefix.len..];
             const cached = session_record.cachedRange(s, read.alloc, read.group, logical, request.offset, request.length) catch |err| return storageOwnerStatusFromError(err);
             if (cached) |bytes| break :blk bytes;
-            // Session header callers can fall back to one full decode.
-            if (request.offset == 0 and request.length <= session_record.cached_prefix_bytes and std.mem.startsWith(u8, logical, session_record.session_prefix))
-                return .end_of_stream;
+            if (request.operation == .probe_prefix) return .end_of_stream;
             const full = s.get(key) catch |err| return storageOwnerStatusFromError(err);
             if (request.offset > full.len or request.length > full.len - request.offset) return .end_of_stream;
             break :blk full[@intCast(request.offset)..][0..request.length];
@@ -2843,7 +2842,7 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     var cursor = read.txn.openCursor() catch |err| return storageOwnerStatusFromError(err);
     defer cursor.close();
     var entry = switch (request.operation) {
-        .get, .get_range, .count_prefix, .prefix_page => unreachable,
+        .get, .get_range, .probe_prefix, .count_prefix, .prefix_page => unreachable,
         .first => cursor.seekAtOrAfter(read.prefix),
         .last => cursor.seekAtOrBefore(upper_bound),
         .next, .seek_at_or_after => cursor.seekAtOrAfter(key),

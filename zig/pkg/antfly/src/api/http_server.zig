@@ -14450,8 +14450,9 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn authorizedTransactionMutation(self: *ApiHttpServer, id: db_mod.types.TxnId, identity: ?AuthenticatedIdentity) !?transactions_api.Mutation {
-        var details = (try self.authorizedTransactionSessionDetails(id, identity, false)) orelse return null;
+        var details = (try self.txn_sessions.getAuthorizationDetailsForPrincipal(self.alloc, id, transactionPrincipal(identity))) orelse return null;
         defer details.deinit(self.alloc);
+        if (!directTransactionRouteEligible(details, false) or !try self.transactionSessionDetailsAuthorized(identity, details)) return null;
         var guard = try self.txn_sessions.mutation(self.alloc, id, self.localSessionNodeId());
         guard.bindPublicSession(details.status.begin_timestamp, transactionPrincipal(identity));
         return guard;
