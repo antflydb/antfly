@@ -13846,29 +13846,36 @@ pub const NativeFile = struct {
         if (self.stagingTransaction() and mutations.len >= TransactionWrites.max_keys) {
             // The caller already owns a complete batch until this call returns.
             // Consume it directly instead of copying it into bounded staging
-            // and rebuilding the same index for every staging-sized chunk.
+            // and rebuilding the same index for every staging-sized chunk --
+            // but only for a non-diverting commit. A diverting commit's
+            // allocator has no ledger, so catalog B-tree pages built through
+            // it would be reachable but never owned (the same failure
+            // `putDocumentBatch`'s shortcut guards against); it logs each
+            // mutation through `stageMutation` below instead.
             try self.flushTransactionWrites();
             const writes = try self.transactionWrites();
-            self.flushing_transaction = true;
-            self.transaction_pages = &writes.pages;
-            defer {
-                self.transaction_pages = null;
-                self.flushing_transaction = false;
-            }
-            try self.putCatalogBatchForRoot(root, mutations, options);
-            // The staged path's catalog chain walk in `flushTransactionWrites`
-            // never sees this batch. A redo fold folds external values whose
-            // chain pages a diverting commit wrote outside the ledger; the
-            // records above retained only each chain's root.
-            if (self.redo != null) if (writes.pages.ledger) |state| {
-                const checkpoint = self.activeCheckpoint();
-                for (mutations) |m| {
-                    if (m.is_delete or m.external_value_root_page == 0) continue;
-                    try self.retainUnretainedValueChainPages(state, checkpoint, m.external_value_root_page, m.external_value_len, null);
+            if (!writes.pages.diverting) {
+                self.flushing_transaction = true;
+                self.transaction_pages = &writes.pages;
+                defer {
+                    self.transaction_pages = null;
+                    self.flushing_transaction = false;
                 }
-            };
-            try writes.pages.flush();
-            return;
+                try self.putCatalogBatchForRoot(root, mutations, options);
+                // The staged path's catalog chain walk in `flushTransactionWrites`
+                // never sees this batch. A redo fold folds external values whose
+                // chain pages a diverting commit wrote outside the ledger; the
+                // records above retained only each chain's root.
+                if (self.redo != null) if (writes.pages.ledger) |state| {
+                    const checkpoint = self.activeCheckpoint();
+                    for (mutations) |m| {
+                        if (m.is_delete or m.external_value_root_page == 0) continue;
+                        try self.retainUnretainedValueChainPages(state, checkpoint, m.external_value_root_page, m.external_value_len, null);
+                    }
+                };
+                try writes.pages.flush();
+                return;
+            }
         }
         if (self.stagingTransaction()) {
             for (mutations) |m| try self.stageMutation(if (root == .metadata) .metadata else .index, .{ .key = m.key, .value = m.value, .is_delete = m.is_delete, .external_value_root_page = m.external_value_root_page, .external_value_len = m.external_value_len }, options);
@@ -38787,6 +38794,58 @@ test "lite redo log bulk-built document index over max_keys passes check() after
     try std.testing.expect((try reopened.check()).valid);
     for (mutations) |mutation| {
         const value = (try reopened.getDocumentAlloc(a, mutation.key)) orelse return error.TestExpectedEqual;
+        defer a.free(value);
+        try std.testing.expectEqualSlices(u8, mutation.value, value);
+    }
+}
+
+// The catalog counterpart of the document test above. A guarded text merge
+// repoints every document it rewrote in one index-catalog batch, which can
+// exceed `TransactionWrites.max_keys`. Under a diverting commit the batch
+// must be logged per mutation rather than built into catalog B-tree pages
+// through the no-ledger allocator.
+test "lite redo log bulk index-catalog batch over max_keys passes check() after commit, fold, and reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-bulk-catalog.aflite");
+    defer a.free(path);
+
+    const count = 1200;
+    try std.testing.expect(count >= TransactionWrites.max_keys);
+    const keys = try a.alloc([24]u8, count);
+    defer a.free(keys);
+    const values = try a.alloc([12]u8, count);
+    defer a.free(values);
+    const mutations = try a.alloc(CatalogMutation, count);
+    defer a.free(mutations);
+    for (mutations, 0..) |*mutation, i| {
+        @memset(&values[i], 'm');
+        mutation.* = .{ .key = try std.fmt.bufPrint(&keys[i], "docmap/doc-{d:0>11}", .{i}), .value = &values[i] };
+    }
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 4 * 1024 * 1024);
+    errdefer file.close();
+    try file.putIndexCatalogRecord("meta/next_seg_id", "\x00\x00\x00\x00\x00\x00\x00\x01");
+    try file.beginTransaction();
+    try file.putIndexCatalogBatch(mutations);
+    try file.commitTransaction();
+    try std.testing.expect((try file.check()).valid);
+
+    try file.checkpointRedoLog();
+    try std.testing.expect((try file.check()).valid);
+    for (mutations) |mutation| {
+        const value = (try file.getIndexCatalogRecordAlloc(a, mutation.key)) orelse return error.TestExpectedEqual;
+        defer a.free(value);
+        try std.testing.expectEqualSlices(u8, mutation.value, value);
+    }
+
+    file.close();
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    try std.testing.expect((try reopened.check()).valid);
+    for (mutations) |mutation| {
+        const value = (try reopened.getIndexCatalogRecordAlloc(a, mutation.key)) orelse return error.TestExpectedEqual;
         defer a.free(value);
         try std.testing.expectEqualSlices(u8, mutation.value, value);
     }

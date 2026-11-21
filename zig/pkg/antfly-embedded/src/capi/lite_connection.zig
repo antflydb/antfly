@@ -8458,6 +8458,8 @@ test "capi native separate writer processes keep full-text deletes at full_index
     try std.Io.Dir.cwd().createDirPath(h.handleLockIo(), tmp.path());
     const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
     defer a.free(path);
+    const workers = 8;
+    const slots = 16;
     {
         const wrapper = try open(path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, true);
         const id = try api.publishHandle(wrapper);
@@ -8467,10 +8469,28 @@ test "capi native separate writer processes keep full-text deletes at full_index
         try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(
             "{\"name\":\"matched_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
         )));
+        // Seed every key through the replay worker, as the SQLite comparison
+        // bootstrap does: batches at `write`, then drained.
+        var seed: std.ArrayList(u8) = .empty;
+        defer seed.deinit(a);
+        for (0..workers) |worker| {
+            var start: usize = 0;
+            while (start < slots) : (start += 8) {
+                seed.clearRetainingCapacity();
+                try seed.appendSlice(a, "{\"inserts\":{");
+                for (start..start + 8) |slot| {
+                    if (slot != start) try seed.append(a, ',');
+                    try seed.print(a, "\"worker-{d}-{d}\":{{\"text\":\"seed worker{d} slot{d}\"}}", .{ worker, slot, worker, slot });
+                }
+                try seed.appendSlice(a, "},\"sync_level\":\"write\"}");
+                var out: h.capi.Buffer = .{};
+                defer api.antfly_buffer_free_zero(&out);
+                try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(seed.items), &out));
+            }
+        }
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
     }
 
-    const workers = 8;
-    const slots = 16;
     const writes_per_worker = 10 * slots;
     const Child = struct {
         fn run(child_path: []const u8, worker: usize, result_fd: std.c.fd_t) noreturn {
