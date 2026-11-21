@@ -340,6 +340,12 @@ Full-prefix host and resident decoders share one input signature bound per
 request. Token and encoder-mask slices remain borrowed. An optional all-ones
 query mask grows in the request owner and is reused at later steps.
 
+`execution/qwen_embedding_workspace.zig` owns bounded Qwen embedding workspace
+geometry, declared admission, receiving banks, and retirement. The task supplies
+token rows, pooling intent, and its numerical lane. Source cohort admission and
+backend gates retain their order. A stale cold description can retry before
+numerical execution, and a submitted operation keeps its original failure.
+
 `execution/audio_schedule.zig` owns the existing audio instruction tape and its
 arena layout. Alias lifetime propagation uses ML's same allocation-free liveness
 implementation, preserving the tape's splitting/coalescing reuse policy and

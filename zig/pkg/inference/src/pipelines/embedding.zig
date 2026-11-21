@@ -42,6 +42,7 @@ const gemma2_content = @import("embedding_gemma2_content.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const embedding_trace = @import("../embedding_trace.zig");
+const qwen_workspace = @import("../execution/qwen_embedding_workspace.zig");
 const qwen_batch = @import("qwen_embedding_batch.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const memory_admission = @import("../runtime/tier/memory.zig");
@@ -1182,378 +1183,50 @@ pub const EmbeddingPipeline = struct {
         return vectors;
     }
 
-    fn qwenWorkspaceHostDeclaration(cold_capacity: usize, fresh_count: usize, receiving_count: usize, selected_metadata: usize, cpu_bytes: usize) !usize {
-        const roles = @import("../backends/metal_workspace_roles.zig");
-        const ownership = @import("../backends/metal_workspace_ownership.zig");
-        const final_capacity = try std.math.add(usize, cold_capacity, fresh_count);
-        const cold_arrays = try std.math.mul(usize, 2, try roles.Snapshot.requestedMetadataBytes(cold_capacity));
-        const final_arrays = try roles.Snapshot.requestedMetadataBytes(final_capacity);
-        const roots = try std.math.mul(usize, try std.math.add(usize, cold_capacity, final_capacity), @sizeOf(*ownership.Root));
-        const bank_all = try ownership.UseBank.requestedMetadataBytes(receiving_count);
-        // Receiving Fences are in the shared persistent metadata charge;
-        // Entry arrays are synchronous and remain in the original permit.
-        const bank_entries = bank_all - try std.math.mul(usize, receiving_count, @sizeOf(@import("../backends/metal_workspace_fence.zig").Fence));
-        var bytes = try std.math.add(usize, try ownership.Phase.requestedPersistentMetadataBytes(fresh_count, receiving_count), bank_entries);
-        inline for (.{ cold_arrays, final_arrays, roots, selected_metadata, cpu_bytes }) |part| bytes = try std.math.add(usize, bytes, part);
-        return bytes;
-    }
-
-    /// First-cold family publication. This is a pre-numerical transaction:
-    /// every supplier/metadata operation precedes the actual cohort/Model/lane,
-    /// then the original family preparer creates the SAME scratch/token banks
-    /// through their individually funded Root slots. Its published immutable
-    /// formats are inspected only after all numerical/provider owners leave.
-    /// A caller must rebuild its cold selected plan after this transaction.
-    fn prepareBoundedQwenWorkspaceFamily(
-        self: *EmbeddingPipeline,
-        request: session_mod.RunRequest,
-        cleanup: CleanupContext,
-        pressure: *?memory_admission.AdmissionPressure,
-        selected: *@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter,
-        held_output: ?session_mod.HostOutputProducer.HeldAdmission,
-    ) anyerror!void {
-        if (comptime !build_options.enable_metal) return error.UnsupportedResidentTextEncoder;
-        if (self.execution_gate_held or self.execution_lane_held) return error.WorkspaceRequiresColdPreparation;
-        const session = self.textEncodingSession();
-        if (session.run_admission == null) return error.MissingRunAdmission;
-        const epoch = cleanup.boundary orelse return error.MissingCurrentCleanupEpoch;
-        const cfg = session_factory.getGptConfig(session) orelse return error.UnsupportedResidentTextEncoder;
-        const architecture = @import("../execution/architecture_session.zig");
-        const roles = @import("../backends/metal_workspace_roles.zig");
-        const ownership = @import("../backends/metal_workspace_ownership.zig");
-        const Metal = @import("../ops/metal_compute.zig").MetalCompute;
-        const process = platform.allocator.processAllocator(platform.allocator.concurrentFallback());
-        // Constructor-only preparation retains the original complete request
-        // floor and cannot call beginRequest or inspect unobserved credit.
-        var constructor_permit = try session.admitWithPressure(request, pressure);
-        defer constructor_permit.deinit();
-        if (!try architecture.prepareQwenWorkspaceProviderOutsideExecution(session, &constructor_permit, self.execution_control))
-            return error.UnsupportedResidentTextEncoder;
-        var described = (try architecture.describeQwenWorkspaceAuxiliaryOutsideExecution(session, 0, self.execution_control)) orelse
-            return error.UnsupportedResidentTextEncoder;
-        defer described.deinitOutsideExecution();
-        // Release before acquiring the SAME original floor plus disjoint
-        // declarations; no double original peak and no supplier under a lane.
-        constructor_permit.deinit();
-        const old_count = (try described.census.physical.capturedCoverage()).witnessed_roots;
-        const host_metadata = try qwenWorkspaceHostDeclaration(described.census.physical.entries.len, described.auxiliary.plan.fresh_slots, old_count, 0, 0);
-        var declarations: [2]@import("../execution/prepared_storage_admission.zig").Requirement = undefined;
-        var declaration_count: usize = 0;
-        if (described.auxiliary.plan.fresh_bytes != 0) {
-            declarations[declaration_count] = .{ .backend = .metal, .class = .workspace, .bytes = described.auxiliary.plan.fresh_bytes };
-            declaration_count += 1;
-        }
-        if (host_metadata != 0) {
-            declarations[declaration_count] = .{ .backend = .native, .class = .host_workspace, .bytes = host_metadata };
-            declaration_count += 1;
-        }
-        var permit = try session.admitDeclaredStorageWithHeldHostOutputWithPressure(request, declarations[0..declaration_count], held_output, pressure);
-        defer permit.deinit();
-        var phase = try ownership.Phase.prepareFromPermitOutsideExecution(session, &permit, &described.census.target, described.auxiliary.plan.fresh_slots, described.auxiliary.plan.fresh_bytes, old_count, self.execution_control);
-        defer phase.finishOutsideExecution();
-        const roots = try process.alloc(*ownership.Root, described.census.physical.entries.len);
-        defer process.free(roots);
-        const existing = try described.census.physical.copyRoots(roots);
-        var bank = try ownership.UseBank.prepareExact(existing.len);
-        defer bank.deinitOutsideExecution();
-        try phase.fundReceivingBankOutsideExecution(&bank);
-        try bank.bindOutsideExecution(existing, epoch);
-        var validation = try roles.Snapshot.prepare(described.census.physical.entries.len);
-        defer validation.deinitOutsideExecution();
-        const final_capacity = try std.math.add(usize, described.census.physical.entries.len, described.auxiliary.plan.fresh_slots);
-        var final = try roles.Snapshot.prepare(final_capacity);
-        defer final.deinitOutsideExecution();
-        const final_roots = try process.alloc(*ownership.Root, final_capacity);
-        defer process.free(final_roots);
-        // These final-address loans are synchronous only; no late node points
-        // into the caller or this stack. Each bank node owns its own pure cell.
-        var receiving: ownership.ReceiverUses = .{ .existing = &bank, .allocations = &phase };
-        var current = cleanup;
-        var context: @import("../execution/invocation_context.zig").Context = .{ .cleanup = current, .workspace_uses = &receiving };
-        const gate = session.execution_gate orelse self.execution_lock;
-        try session.acquireSelectedCohort(self.execution_control orelse .{}, selected);
-        defer session.releaseSelectedCohortGate(selected);
-        const extra_gate = if (self.execution_lock != gate) self.execution_lock else null;
-        if (extra_gate) |extra| {
-            if (self.execution_control) |control| try control.lock(extra) else platform.sync.lockYielding(extra);
-        }
-        defer if (extra_gate) |extra| extra.unlock();
-        const lane = try self.enterExecutionLane();
-        defer self.leaveExecutionLane(lane);
-        self.execution_gate_held = true;
-        defer self.execution_gate_held = false;
-        var managed = try architecture.constructMetalWorkspaceReceiver(session, self.allocator, self.execution_control);
-        defer managed.deinitWithCleanup(current);
-        const cb = &managed.backend;
-        if (!try cb.bindCleanupEpoch(epoch)) return error.BackendOperationCleanupUnavailable;
-        current.operation = cb.operationToken();
-        context.cleanup = current;
-        var binding = try Metal.beginPreparedAuxiliaryWorkspaceInvocation(cb, &context, &described.census.physical, &validation, &described.auxiliary);
-        // Family preparation has the same checked scope lifecycle, with no
-        // mathematical work or retry. Close before propagating its outcome.
-        const body: anyerror!bool = body: {
-            @import("../backends/compute_factory.zig").beginRequestWithCleanup(session, cb, current) catch |err| break :body err;
-            const prepared = cb.decoderRuntimePrepareOrReuseTextPrefill(self.allocator, cfg, cfg.num_hidden_layers) catch |err| break :body err;
-            if (!prepared.prepared) break :body false;
-            // GGUF logical registration deliberately leaves quantized SDK kinds
-            // lazy. Publish the real SAME representations during this funded
-            // cold family scope, before the outside selected-plan capture.
-            break :body Metal.prepareOwnedQwenWorkspaceCatalog(cb, cfg, cfg.num_hidden_layers, self.execution_control) catch |err| break :body err;
-        };
-        const closed = binding.closeReported(&final, final_roots) catch platform.inference_process_supervisor.restartWorker();
-        receiving.allocations = null;
-        const prepared = try body; // real SDK errors retain their original cause
-        try closed.check();
-        if (!prepared) return error.PreparedWorkspaceFamilyUnavailable;
-    }
-
     fn runBoundedQwenChunk(self: *EmbeddingPipeline, comptime Row: type, rows: []const Row, indices: []const usize, held_output: ?session_mod.HostOutputProducer.HeldAdmission, pressure: *?memory_admission.AdmissionPressure, admission_denied: *bool) anyerror![][]f32 {
         if (comptime !build_options.enable_metal) return error.UnsupportedResidentTextEncoder;
         if (self.execution_gate_held or self.execution_lane_held) return error.WorkspaceRequiresColdPreparation;
         try self.validateQwenWorkspaceAdmission();
-        const session = self.textEncodingSession();
-        const cfg = session_factory.getGptConfig(session) orelse return error.UnsupportedResidentTextEncoder;
-        if (!@import("../execution/architecture_session.zig").acceptsMetalWorkspaceSession(session)) return error.UnsupportedWorkspaceTarget;
-        const architecture = @import("../execution/architecture_session.zig");
-        const role_types = @import("../backends/metal_workspace_roles.zig");
-        const ownership = @import("../backends/metal_workspace_ownership.zig");
-        const Metal = @import("../ops/metal_compute.zig").MetalCompute;
-        const process = platform.allocator.processAllocator(platform.allocator.concurrentFallback());
-        var cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginResident(session);
-        defer cleanup_owner.finishAfterUnlock();
-        const cleanup: CleanupContext = .{ .boundary = cleanup_owner.epoch() };
-        const epoch = cleanup.boundary orelse return error.MissingCurrentCleanupEpoch;
         var sequence: usize = 1;
         for (indices) |index| sequence = @max(sequence, rows[index].encoded.ids.len);
-        if (indices.len == 1 and sequence == 1) sequence = 2;
-        const total = try std.math.mul(usize, indices.len, sequence);
-        const original_workspace = if (session.run_admission) |admission|
-            try admission.qwenTransientWorkspaceBytes(total)
-        else
-            try std.math.add(usize, 16 * 1024 * 1024, try std.math.mul(usize, total, self.configOutputWidth() * 16));
-        // Preserve the COMPLETE original opaque/private/static/mandatory/IO
-        // floor. Exact fresh SDK declarations are additive; no old fungible
-        // byte estimate or snapshot is spent as replacement credit.
-        const request: session_mod.RunRequest = .{
-            .batch = indices.len,
-            .sequence = sequence,
-            .input_bytes = try std.math.mul(usize, total, 12),
-            .output_bytes = try std.math.mul(usize, indices.len, self.configOutputWidth() * @sizeOf(f32)),
-            .workspace_bytes = original_workspace,
-        };
-        var waiter: @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter = .{};
-        const gate = session.execution_gate orelse self.execution_lock;
-        const lock_started = if (self.trace != null) embedding_trace.now() else 0;
-        try session.selectReadyCohort(gate, self.execution_control orelse .{}, &waiter);
-        defer session.leaveSelectedCohort(&waiter);
-        if (session.run_admission == null)
-            return self.runUnadmittedBoundedQwenChunk(Row, rows, indices, sequence, request, cleanup, &waiter);
-        var layers: [256]ops_mod.DecoderRuntimeLayerSpec = undefined;
-        const actual_layers = try decoder_gated_runtime.fillDenseQwen3LayerSpecs(cfg, cfg.num_hidden_layers, &layers);
-        const frame_request: ops_mod.DecoderRuntimePrefillFramePlanRequest = .{
-            .contract = .qwen3_dense_text_prefill,
-            .layer_count = actual_layers.len,
-            .rows = total,
-            .batch = indices.len,
-            .seq_len = sequence,
-            .hidden_size = cfg.hidden_size,
-            .vocab_size = cfg.vocab_size,
-            .num_attention_heads = cfg.num_attention_heads,
-            .global_head_dim = 0,
-            .ple_hidden_size = 0,
-            .final_norm_slot = decoder_gated_runtime.finalNormSlot(cfg.num_hidden_layers),
-            .final_lm_head_slot = 0,
-            .include_tail = false,
-            .layers = actual_layers,
-        };
-        const last = self.config.pooling == .last;
-        if (!last and self.config.pooling != .mean) return error.UnsupportedWorkspaceTail;
-        const normalize_in_frame = last and self.config.normalize and !Metal.workspaceFrameNormalizeDisabled();
-        const tail_request: Metal.WorkspaceTailRequest = .{
-            .batch = indices.len,
-            .sequence = sequence,
-            .width = cfg.hidden_size,
-            .take_rows = last,
-            .normalize_rows = normalize_in_frame,
-            .pool_sequence = if (!last) sequence else if (self.config.normalize and !normalize_in_frame) 1 else null,
-        };
-        var family_prepared = false;
-        var stale_attempts: usize = 0;
-        while (true) {
-            if (self.execution_control) |control| try control.check();
-            var cold = (architecture.describeQwenWorkspaceOutsideExecution(session, &frame_request, tail_request, self.execution_control) catch |err| {
-                if (err != error.QueueFull) return err;
-                const control = self.execution_control orelse return err;
-                if (control.deadline_ns == null) return err;
-                try control.check();
-                std.Thread.yield() catch {};
-                continue;
-            }) orelse {
-                if (family_prepared) return error.PreparedWorkspaceFamilyUnavailable;
-                // This original SDK preparation is BEFORE any numerical work;
-                // afterwards the actual selected formats are replanned cold.
-                try self.prepareBoundedQwenWorkspaceFamily(request, cleanup, pressure, &waiter, held_output);
-                family_prepared = true;
-                continue;
-            };
-            defer cold.deinitOutsideExecution();
-            const fresh_count = try std.math.add(usize, cold.reference.fresh_slots, try std.math.add(usize, try std.math.add(usize, cold.roles.fresh_slots, cold.auxiliary.plan.fresh_slots), try std.math.add(usize, cold.tail.allocations.fresh_slots, cold.tail.staging.fresh_slots)));
-            const fresh_bytes = try std.math.add(usize, cold.reference.fresh_bytes, try std.math.add(usize, try std.math.add(usize, cold.roles.fresh_bytes, cold.auxiliary.plan.fresh_bytes), try std.math.add(usize, cold.tail.allocations.fresh_bytes, cold.tail.staging.fresh_bytes)));
-            const old_count = (try cold.census.physical.capturedCoverage()).witnessed_roots;
-            const host_metadata = try qwenWorkspaceHostDeclaration(cold.census.physical.entries.len, fresh_count, old_count, try cold.metadata.requestedMetadataBytes(), try std.math.add(usize, cold.tail.host_cpu_bytes, cold.reference.host_cpu_bytes));
-            var declarations: [2]@import("../execution/prepared_storage_admission.zig").Requirement = undefined;
-            var declaration_count: usize = 0;
-            if (fresh_bytes != 0) {
-                declarations[declaration_count] = .{ .backend = .metal, .class = .workspace, .bytes = fresh_bytes };
-                declaration_count += 1;
-            }
-            if (host_metadata != 0) {
-                declarations[declaration_count] = .{ .backend = .native, .class = .host_workspace, .bytes = host_metadata };
-                declaration_count += 1;
-            }
-            var permit = session.admitDeclaredStorageWithHeldHostOutputWithPressure(request, declarations[0..declaration_count], held_output, pressure) catch |err| {
-                admission_denied.* = true;
-                return err;
-            };
-            defer permit.deinit();
-            var phase = try ownership.Phase.prepareFromPermitOutsideExecutionWithHostCpu(session, &permit, &cold.census.target, fresh_count, fresh_bytes, old_count, cold.reference.host_cpu_bytes, self.execution_control);
-            defer phase.finishOutsideExecution();
-            const root_storage = try process.alloc(*ownership.Root, cold.census.physical.entries.len);
-            defer process.free(root_storage);
-            const old_roots = try cold.census.physical.copyRoots(root_storage);
-            var bank = try ownership.UseBank.prepareExact(old_roots.len);
-            defer bank.deinitOutsideExecution();
-            try phase.fundReceivingBankOutsideExecution(&bank);
-            try bank.bindOutsideExecution(old_roots, epoch);
-            var validation = try role_types.Snapshot.prepare(cold.census.physical.entries.len);
-            defer validation.deinitOutsideExecution();
-            const final_capacity = try std.math.add(usize, cold.census.physical.entries.len, fresh_count);
-            var final = try role_types.Snapshot.prepare(final_capacity);
-            defer final.deinitOutsideExecution();
-            const final_roots = try process.alloc(*ownership.Root, final_capacity);
-            defer process.free(final_roots);
-            var uses: ownership.ReceiverUses = .{ .existing = &bank, .allocations = &phase };
-            var current = cleanup;
-            var context: @import("../execution/invocation_context.zig").Context = .{ .cleanup = current, .workspace_uses = &uses };
-            // All supplier and metadata work above runs with no actual Model,
-            // provider, external gate or execution lane. Only this block owns
-            // numerical state. A stale cold plan retries after ALL defers leave.
-            const vectors = numerical: {
-                try session.acquireSelectedCohort(self.execution_control orelse .{}, &waiter);
-                defer session.releaseSelectedCohortGate(&waiter);
-                const extra_gate = if (self.execution_lock != gate) self.execution_lock else null;
-                if (extra_gate) |extra| {
-                    if (self.execution_control) |control| try control.lock(extra) else platform.sync.lockYielding(extra);
-                }
-                defer if (extra_gate) |extra| extra.unlock();
-                const lane = try self.enterExecutionLane();
-                defer self.leaveExecutionLane(lane);
-                self.execution_gate_held = true;
-                defer self.execution_gate_held = false;
-                var managed = try architecture.constructMetalWorkspaceReceiver(session, self.allocator, self.execution_control);
-                defer managed.deinitWithCleanup(current);
-                const cb = &managed.backend;
-                if (!try cb.bindCleanupEpoch(epoch)) return error.BackendOperationCleanupUnavailable;
-                current.operation = cb.operationToken();
-                context.cleanup = current;
-                if (!self.boundedQwenBatchingEnabled()) return error.WorkspacePolicyChanged;
-                var binding = Metal.beginPreparedWorkspaceInvocation(cb, &context, &cold.census.physical, &validation, &cold.roles, &cold.auxiliary, &cold.tail, &cold.reference, &cold.metadata, &frame_request, &final, final_roots) catch |err| switch (err) {
-                    error.WorkspaceRoleChanged, error.WorkspaceTailChanged, error.WorkspaceReferenceProgramChanged, error.WorkspaceTargetChanged, error.WorkspaceCensusChanged, error.WorkspaceRequestChanged => break :numerical null,
-                    else => return err,
-                };
-                // Capture the original body outcome before closing ONCE. Its
-                // inner SDK/CT defers have completed; no body error can bypass
-                // checked cleanup or authorize replay through an outer retry.
-                const body: anyerror![][]f32 = body: {
-                    @import("../backends/compute_factory.zig").beginRequestWithCleanup(session, cb, current) catch |err| break :body err;
-                    if (self.trace) |trace| trace.execution_lock_ns += embedding_trace.now() -| lock_started;
-                    const produced = self.embedBoundedQwenPacked(Row, rows, indices, sequence, current, cb) catch |err| break :body err;
-                    break :body produced orelse error.PreparedWorkspaceKernelUnavailable;
-                };
-                const closed = binding.closeReported(&final, final_roots) catch platform.inference_process_supervisor.restartWorker();
-                uses.allocations = null;
-                const result = body catch |err| {
-                    // Optional callbacks report null for allocation decline;
-                    // use its certified cause, preserving real SDK/math errors.
-                    if (err == error.PreparedWorkspaceKernelUnavailable) try closed.check();
-                    return err;
-                };
-                errdefer freeEmbeddingSlices(self.allocator, result);
-                try closed.check();
-                break :numerical result;
-            };
-            if (vectors) |result| return result;
-            stale_attempts += 1;
-            if (stale_attempts == 8) return error.WorkspaceRoleChanged;
-            // No numerical callback ran on this path. Loop teardown executes
-            // outside every gate before rebuilding the immutable declarations.
-        }
-    }
+        const Stage = struct {
+            task: *EmbeddingPipeline,
+            rows: []const Row,
+            indices: []const usize,
 
-    /// No admission means no new modern Root or quota credit. It still borrows
-    /// exact old-root cells under its genuine resident B, so an ordinary peer
-    /// cannot consume prior charged roots with an unbound cleanup context.
-    fn runUnadmittedBoundedQwenChunk(self: *EmbeddingPipeline, comptime Row: type, rows: []const Row, indices: []const usize, sequence: usize, request: session_mod.RunRequest, cleanup: CleanupContext, selected: *@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter) anyerror![][]f32 {
-        if (comptime !build_options.enable_metal) return error.UnsupportedResidentTextEncoder;
-        const architecture = @import("../execution/architecture_session.zig");
-        const roles = @import("../backends/metal_workspace_roles.zig");
-        const ownership = @import("../backends/metal_workspace_ownership.zig");
-        const Metal = @import("../ops/metal_compute.zig").MetalCompute;
-        const process = platform.allocator.processAllocator(platform.allocator.concurrentFallback());
-        const session = self.textEncodingSession();
-        var constructor_permit = try session.admit(request);
-        defer constructor_permit.deinit();
-        _ = try architecture.prepareQwenWorkspaceProviderOutsideExecution(session, &constructor_permit, self.execution_control);
-        var census = (try architecture.snapshotQwenWorkspaceOutsideExecution(session, self.execution_control)) orelse return error.WorkspaceTargetChanged;
-        defer census.deinitOutsideExecution();
-        const root_storage = try process.alloc(*ownership.Root, census.physical.entries.len);
-        defer process.free(root_storage);
-        const roots = try census.physical.copyRoots(root_storage);
-        var bank = try ownership.UseBank.prepareExact(roots.len);
-        defer bank.deinitOutsideExecution();
-        try bank.bindOutsideExecution(roots, cleanup.boundary.?);
-        var validation = try roles.Snapshot.prepare(census.physical.entries.len);
-        defer validation.deinitOutsideExecution();
-        var final = try roles.Snapshot.prepare(census.physical.entries.len);
-        defer final.deinitOutsideExecution();
-        var uses: ownership.ReceiverUses = .{ .existing = &bank };
-        var current = cleanup;
-        var context: @import("../execution/invocation_context.zig").Context = .{ .cleanup = current, .workspace_uses = &uses };
-        const gate = session.execution_gate orelse self.execution_lock;
-        try session.acquireSelectedCohort(self.execution_control orelse .{}, selected);
-        defer session.releaseSelectedCohortGate(selected);
-        const extra_gate = if (self.execution_lock != gate) self.execution_lock else null;
-        if (extra_gate) |extra| {
-            if (self.execution_control) |control| try control.lock(extra) else platform.sync.lockYielding(extra);
-        }
-        defer if (extra_gate) |extra| extra.unlock();
-        const lane = try self.enterExecutionLane();
-        defer self.leaveExecutionLane(lane);
-        self.execution_gate_held = true;
-        defer self.execution_gate_held = false;
-        var managed = try architecture.constructMetalWorkspaceReceiver(session, self.allocator, self.execution_control);
-        defer managed.deinitWithCleanup(current);
-        const cb = &managed.backend;
-        if (!try cb.bindCleanupEpoch(cleanup.boundary.?)) return error.BackendOperationCleanupUnavailable;
-        current.operation = cb.operationToken();
-        context.cleanup = current;
-        // Preserve the exact original Main expression, including unadmitted
-        // maxInt when there is no lease. This raw byte guard is NOT Root credit.
-        const original_workspace_bytes = if (constructor_permit.lease) |lease| lease.amounts.backend_scratch_bytes else std.math.maxInt(usize);
-        var binding = try Metal.bindUnadmittedBoundedWorkspaceInvocation(cb, &context, @intFromPtr(census.target.target.metal.runtime), &census.physical, &validation, original_workspace_bytes);
-        const body: anyerror![][]f32 = body: {
-            @import("../backends/compute_factory.zig").beginRequestWithCleanup(session, cb, current) catch |err| break :body err;
-            const result = self.embedBoundedQwenPacked(Row, rows, indices, sequence, current, cb) catch |err| break :body err;
-            break :body result orelse error.UnsupportedResidentTextEncoder;
+            pub fn enterLane(stage: *@This()) !?@import("../execution_control.zig").ExecutionLane.Lease {
+                return stage.task.enterExecutionLane();
+            }
+            pub fn leaveLane(stage: *@This(), lease: ?@import("../execution_control.zig").ExecutionLane.Lease) void {
+                stage.task.leaveExecutionLane(lease);
+            }
+            pub fn valid(stage: *@This()) bool {
+                return stage.task.boundedQwenBatchingEnabled();
+            }
+            pub fn recordLockWait(stage: *@This(), started: u64) void {
+                if (stage.task.trace) |trace| trace.execution_lock_ns += embedding_trace.now() -| started;
+            }
+            pub fn produce(stage: *@This(), length: usize, cleanup: CleanupContext, backend: *const ops_mod.ComputeBackend) !?[][]f32 {
+                return stage.task.embedBoundedQwenPacked(Row, stage.rows, stage.indices, length, cleanup, backend);
+            }
         };
-        const closed = Metal.finishExistingWorkspaceInvocationReported(&binding, &final, root_storage) catch platform.inference_process_supervisor.restartWorker();
-        const result = body catch |err| {
-            if (err == error.UnsupportedResidentTextEncoder) try closed.check();
-            return err;
-        };
-        errdefer freeEmbeddingSlices(self.allocator, result);
-        try closed.check();
-        return result;
+        var stage = Stage{ .task = self, .rows = rows, .indices = indices };
+        return qwen_workspace.run(.{
+            .allocator = self.allocator,
+            .session = self.textEncodingSession(),
+            .control = self.execution_control,
+            .execution_lock = self.execution_lock,
+            .execution_gate_held = &self.execution_gate_held,
+            .batch = indices.len,
+            .max_sequence = sequence,
+            .pooling = switch (self.config.pooling) {
+                .last => .last,
+                .mean => .mean,
+                else => .unsupported,
+            },
+            .normalize = self.config.normalize,
+            .measure_lock = self.trace != null,
+        }, &stage, held_output, pressure, admission_denied);
     }
 
     fn embedBoundedQwenPacked(self: *EmbeddingPipeline, comptime Row: type, rows: []const Row, indices: []const usize, seq_len: usize, cleanup: CleanupContext, receiving: ?*const ops_mod.ComputeBackend) !?[][]f32 {
@@ -8575,7 +8248,7 @@ test "Metal committed workspace allocation denial closes once and healthy cold a
         const old_count = (try described.census.physical.capturedCoverage()).witnessed_roots;
         const count = described.auxiliary.plan.fresh_slots;
         const bytes = described.auxiliary.plan.fresh_bytes;
-        const host = try EmbeddingPipeline.qwenWorkspaceHostDeclaration(described.census.physical.entries.len, count, old_count, 0, 0);
+        const host = try qwen_workspace.hostDeclarationBytes(described.census.physical.entries.len, count, old_count, 0, 0);
         var declarations: [2]@import("../execution/prepared_storage_admission.zig").Requirement = undefined;
         var declaration_count: usize = 0;
         if (bytes != 0) {
