@@ -258,7 +258,12 @@ pub fn Adapter(comptime DB: type) type {
             return .{ .rows = try rows.toOwnedSlice(alloc), .exhausted = exhausted };
         }
 
+        /// The local commit sequence is a position only within one process:
+        /// replicas number derived records independently, so a replicated
+        /// table reports no scalar frontier (`require_current` reads use the
+        /// per-group delivery barrier instead).
         pub fn frontier(db: *DB, alloc: Allocator) ![]u8 {
+            if (db.core.index_manager.context_replication != null) return alloc.dupe(u8, "");
             return std.fmt.allocPrint(alloc, "seq:{d}", .{db.core.nextDerivedSequence()});
         }
     };

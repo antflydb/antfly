@@ -19085,6 +19085,169 @@ pub const ApiHttpServer = struct {
         return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     }
 
+    fn contextTablesAlloc(self: *ApiHttpServer, a: std.mem.Allocator) ![]const @import("context_host.zig").TableInfo {
+        var snapshot = (try self.source.adminSnapshot()) orelse return error.MetadataUnavailable;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const out = try a.alloc(@import("context_host.zig").TableInfo, snapshot.tables.len);
+        for (snapshot.tables, out) |t, *o| o.* = .{ .table_id = t.table_id, .name = try a.dupe(u8, t.name), .indexes_json = try a.dupe(u8, t.indexes_json) };
+        return out;
+    }
+
+    /// One group-local context read (`context_read` lookup mode) at read-index
+    /// consistency.
+    fn contextGroupReadAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, group: u64, table: []const u8, context: anytype) ![]u8 {
+        const reads = self.table_reads orelse return error.StorageReadTemporarilyUnavailable;
+        const read_json = try std.json.Stringify.valueAlloc(alloc, .{ .mode = "context_read", .context = context }, .{});
+        defer alloc.free(read_json);
+        var response = (try reads.lookupGroupLocal(alloc, group, table, "", .{ .relational_topology_json = read_json }, .read_index)) orelse return error.StorageReadTemporarilyUnavailable;
+        defer response.deinit(alloc);
+        return alloc.dupe(u8, response.json);
+    }
+
+    const ArtifactDependencyRead = struct { inbox_pending: bool, report: std.json.Value };
+
+    fn readArtifactDependencies(self: *ApiHttpServer, a: std.mem.Allocator, table: []const u8, key: []const u8, artifact: []const u8) !ArtifactDependencyRead {
+        const route = try table_catalog.routedGroupSnapshotUntil(a, self.catalogSource(), table, key, platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
+        const group = (route.route orelse return error.TopologyChanged).group_id;
+        const raw = try self.contextGroupReadAlloc(a, group, table, .{ .op = "dependencies", .key = key, .names = &[_][]const u8{artifact} });
+        return std.json.parseFromSliceLeaky(ArtifactDependencyRead, a, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    }
+
+    /// What still keeps `artifact` of `key` from being current: every group
+    /// of every source table first (an empty outbox for this table means all
+    /// committed changes reached this table's inboxes, since acknowledgement
+    /// follows delivery), then this group's inbox and state.
+    fn artifactPendingAlloc(self: *ApiHttpServer, a: std.mem.Allocator, table: []const u8, sources: []const []const u8, dependent_identity: []const u8, key: []const u8, artifact: []const u8) !struct { pending: []const []const u8, read: ArtifactDependencyRead } {
+        var pending = std.ArrayListUnmanaged([]const u8).empty;
+        for (sources) |source| {
+            var span = try table_catalog.routedSpanSnapshotUntil(a, self.catalogSource(), source, "", "", platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
+            defer span.deinit(a);
+            for (span.group_ids) |group| {
+                const raw = try self.contextGroupReadAlloc(a, group, source, .{ .op = "outbox_pending", .key = "", .dependent_table_id = dependent_identity });
+                const parsed = try std.json.parseFromSliceLeaky(struct { pending: bool }, a, raw, .{ .ignore_unknown_fields = true });
+                if (parsed.pending) {
+                    try pending.append(a, try std.fmt.allocPrint(a, "outbox:{s}", .{source}));
+                    break;
+                }
+            }
+        }
+        const read = try self.readArtifactDependencies(a, table, key, artifact);
+        if (read.inbox_pending) try pending.append(a, "inbox");
+        const state: []const u8 = blk: {
+            if (read.report != .object) break :blk "missing";
+            const freshness = read.report.object.get("freshness") orelse break :blk "missing";
+            if (freshness != .object) break :blk "missing";
+            const value = freshness.object.get("state") orelse break :blk "missing";
+            break :blk if (value == .string) value.string else "missing";
+        };
+        if (!std.mem.eql(u8, state, "current")) try pending.append(a, state);
+        return .{ .pending = pending.items, .read = read };
+    }
+
+    /// `GET .../documents/{key}/artifacts/{artifact}/dependencies`. With
+    /// `require_current`, polls the read barrier until it clears or the wait
+    /// ends (409 `artifact_not_current`).
+    pub fn handlePublicArtifactDependencies(self: *ApiHttpServer, alloc: std.mem.Allocator, request: api_operation.RequestContext, table: []const u8, key: []const u8, artifact: []const u8, require_current: bool, wait_timeout_ms: u32) !public_table_http.OwnedResponse {
+        try self.authorizeTableReads(alloc, request, &.{table});
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const context_host = @import("context_host.zig");
+        if (!require_current) {
+            const read = try self.readArtifactDependencies(a, table, key, artifact);
+            return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, read.report, .{}), .json = true };
+        }
+        const tables = try self.contextTablesAlloc(a);
+        const owner = context_host.findByName(tables, table) orelse return error.TableNotFound;
+        const sources = try context_host.sourceTablesAlloc(a, tables, .{ .collect_fn = collectContextEnrichments }, table, artifact);
+        const dependent_identity = try context_host.identityAlloc(a, owner.table_id);
+        const deadline = platform_time.monotonicNs() +| @as(u64, @min(wait_timeout_ms, 30_000)) * std.time.ns_per_ms;
+        while (true) {
+            const outcome = try self.artifactPendingAlloc(a, table, sources, dependent_identity, key, artifact);
+            if (outcome.pending.len == 0) {
+                var report = outcome.read.report;
+                if (report == .object) try report.object.put(a, "current", .{ .bool = true });
+                return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, report, .{}), .json = true };
+            }
+            if (platform_time.monotonicNs() >= deadline) {
+                return .{ .status = 409, .body = try std.json.Stringify.valueAlloc(alloc, .{
+                    .@"error" = "artifact_not_current",
+                    .message = "the artifact did not become current before the wait ended",
+                    .retryable = true,
+                    .pending = outcome.pending,
+                    .dependencies = outcome.read.report,
+                }, .{}), .json = true };
+            }
+            sleepNs(50 * std.time.ns_per_ms);
+        }
+    }
+
+    /// `POST /tables/{table}/dependencies/impact`: reverse lineage of one
+    /// source key from every group of every table that reads `table`. Tables
+    /// the caller may not read are omitted and make the answer incomplete.
+    pub fn handlePublicDependencyImpact(self: *ApiHttpServer, alloc: std.mem.Allocator, request: api_operation.RequestContext, table: []const u8, body: []const u8) !public_table_http.OwnedResponse {
+        try self.authorizeTableReads(alloc, request, &.{table});
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Request = struct { key: []const u8, revision: []const u8 = "", traversal: []const u8 = "direct", max_depth: u32 = 8, limit: u32 = 100 };
+        const req = std.json.parseFromSliceLeaky(Request, a, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return badRequest(alloc, "invalid impact request");
+        const transitive = std.mem.eql(u8, req.traversal, "transitive");
+        if (!transitive and !std.mem.eql(u8, req.traversal, "direct")) return badRequest(alloc, "traversal must be direct or transitive");
+        if (req.limit == 0 or req.limit > 10_000 or req.max_depth == 0 or req.max_depth > 64) return badRequest(alloc, "limit must be 1..10000 and max_depth 1..64");
+        if (req.revision.len != 0 and @import("antfly_local_sources").storage_db_enrichment_context_dependency_store.parseRevision(req.revision) == null) return badRequest(alloc, "revision must be a hex digest");
+        const context_host = @import("context_host.zig");
+        const tables = try self.contextTablesAlloc(a);
+        const source = context_host.findByName(tables, table) orelse return error.TableNotFound;
+        const input_identity = try context_host.identityAlloc(a, source.table_id);
+        const dependents = try context_host.dependentTablesAlloc(a, tables, .{ .collect_fn = collectContextEnrichments }, table);
+        var rows = std.ArrayListUnmanaged(std.json.Value).empty;
+        var complete = true;
+        for (dependents) |dependent| {
+            self.authorizeTableReads(a, request, &.{dependent.name}) catch |err| switch (err) {
+                error.Forbidden => {
+                    complete = false;
+                    continue;
+                },
+                else => return err,
+            };
+            const own_identity = try context_host.identityAlloc(a, dependent.table_id);
+            var span = try table_catalog.routedSpanSnapshotUntil(a, self.catalogSource(), dependent.name, "", "", platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
+            defer span.deinit(a);
+            for (span.group_ids) |group| {
+                if (rows.items.len >= req.limit) {
+                    complete = false;
+                    break;
+                }
+                const raw = self.contextGroupReadAlloc(a, group, dependent.name, .{ .op = "impact", .key = req.key, .input_table_id = input_identity, .own_table_id = own_identity, .revision = req.revision, .transitive = transitive, .max_depth = req.max_depth, .limit = req.limit - @as(u32, @intCast(rows.items.len)) }) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        complete = false;
+                        continue;
+                    },
+                };
+                const page = try std.json.parseFromSliceLeaky(struct { rows: []std.json.Value, complete: bool }, a, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+                if (!page.complete) complete = false;
+                for (page.rows) |row| {
+                    var r = row;
+                    if (r == .object) try r.object.put(a, "table", .{ .string = dependent.name });
+                    try rows.append(a, r);
+                }
+            }
+        }
+        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, .{
+            .input = .{ .table_id = input_identity, .key = req.key },
+            .dependents = rows.items,
+            .complete = complete,
+            .traversal = req.traversal,
+            .semantics = "possible impact: dependency edges establish that outputs consumed the input, not that regenerated bytes differ",
+        }, .{}), .json = true };
+    }
+
+    fn badRequest(alloc: std.mem.Allocator, message: []const u8) !public_table_http.OwnedResponse {
+        return .{ .status = 400, .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = "invalid_request", .message = message, .retryable = false }, .{}), .json = true };
+    }
+
     fn collectContextEnrichments(a: std.mem.Allocator, indexes_json: []const u8) anyerror![]const db_mod.types.EnrichmentConfig {
         return indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(a, indexes_json);
     }

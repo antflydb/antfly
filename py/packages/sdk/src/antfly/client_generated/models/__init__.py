@@ -61,7 +61,12 @@ from .api_key_with_secret import ApiKeyWithSecret
 from .apple_generator_config import AppleGeneratorConfig
 from .apple_generator_config_provider import AppleGeneratorConfigProvider
 from .apple_stt_config import AppleSTTConfig
+from .artifact_dependencies import ArtifactDependencies
+from .artifact_dependencies_freshness_type_0 import ArtifactDependenciesFreshnessType0
+from .artifact_dependencies_versions_item import ArtifactDependenciesVersionsItem
 from .artifact_index_source import ArtifactIndexSource
+from .artifact_not_current import ArtifactNotCurrent
+from .artifact_not_current_error import ArtifactNotCurrentError
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
 from .artifact_sources_capability_state import ArtifactSourcesCapabilityState
@@ -341,6 +346,11 @@ from .dense_native_storage_phase import DenseNativeStoragePhase
 from .dense_repair_backpressure_error import DenseRepairBackpressureError
 from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
 from .dense_vector_publication_status import DenseVectorPublicationStatus
+from .dependency_impact_request import DependencyImpactRequest
+from .dependency_impact_request_traversal import DependencyImpactRequestTraversal
+from .dependency_impact_response import DependencyImpactResponse
+from .dependency_impact_response_input import DependencyImpactResponseInput
+from .dependency_impact_row import DependencyImpactRow
 from .derived_coverage_observation_incomplete_reason import DerivedCoverageObservationIncompleteReason
 from .derived_coverage_policy import DerivedCoveragePolicy
 from .derived_coverage_status import DerivedCoverageStatus
@@ -736,6 +746,7 @@ from .geo_shape import GeoShape
 from .geo_shape_geometry import GeoShapeGeometry
 from .geo_shape_geometry_relation import GeoShapeGeometryRelation
 from .geo_shape_query import GeoShapeQuery
+from .get_artifact_dependencies_freshness import GetArtifactDependenciesFreshness
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
@@ -2783,7 +2794,12 @@ __all__ = (
     "AppleGeneratorConfig",
     "AppleGeneratorConfigProvider",
     "AppleSTTConfig",
+    "ArtifactDependencies",
+    "ArtifactDependenciesFreshnessType0",
+    "ArtifactDependenciesVersionsItem",
     "ArtifactIndexSource",
+    "ArtifactNotCurrent",
+    "ArtifactNotCurrentError",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
     "ArtifactSourcesCapabilityState",
@@ -3063,6 +3079,11 @@ __all__ = (
     "DenseRepairBackpressureError",
     "DenseRepairBackpressureErrorCode",
     "DenseVectorPublicationStatus",
+    "DependencyImpactRequest",
+    "DependencyImpactRequestTraversal",
+    "DependencyImpactResponse",
+    "DependencyImpactResponseInput",
+    "DependencyImpactRow",
     "DerivedCoverageObservationIncompleteReason",
     "DerivedCoveragePolicy",
     "DerivedCoverageStatus",
@@ -3450,6 +3471,7 @@ __all__ = (
     "GeoShapeGeometry",
     "GeoShapeGeometryRelation",
     "GeoShapeQuery",
+    "GetArtifactDependenciesFreshness",
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",

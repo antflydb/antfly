@@ -11177,6 +11177,74 @@ pub const DB = struct {
         }
     }
 
+    /// Whether this table's inbox holds notices not yet applied (durable
+    /// check, not the in-memory hint).
+    pub fn contextInboxHasEntries(self: *DB) !bool {
+        const command_mod = @import("enrichment/context_dependency_command.zig");
+        var reader = try context_dependency_db.StoreReader.init(self.core.store);
+        defer reader.deinit();
+        const prefix = context_dependency_store.familyPrefix(command_mod.inbox_family);
+        var probe = struct {
+            found: bool = false,
+            fn visit(p: *anyopaque, _: []const u8, _: []const u8) anyerror!bool {
+                const this: *@This() = @ptrCast(@alignCast(p));
+                this.found = true;
+                return false;
+            }
+        }{};
+        try reader.reader().scanPrefix(self.alloc, &prefix, .{ .ptr = &probe, .visit_fn = @TypeOf(probe).visit });
+        return probe.found;
+    }
+
+    /// Read barrier for `require_current`: whether a committed change of this
+    /// (source) table may still be undelivered to `dependent_table_id`. True
+    /// while its outbox holds a notice for that dependent, or a generated
+    /// record's notices are not staged yet (pending reconcile markers). Past
+    /// a bounded scan the answer is conservatively true.
+    pub fn contextOutboxPendingFor(self: *DB, alloc: Allocator, dependent_table_id: []const u8) !bool {
+        const notices_mod = @import("enrichment/context_notices.zig");
+        var reader = try context_dependency_db.StoreReader.init(self.core.store);
+        defer reader.deinit();
+        const Scan = struct {
+            alloc: Allocator,
+            dependent: []const u8,
+            seen: usize = 0,
+            pending: bool = false,
+            fn visit(p: *anyopaque, _: []const u8, value: []const u8) anyerror!bool {
+                const this: *@This() = @ptrCast(@alignCast(p));
+                this.seen += 1;
+                if (this.seen > 4096) {
+                    this.pending = true;
+                    return false;
+                }
+                const dependent = context_dependency_db.dependentOf(this.alloc, value) catch {
+                    this.pending = true;
+                    return false;
+                };
+                defer this.alloc.free(dependent);
+                if (dependent.len == 0 or std.mem.eql(u8, dependent, this.dependent)) {
+                    this.pending = true;
+                    return false;
+                }
+                return true;
+            }
+        };
+        var scan = Scan{ .alloc = alloc, .dependent = dependent_table_id };
+        const outbox = context_dependency_store.familyPrefix(notices_mod.outbox_family);
+        try reader.reader().scanPrefix(alloc, &outbox, .{ .ptr = &scan, .visit_fn = Scan.visit });
+        if (scan.pending) return true;
+        var markers = struct {
+            found: bool = false,
+            fn visit(p: *anyopaque, _: []const u8, _: []const u8) anyerror!bool {
+                const this: *@This() = @ptrCast(@alignCast(p));
+                this.found = true;
+                return false;
+            }
+        }{};
+        try reader.reader().scanPrefix(alloc, context_dependency_db.pending_prefix, .{ .ptr = &markers, .visit_fn = @TypeOf(markers).visit });
+        return markers.found;
+    }
+
     /// Authoritative dependency state of one dependent artifact.
     pub fn contextDependencyState(self: *DB, alloc: Allocator, doc_key: []const u8, artifact: []const u8) !?context_dependency_store.State {
         var reader = try context_dependency_db.StoreReader.init(self.core.store);
@@ -28404,6 +28472,30 @@ pub const DB = struct {
                         defer alloc.free(values);
                         try stream.beginWriteRaw();
                         try stream.writer.writeAll(values);
+                        stream.endWriteRaw();
+                    },
+                    .dependencies => {
+                        if (read.names.len != 1) return error.InvalidArgument;
+                        const report = try @import("context_api.zig").dependenciesJsonAlloc(alloc, self, read.key, read.names[0], context_dependency_store.default_retain_versions);
+                        defer alloc.free(report);
+                        try stream.beginWriteRaw();
+                        try stream.writer.print("{{\"inbox_pending\":{},\"report\":", .{try self.contextInboxHasEntries()});
+                        try stream.writer.writeAll(report);
+                        try stream.writer.writeAll("}");
+                        stream.endWriteRaw();
+                    },
+                    .outbox_pending => {
+                        try stream.beginWriteRaw();
+                        try stream.writer.print("{{\"pending\":{}}}", .{try self.contextOutboxPendingFor(alloc, read.dependent_table_id)});
+                        stream.endWriteRaw();
+                    },
+                    .impact => {
+                        const revision: ?context_dependency_store.Digest = if (read.revision.len == 0) null else context_dependency_store.parseRevision(read.revision) orelse return error.InvalidArgument;
+                        if (read.limit == 0 or read.limit > 10_000 or read.max_depth == 0 or read.max_depth > 64) return error.InvalidArgument;
+                        const rows = try @import("context_api.zig").groupImpactJsonAlloc(alloc, self, read.own_table_id, read.input_table_id, read.key, revision, read.limit, read.transitive, read.max_depth);
+                        defer alloc.free(rows);
+                        try stream.beginWriteRaw();
+                        try stream.writer.writeAll(rows);
                         stream.endWriteRaw();
                     },
                 }

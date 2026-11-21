@@ -1521,6 +1521,93 @@ pub const ApiKeyWithSecret = struct {
     }
 };
 
+/// Dependency state of one document artifact whose enrichment declares `context_sources`. `freshness` is null when the artifact was never generated with context dependencies. Freshness (`current`, `stale`, `failed`, `pending`) is reported separately from rebuild execution state. `versions` lists retained lineage manifests, newest first.
+pub const ArtifactDependencies = struct {
+    /// State, generation, published generation, version, validated-through frontier, input fingerprint, rebuild state, and bounded change reasons.
+    freshness: ?std.json.ArrayHashMap(std.json.Value),
+    /// Live subscription tuples registered for this artifact.
+    subscriptions: ?i64 = null,
+    versions: []const std.json.ArrayHashMap(std.json.Value),
+    /// Present when `freshness=require_current` was requested: true when a read barrier observed no undelivered committed change to any of the artifact's source tables and its dependency state is current.
+    current: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "freshness", "freshness", false },
+        .{ "subscriptions", "subscriptions", true },
+        .{ "versions", "versions", false },
+        .{ "current", "current", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("freshness");
+        try jw.write(self.freshness);
+        if (self.subscriptions) |value| {
+            try jw.objectField("subscriptions");
+            try jw.write(value);
+        }
+        try jw.objectField("versions");
+        try jw.write(self.versions);
+        if (self.current) |value| {
+            try jw.objectField("current");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ArtifactNotCurrent = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// What kept the artifact from being current when the wait ended (for example `stale`, `inbox`, or `outbox:<table>`).
+    pending: ?[]const []const u8 = null,
+    dependencies: ArtifactDependencies,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "error", "error", false },
+        .{ "message", "message", false },
+        .{ "retryable", "retryable", false },
+        .{ "pending", "pending", true },
+        .{ "dependencies", "dependencies", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("retryable");
+        try jw.write(self.retryable);
+        if (self.pending) |value| {
+            try jw.objectField("pending");
+            try jw.write(value);
+        }
+        try jw.objectField("dependencies");
+        try jw.write(self.dependencies);
+        try jw.endObject();
+    }
+};
+
 /// Kind of stored artifact tracked by the repair queue.
 pub const ArtifactRepairKind = enum {
     embedding,
@@ -3816,6 +3903,165 @@ pub const DenseRepairBackpressureError = struct {
     retryable: bool,
     /// Suggested delay before retrying the write.
     retry_after_ms: u32,
+};
+
+pub const DependencyImpactRequest = struct {
+    /// Source document key whose dependents are requested.
+    key: []const u8,
+    /// Optional hex input revision; only outputs that consumed that revision are returned.
+    revision: ?[]const u8 = null,
+    /// `transitive` also lists same-document artifacts that consume each dependent (live candidates with their path).
+    traversal: ?[]const u8 = null,
+    max_depth: ?i64 = null,
+    limit: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key", "key", false },
+        .{ "revision", "revision", true },
+        .{ "traversal", "traversal", true },
+        .{ "max_depth", "max_depth", true },
+        .{ "limit", "limit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        if (self.revision) |value| {
+            try jw.objectField("revision");
+            try jw.write(value);
+        }
+        if (self.traversal) |value| {
+            try jw.objectField("traversal");
+            try jw.write(value);
+        }
+        if (self.max_depth) |value| {
+            try jw.objectField("max_depth");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Reverse lineage of one source document: dependent artifact versions that consumed it, across every table whose enrichments read this table. A dependency establishes possible impact, not that regenerated bytes differ. `complete` is false whenever a depth or row budget was reached or a group could not be read.
+pub const DependencyImpactResponse = struct {
+    input: std.json.Value,
+    dependents: []const DependencyImpactRow,
+    complete: bool,
+    traversal: []const u8,
+    semantics: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "input", "input", false },
+        .{ "dependents", "dependents", false },
+        .{ "complete", "complete", false },
+        .{ "traversal", "traversal", false },
+        .{ "semantics", "semantics", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("input");
+        try jw.write(self.input);
+        try jw.objectField("dependents");
+        try jw.write(self.dependents);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        try jw.objectField("traversal");
+        try jw.write(self.traversal);
+        if (self.semantics) |value| {
+            try jw.objectField("semantics");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const DependencyImpactRow = struct {
+    table_id: []const u8,
+    /// Public name of the dependent table, when visible to the caller.
+    table: ?[]const u8 = null,
+    key: []const u8,
+    artifact: []const u8,
+    version: ?i64 = null,
+    historical: ?bool = null,
+    live_candidate: ?bool = null,
+    freshness: []const u8,
+    path: []const []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table_id", "table_id", false },
+        .{ "table", "table", true },
+        .{ "key", "key", false },
+        .{ "artifact", "artifact", false },
+        .{ "version", "version", true },
+        .{ "historical", "historical", true },
+        .{ "live_candidate", "live_candidate", true },
+        .{ "freshness", "freshness", false },
+        .{ "path", "path", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("artifact");
+        try jw.write(self.artifact);
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.historical) |value| {
+            try jw.objectField("historical");
+            try jw.write(value);
+        }
+        if (self.live_candidate) |value| {
+            try jw.objectField("live_candidate");
+            try jw.write(value);
+        }
+        try jw.objectField("freshness");
+        try jw.write(self.freshness);
+        try jw.objectField("path");
+        try jw.write(self.path);
+        try jw.endObject();
+    }
 };
 
 pub const DistanceRange = struct {

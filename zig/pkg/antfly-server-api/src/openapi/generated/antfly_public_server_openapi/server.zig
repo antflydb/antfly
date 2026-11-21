@@ -1615,6 +1615,17 @@ pub fn parseRejectCurationProposalBody(allocator: std.mem.Allocator, body: []con
     return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalDecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Find generated artifacts that consumed a source document
+pub const AnalyzeDependencyImpactPathParams = struct {
+    /// Name of the source table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for analyzeDependencyImpact.
+pub fn parseAnalyzeDependencyImpactBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DependencyImpactRequest) {
+    return std.json.parseFromSlice(types.DependencyImpactRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Adopt stored write destinations with the current credential
 pub const ReauthorizeTableDestinationsPathParams = struct {
     /// Name of the table whose stored destinations should be adopted
@@ -1673,6 +1684,21 @@ pub const GetDocumentArtifactManifestPathParams = struct {
 pub const GetDocumentArtifactManifestParams = struct {
     /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
     detail: ?[]const u8 = null,
+};
+
+/// Inspect an artifact's context dependencies and freshness
+pub const GetArtifactDependenciesPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+    /// Name of an asset enrichment that declares context sources.
+    artifact_name: []const u8,
+};
+
+pub const GetArtifactDependenciesParams = struct {
+    freshness: ?[]const u8 = null,
+    wait_timeout_ms: ?[]const u8 = null,
 };
 
 /// Reprocess a derived artifact
@@ -2589,11 +2615,13 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/curation/proposals/{proposalId}", .operation_id = "getCurationProposal", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/curation/proposals/{proposalId}:accept", .operation_id = "acceptCurationProposal", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/curation/proposals/{proposalId}:reject", .operation_id = "rejectCurationProposal", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/dependencies/impact", .operation_id = "analyzeDependencyImpact", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/destination-authorization", .operation_id = "reauthorizeTableDestinations", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/dependencies", .operation_id = "getArtifactDependencies", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/progress", .operation_id = "listEntityResolverProgress", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/redirects", .operation_id = "listEntityResolverState", .request_body = .none, .streaming_response = false },
@@ -2849,11 +2877,13 @@ pub const routes = [_]Route{
 //   fn getCurationProposal(self: *Impl, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response
 //   fn acceptCurationProposal(self: *Impl, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response
 //   fn rejectCurationProposal(self: *Impl, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response
+//   fn analyzeDependencyImpact(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reauthorizeTableDestinations(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
+//   fn getArtifactDependencies(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetArtifactDependenciesParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn listEntityResolverProgress(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListEntityResolverProgressParams) !httpx.Response
 //   fn listEntityResolverState(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response

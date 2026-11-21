@@ -483,6 +483,11 @@ pub const GetDocumentArtifactManifestParams = struct {
     detail: ?[]const u8 = null,
 };
 
+pub const GetArtifactDependenciesParams = struct {
+    freshness: ?[]const u8 = null,
+    wait_timeout_ms: ?[]const u8 = null,
+};
+
 pub const ListEntityResolverProgressParams = struct {
     limit: ?[]const u8 = null,
     cursor: ?[]const u8 = null,
@@ -4275,6 +4280,19 @@ pub const Client = struct {
         return ApiResponse(types.CurationProposalDecisionResult).fromResponse(self.allocator, &resp);
     }
 
+    /// Find generated artifacts that consumed a source document
+    /// POST /db/v1/tables/{tableName}/dependencies/impact
+    pub fn analyzeDependencyImpact(self: *@This(), table_name: []const u8, body: types.DependencyImpactRequest) !ApiResponse(types.DependencyImpactResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/dependencies/impact", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.DependencyImpactResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Adopt stored write destinations with the current credential
     /// POST /db/v1/tables/{tableName}/destination-authorization
     pub fn reauthorizeTableDestinations(self: *@This(), table_name: []const u8) !ApiResponse(std.json.Value) {
@@ -4398,6 +4416,45 @@ pub const Client = struct {
         }
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactManifest).fromResponse(self.allocator, &resp);
+    }
+
+    /// Inspect an artifact's context dependencies and freshness
+    /// GET /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/dependencies
+    pub fn getArtifactDependencies(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetArtifactDependenciesParams) !ApiResponse(types.ArtifactDependencies) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
+        defer self.allocator.free(encoded_artifact_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}/dependencies", .{ self.base_url, encoded_table_name, encoded_key, encoded_artifact_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.freshness) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "freshness=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.wait_timeout_ms) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "wait_timeout_ms=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ArtifactDependencies).fromResponse(self.allocator, &resp);
     }
 
     /// Reprocess a derived artifact

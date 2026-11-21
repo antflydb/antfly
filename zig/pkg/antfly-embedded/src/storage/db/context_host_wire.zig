@@ -48,8 +48,15 @@ pub const Op = enum(u32) {
 
 /// A group-local context read (lookup mode `context_read`), routed by key
 /// to the group owning it.
+///
+/// `dependencies`: the dependency report of artifact `names[0]` on document
+/// `key`, plus whether this group's inbox still holds unapplied notices.
+/// `outbox_pending`: whether this group's outbox (or an unreconciled
+/// generated record) still holds a change for `dependent_table_id`.
+/// `impact`: this group's reverse lineage rows for input `key` of
+/// `input_table_id`, reported under `own_table_id`.
 pub const ReadRequest = struct {
-    op: enum { edges, artifacts },
+    op: enum { edges, artifacts, dependencies, outbox_pending, impact },
     key: []const u8,
     graph_index: []const u8 = "",
     edge_types: []const []const u8 = &.{},
@@ -57,6 +64,12 @@ pub const ReadRequest = struct {
     limit: u32 = 0,
     include_generated: bool = false,
     names: []const []const u8 = &.{},
+    dependent_table_id: []const u8 = "",
+    input_table_id: []const u8 = "",
+    own_table_id: []const u8 = "",
+    revision: []const u8 = "",
+    transitive: bool = false,
+    max_depth: u32 = 8,
 };
 
 /// Page response: `{"rows":[{"key","value"}],"exhausted":bool}`.

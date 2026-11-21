@@ -2532,6 +2532,67 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/dependencies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of an asset enrichment that declares context sources. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Inspect an artifact's context dependencies and freshness
+         * @description Returns the dependency state of one generated artifact: its freshness,
+         *     live subscriptions, and retained lineage manifests. With
+         *     `freshness=require_current` the read waits up to `wait_timeout_ms` for
+         *     a read barrier: every group of every source table the enrichment reads
+         *     has delivered all committed change notices for this table, this
+         *     group's inbox has applied them, and the artifact's state is current.
+         *     Otherwise it answers 409 `artifact_not_current`. The route is
+         *     shard-aware and requires read permission on the table.
+         */
+        get: operations["getArtifactDependencies"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/dependencies/impact": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the source table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Find generated artifacts that consumed a source document
+         * @description Reverse lineage for one source document key: retained dependent artifact
+         *     versions confirmed against their lineage manifests, from every table
+         *     whose enrichments read this table, and optionally their same-document
+         *     downstream consumers. Rows from tables the caller may not read are
+         *     omitted and make the response incomplete.
+         */
+        post: operations["analyzeDependencyImpact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess": {
         parameters: {
             query?: never;
@@ -9151,6 +9212,88 @@ export interface components {
             child_count: number;
             /** @description Approximate extracted text bytes covered by this range when available. */
             text_bytes?: number | null;
+        };
+        /**
+         * @description Dependency state of one document artifact whose enrichment declares
+         *     `context_sources`. `freshness` is null when the artifact was never
+         *     generated with context dependencies. Freshness (`current`, `stale`,
+         *     `failed`, `pending`) is reported separately from rebuild execution
+         *     state. `versions` lists retained lineage manifests, newest first.
+         */
+        ArtifactDependencies: {
+            /** @description State, generation, published generation, version, validated-through frontier, input fingerprint, rebuild state, and bounded change reasons. */
+            freshness: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Format: int64
+             * @description Live subscription tuples registered for this artifact.
+             */
+            subscriptions?: number;
+            versions: {
+                [key: string]: unknown;
+            }[];
+            /**
+             * @description Present when `freshness=require_current` was requested: true when a
+             *     read barrier observed no undelivered committed change to any of the
+             *     artifact's source tables and its dependency state is current.
+             */
+            current?: boolean;
+        };
+        ArtifactNotCurrent: {
+            /** @enum {string} */
+            error: "artifact_not_current";
+            message: string;
+            retryable: boolean;
+            /** @description What kept the artifact from being current when the wait ended (for example `stale`, `inbox`, or `outbox:<table>`). */
+            pending?: string[];
+            dependencies: components["schemas"]["ArtifactDependencies"];
+        };
+        DependencyImpactRequest: {
+            /** @description Source document key whose dependents are requested. */
+            key: string;
+            /** @description Optional hex input revision; only outputs that consumed that revision are returned. */
+            revision?: string;
+            /**
+             * @description `transitive` also lists same-document artifacts that consume each dependent (live candidates with their path).
+             * @default direct
+             * @enum {string}
+             */
+            traversal?: "direct" | "transitive";
+            /** @default 8 */
+            max_depth?: number;
+            /** @default 100 */
+            limit?: number;
+        };
+        DependencyImpactRow: {
+            table_id: string;
+            /** @description Public name of the dependent table, when visible to the caller. */
+            table?: string;
+            key: string;
+            artifact: string;
+            /** Format: int64 */
+            version?: number;
+            historical?: boolean;
+            live_candidate?: boolean;
+            freshness: string;
+            path: string[];
+        };
+        /**
+         * @description Reverse lineage of one source document: dependent artifact versions that
+         *     consumed it, across every table whose enrichments read this table. A
+         *     dependency establishes possible impact, not that regenerated bytes
+         *     differ. `complete` is false whenever a depth or row budget was reached
+         *     or a group could not be read.
+         */
+        DependencyImpactResponse: {
+            input: {
+                table_id?: string;
+                key?: string;
+            };
+            dependents: components["schemas"]["DependencyImpactRow"][];
+            complete: boolean;
+            traversal: string;
+            semantics?: string;
         };
         /**
          * @description Inspection view for a derived document artifact produced from a source
@@ -37663,6 +37806,80 @@ export interface operations {
                     };
                 };
             };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getArtifactDependencies: {
+        parameters: {
+            query?: {
+                freshness?: "any" | "require_current";
+                wait_timeout_ms?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of an asset enrichment that declares context sources. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dependency state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtifactDependencies"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description The artifact did not become current before the wait ended. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtifactNotCurrent"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    analyzeDependencyImpact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the source table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DependencyImpactRequest"];
+            };
+        };
+        responses: {
+            /** @description Impact rows */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DependencyImpactResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
         };

@@ -248,6 +248,41 @@ def test_cross_table_context_sources_follow_source_changes(
     )
     assert updated is not None, _statement(stateful_api, people, "person:1", "brief")
 
+    # Dependency state over HTTP: the read barrier clears once every source
+    # group delivered its notices and the dependent's state is current.
+    deps_path = f"/tables/{people}/documents/person%3A1/artifacts/brief/dependencies"
+    current = None
+    for _ in range(40):
+        response = stateful_api._request(
+            "GET", f"{deps_path}?freshness=require_current&wait_timeout_ms=5000"
+        )
+        if _status(response) == 200:
+            current = response.json()
+            break
+        assert _status(response) == 409, getattr(response, "text", response)
+        assert response.json()["error"] == "artifact_not_current"
+    assert current is not None
+    assert current["current"] is True
+    assert current["freshness"]["state"] == "current"
+    assert current["versions"], current
+    plain = stateful_api.get(deps_path)
+    assert plain["freshness"]["state"] == "current"
+    assert "current" not in plain
+
+    # Reverse lineage: the source row's dependents across tables.
+    impact = stateful_api.post(
+        f"/tables/{orgs}/dependencies/impact", {"key": "org:acme", "limit": 50}
+    )
+    assert any(
+        row["table"] == people and row["key"] == "person:1" and row["artifact"] == "brief"
+        for row in impact["dependents"]
+    ), impact
+    assert not any(row["key"] == "person:2" for row in impact["dependents"]), impact
+    bad = stateful_api._request(
+        "POST", f"/tables/{orgs}/dependencies/impact", {"key": "org:acme", "traversal": "sideways"}
+    )
+    assert _status(bad) == 400, getattr(bad, "text", bad)
+
     # Membership: a new matching row joins the dependent's context.
     stateful_api.batch_write(
         orgs,

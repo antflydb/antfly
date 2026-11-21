@@ -55,15 +55,60 @@ pub const TableInfo = struct {
     indexes_json: []const u8,
 };
 
-fn findByName(tables: []const TableInfo, name: []const u8) ?TableInfo {
+pub fn findByName(tables: []const TableInfo, name: []const u8) ?TableInfo {
     for (tables) |t| if (std.mem.eql(u8, t.name, name)) return t;
     return null;
 }
 
-fn findByIdentity(tables: []const TableInfo, identity: []const u8) ?TableInfo {
+pub fn findByIdentity(tables: []const TableInfo, identity: []const u8) ?TableInfo {
     const id = parseIdentity(identity) orelse return null;
     for (tables) |t| if (t.table_id == id) return t;
     return null;
+}
+
+/// Names of the tables `artifact` of `table_name` reads through its context
+/// sources (the table itself for own-table sources), unique. Empty when the
+/// enrichment declares none; `error.NotFound` when it does not exist.
+pub fn sourceTablesAlloc(a: Allocator, tables: []const TableInfo, collect: CollectEnrichments, table_name: []const u8, artifact: []const u8) ![]const []const u8 {
+    const owner = findByName(tables, table_name) orelse return error.NotFound;
+    const configs = try collect.collect_fn(a, owner.indexes_json);
+    const cfg = for (configs) |c| {
+        if (std.mem.eql(u8, c.name, artifact)) break c;
+    } else return error.NotFound;
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    if (cfg.context_sources_json.len == 0) return out.items;
+    var config = try ctx.parseStoredJson(a, cfg.context_sources_json);
+    defer config.deinit();
+    for (config.sources) |source| {
+        const name = if (source.table_id.len == 0) owner.name else (findByIdentity(tables, source.table_id) orelse return error.ContextSourceTableUnavailable).name;
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, name)) break;
+        } else try out.append(a, name);
+    }
+    return out.items;
+}
+
+/// Tables whose enrichments read `source_table` through context sources
+/// (including the table itself for own-table sources): where its reverse
+/// lineage lives.
+pub fn dependentTablesAlloc(a: Allocator, tables: []const TableInfo, collect: CollectEnrichments, source_table: []const u8) ![]const TableInfo {
+    const source = findByName(tables, source_table) orelse return error.NotFound;
+    const source_identity = try identityAlloc(a, source.table_id);
+    var out = std.ArrayListUnmanaged(TableInfo).empty;
+    for (tables) |t| {
+        const configs = try collect.collect_fn(a, t.indexes_json);
+        const reads = for (configs) |cfg| {
+            if (cfg.context_sources_json.len == 0) continue;
+            var config = ctx.parseStoredJson(a, cfg.context_sources_json) catch continue;
+            defer config.deinit();
+            const hit = for (config.sources) |src| {
+                if (if (src.table_id.len == 0) t.table_id == source.table_id else std.mem.eql(u8, src.table_id, source_identity)) break true;
+            } else false;
+            if (hit) break true;
+        } else false;
+        if (reads) try out.append(a, t);
+    }
+    return out.items;
 }
 
 /// Every enrichment declaration of every table, with server identities.

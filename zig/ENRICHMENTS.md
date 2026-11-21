@@ -1098,7 +1098,7 @@ not a decision explanation.
 | Embedded single DB | own-table document, query (all live predicates, top-N), graph, and snapshot sources |
 | Embedded Lite (multi-table) | cross-table sources, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
 | Ordered (Raft) publication | dependency state commits with the artifact through replicated publish intents |
-| Distributed server tables | every source kind (document, query with all live predicates and top-N, graph, `_artifacts` fields, snapshot search), own table and across tables; declared through the enrichment endpoint |
+| Distributed server tables | every source kind (document, query with all live predicates and top-N, graph, `_artifacts` fields, snapshot search without `semantic_search`), own table and across tables; declared through the enrichment endpoint; HTTP dependency state, `require_current` barrier, and impact |
 
 ### Distributed tables
 
@@ -1151,19 +1151,87 @@ dependency state, and only a group's leader plans changes to it.
   intents for the moved documents; the source keeps and delivers its own
   outbox.
 
+### Freshness reads, impact, and the read barrier
+
+Distributed tables expose the dependency state over HTTP:
+
+- `GET /tables/{t}/documents/{key}/artifacts/{a}/dependencies` returns the
+  freshness, live subscription count, and retained lineage manifests of one
+  artifact (requires read permission and a visible source document).
+- `freshness=require_current&wait_timeout_ms=N` adds a read barrier and
+  answers 409 `artifact_not_current` (with what is still pending) if it does
+  not clear in time. The barrier reads, at read-index consistency, every
+  group of every table the enrichment reads and asks whether its outbox
+  still holds a notice for this table (or a generated record whose notices
+  are not staged yet), then this group's inbox and the artifact's state.
+  Because a source group acknowledges a notice only after the dependent
+  group applied the inbox append, an empty outbox means every source change
+  committed before the barrier reached this table; an empty inbox and a
+  `current` state then mean none of them invalidated the artifact since it
+  was built. No scalar frontier is involved: replicated tables report no
+  `validated_through` position (each replica numbers its derived records
+  independently).
+- `POST /tables/{t}/dependencies/impact` returns reverse lineage for one
+  source key from every group of every table that reads `t` (rows from
+  tables the caller may not read are omitted and mark the answer
+  incomplete), optionally with same-document downstream candidates.
+
+### Execution identity
+
+Context reads run in the background with no caller, so they execute as the
+principal that declared the enrichment. At admission the declarer must be
+able to read every source table, and its effective row filter on each
+source table is conjoined into query and search sources in the stored
+declaration (so it is part of the subscription identity, is evaluated by
+storage on every resolution, and drives invalidation). Document and graph
+sources read rows by key or edge and cannot carry a filter: they are
+refused on tables where the declarer has one. The filter is captured at
+declaration: after the principal's policies change, re-declare the
+enrichment (`PUT .../enrichment`) to re-capture it; retained artifacts keep
+the content they were built from until rebuilt. Anyone who can read the
+dependent table reads generated output derived from what the declarer could
+read, like a definer-rights view.
+
+### Robustness notes
+
+- A replicated command carries at most 4096 effects and 4096 read-set
+  entries. Inbox apply stops before a notice that might not fit, one
+  notice's fan-out counts every hint it examines and tuple it scans, and
+  reconcile and backfill pages retry a shorter prefix rather than propose a
+  command every replica would reject.
+- Outbox acknowledgements name the notice's replicated identity and the
+  pending count the leader observed; a duplicate (a retried proposal, or a
+  redelivery planned before the first acknowledgement applied) finds one
+  fewer and changes nothing.
+- Admission rejects generated-input cycles, also those closed through a
+  derived enrichment's `source_artifact`. Two concurrent declarations on
+  different tables can still each pass against a catalog without the other;
+  maintenance drops every declaration on a cycle from source topologies, so
+  such a loop never drives rebuilds.
+- After a restart the data server sweeps every led group once before it
+  goes idle, so topologies left behind by removed declarations are cleared.
+
 ### Remaining work
 
 - Distributed tables: context sources are declared through the enrichment
   endpoint, not inline at table creation (resolution needs the table's
   catalog identity).
-- HTTP surface: artifact `freshness`, the per-artifact dependency manifest,
-  `POST /dependencies/impact`, and `freshness=require_current&wait_timeout=`
-  reads (the storage and C ABI primitives exist).
-- Execution identity: context reads currently use the host's internal read
-  path; row/field authorization filters and revocation semantics for retained
-  artifacts still need a policy hook.
-- Downstream propagation across tables (an artifact consumed by another
-  table's context) and graph selectors (#1635).
+- Row filters are captured at declaration; revocation applies on
+  re-declaration, not automatically. There are no field-level policies to
+  apply.
+- Impact traversal follows same-document chains; it does not walk into
+  other tables' consumers of a dependent artifact (cross-table invalidation
+  itself does propagate through `_artifacts` sources).
+- Range merges: splits carry context state, but a merge imports the donor's
+  documents without its dependency families (states, subscriptions,
+  shadows, inbox), so artifacts of merged-in documents stop being
+  invalidated until they are rebuilt. Merging ranges of tables with context
+  dependents needs a dependency import (or a rebuild of the merged-in
+  dependents) before it is safe.
+- TTL: expiry notifies when TTL cleanup deletes the row, not at the
+  expiry instant; until then an artifact built from the expired row stays
+  `current`.
+- Graph selectors (#1635).
 - Fan-out benchmarks (invalidation latency, rebuild latency, producer calls,
   subscription storage, bulk-update work).
 - `similar` with `metric: dot` still fans out to every dependent of the

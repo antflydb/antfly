@@ -10124,6 +10124,53 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &resp);
     }
 
+    pub fn getArtifactDependencies(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: metadata_server_openapi.server.GetArtifactDependenciesParams) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
+        defer alloc.free(decoded_table_name);
+        const decoded_key = (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid path parameter");
+        defer alloc.free(decoded_key);
+        const decoded_artifact_name = (try decodePathParamOrBadRequest(ctx, artifact_name)) orelse return ctx.text("invalid path parameter");
+        defer alloc.free(decoded_artifact_name);
+        const freshness = params.freshness orelse "any";
+        const require_current = if (std.mem.eql(u8, freshness, "require_current")) true else if (std.mem.eql(u8, freshness, "any")) false else return textResponse(ctx, 400, "freshness must be any or require_current");
+        const wait_timeout_ms: u32 = if (params.wait_timeout_ms) |raw| (std.fmt.parseInt(u32, raw, 10) catch return textResponse(ctx, 400, "wait_timeout_ms must be 0..30000")) else 0;
+        if (wait_timeout_ms > 30_000) return textResponse(ctx, 400, "wait_timeout_ms must be 0..30000");
+        // Dependency state names the source documents an output consumed:
+        // only callers who may see the source document itself get it.
+        if (!(try self.api_server.sourceDocumentVisibleToIdentity(decoded_table_name, decoded_key, authenticated_identity))) return textResponse(ctx, 404, "not found");
+        var resp = self.api_server.handlePublicArtifactDependencies(alloc, operationContext(ctx, authenticated_identity), decoded_table_name, decoded_key, decoded_artifact_name, require_current, wait_timeout_ms) catch |err| return dependencyFailure(ctx, err);
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn analyzeDependencyImpact(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
+        defer alloc.free(decoded_table_name);
+        const body_data = (try ctx.body()) orelse return textResponse(ctx, 400, "request body required");
+        var resp = self.api_server.handlePublicDependencyImpact(alloc, operationContext(ctx, authenticated_identity), decoded_table_name, body_data) catch |err| return dependencyFailure(ctx, err);
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    fn dependencyFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.Forbidden => textResponse(ctx, 403, "forbidden"),
+            error.TableNotFound, error.NotFound => textResponse(ctx, 404, "not found"),
+            error.InvalidArgument => textResponse(ctx, 400, "invalid dependency request"),
+            error.OutOfMemory => err,
+            else => blk: {
+                std.log.warn("context dependency read failed err={s}", .{@errorName(err)});
+                break :blk textResponse(ctx, 503, "dependency state temporarily unavailable; retry");
+            },
+        };
+    }
+
     pub fn listDocumentArtifactManifests(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_server_openapi.server.ListDocumentArtifactManifestsParams) !httpx.Response {
         _ = params;
         var authenticated_identity: ?AuthenticatedIdentity = null;
