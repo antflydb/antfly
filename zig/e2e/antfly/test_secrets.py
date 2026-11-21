@@ -155,6 +155,7 @@ class TableObjectStorage:
     """
 
     def __init__(self):
+        self.reject_artifact_uploads = threading.Event()
         self.objects = {}
         self.content_types = {}
         self.lock = threading.Lock()
@@ -177,7 +178,14 @@ class TableObjectStorage:
                         else None
                     )
                     if self.command == "PUT":
+                        # Scoped publication artifacts use graph/<domain>/<attempt>/<digest>.
                         if (
+                            outer.reject_artifact_uploads.is_set()
+                            and "graph" in key.split("/")
+                        ):
+                            status = 503
+                            response = b"<Error><Code>ServiceUnavailable</Code></Error>"
+                        elif (
                             self.headers.get("If-None-Match") == "*"
                             and current is not None
                         ) or (

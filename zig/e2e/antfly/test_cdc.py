@@ -2364,12 +2364,14 @@ def test_standalone_postgres_cdc_snapshot_completes_with_embeddings_index(
         ("standalone", 16_384),
         ("distributed", 0),
         ("distributed-mixed", 0),
+        ("distributed-publication-failure", 0),
     ],
     ids=[
         "standalone-single-row",
         "standalone-multi-file",
         "distributed-single-row",
         "distributed-mixed-providers",
+        "distributed-publication-failure",
     ],
 )
 def test_postgres_bootstraps_and_streams_to_writable_iceberg(
@@ -2442,6 +2444,7 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
     table = "/tables/cdc_iceberg"
     native_table = "cdc_native"
     mixed = deployment == "distributed-mixed"
+    publication_failure = deployment == "distributed-publication-failure"
     native_before = {"id": "native-row", "name": "Native", "tier": "before"}
     native_after = {**native_before, "tier": "after"}
     provider = pg_cdc_source["table_name"]
@@ -2494,6 +2497,11 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
             table,
             {
                 "storage": {"engine": "object"},
+                **(
+                    {"indexes": {"name_text": {"type": "full_text", "field": "name"}}}
+                    if publication_failure
+                    else {}
+                ),
                 "schema": {
                     "storage_mode": "relational",
                     "default_type": "row",
@@ -2596,6 +2604,32 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
             ).json()
             feed = f"{feeds}/{created['id']}"
 
+        if publication_failure:
+
+            def publication_progress():
+                return call("GET", table + "/sources/managed")["index_publication"]
+
+            def published_at(snapshot):
+                state = publication_progress()
+                return state if state["published_snapshot"] == str(snapshot) else None
+
+            initial_snapshot = call("GET", table + "/lake/catalog")["metadata"][
+                "current-snapshot-id"
+            ]
+            initial_publication = wait_until(
+                lambda: published_at(initial_snapshot), timeout_s=120, interval_s=0.5
+            )
+            assert initial_publication, server.debug_logs()
+            activation = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": "postgres-iceberg-activation"},
+                json={"tables": ["cdc_iceberg"], "events": ["publication_activated"]},
+            ).json()
+            activation_feed = f"{feeds}/{activation['id']}"
+            artifacts.reject_artifact_uploads.set()
+
         server.pause(crash=True)
         _run_psql(
             f"update {provider} set id = 'user-2', name = 'Bob' where id = 'user-1'"
@@ -2613,6 +2647,20 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
         assert resumed["antfly.cdc.checkpoint"] != cut
         assert rows() == [["user-2", "Bob"]]
         check_row_count()
+        if publication_failure:
+            saved_catalog = call("GET", table + "/lake/catalog")["metadata"]
+
+            def failed_publication():
+                state = publication_progress()
+                return state if state["failed_generation"] is not None else None
+
+            failure = wait_until(failed_publication, timeout_s=120, interval_s=0.5)
+            assert failure, server.debug_logs()
+            assert (
+                failure["failed_generation"]
+                > initial_publication["published_generation"]
+            )
+            assert failure["published_snapshot"] == str(initial_snapshot)
         if feed is not None:
             # Read the original cut after the catalog has committed a newer snapshot.
             cursor = created["cursor"]
@@ -2673,6 +2721,53 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
                 assert events["update"]["before"] == native_before
                 assert events["update"]["after"] == native_after
             _changefeed_call(client, "DELETE", feed)
+        if publication_failure:
+            assert publication_progress()["published_snapshot"] == str(initial_snapshot)
+            heartbeat = _changefeed_call(
+                client,
+                "GET",
+                f"{activation_feed}/events",
+                params={"after": activation["cursor"]},
+            )
+            assert heartbeat.json()["events"] == []
+            activation_cursor = heartbeat.headers["Antfly-Changefeed-Cursor"]
+            _changefeed_call(
+                client,
+                "POST",
+                f"{activation_feed}/ack",
+                json={"cursor": activation_cursor},
+            )
+            artifacts.reject_artifact_uploads.clear()
+            recovery = wait_until(
+                lambda: published_at(saved_catalog["current-snapshot-id"]),
+                timeout_s=120,
+                interval_s=0.5,
+            )
+            assert recovery, server.debug_logs()
+            activated = _changefeed_call(
+                client,
+                "GET",
+                f"{activation_feed}/events",
+                params={"after": activation_cursor},
+            )
+            events = activated.json()["events"]
+            assert len(events) == 1
+            assert events[0]["kind"] == "publication_activated"
+            assert int(events[0]["generation"]) == recovery["published_generation"]
+            _changefeed_call(client, "DELETE", activation_feed)
+            recovered_catalog = call("GET", table + "/lake/catalog")["metadata"]
+            assert (
+                recovered_catalog["current-snapshot-id"]
+                == saved_catalog["current-snapshot-id"]
+            )
+            assert (
+                recovered_catalog["properties"]["antfly.wal.coverage"]
+                == resumed["antfly.wal.coverage"]
+            )
+            assert (
+                recovered_catalog["properties"]["antfly.cdc.checkpoint"]
+                == resumed["antfly.cdc.checkpoint"]
+            )
     finally:
         client.close()
         server.stop()
