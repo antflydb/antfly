@@ -4325,6 +4325,9 @@ pub const NativeGenerationPipeline = struct {
     /// Local diagnostics may request the complete generated sequence. Serving
     /// callers must keep the default so private Gemma4 channel tokens stay hidden.
     return_raw_token_ids: bool = false,
+    /// Optional caller-owned vocabulary row for offline first-token qualification.
+    /// Receives the final, softcapped prefill logits consumed by the sampler.
+    prefill_logits_out: ?[]f32 = null,
     print_timing: bool = false,
     failure_trace: ?*GenerationFailureTrace = null,
     model_dir: ?[]const u8 = null,
@@ -6393,7 +6396,7 @@ pub const NativeGenerationPipeline = struct {
 
         // Prefill
         try setWorkloadProfileRegime(&self.cb, .prefill);
-        const allow_prefill_greedy_token = !use_speculative or (use_speculative and draft_is_gemma4_mtp);
+        const allow_prefill_greedy_token = self.prefill_logits_out == null and (!use_speculative or draft_is_gemma4_mtp);
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
         const prefill_output = if (self.checkpoint_resume) |request|
             try self.resumeNativeCheckpoint(request, token_ids[0..seq_len], max_tokens, decode_state, config)
@@ -6419,6 +6422,11 @@ pub const NativeGenerationPipeline = struct {
         if (self.failure_trace) |trace| trace.mark(.decode);
         defer if (prefill_last_logits) |logits| allocator.free(logits);
         defer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
+        if (self.prefill_logits_out) |dest| {
+            const row = prefill_last_logits orelse return error.MissingLogitCapture;
+            if (dest.len != self.gpt_config.vocab_size or dest.len != row.len) return error.InvalidLogitCapture;
+            @memcpy(dest, row);
+        }
         if (config.qwen3vl_parity_logits_path) |path| {
             if (prepared_qwen3vl_prompt == null or prefill_last_logits == null or
                 prefill_last_logits.?.len != self.gpt_config.vocab_size)

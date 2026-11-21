@@ -47,7 +47,6 @@ fn now() u64 {
     return inference.platform.time.monotonicNs();
 }
 const ops = inference.ops;
-extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
 // Benchmark-only control: restore the pre-fix PLE epsilon in the same binary.
 // Both arms traverse these wrappers; production code and kernel bodies are shared.
 const PleControl = struct {
@@ -81,8 +80,6 @@ const PleControl = struct {
     }
 };
 const Capture = struct {
-    values: ?[]f32 = null,
-    reads: usize = 0,
     io: std.Io = undefined,
     input_path: ?[]const u8 = null,
     input_captured: bool = false,
@@ -111,15 +108,6 @@ const Capture = struct {
         try input(ctx, request.input, 0, request.in_dim, request.out_dim);
         return function(ctx, request);
     }
-    fn read(ctx: *anyopaque, tensor: ops.CT, allocator: std.mem.Allocator) ![]f32 {
-        const values = try original(ctx, tensor, allocator);
-        errdefer allocator.free(values);
-        if (active) |self| if (values.len == 262144) {
-            self.reads += 1;
-            if (self.values == null) self.values = try a.dupe(f32, values);
-        };
-        return values;
-    }
 };
 const Runner = struct {
     pipeline: *generation.NativeGenerationPipeline,
@@ -140,18 +128,18 @@ const Runner = struct {
         const input_path = if (case.ple_input_path) |p| try std.fs.path.join(a, &.{ self.base, p }) else null;
         defer if (input_path) |p| a.free(p);
         var capture = Capture{ .io = self.io, .input_path = input_path, .hidden_size = self.pipeline.gpt_config.hidden_size, .projection_size = self.pipeline.gpt_config.ple_hidden_size * self.pipeline.gpt_config.num_hidden_layers };
-        defer if (capture.values) |values| a.free(values);
-        if (case.logits_path != null) {
-            if (case.max_tokens != 1) return error.LogitCaptureNeedsOneToken;
+        const logits = if (case.logits_path != null) try a.alloc(f32, self.pipeline.gpt_config.vocab_size) else null;
+        defer if (logits) |row| a.free(row);
+        self.pipeline.prefill_logits_out = logits;
+        defer self.pipeline.prefill_logits_out = null;
+        if (logits != null and case.max_tokens != 1) return error.LogitCaptureNeedsOneToken;
+        if (input_path != null) {
             Capture.original = original_vtable.toFloat32;
             Capture.active = &capture;
-            capture_vtable.toFloat32 = Capture.read;
-            if (input_path != null) {
-                Capture.linear = original_vtable.linearNoBias;
-                Capture.prepared = original_vtable.decoderRuntimeApplyLinear;
-                capture_vtable.linearNoBias = Capture.project;
-                if (Capture.prepared != null) capture_vtable.decoderRuntimeApplyLinear = Capture.projectPrepared;
-            }
+            Capture.linear = original_vtable.linearNoBias;
+            Capture.prepared = original_vtable.decoderRuntimeApplyLinear;
+            capture_vtable.linearNoBias = Capture.project;
+            if (Capture.prepared != null) capture_vtable.decoderRuntimeApplyLinear = Capture.projectPrepared;
             self.pipeline.cb.vtable = &capture_vtable;
         }
         defer {
@@ -171,16 +159,17 @@ const Runner = struct {
         const data = if (path) |p| try std.Io.Dir.cwd().readFileAlloc(self.io, p, a, .limited(64 * 1024 * 1024)) else null;
         defer if (data) |bytes| a.free(bytes);
         const media = [_][]const u8{data orelse &.{}};
-        const message = generation.Message{ .role = "user", .content = case.text, .image_bytes = if (case.kind == .image) &media else null, .audio_bytes = if (case.kind == .audio) &media else null, .video_bytes = if (case.kind == .video) data else null };
+        const parts: [2]generation.Message.ContentPart = .{
+            if (case.kind == .audio) .{ .audio = 0 } else .{ .image = 0 },
+            .{ .text = case.text },
+        };
+        const message = generation.Message{ .role = "user", .content = case.text, .content_parts = if (case.kind == .image or case.kind == .audio) &parts else null, .image_bytes = if (case.kind == .image) &media else null, .audio_bytes = if (case.kind == .audio) &media else null, .video_bytes = if (case.kind == .video) data else null };
         var result = try self.pipeline.generate(&.{message}, .{ .max_tokens = case.max_tokens, .temperature = 0, .top_k = 0, .top_p = 0, .repetition_penalty = 1, .cache_dtype = self.kv_dtype, .prompt_cache_enabled = false, .ignore_eos = true, .enable_thinking = false });
         defer result.deinit();
         const finished = now();
         if (input_path != null and !capture.input_captured) return error.MissingPleInputCapture;
         if (case.logits_path) |p| {
-            const values = capture.values orelse return error.MissingLogitCapture;
-            if (capture.reads != 1 or values.len != self.pipeline.gpt_config.vocab_size) return error.InvalidLogitCapture;
-            // The intercepted lm_head readback precedes the architecture's CPU softcap.
-            inference.architectures.gpt.applyFinalLogitSoftcapInPlace(self.pipeline.gpt_config, values);
+            const values = logits.?;
             if (std.mem.indexOfMax(f32, values) != @as(usize, @intCast(result.token_ids.?[0]))) return error.CapturedArgmaxMismatch;
             for (values) |value| if (!std.math.isFinite(value)) return error.NonFiniteLogit;
             const destination = try std.fs.path.join(a, &.{ self.base, p });
@@ -213,13 +202,6 @@ pub fn main(init: std.process.Init) !void {
     const validation = suite.cases[0].logits_path != null;
     for (suite.cases) |case| if ((case.logits_path != null) != validation) return error.MixedValidationSuite;
     for (suite.cases) |case| if (case.ple_input_path != null and case.logits_path == null) return error.PleCaptureNeedsValidation;
-    if (validation) {
-        // Validation alone requests complete host logits. Timed runs retain defaults.
-        if (setenv("ANTFLY_INFERENCE_CUDA_PREFILL_GREEDY_TOKEN", "0", 1) != 0 or
-            setenv("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN", "0", 1) != 0 or
-            setenv("ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS", "0", 1) != 0) return error.SetEnv;
-    }
-
     const session = try factory.createCudaSession(a, args[1]);
     defer session.close();
     factory.attachIo(session, init.io);
@@ -266,6 +248,7 @@ pub fn main(init: std.process.Init) !void {
     // Prime every requested modality before measuring so tower weights do not
     // become a text-only resident-inventory advantage for the native arm.
     for (suite.cases) |case| {
+        std.log.info("priming {s}", .{case.id});
         const row = try runner.run(case, 0);
         a.free(row.tokens);
         a.free(row.text);
