@@ -11491,10 +11491,19 @@ const CudaKvDeviceStorage = struct {
         page_size_tokens: u16,
         logical_blocks: []const kv_block_mod.KvBlockId,
     ) !usize {
+        return plannedBlockTableUploadCount(token_count, page_size_tokens, logical_blocks, cudaDebugGraphForcedKvReplayCapacityTokens(self.compute));
+    }
+
+    fn plannedBlockTableUploadCount(
+        token_count: usize,
+        page_size_tokens: u16,
+        logical_blocks: []const kv_block_mod.KvBlockId,
+        forced_capacity_tokens: ?usize,
+    ) !usize {
         const needed_blocks = try neededBlockCount(token_count, page_size_tokens);
         if (needed_blocks == 0) return 0;
         if (logical_blocks.len < needed_blocks) return error.InvalidPagedKvState;
-        const forced_tokens = cudaDebugGraphForcedKvReplayCapacityTokens(self.compute) orelse return needed_blocks;
+        const forced_tokens = forced_capacity_tokens orelse return needed_blocks;
         const forced_blocks = try neededBlockCount(@max(token_count, forced_tokens), page_size_tokens);
         if (forced_blocks == 0 or logical_blocks.len < forced_blocks) return needed_blocks;
         return @max(needed_blocks, forced_blocks);
@@ -56577,11 +56586,12 @@ test "CUDA generic paged attention reads authoritative unequal reserved PAGE tab
 test "CUDA reserved paged table count refuses short visible prefix without lowering replay reservation" {
     const visible = [_]u32{ 2, 7 };
     const full = [_]u32{ 2, 7, 11, 13, 17, 19 };
-    try std.testing.expectError(error.InvalidPagedKvState, CudaKvDeviceStorage.blockTableUploadBlockCount(64, 16, &visible));
-    try std.testing.expectEqual(@as(usize, 4), try CudaKvDeviceStorage.blockTableUploadBlockCount(64, 16, &full));
-    try std.testing.expectEqual(@as(usize, 6), try CudaKvDeviceStorage.blockTableUploadBlockCount(96, 16, &full));
-    // Peer ordering never changes the caller's own explicit requested bound.
-    try std.testing.expectEqual(@as(usize, 4), try CudaKvDeviceStorage.blockTableUploadBlockCount(64, 16, &full));
+    const count = CudaKvDeviceStorage.plannedBlockTableUploadCount;
+    try std.testing.expectError(error.InvalidPagedKvState, count(64, 16, &visible, 96));
+    try std.testing.expectEqual(@as(usize, 4), try count(64, 16, &full, null));
+    try std.testing.expectEqual(@as(usize, 6), try count(64, 16, &full, 96));
+    try std.testing.expectEqual(@as(usize, 2), try count(32, 16, &visible, 96));
+    try std.testing.expectEqual(@as(usize, 6), try count(96, 16, &full, 64));
 }
 
 test "CUDA reserved paged read rejects copied foreign hooks and invalid runtime before any SDK or layer dereference" {

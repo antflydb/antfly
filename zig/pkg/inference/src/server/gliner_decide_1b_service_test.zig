@@ -1185,7 +1185,8 @@ fn serviceParity(comptime backend: BackendType) !void {
         if (comptime !build_options.enable_metal or builtin.os.tag != .macos) return error.SkipZigTest;
         if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     }
-    const requested = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse return error.SkipZigTest;
+    const requested = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse
+        return if (backend == .cuda) error.MissingRequiredGlinerArtifact else error.SkipZigTest;
     const a = std.testing.allocator;
     var perf_config = try perf.Config.fromEnv(a);
     defer if (perf_config) |*config| config.deinit();
@@ -1280,7 +1281,7 @@ fn serviceParity(comptime backend: BackendType) !void {
         if (cached == null) {
             cached = try expectCached(&node, directory, backend);
             resident_model = direct_model;
-            if (backend == .metal)
+            if (backend == .metal or backend == .cuda)
                 try std.testing.expect(resident_model.?.backend_weight_bytes >= pins.@"model.safetensors".size_bytes)
             else
                 try std.testing.expect(resident_model.?.host_weight_bytes >= pins.@"model.safetensors".size_bytes);
@@ -1377,6 +1378,12 @@ test "GLiNER2.5 Decide-1B exact PJRT F32 direct and HTTP classification parity" 
     if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
     if (!platform.env.getenvBool("ANTFLY_GLINER25_DECIDE_1B_PJRT_PARITY")) return error.SkipZigTest;
     try serviceParity(.pjrt);
+}
+
+test "GLiNER2.5 Decide-1B exact CUDA direct and HTTP service parity" {
+    if (!platform.env.getenvBool("ANTFLY_GLINER25_DECIDE_1B_CUDA_PARITY")) return error.SkipZigTest;
+    if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    try serviceParity(.cuda);
 }
 
 test "GLiNER2.5 Decide-1B exact native direct and HTTP service parity" {
