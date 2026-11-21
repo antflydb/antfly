@@ -1365,7 +1365,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
             const item = self.items[index];
             const parts = [_]Part{ .{ .sampled_video = item.movie }, .{ .text = item.caption orelse "" } };
             const group = Group{ .content = parts[0..if (item.caption != null) 2 else 1] };
-            try validateGroup(group, self.options);
+            try validateGroupContentControlled(group, self.options, true, self.control);
             var row_options = self.options;
             row_options.video_encoded = encoded;
             row_options.video_prepared_frames = item.prepared_frames;

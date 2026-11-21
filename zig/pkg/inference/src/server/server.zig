@@ -50582,7 +50582,6 @@ const ChunkEmbeddingAdapter = struct {
                         .pcm => unreachable,
                     };
                     const group = grouped.Group{ .content = &.{part} };
-                    try grouped.validateGroup(group, options);
                     const result = try grouped.embedCached(out, adapter.model.?.session, adapter.tokenizer, group, options, adapter.model.?.embeddingExecutionLock(), adapter.control, adapter.cache);
                     vector = result.vector;
                     input_tokens = result.input_tokens;
