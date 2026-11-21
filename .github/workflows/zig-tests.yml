@@ -1063,7 +1063,7 @@ jobs:
           # The @antfly/web package contract suite runs from its built ESM
           # artifact in the TypeScript SDK gate.
           node pkg/antfly-embedded/wasm_client_test.mjs
-          node pkg/antfly-embedded/wasm_opfs_store_test.mjs
+          node pkg/antfly-embedded/wasm_opfs_fs_test.mjs
           # Separate the complete embedded image and inference image phases:
           # their LLVM peaks must not overlap within the runner's fixed budget.
           python3 tools/run_bounded_zig_build.py --report reports/wasm-embedded-build.json build wasm-test -Dmetal=false -j1 -freference-trace=30 --summary all

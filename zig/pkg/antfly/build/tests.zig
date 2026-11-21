@@ -1388,6 +1388,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "embedded api Cypher relational counts account for rejected storage candidates",
             "embedded api hosted profile drains derived indexing without native runtimes",
             "embedded api hosted profile persists text index across reopen over storage",
+            "embedded api hosted profile persists text and vectors over host file storage",
             "embedded api createLite provisions default full text index",
             "embedded api openLite round-trips batch lookup over aflite file",
             "embedded api openLite manages index and enrichment definitions over aflite file",

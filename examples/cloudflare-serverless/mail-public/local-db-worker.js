@@ -14,13 +14,17 @@
 // limitations under the License.
 
 // Dedicated module worker that owns this device's copy of one mailbox: the
-// embedded Antfly WASM database plus its OPFS checkpoints. Requests arrive one
-// at a time from local-index.js and are answered in order.
+// embedded Antfly WASM database, whose files live directly in OPFS through a
+// pool of synchronous access handles (antfly_embedded_opfs_fs.mjs). Requests
+// arrive one at a time from local-index.js and are answered in order.
 import { localSchema, documentFor, searchRequest, hitsFrom } from "/local-schema.js";
 
 const ROOT = "antfly-mail-local";
+const DATABASE = "/mail";
+// Sync position and vector space, committed in the same batch as each page.
+const STATE = "_local/state";
 let api = null;
-let store = null;
+let pool = null;
 let mailbox = null;
 let runtime = null;
 
@@ -29,26 +33,22 @@ async function root() {
 }
 
 // Runtime URLs come from /local/config.json and are versioned by content.
-async function module(urls) {
+async function loadRuntime(urls) {
   if (runtime?.key !== urls.wasm) {
-    const [client, opfs, response] = await Promise.all([
-      import(urls.client),
-      import(urls.store),
-      fetch(urls.wasm),
-    ]);
+    const [client, fs, response] = await Promise.all([import(urls.client), import(urls.fs), fetch(urls.wasm)]);
     if (!response.ok) throw Error(`Local database runtime unavailable (${response.status})`);
-    runtime = { key: urls.wasm, client, opfs, bytes: new Uint8Array(await response.arrayBuffer()) };
+    runtime = { key: urls.wasm, client, fs, bytes: new Uint8Array(await response.arrayBuffer()) };
   }
-  return runtime.client.instantiateAntflyEmbeddedApiFromBytes(runtime.bytes, {});
+  return runtime;
 }
-const openOpfsStore = (directory) => runtime.opfs.openOpfsStore(directory);
-const destroyOpfsStore = async (parent, name) => {
+
+async function removeEntry(parent, name) {
   try {
     await parent.removeEntry(name, { recursive: true });
   } catch (error) {
     if (error?.name !== "NotFoundError") throw error;
   }
-};
+}
 
 function close() {
   try {
@@ -56,9 +56,22 @@ function close() {
   } catch {
     /* The instance is discarded either way. */
   }
+  // Releasing the handles lets another tab (or a later open) take the pool.
+  pool?.close();
   api = null;
-  store = null;
+  pool = null;
   mailbox = null;
+}
+
+function state() {
+  try {
+    return api.lookup(STATE)._source ?? null;
+  } catch {
+    return null;
+  }
+}
+function status(current = state()) {
+  return { ...(current ?? {}), mailbox, ...pool.stats() };
 }
 
 const handlers = {
@@ -67,45 +80,47 @@ const handlers = {
   async open({ mailboxId, runtime: urls, space }) {
     if (!/^[a-f0-9-]{36}$/.test(mailboxId ?? "")) throw Error("InvalidMailbox");
     close();
+    const { client, fs } = await loadRuntime(urls);
     const directory = await (await root()).getDirectoryHandle(mailboxId, { create: true });
-    api = await module(urls);
-    store = await openOpfsStore(directory);
-    const loaded = await store.load(api);
-    const current = loaded.metadata?.space;
-    if (loaded.restored && current && JSON.stringify(current) !== JSON.stringify(space)) {
+    try {
+      pool = await fs.openOpfsFileSystem(directory);
+    } catch (error) {
+      if (error?.message === "OpfsBusy") throw Error("On-device search is open in another tab");
+      throw error;
+    }
+    api = await client.instantiateAntflyEmbeddedApiFromBytes(runtime.bytes, { fileSystem: pool });
+    api.openFileSystem(DATABASE);
+    mailbox = mailboxId;
+    const current = state();
+    if (current && JSON.stringify(current.space) !== JSON.stringify(space)) {
       close();
-      await destroyOpfsStore(await root(), mailboxId);
+      await removeEntry(await root(), mailboxId);
       return handlers.open({ mailboxId, runtime: urls, space });
     }
-    if (!loaded.restored) {
+    if (!current) {
       api.addIndex(localSchema.vectorIndex(space.dimensions));
-      await store.checkpoint(api, { space, cursor: "", messages: 0 });
+      api.put(STATE, { space, cursor: "", messages: 0 });
     }
-    mailbox = mailboxId;
-    return { ...store.metadata, bytes: store.size() };
+    return status();
   },
 
-  // Apply one synced page and persist it together with the next cursor, so a
-  // reload resumes exactly after the last page that reached OPFS.
+  // Apply one synced page. Messages and the next cursor are one batch, so a
+  // reload resumes exactly after the last page the database committed.
   async apply({ messages, vectors, cursor }) {
     if (!api) throw Error("LocalIndexClosed");
     if (messages.length !== vectors.length) throw Error("LocalVectorMismatch");
-    const inserts = {};
+    // Keep free slots ahead of the database's next files (asynchronous).
+    await pool.ensureCapacity();
+    const previous = state() ?? {};
+    const next = { ...previous, cursor, messages: (previous.messages ?? 0) + messages.length, synced_at: Date.now() };
+    const inserts = { [STATE]: next };
     messages.forEach((message, i) => {
       inserts[localSchema.key(message.id)] = documentFor(message, vectors[i]);
     });
-    if (messages.length) {
-      api.batch({ inserts });
-      api.runUntilIdle();
-    }
-    const previous = store.metadata ?? {};
-    const result = await store.checkpoint(api, {
-      ...previous,
-      cursor,
-      messages: (previous.messages ?? 0) + messages.length,
-      synced_at: Date.now(),
-    });
-    return { ...store.metadata, bytes: store.size(), written: result.bytesWritten };
+    api.batch({ inserts });
+    api.runUntilIdle();
+    await pool.ensureCapacity();
+    return status(next);
   },
 
   async search({ text, vector, limit = 20 }) {
@@ -123,15 +138,14 @@ const handlers = {
   },
 
   async status() {
-    return store ? { mailbox, ...store.metadata, bytes: store.size() } : null;
+    return api ? status() : null;
   },
 
   // Remove one mailbox's copy, or every copy on this device.
   async destroy({ mailboxId } = {}) {
     if (!mailboxId || mailboxId === mailbox) close();
-    const parent = await navigator.storage.getDirectory();
-    if (mailboxId) await destroyOpfsStore(await root(), mailboxId);
-    else await destroyOpfsStore(parent, ROOT);
+    if (mailboxId) await removeEntry(await root(), mailboxId);
+    else await removeEntry(await navigator.storage.getDirectory(), ROOT);
     return true;
   },
 };

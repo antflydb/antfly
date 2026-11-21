@@ -211,9 +211,41 @@ function createHostImports(module, options = {}) {
     }
     if (incompleteGpu) webgpuImports.gpu_is_available = () => 0;
 
+    // Host file system bridge (see wasm_opfs_fs.mjs). Pointers are wasm32
+    // numbers; 64-bit offsets and results cross as BigInt.
+    const fs = options.fileSystem;
+    const noFs = -5n;
+    const pathAt = (ptr, len) => readUtf8(ptr, len);
+    const bytesAt = (ptr, len) => new Uint8Array(requireExports().memory.buffer, Number(ptr), Number(len));
+    const fsCall = (fn) => {
+        if (!fs) return noFs;
+        try {
+            return BigInt(fn());
+        } catch (error) {
+            fs.lastError = error;
+            return noFs;
+        }
+    };
+    const fileSystemImports = {
+        antfly_host_fs_size: (p, l) => fsCall(() => fs.size(pathAt(p, l))),
+        antfly_host_fs_read: (p, l, offset, out, outLen) => fsCall(() => fs.read(pathAt(p, l), Number(offset), bytesAt(out, outLen))),
+        antfly_host_fs_write: (p, l, ptr, len, append) => fsCall(() => fs.write(pathAt(p, l), bytesAt(ptr, len), append !== 0)),
+        antfly_host_fs_sync: (p, l) => fsCall(() => fs.sync(pathAt(p, l))),
+        antfly_host_fs_rename: (op, ol, np, nl) => fsCall(() => fs.rename(pathAt(op, ol), pathAt(np, nl))),
+        antfly_host_fs_remove: (p, l, tree) => fsCall(() => fs.remove(pathAt(p, l), tree !== 0)),
+        antfly_host_fs_list: (p, l, dirs, out, outLen) =>
+            fsCall(() => {
+                const joined = textEncoder.encode(fs.list(pathAt(p, l), dirs !== 0).map((name) => name + "\n").join(""));
+                if (joined.length <= Number(outLen)) bytesAt(out, joined.length).set(joined);
+                return joined.length;
+            }),
+        antfly_host_fs_now_ns: () => (fs ? BigInt(fs.nowNs()) : BigInt(Date.now()) * 1000000n),
+    };
+
     return {
         imports: {
             env: {
+                ...fileSystemImports,
                 antfly_platform_random_secure(ptr, len) {
                     const crypto = globalThis.crypto;
                     if (typeof crypto?.getRandomValues !== "function") return 1;
@@ -380,47 +412,18 @@ export function bindAntflyEmbeddedApi(exports) {
             exports.antfly_embedded_close();
             return lastMessage();
         },
-        // --- Change-tracked storage for host persistence (see WASM.md) ---
-        openTracked() {
-            expectOk(exports.antfly_embedded_open_tracked());
-            return lastMessage();
-        },
-        storageReset() {
-            expectOk(exports.antfly_embedded_storage_reset());
-            return lastMessage();
-        },
-        storageImport(path, bytes) {
-            const name = writeInput(String(path));
-            const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-            const ptr = data.length ? Number(exports.antfly_embedded_alloc(data.length)) : 0;
-            if (ptr === 0 && data.length > 0) {
-                freeInput(name);
-                throw new Error("allocation failed");
-            }
+        /**
+         * Open a database stored in the host file system given to
+         * `instantiate*({ fileSystem })` (in browsers, an OPFS pool from
+         * wasm_opfs_fs.mjs). `path` is the database's root inside it.
+         */
+        openFileSystem(path = "/antfly") {
+            const input = writeInput(String(path));
             try {
-                if (data.length) new Uint8Array(exports.memory.buffer, ptr, data.length).set(data);
-                expectOk(exports.antfly_embedded_storage_import(name.ptr, name.len, ptr, data.length));
+                expectOk(exports.antfly_embedded_open_host_fs(input.ptr, input.len));
+                return lastMessage();
             } finally {
-                if (data.length) exports.antfly_embedded_free(ptr, data.length);
-                freeInput(name);
-            }
-        },
-        storageManifest() {
-            expectOk(exports.antfly_embedded_storage_manifest_json());
-            return JSON.parse(lastResult()).files;
-        },
-        /** Copy one stored file out of WASM memory; null when it does not exist. */
-        storageFile(path, expectedSize) {
-            const name = writeInput(String(path));
-            try {
-                const len = Number(exports.antfly_embedded_storage_file_len(name.ptr, name.len));
-                if (expectedSize != null && len !== expectedSize) return null;
-                if (len === 0) return new Uint8Array(0);
-                const ptr = Number(exports.antfly_embedded_storage_file_ptr(name.ptr, name.len));
-                if (ptr === 0) return null;
-                return new Uint8Array(exports.memory.buffer, ptr, len).slice();
-            } finally {
-                freeInput(name);
+                freeInput(input);
             }
         },
         batchJson(body) {

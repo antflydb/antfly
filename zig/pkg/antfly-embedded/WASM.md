@@ -146,40 +146,62 @@ reopen. Raw embedded calls reject protected tables because these entry points
 do not carry authenticated principal authority. Hosts drive graph indexing
 with `runUntilIdle()` alongside other derived indexes.
 
-## Persisting a Browser Database (OPFS)
+## Browser Database Files in OPFS
 
-The hosted bundle can persist itself without a full OPFS `Storage`
-implementation. `openTracked()` opens the database on `MemoryStorage` wrapped
-with per-path change versions. Writes, appends, renames, deletes and tree
-deletes bump or drop a path's version. The client adds:
+`HostFileStorage` (`src/storage/host_file_storage.zig`) implements `Storage`
+over a small synchronous file-operation table supplied by the host: size,
+read, write/append, sync, rename, remove (file or tree), list and a clock. In
+the WASM bundle, the table is the `antfly_host_fs_*` env imports. The JS client
+fills them from `instantiate*({ fileSystem })`, and `openFileSystem(path)` opens
+a hosted database there. `HostFileStorage.MemoryHost` is an in-memory table for
+native tests.
 
-- `storageManifest()`: `[{path, size, version}]` for every stored file.
-- `storageFile(path, size)`: copy one file out of WASM memory.
-- `storageReset()` / `storageImport(path, bytes)`: restore files before
-  `openTracked()`. Imports are rejected while the database is open.
-
-The module is single-threaded, so a manifest taken between calls is a
-crash-consistent image of storage. `antfly_embedded_opfs_store.mjs` (installed
-next to the client) turns that into durable OPFS checkpoints:
+`antfly_embedded_opfs_fs.mjs` provides that table on the Origin Private File
+System. It must run in a dedicated worker, because synchronous access handles
+exist only there:
 
 ```js
-import { openOpfsStore } from "./antfly_embedded_opfs_store.mjs";
+import { openOpfsFileSystem } from "./antfly_embedded_opfs_fs.mjs";
 const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle("my-db", { create: true });
-const store = await openOpfsStore(dir);
-const { restored, metadata } = await store.load(api); // imports the newest complete generation, then openTracked()
+const fs = await openOpfsFileSystem(dir);              // throws OpfsBusy if another tab holds it
+const api = await instantiateAntflyEmbeddedApiFromBytes(wasmBytes, { fileSystem: fs });
+api.openFileSystem("/db");                             // new or existing database
+await fs.ensureCapacity();                             // keep free slots between operations
 api.putMany(docs);
 api.runUntilIdle();
-await store.checkpoint(api, { cursor }); // writes only changed files, then the next A/B manifest
+api.close();
+fs.close();                                            // release the handles
 ```
 
-A checkpoint writes immutable blobs, then the next manifest slot (with a
-SHA-256 over its body), then deletes blobs that neither of the two newest
-generations references. `load()` uses the newest manifest whose checksum and
-blobs are complete, falling back one generation after a torn write. Caller
-metadata commits atomically with the data. The store never relies on rename.
-The database stays resident in WASM memory, so this suits datasets that fit
-comfortably in wasm32 memory. Treat the copy as rebuildable: delete the
-directory and reload from the source of truth if `load()` restores nothing.
+Antfly's storage calls are synchronous. OPFS can only open, rename or delete
+files asynchronously, so the backend keeps a pool of pre-opened physical "slot"
+files and stores the logical namespace inside them, like SQLite's
+`opfs-sahpool` VFS:
+
+- **Slot layout.** Each slot has two 2 KiB header records followed by file
+  data. A record holds a generation, the logical path and a CRC-32; the newest
+  valid record wins, and an empty path means free.
+- **Namespace changes.** Create, rename and delete overwrite the slot's older
+  record and flush before returning. A torn header write therefore leaves the
+  previous record in force, which makes each of those operations
+  all-or-nothing.
+- **Rename.** The moved slot's record (with a fresh generation) is flushed
+  before the replaced destination is freed. If a crash leaves both, the higher
+  generation wins on reopen, so `rename_is_atomic` holds.
+- **Data durability.** Data becomes durable at `sync`, as with `fsync`.
+  Deleted slots are truncated and reused.
+- **Capacity.** Creating a file with no free slot returns "no space" and never
+  loses data. Call `ensureCapacity()` (asynchronous) between operations; it
+  keeps 32 free slots by default.
+- **One tab at a time.** Sync access handles are exclusive, so a second tab gets
+  `OpfsBusy`. Close the pool to hand it over.
+
+The database is no longer resident in WASM memory; only the engine's caches
+are. `wasm_opfs_fs_test.mjs` simulates OPFS with separate durable and volatile
+bytes. It checks the contract, unsynced-data loss, interrupted renames, torn
+header records, deletion, capacity exhaustion and the exclusive lock. The WASM
+smoke test runs a database with vector and hybrid search through the pool and
+reopens it in a fresh module.
 
 ## Host Storage Contracts
 
@@ -384,9 +406,6 @@ Remaining concerns outside this seam include:
 - full parity between the shared hosted embedded path and every native-only
   subsystem
 
-The next useful adapter should live outside core storage logic:
-
-- browser JS host
-- `HostStorage` backed by OPFS directly (the tracked-memory checkpoints above
-  cover databases that fit in memory)
-- `HostObjectStorage` backed by IndexedDB or OPFS blobs
+Adapters live outside core storage logic. File-backed `Storage` on OPFS is
+covered above; the next useful one is `HostObjectStorage` backed by IndexedDB
+or OPFS blobs for object-backed consumers.

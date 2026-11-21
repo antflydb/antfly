@@ -70,7 +70,7 @@ await mkdir(staging, { recursive: true });
 if (!process.env.LOCAL_SKIP_ZIG) run(zig, ["build", "wasm", "-j1"], join(root, "zig"));
 const antflyOut = join(root, "zig", "zig-out", "antfly-wasm");
 await mkdir(join(staging, "antfly"), { recursive: true });
-for (const name of ["antfly.wasm", "antfly_embedded_wasm_client.mjs", "antfly_embedded_opfs_store.mjs", "LICENSE", "THIRD_PARTY_NOTICES.md"])
+for (const name of ["antfly.wasm", "antfly_embedded_wasm_client.mjs", "antfly_embedded_opfs_fs.mjs", "LICENSE", "THIRD_PARTY_NOTICES.md"])
   await cp(join(antflyOut, name), join(staging, "antfly", name)).catch((error) => {
     if (!["LICENSE", "THIRD_PARTY_NOTICES.md"].includes(name)) throw error;
   });
@@ -126,7 +126,7 @@ const config = {
     antfly: {
       wasm: `${base}antfly/antfly.wasm`,
       client: `${base}antfly/antfly_embedded_wasm_client.mjs`,
-      store: `${base}antfly/antfly_embedded_opfs_store.mjs`,
+      fs: `${base}antfly/antfly_embedded_opfs_fs.mjs`,
     },
   },
   model: { catalog: "/local/models/catalog.json" },

@@ -16,7 +16,7 @@
 // Optional on-device mailbox index. Loaded only after the user opts in.
 //
 //   server  --/mail/sync (text only)-->  page  --EmbeddingGemma2 (WASM CPU)-->
-//   database worker (Antfly WASM)  --checkpoints-->  OPFS
+//   database worker (Antfly WASM)  --files (sync access handle pool)-->  OPFS
 //
 // Message text and vectors never leave the device. The server copy remains
 // authoritative; the local copy is a rebuildable cache keyed by mailbox.

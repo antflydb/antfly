@@ -129,9 +129,9 @@ Mailbox actor ──/mail/sync (text only, cursor)──▶ page
                                                    │ EmbeddingGemma 2 (@antfly/web, WASM CPU)
                                                    ▼
                        database worker: Antfly embedded WASM (hosted profile)
-                                                   │ changed files between calls
+                                                   │ HostFileStorage (sync file ops)
                                                    ▼
-                                    OPFS: blobs + A/B manifest generations
+                          OPFS: pool of sync access handles (slot files)
 ```
 
 ### Sync log
@@ -179,39 +179,36 @@ different space is discarded and rebuilt, never mixed.
 
 ### Persistence in the browser
 
-The embedded hosted profile previously ran only on `MemoryStorage`. Rather than
-write a second implementation of the storage interface against OPFS, the WASM
-build wraps `MemoryStorage` with per-path version tracking. That covers write,
-append, rename, delete and tree deletion. It also exports:
+The database's files live directly in OPFS. `HostFileStorage` implements
+Antfly's `Storage` interface over a small synchronous file-operation table,
+which the WASM bundle imports from the host (`antfly_host_fs_*`).
+`antfly_embedded_opfs_fs.mjs` supplies that table in the database worker.
 
-- `open_tracked`: open on tracked storage, keeping imported files;
-- `storage_import`: restore a file before opening;
-- `storage_manifest_json`: `{path, size, version}` for every file;
-- `storage_file_ptr` / `storage_file_len`: copy one file out.
+OPFS's synchronous API works only on files that are already open; opening,
+renaming and deleting are asynchronous. So, like SQLite's `opfs-sahpool` VFS,
+the backend pre-opens a pool of physical slot files and keeps the logical
+namespace inside them:
 
-The module is single-threaded and every call runs to completion, so a manifest
-taken between calls is a crash-consistent image. It is equivalent to a process
-stop at that point with every write synced.
+- **Slots.** Each slot carries two checksummed header records (generation +
+  path) ahead of its data. Create, rename and delete overwrite the older record
+  and flush before returning. A torn write therefore leaves the previous record
+  in force, and each namespace change is all-or-nothing.
+- **Rename.** The moved slot's record (with a newer generation) is flushed
+  before the replaced destination is freed, and reopen keeps the higher
+  generation. That gives the engine the atomic rename its publication protocol
+  relies on.
+- **Data.** File data is durable at `sync`.
+- **Capacity.** The pool grows asynchronously between database calls
+  (`ensureCapacity`). An operation that finds no free slot fails cleanly rather
+  than losing data.
+- **One tab at a time.** Access handles are exclusive, so a second tab is told
+  the index is open elsewhere.
 
-`antfly_embedded_opfs_store.mjs` persists those images:
-
-1. Write changed files as new immutable blobs.
-2. Write the next A/B manifest slot. The manifest carries the generation, a
-   SHA-256 of its body, the file→blob map and caller metadata.
-3. Delete blobs that neither of the two newest generations references.
-
-Loading picks the newest manifest whose checksum and blobs are complete. A torn
-manifest falls back one generation. The sync cursor rides in the manifest
-metadata, so data and cursor commit together. A crash after step 1 merely
-re-applies a page; upserts make that idempotent.
-
-OPFS does not document crash-atomic rename. The store never relies on rename,
-and it does not claim that `createWritable` closes atomically on every engine;
-the checksum and the second slot cover a torn write. The whole database is
-resident in WASM memory. That suits a mailbox-sized text index (tens of MB) and
-stays inside the 2 GiB wasm32 ceiling. It is not a general large-dataset
-browser backend; a direct OPFS `Storage` implementation is still the long-term
-path for that.
+The sync cursor and vector-space descriptor are a `_local/state` document
+written in the same batch as each page of messages. Cursor and data therefore
+commit together through the database's own log, and a reload resumes after the
+last committed page. Only caches stay in WASM memory, so the copy is no longer
+bounded by the 2 GiB wasm32 memory.
 
 ### Privacy and lifecycle
 
@@ -235,13 +232,15 @@ path for that.
 
 Covered by tests:
 
-- `wasm_opfs_store_test.mjs` checks the checkpoint protocol without WASM:
-  incremental writes, deletes, two-generation GC, torn-manifest fallback,
-  failed blob writes and missing blobs.
-- The embedded WASM smoke test adds the same round trip on the real module,
-  plus dense and hybrid search after a restore in a fresh instance. Its bundle
-  type-checks, but the 20 GiB LLVM step could not finish on the 16 GiB
-  development host, so that smoke has yet to run (CI's WASM job runs it).
+- `wasm_opfs_fs_test.mjs` runs the slot pool against a simulated OPFS where
+  only flushed bytes survive a crash. It covers the storage contract,
+  unsynced-data loss, interrupted renames, torn header records, deletion,
+  capacity exhaustion and the exclusive lock.
+- A native embedded API test runs a hosted database (full-text and external
+  vector indexes) through `HostFileStorage` and reopens it.
+- The WASM smoke test does the same through the real module and the OPFS pool.
+  The 20 GiB LLVM step for that bundle could not finish on the 16 GiB
+  development host, so CI's WASM job is the first to run it.
 - `test-backends-runtime.mjs` adds `embed` checks to the synthetic
   full-geometry EmbeddingGemma 2 fixture. These pass against a freshly built
   `antfly-extraction-cpu.wasm`, along with the rest of the browser runtime

@@ -41,8 +41,8 @@ How it works:
 2. It embeds them in batches with `@antfly/web`'s `embed()` task.
 3. A dedicated worker writes them to an embedded Antfly database: a full-text
    index plus an external 256-dimension vector index.
-4. Each page is checkpointed to OPFS together with its cursor, so a reload
-   resumes where it left off.
+4. The database's files live in OPFS. Each page's messages and the next
+   cursor are committed in one batch, so a reload resumes where it left off.
 5. Searches run keyword and semantic retrieval locally and merge them with RRF.
 
 See the [design](../../docs/design/cloudflare-mail-service.md#on-device-search-progressive-web-app)
@@ -84,9 +84,8 @@ Limits:
 
 - Embedding runs on the WASM CPU backend, so first sync of a large mailbox
   takes time. It runs in the background and resumes after reloads.
-- The local database is resident in WASM memory, sized for a mailbox's text
-  (each message's text is capped at 64 KiB in the sync export), not for
-  arbitrary corpora.
+- The on-device copy can be open in one tab at a time, because OPFS access
+  handles are exclusive. Other tabs fall back to server search.
 - Deleted or edited messages are not synchronized yet, because the app has no
   deletion.
 

@@ -52,114 +52,54 @@ var global_storage: ?MemoryStorage = null;
 var global_api: ?Api = null;
 var local_embedder: ?TermiteDenseEmbedder = null;
 
-// --- Tracked storage: MemoryStorage plus per-path versions for host checkpoints ---
-//
-// Browsers persist the database by copying changed files to OPFS between API
-// calls. The module is single-threaded and every API call runs to completion,
-// so any manifest taken between calls is a crash-consistent image of storage:
-// it equals a process stop at that point with all writes synced. Hosts publish
-// a manifest atomically (for example A/B generations) and treat the copy as a
-// rebuildable cache of server-owned data.
+// --- Host file storage: the browser supplies files (OPFS) through env imports ---
 
-const Storage = embedded_db.Storage;
-var tracked_inner: Storage.VTable = undefined;
-var tracked_vtable: Storage.VTable = undefined;
-var tracked_versions: std.StringHashMapUnmanaged(u64) = .empty;
-var tracked_next_version: u64 = 1;
-var tracked_active = false;
+extern fn antfly_host_fs_size(path_ptr: usize, path_len: usize) i64;
+extern fn antfly_host_fs_read(path_ptr: usize, path_len: usize, offset: u64, out_ptr: usize, out_len: usize) i64;
+extern fn antfly_host_fs_write(path_ptr: usize, path_len: usize, ptr: usize, len: usize, append: u32) i64;
+extern fn antfly_host_fs_sync(path_ptr: usize, path_len: usize) i64;
+extern fn antfly_host_fs_rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) i64;
+extern fn antfly_host_fs_remove(path_ptr: usize, path_len: usize, tree: u32) i64;
+extern fn antfly_host_fs_list(path_ptr: usize, path_len: usize, dirs: u32, out_ptr: usize, out_len: usize) i64;
+extern fn antfly_host_fs_now_ns() u64;
 
-fn trackedTouch(path: []const u8) !void {
-    const a = allocator();
-    const version = tracked_next_version;
-    tracked_next_version += 1;
-    if (tracked_versions.getPtr(path)) |existing| {
-        existing.* = version;
-        return;
+const host_fs = struct {
+    fn size(_: ?*anyopaque, path: []const u8) i64 {
+        return antfly_host_fs_size(@intFromPtr(path.ptr), path.len);
     }
-    const owned = try a.dupe(u8, path);
-    errdefer a.free(owned);
-    try tracked_versions.put(a, owned, version);
-}
-
-fn trackedForget(path: []const u8) void {
-    if (tracked_versions.fetchRemove(path)) |entry| allocator().free(entry.key);
-}
-
-fn trackedForgetTree(path: []const u8) void {
-    const directory = std.mem.trimEnd(u8, path, "/");
-    var doomed: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer doomed.deinit(allocator());
-    var it = tracked_versions.keyIterator();
-    while (it.next()) |key| {
-        const k = key.*;
-        const below = k.len > directory.len and std.mem.startsWith(u8, k, directory) and k[directory.len] == '/';
-        if (below or std.mem.eql(u8, k, directory)) doomed.append(allocator(), k) catch return trackedResetVersions();
+    fn read(_: ?*anyopaque, path: []const u8, offset: u64, out: []u8) i64 {
+        return antfly_host_fs_read(@intFromPtr(path.ptr), path.len, offset, @intFromPtr(out.ptr), out.len);
     }
-    for (doomed.items) |k| trackedForget(k);
-}
-
-/// On bookkeeping allocation failure, assign fresh versions to everything so
-/// the next manifest conservatively reports every file as changed.
-fn trackedResetVersions() void {
-    var it = tracked_versions.iterator();
-    while (it.next()) |entry| {
-        entry.value_ptr.* = tracked_next_version;
-        tracked_next_version += 1;
+    fn write(_: ?*anyopaque, path: []const u8, bytes: []const u8, append: bool) i64 {
+        return antfly_host_fs_write(@intFromPtr(path.ptr), path.len, @intFromPtr(bytes.ptr), bytes.len, @intFromBool(append));
     }
-}
-
-fn trackedWrite(ptr: *anyopaque, path: []const u8, contents: []const u8) anyerror!void {
-    try tracked_inner.write_file_absolute(ptr, path, contents);
-    trackedTouch(path) catch trackedResetVersions();
-}
-
-fn trackedAppend(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) anyerror!void {
-    const append = tracked_inner.append_file_absolute orelse return error.Unsupported;
-    try append(ptr, path, contents, sync);
-    trackedTouch(path) catch trackedResetVersions();
-}
-
-fn trackedRename(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void {
-    try tracked_inner.rename_absolute(ptr, old_path, new_path);
-    trackedForget(old_path);
-    trackedTouch(new_path) catch trackedResetVersions();
-}
-
-fn trackedDelete(ptr: *anyopaque, path: []const u8) anyerror!void {
-    try tracked_inner.delete_file_absolute(ptr, path);
-    trackedForget(path);
-}
-
-fn trackedDeleteTree(ptr: *anyopaque, path: []const u8) anyerror!void {
-    try tracked_inner.delete_tree(ptr, path);
-    trackedForgetTree(path);
-}
-
-fn trackedStorage() Storage {
-    const memory = &global_storage.?;
-    if (!tracked_active) {
-        tracked_inner = memory.storage().vtable.*;
-        tracked_vtable = tracked_inner;
-        tracked_vtable.write_file_absolute = trackedWrite;
-        tracked_vtable.append_file_absolute = if (tracked_inner.append_file_absolute != null) trackedAppend else null;
-        // A checked append is an append; route it through the tracked path.
-        tracked_vtable.append_file_absolute_checked = null;
-        tracked_vtable.rename_absolute = trackedRename;
-        tracked_vtable.delete_file_absolute = trackedDelete;
-        tracked_vtable.delete_tree = trackedDeleteTree;
-        tracked_active = true;
+    fn sync(_: ?*anyopaque, path: []const u8) i64 {
+        return antfly_host_fs_sync(@intFromPtr(path.ptr), path.len);
     }
-    return .{ .ptr = memory, .vtable = &tracked_vtable };
-}
+    fn rename(_: ?*anyopaque, old: []const u8, new: []const u8) i64 {
+        return antfly_host_fs_rename(@intFromPtr(old.ptr), old.len, @intFromPtr(new.ptr), new.len);
+    }
+    fn remove(_: ?*anyopaque, path: []const u8, tree: bool) i64 {
+        return antfly_host_fs_remove(@intFromPtr(path.ptr), path.len, @intFromBool(tree));
+    }
+    fn list(_: ?*anyopaque, path: []const u8, dirs: bool, out: []u8) i64 {
+        return antfly_host_fs_list(@intFromPtr(path.ptr), path.len, @intFromBool(dirs), @intFromPtr(out.ptr), out.len);
+    }
+    fn now(_: ?*anyopaque) u64 {
+        return antfly_host_fs_now_ns();
+    }
+};
 
-fn trackedClear() void {
-    const a = allocator();
-    var it = tracked_versions.keyIterator();
-    while (it.next()) |key| a.free(key.*);
-    tracked_versions.deinit(a);
-    tracked_versions = .empty;
-    tracked_active = false;
-}
+var host_file_storage: embedded_db.HostFileStorage = .init(.{
+    .size = host_fs.size,
+    .read = host_fs.read,
+    .write = host_fs.write,
+    .sync = host_fs.sync,
+    .rename = host_fs.rename,
+    .remove = host_fs.remove,
+    .list = host_fs.list,
+    .now_ns = host_fs.now,
+});
 
 // --- TermiteDenseEmbedder: bridges antfly's DenseEmbedder vtable to termite WASM exports ---
 
@@ -312,113 +252,46 @@ fn closeState() void {
     closeApiOnly();
     if (global_storage) |*storage| storage.deinit();
     global_storage = null;
-    trackedClear();
 }
 
-fn openTracked() !void {
-    closeApiOnly();
-    if (global_storage == null) global_storage = MemoryStorage.init(allocator());
+fn openHostFiles(path: []const u8) !void {
+    closeState();
     installHostRenderer();
-    const fresh = global_storage.?.files.count() == 0;
-    global_api = try Api.openHosted(allocator(), "/embedded-hosted", .{
+    global_api = try Api.openHosted(allocator(), path, .{
         .table_name = "docs",
         .db = .{
             .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
-            .storage = trackedStorage(),
+            .storage = host_file_storage.storage(),
         },
     });
     errdefer closeApiOnly();
-    if (fresh) {
-        try global_api.?.db.addIndex(.{
-            .name = "full_text_index_v0",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+    const indexes = try global_api.?.db.listIndexes(allocator());
+    defer embedded_db.types.freeIndexConfigs(allocator(), indexes);
+    for (indexes) |index| {
+        if (std.mem.eql(u8, index.name, "full_text_index_v0")) return;
     }
+    try global_api.?.db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
 }
 
-/// Open (or reopen) the hosted database on change-tracked memory storage.
-/// Files imported with `antfly_embedded_storage_import` are retained; an empty
-/// store receives the default full-text index.
-pub export fn antfly_embedded_open_tracked() u32 {
-    openTracked() catch |err| {
-        setMessage(@errorName(err));
+/// Open (or reopen) a hosted database whose files the host provides through
+/// the `antfly_host_fs_*` imports (in browsers, an OPFS pool). A new database
+/// receives the default full-text index.
+pub export fn antfly_embedded_open_host_fs(path_ptr: usize, path_len: usize) u32 {
+    const path = inputSlice(path_ptr, path_len);
+    if (path.len == 0 or path[0] != '/') {
+        setMessage("InvalidPath");
         return 1;
-    };
-    setMessage("ok");
-    return 0;
-}
-
-/// Drop the database and every stored file, then start an empty store.
-pub export fn antfly_embedded_storage_reset() u32 {
-    closeState();
-    global_storage = MemoryStorage.init(allocator());
-    setMessage("ok");
-    return 0;
-}
-
-fn storageImport(path: []const u8, bytes: []const u8) !void {
-    if (global_api != null) return error.DatabaseOpen;
-    if (path.len == 0 or path[0] != '/') return error.InvalidPath;
-    if (global_storage == null) global_storage = MemoryStorage.init(allocator());
-    const storage = trackedStorage();
-    try storage.vtable.write_file_absolute(storage.ptr, path, bytes);
-}
-
-/// Restore one file before `antfly_embedded_open_tracked`. Rejected while open.
-pub export fn antfly_embedded_storage_import(path_ptr: usize, path_len: usize, ptr: usize, len: usize) u32 {
-    storageImport(inputSlice(path_ptr, path_len), inputSlice(ptr, len)) catch |err| {
-        setMessage(@errorName(err));
-        return 1;
-    };
-    setMessage("ok");
-    return 0;
-}
-
-const ManifestEntry = struct { path: []const u8, size: usize, version: u64 };
-
-fn storageManifest() !void {
-    const memory = &(global_storage orelse return error.NotOpen);
-    const a = allocator();
-    var entries: std.ArrayListUnmanaged(ManifestEntry) = .empty;
-    defer entries.deinit(a);
-    var it = memory.files.iterator();
-    while (it.next()) |entry| {
-        const path = entry.key_ptr.*;
-        const version = tracked_versions.get(path) orelse blk: {
-            // Untracked bytes (written before tracking began) are reported
-            // as changed once, then tracked from here on.
-            try trackedTouch(path);
-            break :blk tracked_versions.get(path).?;
-        };
-        try entries.append(a, .{ .path = path, .size = entry.value_ptr.len, .version = version });
     }
-    storeResult(try std.json.Stringify.valueAlloc(a, .{ .files = entries.items }, .{}));
-}
-
-/// JSON `{files:[{path,size,version}]}`. A file changed since a previous
-/// manifest iff its version changed; a missing path was deleted.
-pub export fn antfly_embedded_storage_manifest_json() u32 {
-    storageManifest() catch |err| {
+    openHostFiles(path) catch |err| {
         setMessage(@errorName(err));
         return 1;
     };
     setMessage("ok");
     return 0;
-}
-
-/// Borrowed pointer to a stored file's bytes, valid until the next call into
-/// the module. Returns 0 when the file is missing (or empty, with len 0).
-pub export fn antfly_embedded_storage_file_ptr(path_ptr: usize, path_len: usize) usize {
-    const memory = &(global_storage orelse return 0);
-    const bytes = memory.files.get(inputSlice(path_ptr, path_len)) orelse return 0;
-    return if (bytes.len == 0) 0 else @intFromPtr(bytes.ptr);
-}
-
-pub export fn antfly_embedded_storage_file_len(path_ptr: usize, path_len: usize) usize {
-    const memory = &(global_storage orelse return 0);
-    const bytes = memory.files.get(inputSlice(path_ptr, path_len)) orelse return 0;
-    return bytes.len;
 }
 
 fn openWithCurrentStorage(add_index: bool) !void {

@@ -807,6 +807,52 @@ test "embedded api hosted profile persists text index across reopen over storage
     }
 }
 
+test "embedded api hosted profile persists text and vectors over host file storage" {
+    const host_files = support.host_file_storage;
+    const alloc = std.testing.allocator;
+    var host = host_files.MemoryHost.init(alloc);
+    defer host.deinit();
+    var backend = host_files.HostFileStorage.init(host.ops());
+    const options: OpenOptions = .{
+        .table_name = "docs",
+        .db = .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .storage = backend.storage(),
+        },
+    };
+    {
+        var api = try Api.openHosted(alloc, "/mail", options);
+        defer api.close();
+        try api.db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+        const created = try api.addIndexJson(alloc, "{\"name\":\"mail_semantic\",\"kind\":\"dense_vector\",\"config_json\":\"{\\\"dims\\\":3,\\\"metric\\\":\\\"cosine\\\",\\\"external\\\":true}\"}");
+        defer alloc.free(created);
+        for (0..3) |round| {
+            var body_buf: [512]u8 = undefined;
+            const body = try std.fmt.bufPrint(&body_buf, "{{\"inserts\":{{\"message/{d}a\":{{\"content\":\"plumber invoice {d}\",\"_embeddings\":{{\"mail_semantic\":[1,0,0]}}}},\"message/{d}b\":{{\"content\":\"team offsite {d}\",\"_embeddings\":{{\"mail_semantic\":[0,1,0]}}}}}}}}", .{ round, round, round, round });
+            const batch_json = try api.batchJson(alloc, body);
+            defer alloc.free(batch_json);
+            const idle_json = try api.runUntilIdleJson(alloc);
+            defer alloc.free(idle_json);
+        }
+    }
+    try std.testing.expect(host.files.count() > 0);
+    {
+        var reopened = try Api.openHosted(alloc, "/mail", options);
+        defer reopened.close();
+        const text = try reopened.searchJson(alloc, "{\"full_text_search\":{\"match\":{\"field\":\"content\",\"text\":\"offsite\"}},\"limit\":10}");
+        defer alloc.free(text);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"message/2b\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\"message/0a\"") == null);
+        const dense = try reopened.searchJson(alloc, "{\"embeddings\":{\"mail_semantic\":[1,0,0]},\"indexes\":[\"mail_semantic\"],\"limit\":3}");
+        defer alloc.free(dense);
+        try std.testing.expect(std.mem.indexOf(u8, dense, "a\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, dense, "\"message/1b\"") == null);
+        const hybrid = try reopened.searchJson(alloc, "{\"full_text_search\":{\"match\":{\"field\":\"content\",\"text\":\"plumber\"}},\"embeddings\":{\"mail_semantic\":[1,0,0]},\"indexes\":[\"mail_semantic\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}");
+        defer alloc.free(hybrid);
+        try std.testing.expect(std.mem.indexOf(u8, hybrid, "\"message/0a\"") != null or std.mem.indexOf(u8, hybrid, "\"message/1a\"") != null);
+    }
+}
+
 test "embedded api createLite provisions default full text index" {
     const alloc = std.testing.allocator;
 
