@@ -135,11 +135,11 @@ test "replicated session bounded probe skips a full read on a cache miss" {
         physical: []const u8,
         full_reads: usize = 0,
 
-        fn getRange(_: *@This(), _: []const u8, _: u64, _: usize) ![]const u8 {
+        fn getRange(_: *@This(), _: []const u8, _: u64, _: usize) anyerror![]const u8 {
             return error.Unsupported;
         }
 
-        fn get(self: *@This(), key: []const u8) ![]const u8 {
+        fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
             if (!std.mem.eql(u8, key, self.physical)) return error.NotFound;
             self.full_reads += 1;
             return "header plus payload";
