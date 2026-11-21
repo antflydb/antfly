@@ -243,6 +243,18 @@ pub const Cursor = struct {
         if (self.vtable.set_keys_only) |set| set(self.ptr);
     }
 
+    /// Count borrowed keys on this snapshot without retaining or copying values.
+    pub fn countPrefix(self: *Cursor, prefix: []const u8) !u64 {
+        self.setKeysOnly();
+        var row = try self.seekAtOrAfter(prefix);
+        var count: u64 = 0;
+        while (row) |entry| : (row = try self.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            count += 1;
+        }
+        return count;
+    }
+
     pub fn start(self: *Cursor, options: backend_types.CursorOptions) !?Entry {
         return switch (options.start) {
             .first => switch (options.order) {
@@ -602,6 +614,8 @@ pub const ReadTxn = struct {
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
         fork_read: ?*const fn (Allocator, *anyopaque) anyerror!ReadTxn = null,
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
+        read_prefix_page: ?*const fn (*anyopaque, Allocator, []const u8, ?[]const u8, usize) anyerror![]Entry = null,
+        count_prefix: ?*const fn (*anyopaque, []const u8) anyerror!u64 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -614,6 +628,20 @@ pub const ReadTxn = struct {
     pub fn decodedResultsNamespace(self: *const ReadTxn) ?[]const u8 {
         if (!self.canReuseDecodedResults()) return null;
         return if (self.vtable.decoded_results_namespace) |get_namespace| get_namespace(self.ptr) else null;
+    }
+
+    /// Up to 64 rows, after an exclusive continuation, from this snapshot.
+    /// Keys and bounded value prefixes are allocated by the caller.
+    pub fn readPrefixPage(self: *ReadTxn, alloc: Allocator, prefix: []const u8, after: ?[]const u8, value_prefix_len: usize) ![]Entry {
+        const read = self.vtable.read_prefix_page orelse return error.Unsupported;
+        return BoundaryAbi.call("read_prefix_page", self.boundary_dispatch, read, .{ self.ptr, alloc, prefix, after, value_prefix_len });
+    }
+
+    pub fn countPrefix(self: *ReadTxn, prefix: []const u8) !u64 {
+        if (self.vtable.count_prefix) |count| return BoundaryAbi.call("count_prefix", self.boundary_dispatch, count, .{ self.ptr, prefix });
+        var cursor = try self.openCursor();
+        defer cursor.close();
+        return cursor.countPrefix(prefix);
     }
 
     pub fn abort(self: *ReadTxn) void {
@@ -823,6 +851,7 @@ pub const WriteTxn = struct {
         contains: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         put_index_catalog: ?*const fn (*anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void = null,
         delete_index_catalog_scope: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+        count_prefix: ?*const fn (*anyopaque, []const u8) anyerror!u64 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -837,6 +866,13 @@ pub const WriteTxn = struct {
     pub fn putIndexCatalogBatch(self: *WriteTxn, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
         const put_index_catalog = self.vtable.put_index_catalog orelse return error.Unsupported;
         try BoundaryAbi.call("put_index_catalog", self.boundary_dispatch, put_index_catalog, .{ self.ptr, scope, mutations });
+    }
+
+    pub fn countPrefix(self: *WriteTxn, prefix: []const u8) !u64 {
+        if (self.vtable.count_prefix) |count| return BoundaryAbi.call("count_prefix", self.boundary_dispatch, count, .{ self.ptr, prefix });
+        var cursor = try self.openCursor();
+        defer cursor.close();
+        return cursor.countPrefix(prefix);
     }
 
     pub fn abort(self: *WriteTxn) void {

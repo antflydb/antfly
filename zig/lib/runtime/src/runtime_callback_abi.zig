@@ -44,7 +44,7 @@ test "boundary dispatcher preserves readiness and storage contention across runt
             return TestBoundary.local_dispatch(contract, callback, args, output);
         }
     };
-    for ([_]anyerror{ error.MetricNotReady, error.MetricStale, error.FileBusy, error.WouldBlock, error.SqlStatementReadUnavailable }) |err| {
+    for ([_]anyerror{ error.MetricNotReady, error.MetricStale, error.FileBusy, error.WouldBlock, error.SqlStatementReadUnavailable, error.TransactionPrepareAbortedUnavailable, error.PreDispatchDecisionAdmissionUnavailable }) |err| {
         try std.testing.expectError(err, TestBoundary.call("query", &Callbacks.foreignDispatch, &Callbacks.query, .{&err}));
         try std.testing.expectError(err, TestBoundary.callRemote("query", &Callbacks.foreignDispatch, &Callbacks.query, .{&err}));
     }
