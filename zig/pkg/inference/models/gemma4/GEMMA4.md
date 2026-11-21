@@ -66,11 +66,27 @@ priming all modalities, GPU memory peaked at about 15.0 GiB native versus
 
 ## GB10 projector qualification
 
-The offline `bench-gemma4-core-build` runner can exercise the E4B compact
-projector on SM121 with the same environment settings. The benchmark constructs
-structured media prompts and captures the vocabulary row consumed by the
-sampler. All eight cases met the first-step logit gates. The compact projector
-matched 578 of 585 CPU decisions through EOS or the output budget. The original
+For the offline E4B compact projector on SM121, use the L4 base settings
+and select three BF16 activation terms. Run these commands from the repository root.
+
+```sh
+source zig/pkg/inference/scripts/gemma4/gemma4_e4b_qat_l4_qualified.env
+export ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL_TERMS=3
+```
+
+The `bench-gemma4-core-build` runner constructs structured media prompts and
+captures the vocabulary row consumed by the sampler. With the automatic GB10
+decoder at `0b94bdff50`, two terms gave a video cosine of 0.999895 against
+FP32 Transformers. Three terms raised it to 0.999903 and passed all eight
+first-step gates. Across three fixed-budget repetitions, each case produced
+the same tokens. The compact projector matched 581 of 585 teacher-forced CPU
+decisions through EOS or budget. Short text differed at token 206, page summary
+at token 102, and video at tokens 55 and 61. Image matched all 64 decisions.
+Median image and video latency on the shared GB10 was 2.72 s and 2.79 s,
+respectively. [GB10 native-plan qualification receipt](../../scripts/gemma4/qualification/e4b-qat-gb10-projector-native-plan-20261121.json)
+
+At the earlier `94ae2691eb` checkpoint, the compact projector matched 578 of
+585 CPU decisions through EOS or the output budget. The original
 GB10 route matched 579. Both routes missed the same four text and two video
 decisions. The compact route also missed image token 17, with a reference
 logit gap of 0.00595. Three BF16 terms made the same choice. GB10 serving
