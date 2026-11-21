@@ -8759,6 +8759,16 @@ test "durable session mutations publish only after persistence succeeds: shared 
                         alloc.destroy(self);
                     }
                 };
+                fn capabilities(ptr: *anyopaque) @import("antfly_local_sources").storage_backend_types.Capabilities {
+                    return @as(*@This(), @ptrCast(@alignCast(ptr))).store.capabilities();
+                }
+                fn beginRead(_: std.mem.Allocator, ptr: *anyopaque) !backend_erased.ReadTxn {
+                    return @as(*@This(), @ptrCast(@alignCast(ptr))).store.beginRead();
+                }
+                fn beginBatch(_: std.mem.Allocator, ptr: *anyopaque) !backend_erased.Batch {
+                    return @as(*@This(), @ptrCast(@alignCast(ptr))).store.beginBatch();
+                }
+                fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
                 fn beginWrite(alloc: std.mem.Allocator, ptr: *anyopaque) !backend_erased.WriteTxn {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     const wrapped = try alloc.create(Wrapped);
@@ -8773,11 +8783,14 @@ test "durable session mutations publish only after persistence succeeds: shared 
                 }
             };
             var fixture: Fixture = .{ .store = &runtime };
-            var vtable = runtime.vtable.*;
-            vtable.begin_write = Fixture.beginWrite;
-            var intercepted = runtime;
-            intercepted.ptr = &fixture;
-            intercepted.vtable = &vtable;
+            // Every erased callback must receive the context it was built for.
+            // Delegate serialization to the wrapped store, including its gate.
+            var intercepted: backend_erased.Store = .{
+                .allocator = a,
+                .ptr = &fixture,
+                .write_serialization = runtime.writeSerialization(),
+                .vtable = &.{ .deinit = Fixture.deinit, .capabilities = Fixture.capabilities, .begin_read = Fixture.beginRead, .begin_write = Fixture.beginWrite, .begin_batch = Fixture.beginBatch },
+            };
             var first_docs = if (document_facades) try docstore_mod.DocStore.openRuntime(a, &intercepted) else null;
             defer if (first_docs) |*docs| docs.close();
             var second_docs = if (document_facades) try docstore_mod.DocStore.openRuntime(a, &wrapped_runtime) else null;
