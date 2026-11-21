@@ -9927,7 +9927,9 @@ pub fn antfly_db_add_enrichment_json(
     defer config.deinit(handle.alloc);
     const context_dependencies = @import("context_dependencies.zig");
     context_dependencies.resolveEnrichment(handle, handle.alloc, config_json.bytes(), &config) catch |err| return capi.mapErrorContext(err, @src().fn_name);
-    if (config.context_sources_json.len != 0) {
+    // A derived enrichment without its own sources can still close a loop
+    // through what its source artifact reads.
+    if (config.context_sources_json.len != 0 or config.source_artifact_name.len != 0) {
         @import("tables.zig").ensureDiscovered(@import("context_dependencies.zig").rootOf(handle)) catch |err| return capi.mapError(err);
         context_dependencies.rejectCrossTableCycle(handle, handle.database(), config) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     }

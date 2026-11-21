@@ -70,7 +70,10 @@ fn findByIdentity(tables: []const TableInfo, identity: []const u8) ?TableInfo {
 pub fn declarationsAlloc(a: Allocator, tables: []const TableInfo, collect: CollectEnrichments) ![]ctx.DeclaredEnrichment {
     var out = std.ArrayListUnmanaged(ctx.DeclaredEnrichment).empty;
     for (tables) |t| {
-        const configs = collect.collect_fn(a, t.indexes_json) catch continue;
+        // A table whose declarations cannot be read fails the whole pass: a
+        // partial set would publish topology missing that table's dependents
+        // (and cache it until some definition changed).
+        const configs = try collect.collect_fn(a, t.indexes_json);
         const identity = try identityAlloc(a, t.table_id);
         for (configs) |cfg| try out.append(a, .{
             .table_id = identity,
@@ -92,7 +95,7 @@ pub const CollectEnrichments = struct {
 pub fn topologyJsonAlloc(alloc: Allocator, tables: []const TableInfo, collect: CollectEnrichments, table_name: []const u8) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    return topologyFromDeclaredAlloc(alloc, tables, try declarationsAlloc(arena.allocator(), tables, collect), table_name);
+    return topologyFromDeclaredAlloc(alloc, tables, try ctx.acyclicDeclarationsAlloc(arena.allocator(), try declarationsAlloc(arena.allocator(), tables, collect)), table_name);
 }
 
 /// `topologyJsonAlloc` from already collected declarations.
@@ -162,7 +165,7 @@ pub fn admitAlloc(
     refresh_value: ?std.json.Value,
     lowering: ?ctx.FilterLowering,
 ) ![]u8 {
-    return admitResolvingAlloc(alloc, tables, collect, owner_table, enrichment_name, sources_value, refresh_value, lowering, null);
+    return admitResolvingAlloc(alloc, tables, collect, owner_table, enrichment_name, sources_value, refresh_value, lowering, null, "");
 }
 
 /// `admitAlloc` where `owner_table` is a storage name and declared source
@@ -177,6 +180,7 @@ pub fn admitResolvingAlloc(
     refresh_value: ?std.json.Value,
     lowering: ?ctx.FilterLowering,
     names: ?PublicNameResolver,
+    source_artifact: []const u8,
 ) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -195,8 +199,30 @@ pub fn admitResolvingAlloc(
         if (std.mem.eql(u8, d.table_id, owner_identity) and std.mem.eql(u8, d.name, enrichment_name)) continue;
         try others.append(a, d);
     }
-    try ctx.rejectCrossTableCycle(a, others.items, owner_identity, enrichment_name, stored);
+    try ctx.rejectCrossTableCycle(a, others.items, owner_identity, enrichment_name, stored, source_artifact);
     return alloc.dupe(u8, stored);
+}
+
+/// Cycle admission for a declaration without context sources of its own:
+/// a derived enrichment (`source_artifact`) can still close a loop through
+/// what its input reads.
+pub fn rejectDerivedCycle(alloc: Allocator, tables: []const TableInfo, collect: CollectEnrichments, owner_table: []const u8, enrichment_name: []const u8, source_artifact: []const u8) !void {
+    if (source_artifact.len == 0) return;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const owner = findByName(tables, owner_table) orelse return error.ContextSourceTableUnavailable;
+    const owner_identity = try identityAlloc(a, owner.table_id);
+    const declared = try declarationsAlloc(a, tables, collect);
+    var others = std.ArrayListUnmanaged(ctx.DeclaredEnrichment).empty;
+    var any_context = false;
+    for (declared) |d| {
+        if (d.context_sources_json.len != 0) any_context = true;
+        if (std.mem.eql(u8, d.table_id, owner_identity) and std.mem.eql(u8, d.name, enrichment_name)) continue;
+        try others.append(a, d);
+    }
+    if (!any_context) return;
+    try ctx.rejectCrossTableCycle(a, others.items, owner_identity, enrichment_name, "", source_artifact);
 }
 
 /// Distributed snapshot sources run their search request on the data
@@ -280,7 +306,7 @@ pub const Host = struct {
             // copy every string into the cache's own arena.
             var scratch = std.heap.ArenaAllocator.init(alloc);
             defer scratch.deinit();
-            const parsed = try declarationsAlloc(scratch.allocator(), tables, collect);
+            const parsed = try ctx.acyclicDeclarationsAlloc(scratch.allocator(), try declarationsAlloc(scratch.allocator(), tables, collect));
             const declared = try owned.alloc(ctx.DeclaredEnrichment, parsed.len);
             for (parsed, declared) |d, *o| o.* = .{
                 .table_id = try owned.dupe(u8, d.table_id),
@@ -302,8 +328,12 @@ pub const Host = struct {
     };
 
     pub fn deinit(self: *Host) void {
+        self.cache.lock();
         if (self.cache.arena) |*arena| arena.deinit();
-        self.cache = .{};
+        self.cache.arena = null;
+        self.cache.declared = &.{};
+        self.cache.valid = false;
+        self.cache.mutex.unlock();
     }
 
     /// Whether any table declares context sources. Re-reads the catalog at
@@ -362,7 +392,10 @@ pub const Host = struct {
                 // sequentially and the storage reader resumes by key).
                 const body = try std.json.parseFromSliceLeaky(struct { table: []const u8, envelope: []const u8, offset: u32, limit: u32 }, a, request, .{ .allocate = .alloc_always });
                 const name = try self.tableName(a, body.table, table_name);
-                const want = @min(@as(u64, body.offset) + body.limit + 1, max_scan_rows);
+                // Past the scan bound the page cannot be proven complete:
+                // fail explicitly rather than report a truncated membership.
+                const want = @as(u64, body.offset) + body.limit + 1;
+                if (want > max_scan_rows) return error.ContextBudgetExceeded;
                 const keys = try scanKeys(p, alloc, a, name, try scanFilter(a, body.envelope), "", @intCast(want));
                 const start = @min(keys.len, body.offset);
                 const end = @min(keys.len, @as(usize, body.offset) + body.limit);
@@ -439,7 +472,7 @@ fn scanFilter(a: Allocator, envelope_json: []const u8) ![]const u8 {
 /// Keys of the rows matching the storage filter (evaluated by every group),
 /// in key order, after `after` (exclusive; "" from the start).
 fn scanKeys(p: Primitives, alloc: Allocator, a: Allocator, table: []const u8, filter: []const u8, after: []const u8, limit: u32) ![]const []const u8 {
-    var response = (try p.reads_fn(p.ptr).scan(alloc, table, after, "", .{ .include_documents = false, .inclusive_from = after.len == 0, .filter_query_json = filter, .limit = limit }, .read_index)) orelse return &.{};
+    var response = (try p.reads_fn(p.ptr).scan(alloc, table, after, "", .{ .include_documents = false, .inclusive_from = after.len == 0, .filter_query_json = filter, .limit = limit }, .read_index)) orelse return error.ContextSourceTableUnavailable;
     defer response.deinit(alloc);
     var keys = std.ArrayListUnmanaged([]const u8).empty;
     var lines = std.mem.splitScalar(u8, response.ndjson, '\n');
@@ -467,9 +500,10 @@ fn hydrateRows(p: Primitives, alloc: Allocator, a: Allocator, table: []const u8,
             .filter_doc_ids = batch,
             .include_stored = true,
             .limit = @intCast(batch.len),
-        }, .read_index)) orelse continue;
+        }, .read_index)) orelse return error.ContextSourceTableUnavailable;
         defer hydrated.deinit();
         for (batch, hydrated.rows) |key, doc| {
+            // Deleted between the scan and the read: no longer a member.
             const value = doc orelse continue;
             try rows.append(a, .{ .key = try a.dupe(u8, key), .value = try a.dupe(u8, value) });
         }
@@ -536,7 +570,7 @@ test "context host admission maps public source names to storage names" {
     const sources = try std.json.parseFromSliceLeaky(std.json.Value, a,
         \\{"org":{"document":{"table":"orgs","key_from":"/org"},"fields":["name"]}}
     , .{});
-    const stored = try admitResolvingAlloc(alloc, &tables, collect, "table:bb", "summary", sources, null, null, names);
+    const stored = try admitResolvingAlloc(alloc, &tables, collect, "table:bb", "summary", sources, null, null, names, "");
     defer alloc.free(stored);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"table_id\":\"srv:7\"") != null);
     // Without the mapping the public name matches no catalog entry.
@@ -545,12 +579,12 @@ test "context host admission maps public source names to storage names" {
     const by_storage = try std.json.parseFromSliceLeaky(std.json.Value, a,
         \\{"org":{"document":{"table":"table:aa","key_from":"/org"},"fields":["name"]}}
     , .{});
-    try std.testing.expectError(error.InvalidContextSourcesConfig, admitResolvingAlloc(alloc, &tables, collect, "table:bb", "s", by_storage, null, null, names));
+    try std.testing.expectError(error.InvalidContextSourcesConfig, admitResolvingAlloc(alloc, &tables, collect, "table:bb", "s", by_storage, null, null, names, ""));
     // Authorization failures surface instead of being treated as unknown.
     const secret = try std.json.parseFromSliceLeaky(std.json.Value, a,
         \\{"org":{"document":{"table":"secret","key_from":"/org"},"fields":["name"]}}
     , .{});
-    try std.testing.expectError(error.Forbidden, admitResolvingAlloc(alloc, &tables, collect, "table:bb", "s", secret, null, null, names));
+    try std.testing.expectError(error.Forbidden, admitResolvingAlloc(alloc, &tables, collect, "table:bb", "s", secret, null, null, names, ""));
 }
 
 test "context host admission resolves names, rejects cycles, and computes inbound topology" {

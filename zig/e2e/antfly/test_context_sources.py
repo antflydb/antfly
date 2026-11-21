@@ -323,6 +323,7 @@ def test_distributed_context_source_admission(stateful_api, echo_generator):
         _enrichment(echo_generator, peers(f"ctx_missing_{suffix}", ["title"])),
     )
     assert _status(response) == 400, getattr(response, "text", response)
+    assert "context_source_table_not_found" in getattr(response, "text", ""), getattr(response, "text", response)
 
     # A downstream consumer of another table's generated output is admitted;
     # closing the loop back through generated inputs is a cycle.
@@ -340,3 +341,4 @@ def test_distributed_context_source_admission(stateful_api, echo_generator):
         _enrichment(echo_generator, peers(right, ["_artifacts.digest"])),
     )
     assert _status(response) == 400, getattr(response, "text", response)
+    assert "context_source_cycle" in getattr(response, "text", ""), getattr(response, "text", response)

@@ -115,27 +115,28 @@ pub fn buildSourceSpecs(alloc: Allocator, own_table_id: []const u8, declared: []
         for (configs.items) |*c| c.deinit();
         configs.deinit(alloc);
     }
-    for (declared) |d| {
-        const config = ctx.parseStoredJson(alloc, d.stored_json) catch |err| switch (err) {
+    // The declaration each parsed config came from.
+    var owners = std.ArrayListUnmanaged(usize).empty;
+    defer owners.deinit(alloc);
+    for (declared, 0..) |d, declared_index| {
+        var config = ctx.parseStoredJson(alloc, d.stored_json) catch |err| switch (err) {
             error.OutOfMemory => return err,
             // A malformed inbound declaration must not block writes to this
             // table; the dependent's own admission rejects it.
             else => continue,
         };
-        try configs.append(alloc, config);
+        configs.append(alloc, config) catch |err| {
+            config.deinit();
+            return err;
+        };
+        try owners.append(alloc, declared_index);
     }
     var items = std.ArrayListUnmanaged(SpecBinding).empty;
     errdefer items.deinit(alloc);
     var fields = std.ArrayListUnmanaged([]const u8).empty;
     defer fields.deinit(alloc);
-    var config_index: usize = 0;
-    for (declared) |d| {
-        if (ctx.parseStoredJson(alloc, d.stored_json)) |probe| {
-            var p = probe;
-            p.deinit();
-        } else |_| continue;
-        const config = &configs.items[config_index];
-        config_index += 1;
+    for (configs.items, owners.items) |*config, declared_index| {
+        const d = declared[declared_index];
         for (config.sources) |*source| {
             const targets_this = if (source.table_id.len == 0)
                 d.dependent_table_id.len == 0 or std.mem.eql(u8, d.dependent_table_id, own_table_id)
@@ -509,7 +510,13 @@ pub fn planStageNotices(
         }
 
         if (next_projection) |projection| {
-            try plan.putOwned(try alloc.dupe(u8, skey), try encodeShadowAlloc(alloc, specs.fields_digest, projection));
+            {
+            const shadow = try encodeShadowAlloc(alloc, specs.fields_digest, projection);
+            errdefer alloc.free(shadow);
+            const owned_key = try alloc.dupe(u8, skey);
+            errdefer alloc.free(owned_key);
+            try plan.putOwned(owned_key, shadow);
+        }
         } else {
             try plan.delete(skey);
         }
@@ -628,7 +635,13 @@ pub fn planBackfillShadows(alloc: Allocator, reader: store.Reader, plan: *store.
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch continue;
         if (parsed != .object) continue;
         const projection = try ctx.projectTreeAlloc(a, parsed, specs.union_fields);
-        try plan.putOwned(try alloc.dupe(u8, skey), try encodeShadowAlloc(alloc, specs.fields_digest, projection));
+        {
+            const shadow = try encodeShadowAlloc(alloc, specs.fields_digest, projection);
+            errdefer alloc.free(shadow);
+            const owned_key = try alloc.dupe(u8, skey);
+            errdefer alloc.free(owned_key);
+            try plan.putOwned(owned_key, shadow);
+        }
         written += 1;
     }
     return written;
@@ -806,13 +819,18 @@ pub fn planApplyNoticeWithSources(
     defer invalidated.deinit(alloc);
     // Further tuples of the same change, each fully drained before the next
     // unless the page budget is reached (then the continuation carries them).
+    // The budget counts every hint examined plus one per tuple scanned, not
+    // only confirmed targets: stale hints are deleted and empty tuples still
+    // cost a scan, so one notice's effects and read set stay bounded.
+    var spent: usize = @max(invalidated.visited, invalidated.targets.items.len);
     var more_index: usize = 0;
-    while (invalidated.resume_after == null and more_index < notice.more_tuples.len and invalidated.targets.items.len < page) : (more_index += 1) {
+    while (invalidated.resume_after == null and more_index < notice.more_tuples.len and spent < page) : (more_index += 1) {
         var next_options = options;
         next_options.resume_after = "";
-        next_options.max_targets = page - invalidated.targets.items.len;
+        next_options.max_targets = page - spent;
         var extra = try store.planInvalidateTuple(alloc, reader, plan, notice.spec, notice.more_tuples[more_index], next_options);
         defer extra.deinit(alloc);
+        spent += extra.visited + 1;
         for (extra.targets.items) |t| {
             var duplicate = false;
             for (invalidated.targets.items) |existing| if (std.mem.eql(u8, existing.artifact, t.artifact) and std.mem.eql(u8, existing.doc_key, t.doc_key)) {

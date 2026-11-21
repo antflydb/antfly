@@ -390,6 +390,10 @@ pub const TableApi = struct {
         InferenceEndpointAccessDenied,
         ModelNotFound,
         AmbiguousModelIdentifier,
+        Forbidden,
+        InvalidContextSources,
+        ContextSourceTableUnavailable,
+        ContextSourceFeedbackCycle,
         InternalFailure,
     };
 
@@ -2697,6 +2701,10 @@ pub fn handlePutArtifactEnrichment(
         error.AmbiguousModelIdentifier => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"ambiguous_model\",\"message\":\"model selection matches multiple installed artifacts; specify a variant and revision\",\"retryable\":false}"), .json = true },
         error.InferenceEndpointAccessDenied => return .{ .status = 400, .body = try alloc.dupe(u8, inference_endpoint_access_denied_message) },
         error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
+        error.Forbidden => return .{ .status = 403, .body = try alloc.dupe(u8, "{\"error\":\"forbidden\",\"message\":\"the declaring principal may not read a context source (missing read permission, or a row filter on a source that reads rows by key or graph edge)\",\"retryable\":false}"), .json = true },
+        error.InvalidContextSources => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_context_sources\",\"message\":\"context_sources declaration is not supported\",\"retryable\":false}"), .json = true },
+        error.ContextSourceTableUnavailable => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"context_source_table_not_found\",\"message\":\"a context source names a table that does not exist\",\"retryable\":false}"), .json = true },
+        error.ContextSourceFeedbackCycle => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"context_source_cycle\",\"message\":\"context sources would form a generated-input cycle\",\"retryable\":false}"), .json = true },
         error.MissingEmbeddingArtifactEnrichment => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding index source has no matching embedding enrichment") },
         error.MissingEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment has no producer configuration") },
         error.InvalidEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment producer is not runnable") },

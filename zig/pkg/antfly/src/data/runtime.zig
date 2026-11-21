@@ -5832,7 +5832,12 @@ pub const DataServer = struct {
     /// notice delivery, routed reads, and table topology for every owner.
     context_host: ?antfly.public_api.context_host.Host = null,
     /// Some table declared context sources since this process started.
-    context_sources_seen: bool = false,
+    /// Whether the per-group context sweep must run. True at startup: group
+    /// topologies committed before a restart may still name dependents (and
+    /// keep staging notices) even if every declaration has since been removed.
+    context_sweep_needed: bool = true,
+    /// The current sweep started while no table declared context sources.
+    context_idle_sweep: bool = false,
     context_maintenance_running: std.atomic.Value(bool) = .init(false),
     context_maintenance_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     status_source: antfly.public_api.http_server.StatusSource,
@@ -6813,14 +6818,15 @@ pub const DataServer = struct {
         const runtime = self.backend_runtime orelse return;
         if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
         if (self.context_host == null) return;
-        // Skip the per-group sweep entirely while no table has ever declared
-        // context sources (checked against a cached catalog digest at most
-        // once a second). Once any has, keep sweeping so removals still
-        // refresh each group's topology.
-        if (!self.context_sources_seen) {
+        // Skip the per-group sweep while no table declares context sources
+        // (checked against a cached catalog digest at most once a second),
+        // but only after one full sweep without any: that sweep refreshes
+        // every group's topology (clearing dependents a removal or a restart
+        // left behind) and drains what they staged.
+        if (!self.context_sweep_needed) {
             const any = self.context_host.?.anyContextSources(self.alloc, platform_time.monotonicNs(), std.time.ns_per_s) catch true;
             if (!any) return;
-            self.context_sources_seen = true;
+            self.context_sweep_needed = true;
         }
         if (self.context_maintenance_running.swap(true, .acq_rel)) return;
         var scheduled = false;
@@ -6828,7 +6834,14 @@ pub const DataServer = struct {
         const catalog = self.write_source.catalog;
         const deadline = catalog.budget(null).nowNs() +| 100 * std.time.ns_per_ms;
         for (0..8) |_| {
-            const visit = (try self.context_maintenance_sweep.next(self.alloc, catalog, deadline)) orelse return;
+            const visit = (try self.context_maintenance_sweep.next(self.alloc, catalog, deadline)) orelse {
+                if (self.context_idle_sweep) self.context_sweep_needed = false;
+                self.context_idle_sweep = false;
+                return;
+            };
+            if (self.context_maintenance_sweep.cursor == 1) {
+                self.context_idle_sweep = !(self.context_host.?.anyContextSources(self.alloc, platform_time.monotonicNs(), std.time.ns_per_s) catch true);
+            }
             if (self.data_raft) |raft| {
                 lockAtomic(&self.data_raft_mutex);
                 const leader = raft.host.http_host.host.isLocalLeader(visit.range.group_id);
@@ -6880,7 +6893,7 @@ pub const DataServer = struct {
             const status = try std.json.parseFromSliceLeaky(struct {
                 more: bool = false,
                 proposals: []const []const u8 = &.{},
-                deliveries: []const struct { dependent: []const u8, notice: []const u8 } = &.{},
+                deliveries: []const struct { dependent: []const u8, notice: []const u8, ack: []const u8 } = &.{},
             }, a, response.json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
             for (status.proposals) |encoded| {
                 const command = try std.json.parseFromSliceLeaky(command_mod.Command, a, encoded, .{ .allocate = .alloc_always });
@@ -6897,7 +6910,7 @@ pub const DataServer = struct {
                         continue;
                     };
                     _ = out;
-                    try acks.append(a, try command_mod.ackDigestHexAlloc(a, d.notice));
+                    try acks.append(a, d.ack);
                 }
                 if (acks.items.len != 0) try contextPropose(server, a, job.group_id, job.table, .{ .acks = acks.items }, false);
             }
@@ -10151,6 +10164,7 @@ pub const DataServer = struct {
         self.group_source_sweep.deinit();
         if (self.group_source_worker) |*worker| worker.deinit();
         self.graph_cleanup_sweep.deinit();
+        self.context_maintenance_sweep.deinit();
         self.leann_replication_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
         self.initial_fk_retirement_gc_cursor.deinit();

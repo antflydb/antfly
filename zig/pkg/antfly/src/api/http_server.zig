@@ -18993,14 +18993,82 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    /// Context reads run in the background with no caller, so they execute
+    /// as the declaring principal: each source is narrowed by the
+    /// declarer's effective row filter on its table, captured here into the
+    /// stored declaration (and its subscription identity). Sources that read
+    /// rows by key or by graph edge cannot carry a filter and are refused on
+    /// tables where one applies. Re-declaring the enrichment re-captures the
+    /// filter after the principal's policies change.
+    fn applyContextRowPolicies(self: *ApiHttpServer, a: std.mem.Allocator, request: api_operation.RequestContext, owner_table: []const u8, sources: *std.json.Value) !void {
+        if (sources.* != .object) return;
+        var it = sources.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .object) continue;
+            const spec = &entry.value_ptr.object;
+            inline for (.{ "query", "search", "document", "graph" }) |kind| if (spec.getPtr(kind)) |target| {
+                if (target.* != .object) return error.InvalidContextSourcesConfig;
+                const public_name: []const u8 = if (target.object.get("table")) |t| (if (t == .string) t.string else return error.InvalidContextSourcesConfig) else owner_table;
+                var identity: ?AuthenticatedIdentity = null;
+                const storage = self.resolveCatalogNameAlloc(a, request, public_name, &identity) catch |err| switch (err) {
+                    error.TableNotFound => return error.ContextSourceTableUnavailable,
+                    else => return err,
+                };
+                _ = storage;
+                if (try resolveEffectiveRowFilterJson(a, identity, public_name)) |row_filter_json| {
+                    const row_filter = try std.json.parseFromSliceLeaky(std.json.Value, a, row_filter_json, .{});
+                    if (comptime std.mem.eql(u8, kind, "query")) {
+                        const original = target.object.get("filter_query") orelse return error.InvalidContextSourcesConfig;
+                        try target.object.put(a, "filter_query", try conjoinJson(a, original, row_filter));
+                    } else if (comptime std.mem.eql(u8, kind, "search")) {
+                        // Only the full request form carries a filter.
+                        const req = target.object.getPtr("request") orelse return error.Forbidden;
+                        if (req.* != .object) return error.InvalidContextSourcesConfig;
+                        const next = if (req.object.get("filter_query")) |existing| try conjoinJson(a, existing, row_filter) else row_filter;
+                        try req.object.put(a, "filter_query", next);
+                    } else {
+                        // Key lookups and edge traversals cannot be narrowed.
+                        return error.Forbidden;
+                    }
+                }
+            };
+        }
+    }
+
+    fn conjoinJson(a: std.mem.Allocator, left: std.json.Value, right: std.json.Value) !std.json.Value {
+        var items = std.json.Array.init(a);
+        try items.append(left);
+        try items.append(right);
+        var object: std.json.ObjectMap = .empty;
+        try object.put(a, "conjuncts", .{ .array = items });
+        return .{ .object = object };
+    }
+
     fn admitContextSources(self: *ApiHttpServer, alloc: std.mem.Allocator, request: api_operation.RequestContext, table_name: []const u8, artifact_name: []const u8, enrichment_json: []u8) ![]u8 {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, enrichment_json, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return enrichment_json;
-        const sources = parsed.value.object.get("context_sources") orelse return enrichment_json;
+        const source_artifact: []const u8 = if (parsed.value.object.get("source_artifact_name")) |v| (if (v == .string) v.string else "") else "";
+        const sources = parsed.value.object.get("context_sources") orelse {
+            // No sources of its own, but a derived enrichment can still close
+            // a generated-input loop through what its input reads.
+            if (source_artifact.len != 0) {
+                var snapshot = (try self.source.adminSnapshot()) orelse return error.MetadataUnavailable;
+                defer self.source.freeAdminSnapshot(&snapshot);
+                const context_host = @import("context_host.zig");
+                const tables = try alloc.alloc(context_host.TableInfo, snapshot.tables.len);
+                defer alloc.free(tables);
+                for (snapshot.tables, tables) |t, *o| o.* = .{ .table_id = t.table_id, .name = t.name, .indexes_json = t.indexes_json };
+                try context_host.rejectDerivedCycle(alloc, tables, .{ .collect_fn = collectContextEnrichments }, table_name, artifact_name, source_artifact);
+            }
+            return enrichment_json;
+        };
         const refresh = parsed.value.object.get("refresh");
         _ = parsed.value.object.orderedRemove("context_sources");
         _ = parsed.value.object.orderedRemove("refresh");
+        var sources_mut = sources;
+        if (sources != .null) try self.applyContextRowPolicies(parsed.arena.allocator(), request, table_name, &sources_mut);
+        const sources_policy = sources_mut;
         if (sources != .null) {
             var snapshot = (try self.source.adminSnapshot()) orelse return error.MetadataUnavailable;
             defer self.source.freeAdminSnapshot(&snapshot);
@@ -19011,7 +19079,7 @@ pub const ApiHttpServer = struct {
             const tables = try a.alloc(context_host.TableInfo, snapshot.tables.len);
             for (snapshot.tables, tables) |t, *o| o.* = .{ .table_id = t.table_id, .name = t.name, .indexes_json = t.indexes_json };
             var names = ContextSourceNames{ .server = self, .request = request };
-            const stored = try context_host.admitResolvingAlloc(a, tables, .{ .collect_fn = collectContextEnrichments }, table_name, artifact_name, sources, if (refresh) |r| (if (r == .null) null else r) else null, @import("antfly_local_sources").api_local_indexes.contextFilterLowering(), .{ .ptr = &names, .resolve_fn = ContextSourceNames.resolve });
+            const stored = try context_host.admitResolvingAlloc(a, tables, .{ .collect_fn = collectContextEnrichments }, table_name, artifact_name, sources_policy, if (refresh) |r| (if (r == .null) null else r) else null, @import("antfly_local_sources").api_local_indexes.contextFilterLowering(), .{ .ptr = &names, .resolve_fn = ContextSourceNames.resolve }, source_artifact);
             try parsed.value.object.put(parsed.arena.allocator(), "context_sources_json", .{ .string = try parsed.arena.allocator().dupe(u8, stored) });
         }
         return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
@@ -19046,7 +19114,16 @@ pub const ApiHttpServer = struct {
         // the catalog; the stored form replaces the public declaration.
         const enrichment_json = self.admitContextSources(alloc, request, table_name, artifact_name, request_json) catch |err| {
             std.log.warn("artifact enrichment validation failed stage=context_sources table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
-            return error.InvalidEnrichmentRequest;
+            return switch (err) {
+                error.Forbidden => error.Forbidden,
+                error.ContextSourceTableUnavailable => error.ContextSourceTableUnavailable,
+                error.ContextSourceFeedbackCycle => error.ContextSourceFeedbackCycle,
+                error.OutOfMemory => error.InternalFailure,
+                // Catalog reads that can be retried (no metadata leader, a
+                // snapshot not available yet) are not the caller's fault.
+                error.MetadataUnavailable => error.NotLeader,
+                else => if (metadata_authority.isRetryableError(err)) error.NotLeader else error.InvalidContextSources,
+            };
         };
         defer if (enrichment_json.ptr != request_json.ptr) alloc.free(enrichment_json);
         managed_embedder.validateEmbeddingEnrichmentProducerJsonWithOptions(

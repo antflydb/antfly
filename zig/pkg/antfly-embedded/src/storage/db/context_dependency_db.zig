@@ -304,6 +304,7 @@ var marker_counter = std.atomic.Value(u64).init(0);
 
 pub const pending_prefix = "\x00\x00__metadata__:context_dependency:generated_pending:";
 const reconcile_cursor_key = "\x00\x00__metadata__:context_dependency:reconcile_cursor";
+const reconcile_settled_key = "\x00\x00__metadata__:context_dependency:reconcile_settled";
 
 fn readsGenerated(manager: anytype, batch: anytype) bool {
     if (!manager.hasContextDependents() or !manager.contextReadsGenerated()) return false;
@@ -333,91 +334,96 @@ pub fn stageGenerated(alloc: Allocator, primary: *docstore_mod.DocStore, manager
     defer alloc.free(declared);
     var specs = try notices.buildSourceSpecs(alloc, manager.context_table_id, declared);
     defer specs.deinit();
-    var reader_state = try StoreReader.init(primary);
-    defer reader_state.deinit();
-    const reader = reader_state.reader();
-    var plan = store.Plan.init(alloc);
-    defer plan.deinit();
+    const marker = try std.fmt.allocPrint(alloc, "{s}{x:0>16}", .{ pending_prefix, t });
+    defer alloc.free(marker);
+    const replicated = manager.context_replication != null;
+    const Pass = struct {
+        manager: @TypeOf(manager),
+        specs: *const notices.SourceSpecs,
+        sequence: u64,
+        batch: @TypeOf(batch),
+        /// Local commits clear the marker with the notices; replicated
+        /// plans never carry replica-local markers.
+        marker: ?[]const u8,
+        fn run(p: *anyopaque, alloc_: Allocator, reader: store.Reader, plan: *store.Plan) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            try planGenerated(alloc_, reader, plan, self.manager, self.specs, self.sequence, self.batch);
+            if (self.marker) |key| try plan.delete(key);
+        }
+    };
+    var pass = Pass{ .manager = manager, .specs = &specs, .sequence = sequence, .batch = batch, .marker = if (replicated) null else marker };
+    // Replicated: the leader proposes the shadows and notices so every
+    // replica applies the same plan (followers never stage them locally).
+    try planAndCommit(alloc, primary, manager, .{ .ptr = &pass, .plan_fn = Pass.run });
+    if (replicated) try primary.putBatch(&.{}, &.{marker});
+}
+
+fn planGenerated(alloc: Allocator, reader: store.Reader, plan: *store.Plan, manager: anytype, specs: *const notices.SourceSpecs, sequence: u64, batch: anytype) !void {
+    if (specs.isEmpty() or (specs.artifact_names.len == 0 and !specs.generated_edges)) return;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    if (!specs.isEmpty() and (specs.artifact_names.len != 0 or specs.generated_edges)) {
-        var docs = std.StringArrayHashMapUnmanaged(void).empty;
-        var edge_keys = std.ArrayListUnmanaged([]const u8).empty;
-        inline for (.{ batch.changed_artifact_keys, batch.deleted_keys }) |keys| for (keys) |key| {
-            if (internal_keys.isGraphEdgeArtifactKey(key)) {
-                try edge_keys.append(a, key);
-                continue;
-            }
-            const ref = (artifact_ids.decodeArtifactRefAlloc(a, key) catch null) orelse continue;
-            for (specs.artifact_names) |name| if (std.mem.eql(u8, name, ref.name)) {
-                try docs.put(a, ref.document_id, {});
-                break;
-            };
+    var docs = std.StringArrayHashMapUnmanaged(void).empty;
+    var edge_keys = std.ArrayListUnmanaged([]const u8).empty;
+    inline for (.{ batch.changed_artifact_keys, batch.deleted_keys }) |keys| for (keys) |key| {
+        if (internal_keys.isGraphEdgeArtifactKey(key)) {
+            try edge_keys.append(a, key);
+            continue;
+        }
+        const ref = (artifact_ids.decodeArtifactRefAlloc(a, key) catch null) orelse continue;
+        for (specs.artifact_names) |name| if (std.mem.eql(u8, name, ref.name)) {
+            try docs.put(a, ref.document_id, {});
+            break;
         };
-        var changes = std.ArrayListUnmanaged(notices.RowChange).empty;
-        for (docs.keys()) |doc| {
-            const values = try artifactValuesFromReaderAlloc(a, reader, manager, doc, specs.artifact_names);
-            const shadow = try reader.get(a, try notices.shadowKeyAlloc(a, doc));
-            var base: std.json.Value = .{ .object = .empty };
-            if (shadow) |raw| if (raw.len >= 32 and std.mem.eql(u8, raw[0..32], &specs.fields_digest)) {
-                base = std.json.parseFromSliceLeaky(std.json.Value, a, raw[32..], .{}) catch base;
-            };
-            if (shadow == null) {
-                // No shadow yet: take the document itself.
-                const doc_key = try internal_keys.documentKeyAlloc(a, doc);
-                if (try reader.get(a, doc_key)) |raw| base = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch base;
-            }
-            if (base != .object) continue;
-            try base.object.put(a, "_artifacts", try std.json.parseFromSliceLeaky(std.json.Value, a, values, .{}));
-            try changes.append(a, .{ .key = doc, .next = try std.json.Stringify.valueAlloc(a, base, .{}) });
-        }
-        const complete = try shadowsComplete(alloc, reader, specs.fields_digest);
-        const staged = try notices.planStageNotices(alloc, reader, &plan, &specs, manager.context_table_id, sequence, 0x4000_0000, changes.items, complete);
-        if (specs.generated_edges) {
-            var edges = std.ArrayListUnmanaged(notices.EdgeChange).empty;
-            defer edges.deinit(alloc);
-            try appendDerivedEdgesAlloc(a, &edges, alloc, edge_keys.items);
-            for (batch.graph_writes) |e| try edges.append(alloc, .{ .graph_index = e.index_name, .source = e.source, .target = e.target, .edge_type = e.edge_type, .artifact_derived = true });
-            _ = try notices.planStageEdgeNotices(alloc, &plan, &specs, manager.context_table_id, sequence, staged.next_ordinal, edges.items);
-        }
-    }
-    const key = try std.fmt.allocPrint(alloc, "{s}{x:0>16}", .{ pending_prefix, t });
-    defer alloc.free(key);
-    try plan.delete(key);
-    try commitPlan(alloc, primary, &plan);
-}
-
-pub fn hasGeneratedPending(alloc: Allocator, primary: *docstore_mod.DocStore) !bool {
-    var reader = try StoreReader.init(primary);
-    defer reader.deinit();
-    const Probe = struct {
-        found: bool = false,
-        fn visit(p: *anyopaque, _: []const u8, _: []const u8) anyerror!bool {
-            const self: *@This() = @ptrCast(@alignCast(p));
-            self.found = true;
-            return false;
-        }
     };
-    var probe = Probe{};
-    try reader.reader().scanPrefix(alloc, pending_prefix, .{ .ptr = &probe, .visit_fn = Probe.visit });
-    return probe.found;
+    var changes = std.ArrayListUnmanaged(notices.RowChange).empty;
+    for (docs.keys()) |doc| {
+        const values = try artifactValuesFromReaderAlloc(a, reader, manager, doc, specs.artifact_names);
+        const shadow = try reader.get(a, try notices.shadowKeyAlloc(a, doc));
+        var base: std.json.Value = .{ .object = .empty };
+        if (shadow) |raw| if (raw.len >= 32 and std.mem.eql(u8, raw[0..32], &specs.fields_digest)) {
+            base = std.json.parseFromSliceLeaky(std.json.Value, a, raw[32..], .{}) catch base;
+        };
+        if (shadow == null) {
+            // No shadow yet: take the document itself.
+            const doc_key = try internal_keys.documentKeyAlloc(a, doc);
+            if (try reader.get(a, doc_key)) |raw| base = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch base;
+        }
+        if (base != .object) continue;
+        try base.object.put(a, "_artifacts", try std.json.parseFromSliceLeaky(std.json.Value, a, values, .{}));
+        try changes.append(a, .{ .key = doc, .next = try std.json.Stringify.valueAlloc(a, base, .{}) });
+    }
+    const complete = try shadowsComplete(alloc, reader, specs.fields_digest);
+    const staged = try notices.planStageNotices(alloc, reader, plan, specs, manager.context_table_id, sequence, 0x4000_0000, changes.items, complete);
+    if (specs.generated_edges) {
+        var edges = std.ArrayListUnmanaged(notices.EdgeChange).empty;
+        defer edges.deinit(alloc);
+        try appendDerivedEdgesAlloc(a, &edges, alloc, edge_keys.items);
+        for (batch.graph_writes) |e| try edges.append(alloc, .{ .graph_index = e.index_name, .source = e.source, .target = e.target, .edge_type = e.edge_type, .artifact_derived = true });
+        _ = try notices.planStageEdgeNotices(alloc, plan, specs, manager.context_table_id, sequence, staged.next_ordinal, edges.items);
+    }
 }
 
 /// One reconcile page after an interrupted generated record: recompute
 /// logical rows (document plus artifacts) and stage exactly the differences
-/// from their shadows. With `done`, the pending markers are cleared.
+/// from their shadows. With `done`, the final page also records the digest of
+/// the pending markers it settles; the markers are cleared once that record
+/// is visible (immediately when the plan committed in this call, otherwise on
+/// the next pass after the deferred proposal applied).
 pub fn reconcilePage(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, sequence: u64, rows: []const notices.RowChange, done: bool) !void {
     const declared = try manager.contextDeclarationsAlloc(alloc);
     defer alloc.free(declared);
     var specs = try notices.buildSourceSpecs(alloc, manager.context_table_id, declared);
     defer specs.deinit();
+    var markers = try pendingMarkersAlloc(alloc, primary);
+    defer markers.deinit(alloc);
     const Pass = struct {
         manager: @TypeOf(manager),
         specs: *const notices.SourceSpecs,
         rows: []const notices.RowChange,
         sequence: u64,
         done: bool,
+        settled: ctx.Digest,
         fn run(p: *anyopaque, a: Allocator, reader: store.Reader, plan: *store.Plan) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(p));
             var arena = std.heap.ArenaAllocator.init(a);
@@ -430,34 +436,78 @@ pub fn reconcilePage(alloc: Allocator, primary: *docstore_mod.DocStore, manager:
             if (!self.specs.isEmpty()) _ = try notices.planStageNotices(a, reader, plan, self.specs, self.manager.context_table_id, self.sequence, 0x6000_0000, changes.items, true);
             if (self.done) {
                 try plan.delete(reconcile_cursor_key);
+                try plan.put(reconcile_settled_key, &self.settled);
             } else if (self.rows.len != 0) {
                 try plan.put(reconcile_cursor_key, self.rows[self.rows.len - 1].key);
             }
         }
     };
-    var pass = Pass{ .manager = manager, .specs = &specs, .rows = rows, .sequence = sequence, .done = done };
+    var pass = Pass{ .manager = manager, .specs = &specs, .rows = rows, .sequence = sequence, .done = done, .settled = markers.digest };
     try planAndCommit(alloc, primary, manager, .{ .ptr = &pass, .plan_fn = Pass.run });
     if (!done) return;
-    // Pending markers are replica-local crash intents (never replicated, so
-    // never part of a replicated read set): clear them locally.
+    // A deferred plan has not applied yet; the next pass settles the markers
+    // once its record is visible (or re-runs the reconcile if it never is).
+    if (active_collector != null) return;
+    try deleteMarkers(primary, markers.keys.items);
+}
+
+/// Pending markers are replica-local crash intents (never replicated, so
+/// never part of a replicated read set).
+const PendingMarkers = struct {
+    keys: std.ArrayListUnmanaged([]u8) = .empty,
+    digest: ctx.Digest = @splat(0),
+
+    fn deinit(self: *PendingMarkers, alloc: Allocator) void {
+        for (self.keys.items) |k| alloc.free(k);
+        self.keys.deinit(alloc);
+    }
+};
+
+fn pendingMarkersAlloc(alloc: Allocator, primary: *docstore_mod.DocStore) !PendingMarkers {
     var reader_state = try StoreReader.init(primary);
     defer reader_state.deinit();
     const Collect = struct {
         alloc: Allocator,
-        keys: std.ArrayListUnmanaged([]u8) = .empty,
+        out: PendingMarkers = .{},
+        hash: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
         fn visit(p: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
             const self: *@This() = @ptrCast(@alignCast(p));
-            try self.keys.append(self.alloc, try self.alloc.dupe(u8, key));
+            const owned = try self.alloc.dupe(u8, key);
+            errdefer self.alloc.free(owned);
+            try self.out.keys.append(self.alloc, owned);
+            var len: [8]u8 = undefined;
+            std.mem.writeInt(u64, &len, key.len, .little);
+            self.hash.update(&len);
+            self.hash.update(key);
             return true;
         }
     };
     var collect = Collect{ .alloc = alloc };
-    defer {
-        for (collect.keys.items) |k| alloc.free(k);
-        collect.keys.deinit(alloc);
-    }
+    errdefer collect.out.deinit(alloc);
     try reader_state.reader().scanPrefix(alloc, pending_prefix, .{ .ptr = &collect, .visit_fn = Collect.visit });
-    if (collect.keys.items.len != 0) try primary.putBatch(&.{}, @ptrCast(collect.keys.items));
+    collect.hash.final(&collect.out.digest);
+    return collect.out;
+}
+
+fn deleteMarkers(primary: *docstore_mod.DocStore, keys: []const []u8) !void {
+    if (keys.len != 0) try primary.putBatch(&.{}, @ptrCast(keys));
+}
+
+/// Clear pending markers whose reconcile has applied: the replicated settle
+/// record matches the current marker set. Returns true when no markers
+/// remain afterwards. New markers written since change the digest, so their
+/// records are reconciled again.
+pub fn settleReconciledMarkers(alloc: Allocator, primary: *docstore_mod.DocStore) !bool {
+    var markers = try pendingMarkersAlloc(alloc, primary);
+    defer markers.deinit(alloc);
+    if (markers.keys.items.len == 0) return true;
+    var reader = try StoreReader.init(primary);
+    defer reader.deinit();
+    const settled = (try reader.reader().get(alloc, reconcile_settled_key)) orelse return false;
+    defer alloc.free(settled);
+    if (!std.mem.eql(u8, settled, &markers.digest)) return false;
+    try deleteMarkers(primary, markers.keys.items);
+    return true;
 }
 
 pub fn reconcileCursorAlloc(alloc: Allocator, primary: *docstore_mod.DocStore) !?[]u8 {
@@ -481,32 +531,16 @@ pub fn shadowsCompleteForCurrent(alloc: Allocator, reader: store.Reader, manager
     return shadowsComplete(alloc, reader, specs.fields_digest);
 }
 
-/// Mark shadows complete for the current field set (after a full backfill).
-pub fn markShadowsComplete(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype) !void {
-    const declared = try manager.contextDeclarationsAlloc(alloc);
-    defer alloc.free(declared);
-    var specs = try notices.buildSourceSpecs(alloc, manager.context_table_id, declared);
-    defer specs.deinit();
-    if (manager.context_replication == null) return primary.put(shadows_complete_key, &specs.fields_digest);
-    const Pass = struct {
-        digest: ctx.Digest,
-        fn run(p: *anyopaque, _: Allocator, _: store.Reader, plan: *store.Plan) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(p));
-            try plan.put(shadows_complete_key, &self.digest);
-        }
-    };
-    var pass = Pass{ .digest = specs.fields_digest };
-    try planAndCommit(alloc, primary, manager, .{ .ptr = &pass, .plan_fn = Pass.run });
-}
-
 /// Backfill covering shadows for one page of existing rows.
 pub fn backfillShadowPage(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, rows: []const notices.RowChange) !usize {
-    return backfillShadowPageWithCursor(alloc, primary, manager, rows, null, null);
+    return backfillShadowPageWithCursor(alloc, primary, manager, rows, null, null, false);
 }
 
 /// One backfill page; `cursor_key`/`cursor` (when given) are written in the
 /// same commit, so a replicated owner advances shadows and cursor together.
-pub fn backfillShadowPageWithCursor(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, rows: []const notices.RowChange, cursor_key: ?[]const u8, cursor: ?[]const u8) !usize {
+/// With `complete`, the same commit marks shadows complete for the current
+/// field set, so completion can never apply without its final page.
+pub fn backfillShadowPageWithCursor(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, rows: []const notices.RowChange, cursor_key: ?[]const u8, cursor: ?[]const u8, complete: bool) !usize {
     const declared = try manager.contextDeclarationsAlloc(alloc);
     defer alloc.free(declared);
     var specs = try notices.buildSourceSpecs(alloc, manager.context_table_id, declared);
@@ -518,6 +552,7 @@ pub fn backfillShadowPageWithCursor(alloc: Allocator, primary: *docstore_mod.Doc
         rows: []const notices.RowChange,
         cursor_key: ?[]const u8,
         cursor: ?[]const u8,
+        complete: bool,
         written: usize = 0,
         fn run(p: *anyopaque, a: Allocator, reader: store.Reader, plan: *store.Plan) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(p));
@@ -532,9 +567,10 @@ pub fn backfillShadowPageWithCursor(alloc: Allocator, primary: *docstore_mod.Doc
             if (self.cursor_key) |key| {
                 if (self.cursor) |value| try plan.put(key, value) else try plan.delete(key);
             }
+            if (self.complete) try plan.put(shadows_complete_key, &self.specs.fields_digest);
         }
     };
-    var pass = Pass{ .manager = manager, .specs = &specs, .rows = rows, .cursor_key = cursor_key, .cursor = cursor };
+    var pass = Pass{ .manager = manager, .specs = &specs, .rows = rows, .cursor_key = cursor_key, .cursor = cursor, .complete = complete };
     try planAndCommit(alloc, primary, manager, .{ .ptr = &pass, .plan_fn = Pass.run });
     return pass.written;
 }
@@ -631,6 +667,14 @@ fn planEffects(plan: *const store.Plan) usize {
     return plan.puts.items.len + plan.deletes.items.len;
 }
 
+/// True once planning one more notice might not fit a replicated command:
+/// either its effects or its recorded read set (each hint examined costs a
+/// state read, each tuple a scan) could pass the command's limits.
+fn planFull(plan: *const store.Plan, reader: store.Reader) bool {
+    const read_threshold = if (test_plan_threshold) |t| t else command_mod.max_reads - notice_effect_headroom;
+    return planEffects(plan) > planThreshold() or reader.readCount() > read_threshold;
+}
+
 pub fn applyNoticesConsuming(
     alloc: Allocator,
     primary: *docstore_mod.DocStore,
@@ -671,7 +715,7 @@ pub fn applyNoticesConsuming(
             for (self.encoded, 0..) |raw, i| {
                 // One replicated command carries at most `max_effects`. Stop
                 // before a notice that might not fit; it stays in the inbox.
-                if (self.budgeted and i != 0 and planEffects(plan) > planThreshold()) break;
+                if (self.budgeted and i != 0 and planFull(plan, reader)) break;
                 self.summary.processed = i + 1;
                 var decoded = try notices.decodeNoticeAlloc(a, raw);
                 defer decoded.deinit();
@@ -697,7 +741,7 @@ pub fn applyNoticesConsuming(
             for (self.consumed[0..@min(self.consumed.len, self.summary.processed)]) |key| try plan.delete(key);
             // Debounced rebuilds that are due join this journal record when
             // they fit; otherwise the next pass drains them.
-            if (self.budgeted and planEffects(plan) > planThreshold()) return;
+            if (self.budgeted and planFull(plan, reader)) return;
             const due = try store.planDrainDebounced(a, reader, plan, self.now_ms, notices.default_fanout_page);
             defer store.freeTargets(a, due);
             for (due) |t| try appendRef(a, &self.refs, t.artifact, t.doc_key);
@@ -771,20 +815,61 @@ pub fn deleteOutboxEntries(alloc: Allocator, primary: *docstore_mod.DocStore, ke
 /// Acknowledge delivered outbox entries. Replicated owners propose content
 /// acknowledgements (every replica deletes its identical entries, whatever
 /// their local keys); `values` are the delivered notice bytes.
-pub fn ackOutbox(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, keys: []const []const u8, values: []const []const u8) !void {
+/// `acks` are the guarded acknowledgements of the delivered entries, computed
+/// over the whole pass (`ackTokensAlloc`) so an undelivered earlier entry of
+/// the same identity is never retired in a delivered one's place.
+pub fn ackOutbox(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, keys: []const []const u8, values: []const []const u8, acks: []const []const u8) !void {
     if (keys.len == 0) return;
     const replication = manager.context_replication orelse return deleteOutboxEntries(alloc, primary, keys, values);
     if (!replication.isOwner()) return error.ContextDependencyNotOwner;
     // Deferred: the host acknowledges after it delivered.
     if (active_collector != null) return;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const acks = try a.alloc([]const u8, values.len);
-    for (values, acks) |v, *d| d.* = try command_mod.ackDigestHexAlloc(a, v);
+    if (acks.len != keys.len) return error.InvalidContextDependencyCommand;
     manager.lockContextProposals();
     defer manager.unlockContextProposals();
     try replication.propose(alloc, .{ .acks = acks });
+}
+
+/// Guarded acknowledgements for outbox entries read (in key order) in one
+/// pass: the k-th delivered entry of an identity expects the pending count
+/// minus the k earlier ones this pass acknowledges first.
+pub fn ackTokensAlloc(alloc: Allocator, primary: *docstore_mod.DocStore, values: []const []const u8) ![][]const u8 {
+    var reader = try StoreReader.init(primary);
+    defer reader.deinit();
+    const out = try alloc.alloc([]const u8, values.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |t| alloc.free(t);
+        alloc.free(out);
+    }
+    var seen = std.AutoHashMapUnmanaged(ctx.Digest, u64).empty;
+    defer seen.deinit(alloc);
+    for (values, out) |value, *token| {
+        const identity = try notices.stableIdentity(alloc, value);
+        const entry = try seen.getOrPut(alloc, identity);
+        if (!entry.found_existing) {
+            var key: [4 + 32]u8 = undefined;
+            @memcpy(key[0..4], &store.familyPrefix(notices.outbox_index_family));
+            @memcpy(key[4..], &identity);
+            const Count = struct {
+                n: u64 = 0,
+                fn visit(p: *anyopaque, _: []const u8, _: []const u8) anyerror!bool {
+                    const self: *@This() = @ptrCast(@alignCast(p));
+                    self.n += 1;
+                    return true;
+                }
+            };
+            var count = Count{};
+            try reader.reader().scanPrefix(alloc, &key, .{ .ptr = &count, .visit_fn = Count.visit });
+            entry.value_ptr.* = count.n;
+        }
+        // An entry read this pass is still pending, so the count is >= 1.
+        const pending = @max(entry.value_ptr.*, 1);
+        token.* = try command_mod.ackAlloc(alloc, value, pending);
+        filled += 1;
+        entry.value_ptr.* = pending - 1;
+    }
+    return out;
 }
 
 /// Replicated (Raft) owner hooks.
@@ -846,7 +931,8 @@ pub const Collector = struct {
     commands: std.ArrayListUnmanaged([]u8) = .empty,
     deliveries: std.ArrayListUnmanaged(Delivery) = .empty,
 
-    pub const Delivery = struct { dependent: []u8, notice: []u8 };
+    /// `ack` is the guarded acknowledgement to propose once delivered.
+    pub const Delivery = struct { dependent: []u8, notice: []u8, ack: []u8 };
 
     pub fn deinit(self: *Collector) void {
         for (self.commands.items) |c| self.alloc.free(c);
@@ -854,6 +940,7 @@ pub const Collector = struct {
         for (self.deliveries.items) |d| {
             self.alloc.free(d.dependent);
             self.alloc.free(d.notice);
+            self.alloc.free(d.ack);
         }
         self.deliveries.deinit(self.alloc);
     }
@@ -864,12 +951,14 @@ pub const Collector = struct {
         try self.commands.append(self.alloc, encoded);
     }
 
-    pub fn addDelivery(self: *Collector, dependent: []const u8, notice: []const u8) !void {
+    pub fn addDelivery(self: *Collector, dependent: []const u8, notice: []const u8, ack: []const u8) !void {
         const d = try self.alloc.dupe(u8, dependent);
         errdefer self.alloc.free(d);
         const n = try self.alloc.dupe(u8, notice);
         errdefer self.alloc.free(n);
-        try self.deliveries.append(self.alloc, .{ .dependent = d, .notice = n });
+        const k = try self.alloc.dupe(u8, ack);
+        errdefer self.alloc.free(k);
+        try self.deliveries.append(self.alloc, .{ .dependent = d, .notice = n, .ack = k });
     }
 
     pub fn isEmpty(self: *const Collector) bool {
@@ -935,7 +1024,21 @@ pub fn planAndCommit(alloc: Allocator, primary: *docstore_mod.DocStore, manager:
     var plan = store.Plan.init(alloc);
     defer plan.deinit();
     try planner.plan_fn(planner.ptr, alloc, state.reader(), &plan);
+    // Rebuilds become durable intents in the same commit as the state they
+    // follow from (the debounce entries they drain, the notices they apply),
+    // so a crash before the caller journals them never loses one.
+    if (planner.rebuilds_fn) |rebuilds| try planRebuildIntents(alloc, &plan, rebuilds(planner.ptr));
     try commitPlan(alloc, primary, &plan);
+}
+
+fn planRebuildIntents(alloc: Allocator, plan: *store.Plan, refs: []const enrichment_types.GeneratedEnrichmentRef) !void {
+    if (refs.len == 0) return;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (try command_mod.rebuildsAlloc(a, refs)) |rebuild| {
+        try plan.put(try command_mod.rebuildIntentKeyAlloc(a, rebuild), try std.json.Stringify.valueAlloc(a, rebuild, .{}));
+    }
 }
 
 fn commitPlan(alloc: Allocator, primary: *docstore_mod.DocStore, plan: *const store.Plan) !void {

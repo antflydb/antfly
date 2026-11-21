@@ -94,7 +94,7 @@ pub const Command = struct {
         for (self.reads) |r| if (!isHex(r.key) or (r.digest.len != 0 and r.digest.len != 64) or !isHex(r.digest)) return error.InvalidContextDependencyCommand;
         for (self.scans) |s| if (!isHex(s.lower) or !isHex(s.upper) or s.digest.len != 64 or !isHex(s.digest)) return error.InvalidContextDependencyCommand;
         if (self.acks.len > max_effects) return error.InvalidContextDependencyCommand;
-        for (self.acks) |d| if (d.len != 64 or !isHex(d)) return error.InvalidContextDependencyCommand;
+        for (self.acks) |d| _ = parseAck(d) catch return error.InvalidContextDependencyCommand;
         if (self.rebuilds.len > max_effects or (self.rebuilds.len != 0 and self.isInbox())) return error.InvalidContextDependencyCommand;
         for (self.rebuilds) |r| if (!isHex(r.artifact) or !isHex(r.doc_key) or r.artifact.len == 0 or r.doc_key.len == 0) return error.InvalidContextDependencyCommand;
     }
@@ -124,6 +124,11 @@ pub const Command = struct {
         for (self.inbox) |n| field(&h, n);
         field(&h, "|");
         for (self.acks) |d| field(&h, d);
+        field(&h, "|");
+        for (self.rebuilds) |r| {
+            field(&h, r.artifact);
+            field(&h, r.doc_key);
+        }
         var out: Digest = undefined;
         h.final(&out);
         return out;
@@ -173,6 +178,29 @@ pub fn ackDigestHexAlloc(a: Allocator, notice: []const u8) ![]u8 {
     return hexAlloc(a, &(try @import("context_notices.zig").stableIdentity(a, notice)));
 }
 
+/// An outbox acknowledgement: the notice's replicated identity and how many
+/// entries with that identity were pending when it was delivered. It retires
+/// the earliest such entry only while exactly that many remain, so a
+/// duplicate (a retried proposal, or a redelivery planned before the first
+/// acknowledgement applied) finds one fewer and changes nothing.
+pub const Ack = struct { identity_hex: []const u8, pending: u64 };
+
+pub fn ackAlloc(a: Allocator, notice: []const u8, pending: u64) ![]u8 {
+    const identity = try ackDigestHexAlloc(a, notice);
+    defer a.free(identity);
+    return std.fmt.allocPrint(a, "{s}:{d}", .{ identity, pending });
+}
+
+pub fn parseAck(raw: []const u8) !Ack {
+    if (raw.len < 66 or raw[64] != ':' or !isHex(raw[0..64])) return error.InvalidContextDependencyCommand;
+    const digits = raw[65..];
+    if (digits.len > 19) return error.InvalidContextDependencyCommand;
+    for (digits) |c| if (c < '0' or c > '9') return error.InvalidContextDependencyCommand;
+    const pending = std.fmt.parseInt(u64, digits, 10) catch return error.InvalidContextDependencyCommand;
+    if (pending == 0) return error.InvalidContextDependencyCommand;
+    return .{ .identity_hex = raw[0..64], .pending = pending };
+}
+
 fn valueDigest(value: []const u8) Digest {
     var out: Digest = undefined;
     Sha256.hash(value, &out, .{});
@@ -185,6 +213,9 @@ pub const Recorder = struct {
     inner: store.Reader,
     reads: std.ArrayListUnmanaged(Command.Read) = .empty,
     scans: std.ArrayListUnmanaged(Command.Scan) = .empty,
+    /// Keys already in the read set: one snapshot, so a repeated read adds
+    /// nothing to validate.
+    seen: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(alloc: Allocator, inner: store.Reader) Recorder {
         return .{ .arena = std.heap.ArenaAllocator.init(alloc), .inner = inner };
@@ -196,13 +227,28 @@ pub const Recorder = struct {
     }
 
     pub fn reader(self: *Recorder) store.Reader {
-        return .{ .ptr = self, .get_fn = getImpl, .scan_fn = scanImpl };
+        return .{ .ptr = self, .get_fn = getImpl, .scan_fn = scanImpl, .reads_fn = readCountImpl };
+    }
+
+    /// Entries in the read set so far (reads plus scans); a command carries
+    /// at most `max_reads`.
+    pub fn readCount(self: *const Recorder) usize {
+        return self.reads.items.len + self.scans.items.len;
+    }
+
+    fn readCountImpl(p: *anyopaque) usize {
+        const self: *Recorder = @ptrCast(@alignCast(p));
+        return self.readCount();
     }
 
     fn getImpl(p: *anyopaque, alloc: Allocator, key: []const u8) anyerror!?[]u8 {
         const self: *Recorder = @ptrCast(@alignCast(p));
         const value = try self.inner.get(alloc, key);
+        errdefer if (value) |v| alloc.free(v);
         const a = self.arena.allocator();
+        const seen = try self.seen.getOrPut(a, key);
+        if (seen.found_existing) return value;
+        seen.key_ptr.* = try a.dupe(u8, key);
         try self.reads.append(a, .{
             .key = try hexAlloc(a, key),
             .digest = if (value) |v| try hexAlloc(a, &valueDigest(v)) else "",
@@ -246,7 +292,7 @@ pub const Recorder = struct {
     /// recorder's arena; encode before deinit).
     pub fn commandAlloc(self: *Recorder, plan: *const store.Plan) !Command {
         const a = self.arena.allocator();
-        if (plan.puts.items.len + plan.deletes.items.len > max_effects) return error.ContextBudgetExceeded;
+        if (plan.puts.items.len + plan.deletes.items.len > max_effects or self.readCount() > max_reads) return error.ContextBudgetExceeded;
         const puts = try a.alloc(Command.Put, plan.puts.items.len);
         for (plan.puts.items, puts) |e, *o| o.* = .{ .key = try hexAlloc(a, e.key), .value = try hexAlloc(a, e.value) };
         const deletes = try a.alloc([]const u8, plan.deletes.items.len);
@@ -319,31 +365,36 @@ pub fn applyTxn(alloc: Allocator, txn: anytype, command: Command) !Outcome {
     for (command.puts) |p| try txn.put(try unhexAlloc(a, p.key), try unhexAlloc(a, p.value));
     if (command.acks.len != 0) {
         // Each acknowledgement retires the earliest pending outbox entry with
-        // that identity (replicas stage identical notices in the same order),
-        // found through the identity index: work is bounded by the page.
+        // its identity (replicas stage identical notices in the same order),
+        // found through the identity index, and only while the pending count
+        // it observed still holds: duplicates are no-ops on every replica.
         const notices_mod = @import("context_notices.zig");
-        var counts = std.StringArrayHashMapUnmanaged(usize).empty;
-        for (command.acks) |hex| {
-            const entry = try counts.getOrPut(a, hex);
-            if (!entry.found_existing) entry.value_ptr.* = 0;
-            entry.value_ptr.* += 1;
-        }
+        const Pending = struct { keys: std.ArrayListUnmanaged([]u8) = .empty, retired: usize = 0 };
+        var by_identity = std.StringArrayHashMapUnmanaged(Pending).empty;
         var doomed = std.ArrayListUnmanaged([]u8).empty;
-        var it = counts.iterator();
-        while (it.next()) |entry| {
-            const identity_bytes = try unhexAlloc(a, entry.key_ptr.*);
-            const prefix = try std.mem.concat(a, u8, &.{ &store.familyPrefix(notices_mod.outbox_index_family), identity_bytes });
-            var remaining = entry.value_ptr.*;
-            var cursor = try txn.openCursor();
-            defer cursor.close();
-            var row = try cursor.seekAtOrAfter(prefix);
-            while (row) |r| {
-                if (remaining == 0 or !std.mem.startsWith(u8, r.key, prefix) or r.key.len != notices_mod.outbox_index_key_len) break;
-                try doomed.append(a, try a.dupe(u8, r.key));
-                try doomed.append(a, try a.dupe(u8, r.key[prefix.len..]));
-                remaining -= 1;
-                row = try cursor.next();
+        for (command.acks) |raw| {
+            const ack = try parseAck(raw);
+            const entry = try by_identity.getOrPut(a, ack.identity_hex);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{};
+                const identity_bytes = try unhexAlloc(a, ack.identity_hex);
+                const prefix = try std.mem.concat(a, u8, &.{ &store.familyPrefix(notices_mod.outbox_index_family), identity_bytes });
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                var row = try cursor.seekAtOrAfter(prefix);
+                while (row) |r| {
+                    if (!std.mem.startsWith(u8, r.key, prefix)) break;
+                    if (r.key.len == notices_mod.outbox_index_key_len) try entry.value_ptr.keys.append(a, try a.dupe(u8, r.key));
+                    row = try cursor.next();
+                }
             }
+            const pending = entry.value_ptr;
+            const remaining = pending.keys.items.len - pending.retired;
+            if (remaining != ack.pending) continue;
+            const index_key = pending.keys.items[pending.retired];
+            pending.retired += 1;
+            try doomed.append(a, index_key);
+            try doomed.append(a, try a.dupe(u8, index_key[4 + 32 ..]));
         }
         for (doomed.items) |key| txn.delete(key) catch |err| {
             if (@as(anyerror, err) != error.NotFound) return err;
@@ -354,8 +405,17 @@ pub fn applyTxn(alloc: Allocator, txn: anytype, command: Command) !Outcome {
         const value = try std.json.Stringify.valueAlloc(a, rebuild, .{});
         try txn.put(key, value);
     }
+    // A short ring of recent receipts: a proposer that lost the race to a
+    // concurrent proposal (the deferred host and a worker interleave) still
+    // finds its own receipt behind the other one.
     const d = command.digest();
-    try txn.put(&last_applied_key, &d);
+    const previous: []const u8 = txn.get(&last_applied_key) catch |err| switch (@as(anyerror, err)) {
+        error.NotFound => "",
+        else => return err,
+    };
+    const kept = @min(previous.len - previous.len % 32, (applied_receipts - 1) * 32);
+    const ring = try std.mem.concat(a, u8, &.{ &d, previous[0..kept] });
+    try txn.put(&last_applied_key, ring);
     return .applied;
 }
 
@@ -381,10 +441,16 @@ pub fn decodeRebuildIntentAlloc(alloc: Allocator, value: []const u8) !struct { a
 
 /// Whether `command` was the last plan applied (read after the proposal
 /// committed on the leader).
+/// Receipts retained in the applied ring.
+pub const applied_receipts: usize = 64;
+
 pub fn wasApplied(alloc: Allocator, reader: store.Reader, command: Command) !bool {
     const value = (try reader.get(alloc, &last_applied_key)) orelse return false;
     defer alloc.free(value);
-    return std.mem.eql(u8, value, &command.digest());
+    const d = command.digest();
+    var i: usize = 0;
+    while (i + 32 <= value.len) : (i += 32) if (std.mem.eql(u8, value[i..][0..32], &d)) return true;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -545,7 +611,7 @@ test "outbox acknowledgements use replicated identity, one occurrence each" {
     const index = store.familyPrefix(notices_mod.outbox_index_family);
     // The leader delivered its first entry: one ack retires exactly one
     // occurrence on every replica, whatever its local sequence.
-    const ack = try ackDigestHexAlloc(alloc, leader_values[0]);
+    const ack = try ackAlloc(alloc, leader_values[0], 2);
     defer alloc.free(ack);
     for ([_]*store.MemoryStore{ &leader, &follower }) |s| {
         var txn = MemTxn{ .s = s };
@@ -556,11 +622,24 @@ test "outbox acknowledgements use replicated identity, one occurrence each" {
     // The earliest occurrence went first: the leader keeps its second entry.
     try testing.expect(memGet(&leader, &notices_mod.outboxKey(11, 0)) != null);
     try testing.expect(memGet(&follower, &notices_mod.outboxKey(9001, 0)) != null);
-    // The second ack drains both.
+    // A duplicate of the same acknowledgement (a retried proposal) retires
+    // nothing: the undelivered second entry survives on every replica.
     for ([_]*store.MemoryStore{ &leader, &follower }) |s| {
         var txn = MemTxn{ .s = s };
         _ = try applyTxn(alloc, &txn, .{ .acks = &.{ack} });
+        try testing.expectEqual(@as(usize, 1), s.countPrefix(&outbox));
+        try testing.expectEqual(@as(usize, 1), s.countPrefix(&index));
+    }
+    // The second entry's own acknowledgement drains both.
+    const second = try ackAlloc(alloc, leader_values[1], 1);
+    defer alloc.free(second);
+    for ([_]*store.MemoryStore{ &leader, &follower }) |s| {
+        var txn = MemTxn{ .s = s };
+        _ = try applyTxn(alloc, &txn, .{ .acks = &.{second} });
         try testing.expectEqual(@as(usize, 0), s.countPrefix(&outbox));
         try testing.expectEqual(@as(usize, 0), s.countPrefix(&index));
     }
+    // Acknowledgements must carry their observed pending count.
+    try testing.expectError(error.InvalidContextDependencyCommand, parseAck("ab"));
+    try testing.expectError(error.InvalidContextDependencyCommand, (Command{ .acks = &.{"0000000000000000000000000000000000000000000000000000000000000000"} }).validate());
 }

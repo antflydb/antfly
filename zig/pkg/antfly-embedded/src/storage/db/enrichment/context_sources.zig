@@ -4222,7 +4222,9 @@ pub const DeclaredEnrichment = struct {
 /// Reject a candidate whose generated inputs, followed across tables
 /// through context reads of `_artifacts.X` and upstream artifact streams,
 /// reach the candidate itself (a producer feedback loop).
-pub fn rejectCrossTableCycle(alloc: Allocator, declared: []const DeclaredEnrichment, owner_table_id: []const u8, candidate_name: []const u8, candidate_json: []const u8) !void {
+/// `candidate_source_artifact` is the candidate's own derived input (empty
+/// when none): a derived enrichment closes a loop through what it reads.
+pub fn rejectCrossTableCycle(alloc: Allocator, declared: []const DeclaredEnrichment, owner_table_id: []const u8, candidate_name: []const u8, candidate_json: []const u8, candidate_source_artifact: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -4241,6 +4243,7 @@ pub fn rejectCrossTableCycle(alloc: Allocator, declared: []const DeclaredEnrichm
         }
     };
     try Push.reads(a, &stack, owner_table_id, candidate_json);
+    if (candidate_source_artifact.len != 0) try stack.append(a, .{ .table = owner_table_id, .name = candidate_source_artifact });
     var steps: usize = 0;
     while (stack.pop()) |node| {
         steps += 1;
@@ -4254,6 +4257,32 @@ pub fn rejectCrossTableCycle(alloc: Allocator, declared: []const DeclaredEnrichm
             try Push.reads(a, &stack, node.table, d.context_sources_json);
         }
     }
+}
+
+/// `declared` without every declaration that lies on a generated-input cycle.
+/// Admission rejects cycles, but two concurrent declarations on different
+/// tables can each pass against a catalog without the other; maintenance
+/// never wires a cyclic declaration into a source's topology, so a loop that
+/// slipped through cannot drive a rebuild storm.
+pub fn acyclicDeclarationsAlloc(alloc: Allocator, declared: []const DeclaredEnrichment) ![]DeclaredEnrichment {
+    var out = std.ArrayListUnmanaged(DeclaredEnrichment).empty;
+    errdefer out.deinit(alloc);
+    for (declared, 0..) |d, i| {
+        if (d.context_sources_json.len != 0 or d.source_artifact.len != 0) {
+            var others = std.ArrayListUnmanaged(DeclaredEnrichment).empty;
+            defer others.deinit(alloc);
+            for (declared, 0..) |o, j| if (j != i) try others.append(alloc, o);
+            rejectCrossTableCycle(alloc, others.items, d.table_id, d.name, d.context_sources_json, d.source_artifact) catch |err| switch (err) {
+                error.ContextSourceFeedbackCycle => {
+                    std.log.warn("context declaration on a generated-input cycle ignored table={s} enrichment={s}", .{ d.table_id, d.name });
+                    continue;
+                },
+                else => return err,
+            };
+        }
+        try out.append(alloc, d);
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 /// Inbound declarations of `table_id`: other tables' enrichments whose live
@@ -4298,9 +4327,19 @@ test "cross-table generated-input cycles are rejected" {
     defer alloc.free(b_reads_a);
     const declared = [_]DeclaredEnrichment{.{ .table_id = "srv:2", .name = "beta", .context_sources_json = b_reads_a }};
     // alpha (table 1) reads beta (table 2), which reads alpha: rejected.
-    try testing.expectError(error.ContextSourceFeedbackCycle, rejectCrossTableCycle(alloc, &declared, "srv:1", "alpha", a_reads_b));
+    try testing.expectError(error.ContextSourceFeedbackCycle, rejectCrossTableCycle(alloc, &declared, "srv:1", "alpha", a_reads_b, ""));
     // Reading an upstream that does not depend on the candidate is fine.
-    try rejectCrossTableCycle(alloc, &declared, "srv:1", "gamma", a_reads_b);
+    try rejectCrossTableCycle(alloc, &declared, "srv:1", "gamma", a_reads_b, "");
+    // A derived enrichment with no sources of its own closes the loop
+    // through its source artifact.
+    const with_input = [_]DeclaredEnrichment{ declared[0], .{ .table_id = "srv:1", .name = "alpha_input", .context_sources_json = a_reads_b } };
+    try testing.expectError(error.ContextSourceFeedbackCycle, rejectCrossTableCycle(alloc, &with_input, "srv:1", "alpha", "", "alpha_input"));
+    // A loop two concurrent declarations formed is dropped from topology.
+    const looped = [_]DeclaredEnrichment{ declared[0], .{ .table_id = "srv:1", .name = "alpha", .context_sources_json = a_reads_b }, .{ .table_id = "srv:1", .name = "plain" } };
+    const acyclic = try acyclicDeclarationsAlloc(alloc, &looped);
+    defer alloc.free(acyclic);
+    try testing.expectEqual(@as(usize, 1), acyclic.len);
+    try testing.expectEqualStrings("plain", acyclic[0].name);
     const inbound = try inboundDeclarationsAlloc(alloc, &declared, "srv:1");
     defer alloc.free(inbound);
     try testing.expectEqual(@as(usize, 1), inbound.len);

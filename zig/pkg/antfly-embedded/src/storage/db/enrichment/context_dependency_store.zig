@@ -772,6 +772,9 @@ pub const Reader = struct {
     ptr: *anyopaque,
     get_fn: *const fn (ptr: *anyopaque, alloc: Allocator, key: []const u8) anyerror!?[]u8,
     scan_fn: *const fn (ptr: *anyopaque, lower: []const u8, upper: []const u8, visitor: Visitor) anyerror!void,
+    /// Size of the recorded read set when this reader records one (replicated
+    /// planning); null for plain readers.
+    reads_fn: ?*const fn (ptr: *anyopaque) usize = null,
 
     pub const Visitor = struct {
         ptr: *anyopaque,
@@ -780,6 +783,11 @@ pub const Reader = struct {
 
     pub fn get(self: Reader, alloc: Allocator, key: []const u8) !?[]u8 {
         return self.get_fn(self.ptr, alloc, key);
+    }
+
+    pub fn readCount(self: Reader) usize {
+        const f = self.reads_fn orelse return 0;
+        return f(self.ptr);
     }
 
     pub fn scan(self: Reader, lower: []const u8, upper: []const u8, visitor: Visitor) !void {
@@ -888,7 +896,9 @@ pub const Plan = struct {
     pub fn put(self: *Plan, key: []const u8, value: []const u8) !void {
         const k = try self.alloc.dupe(u8, key);
         errdefer self.alloc.free(k);
-        try self.putOwned(k, try self.alloc.dupe(u8, value));
+        const v = try self.alloc.dupe(u8, value);
+        errdefer self.alloc.free(v);
+        try self.putOwned(k, v);
     }
 
     pub fn deleteOwned(self: *Plan, key: []u8) !void {
@@ -1380,6 +1390,9 @@ pub const InvalidatePage = struct {
     targets: std.ArrayListUnmanaged(Invalidated) = .empty,
     /// Non-null when the page budget stopped the scan; pass as `resume_after`.
     resume_after: ?[]u8 = null,
+    /// Subscription hints examined (each costs at most a state read and one
+    /// effect), counted against the caller's page budget.
+    visited: usize = 0,
 
     pub fn deinit(self: *InvalidatePage, alloc: Allocator) void {
         for (self.targets.items) |t| {
@@ -1456,6 +1469,7 @@ fn planInvalidateRange(
     try reader.scan(lower, upper, .{ .ptr = &collect, .visit_fn = Collect.visit });
     const more = hints.items.len > options.max_targets;
     const visible = if (more) hints.items[0..options.max_targets] else hints.items;
+    page.visited = visible.len;
 
     for (visible, values.items[0..visible.len]) |hint_key, hint_value| {
         var hint = (try parseSubscriptionKeyAlloc(alloc, hint_key)) orelse {
@@ -1611,7 +1625,11 @@ pub fn queryImpact(
         limit: usize,
         fn visit(p: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
             const self: *@This() = @ptrCast(@alignCast(p));
-            try self.keys.append(self.alloc, try self.alloc.dupe(u8, key));
+            const owned = try self.alloc.dupe(u8, key);
+            self.keys.append(self.alloc, owned) catch |err| {
+                self.alloc.free(owned);
+                return err;
+            };
             return self.keys.items.len <= self.limit;
         }
     };
@@ -1678,7 +1696,11 @@ pub fn liveDependentsAlloc(alloc: Allocator, reader: Reader, spec: Digest, tuple
         limit: usize,
         fn visit(p: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
             const self: *@This() = @ptrCast(@alignCast(p));
-            try self.keys.append(self.alloc, try self.alloc.dupe(u8, key));
+            const owned = try self.alloc.dupe(u8, key);
+            self.keys.append(self.alloc, owned) catch |err| {
+                self.alloc.free(owned);
+                return err;
+            };
             return self.keys.items.len < self.limit;
         }
     };
@@ -1788,7 +1810,11 @@ pub fn planDrainDebounced(alloc: Allocator, reader: Reader, plan: *Plan, now_ms:
         limit: usize,
         fn visit(p: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
             const self: *@This() = @ptrCast(@alignCast(p));
-            try self.keys.append(self.alloc, try self.alloc.dupe(u8, key));
+            const owned = try self.alloc.dupe(u8, key);
+            self.keys.append(self.alloc, owned) catch |err| {
+                self.alloc.free(owned);
+                return err;
+            };
             return self.keys.items.len < self.limit;
         }
     };
@@ -1805,7 +1831,10 @@ pub fn planDrainDebounced(alloc: Allocator, reader: Reader, plan: *Plan, now_ms:
             entry.deinit(alloc);
             continue;
         }
-        try out.append(alloc, .{ .artifact = entry.artifact, .doc_key = entry.doc_key });
+        out.append(alloc, .{ .artifact = entry.artifact, .doc_key = entry.doc_key }) catch |err| {
+            entry.deinit(alloc);
+            return err;
+        };
     }
     return try out.toOwnedSlice(alloc);
 }

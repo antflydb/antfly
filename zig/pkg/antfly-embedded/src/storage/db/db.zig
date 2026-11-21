@@ -220,10 +220,15 @@ fn copyContextDependencyHints(alloc: Allocator, source: *docstore_mod.DocStore, 
 /// source keeps and delivers its own outbox, so a physically copied outbox
 /// is dropped here rather than delivered twice.
 fn copyContextSplitState(alloc: Allocator, source: *docstore_mod.DocStore, dest: *docstore_mod.DocStore) !void {
+    // Unjournaled rebuild intents are keyed by digest, not document, so all
+    // of them travel: a rebuild of a document outside the destination's
+    // range finds nothing to rebuild there.
+    const rebuild_intents = context_dependency_store.familyPrefix(@import("enrichment/context_dependency_command.zig").rebuild_family);
     const prefixes = [_][]const u8{
         "\x00\x00__metadata__:context_dependency:host",
         context_dependency_db.shadows_complete_key,
         context_dependency_db.pending_prefix,
+        &rebuild_intents,
     };
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer writes.deinit(alloc);
@@ -10659,6 +10664,10 @@ pub const DB = struct {
         }
         try self.setContextDependencyHost(config.table_id, config.inbound, reader, config.dispatcher);
         self.setContextReplication(config.replication);
+        // Recover rebuilds a local plan committed as intents before a crash.
+        if (!openModeRequiresReadOnlyBackends(self.open_mode)) self.drainContextRebuildIntents() catch |err| {
+            std.log.warn("context rebuild intent recovery deferred: {s}", .{@errorName(err)});
+        };
     }
 
     const ContextTopology = struct { table_id: []const u8, inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig };
@@ -10909,14 +10918,22 @@ pub const DB = struct {
             }
             var summary = context_dependency_db.ApplySummary{ .rebuild_refs = try refs.toOwnedSlice(self.alloc) };
             defer summary.deinit(self.alloc);
-            try self.journalContextRebuilds(&summary);
+            try self.journalContextRebuildRefs(&summary);
             try self.core.store.putBatch(&.{}, collect.keys.items);
             if (collect.keys.items.len < 1024) break;
         }
         self.context_rebuild_intents_pending.store(false, .release);
     }
 
+    /// Journal the rebuilds a local plan decided on. The plan committed them
+    /// as durable intents, so journaling goes through the intent drain (which
+    /// retires each intent only after its journal record landed).
     fn journalContextRebuilds(self: *DB, summary: *context_dependency_db.ApplySummary) !void {
+        if (summary.rebuild_refs.len == 0) return;
+        return self.drainContextRebuildIntents();
+    }
+
+    fn journalContextRebuildRefs(self: *DB, summary: *context_dependency_db.ApplySummary) !void {
         if (summary.rebuild_refs.len == 0) return;
         var pending = derived_types.DerivedBatch{ .generated_enrichment_refs = summary.rebuild_refs };
         summary.rebuild_refs = &.{};
@@ -10945,7 +10962,18 @@ pub const DB = struct {
         // another group, so every notice goes through the dispatcher (which
         // delivers to every group of the dependent table, this one included).
         const replicated = self.core.index_manager.context_replication != null;
-        for (entries) |entry| {
+        var ack_tokens: [][]const u8 = &.{};
+        defer {
+            for (ack_tokens) |t| self.alloc.free(t);
+            self.alloc.free(ack_tokens);
+        }
+        if (replicated) {
+            const values = try self.alloc.alloc([]const u8, entries.len);
+            defer self.alloc.free(values);
+            for (entries, values) |entry, *v| v.* = entry.value;
+            ack_tokens = try context_dependency_db.ackTokensAlloc(self.alloc, self.core.store, values);
+        }
+        for (entries, 0..) |entry, entry_index| {
             if (!replicated and try context_dependency_db.isLocalNotice(self.alloc, entry.value, self.context_source_table_id)) {
                 try local.append(self.alloc, entry.value);
                 continue;
@@ -10958,7 +10986,7 @@ pub const DB = struct {
             defer self.alloc.free(dependent);
             if (context_dependency_db.active_collector) |collector| {
                 // Deferred: the host delivers, then acknowledges by content.
-                try collector.addDelivery(dependent, entry.value);
+                try collector.addDelivery(dependent, entry.value, ack_tokens[entry_index]);
                 result.delivered += 1;
                 continue;
             }
@@ -10984,11 +11012,14 @@ pub const DB = struct {
         }
         var done_values = std.ArrayListUnmanaged([]const u8).empty;
         defer done_values.deinit(self.alloc);
-        for (done.items) |key| for (entries) |entry| if (entry.key.ptr == key.ptr) {
+        var done_acks = std.ArrayListUnmanaged([]const u8).empty;
+        defer done_acks.deinit(self.alloc);
+        for (done.items) |key| for (entries, 0..) |entry, entry_index| if (entry.key.ptr == key.ptr) {
             try done_values.append(self.alloc, entry.value);
+            if (ack_tokens.len != 0) try done_acks.append(self.alloc, ack_tokens[entry_index]);
             break;
         };
-        try context_dependency_db.ackOutbox(self.alloc, self.core.store, self.core.index_manager, done.items, done_values.items);
+        try context_dependency_db.ackOutbox(self.alloc, self.core.store, self.core.index_manager, done.items, done_values.items, done_acks.items);
         return result;
     }
 
@@ -10999,7 +11030,7 @@ pub const DB = struct {
 
     /// One bounded reconcile page while generated-record markers remain.
     pub fn advanceContextReconcile(self: *DB, page_rows: u32) !bool {
-        if (!try context_dependency_db.hasGeneratedPending(self.alloc, self.core.store)) return true;
+        if (try context_dependency_db.settleReconciledMarkers(self.alloc, self.core.store)) return true;
         const cursor = try context_dependency_db.reconcileCursorAlloc(self.alloc, self.core.store);
         defer if (cursor) |value| self.alloc.free(value);
         const Collect = struct {
@@ -11028,15 +11059,30 @@ pub const DB = struct {
             error.Canceled => {},
             else => return err,
         };
-        const done = collect.rows.items.len < collect.limit;
-        try context_dependency_db.reconcilePage(self.alloc, self.core.store, self.core.index_manager, self.core.nextDerivedSequence(), collect.rows.items, done);
-        return done;
+        // A replicated page is one bounded command; retry a shorter prefix
+        // when the read set or effects do not fit.
+        var rows = collect.rows.items;
+        while (true) {
+            const done = rows.len == collect.rows.items.len and rows.len < collect.limit;
+            context_dependency_db.reconcilePage(self.alloc, self.core.store, self.core.index_manager, self.core.nextDerivedSequence(), rows, done) catch |err| switch (err) {
+                error.ContextBudgetExceeded => {
+                    if (rows.len <= 1) return err;
+                    rows = rows[0 .. rows.len / 2];
+                    continue;
+                },
+                else => return err,
+            };
+            return done;
+        }
     }
 
     fn drainContextNoticeOutboxBestEffort(self: *DB) void {
         // Replicated owners drain from the host's leader maintenance pass,
         // never from a commit (which may be the apply path).
         if (self.core.index_manager.context_replication != null) return;
+        if (self.context_rebuild_intents_pending.load(.acquire)) self.drainContextRebuildIntents() catch |err| {
+            std.log.warn("context rebuild intent recovery deferred: {s}", .{@errorName(err)});
+        };
         if (!self.core.index_manager.hasContextDependents()) return;
         _ = self.advanceContextReconcile(256) catch |err| blk: {
             std.log.warn("context reconcile deferred: {s}", .{@errorName(err)});
@@ -11112,13 +11158,23 @@ pub const DB = struct {
             else => return err,
         };
         const replicated = self.core.index_manager.context_replication != null;
-        const next_cursor: ?[]const u8 = if (collect.rows.items.len < collect.limit or collect.rows.items.len == 0) null else collect.rows.items[collect.rows.items.len - 1].key;
-        _ = try context_dependency_db.backfillShadowPageWithCursor(self.alloc, self.core.store, self.core.index_manager, collect.rows.items, if (replicated) context_shadow_cursor_key else null, if (replicated) next_cursor else null);
-        if (collect.rows.items.len < collect.limit) {
-            try context_dependency_db.markShadowsComplete(self.alloc, self.core.store, self.core.index_manager);
-            return .{ .done = true, .next_key = null };
+        // A replicated page is one bounded command; a page whose read set or
+        // effects do not fit is retried on a shorter prefix of its rows.
+        var rows = collect.rows.items;
+        while (true) {
+            const done = rows.len == collect.rows.items.len and rows.len < collect.limit;
+            const next_cursor: ?[]const u8 = if (done or rows.len == 0) null else rows[rows.len - 1].key;
+            _ = context_dependency_db.backfillShadowPageWithCursor(self.alloc, self.core.store, self.core.index_manager, rows, if (replicated) context_shadow_cursor_key else null, if (replicated) next_cursor else null, done) catch |err| switch (err) {
+                error.ContextBudgetExceeded => {
+                    if (rows.len <= 1) return err;
+                    rows = rows[0 .. rows.len / 2];
+                    continue;
+                },
+                else => return err,
+            };
+            if (done) return .{ .done = true, .next_key = null };
+            return .{ .done = false, .next_key = try self.alloc.dupe(u8, rows[rows.len - 1].key) };
         }
-        return .{ .done = false, .next_key = try self.alloc.dupe(u8, collect.rows.items[collect.rows.items.len - 1].key) };
     }
 
     /// Authoritative dependency state of one dependent artifact.
@@ -159835,7 +159891,7 @@ fn contextTestDeferredMaintenance(db: *DB, alloc: Allocator, pair: *ContextRepli
         }
         for (collector.deliveries.items) |d| {
             try deliver.deliverNotice(alloc, d.dependent, d.notice);
-            try acks.append(alloc, try command_mod.ackDigestHexAlloc(alloc, d.notice));
+            try acks.append(alloc, try alloc.dupe(u8, d.ack));
         }
         if (acks.items.len != 0) try pair.apply(.{ .context_dependency = .{ .acks = acks.items } });
         if (!more and collector.isEmpty()) return rebuilds;
@@ -161237,7 +161293,7 @@ test "db replicated inbox apply splits high fan-out notices across bounded comma
                 for (acks.items) |digest| alloc.free(digest);
                 acks.deinit(alloc);
             }
-            for (collector.deliveries.items) |d| try acks.append(alloc, try command_mod.ackDigestHexAlloc(alloc, d.notice));
+            for (collector.deliveries.items) |d| try acks.append(alloc, try alloc.dupe(u8, d.ack));
             try pair.apply(.{ .context_dependency = .{ .acks = acks.items } });
         }
         if (!more and collector.isEmpty() and !leader.contextInboxPending()) break;
