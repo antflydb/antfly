@@ -55,6 +55,7 @@ pub const ValidatedArtifact = struct {
     canonical_path: []u8,
     size: u64,
     sha256: ?[]const u8,
+    needs_binding_check: bool = false,
 };
 
 pub const ValidatedReceipt = struct {
@@ -329,6 +330,7 @@ fn loadValidatedSource(
     source: ReceiptSource,
     control: ExecutionControl,
     damaged: ?*?DamagedReceipt,
+    selected_members: bool,
 ) !?ValidatedReceipt {
     try control.check();
     const cwd = std.Io.Dir.cwd();
@@ -400,6 +402,12 @@ fn loadValidatedSource(
         return error.InvalidManagedDownload;
     }
 
+    // Legacy aliases may inherit their checksum from a physical sibling.
+    // Only a complete declaration can defer live checks to selected members.
+    const selective = selected_members and for (parsed.value.artifacts) |artifact| {
+        if (artifact.sha256 == null) break false;
+    } else true;
+
     const canonical_root = realPathAlloc(allocator, io, dest_dir) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => {
             artifact_damaged = true;
@@ -430,29 +438,36 @@ fn loadValidatedSource(
         const entry = path_index.getOrPutAssumeCapacity(artifact.path);
         if (entry.found_existing) return error.InvalidManagedDownload;
         entry.value_ptr.* = index;
+        if (!artifactPathIsSafe(artifact.path)) return error.InvalidManagedDownload;
+        var needs_binding_check = false;
         const canonical_path = resolveContainedArtifactFromCanonicalRoot(
             allocator,
             io,
             canonical_root,
             artifact.path,
         ) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir, error.InvalidModelArtifactPath => {
+            error.FileNotFound, error.NotDir => if (selective) missing: {
+                needs_binding_check = true;
+                break :missing try std.fs.path.join(allocator, &.{ canonical_root, artifact.path });
+            } else {
                 artifact_damaged = true;
                 return error.InvalidManagedDownload;
             },
             else => return err,
         };
         errdefer allocator.free(canonical_path);
-        const stat = cwd.statFile(io, canonical_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => {
+        if (!selective) {
+            const stat = cwd.statFile(io, canonical_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => {
+                    artifact_damaged = true;
+                    return error.InvalidManagedDownload;
+                },
+                else => return err,
+            };
+            if (stat.kind != .file or stat.size != artifact.size) {
                 artifact_damaged = true;
                 return error.InvalidManagedDownload;
-            },
-            else => return err,
-        };
-        if (stat.kind != .file or stat.size != artifact.size) {
-            artifact_damaged = true;
-            return error.InvalidManagedDownload;
+            }
         }
         const canonical = canonical_groups.getOrPutAssumeCapacity(canonical_path);
         if (canonical.found_existing) {
@@ -469,6 +484,7 @@ fn loadValidatedSource(
             .canonical_path = canonical_path,
             .size = artifact.size,
             .sha256 = artifact.sha256,
+            .needs_binding_check = needs_binding_check,
         };
         initialized += 1;
         if (std.mem.endsWith(u8, artifact.path, ".gguf") or
@@ -524,7 +540,18 @@ pub fn loadValidatedWithControl(
     dest_dir: []const u8,
     control: ExecutionControl,
 ) !?ValidatedReceipt {
-    return loadValidatedSource(allocator, io, dest_dir, .completion, control, null);
+    return loadValidatedSource(allocator, io, dest_dir, .completion, control, null, false);
+}
+
+/// Load the immutable publication declaration for a pinned operation.
+/// Callers verify the live binding, size and checksum of selected members.
+pub fn loadForSelectedArtifacts(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    control: ExecutionControl,
+) !?ValidatedReceipt {
+    return loadValidatedSource(allocator, io, dest_dir, .completion, control, null, true);
 }
 
 pub fn loadValidatedForInventory(
@@ -534,7 +561,7 @@ pub fn loadValidatedForInventory(
     control: ExecutionControl,
     damaged: *?DamagedReceipt,
 ) !?ValidatedReceipt {
-    return loadValidatedSource(allocator, io, dest_dir, .completion, control, damaged);
+    return loadValidatedSource(allocator, io, dest_dir, .completion, control, damaged, false);
 }
 
 /// Load the validated artifact plan of a private staging transaction. This is
@@ -545,7 +572,7 @@ pub fn loadValidatedPlan(
     io: std.Io,
     dest_dir: []const u8,
 ) !ValidatedReceipt {
-    return (try loadValidatedSource(allocator, io, dest_dir, .plan, .{}, null)) orelse
+    return (try loadValidatedSource(allocator, io, dest_dir, .plan, .{}, null, false)) orelse
         error.IncompleteManagedDownload;
 }
 

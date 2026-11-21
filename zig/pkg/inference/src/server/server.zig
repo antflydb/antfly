@@ -2121,7 +2121,7 @@ fn pinnedEmbeddingPreflightFailure(ctx: *httpx.Context, revision: ?[32]u8, err: 
 
 fn isPinnedCatalogArtifactFailure(err: anyerror) bool {
     return switch (err) {
-        error.InvalidManagedDownload, error.ChecksumMismatch, error.ModelArtifactNotPublished => true,
+        error.InvalidManagedDownload, error.ChecksumMismatch, error.ModelArtifactNotPublished, error.FileNotFound, error.NotDir, error.CatalogArtifactUnavailable => true,
         else => false,
     };
 }
@@ -27252,6 +27252,9 @@ pub const Node = struct {
                             if (manifest_mod.isListingCandidateRejection(err)) break :candidate .{ .rejected = err };
                             return err;
                         };
+                        const verification_cache = &self.model_manager.verified_artifacts;
+                        if (captured.artifacts.hasKnownChecksumRejections(verification_cache))
+                            captured.artifacts.verification_cache = verification_cache;
                         // Let execution resolve a repaired selector immediately,
                         // even when in-place repair leaves the receipt unchanged.
                         if (entry.installation_selection.damaged) if (borrowed) |lease| lease.invalidateIfCurrent();
@@ -51291,10 +51294,10 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool) !void {
     try tmp.dir.createDirPath(io, path ++ "/parts");
     const dir = try tmp.dir.openDir(io, path, .{});
     defer dir.close(io);
-    // ModelProto.graph.initializer.external_data stores a missing location.
-    const graph = "\x3a\x1d\x2a\x1b\x6a\x17\x0a\x08location\x12\x0bmissing.bin\x70\x01";
+    // The external tensor points beyond the end of a valid receipt member.
+    const graph = "\x3a\x2c\x2a\x2a\x6a\x17\x0a\x08location\x12\x0btensors.bin\x6a\x0d\x0a\x06offset\x12\x03999\x70\x01";
     const native_files = .{ .{ "config.json", config }, .{ index_path, index }, .{ shard_path, weights } };
-    const files = if (with_onnx) native_files ++ .{.{ "model.onnx", graph }} else native_files;
+    const files = if (with_onnx) native_files ++ .{ .{ "model.onnx", graph }, .{ "tensors.bin", "tensor data" } } else native_files;
     var entries: [files.len]managed.ArtifactReceipt = undefined;
     var sums: [files.len][64]u8 = undefined;
     inline for (files, 0..) |file, i| {
@@ -51356,6 +51359,36 @@ fn testScopedShardedDiscovery(comptime with_onnx: bool) !void {
         try std.testing.expectEqual(@as(usize, 1), candidates.len);
         try std.testing.expect(candidates.contains(@splat(2)));
         try std.testing.expect(rejected.contains(@splat(1)));
+        publication.borrow.invalidate();
+        try dir.deleteFile(io, "model.onnx");
+        node.selector_cache.?.invalidate(io);
+        var cold_ctx = httpx.Context.init(a, io, &request);
+        defer cold_ctx.deinit();
+        var cold = try node.listModels(&cold_ctx);
+        defer cold.deinit();
+        try std.testing.expectEqual(@as(u16, 200), cold.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, cold.body.?, .{});
+        defer parsed.deinit();
+        const model = parsed.value.object.get("embedders").?.object.get("acme/sharded").?;
+        try std.testing.expect(model.object.get("model_revision_pinning").?.bool);
+        var preparation = model_manager_mod.PreparedPinnedEmbedding{ .manager = &node.model_manager };
+        defer preparation.deinit();
+        var pinned = PinnedRequestSelection{ .node = &node, .proof = &preparation, .control = control };
+        const selection = try node.resolveRequestModelSelectionWithOptions(a, io, "acme/sharded:safetensors", "embedders", .{ .pinned = &pinned });
+        defer a.free(selection.path);
+        try std.testing.expectEqual(model_publication, selection.publication);
+        try std.testing.expectEqualStrings(model_dir, selection.path);
+
+        // Record an optional graph checksum failure through a strict load.
+        // Native discovery still authenticates its own selected members.
+        const corrupt: [graph.len]u8 = @splat('x');
+        try dir.writeFile(io, .{ .sub_path = "model.onnx", .data = &corrupt });
+        try std.testing.expectError(error.ChecksumMismatch, node.model_manager.modelIdentityForManifestWithControl(model_dir, manifest.*, control));
+        var known_bad_ctx = httpx.Context.init(a, io, &request);
+        defer known_bad_ctx.deinit();
+        var known_bad = try node.listModels(&known_bad_ctx);
+        defer known_bad.deinit();
+        try std.testing.expectEqual(@as(u16, 200), known_bad.status.code);
     }
 
     // An in-place write to a nested shard leaves the model root and completion

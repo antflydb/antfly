@@ -483,7 +483,13 @@ pub const Cache = struct {
             const lease = try self.acquire(io, root, retried_catalog, control);
             defer lease.release();
             const inventory = lease.inventory();
-            const index = if (task) |scope| try inventory.lookupIndex(requested, scope) else null;
+            const index = if (task) |scope| scoped: {
+                if (try inventory.lookupIndex(requested, scope)) |valid| break :scoped valid;
+                if (resident) |candidate| {
+                    if (candidate.prepare != null) break :scoped try inventory.lookupDamagedIndex(requested, scope);
+                }
+                break :scoped null;
+            } else null;
             const path = if (index) |i| inventory.discovered[i].path else if (task == null) try inventory.lookup(requested, null) else null;
             const selected = path orelse {
                 if (!std.meta.eql(lease.slot.inventory.generation, try catalog_publication.read(allocator, io, root))) return error.ModelArtifactsChanging;

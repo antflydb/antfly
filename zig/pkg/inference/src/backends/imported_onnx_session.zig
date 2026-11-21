@@ -927,21 +927,10 @@ pub fn inspectArtifactSetWithControl(allocator: std.mem.Allocator, onnx_path: []
             allocator.free(full_path);
             return err;
         };
-        const offset: u64 = @intCast(external.offset);
-        if (offset > file_size) {
+        external.validateRange(file_size) catch |err| {
             allocator.free(full_path);
-            return error.ExternalRegionOutOfBounds;
-        }
-        if (external.length >= 0) {
-            const end = std.math.add(u64, offset, @as(u64, @intCast(external.length))) catch {
-                allocator.free(full_path);
-                return error.ExternalRegionOutOfBounds;
-            };
-            if (end > file_size) {
-                allocator.free(full_path);
-                return error.ExternalRegionOutOfBounds;
-            }
-        }
+            return err;
+        };
 
         if (duplicate) {
             allocator.free(full_path);

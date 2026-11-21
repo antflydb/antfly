@@ -132,7 +132,8 @@ pub const Cache = struct {
 
             fn reject(self: *PrimaryCache, io: std.Io, err: anyerror) !bool {
                 switch (err) {
-                    error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+                    error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled, error.ModelArtifactsChanging => return err,
+                    error.ChecksumMismatch, error.CatalogArtifactUnavailable => return false,
                     else => {},
                 }
                 self.retry_at = .{ .nanoseconds = std.Io.Timestamp.now(io, .awake).nanoseconds + dependency_retry_ns };
@@ -240,16 +241,26 @@ pub const Cache = struct {
             try add(members, a, artifacts, logical);
             var mapped = try c_file.MmapRegion.init(artifacts.allocator, graph);
             defer mapped.deinit();
-            var tensors = dependencies.onnxWithControl(artifacts.allocator, logical, mapped.data, control) catch |err| switch (err) {
-                error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+            const MemberReader = struct {
+                members: *Members,
+                allocator: std.mem.Allocator,
+                artifacts: *const PublishedArtifacts,
+
+                fn size(raw: *anyopaque, path: []const u8) !u64 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try add(self.members, self.allocator, self.artifacts, path);
+                    return self.members.get(path).?.size;
+                }
+            };
+            var reader: MemberReader = .{ .members = members, .allocator = a, .artifacts = artifacts };
+            var tensors = dependencies.onnxWithMemberSizes(artifacts.allocator, logical, mapped.data, control, .{
+                .context = &reader,
+                .size = MemberReader.size,
+            }) catch |err| switch (err) {
+                error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled, error.ChecksumMismatch, error.ModelArtifactsChanging, error.CatalogArtifactUnavailable => return err,
                 else => return error.InvalidManagedDownload,
             };
-            defer tensors.deinit();
-            var it = tensors.items.keyIterator();
-            while (it.next()) |tensor| {
-                try control.check();
-                try add(members, a, artifacts, tensor.*);
-            }
+            tensors.deinit();
         }
 
         fn validate(members: []const Member, artifacts: *const PublishedArtifacts, control: ExecutionControl) !void {
@@ -319,7 +330,7 @@ pub const Cache = struct {
             if (snapshot.inspection.load(.acquire)) |cached| {
                 if (std.mem.eql(backends.BackendType, backend_order, cached.backend_order)) {
                     Inspection.validate(cached.members, artifacts, control) catch |err| {
-                        if (err == error.ModelArtifactsChanging or err == error.InvalidManagedDownload) self.invalidate();
+                        if (err == error.ModelArtifactsChanging or err == error.InvalidManagedDownload or err == error.ChecksumMismatch or err == error.CatalogArtifactUnavailable) self.invalidate();
                         return err;
                     };
                     return cached.summary;
@@ -330,7 +341,7 @@ pub const Cache = struct {
             if (snapshot.inspection.load(.acquire)) |cached| {
                 if (std.mem.eql(backends.BackendType, backend_order, cached.backend_order)) {
                     Inspection.validate(cached.members, artifacts, control) catch |err| {
-                        if (err == error.ModelArtifactsChanging or err == error.InvalidManagedDownload) self.invalidate();
+                        if (err == error.ModelArtifactsChanging or err == error.InvalidManagedDownload or err == error.ChecksumMismatch or err == error.CatalogArtifactUnavailable) self.invalidate();
                         return err;
                     };
                     return cached.summary;
@@ -427,7 +438,7 @@ pub const Cache = struct {
 
         const owned_path = try owner.dupe(u8, path);
         errdefer owner.free(owned_path);
-        var artifacts = try PublishedArtifacts.initWithControl(owner, io, owned_path, .{ .publication = publication }, control);
+        var artifacts = try PublishedArtifacts.initForSelectedArtifacts(owner, io, owned_path, .{ .publication = publication }, control);
         errdefer artifacts.deinit();
         const snapshot = try owner.create(Snapshot);
         snapshot.* = .{ .artifacts = artifacts, .root_stamp = stamp, .checked_at = std.Io.Timestamp.now(io, .awake) };

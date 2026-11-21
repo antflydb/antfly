@@ -17,6 +17,7 @@
 const std = @import("std");
 const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const wire = @import("protobuf").wire;
+const ExternalDataInfo = @import("onnx_data").proto.ExternalDataInfo;
 const receipt = @import("managed_receipt.zig");
 
 pub const Paths = struct {
@@ -29,7 +30,7 @@ pub const Paths = struct {
         self.items.deinit(self.allocator);
     }
 
-    fn add(self: *Paths, parent: []const u8, relative: []const u8) !void {
+    fn add(self: *Paths, parent: []const u8, relative: []const u8) ![]const u8 {
         if (!receipt.artifactPathIsSafe(relative)) return error.InvalidModelArtifactPath;
         const directory = std.fs.path.dirname(parent);
         const path = if (directory) |dir|
@@ -37,9 +38,13 @@ pub const Paths = struct {
         else
             try self.allocator.dupe(u8, relative);
         errdefer self.allocator.free(path);
+        if (self.items.getKey(path)) |existing| {
+            self.allocator.free(path);
+            return existing;
+        }
         if (self.items.count() >= receipt.max_artifact_count) return error.TooManyArtifactDependencies;
-        const entry = try self.items.getOrPut(self.allocator, path);
-        if (entry.found_existing) self.allocator.free(path);
+        try self.items.putNoClobber(self.allocator, path, {});
+        return path;
     }
 };
 
@@ -59,7 +64,7 @@ pub fn safetensorsWithControl(allocator: std.mem.Allocator, filename: []const u8
     for (weights.object.values()) |value| {
         try control.check();
         if (value != .string) return error.InvalidSafetensorsIndex;
-        try paths.add(filename, value.string);
+        _ = try paths.add(filename, value.string);
     }
     return paths;
 }
@@ -116,7 +121,7 @@ fn readBytes(bytes: []const u8, pos: *usize) ![]const u8 {
     return result;
 }
 
-fn externalLocation(bytes: []const u8) !?[]const u8 {
+fn parseExternalEntry(info: *ExternalDataInfo, bytes: []const u8) !bool {
     var pos: usize = 0;
     var key: []const u8 = "";
     var value: []const u8 = "";
@@ -128,26 +133,43 @@ fn externalLocation(bytes: []const u8) !?[]const u8 {
             if (tag.field == 2) value = text;
         } else try wire.skipField(bytes, &pos, tag.wire_type);
     }
-    return if (std.mem.eql(u8, key, "location")) value else null;
+    info.apply(key, value);
+    return std.mem.eql(u8, key, "location");
 }
 
-fn visit(paths: *Paths, filename: []const u8, bytes: []const u8, kind: Message, depth: usize, control: ExecutionControl) anyerror!void {
+pub const ExternalMemberSize = struct {
+    context: *anyopaque,
+    size: *const fn (*anyopaque, []const u8) anyerror!u64,
+};
+
+fn visit(paths: *Paths, filename: []const u8, bytes: []const u8, kind: Message, depth: usize, control: ExecutionControl, sizes: ?ExternalMemberSize) anyerror!void {
     if (depth > 64) return error.OnnxGraphNestingTooDeep;
     var pos: usize = 0;
+    var external_location = false;
+    var has_location = false;
+    var info: ExternalDataInfo = .{};
     while (pos < bytes.len) {
         try control.check();
         const tag = try wire.readTag(bytes, &pos);
         if (tag.field == 0) return error.InvalidOnnxModel;
+        if (kind == .tensor and tag.field == 14 and tag.wire_type == .varint) {
+            external_location = (try wire.readVarint(bytes, &pos)) == 1;
+            continue;
+        }
         if (tag.wire_type != .length_delimited) {
             try wire.skipField(bytes, &pos, tag.wire_type);
             continue;
         }
         const payload = try readBytes(bytes, &pos);
         if (kind == .tensor and tag.field == 13) {
-            if (try externalLocation(payload)) |location| try paths.add(filename, location);
+            has_location = (try parseExternalEntry(&info, payload)) or has_location;
         } else if (childMessage(kind, tag.field)) |child| {
-            try visit(paths, filename, payload, child, depth + 1, control);
+            try visit(paths, filename, payload, child, depth + 1, control, sizes);
         }
+    }
+    if (external_location or has_location) {
+        const path = try paths.add(filename, info.location);
+        if (sizes) |members| try info.validateRange(try members.size(members.context, path));
     }
 }
 
@@ -156,9 +178,13 @@ pub fn onnx(allocator: std.mem.Allocator, filename: []const u8, bytes: []const u
 }
 
 pub fn onnxWithControl(allocator: std.mem.Allocator, filename: []const u8, bytes: []const u8, control: ExecutionControl) !Paths {
+    return onnxWithMemberSizes(allocator, filename, bytes, control, null);
+}
+
+pub fn onnxWithMemberSizes(allocator: std.mem.Allocator, filename: []const u8, bytes: []const u8, control: ExecutionControl, sizes: ?ExternalMemberSize) !Paths {
     var paths: Paths = .{ .allocator = allocator };
     errdefer paths.deinit();
-    try visit(&paths, filename, bytes, .model, 0, control);
+    try visit(&paths, filename, bytes, .model, 0, control, sizes);
     return paths;
 }
 

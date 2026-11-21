@@ -186,6 +186,14 @@ pub const PublishedArtifacts = struct {
     }
 
     pub fn initWithControl(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected, control: ExecutionControl) !PublishedArtifacts {
+        return initWithValidation(a, io, root, expected, control, false);
+    }
+
+    pub fn initForSelectedArtifacts(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected, control: ExecutionControl) !PublishedArtifacts {
+        return initWithValidation(a, io, root, expected, control, true);
+    }
+
+    fn initWithValidation(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected, control: ExecutionControl, selected_members: bool) !PublishedArtifacts {
         try control.check();
         const direct = managed.isDirectModelPath(root);
         const publication_root = try managed.publicationRootAlloc(a, io, root);
@@ -216,7 +224,10 @@ pub const PublishedArtifacts = struct {
             };
             break :stamp managed.ArtifactStamp.fromStat(stat);
         } else null;
-        var receipt = if (standalone) null else try managed.loadValidatedWithControl(a, io, physical_root, control);
+        var receipt = if (standalone) null else if (selected_members)
+            try managed.loadForSelectedArtifacts(a, io, physical_root, control)
+        else
+            try managed.loadValidatedWithControl(a, io, physical_root, control);
         errdefer if (receipt) |*value| value.deinit();
         const publication = if (receipt) |value| value.publication_generation else null;
         const verification_scope = if (publication) |generation| scope: {
@@ -381,17 +392,28 @@ pub const PublishedArtifacts = struct {
         if (!std.mem.eql(u8, path, logical) and !std.mem.eql(u8, path, artifact.canonical_path))
             try self.verifyBinding(path, artifact.canonical_path);
         const canonical = managed.resolveRegularFilePath(self.allocator, self.io, logical) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => return error.InvalidManagedDownload,
+            error.FileNotFound, error.NotDir, error.InvalidModelArtifactKind => return error.CatalogArtifactUnavailable,
             else => return err,
         };
         defer self.allocator.free(canonical);
         if (!std.mem.eql(u8, canonical, artifact.canonical_path)) return error.ModelArtifactsChanging;
         const stat = std.Io.Dir.cwd().statFile(self.io, canonical, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => return error.InvalidManagedDownload,
+            error.FileNotFound, error.NotDir => return error.CatalogArtifactUnavailable,
             else => return err,
         };
-        if (stat.kind != .file or stat.size != artifact.size) return error.InvalidManagedDownload;
-        return managed.ArtifactStamp.fromStat(stat);
+        if (stat.kind != .file or stat.size != artifact.size) return error.CatalogArtifactUnavailable;
+        const stamp = managed.ArtifactStamp.fromStat(stat);
+        if (artifact.sha256 != null) if (self.verification_cache) |cache| {
+            const key = VerificationCache.keyFor(self.verification_scope.?, artifact);
+            if (cache.rejectedStamp(key)) |rejected| {
+                if (std.meta.eql(rejected, stamp)) return error.ChecksumMismatch;
+            }
+        };
+        return stamp;
+    }
+
+    pub fn hasKnownChecksumRejections(self: *const PublishedArtifacts, cache: *VerificationCache) bool {
+        return if (self.verification_scope) |scope| cache.hasRejections(scope) else false;
     }
 
     /// Return the portable receipt name of a file selected by this acquisition.
@@ -454,22 +476,6 @@ pub const PublishedArtifacts = struct {
         const receipt = if (self.receipt) |*value| value else return null;
         const index = receipt.path_index.get(relative) orelse return error.InvalidManagedDownload;
         return self.canonical_index.get(receipt.artifacts[index].canonical_path).?;
-    }
-
-    pub fn hasRejectedChecksum(self: *const PublishedArtifacts, cache: *VerificationCache, control: ExecutionControl) !bool {
-        const receipt = self.receipt orelse return false;
-        const scope = self.verification_scope.?;
-        if (!cache.hasRejections(scope)) return false;
-        for (receipt.artifacts) |*artifact| {
-            try control.check();
-            if (artifact.sha256 == null) continue;
-            const key = VerificationCache.keyFor(scope, artifact);
-            const rejected = cache.rejectedStamp(key) orelse continue;
-            try control.check();
-            const current = managed.ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(self.io, artifact.canonical_path, .{ .follow_symlinks = false }));
-            if (std.meta.eql(rejected, current)) return true;
-        }
-        return false;
     }
 
     pub fn verifyFile(self: *PublishedArtifacts, relative: []const u8) !void {
@@ -963,15 +969,17 @@ test "model selection shared checksum proofs reject changed digests publications
         defer source.deinit();
         source.verification_cache = &cache;
         try std.testing.expectError(error.ChecksumMismatch, source.verifyFile("model.onnx"));
-        try std.testing.expect(try source.hasRejectedChecksum(&cache, .{}));
-        try std.testing.expectError(error.Timeout, source.hasRejectedChecksum(&cache, .{ .deadline_ns = 0 }));
+        try std.testing.expect(source.hasKnownChecksumRejections(&cache));
+        const selected = (try source.resolveModel("model.onnx")).?;
+        defer a.free(selected);
+        try std.testing.expectError(error.ChecksumMismatch, source.requireCatalogMember(selected));
 
         const first_path = try std.fs.path.join(a, &.{ root, "first" });
         defer a.free(first_path);
         var first = try PublishedArtifacts.init(a, io, first_path, null);
         defer first.deinit();
         try std.testing.expectEqual(first.publication, source.publication);
-        try std.testing.expect(!try first.hasRejectedChecksum(&cache, .{}));
+        try std.testing.expect(!first.hasKnownChecksumRejections(&cache));
     }
     try tmp.dir.deleteFile(io, "current");
     try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });

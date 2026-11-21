@@ -1188,7 +1188,16 @@ const ArtifactCatalog = struct {
     fn readOptionalUnchecked(self: *const ArtifactCatalog, name: []const u8) !?[]u8 {
         if (self.receipt != null) {
             const artifact = self.find(name) orelse return null;
-            const bytes = try c_file.readFile(self.allocator, artifact.canonical_path);
+            if (artifact.needs_binding_check) {
+                const canonical = try managed_receipt.resolveRegularFilePath(self.allocator, std.Options.debug_io, artifact.canonical_path);
+                defer self.allocator.free(canonical);
+                if (!std.mem.eql(u8, canonical, artifact.canonical_path)) return error.ModelArtifactsChanging;
+            }
+            const limit: usize = @intCast(@min(artifact.size, c_file.default_read_file_max_bytes));
+            const bytes = c_file.readFileMax(self.allocator, artifact.canonical_path, limit) catch |err| switch (err) {
+                error.FileTooLarge => if (artifact.size <= c_file.default_read_file_max_bytes) return error.InvalidManagedDownload else return err,
+                else => return err,
+            };
             errdefer self.allocator.free(bytes);
             try managed_receipt.verifyArtifactBytes(artifact, bytes);
             return bytes;
@@ -1218,7 +1227,13 @@ const ArtifactCatalog = struct {
         const member = if (self.receipt != null) self.find(relative).?.path else relative;
         const parent = try std.fs.path.join(self.allocator, &.{ self.storageRoot(), std.fs.path.dirname(member) orelse "." });
         defer self.allocator.free(parent);
-        const physical_parent = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, parent, self.allocator);
+        const physical_parent = std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, parent, self.allocator) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => if (self.receipt != null)
+                return std.fs.path.join(self.allocator, &.{ self.storageRoot(), member })
+            else
+                return err,
+            else => return err,
+        };
         defer self.allocator.free(physical_parent);
         return try std.fs.path.join(self.allocator, &.{ physical_parent, std.fs.path.basename(member) });
     }

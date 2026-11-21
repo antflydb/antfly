@@ -48,6 +48,10 @@ const ComponentConstruction = struct {
     borrowed: ?*PublishedArtifacts,
 
     fn init(a: std.mem.Allocator, io: std.Io, selected: ResolvedModel, control: ?InferenceExecutionControl, borrowed: ?*PublishedArtifacts) !ComponentConstruction {
+        return initWithValidation(a, io, selected, control, borrowed, false);
+    }
+
+    fn initWithValidation(a: std.mem.Allocator, io: std.Io, selected: ResolvedModel, control: ?InferenceExecutionControl, borrowed: ?*PublishedArtifacts, selected_members: bool) !ComponentConstruction {
         if (control) |active| {
             try active.check();
             if (active.model_selection) |expected| {
@@ -61,7 +65,11 @@ const ComponentConstruction = struct {
             try selected.verify(a, io);
             return .{ .io = io, .lease = lease, .owned = null, .borrowed = provided };
         }
-        return .{ .io = io, .lease = lease, .owned = try PublishedArtifacts.init(a, io, selected.path, .{ .publication = selected.publication }), .borrowed = null };
+        const owned = if (selected_members)
+            try PublishedArtifacts.initForSelectedArtifacts(a, io, selected.path, .{ .publication = selected.publication }, control orelse .{})
+        else
+            try PublishedArtifacts.init(a, io, selected.path, .{ .publication = selected.publication });
+        return .{ .io = io, .lease = lease, .owned = owned, .borrowed = null };
     }
     /// Reuse an externally owned publication lease and artifact catalog during
     /// synchronous preparation. This view never releases the caller's fence.
@@ -3342,6 +3350,7 @@ pub const ChunkPlanningAssets = struct {
 };
 
 pub const LoadedModel = struct {
+    selected_artifact_validation: bool = false,
     managed_publication: ?[32]u8 = null,
     managed_installation: ?managed_receipt.Installation = null,
     runtime_id: RuntimeId = 0,
@@ -3749,6 +3758,15 @@ pub const LoadedModel = struct {
             break :blk mapped;
         } else null;
         try bindOptionalSessionProfile(&session_manager, kind, profile_bundle);
+        var selected_artifacts = if (self.selected_artifact_validation)
+            try PublishedArtifacts.initForSelectedArtifacts(self.allocator, io, self.model_dir, .{ .publication = self.managed_publication }, control orelse .{})
+        else
+            null;
+        defer if (selected_artifacts) |*artifacts| artifacts.deinit();
+        if (selected_artifacts) |*artifacts| {
+            artifacts.verification_cache = &self.model_manager.verified_artifacts;
+            artifacts.verification_control = control orelse .{};
+        }
         var loaded = try self.model_manager.loadManagedSessionWithAdmissionUsingManager(
             session_path,
             strict_backend[0..],
@@ -3756,7 +3774,7 @@ pub const LoadedModel = struct {
             &session_manager,
             control,
             .{ .path = self.model_dir, .publication = self.managed_publication },
-            null,
+            if (selected_artifacts) |*artifacts| artifacts else null,
             try self.requiredSessionResidency(),
         );
         defer loaded.deinit();
@@ -4284,7 +4302,10 @@ pub const LoadedModel = struct {
         defer self.projector_store_mutex.unlock();
         if (self.projector_store) |store| return store;
         const io = self.publicationIo(control);
-        var proof = try ComponentConstruction.init(self.allocator, io, .{ .path = self.model_dir, .publication = self.managed_publication }, control, null);
+        var proof = try ComponentConstruction.initWithValidation(self.allocator, io, .{
+            .path = self.model_dir,
+            .publication = self.managed_publication,
+        }, control, null, self.selected_artifact_validation);
         defer proof.deinit();
         proof.artifacts().verification_cache = &self.model_manager.verified_artifacts;
         const physical = try proof.artifacts().constructionPath(path);
@@ -4737,10 +4758,13 @@ const PinnedEmbeddingConstruction = struct {
     fn loadManifest(self: *PinnedEmbeddingConstruction) !*const manifest_mod.ModelManifest {
         if (self.manifest == null) {
             const a = self.artifacts.allocator;
-            self.manifest = if (std.mem.endsWith(u8, self.path, ".onnx"))
-                try manifest_mod.loadBoundFromDir(a, self.artifacts.io, self.path, self.artifacts.publication, false)
+            self.manifest = (if (std.mem.endsWith(u8, self.path, ".onnx"))
+                manifest_mod.loadBoundFromDir(a, self.artifacts.io, self.path, self.artifacts.publication, false)
             else
-                try manifest_mod.loadFromPublishedArtifacts(a, self.path, &self.artifacts, false);
+                manifest_mod.loadFromPublishedArtifacts(a, self.path, &self.artifacts, false)) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => return error.PinnedEmbeddingArtifactUnavailable,
+                else => return err,
+            };
         }
         return &self.manifest.?;
     }
@@ -4786,7 +4810,7 @@ pub const PreparedPinnedEmbedding = struct {
         defer lease.deinit(io);
         const owned_path = try a.dupe(u8, path);
         errdefer a.free(owned_path);
-        var artifacts = try PublishedArtifacts.initWithControl(a, io, owned_path, null, control);
+        var artifacts = try PublishedArtifacts.initForSelectedArtifacts(a, io, owned_path, null, control);
         errdefer artifacts.deinit();
         const installed = artifacts.installation orelse return error.InferenceCapabilitiesStale;
         if (selector) |requested| {
@@ -4829,7 +4853,7 @@ pub const PreparedPinnedEmbedding = struct {
             const a = self.manager.allocator;
             const owned_path = try a.dupe(u8, path);
             errdefer a.free(owned_path);
-            var artifacts = try PublishedArtifacts.initWithControl(a, io, owned_path, .{ .publication = installed.publication }, control);
+            var artifacts = try PublishedArtifacts.initForSelectedArtifacts(a, io, owned_path, .{ .publication = installed.publication }, control);
             errdefer artifacts.deinit();
             if (!std.meta.eql(artifacts.installation, @as(?managed_receipt.Installation, installed))) return error.ModelArtifactsChanging;
             self.construction = .{ .path = owned_path, .artifacts = artifacts };
@@ -9899,7 +9923,7 @@ pub const ModelManager = struct {
             );
         defer self.allocator.free(prefix);
         const publication_hex = if (policy.managed_publication) |value| std.fmt.bytesToHex(value, .lower) else @as([64]u8, @splat('-'));
-        const precision_prefix = try std.fmt.allocPrint(self.allocator, "{s}publication={s}:gliner_cuda_precision={s}:", .{ prefix, publication_hex, if (policy.gliner_cuda_precision) |value| @tagName(value) else "none" });
+        const precision_prefix = try std.fmt.allocPrint(self.allocator, "{s}publication={s}:selected_artifacts={d}:gliner_cuda_precision={s}:", .{ prefix, publication_hex, @intFromBool(policy.selected_artifacts), if (policy.gliner_cuda_precision) |value| @tagName(value) else "none" });
         defer self.allocator.free(precision_prefix);
         const key = try self.allocator.alloc(u8, precision_prefix.len + preferred_backends.len);
         @memcpy(key[0..precision_prefix.len], precision_prefix);
@@ -10178,6 +10202,7 @@ pub const ModelManager = struct {
             &required_backend_scratch,
         );
         var checked_policy = policy;
+        checked_policy.selected_artifacts = prepared != null;
         checked_policy.managed_publication = if (prepared) |proof| proof.installation.?.publication else try self.publicationForRequest(model_dir, control);
         const flight_key = try self.loadFlightKey(
             model_dir,
@@ -10471,7 +10496,7 @@ pub const ModelManager = struct {
         const io = control.io orelse try self.componentPlanIo();
         var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
         defer lease.deinit(io);
-        var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = manifest.managed_publication });
+        var artifacts = try PublishedArtifacts.initForSelectedArtifacts(self.allocator, io, model_dir, .{ .publication = manifest.managed_publication }, control);
         defer artifacts.deinit();
         return self.embeddingRevisionCandidatesFromArtifacts(model_dir, manifest, control, include_unavailable, &artifacts);
     }
@@ -10498,7 +10523,6 @@ pub const ModelManager = struct {
         try control.check();
         if (!std.meta.eql(manifest.managed_publication, artifacts.publication)) return error.ModelArtifactsChanging;
         if (!hasCompleteChecksums(artifacts)) return result;
-        if (try artifacts.hasRejectedChecksum(&self.verified_artifacts, control)) return error.ChecksumMismatch;
         const receipt = &artifacts.receipt.?;
         const slot = &self.declared_receipt_revisions[receipt.publication_generation[0] % self.declared_receipt_revisions.len];
         const declared = try slot.get(self.allocator, artifacts.io, receipt, control);
@@ -10551,7 +10575,7 @@ pub const ModelManager = struct {
         return self.acquireVerifiedPinnedEmbedding(model_dir, expected, control, prepared) catch |err| {
             if (isPinnedBackendLoadFailure(err)) return error.PinnedEmbeddingBackendUnavailable;
             return switch (err) {
-                error.ChecksumMismatch, error.InvalidManagedDownload, error.ModelArtifactNotPublished, error.FileNotFound, error.NotDir => error.PinnedEmbeddingArtifactUnavailable,
+                error.ChecksumMismatch, error.InvalidManagedDownload, error.ModelArtifactNotPublished, error.FileNotFound, error.NotDir, error.InvalidExternalPath, error.InvalidExternalOffset, error.ExternalRegionOutOfBounds => error.PinnedEmbeddingArtifactUnavailable,
                 else => err,
             };
         };
@@ -10595,15 +10619,40 @@ pub const ModelManager = struct {
         var compatible: [EmbeddingRevisions.max_backends]backends.BackendType = undefined;
         var count: usize = 0;
         var known_recipe = false;
+        var refused_artifact = false;
+        if (construction.artifacts.hasKnownChecksumRejections(&self.verified_artifacts))
+            construction.artifacts.verification_cache = &self.verified_artifacts;
         for (declared.values(), declared.backends[0..declared.len]) |revision, backend| {
             if (!std.mem.eql(u8, &revision, &expected)) continue;
             known_recipe = true;
             if (self.pinnedBackendIsUnavailable(model_dir, installation, backend)) continue;
             if (backend == .cuda and !try backends.probeCudaDeviceWithControl(control)) continue;
+            // Classify absent or truncated selected files before the
+            // architecture-specific metadata and admission parsers run.
+            const primary_path = if (artifactCandidateForBackend(manifest.*, backend)) |candidate| switch (candidate) {
+                .onnx => manifest.onnx_logical_path orelse manifest.onnx_path,
+                .gguf => manifest.gguf_path,
+                .safetensors => manifest.safetensors_path orelse manifest.safetensors_index_path,
+                .component_bundle => null,
+            } else null;
+            if (primary_path) |path| {
+                _ = construction.artifacts.requireCatalogMember(path) catch |err| switch (err) {
+                    error.CatalogArtifactUnavailable, error.ChecksumMismatch, error.InvalidManagedDownload, error.ModelArtifactsChanging => {
+                        refused_artifact = true;
+                        continue;
+                    },
+                    else => return err,
+                };
+            }
             compatible[count] = backend;
             count += 1;
         }
-        if (count == 0) return if (known_recipe) error.PinnedEmbeddingBackendUnavailable else error.InferenceCapabilitiesStale;
+        if (count == 0) return if (refused_artifact)
+            error.PinnedEmbeddingArtifactUnavailable
+        else if (known_recipe)
+            error.PinnedEmbeddingBackendUnavailable
+        else
+            error.InferenceCapabilitiesStale;
         try construction.artifacts.verifyPublication();
         try self.retirePinnedEmbeddingReplacements(model_dir, installation, compatible[0..count]);
         const default_backends = self.defaultModelBackends(model_dir);
@@ -10756,8 +10805,29 @@ pub const ModelManager = struct {
         };
         tokenizer_artifacts.verification_cache = &self.verified_artifacts;
         if (control) |active| tokenizer_artifacts.verification_control = active;
-        const resolution_file_revision = try resolutionModelRevisionWithControl(self.allocator, sm.io orelse std.Options.debug_io, man, control orelse .{});
-        const resolution_revision = try modelIdentityWithArtifacts(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man, tokenizer_artifacts, control orelse .{});
+        // A pinned load derives portable identity from the declaration, then
+        // authenticates bytes through the selected tokenizer and session paths.
+        const verify_selected = prepared != null and hasCompleteChecksums(tokenizer_artifacts);
+        if (verify_selected) {
+            // These sidecars may be opened by the tokenizer, planner or
+            // media pipeline outside backend session construction.
+            inline for (.{ "config_path", "model_manifest_path", "tokenizer_json_path", "vocab_txt_path", "tokenizer_config_path", "special_tokens_map_path", "preprocessor_config_path", "processor_config_path" }) |field|
+                if (@field(man, field)) |metadata| try tokenizer_artifacts.verifyPath(metadata);
+            if (man.embedding_style == .embedding_gemma2) {
+                const recipe = @import("../models/embedding_gemma2_identity.zig");
+                for (recipe.sidecars) |sidecar| {
+                    const member = try std.fs.path.join(self.allocator, &.{ model_dir, sidecar });
+                    defer self.allocator.free(member);
+                    try tokenizer_artifacts.verifyPath(member);
+                }
+            }
+        }
+        const resolution_file_revision: ?[32]u8 = if (verify_selected) null else try resolutionModelRevisionWithControl(self.allocator, publication_io, man, control orelse .{});
+        const resolution_revision = if (verify_selected) declared: {
+            const receipt = &tokenizer_artifacts.receipt.?;
+            const slot = &self.declared_receipt_revisions[receipt.publication_generation[0] % self.declared_receipt_revisions.len];
+            break :declared imagePreprocessingRevision(man, try slot.get(self.allocator, publication_io, receipt, control orelse .{}));
+        } else try modelIdentityWithArtifacts(self.allocator, publication_io, model_dir, man, tokenizer_artifacts, control orelse .{});
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
             try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
@@ -10995,8 +11065,12 @@ pub const ModelManager = struct {
         errdefer if (model_storage_owned) self.allocator.destroy(model);
         const chunk_planning = try chunkPlanningSnapshotWithControl(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision, control orelse .{});
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
-        if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevisionWithControl(self.allocator, sm.io orelse std.Options.debug_io, man, control orelse .{}))) return error.ModelArtifactsChanging;
+        if (resolution_file_revision) |before| {
+            if (!std.mem.eql(u8, &before, &try resolutionModelRevisionWithControl(self.allocator, publication_io, man, control orelse .{})))
+                return error.ModelArtifactsChanging;
+        }
         model.* = .{
+            .selected_artifact_validation = verify_selected,
             .managed_publication = managed_publication,
             .managed_installation = tokenizer_artifacts.installation,
             .chunk_planning = chunk_planning,
@@ -11241,6 +11315,7 @@ fn modelCacheHasPublicationCapacity(loaded_count: usize, max_loaded_models: usiz
 }
 
 const ModelLoadCachePolicy = struct {
+    selected_artifacts: bool = false,
     managed_publication: ?[32]u8 = null,
     gliner_cuda_precision: ?session_factory.GlinerCudaPrecision = null,
     a4b_request: ?backend_contracts.A4bInferenceRequest = null,
@@ -14002,6 +14077,7 @@ test "optional session adoption owns rollback and transfers admission exactly on
         defer primary.deinit();
         const baseline = manager.admissionController().snapshot();
         var model: LoadedModel = undefined;
+        model.selected_artifact_validation = false;
         model.managed_publication = null;
         model.model_dir = root;
         model.allocator = allocator;
@@ -18738,6 +18814,7 @@ test "model selection lazy optional component retains primary publication" {
     var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null, .{ .path = root, .publication = try managed_receipt.publicationGeneration(a, std.testing.io, root) }, null);
     defer primary.deinit();
     var model: LoadedModel = undefined;
+    model.selected_artifact_validation = false;
     model.managed_publication = publication_a;
     model.model_dir = root;
     model.allocator = a;
@@ -19089,6 +19166,7 @@ test "model selection lazy ONNX sessions enforce graph and external tensor recei
     var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, control, selected, null);
     defer primary.deinit();
     var model: LoadedModel = undefined;
+    model.selected_artifact_validation = false;
     model.managed_publication = selected.publication;
     model.model_dir = root;
     model.allocator = a;
@@ -21006,6 +21084,7 @@ test "model selection lazy projector authenticates before opening and reuses its
     var model: LoadedModel = undefined;
     model.allocator = a;
     model.model_dir = root;
+    model.selected_artifact_validation = false;
     model.managed_publication = man.managed_publication;
     model.session_manager = &sm;
     model.model_manager = &manager;
