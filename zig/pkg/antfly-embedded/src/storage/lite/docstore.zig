@@ -4778,10 +4778,11 @@ pub const Store = struct {
 
     fn vacuumWorkspaceBytes(self: *Store, compact: u64) u64 {
         const budget = self.maintenance_policy.options.max_storage_bytes;
-        if (budget != 0 and self.needsProtectedRedoUpgrade()) {
-            return compact *| 2 +| self.file.vacuumRedoReservation(budget);
-        }
-        return @max(compact *| 2, self.maintenance_policy.options.assessment_bytes);
+        // Live statistics estimate data pages only. Every redo successor
+        // also needs its own reservation, including ordinary compaction.
+        const image_workspace = compact *| 2 +| self.file.vacuumRedoReservation(budget);
+        if (budget != 0 and self.needsProtectedRedoUpgrade()) return image_workspace;
+        return @max(image_workspace, self.maintenance_policy.options.assessment_bytes);
     }
 
     fn admitShrinkWorkspaceAssumeLocked(self: *Store, compact: u64, cancel: ?*const maintenance.CancelToken) !?u64 {
