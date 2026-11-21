@@ -274,9 +274,9 @@ def test_cross_table_context_sources_follow_source_changes(
         f"/tables/{orgs}/dependencies/impact", {"key": "org:acme", "limit": 50}
     )
     assert any(
-        row["table"] == people and row["key"] == "person:1" and row["artifact"] == "brief"
+        row.get("table") == people and row["key"] == "person:1" and row["artifact"] == "brief"
         for row in impact["dependents"]
-    ), impact
+    ), (people, [(r.get("table"), r.get("table_id"), r["key"], r["artifact"]) for r in impact["dependents"]])
     assert not any(row["key"] == "person:2" for row in impact["dependents"]), impact
     bad = stateful_api._request(
         "POST", f"/tables/{orgs}/dependencies/impact", {"key": "org:acme", "traversal": "sideways"}

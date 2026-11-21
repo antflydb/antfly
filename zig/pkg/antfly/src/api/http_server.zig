@@ -19250,6 +19250,13 @@ pub const ApiHttpServer = struct {
     fn publicTableNamesAlloc(self: *ApiHttpServer, a: std.mem.Allocator, request: api_operation.RequestContext, tables: []const @import("context_host.zig").TableInfo) ![]const []const u8 {
         const out = try a.alloc([]const u8, tables.len);
         for (tables, out) |t, *o| o.* = t.name;
+        defer for (out) |*o| {
+            // Catalog keys (`\x00catalog:...`) render as the public name:
+            // `table` in default.public, `db.schema.table` otherwise.
+            if (system_catalog.Target.parse(o.*)) |target| {
+                if (target.displayNameAlloc(a)) |display| o.* = display else |_| {}
+            } else |_| {}
+        };
         if (self.source.vtable.system_catalog == null or tables.len == 0) return out;
         var offset: usize = 0;
         while (offset < tables.len) {
