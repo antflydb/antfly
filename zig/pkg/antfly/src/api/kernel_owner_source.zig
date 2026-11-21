@@ -3763,6 +3763,33 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.loadDescriptorWithDeadline(alloc, group_id, table_name, null);
     }
 
+    /// A split's provisional destination is absent from public routing. The
+    /// caller has verified the active transition and its physical identity.
+    pub fn loadSplitDestinationDescriptor(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        contract: @import("../metadata/domain.zig").TransitionTableContract,
+        table_storage: @import("antfly_local_sources").common_table_storage.Settings,
+        range: db_types.ByteRange,
+    ) !LoadedDescriptor {
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        errdefer alloc.free(path);
+        const schema = try alloc.dupe(u8, contract.schema_json);
+        errdefer alloc.free(schema);
+        const indexes = try @import("antfly_local_sources").api_index_metadata.aliases.physicalProjection(alloc, contract.indexes_json);
+        errdefer alloc.free(indexes);
+        return .{
+            .path = path,
+            .schema_json = schema,
+            .indexes_json = indexes,
+            .table_storage = table_storage,
+            .initial_range = try descriptor_contract.cloneInitialRange(alloc, range),
+            .generation = self.visibleRootGeneration(group_id),
+            .identity = .{ .table_id = contract.table_id, .shard_id = contract.target_identity.shard_id, .range_id = contract.target_identity.range_id },
+        };
+    }
+
     /// Only an exact metadata-authorized hidden child may obtain a Raft
     /// descriptor without a public catalog route. The bootstrap travels in
     /// the committed entry so follower apply uses the same private identity.

@@ -14963,6 +14963,8 @@ pub const DataServer = struct {
                         const owner_source = try self.ensureKernelOwnerSource();
                         storage_owner_descriptor = if (route.initial_child_bootstrap) |bootstrap|
                             try owner_source.loadInitialChildDescriptor(alloc, group_id, table_name, bootstrap)
+                        else if (req.split_replication) |replication|
+                            try self.loadSplitRaftDestinationDescriptor(owner_source, alloc, group_id, table_name, replication, route.visibility_cancellation)
                         else if (completion_command)
                             try owner_source.loadCompletionDescriptor(alloc, group_id, table_name, completion_context)
                         else
@@ -17893,6 +17895,34 @@ pub const DataServer = struct {
                 .delta_sequence = delta_sequence,
             },
         }, .{ .discovery = .cached });
+    }
+
+    fn loadSplitRaftDestinationDescriptor(
+        self: *DataServer,
+        owners: *antfly.public_api.ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        replication: antfly.db.types.SplitReplicationContext,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !antfly.public_api.ProvisionedKernelOwnerSource.LoadedDescriptor {
+        if (replication.destination_group_id != group_id) return error.TopologyChanged;
+        var snapshot = (try self.status_source.linearizableSnapshot(.{ .cancellation = cancellation })) orelse return error.CatalogRoutingUnavailable;
+        defer self.status_source.freeAdminSnapshot(&snapshot);
+        const transition = for (snapshot.split_transitions) |record| {
+            if (record.transition_id == replication.transition_id) break record;
+        } else return error.TopologyChanged;
+        const contract = transition.table_contract;
+        try contract.validateForSplit();
+        if (transition.phase == .finalized or transition.phase == .rolled_back or transition.attempt_epoch != replication.attempt_epoch or
+            transition.source_group_id != replication.source_group_id or transition.destination_group_id != group_id or
+            !std.mem.eql(u8, contract.table_name, table_name) or
+            !identityNamespaceFromTransitionContract(contract, .target).eql(replication.identity_namespace))
+            return error.TopologyChanged;
+        const table = findTableById(snapshot.tables, contract.table_id) orelse return error.TopologyChanged;
+        if (table.storage.engine != .local or !std.mem.eql(u8, table.name, table_name)) return error.TopologyChanged;
+        const start = transition.split_key orelse return error.TopologyChanged;
+        return owners.loadSplitDestinationDescriptor(alloc, group_id, contract, table.storage, .{ .start = start, .end = transition.source_range_end });
     }
 
     fn replicateSplitDestinationBatch(
