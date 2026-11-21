@@ -245,6 +245,13 @@ class EmbeddedPublishTests(unittest.TestCase):
                     "publish": "true",
                 },
             )
+            # New patch releases use the maintenance branch and series npm tag.
+            git("branch", "v0.3.x", source)
+            maintenance = copy.deepcopy(document)
+            maintenance.update(channel="v0-3", source_ref="refs/heads/v0.3.x")
+            maintenance_outputs = verify(maintenance)
+            self.assertEqual(maintenance_outputs["npm_tag"], "v0-3")
+            self.assertEqual(maintenance_outputs["publish"], "true")
             combined = copy.deepcopy(document)
             combined["build_contract_schema"] = 3
             self.assertEqual(verify(combined)["build_contract_schema"], "3")
