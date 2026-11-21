@@ -26616,6 +26616,7 @@ const RemoteMetadataSource = struct {
             .io = runtime_io_abi.Borrow.init(&self.io),
             .vtable = &.{
                 .admin_snapshot = remoteAdminSnapshot,
+                .admin_snapshot_with_budget = remoteAdminSnapshotWithBudget,
                 .export_catalog = remoteExportCatalog,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .catalog_identity = remoteCatalogIdentity,
@@ -27509,6 +27510,16 @@ const RemoteMetadataSource = struct {
     fn remoteControlSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         return try self.fetchSnapshotForHead(try self.fetchHead());
+    }
+
+    fn remoteAdminSnapshotWithBudget(ptr: *anyopaque, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.AdminSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var cancellation = antfly.common.http.http_common.RequestCancellation.fromToken(budget.cancellation);
+        return self.fetchSnapshotWithBudget(.{
+            .deadline_ns = budget.deadline_ns orelse (self.awakeNs() +| remote_metadata_snapshot_timeout_ns),
+            .io = self.io,
+            .cancellation = &cancellation,
+        });
     }
 
     fn remoteAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {

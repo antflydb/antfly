@@ -38371,6 +38371,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Graph write exceeds transaction capacity */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Query capacity or resource budget exhausted */
             429: {
                 headers: {
@@ -39110,7 +39117,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            500: components["responses"]["InternalServerError"];
+            500: components["responses"]["StatelessTransactionFailure"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
             501: {
                 headers: {

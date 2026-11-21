@@ -39,7 +39,7 @@ pub const Store = struct {
     }
     fn deinit(_: A, _: *anyopaque) void {}
     fn capabilities(_: *anyopaque) types.Capabilities {
-        return .{ .reverse_ranges = true };
+        return .{ .reverse_ranges = true, .max_atomic_compare_write_bytes = record.max_bytes };
     }
     fn beginRead(a: A, ptr: *anyopaque) !erased.ReadTxn {
         const read = try Read.create(a, cast(ptr));
@@ -235,9 +235,12 @@ const Write = struct {
         const self = cast(ptr);
         if (self.refs.load(.acquire) != 1) return error.TransactionCursorActive;
         const store = self.read.store;
-        if (store.host.term(store.host.ptr) != self.term) return error.NotLeader;
+        if (store.host.term(store.host.ptr) != self.term) return error.SessionWriteNotLeaderBeforeProposal;
         if (self.changes.items.len != 0) {
-            const bytes = try record.encode(self.read.arena.allocator(), .{ .changes = self.changes.items, .scan_epoch = if (self.scanned) self.epoch else null });
+            const bytes = record.encode(self.read.arena.allocator(), .{ .changes = self.changes.items, .scan_epoch = if (self.scanned) self.epoch else null }) catch |err| return switch (err) {
+                error.OutOfMemory => error.SessionWriteOutOfMemoryBeforeProposal,
+                else => err,
+            };
             try store.host.propose(store.host.ptr, bytes, self.term);
             // The write gate remains held through this confirmation. A term
             // change instead returns an uncertain result for receipt recovery.

@@ -2333,14 +2333,21 @@ test "distributed txn batched admission checks legacy owner groups and ignores t
 
 const AdmissionRequest = @import("../metadata/api.zig").DecisionAdmissionRequest;
 
-fn validateTableBatch(catalog: table_catalog.CatalogSource, identity: RoutingIdentity, tables: []const AdmissionRequest.TableCheck, failure: ?*[]const u8) !?u64 {
+fn transactionRoutingBudget(catalog: table_catalog.CatalogSource) table_catalog.RoutingBudget {
+    var budget = catalog.budget(null);
+    budget.deadline_ns = budget.nowNs() +| @as(u64, @import("../metadata/api.zig").catalog_route_default_deadline_ms) * std.time.ns_per_ms;
+    return budget;
+}
+
+fn validateTableBatch(catalog: table_catalog.CatalogSource, identity: RoutingIdentity, tables: []const AdmissionRequest.TableCheck, failure: ?*[]const u8, budget: table_catalog.RoutingBudget) !?u64 {
     const capture = catalog.vtable.decision_admission orelse return null;
     const check = capture(catalog.ptr, .{
         .table_name = tables[0].table_name,
         .table_id = tables[0].table_id,
         .table_batch = .{ .tables = tables, .verified_revision = identity.verified_revision.? },
-    }, catalog.budget(null)) catch |err| if (err == error.UnsupportedOperation) return null else return err;
+    }, budget) catch |err| if (err == error.UnsupportedOperation) return null else return err;
     // An older metadata peer can answer only for the first table.
+    try budget.checkpoint();
     if (!check.tables_checked) return null;
     if (check.metadata_group_id != identity.group_id or !std.meta.eql(check.metadata_incarnation, identity.incarnation)) return error.CatalogGenerationChanged;
     if (!check.stable) {
@@ -2358,7 +2365,9 @@ fn validateTableBatch(catalog: table_catalog.CatalogSource, identity: RoutingIde
 fn validateParticipantEpochs(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, participants: []const ParticipantTxn, admitted: ?RoutingIdentity, failure: ?*[]const u8) !void {
     if (participants.len == 0) return;
     const identity = admitted orelse return error.CatalogGenerationChanged;
-    if (identity.enlisted.len != 0 and (try validateTableBatch(table_catalog.decisionCatalog(catalog), identity, identity.enlisted, failure)) != null) return;
+    const authority = table_catalog.decisionCatalog(catalog);
+    const budget = transactionRoutingBudget(authority);
+    if (identity.enlisted.len != 0 and (try validateTableBatch(authority, identity, identity.enlisted, failure, budget)) != null) return;
     var workspace = std.heap.ArenaAllocator.init(alloc);
     defer workspace.deinit();
     const a = workspace.allocator();
@@ -2367,7 +2376,8 @@ fn validateParticipantEpochs(alloc: std.mem.Allocator, catalog: table_catalog.Ca
         const slot = try by_name.getOrPut(a, participant.table_name);
         if (!slot.found_existing) slot.value_ptr.* = .{ .requirements = .{ .table_name = participant.table_name } };
     }
-    var snapshot = try catalog.adminSnapshot();
+    const legacy_budget = catalog.budget(catalog.deadlineFrom(budget));
+    var snapshot = try catalog.adminSnapshotWithBudget(legacy_budget);
     defer catalog.freeAdminSnapshot(&snapshot);
     if (identity.group_id != snapshot.status.metadata_group_id or !std.meta.eql(identity.incarnation, snapshot.status.metadata_incarnation)) return error.CatalogGenerationChanged;
     try loadTableRoutes(a, &by_name, &snapshot, failure);
@@ -2416,9 +2426,9 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
     defer if (generation) |g| g.release();
     var admin: ?@import("../metadata/api.zig").AdminSnapshot = null;
     defer if (admin) |*snapshot| catalog.freeAdminSnapshot(snapshot);
+    const budget = transactionRoutingBudget(authority);
     const identity: RoutingIdentity = selected: {
         if (authority.vtable.decision_admission != null) if (authority.vtable.acquire_routing_generation) |acquire| {
-            const budget = authority.budget(null);
             generation = try acquire(authority.ptr, budget, true);
             const indexed = &generation.?.indexed;
             const view = indexed.snapshot.value;
@@ -2432,7 +2442,7 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
                 routes.epoch = table.topology_epoch;
                 check.* = .{ .table_id = table.table_id, .table_name = name, .topology_epoch = table.topology_epoch };
             }
-            if (try validateTableBatch(authority, id, checks, failure)) |revision| {
+            if (try validateTableBatch(authority, id, checks, failure, budget)) |revision| {
                 id.verified_revision = revision;
                 break :selected id;
             }
@@ -2447,7 +2457,7 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
                 else => return err,
             };
         };
-        admin = try catalog.adminSnapshot();
+        admin = try catalog.adminSnapshotWithBudget(catalog.budget(catalog.deadlineFrom(budget)));
         const id = RoutingIdentity.from(&admin.?);
         try id.requireIncarnation(bound_incarnation);
         try loadTableRoutes(a, &by_name, &admin.?, failure);
@@ -2566,7 +2576,6 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
         const decision_epoch = table_catalog.decisionEpochForAuthority(identity.group_id, identity.incarnation, topology_epoch);
         if (bound_incarnation != null or routes.guard_owners.count() != 0) {
             if (identity.verified_revision != null) {
-                const budget = authority.budget(null);
                 for (groups.values()) |index| {
                     const participant = &participants.items[index];
                     const range = try generation.?.indexed.rangeForGroup(routes.ranges[0].table_id, participant.group_id, budget);

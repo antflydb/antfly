@@ -799,6 +799,7 @@ pub const SessionReadSnapshot = struct {
 };
 
 pub const SessionTableDetail = struct {
+    storage_name: ?[]const u8 = null,
     has_range_reads: bool = false,
     table_name: []u8,
     staged_read_count: usize,
@@ -808,6 +809,7 @@ pub const SessionTableDetail = struct {
 
     pub fn deinit(self: *SessionTableDetail, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
+        if (self.storage_name) |name| alloc.free(name);
         self.* = undefined;
     }
 };
@@ -1019,6 +1021,7 @@ pub const Savepoint = struct {
 pub const Session = struct {
     graph_receipt: bool = false,
     graph_abort_tables: []SessionTableDetail = &.{},
+    graph_admission_growth: usize = 0,
     // Owned sessions retain their allocator across registry publication and eviction.
     owner_alloc: ?std.mem.Allocator = null,
     sql: ?SqlMetadata = null,
@@ -1207,6 +1210,25 @@ pub const DurableSessionStore = struct {
         return .{ .alloc = alloc, .backend = .{ .runtime = store } };
     }
 
+    fn checkRecordSize(self: *DurableSessionStore, session: Session, size: usize, configured_limit: ?usize, creating: bool) !void {
+        const limit = configured_limit orelse std.math.maxInt(usize);
+        if (creating and session.graph_receipt) {
+            if (size +| session.graph_admission_growth > @min(limit, self.graphRecordLimit())) return error.SessionRecordTooLarge;
+        } else if (size > limit) return error.SessionRecordTooLarge;
+    }
+
+    fn graphRecordLimit(self: *DurableSessionStore) usize {
+        return switch (self.backend) {
+            .docstore => std.math.maxInt(usize),
+            .runtime => |store| if (store.capabilities().max_atomic_compare_write_bytes) |limit|
+                // Allow space for keys, framing, lease and index changes as
+                // well as the old and new session in the same proposal.
+                (limit -| 4096) / 2
+            else
+                std.math.maxInt(usize),
+        };
+    }
+
     pub const Version = struct {
         owner: u64,
         touched: u64,
@@ -1239,9 +1261,7 @@ pub const DurableSessionStore = struct {
         defer self.alloc.free(key);
         const value = try encodeSessionRecord(self.alloc, session);
         defer self.alloc.free(value);
-        if (max_record_bytes) |limit| {
-            if (value.len > limit) return error.SessionRecordTooLarge;
-        }
+        try self.checkRecordSize(session, value.len, max_record_bytes, options.creating);
         switch (self.backend) {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
@@ -1301,6 +1321,8 @@ pub const DurableSessionStore = struct {
             txn.commit() catch |err| {
                 // The replicated store bounds its encoded change set before
                 // proposing it. Other commit failures can lose the reply.
+                if (err == error.SessionWriteNotLeaderBeforeProposal) return error.NotLeader;
+                if (err == error.SessionWriteOutOfMemoryBeforeProposal) return error.OutOfMemory;
                 if (graph_admission and err != error.TransactionTooLarge) return error.GraphReceiptAdmissionUnknown;
                 return err;
             };
@@ -1371,7 +1393,7 @@ pub const DurableSessionStore = struct {
 
         const session_value = try encodeSessionRecord(self.alloc, session);
         defer self.alloc.free(session_value);
-        if (max_record_bytes) |limit| if (session_value.len > limit) return error.SessionRecordTooLarge;
+        try self.checkRecordSize(session, session_value.len, max_record_bytes, expected == null);
         const lease_value = try std.json.Stringify.valueAlloc(self.alloc, lease_mod.LeaseRecord{
             .owner_id = owner_id,
             .expires_at_ms = expires,
@@ -2674,6 +2696,11 @@ pub const SessionRegistry = struct {
         session.staged = try input.clone(alloc);
         session.commit_body_digest = try commitBodyDigest(alloc, input);
         session.execution_plan = try encodeExecutionPlan(alloc, tables);
+        var max_name: usize = 0;
+        for (tables) |table| max_name = @max(max_name, table.table_name.len);
+        // JSON can escape a byte as six characters. Reserve room for the
+        // longest coordinator name, terminal fields, and wider numbers.
+        session.graph_admission_growth = 256 +| (6 *| max_name);
         var plan = try parseExecutionPlan(alloc, session.execution_plan.?);
         errdefer plan.deinit();
         const guard = try self.insertNewSession(alloc, &session);
@@ -2941,18 +2968,23 @@ pub const SessionRegistry = struct {
     /// Clone staged rows from the very cache entry admitted by the durable
     /// version and lease check. The stripe pins its slices through the copy.
     pub fn admitSqlStatement(self: *SessionRegistry, registry_alloc: std.mem.Allocator, result_alloc: std.mem.Allocator, guard: Mutation, principal: ?[]const u8, connection: ?[32]u8) !struct { state: SqlState, staged: OwnedTransactionCommitRequest } {
-        const lock = self.sessionLock(guard.id);
+        const admission = try self.admitSqlStatementForOwner(registry_alloc, result_alloc, guard.id, principal, guard.owner, connection, guard);
+        return .{ .state = admission.state, .staged = admission.staged };
+    }
+
+    pub fn admitSqlStatementForOwner(self: *SessionRegistry, registry_alloc: std.mem.Allocator, result_alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: ?[]const u8, owner: u64, connection: ?[32]u8, prior: ?Mutation) !struct { state: SqlState, staged: OwnedTransactionCommitRequest, guard: Mutation } {
+        const lock = self.sessionLock(id);
         lock.lock();
         defer lock.unlock();
-        var admission = try self.admitSqlLocked(registry_alloc, guard.id, principal, guard.owner, connection, guard);
+        var admission = try self.admitSqlLocked(registry_alloc, id, principal, owner, connection, prior);
         errdefer admission.state.deinit(registry_alloc);
         if (admission.state.terminal_abort or admission.state.terminal != null) return error.SqlTransactionNotActive;
         if (admission.state.execution_started) return error.SqlTransactionOutcomeUnknown;
         self.mutex.lock();
-        const cached = self.sessions.get(guard.id).?;
+        const cached = self.sessions.get(id).?;
         self.mutex.unlock();
         var view = SessionView{ .session = cached };
-        return .{ .state = admission.state, .staged = try view.stagedRequest(result_alloc) };
+        return .{ .state = admission.state, .staged = try view.stagedRequest(result_alloc), .guard = admission.guard };
     }
 
     fn admitSqlLocked(self: *SessionRegistry, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: ?[]const u8, owner: u64, connection: ?[32]u8, prior: ?Mutation) !SqlAdmission {
@@ -3588,6 +3620,11 @@ pub const SessionRegistry = struct {
         if (publication) |first| if (!std.meta.eql(first.version, expected) or !std.meta.eql(first.guard.id, txn_id)) return error.SessionLeaseLost;
         if (candidate.graph_receipt and candidate.staged != null) {
             candidate.graph_abort_tables = try sessionTableDetails(alloc, candidate.staged);
+            for (candidate.graph_abort_tables) |*table| {
+                const physical = candidate.staged.?.physicalName(table.table_name);
+                if (!std.mem.eql(u8, physical, table.table_name))
+                    table.storage_name = try alloc.dupe(u8, physical);
+            }
             if (candidate.staged) |*staged| staged.deinit(alloc);
             candidate.staged = null;
             if (candidate.execution_plan) |bytes| alloc.free(bytes);
@@ -4052,20 +4089,46 @@ pub const SessionRegistry = struct {
     }
 
     pub fn getStatus(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SessionStatus {
+        return self.getStatusFiltered(alloc, txn_id, .all);
+    }
+
+    pub fn getStatusForPrincipal(self: *SessionRegistry, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: ?[]const u8) !?SessionStatus {
+        return self.getStatusFiltered(alloc, id, .{ .principal = principal });
+    }
+
+    fn getStatusFiltered(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, filter: StatusPrincipalFilter) !?SessionStatus {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        var session = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
-        defer session.deinit(alloc);
+        var view = (try self.readSessionAssumeStripe(txn_id)) orelse return null;
+        defer view.deinit();
+        const session = view.session;
+        switch (filter) {
+            .all => {},
+            .principal => |principal| if (!principalsEqual(session.principal, principal)) return null,
+        }
         return try sessionStatusFromSession(self, alloc, &session);
     }
 
     pub fn getDetails(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SessionDetails {
+        return self.getDetailsFiltered(alloc, txn_id, .all);
+    }
+
+    pub fn getDetailsForPrincipal(self: *SessionRegistry, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: ?[]const u8) !?SessionDetails {
+        return self.getDetailsFiltered(alloc, id, .{ .principal = principal });
+    }
+
+    fn getDetailsFiltered(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, filter: StatusPrincipalFilter) !?SessionDetails {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        var session = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
-        defer session.deinit(alloc);
+        var view = (try self.readSessionAssumeStripe(txn_id)) orelse return null;
+        defer view.deinit();
+        const session = view.session;
+        switch (filter) {
+            .all => {},
+            .principal => |principal| if (!principalsEqual(session.principal, principal)) return null,
+        }
         var details: SessionDetails = .{
             .graph_receipt = session.graph_receipt,
             .status = try sessionStatusFromSession(self, alloc, &session),
@@ -4553,7 +4616,7 @@ pub const SessionRegistry = struct {
         }
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.owner_node_id != owner_node_id) continue;
+            if (!shouldRenewLease(entry.value_ptr.*, owner_node_id)) continue;
             ids.append(durable.alloc, entry.key_ptr.*) catch |err| {
                 self.mutex.unlock();
                 return err;
@@ -4567,7 +4630,7 @@ pub const SessionRegistry = struct {
             session_lock.lock();
             defer session_lock.unlock();
             self.mutex.lock();
-            const still_owned = if (self.sessions.getPtr(txn_id)) |session| session.owner_node_id == owner_node_id else false;
+            const still_owned = if (self.sessions.getPtr(txn_id)) |session| shouldRenewLease(session.*, owner_node_id) else false;
             self.mutex.unlock();
             if (!still_owned) continue;
             self.renewLeaseLockedAt(txn_id, owner_node_id, now_ns) catch |err| switch (err) {
@@ -4577,6 +4640,10 @@ pub const SessionRegistry = struct {
             renewed += 1;
         }
         return renewed;
+    }
+
+    fn shouldRenewLease(session: Session, owner: u64) bool {
+        return session.owner_node_id == owner and !(session.graph_receipt and sessionCanExpire(session));
     }
 
     fn renewLeaseLockedAt(self: *SessionRegistry, txn_id: db_mod.types.TxnId, owner_node_id: u64, now_ns: u64) !void {
@@ -6362,11 +6429,14 @@ fn sessionReadSnapshots(alloc: std.mem.Allocator, session: *const Session) ![]Se
 fn cloneTableDetails(alloc: std.mem.Allocator, tables: []const SessionTableDetail) ![]SessionTableDetail {
     const result = try alloc.dupe(SessionTableDetail, tables);
     errdefer alloc.free(result);
-    for (result, 0..) |*table, i| {
-        table.table_name = alloc.dupe(u8, table.table_name) catch |err| {
-            for (result[0..i]) |*previous| previous.deinit(alloc);
-            return err;
-        };
+    var initialized: usize = 0;
+    errdefer for (result[0..initialized]) |*table| table.deinit(alloc);
+    for (result) |*table| {
+        const storage_name = table.storage_name;
+        table.table_name = try alloc.dupe(u8, table.table_name);
+        table.storage_name = null;
+        initialized += 1;
+        if (storage_name) |name| table.storage_name = try alloc.dupe(u8, name);
     }
     return result;
 }
@@ -6690,7 +6760,19 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         try out.appendSlice(alloc, "\"graph_receipt\":true,");
         if (session.terminal_abort) {
             try out.appendSlice(alloc, "\"graph_abort_tables\":");
-            try out.print(alloc, "{f},", .{std.json.fmt(session.graph_abort_tables, .{})});
+            try out.append(alloc, '[');
+            for (session.graph_abort_tables, 0..) |table, index| {
+                if (index != 0) try out.append(alloc, ',');
+                var public_fields = table;
+                public_fields.storage_name = null;
+                try out.print(alloc, "{f}", .{std.json.fmt(public_fields, .{ .emit_null_optional_fields = false })});
+            }
+            try out.appendSlice(alloc, "],\"graph_abort_storage_names\":[");
+            for (session.graph_abort_tables, 0..) |table, index| {
+                if (index != 0) try out.append(alloc, ',');
+                if (table.storage_name) |name| try appendJsonString(alloc, &out, name) else try out.appendSlice(alloc, "null");
+            }
+            try out.appendSlice(alloc, "],");
         }
     }
     try out.appendSlice(alloc, "\"owner_node_id\":");
@@ -6933,6 +7015,18 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         var tables = try std.json.parseFromValue([]SessionTableDetail, alloc, value, .{});
         defer tables.deinit();
         session.graph_abort_tables = try cloneTableDetails(alloc, tables.value);
+    }
+    if (obj.get("graph_abort_storage_names")) |value| {
+        if (!session.graph_receipt or !session.terminal_abort or value != .array or value.array.items.len != session.graph_abort_tables.len)
+            return error.InvalidTransactionSessionRecord;
+        for (session.graph_abort_tables, value.array.items) |*table, name| switch (name) {
+            .null => {},
+            .string => |physical| {
+                if (table.storage_name != null) return error.InvalidTransactionSessionRecord;
+                table.storage_name = try alloc.dupe(u8, physical);
+            },
+            else => return error.InvalidTransactionSessionRecord,
+        };
     }
     if (obj.get("execution_plan")) |value| switch (value) {
         .null => {},
@@ -7587,7 +7681,9 @@ test "distributed txn graph admission and recovered abort retain a compact princ
     defer saved.deinit(a);
     try std.testing.expect(saved.terminal_abort and saved.execution_plan == null and saved.staged == null);
     try std.testing.expectEqual(SessionRegistry.PrincipalAccess.denied, try reader.principalAccess(a, id, "bob"));
-    var details = (try reader.getDetails(a, id)).?;
+    try std.testing.expect((try reader.getStatusForPrincipal(a, id, "bob")) == null);
+    try std.testing.expect((try reader.getDetailsForPrincipal(a, id, "bob")) == null);
+    var details = (try reader.getDetailsForPrincipal(a, id, "alice")).?;
     defer details.deinit(a);
     try std.testing.expect(details.graph_receipt);
     try std.testing.expectEqual(SessionDisposition.aborted, details.status.disposition);
@@ -7597,6 +7693,36 @@ test "distributed txn graph admission and recovered abort retain a compact princ
     try std.testing.expectError(error.CypherWriteRequestAlreadyUsed, reader.beginGraphExecution(a, id, 2, "bob", &request, &tables));
     try std.testing.expectEqual(@as(usize, 1), try reader.cleanupExpired(a, std.math.maxInt(u64)));
     try std.testing.expect((try durable.load(id)) == null);
+}
+
+test "distributed txn graph admission reserves terminal and acknowledgement capacity" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "system/api-transaction-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(a, &store);
+    const leases = SessionLeaseStore.initFromDurable(&durable);
+    var registry = SessionRegistry.initWithLeaseTtl(&durable, leases, 60 * std.time.ns_per_s);
+    defer registry.deinit(a);
+    var request = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{}}}}}");
+    defer request.deinit(a);
+    const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .normalized_graph_rows = true }};
+    const id: db_mod.types.TxnId = @splat(9);
+    const first = try registry.beginGraphExecution(a, id, 1, "alice", &request, &tables);
+    defer first.plan.deinit();
+    const key = try makeSessionKey(a, id);
+    defer a.free(key);
+    var read = try store.beginRead();
+    registry.max_record_bytes = (try read.get(key)).len;
+    read.abort();
+    try std.testing.expectError(error.SessionRecordTooLarge, registry.beginGraphExecution(a, @splat(10), 1, "alice", &request, &tables));
+    registry.max_record_bytes.? += 256 + 6 * "docs".len;
+    const second = try registry.beginGraphExecution(a, @splat(10), 1, "alice", &request, &tables);
+    defer second.plan.deinit();
+    try std.testing.expect((try registry.recordTerminalCommitWithRepair(a, @splat(10), .committed, false, 42, "docs")) != null);
+    try std.testing.expect((try registry.markTerminalCoordinatorAcknowledged(a, @splat(10))) != null);
+    try std.testing.expectEqual(@as(usize, 1), try registry.cleanupExpired(a, std.math.maxInt(u64)));
 }
 
 test "distributed txn graph admission distinguishes lost commit acknowledgments from staging failures" {
@@ -7614,6 +7740,10 @@ test "distributed txn graph admission distinguishes lost commit acknowledgments 
     try std.testing.expect(!txn.attempted);
     try std.testing.expectError(error.GraphReceiptAdmissionUnknown, DurableSessionStore.finishSessionWrite(&txn, true, true));
     try std.testing.expect(txn.attempted);
+    txn.failure = error.SessionWriteNotLeaderBeforeProposal;
+    try std.testing.expectError(error.NotLeader, DurableSessionStore.finishSessionWrite(&txn, true, true));
+    txn.failure = error.NotLeader;
+    try std.testing.expectError(error.GraphReceiptAdmissionUnknown, DurableSessionStore.finishSessionWrite(&txn, true, true));
     txn.failure = error.TransactionTooLarge;
     try std.testing.expectError(error.TransactionTooLarge, DurableSessionStore.finishSessionWrite(&txn, true, true));
 }

@@ -64,6 +64,16 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     if (identity.*) |principal| {
         if (!server_mod.permissionsAllow(principal.permissions, .graph, name, .read) or (writes and !compiled.query.explain and !server_mod.permissionsAllow(principal.permissions, .graph, name, .write))) return error.Forbidden;
     }
+    if (writes and !compiled.query.explain) if (request.write_request_id) |encoded| {
+        const id = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
+        if (server.txn_sessions.hasSession(a, id) catch |err| {
+            write_outcome.* = .unknown;
+            return err;
+        }) {
+            write_outcome.* = .unknown;
+            return error.CypherWriteRequestAlreadyUsed;
+        }
+    };
     var execution = try server.acquireSqlExecution(writes and !compiled.query.explain);
     defer execution.release();
     const bytes = try server.source.systemCatalog(scratch, context, .{ .read = .{ .kind = .graph, .name = name } });
@@ -97,12 +107,15 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
         physical.namespace = target.namespace;
         if (table.id != physical.table_id or !std.mem.eql(u8, table.physical_name, physical.table)) return error.CatalogGenerationChanged;
     }
+    var receipt_names: std.StringHashMapUnmanaged([]const u8) = .empty;
     for (resolved, targets.items) |table, target| {
         var duplicate = false;
         for (tables.items) |existing| if (existing.table_id == table.id) {
             duplicate = true;
             break;
         };
+        if (!duplicate and writes and !compiled.query.explain)
+            try receipt_names.put(scratch, table.physical_name, try target.resourceNameAlloc(scratch));
         if (!duplicate) try tables.append(scratch, .{ .name = table.physical_name, .table_id = table.id, .schema_version = table.schema_version, .principal_proof = (try sql.rowPolicyProof(scratch, table)) orelse "", .database = target.database, .filter_query_json = (try server_mod.resolveEffectiveRowFilterJson(scratch, identity.*, table.physical_name)) orelse "" });
     }
     try cypher.binder.validate(scratch, graph, compiled.query);
@@ -140,7 +153,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
         provider = client.backend();
     }
     provider.index_attribution = .{ .ptr = &channel, .snapshot = AuthorityChannel.indexSnapshot };
-    var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .graph = graph, .tables = read_tables.items, .release_read = AuthorityChannel.releaseRead, .channel = channel.rpcChannel() };
+    var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .receipt_names = receipt_names, .graph = graph, .tables = read_tables.items, .release_read = AuthorityChannel.releaseRead, .channel = channel.rpcChannel() };
     defer if (writer.execution_plan) |*plan| plan.deinit();
     errdefer if (writer.receipt) |receipt| {
         write_outcome.* = switch (receipt.status) {
@@ -353,7 +366,7 @@ pub fn httpStatus(err: anyerror) u16 {
         error.CatalogNotFound, error.TableNotFound, error.IndexNotFound => 404,
         error.CatalogGenerationChanged, error.SchemaVersionChanged, error.RowPolicyCatalogChanged, error.CypherTransactionConflict, error.CypherWriteRequestAlreadyUsed => 409,
         error.StorageOwnerAdmissionPending, error.CatalogRoutingSnapshotTimeout, error.DocIdentityNamespaceMismatch, error.IndexRebuilding, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.PrivacyReadFenceUnavailable, error.EnrichmentRetryInProgress, error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => 503,
-        error.OutOfMemory, error.CypherResponseTooLarge, error.CypherMemoryBudgetExceeded, error.CypherAnchorBudgetExceeded, error.CypherEdgeBudgetExceeded, error.CypherStateBudgetExceeded, error.SqlWriteCapacityUnavailable => 429,
+        error.OutOfMemory, error.CypherResponseTooLarge, error.CypherMemoryBudgetExceeded, error.CypherAnchorBudgetExceeded, error.CypherEdgeBudgetExceeded, error.CypherStateBudgetExceeded, error.SqlWriteCapacityUnavailable, error.SessionLimitExceeded => 429,
         error.SessionRecordTooLarge, error.TransactionTooLarge => 413,
         error.DeadlineExceeded => 408,
         error.Canceled => 499,
@@ -380,7 +393,7 @@ pub fn errorMessage(err: anyerror, outcome: WriteOutcome) []const u8 {
         error.CypherValueDepthExceeded => "A computed or input value exceeds 64 nesting levels. Reduce nested list or map construction.",
         error.CypherResponseTooLarge => "The result exceeds the response limit. Reduce RETURN data or add a smaller LIMIT.",
         error.OutOfMemory, error.CypherMemoryBudgetExceeded, error.CypherAnchorBudgetExceeded, error.CypherEdgeBudgetExceeded, error.CypherStateBudgetExceeded => "The query exceeded its execution budget. Narrow the starting nodes, bound path lengths, or reduce intermediate results.",
-        error.SqlWriteCapacityUnavailable => "Write capacity is temporarily unavailable. Wait for active transactions to finish before submitting a new write.",
+        error.SqlWriteCapacityUnavailable, error.SessionLimitExceeded => "Write capacity is temporarily unavailable. Wait for active transactions to finish before submitting a new write.",
         error.DeadlineExceeded => "The query exceeded its deadline. Narrow the query or increase the allowed deadline.",
         error.Canceled => "The query was canceled.",
         error.MissingCypherParameter, error.InvalidCypherParameters => "Provide every query parameter using the supported parameter object or typed parameter format.",

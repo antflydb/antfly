@@ -512,11 +512,11 @@ const OwnedRead = struct {
         if (self.session_id) |id_hex| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(id_hex) catch return error.SqlTransactionNotActive;
             transaction_lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
-            tenure = try server.txn_sessions.sqlReaderTenure(alloc, id, credential.sessionPrincipal(), server.localSessionNodeId());
-            if (credential.transaction_guard) |guard| if (!std.mem.eql(u8, &guard.id, &id) or guard.tenure != tenure) return error.SessionLeaseLost;
-            var state = (try server.txn_sessions.readSqlState(alloc, id, &self.staged)) orelse return error.SqlTransactionNotActive;
-            defer state.deinit(alloc);
-            if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
+            var statement_admission = try server.txn_sessions.admitSqlStatementForOwner(server.alloc, alloc, id, credential.sessionPrincipal(), server.localSessionNodeId(), null, credential.transaction_guard);
+            defer statement_admission.state.deinit(server.alloc);
+            self.staged = statement_admission.staged;
+            tenure = statement_admission.guard.tenure;
+            const state = &statement_admission.state;
             if (!std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
             if (state.metadata.accepted_lake_reads) {
                 if (request.read_requirements.visibility == .committed) return error.ReadSnapshotTooOld;
@@ -524,7 +524,7 @@ const OwnedRead = struct {
             }
             self.native_adapter.accepted_lake_repeatable = self.native_adapter.lake_visibility == .accepted and (state.metadata.isolation != .serializable or state.metadata.mode == .read_only);
             self.native_adapter.active_transaction = id;
-            self.native_adapter.admitted_mutation = .{ .id = id, .owner = server.localSessionNodeId(), .tenure = tenure };
+            self.native_adapter.admitted_mutation = statement_admission.guard;
             self.native_adapter.staged = &self.staged;
             if (state.metadata.isolation != .read_committed) self.native_adapter.range_reads = &self.range_guards;
         }

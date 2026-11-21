@@ -35,6 +35,7 @@ pub const Provider = struct {
     overlay: ?*cypher.transaction.Overlay = null,
     transaction_id: ?types.TxnId = null,
     request_id: ?[]const u8 = null,
+    receipt_names: std.StringHashMapUnmanaged([]const u8) = .empty,
     outcome: ?contract.CommitOutcome = null,
     pub fn host(self: *Provider) cypher.transaction.Host {
         return .{ .ptr = self, .new_identity = newIdentity, .commit = commit };
@@ -100,7 +101,7 @@ pub const Provider = struct {
         var id: types.TxnId = undefined;
         if (self.request_id) |encoded| id = try @import("distributed_txn.zig").parseTxnIdHex(encoded) else try self.server.embedding_provider_runtime.io.randomSecure(&id);
         self.transaction_id = id;
-        const receipt = try @import("graph_write_receipt.zig").execute(self.server, self.identity.*, self.context, id, requests, a, &self.execution_plan);
+        const receipt = try @import("graph_write_receipt.zig").execute(self.server, self.identity.*, self.context, id, requests, self.receipt_names, a, &self.execution_plan);
         self.receipt = receipt;
         self.outcome = receipt.outcome;
         if (receipt.status == .aborted) return receipt.failure orelse error.CypherTransactionConflict;

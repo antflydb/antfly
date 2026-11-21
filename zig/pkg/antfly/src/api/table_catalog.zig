@@ -94,6 +94,7 @@ pub const CatalogSource = struct {
         /// Snapshot slices and all transitively referenced bytes must remain
         /// valid until the matching `free_admin_snapshot` call returns.
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
+        admin_snapshot_with_budget: ?*const fn (*anyopaque, RoutingBudget) anyerror!metadata_api.AdminSnapshot = null,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
         export_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 = null,
         catalog_identity: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.CatalogIdentity = null,
@@ -151,6 +152,17 @@ pub const CatalogSource = struct {
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
         return try self.vtable.admin_snapshot(self.ptr);
+    }
+
+    pub fn adminSnapshotWithBudget(self: CatalogSource, routing_budget: RoutingBudget) !metadata_api.AdminSnapshot {
+        try routing_budget.checkpoint();
+        var snapshot = if (self.vtable.admin_snapshot_with_budget) |capture|
+            try capture(self.ptr, routing_budget)
+        else
+            try self.adminSnapshot();
+        errdefer self.freeAdminSnapshot(&snapshot);
+        try routing_budget.checkpoint();
+        return snapshot;
     }
 
     pub fn restoreScopeForGroup(self: CatalogSource, table_name: []const u8, group_id: u64) !?[32]u8 {
@@ -718,6 +730,7 @@ pub const RoutingSession = struct {
         .restore_scope_for_group = restoreScopeForGroup,
         .restore_plan_for_group = restorePlanForGroup,
         .admin_snapshot = adminSnapshot,
+        .admin_snapshot_with_budget = adminSnapshotWithBudget,
         .free_admin_snapshot = freeAdminSnapshot,
         .routing_snapshot = routingSnapshot,
         .linearizable_routing_snapshot = linearizableRoutingSnapshot,
@@ -746,6 +759,10 @@ pub const RoutingSession = struct {
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         return try cast(ptr).base.adminSnapshot();
+    }
+
+    fn adminSnapshotWithBudget(ptr: *anyopaque, routing_budget: RoutingBudget) !metadata_api.AdminSnapshot {
+        return cast(ptr).base.adminSnapshotWithBudget(routing_budget);
     }
 
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {

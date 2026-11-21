@@ -14472,17 +14472,19 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         read_only: bool,
     ) !bool {
-        if ((try self.txn_sessions.principalAccess(
-            self.alloc,
-            txn_id,
-            transactionPrincipal(authenticated_identity),
-        )) != .allowed) return false;
-        var details = (try self.txn_sessions.getDetails(self.alloc, txn_id)) orelse return false;
+        var details = (try self.authorizedTransactionSessionDetails(txn_id, authenticated_identity, read_only)) orelse return false;
         defer details.deinit(self.alloc);
-        // Connection-owned sessions and graph receipts expose status here.
-        // Their execution and retirement stay with their originating protocol.
-        if (!directTransactionRouteEligible(details, read_only)) return false;
-        return try self.transactionSessionDetailsAuthorized(authenticated_identity, details);
+        return true;
+    }
+
+    pub fn authorizedTransactionSessionDetails(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, identity: ?AuthenticatedIdentity, read_only: bool) !?transactions_api.SessionDetails {
+        var details = (try self.txn_sessions.getDetailsForPrincipal(self.alloc, txn_id, transactionPrincipal(identity))) orelse return null;
+        errdefer details.deinit(self.alloc);
+        if (!directTransactionRouteEligible(details, read_only) or !try self.transactionSessionDetailsAuthorized(identity, details)) {
+            details.deinit(self.alloc);
+            return null;
+        }
+        return details;
     }
 
     fn directTransactionRouteEligible(details: transactions_api.SessionDetails, read_only: bool) bool {
@@ -14501,8 +14503,9 @@ pub const ApiHttpServer = struct {
         var authorized = std.ArrayListUnmanaged(transactions_api.SessionStatus).empty;
         errdefer authorized.deinit(self.alloc);
         for (candidates) |status| {
-            if (try self.transactionSessionReadable(status.txn_id, authenticated_identity))
-                try authorized.append(self.alloc, status);
+            var details = (try self.authorizedTransactionSessionDetails(status.txn_id, authenticated_identity, true)) orelse continue;
+            defer details.deinit(self.alloc);
+            try authorized.append(self.alloc, details.status);
         }
         return try authorized.toOwnedSlice(self.alloc);
     }
@@ -14544,7 +14547,13 @@ pub const ApiHttpServer = struct {
     ) !bool {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        const resources = try self.currentTransactionResources(arena.allocator(), details.catalog_bindings);
+        const a = arena.allocator();
+        const bindings = if (details.graph_receipt and details.catalog_bindings.len == 0) legacy: {
+            const entries = try a.alloc(transactions_api.CatalogBinding, details.tables.len);
+            for (details.tables, entries) |table, *entry| entry.* = .{ .logical = table.table_name, .physical = table.storage_name orelse table.table_name };
+            break :legacy entries;
+        } else details.catalog_bindings;
+        const resources = try self.currentTransactionResources(a, bindings);
         for (details.tables) |table| {
             const resource = resources.get(table.table_name) orelse table.table_name;
             if (resource.len == 0) return false;

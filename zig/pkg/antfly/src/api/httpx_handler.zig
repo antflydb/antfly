@@ -5729,12 +5729,8 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, "")) |response| return response;
-        if (!(try self.api_server.transactionSessionReadable(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
         const alloc = self.api_server.alloc;
-        var details = (self.api_server.txn_sessions.getDetails(alloc, txn_id) catch |err| switch (err) {
+        var details = (self.api_server.authorizedTransactionSessionDetails(txn_id, authenticated_identity, true) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -5760,9 +5756,7 @@ pub const AntflyApiHandler = struct {
         // Principal binding remains authoritative after resource revocation.
         // This read returns no staged rows or catalog identities and must not
         // require participant permissions or a live execution owner.
-        if ((try self.api_server.txn_sessions.principalAccess(self.api_server.alloc, id, http_server_mod.transactionPrincipal(identity))) != .allowed)
-            return textResponse(ctx, 404, "not found");
-        const status = (try self.api_server.txn_sessions.getStatus(self.api_server.alloc, id)) orelse return textResponse(ctx, 404, "not found");
+        const status = (try self.api_server.txn_sessions.getStatusForPrincipal(self.api_server.alloc, id, http_server_mod.transactionPrincipal(identity))) orelse return textResponse(ctx, 404, "not found");
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         return ctx.openApiJson(try transactions_api.buildSessionStatusResponse(arena.allocator(), status));

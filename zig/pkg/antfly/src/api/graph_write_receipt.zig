@@ -22,7 +22,7 @@ const sessions = @import("transactions.zig");
 const contract = local.api_local_transaction_contract;
 pub const Status = enum { committed, committed_pending, committed_repair_required, aborted, unknown };
 pub const Result = struct { status: Status, outcome: ?contract.CommitOutcome = null, failure: ?anyerror = null };
-pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: local.api_operation.RequestContext, id: local.storage_db_types.TxnId, tables: []const contract.TableCommitRequest, alloc: std.mem.Allocator, retained_plan: *?sessions.ExecutionPlan) !Result {
+pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: local.api_operation.RequestContext, id: local.storage_db_types.TxnId, tables: []const contract.TableCommitRequest, receipt_names: std.StringHashMapUnmanaged([]const u8), alloc: std.mem.Allocator, retained_plan: *?sessions.ExecutionPlan) !Result {
     const owned = server.alloc;
     const registry = &server.txn_sessions;
     var input_arena = std.heap.ArenaAllocator.init(owned);
@@ -32,8 +32,10 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     for (tables, input.tables) |table, *entry| {
         const writes = try input_alloc.alloc(local.storage_db_types.BatchWrite, table.writes.len);
         for (table.writes, writes) |write, *output| output.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
+        const logical = receipt_names.get(table.table_name) orelse table.table_name;
+        try input.bind(input_alloc, logical, table.table_name);
         entry.* = .{
-            .table_name = @constCast(table.table_name),
+            .table_name = @constCast(logical),
             .schema_version = table.schema_version,
             .relational_schema_version = table.relational_schema_version,
             .batch = .{ .writes = writes, .deletes = @constCast(table.deletes), .transforms = @constCast(table.transforms), .graph_writes = @constCast(table.graph_writes), .graph_deletes = @constCast(table.graph_deletes) },
@@ -69,7 +71,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
             return .{ .status = .aborted, .failure = publicAbortCause(err) };
         }
         if (err == error.EnrichmentWorkerFailed) {
-            _ = registry.recordTerminalCommitWithRepair(owned, id, .committed, true, null, null) catch return .{ .status = .committed_pending };
+            _ = (registry.recordTerminalCommitWithRepair(owned, id, .committed, true, null, null) catch return .{ .status = .committed_pending }) orelse return .{ .status = .committed_pending };
             return .{ .status = .committed_repair_required };
         }
         return .{ .status = switch (err) {
@@ -84,11 +86,11 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         },
         .committed => |committed| {
             const status = sessions.terminalCommitStatusForOutcome(committed.propagation_pending, committed.visibility_pending, committed.visibility_retry_pending, committed.visibility_repair_required);
-            _ = registry.recordTerminalCommitWithRepair(owned, id, status, committed.visibility_repair_required, committed.coordinator_group_id, committed.coordinator_table_name) catch return .{ .status = .committed_pending, .outcome = outcome };
+            _ = (registry.recordTerminalCommitWithRepair(owned, id, status, committed.visibility_repair_required, committed.coordinator_group_id, committed.coordinator_table_name) catch return .{ .status = .committed_pending, .outcome = outcome }) orelse return .{ .status = .committed_pending, .outcome = outcome };
             if (status == .committed) if (committed.coordinator_group_id) |group| {
                 const table = committed.coordinator_table_name orelse return .{ .status = .committed_pending, .outcome = outcome };
-                _ = writer.acknowledgeTransactionCommit(alloc, id, group, table) catch return .{ .status = .committed_pending, .outcome = outcome };
-                _ = registry.markTerminalCoordinatorAcknowledged(owned, id) catch return .{ .status = .committed_pending, .outcome = outcome };
+                _ = (writer.acknowledgeTransactionCommit(alloc, id, group, table) catch return .{ .status = .committed_pending, .outcome = outcome }) orelse return .{ .status = .committed_pending, .outcome = outcome };
+                _ = (registry.markTerminalCoordinatorAcknowledged(owned, id) catch return .{ .status = .committed_pending, .outcome = outcome }) orelse return .{ .status = .committed_pending, .outcome = outcome };
             };
             return .{ .status = if (committed.visibility_repair_required) .committed_repair_required else if (status == .committed) .committed else .committed_pending, .outcome = outcome };
         },

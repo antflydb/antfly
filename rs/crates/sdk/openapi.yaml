@@ -8761,6 +8761,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           description: Catalog or policy generation changed, or a write conflicted
+        '413':
+          description: Graph write exceeds transaction capacity
         '429':
           description: Query capacity or resource budget exhausted
         '503':
@@ -9557,7 +9559,7 @@ paths:
         '503':
           $ref: '#/components/responses/WriteTemporarilyUnavailable'
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
         '501':
           description: Catalog target cannot be delegated to legacy table storage unambiguously.
       security:
