@@ -111,6 +111,10 @@ pub const Sink = struct {
     /// this backend's mirror. With it, the `tip_namespace` records stay out of
     /// the mirror and are always read this way (see `tip_namespace`).
     loadOneAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
+    /// Optional: a value that grows whenever any commit changes `scope`'s
+    /// records, from any process, or null when the sink cannot say. See
+    /// `scopeGuard`.
+    scopeSequence: ?*const fn (ptr: *anyopaque, scope: []const u8) ?u64 = null,
     /// Optional (`null` for a `Sink` with no deferred path, e.g. the test
     /// fakes below): like `submit`, but for `durable = false` only, and
     /// never blocks waiting for the underlying group commit to apply --
@@ -148,8 +152,29 @@ pub const Sink = struct {
 /// docs/design/lite-performance/lite-full-text-storage.md.
 pub const tip_namespace = "docmap";
 
+/// A commit carrying a `scopeGuard` mutation applies only if its scope has
+/// not changed since the guarded value was read (`Sink.scopeSequence`); the
+/// sink checks it under writer authority and refuses with
+/// `error.IndexScopeChanged`. The guard is never stored or mirrored. Lets a
+/// publication computed from reads at the tip (a merge's doc map checks)
+/// commit only if those reads are still the tip.
+pub const guard_namespace = "\x00guard";
+
+pub fn scopeGuard(expected: *const [8]u8) Mutation {
+    return .{ .namespace = guard_namespace, .key = "scope_sequence", .value = expected };
+}
+
+pub fn isGuard(namespace: ?[]const u8) bool {
+    return if (namespace) |name| std.mem.eql(u8, name, guard_namespace) else false;
+}
+
 fn isTipNamespace(namespace: ?[]const u8) bool {
     return if (namespace) |name| std.mem.eql(u8, name, tip_namespace) else false;
+}
+
+/// Staged only: never mirrored.
+fn isStagedOnly(namespace: ?[]const u8) bool {
+    return isGuard(namespace);
 }
 
 /// Durably removes every entry currently committed under `scope`, so a
@@ -309,7 +334,7 @@ pub const Backend = struct {
         };
         const tip_reads = options.sink.loadOneAlloc != null;
         for (loaded) |entry| {
-            if (!(tip_reads and isTipNamespace(entry.namespace))) {
+            if (!(tip_reads and isTipNamespace(entry.namespace)) and !isStagedOnly(entry.namespace)) {
                 const next = try tree.put(allocator, entry.namespace, entry.key, entry.value);
                 tree.release(allocator);
                 tree = next;
@@ -580,6 +605,12 @@ pub const Backend = struct {
         return self.sink.loadOneAlloc != null;
     }
 
+    /// See `Sink.scopeSequence`.
+    pub fn scopeSequence(self: *const Backend) ?u64 {
+        const scope_sequence = self.sink.scopeSequence orelse return null;
+        return scope_sequence(self.sink.ptr, self.scope);
+    }
+
     pub fn invalidateMirror(self: *Backend) void {
         self.mirror_invalid.store(true, .release);
     }
@@ -595,7 +626,7 @@ pub const Backend = struct {
         var cloned = current.state.clone();
         errdefer cloned.deinit(self.allocator);
         for (mutations) |m| {
-            if (self.tipReads() and isTipNamespace(m.namespace)) continue;
+            if ((self.tipReads() and isTipNamespace(m.namespace)) or isStagedOnly(m.namespace)) continue;
             const namespace: backend_types.Namespace = .{ .name = m.namespace };
             if (m.is_delete) {
                 // Matches `NamespaceTxn.delete`'s own unconditional `try`
@@ -775,7 +806,9 @@ pub const Backend = struct {
                 // old always-blocking `submit` for a `Sink` with no deferred
                 // path (every current fake/test `Sink`), which keeps this
                 // exactly as correct -- just not as fast -- as before.
-                if (!self.durable and self.backend.sink.submitDeferred != null) {
+                // A guarded commit can be refused; it must not be deferred,
+                // or the refusal would surface after this mirror swap.
+                if (!self.durable and self.backend.sink.submitDeferred != null and !self.hasGuard()) {
                     const pending = try self.backend.sink.submitDeferred.?(self.backend.sink.ptr, self.backend.scope, self.pending.items);
                     try self.backend.enqueuePendingRideAlong(pending);
                 } else {
@@ -818,6 +851,11 @@ pub const Backend = struct {
             return value;
         }
 
+        fn hasGuard(self: *const NamespaceTxn) bool {
+            for (self.pending.items) |m| if (isGuard(m.namespace)) return true;
+            return false;
+        }
+
         /// A `tip_namespace` read: this transaction's latest staged write,
         /// then the file. The value lives until the transaction ends.
         fn getAtTip(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
@@ -835,7 +873,7 @@ pub const Backend = struct {
 
         pub fn put(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
             if (self.read_only) return error.ReadOnly;
-            if (self.backend.tipReads() and isTipNamespace(namespace.name)) return self.stage(namespace, key, value, false);
+            if ((self.backend.tipReads() and isTipNamespace(namespace.name)) or isStagedOnly(namespace.name)) return self.stage(namespace, key, value, false);
             if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
             self.replaceTree(try self.rc.?.state.tree.put(self.allocator, namespace.name, key, value));
             try self.pending.append(self.pending_arena.allocator(), .{

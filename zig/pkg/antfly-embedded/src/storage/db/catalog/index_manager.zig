@@ -27002,6 +27002,9 @@ pub const IndexManager = struct {
                 publication_deletes.bitmaps,
             ) catch |err| switch (err) {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
+                // Another commit changed the index since this merge read the
+                // doc map: stale, like any other; it is planned again.
+                error.IndexScopeChanged => false,
                 else => {
                     const mapped_err = task.deletion_state.allocationError(err);
                     logTextMergeFailure("apply", task.index_name, mapped_err);
@@ -27018,6 +27021,9 @@ pub const IndexManager = struct {
                 publication_deletes.bitmaps,
             ) catch |err| switch (err) {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
+                // Another commit changed the index since this merge read the
+                // doc map: stale, like any other; it is planned again.
+                error.IndexScopeChanged => false,
                 else => {
                     const mapped_err = task.deletion_state.allocationError(err);
                     logTextMergeFailure("apply", task.index_name, mapped_err);

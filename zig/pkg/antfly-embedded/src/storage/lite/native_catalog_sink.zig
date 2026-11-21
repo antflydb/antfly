@@ -86,6 +86,13 @@ fn decodeAlloc(allocator: Allocator, scope: []const u8, full_key: []const u8, va
     };
 }
 
+fn checkScopeGuard(file: *native.NativeFile, scope: []const u8, value: []const u8) !void {
+    if (value.len != 8) return error.InvalidIndexScopeGuard;
+    const expected = std.mem.readInt(u64, value[0..8], .little);
+    const redo = if (file.redo) |*redo| redo else return error.IndexScopeChanged;
+    if (redo.shared.scopeLatestSequence(file.runtime(), scope) != expected) return error.IndexScopeChanged;
+}
+
 const ApplyCtx = struct {
     scope: []const u8,
     mutations: []const native_catalog_backend.Mutation,
@@ -97,19 +104,26 @@ const ApplyCtx = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        const batch = try a.alloc(native.CatalogMutation, self.mutations.len);
-        for (self.mutations, batch) |m, *out| {
-            out.* = .{
+        var batch = try std.ArrayListUnmanaged(native.CatalogMutation).initCapacity(a, self.mutations.len);
+        for (self.mutations) |m| {
+            // A scope guard is checked here, under writer authority at the
+            // file's tip, and never written: the commit applies only if no
+            // commit has changed this scope since the guarded reads.
+            if (native_catalog_backend.isGuard(m.namespace)) {
+                try checkScopeGuard(file, self.scope, m.value);
+                continue;
+            }
+            batch.appendAssumeCapacity(.{
                 .key = try durableKeyAlloc(a, self.scope, m.namespace, m.key),
                 .value = m.value,
                 .is_delete = m.is_delete,
-            };
+            });
         }
         // One call: every mutation this transaction accumulated lands in the
         // same native commit (one `syncData`/checkpoint publication) as
         // whatever else `submitIndexMutation`'s group-commit queue already
         // batched with it.
-        try file.putIndexCatalogBatch(batch);
+        try file.putIndexCatalogBatch(batch.items);
     }
 };
 
@@ -169,15 +183,22 @@ const DeferredApplyCtx = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        const batch = try a.alloc(native.CatalogMutation, self.mutations.len);
-        for (self.mutations, batch) |m, *out| {
-            out.* = .{
+        var batch = try std.ArrayListUnmanaged(native.CatalogMutation).initCapacity(a, self.mutations.len);
+        for (self.mutations) |m| {
+            // A scope guard is checked here, under writer authority at the
+            // file's tip, and never written: the commit applies only if no
+            // commit has changed this scope since the guarded reads.
+            if (native_catalog_backend.isGuard(m.namespace)) {
+                try checkScopeGuard(file, self.scope, m.value);
+                continue;
+            }
+            batch.appendAssumeCapacity(.{
                 .key = try durableKeyAlloc(a, self.scope, m.namespace, m.key),
                 .value = m.value,
                 .is_delete = m.is_delete,
-            };
+            });
         }
-        try file.putIndexCatalogBatch(batch);
+        try file.putIndexCatalogBatch(batch.items);
     }
 
     /// `native_catalog_backend.Pending.waitFn`: waits for this ride-along
@@ -205,6 +226,7 @@ pub const Sink = struct {
             .submit = submit,
             .loadAllAlloc = loadAllAlloc,
             .loadOneAlloc = loadOneAlloc,
+            .scopeSequence = scopeSequence,
             .submitDeferred = submitDeferred,
             .pauseMaintenance = pauseMaintenance,
             .resumeMaintenance = resumeMaintenance,
@@ -324,6 +346,12 @@ pub const Sink = struct {
             }
         }
         return try result.toOwnedSlice(allocator);
+    }
+
+    fn scopeSequence(ptr: *anyopaque, scope: []const u8) ?u64 {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        const redo = if (self.store.file.redo) |*redo| redo else return null;
+        return redo.shared.scopeLatestSequence(self.store.file.runtime(), scope);
     }
 
     /// One committed record, read from the file at its current tip.
