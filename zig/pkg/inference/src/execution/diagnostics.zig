@@ -85,21 +85,34 @@ pub const PendingInterval = struct {
         download_bytes: u64 = 0,
         device_copies: ?u64 = null,
         device_copy_bytes: ?u64 = null,
+        host_accesses: u64 = 0,
+        host_access_bytes: u64 = 0,
+        index_metadata_host_accesses: u64 = 0,
+        index_metadata_host_access_bytes: u64 = 0,
+        /// Sum of callback host wall time, excluding inter-phase waits.
+        callback_wall_ns: ?u64 = null,
         native_assigned_dispatches: u64 = 0,
         metal_encoded_dispatches: ?u64 = null,
+        metal_vendor_encodes: ?u64 = null,
         metal_command_submissions: ?u64 = null,
         metal_command_waits: ?u64 = null,
         cuda_accepted_launch_calls: ?u64 = null,
 
-        pub fn join(self: *ObservedPhases, transfers: @import("transfer_audit.zig").Measurements, submission: observation.Counters, cuda_launch_calls: ?u64) void {
+        pub fn join(self: *ObservedPhases, transfers: @import("transfer_audit.zig").Measurements, submission: observation.Counters, cuda_launch_calls: ?u64, wall_ns: ?u64) void {
             self.uploads +|= transfers.upload_calls;
             self.upload_bytes +|= transfers.upload_bytes;
             self.downloads +|= transfers.download_calls;
             self.download_bytes +|= transfers.download_bytes;
             self.device_copies = sum(self.count, self.device_copies, transfers.device_copy_calls);
             self.device_copy_bytes = sum(self.count, self.device_copy_bytes, transfers.device_copy_bytes);
+            self.host_accesses +|= transfers.host_accesses;
+            self.host_access_bytes +|= transfers.host_access_bytes;
+            self.index_metadata_host_accesses +|= transfers.index_metadata_host_accesses;
+            self.index_metadata_host_access_bytes +|= transfers.index_metadata_host_access_bytes;
+            self.callback_wall_ns = sum(self.count, self.callback_wall_ns, wall_ns);
             self.native_assigned_dispatches +|= submission.native_assigned_dispatches;
             self.metal_encoded_dispatches = sum(self.count, self.metal_encoded_dispatches, submission.metal_encoded_dispatches);
+            self.metal_vendor_encodes = sum(self.count, self.metal_vendor_encodes, submission.metal_vendor_encodes);
             self.metal_command_submissions = sum(self.count, self.metal_command_submissions, submission.metal_command_submissions);
             self.metal_command_waits = sum(self.count, self.metal_command_waits, submission.metal_command_waits);
             self.cuda_accepted_launch_calls = sum(self.count, self.cuda_accepted_launch_calls, cuda_launch_calls);
@@ -122,6 +135,7 @@ pub const PendingInterval = struct {
     prior_failure: ?Text = null,
     counters_scope: enum { synchronous_phase_only } = .synchronous_phase_only,
     whole_interval_counters: enum { unavailable } = .unavailable,
+    callback_wall_ns: ?u64 = null,
     observed_phases: ?ObservedPhases = null,
 };
 pub const PublicationScope = enum { program_execution, session_numerical_dispatch, shared_batch_numerical_dispatch, session_preparation };
@@ -171,6 +185,8 @@ pub const StagePlacement = struct {
         missing_controlled_entry,
         unsupported_encoder_signature,
         unsupported_decoder_signature,
+        unknown_decoder_vocabulary,
+        missing_resident_row_selection,
     };
 };
 

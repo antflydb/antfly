@@ -55,6 +55,7 @@ pub fn residentPairPlacement(encoder: backends.Session, decoder: backends.Sessio
     if (decoder.shared_compute_context != source) return .foreign_context;
     if (encoder.vtable.runResident == null or decoder.vtable.runResidentInputs == null) return .missing_resident_entry;
     if (controlled and (encoder.vtable.runResidentWithControl == null or decoder.vtable.runResidentInputsWithControl == null)) return .missing_controlled_entry;
+    if (source.stableBackend().vtable.sliceRows2D == null) return .missing_resident_row_selection;
     const outputs = encoder.outputInfo();
     if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 3) return .unsupported_encoder_signature;
     const logits = decoder.outputInfo();
@@ -87,14 +88,16 @@ pub fn encode(allocator: std.mem.Allocator, encoder: backends.Session, decoder: 
 /// A preprocessing permit may transfer its lease into resident encoder outputs.
 /// Host reference execution preserves the caller's existing permit lifetime.
 pub fn encodeWithPermit(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
-    return encodeOptions(allocator, encoder, decoder, inputs, dispatch, control, supplied, false);
+    return encodeOptions(allocator, encoder, decoder, inputs, dispatch, control, supplied, .resident);
 }
 
 /// An incremental consumer explicitly opts into its typed cache receiver. A
 /// stateless full-prefix task must never inherit a native KV route implicitly.
 pub fn encodeForIncrementalWithPermit(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
-    return encodeOptions(allocator, encoder, decoder, inputs, dispatch, control, supplied, true);
+    return encodeOptions(allocator, encoder, decoder, inputs, dispatch, control, supplied, .incremental);
 }
+
+pub const EncoderIntent = enum { resident, incremental, vocabulary_row };
 
 const EncoderRoute = struct {
     dispatched: bool,
@@ -102,10 +105,17 @@ const EncoderRoute = struct {
     incremental: ?Incremental.Receiver,
     placement: PlacementReason,
 };
-fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, allow_incremental: bool) EncoderRoute {
+fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, intent: EncoderIntent) EncoderRoute {
     const dispatched = if (comptime @TypeOf(dispatch) == @TypeOf(null)) false else if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) dispatch != null else true;
-    const incremental = if (allow_incremental) Incremental.qualify(encoder, decoder) else null;
-    const placement: PlacementReason = if (!supportsResidentDispatch(dispatch)) .dispatcher_host_only else if (incremental != null) .resident_incremental else residentPairPlacement(encoder, decoder, control != null);
+    const incremental = if (intent == .incremental) Incremental.qualify(encoder, decoder) else null;
+    const placement: PlacementReason = if (intent == .vocabulary_row and outputVocabulary(decoder) == null)
+        .unknown_decoder_vocabulary
+    else if (!supportsResidentDispatch(dispatch))
+        .dispatcher_host_only
+    else if (incremental != null)
+        .resident_incremental
+    else
+        residentPairPlacement(encoder, decoder, control != null);
     return .{ .dispatched = dispatched, .incremental = incremental, .placement = placement, .resident = placement == .resident_pair or placement == .resident_incremental };
 }
 
@@ -113,15 +123,15 @@ fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: 
 /// shared with execution; host fallbacks allocate no resident metadata. A typed
 /// dispatcher prepares its own exact execution, so its preprocessing permit is
 /// left unchanged. Supplied execution itself only validates this prepayment.
-pub fn prepareEncoderPermit(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, allow_incremental: bool, permit: *session_mod.RunPermit) !void {
+pub fn prepareEncoderPermit(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, intent: EncoderIntent, permit: *session_mod.RunPermit) !void {
     if (permit.session.ptr != encoder.ptr or permit.session.vtable != encoder.vtable) return error.InvalidStagePermit;
-    const selected = encoderRoute(encoder, decoder, dispatch, control, allow_incremental);
+    const selected = encoderRoute(encoder, decoder, dispatch, control, intent);
     if (selected.resident and !selected.dispatched) try permit.prepareResidentOutputRetirement();
 }
 
-fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit, allow_incremental: bool) !EncoderOutputs {
+fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit, intent: EncoderIntent) !EncoderOutputs {
     if (supplied) |permit| if (permit.session.ptr != encoder.ptr or permit.session.vtable != encoder.vtable) return error.InvalidStagePermit;
-    const selected = encoderRoute(encoder, decoder, dispatch, control, allow_incremental);
+    const selected = encoderRoute(encoder, decoder, dispatch, control, intent);
     observePlacement(encoder, decoder, selected.placement);
     const dispatched = selected.dispatched;
     const incremental = selected.incremental;
@@ -133,7 +143,7 @@ fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decode
             break :blk &own_permit.?;
         };
         if (!dispatched) if (permit) |owner| {
-            if (own_permit != null) try prepareEncoderPermit(encoder, decoder, dispatch, control, allow_incremental, owner) else try owner.validateResidentOutputRetirement();
+            if (own_permit != null) try owner.prepareResidentOutputRetirement() else try owner.validateResidentOutputRetirement();
         };
         var values = if (dispatched)
             (try callResidentDispatch(dispatch, allocator, encoder, permit, inputs, control)) orelse return error.UnexpectedResidentStageDecline
@@ -309,8 +319,7 @@ pub fn encodeForFinalRow(allocator: std.mem.Allocator, encoder: backends.Session
 }
 
 pub fn encodeForFinalRowWithPermit(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
-    if (outputVocabulary(decoder) == null) return encodeHost(allocator, encoder, inputs, dispatch, control, supplied);
-    return encodeWithPermit(allocator, encoder, decoder, inputs, dispatch, control, supplied);
+    return encodeOptions(allocator, encoder, decoder, inputs, dispatch, control, supplied, .vocabulary_row);
 }
 
 /// Only the final vocabulary row crosses the output boundary. The encoder and
@@ -356,7 +365,8 @@ pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Sessio
     if (control) |active| try active.check();
     var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
     defer if (guard) |*scope| scope.deinit();
-    const row = try outputs.backend.sliceRows2D(allocator, outputs.outputs[0], query_rows - 1, 1, vocab);
+    const slice = outputs.backend.vtable.sliceRows2D orelse return error.UnexpectedResidentStageDecline;
+    const row = try slice(outputs.backend.ptr, outputs.outputs[0], query_rows - 1, 1, vocab);
     defer outputs.backend.free(row);
     const values = try outputs.backend.toFloat32(row, allocator);
     errdefer allocator.free(values);
@@ -406,7 +416,7 @@ test "encoder decoder resident stages retain hidden state and materialize only t
             defer audit_mod.end();
             var permit = try encoder.admitInputs(&.{input}, a, null);
             defer permit.deinit();
-            try prepareEncoderPermit(encoder, decoder, null, control, false, &permit);
+            try prepareEncoderPermit(encoder, decoder, null, control, .resident, &permit);
             var result = try encodeWithPermit(a, encoder, decoder, &.{input}, null, control, &permit);
             errdefer result.deinit(a);
             try std.testing.expect(permit.lease == null);
@@ -510,14 +520,17 @@ test "encoder cold preparation shares host fallback and typed dispatcher qualifi
     const session = backends.Session{ .ptr = &marker, .vtable = &Fixture.table };
     var permit = session_mod.RunPermit{ .session = session, .lease = null };
     defer permit.deinit();
-    try prepareEncoderPermit(session, session, null, null, false, &permit);
+    try prepareEncoderPermit(session, session, null, null, .resident, &permit);
     try std.testing.expect(permit.output_retirement_shell == null);
     var dispatcher = Dispatch{};
-    try prepareEncoderPermit(session, session, &dispatcher, null, true, &permit);
+    try prepareEncoderPermit(session, session, &dispatcher, null, .incremental, &permit);
     try std.testing.expect(permit.output_retirement_shell == null);
-    try std.testing.expect(!encoderRoute(session, session, &dispatcher, null, true).resident);
-    try std.testing.expectEqual(PlacementReason.dispatcher_host_only, encoderRoute(session, session, &dispatcher, null, true).placement);
+    try std.testing.expect(!encoderRoute(session, session, &dispatcher, null, .incremental).resident);
+    try std.testing.expectEqual(PlacementReason.dispatcher_host_only, encoderRoute(session, session, &dispatcher, null, .incremental).placement);
     try std.testing.expectEqual(PlacementReason.no_source_context, residentPairPlacement(session, session, false));
+    try prepareEncoderPermit(session, session, null, null, .vocabulary_row, &permit);
+    try std.testing.expect(permit.output_retirement_shell == null);
+    try std.testing.expectEqual(PlacementReason.unknown_decoder_vocabulary, encoderRoute(session, session, null, null, .vocabulary_row).placement);
     var diagnostics = @import("diagnostics.zig").Diagnostics{};
     diagnostics.configure(true);
     publishPlacement(&diagnostics, .native, .cuda, .foreign_context);

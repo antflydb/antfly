@@ -433,7 +433,7 @@ pub const TranscriptionPipeline = struct {
         // belongs to a fused batch; queued requests must not prepay idle peaks.
         var encoder_permit: ?@import("../backends/session.zig").RunPermit = if (self.native_workspace != null) null else try self.encoder.admit(planned);
         defer if (encoder_permit) |*permit| permit.deinit();
-        if (encoder_permit) |*permit| try stage_runtime.prepareEncoderPermit(self.encoder, self.decoder, self.batch_dispatch, self.execution_control, true, permit);
+        if (encoder_permit) |*permit| try stage_runtime.prepareEncoderPermit(self.encoder, self.decoder, self.batch_dispatch, self.execution_control, .incremental, permit);
 
         const mel_started = platform.time.monotonicNs();
         const mel = try audio.whisperMelFromPcmSecondsMels(allocator, samples, sample_rate, context_seconds, @intCast(n_mels));

@@ -1238,7 +1238,7 @@ pub const ReadingPipeline = struct {
         const encoder = self.vision_encoder.withAdmissionControl(self.execution_control);
         var permit = try preparation.admitRun(encoder, try encoder.planRun(inputs, null));
         defer permit.deinit();
-        try stage_runtime.prepareEncoderPermit(encoder, self.decoder, null, self.execution_control, false, &permit);
+        try stage_runtime.prepareEncoderPermit(encoder, self.decoder, null, self.execution_control, .vocabulary_row, &permit);
         return stage_runtime.encodeForFinalRowWithPermit(self.allocator, encoder, self.decoder, inputs, null, self.execution_control, &permit);
     }
 

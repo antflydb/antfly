@@ -12712,7 +12712,7 @@ test "foreign Metal public Whisper encoder final norm promotes before receiver a
     defer cleanup.finish();
     var permit = try encoder.admitInputs(&features, request_allocator, control);
     defer permit.deinit();
-    try stages.prepareEncoderPermit(encoder, destination, null, control, true, &permit);
+    try stages.prepareEncoderPermit(encoder, destination, null, control, .incremental, &permit);
     var encoded = try stages.encodeForIncrementalWithPermit(request_allocator, encoder, destination, &features, null, control, &permit);
     var encoded_open = true;
     defer if (encoded_open) encoded.deinit(request_allocator);
