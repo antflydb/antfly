@@ -7222,7 +7222,7 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
 /// owner. Adoption and legacy replay still load the complete durable record.
 fn decodeOwnedSealedRecovery(alloc: std.mem.Allocator, id: db_mod.types.TxnId, body: []const u8, owner: u64) !?Session {
     const Header = struct {
-        session_format: ?u16 = null,
+        session_format: u16 = 2,
         owner_node_id: ?u64 = null,
         begin_timestamp: u64,
         sync_level: []const u8,
@@ -7244,7 +7244,7 @@ fn decodeOwnedSealedRecovery(alloc: std.mem.Allocator, id: db_mod.types.TxnId, b
     };
     defer decoded.deinit();
     const header = decoded.value;
-    if (header.session_format) |version| if (version != 2) return error.InvalidTransactionSessionRecord;
+    if (header.session_format != 2) return error.InvalidTransactionSessionRecord;
     if ((header.owner_node_id orelse sessionOwnerNodeId(id)) != owner) return null;
     const plan = header.execution_plan orelse return null;
     if (!header.commit_execution_started) return error.InvalidTransactionSessionRecord;
