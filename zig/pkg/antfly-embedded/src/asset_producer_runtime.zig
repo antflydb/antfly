@@ -4235,7 +4235,12 @@ pub const Runtime = struct {
                     json_only = true;
                     continue;
                 },
-                error.InferenceDiscoveryShapeRejected => return if (framed_failure == error.InferenceDiscoveryTooManyItems) error.InferenceDiscoveryTooManyItems else err,
+                error.InferenceDiscoveryShapeRejected => {
+                    if (framed_failure) |failure| {
+                        if (failure == error.InferenceDiscoveryTooManyItems) return failure;
+                    }
+                    return err;
+                },
                 error.InferenceDiscoveryRequiresExactGeometry, error.InferenceDiscoveryTooManyItems, error.RemoteCapabilityDiscoveryTransient, error.RemoteCapabilityDiscoveryRejected => {
                     if (rounded) {
                         rounded = false;
@@ -4250,7 +4255,10 @@ pub const Runtime = struct {
                         complete = false;
                         continue;
                     }
-                    return if (framed_failure == error.InferenceDiscoveryTooManyItems) framed_failure.? else err;
+                    if (framed_failure) |failure| {
+                        if (failure == error.InferenceDiscoveryTooManyItems) return failure;
+                    }
+                    return err;
                 },
                 else => return err,
             };
