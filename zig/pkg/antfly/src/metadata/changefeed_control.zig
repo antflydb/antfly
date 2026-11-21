@@ -465,6 +465,7 @@ pub const State = struct {
     }
     pub fn atDeliveryBoundary(self: State) bool {
         if (self.cursors.len != 0) return false;
+        for (self.roots) |root| if (root.acknowledged.event != 0) return false;
         if (self.slot) |slot| {
             if (slot.entries.len != 0 or !equal(slot.mapped_cursor, self.acknowledged_cursor)) return false;
             for (slot.spool.records) |record| if (record.phase == .uploading) return false;
@@ -1902,11 +1903,13 @@ test "changefeed control separates partial delivery ACK and native reclamation" 
     try std.testing.expectError(error.ChangefeedCursorExpired, step(scratch, state, .{ .acknowledge = @splat(99) }));
     state = try step(scratch, state, .{ .acknowledge = first.cursor });
     try std.testing.expectEqual(@as(u32, 3), state.roots[0].acknowledged.event);
+    try std.testing.expect(!state.atDeliveryBoundary());
     try std.testing.expectEqual(@as(u64, 10), state.roots[0].reclaimed_through);
     try std.testing.expectError(error.ChangefeedConflict, step(scratch, state, .{ .reclaimed = .{ .namespace = testNamespace(7), .consumer_epoch = 6, .previous = 10, .next = 11 } }));
     const second = testDelivery(state, &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 11 } }});
     state = try step(scratch, state, .{ .issue = second });
     state = try step(scratch, state, .{ .acknowledge = second.cursor });
+    try std.testing.expect(state.atDeliveryBoundary());
     state = try step(scratch, state, .{ .reclaimed = .{ .namespace = testNamespace(7), .consumer_epoch = 6, .previous = 10, .next = 11 } });
     try std.testing.expectEqual(@as(u64, 11), state.roots[0].reclaimed_through);
     try std.testing.expectError(error.ChangefeedCursorExpired, step(scratch, state, .{ .acknowledge = first.cursor }));
