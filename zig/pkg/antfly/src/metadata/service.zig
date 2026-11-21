@@ -9747,6 +9747,13 @@ pub const MetadataHttpService = struct {
         return receipt;
     }
 
+    pub fn proposeSessionCommandObserved(self: *MetadataHttpService, bytes: []const u8, term: u64, submitted: *bool) !MetadataProposalReceipt {
+        if (term == 0) return error.NotLeader;
+        const receipt = try self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .apply_transaction_sessions = bytes }, term, null, submitted);
+        try self.waitForTransitionApplied(receipt);
+        return receipt;
+    }
+
     pub fn upsertNode(self: *MetadataHttpService, record: metadata_table_manager.NodeRecord) !void {
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();

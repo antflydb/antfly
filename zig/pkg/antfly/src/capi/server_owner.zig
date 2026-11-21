@@ -2793,6 +2793,16 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     @memcpy(upper[0..read.prefix.len], read.prefix);
     upper[read.prefix.len - 1] += 1;
     const upper_bound = upper[0..read.prefix.len];
+    if (request.operation == .prefix_page) {
+        if (request.offset > key.len or request.length > 128) return .invalid_argument;
+        const prefix_len: usize = @intCast(request.offset);
+        const prefix = key[0..prefix_len];
+        const after = key[prefix_len..];
+        if (!std.mem.startsWith(u8, prefix, read.prefix) or prefix.len > read.prefix.len + 512 or
+            (after.len != 0 and (!std.mem.startsWith(u8, after, prefix) or after.len > read.prefix.len + 512))) return .invalid_argument;
+        metadataSessionReadPrefixPage(read, prefix, after, request.length, out_value) catch |err| return storageOwnerStatusFromError(err);
+        return .ok;
+    }
     const bounded = switch (request.operation) {
         .get, .get_range, .count_prefix, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
         else => false,
@@ -2828,7 +2838,7 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     var cursor = read.txn.openCursor() catch |err| return storageOwnerStatusFromError(err);
     defer cursor.close();
     var entry = switch (request.operation) {
-        .get, .get_range, .count_prefix => unreachable,
+        .get, .get_range, .count_prefix, .prefix_page => unreachable,
         .first => cursor.seekAtOrAfter(read.prefix),
         .last => cursor.seekAtOrBefore(upper_bound),
         .next, .seek_at_or_after => cursor.seekAtOrAfter(key),
@@ -2841,6 +2851,40 @@ pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_o
     const current = entry orelse return .not_found;
     if (!std.mem.startsWith(u8, current.key, read.prefix)) return .not_found;
     return encodeMetadataSessionCursorEntry(read, current, out_value);
+}
+
+fn metadataSessionReadPrefixPage(read: *MetadataSessionRead, prefix: []const u8, after: []const u8, length: usize, out: *kernel_owner_abi.OwnedBytes) !void {
+    var cursor = try read.txn.openPhysicalKeyCursorAdapter();
+    defer cursor.close();
+    var scope = try read.txn.openReadScope(read.alloc);
+    defer scope.close();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(read.alloc);
+    var entry = try cursor.seekAtOrAfter(if (after.len == 0) prefix else after);
+    if (entry != null and after.len != 0 and std.mem.eql(u8, entry.?.key, after)) entry = try cursor.next();
+    var count: usize = 0;
+    while (entry) |row| {
+        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+        const value = scope.getRange(row.key, 0, length) catch |err| switch (err) {
+            error.EndOfStream, error.NotFound => &.{},
+            error.Unsupported => (@import("../metadata/transaction_session_record.zig").cachedRange(&scope, read.alloc, read.group, row.key[read.prefix.len..], 0, length) catch |cache_err| switch (cache_err) {
+                error.EndOfStream => null,
+                else => return cache_err,
+            }) orelse &.{},
+            else => return err,
+        };
+        var lengths: [4]u8 = undefined;
+        std.mem.writeInt(u16, lengths[0..2], @intCast(row.key.len), .little);
+        std.mem.writeInt(u16, lengths[2..4], @intCast(value.len), .little);
+        try bytes.appendSlice(read.alloc, &lengths);
+        try bytes.appendSlice(read.alloc, row.key);
+        try bytes.appendSlice(read.alloc, value);
+        count += 1;
+        if (count == 64) break;
+        entry = try cursor.next();
+    }
+    const owned = try bytes.toOwnedSlice(read.alloc);
+    out.* = .{ .ptr = if (owned.len == 0) null else owned.ptr, .len = @intCast(owned.len) };
 }
 
 const MetadataSessionCursor = struct {

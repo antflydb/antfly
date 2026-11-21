@@ -4050,6 +4050,15 @@ test "opaque metadata session reads retain binary values and survive raft snapsh
         var expanded = try restored.openSessionRead(a, group);
         defer expanded.abort();
         try std.testing.expectEqualSlices(u8, oversized, try expanded.get(session_key));
+        var page_arena = std.heap.ArenaAllocator.init(a);
+        defer page_arena.deinit();
+        const rows = try expanded.readPrefixPage(page_arena.allocator(), session_key, null, 128);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        try std.testing.expectEqualStrings(session_key, rows[0].key);
+        try std.testing.expectEqualSlices(u8, oversized[0..128], rows[0].value);
+        const rest = try expanded.readPrefixPage(page_arena.allocator(), session_key, rows[0].key, 128);
+        try std.testing.expectEqual(@as(usize, 1), rest.len);
+        try std.testing.expectEqualStrings(neighbor_key, rest[0].key);
         var scan = try expanded.openCursor();
         defer scan.close();
         scan.setKeysOnly();

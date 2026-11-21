@@ -21622,7 +21622,9 @@ pub const RaftApplyStore = struct {
             .apply_relation_reconciliation => |bytes| try self.applyRelationControlTxn(txn, group_id, bytes),
             .apply_system_catalog => |bytes| try self.applySystemCatalogTxn(txn, group_id, bytes),
             .apply_transaction_sessions => |bytes| {
-                _ = try transaction_session_record.apply(txn, self.alloc, group_id, bytes);
+                const applied = try transaction_session_record.apply(txn, self.alloc, group_id, bytes);
+                const position = self.active_resolver_apply_position;
+                if (position.index != 0) try transaction_session_record.writeApplyResult(txn, self.alloc, group_id, position.term, position.index, applied);
             },
             .apply_sql_settings => |bytes| try self.applySqlSettingsTxn(txn, group_id, bytes),
             .apply_sql_policies => |bytes| try self.applySqlPoliciesTxn(txn, group_id, bytes),

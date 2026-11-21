@@ -607,6 +607,7 @@ pub const ReadTxn = struct {
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
         fork_read: ?*const fn (Allocator, *anyopaque) anyerror!ReadTxn = null,
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
+        read_prefix_page: ?*const fn (*anyopaque, Allocator, []const u8, ?[]const u8, usize) anyerror![]Entry = null,
         count_prefix: ?*const fn (*anyopaque, []const u8) anyerror!u64 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
@@ -620,6 +621,13 @@ pub const ReadTxn = struct {
     pub fn decodedResultsNamespace(self: *const ReadTxn) ?[]const u8 {
         if (!self.canReuseDecodedResults()) return null;
         return if (self.vtable.decoded_results_namespace) |get_namespace| get_namespace(self.ptr) else null;
+    }
+
+    /// Up to 64 rows, after an exclusive continuation, from this snapshot.
+    /// Keys and bounded value prefixes are allocated by the caller.
+    pub fn readPrefixPage(self: *ReadTxn, alloc: Allocator, prefix: []const u8, after: ?[]const u8, value_prefix_len: usize) ![]Entry {
+        const read = self.vtable.read_prefix_page orelse return error.Unsupported;
+        return BoundaryAbi.call("read_prefix_page", self.boundary_dispatch, read, .{ self.ptr, alloc, prefix, after, value_prefix_len });
     }
 
     pub fn countPrefix(self: *ReadTxn, prefix: []const u8) !u64 {

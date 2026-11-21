@@ -53,6 +53,30 @@ pub const epoch_key = "\x00epoch";
 // its logical API. Old binaries advance epoch_key on every successful write.
 // A discontinuity starts a new generation, invalidating every pre-gap prefix.
 pub const cache_namespace = "\x00reader_v1/";
+/// The metadata writer serializes proposals per group. One bounded result
+/// slot suffices, and readers must match both Raft coordinates.
+pub const apply_result_key = cache_namespace ++ "last-apply-result";
+
+pub fn writeApplyResult(txn: anytype, a: std.mem.Allocator, group: u64, term: u64, index: u64, applied: bool) !void {
+    const key = try keyAlloc(a, group, apply_result_key);
+    defer a.free(key);
+    var result: [17]u8 = undefined;
+    std.mem.writeInt(u64, result[0..8], term, .little);
+    std.mem.writeInt(u64, result[8..16], index, .little);
+    result[16] = @intFromBool(applied);
+    try txn.put(key, &result);
+}
+
+pub fn readApplyResult(txn: anytype, a: std.mem.Allocator, group: u64, term: u64, index: u64) !bool {
+    const key = try keyAlloc(a, group, apply_result_key);
+    defer a.free(key);
+    const result = (try optionalGet(txn, key)) orelse return error.SessionApplyResultUnavailable;
+    if (result.len != 17 or result[16] > 1) return error.InvalidTransactionSessionRecord;
+    if (std.mem.readInt(u64, result[0..8], .little) != term or std.mem.readInt(u64, result[8..16], .little) != index)
+        return error.SessionApplyResultUnavailable;
+    return result[16] == 1;
+}
+
 const count_watermark = cache_namespace ++ "count-epoch";
 const watermark_key = cache_namespace ++ "epoch";
 const entry_prefix = cache_namespace ++ "record/";
@@ -345,6 +369,11 @@ test "replicated session compare and set rejects lost updates and scan phantoms 
     const a = std.testing.allocator;
     var map: Map = .{ .a = a };
     defer map.deinit();
+    try writeApplyResult(&map, a, 7, 2, 9, false);
+    try std.testing.expect(!try readApplyResult(&map, a, 7, 2, 9));
+    try std.testing.expectError(error.SessionApplyResultUnavailable, readApplyResult(&map, a, 7, 2, 8));
+    try writeApplyResult(&map, a, 7, 3, 10, true);
+    try std.testing.expect(try readApplyResult(&map, a, 7, 3, 10));
     const first = try encode(a, .{ .changes = &.{.{ .key = "receipt", .expected = null, .value = "pending" }} });
     defer a.free(first);
     try std.testing.expect(try apply(&map, a, 7, first));

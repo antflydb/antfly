@@ -47,6 +47,33 @@ const Read = struct {
         if (response.len > abi.metadata_session_max_value_bytes) return error.TransactionTooLarge;
         return a.dupe(u8, response.slice());
     }
+    fn prefixPage(ptr: *anyopaque, alloc: A, prefix: []const u8, after: ?[]const u8, length: usize) ![]erased.Entry {
+        const self = cast(ptr);
+        if (length > 128) return error.InvalidArgument;
+        const keys = try std.mem.concat(alloc, u8, &.{ prefix, after orelse "" });
+        defer alloc.free(keys);
+        const bytes = try self.readValue(alloc, .{
+            .operation = .prefix_page,
+            .key = .fromSlice(keys),
+            .offset = prefix.len,
+            .length = @intCast(length),
+        });
+        const rows = try alloc.alloc(erased.Entry, 64);
+        var count: usize = 0;
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            if (bytes.len - pos < 4 or count == rows.len) return error.StorageKernelFailure;
+            const key_len = std.mem.readInt(u16, bytes[pos..][0..2], .little);
+            const value_len = std.mem.readInt(u16, bytes[pos + 2 ..][0..2], .little);
+            pos += 4;
+            if (key_len == 0 or value_len > length or key_len + @as(usize, value_len) > bytes.len - pos) return error.StorageKernelFailure;
+            rows[count] = .{ .key = bytes[pos..][0..key_len], .value = bytes[pos + key_len ..][0..value_len] };
+            pos += @as(usize, key_len) + value_len;
+            count += 1;
+        }
+        return rows[0..count];
+    }
+
     fn countPrefix(ptr: *anyopaque, key: []const u8) !u64 {
         const self = cast(ptr);
         var response: abi.OwnedBytes = .{};
@@ -106,7 +133,7 @@ pub fn open(a: A, store: ?*anyopaque, group: u64) !erased.ReadTxn {
     const native = handle orelse return error.StorageKernelFailure;
     const read = try a.create(Read);
     read.* = .{ .handle = native, .arena = std.heap.ArenaAllocator.init(a) };
-    return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope, .count_prefix = Read.countPrefix } };
+    return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope, .count_prefix = Read.countPrefix, .read_prefix_page = Read.prefixPage } };
 }
 fn status(value: abi.Status) !void {
     return identity.statusToError(value);

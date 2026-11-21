@@ -1323,6 +1323,8 @@ pub const DurableSessionStore = struct {
                 // proposing it. Other commit failures can lose the reply.
                 if (err == error.SessionWriteNotLeaderBeforeProposal) return error.NotLeader;
                 if (err == error.SessionWriteOutOfMemoryBeforeProposal) return error.OutOfMemory;
+                if (err == error.SessionWriteUnavailableBeforeProposal) return error.StorageReadTemporarilyUnavailable;
+                if (graph_admission and err == error.SessionLeaseLost) return error.StorageReadTemporarilyUnavailable;
                 if (graph_admission and err != error.TransactionTooLarge) return error.GraphReceiptAdmissionUnknown;
                 return err;
             };
@@ -2308,12 +2310,47 @@ pub const DurableSessionStore = struct {
             .runtime => |store| {
                 var txn = try store.beginRead();
                 defer txn.abort();
+                if (self.listSessionIdsPaged(&txn, alloc, principal)) |ids| return ids else |err| {
+                    if (err != error.Unsupported) return err;
+                }
                 var cursor = try txn.openCursor();
                 defer cursor.close();
                 cursor.setKeysOnly();
                 return listPrincipalSessionIds(&txn, &cursor, alloc, principal);
             },
         }
+    }
+
+    fn listSessionIdsPaged(_: *DurableSessionStore, txn: *backend_erased.ReadTxn, alloc: std.mem.Allocator, principal: ?[]const u8) ![]db_mod.types.TxnId {
+        var ids: std.ArrayList(db_mod.types.TxnId) = .empty;
+        errdefer ids.deinit(alloc);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(principal orelse "", &digest, .{});
+        var page = std.heap.ArenaAllocator.init(alloc);
+        defer page.deinit();
+        var continuation: [512]u8 = undefined;
+        var after: ?[]const u8 = null;
+        while (true) {
+            _ = page.reset(.retain_capacity);
+            const rows = try txn.readPrefixPage(page.allocator(), session_prefix, after, graph_status_read_len);
+            for (rows) |row| {
+                if (!std.mem.startsWith(u8, row.key, session_prefix)) return error.InvalidTransactionSessionRecord;
+                const id = distributed_txn.parseTxnIdHex(row.key[session_prefix.len..]) catch continue;
+                const matches = (try sessionPrincipalMatchesPrefix(row.value, principal, &digest)) orelse legacy: {
+                    var scope = try txn.openReadScope(alloc);
+                    defer scope.close();
+                    break :legacy try sessionPrincipalCandidate(&scope, alloc, row.key, principal, &digest);
+                };
+                if (matches) try ids.append(alloc, id);
+            }
+            if (rows.len < 64) break;
+            const last = rows[rows.len - 1].key;
+            if (last.len > continuation.len) return error.InvalidTransactionSessionRecord;
+            if (after) |previous| if (std.mem.order(u8, last, previous) != .gt) return error.InvalidTransactionSessionRecord;
+            @memcpy(continuation[0..last.len], last);
+            after = continuation[0..last.len];
+        }
+        return ids.toOwnedSlice(alloc);
     }
 
     fn listPrincipalSessionIds(txn: anytype, cursor: *backend_erased.Cursor, alloc: std.mem.Allocator, principal: ?[]const u8) ![]db_mod.types.TxnId {
@@ -4012,7 +4049,10 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
 
         var candidate = if (self.durable) |durable|
-            (try durable.loadWithRecoveryOwner(txn_id, owner_node_id)) orelse return null
+            (try durable.loadWithRecoveryOwner(txn_id, owner_node_id)) orelse {
+                try durable.refreshRecoveryIndex(txn_id);
+                return null;
+            }
         else blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -4023,7 +4063,10 @@ pub const SessionRegistry = struct {
 
         // The scan is advisory. A foreground attempt may have settled this ID
         // before we acquired the execution guard.
-        if (!sessionNeedsRecovery(candidate)) return null;
+        if (!sessionNeedsRecovery(candidate)) {
+            if (self.durable) |durable| try durable.refreshRecoveryIndex(txn_id);
+            return null;
+        }
         if (candidate.owner_node_id != owner_node_id) {
             const durable = self.durable orelse return null;
             if (self.durable_scope != .cluster_shared or self.lease_store == null or self.owner_lease_ttl_ns == null or owner_node_id == 0) return null;
@@ -6928,23 +6971,7 @@ fn sessionPrincipalCandidate(scope: *backend_erased.ReadScope, alloc: std.mem.Al
         error.Unsupported, error.EndOfStream => null,
         else => return err,
     };
-    if (narrow) |raw| {
-        const header: []const u8 = if (std.mem.startsWith(u8, raw, session_record.bound_session_header)) session_record.bound_session_header else "{";
-        const fields = raw[header.len..];
-        if (std.mem.startsWith(u8, fields, graph_status_field)) {
-            var bits: [graph_status_bytes]u8 = undefined;
-            std.base64.standard.Decoder.decode(&bits, fields[graph_status_field.len..][0..graph_status_encoded_len]) catch return error.InvalidTransactionSessionRecord;
-            return (principal != null) == (bits[32] != 0) and std.mem.eql(u8, digest, bits[0..32]);
-        }
-        for ([_][]const u8{ connection_field, sql_field }) |field| {
-            if (try parseSqlPrefix(raw, field)) |bytes| return std.mem.eql(u8, digest, bytes[9..41]);
-        }
-        if (std.mem.startsWith(u8, fields, reader_field)) {
-            var bytes: [reader_payload_len]u8 = undefined;
-            _ = std.fmt.hexToBytes(&bytes, fields[reader_field.len..][0 .. 2 * reader_payload_len]) catch return error.InvalidTransactionSessionRecord;
-            return std.mem.eql(u8, digest, bytes[9..41]);
-        }
-    }
+    if (narrow) |raw| if (try sessionPrincipalMatchesPrefix(raw, principal, digest)) |matches| return matches;
     const raw = scope.get(key) catch |err| switch (err) {
         error.NotFound => return false,
         else => return err,
@@ -6955,6 +6982,26 @@ fn sessionPrincipalCandidate(scope: *backend_erased.ReadScope, alloc: std.mem.Al
     };
     defer parsed.deinit();
     return principalsEqual(parsed.value.principal, principal);
+}
+
+fn sessionPrincipalMatchesPrefix(raw: []const u8, principal: ?[]const u8, digest: *const [32]u8) !?bool {
+    if (raw.len < graph_status_read_len) return null;
+    const header: []const u8 = if (std.mem.startsWith(u8, raw, session_record.bound_session_header)) session_record.bound_session_header else "{";
+    const fields = raw[header.len..];
+    if (std.mem.startsWith(u8, fields, graph_status_field)) {
+        var bits: [graph_status_bytes]u8 = undefined;
+        std.base64.standard.Decoder.decode(&bits, fields[graph_status_field.len..][0..graph_status_encoded_len]) catch return error.InvalidTransactionSessionRecord;
+        return (principal != null) == (bits[32] != 0) and std.mem.eql(u8, digest, bits[0..32]);
+    }
+    for ([_][]const u8{ connection_field, sql_field }) |field| {
+        if (try parseSqlPrefix(raw, field)) |bytes| return std.mem.eql(u8, digest, bytes[9..41]);
+    }
+    if (std.mem.startsWith(u8, fields, reader_field)) {
+        var bytes: [reader_payload_len]u8 = undefined;
+        _ = std.fmt.hexToBytes(&bytes, fields[reader_field.len..][0 .. 2 * reader_payload_len]) catch return error.InvalidTransactionSessionRecord;
+        return std.mem.eql(u8, digest, bytes[9..41]);
+    }
+    return null;
 }
 
 fn encodeGraphStatus(out: *std.ArrayList(u8), alloc: std.mem.Allocator, session: *const Session) !void {

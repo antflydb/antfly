@@ -25,7 +25,7 @@ pub const Host = struct {
     ptr: *anyopaque,
     read: *const fn (*anyopaque, A) anyerror!erased.ReadTxn,
     term: *const fn (*anyopaque) ?u64,
-    propose: *const fn (*anyopaque, []const u8, u64) anyerror!void,
+    propose: *const fn (*anyopaque, []const u8, u64, *bool) anyerror!bool,
 };
 pub const Store = struct {
     host: Host,
@@ -43,7 +43,7 @@ pub const Store = struct {
     }
     fn beginRead(a: A, ptr: *anyopaque) !erased.ReadTxn {
         const read = try Read.create(a, cast(ptr));
-        return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope, .count_prefix = Read.countPrefix } };
+        return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope, .count_prefix = Read.countPrefix, .read_prefix_page = Read.prefixPage } };
     }
     fn beginProbe(a: A, ptr: *anyopaque) !erased.ProbeTxn {
         const read = try Read.create(a, cast(ptr));
@@ -152,6 +152,21 @@ const Read = struct {
             self.physical.close();
         }
     };
+    fn prefixPage(ptr: *anyopaque, alloc: A, prefix: []const u8, after: ?[]const u8, length: usize) ![]erased.Entry {
+        const self = cast(ptr);
+        if (!std.mem.startsWith(u8, prefix, record.session_prefix)) return error.Unsupported;
+        const physical_prefix = try record.keyAlloc(alloc, self.store.group, prefix);
+        defer alloc.free(physical_prefix);
+        const physical_after = if (after) |key| try record.keyAlloc(alloc, self.store.group, key) else null;
+        defer if (physical_after) |key| alloc.free(key);
+        const rows = try self.physical.readPrefixPage(alloc, physical_prefix, physical_after, length);
+        for (rows) |*row| {
+            if (!std.mem.startsWith(u8, row.key, physical_prefix)) return error.InvalidTransactionSessionRecord;
+            row.key = row.key[self.prefix.len..];
+        }
+        return rows;
+    }
+
     fn countPrefix(ptr: *anyopaque, prefix: []const u8) !u64 {
         const self = cast(ptr);
         const a = self.arena.child_allocator;
@@ -307,22 +322,17 @@ const Write = struct {
                 error.OutOfMemory => error.SessionWriteOutOfMemoryBeforeProposal,
                 else => err,
             };
-            try store.host.propose(store.host.ptr, bytes, self.term);
-            // The write gate remains held through this confirmation. A term
-            // change instead returns an uncertain result for receipt recovery.
-            if (store.host.term(store.host.ptr) != self.term) return error.NotLeader;
-            const current = try Read.create(a, store);
-            defer current.destroy(a);
-            for (self.changes.items) |change| {
-                if (self.scanned and change.observation_only) continue;
-                const actual = Read.get(current, change.key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
+            var submitted = false;
+            const applied = store.host.propose(store.host.ptr, bytes, self.term, &submitted) catch |err| {
+                if (submitted) return err;
+                return switch (err) {
+                    error.NotLeader => error.SessionWriteNotLeaderBeforeProposal,
+                    error.OutOfMemory => error.SessionWriteOutOfMemoryBeforeProposal,
+                    error.TransactionTooLarge => err,
+                    else => error.SessionWriteUnavailableBeforeProposal,
                 };
-                if (change.value) |value| {
-                    if (actual == null or !std.mem.eql(u8, value, actual.?)) return error.SessionLeaseLost;
-                } else if (actual != null) return error.SessionLeaseLost;
-            }
+            };
+            if (!applied) return error.SessionLeaseLost;
         }
         abort(a, ptr);
     }
@@ -451,17 +461,19 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         fn term(ptr: *anyopaque) ?u64 {
             return cast(ptr).current_term;
         }
-        fn propose(ptr: *anyopaque, bytes: []const u8, expected: u64) !void {
+        fn propose(ptr: *anyopaque, bytes: []const u8, expected: u64, submitted: *bool) !bool {
             const self = cast(ptr);
             if (self.current_term != expected) return error.NotLeader;
             self.last_frame = bytes[0];
+            submitted.* = true;
             var txn = try self.physical.beginWrite();
             var active = true;
             defer if (active) txn.abort();
-            _ = try record.apply(&txn, std.testing.allocator, 7, bytes);
+            const applied = try record.apply(&txn, std.testing.allocator, 7, bytes);
             try txn.commit();
             active = false;
             if (self.lose_ack) return error.Unavailable;
+            return applied;
         }
     };
     const a = std.testing.allocator;
@@ -573,6 +585,25 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         const two = std.mem.toBytes(std.mem.nativeToLittle(u64, 2));
         try repair.put(record.count_key, &two);
         try repair.commit();
+    }
+    {
+        var txn = try logical.beginWrite();
+        defer txn.abort();
+        _ = try txn.countPrefix("receipt");
+        // The desired value already matches, but the epoch no longer does.
+        try txn.put("receipt", "acknowledgement lost");
+        var remote = try physical.beginWrite();
+        var remote_open = true;
+        defer if (remote_open) remote.abort();
+        const epoch_key = try record.keyAlloc(a, 7, record.epoch_key);
+        defer a.free(epoch_key);
+        const epoch = std.mem.readInt(u64, (try remote.get(epoch_key))[0..8], .little);
+        var next_epoch: [8]u8 = undefined;
+        std.mem.writeInt(u64, &next_epoch, epoch + 1, .little);
+        try remote.put(epoch_key, &next_epoch);
+        try remote.commit();
+        remote_open = false;
+        try std.testing.expectError(error.SessionLeaseLost, txn.commit());
     }
     var current = try logical.beginRead();
     defer current.abort();
