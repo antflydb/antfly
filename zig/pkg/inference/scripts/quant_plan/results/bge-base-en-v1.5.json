@@ -1,0 +1,117 @@
+{
+  "model": "BAAI/bge-base-en-v1.5 (safetensors, f32)",
+  "base_format": "q4_k",
+  "candidates": [
+    "q4_0",
+    "q4_k",
+    "q5_k",
+    "q6_k",
+    "q8_0"
+  ],
+  "corpus": "paragraphs from docs/ (400 lines, shuffled with seed 7); calibration lines 0-63, evaluation lines 64-363",
+  "measurement": "torch_embedding_sensitivity.py measure: one tensor in one format, all others dense; mean 1-cos vs the dense model (CLS pooling)",
+  "reference_forward": "PyTorch over the exact tensors antfly export wrote; every mixed GGUF checked tensor-for-tensor against the planned formats",
+  "heldout": {
+    "texts": 300,
+    "results": [
+      {
+        "variant": "uniform q4_0",
+        "planned_bytes": 61515072,
+        "cosine_loss": 0.027612784877419472,
+        "recall@10": 0.7856666666666667
+      },
+      {
+        "variant": "uniform q4_k",
+        "planned_bytes": 61515072,
+        "cosine_loss": 0.0194977056235075,
+        "recall@10": 0.8460000000000001
+      },
+      {
+        "variant": "uniform q5_k",
+        "planned_bytes": 75185088,
+        "cosine_loss": 0.005479548126459122,
+        "recall@10": 0.9143333333333333
+      },
+      {
+        "variant": "uniform q6_k",
+        "planned_bytes": 89709480,
+        "cosine_loss": 0.0010267579928040504,
+        "recall@10": 0.9593333333333334
+      },
+      {
+        "variant": "uniform q8_0",
+        "planned_bytes": 116195136,
+        "cosine_loss": 7.742782327113673e-05,
+        "recall@10": 0.9903333333333334
+      },
+      {
+        "variant": "plan cos-4.5.json",
+        "planned_bytes": 61515072,
+        "cosine_loss": 0.01635422371327877,
+        "recall@10": 0.8553333333333334
+      },
+      {
+        "variant": "plan cos-5.0.json",
+        "planned_bytes": 68331072,
+        "cosine_loss": 0.0034549275878816843,
+        "recall@10": 0.9196666666666666
+      },
+      {
+        "variant": "plan cos-5.5.json",
+        "planned_bytes": 75155520,
+        "cosine_loss": 0.0017319940961897373,
+        "recall@10": 0.9339999999999999
+      },
+      {
+        "variant": "plan cos-6.0.json",
+        "planned_bytes": 81984000,
+        "cosine_loss": 0.0009112335974350572,
+        "recall@10": 0.9566666666666667
+      },
+      {
+        "variant": "plan sse-4.5.json",
+        "planned_bytes": 61515072,
+        "cosine_loss": 0.019066302105784416,
+        "recall@10": 0.8476666666666667
+      },
+      {
+        "variant": "plan sse-5.0.json",
+        "planned_bytes": 68328960,
+        "cosine_loss": 0.011920860037207603,
+        "recall@10": 0.8726666666666667
+      },
+      {
+        "variant": "plan sse-5.5.json",
+        "planned_bytes": 75185088,
+        "cosine_loss": 0.005479548126459122,
+        "recall@10": 0.9143333333333333
+      },
+      {
+        "variant": "plan sse-6.0.json",
+        "planned_bytes": 82009884,
+        "cosine_loss": 0.0031126670073717833,
+        "recall@10": 0.9343333333333333
+      }
+    ]
+  },
+  "antfly_runtime_spot_check": {
+    "texts": 4,
+    "note": "embedding_sensitivity.py evaluate through antfly embed --backend native",
+    "results": [
+      {
+        "variant": "uniform q5_k",
+        "file_bytes": 76378912,
+        "cosine_loss": 0.005913581694897196,
+        "min_cosine": 0.9926404873773941,
+        "recall@2": 1.0
+      },
+      {
+        "variant": "plan cos-5.5.json",
+        "file_bytes": 76349344,
+        "cosine_loss": 0.0018889472317966671,
+        "min_cosine": 0.9972387053973617,
+        "recall@2": 1.0
+      }
+    ]
+  }
+}

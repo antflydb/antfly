@@ -300,6 +300,38 @@ Loss sources:
   formats by cosine loss and nearest-neighbor recall at equal file size.
   Decoders would use token KL, Whisper WER, and GLiNER span F1 in the same way.
 
+`scripts/quant_plan/torch_embedding_sensitivity.py` is the faster equivalent:
+it exports each candidate format once, uniformly, and swaps Antfly's
+dequantized tensors one at a time inside a PyTorch reference model, so the
+quantized values are Antfly's and only the forward pass differs.
+
+Measured on BAAI/bge-base-en-v1.5 (76 planned tensors, base `q4_k`,
+candidates `q4_0,q4_k,q5_k,q6_k,q8_0`), calibrated on 64 paragraphs from
+`docs/` and evaluated on 300 different ones. Bits per weight and bytes cover
+the planned tensors; recall is top-10 neighbor overlap with the dense model.
+Details are in `scripts/quant_plan/results/bge-base-en-v1.5.json`.
+
+| Variant | bits/weight | 1 - cos | recall@10 |
+|---|---:|---:|---:|
+| uniform q4_k | 4.50 | 0.01950 | 0.846 |
+| cosine plan | 4.50 | 0.01635 | 0.855 |
+| weight_sse plan | 5.00 | 0.01192 | 0.873 |
+| cosine plan | 5.00 | 0.00345 | 0.920 |
+| uniform q5_k | 5.50 | 0.00548 | 0.914 |
+| weight_sse plan | 5.50 | 0.00548 | 0.914 |
+| cosine plan | 5.50 | 0.00173 | 0.934 |
+| cosine plan | 6.00 | 0.00091 | 0.957 |
+| uniform q6_k | 6.56 | 0.00103 | 0.959 |
+
+At the size of uniform `q5_k`, the cosine-measured plan cuts embedding loss
+3.2x; at 5.0 bits it beats `q5_k` with 9% fewer bytes, and at 6.0 bits it
+matches `q6_k` with about 9% fewer. The data-free `weight_sse` proxy is much weaker
+(at 5.5 bits it chose all `q5_k`), so measure in output space when the model
+can run. Summed single-tensor losses predicted the held-out loss of every
+cosine plan within 4%. Antfly's own runtime agrees: through
+`antfly inference embed`, the 5.5-bit plan had 3.1x lower loss than uniform
+`q5_k` on a spot check of four texts.
+
 The allocator (`src/quantize/mixed_plan.zig`) treats losses as additive across
 tensors. It walks each tensor's lower convex hull of (bytes, loss) in order of
 loss saved per byte, fills leftover budget, repairs gaps with pairwise
