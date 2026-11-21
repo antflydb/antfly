@@ -89,8 +89,10 @@ pub const WebmInput = struct {
         ids: [32]usize = @splat(0),
         count: usize,
         replay: video.webm_pictures.ReplayBudget,
-        // Cumulative read limit. replay.coded_bytes is the input span admitted once.
-        coded_limit: usize,
+        /// The cold input span may exceed the per-window limit when a
+        /// cooperative decoder can continue from an earlier window.
+        cold_bytes: usize,
+        warm_input_bytes: ?usize,
         apple_possible: bool,
     };
 
@@ -1611,6 +1613,14 @@ test "embeddinggemma2 video reader timestamps and cache binding survive independ
     const trial = (try automaticAppleReplayBudget(&restart_reader, seek_index, &.{0}, two_replays, null)).?;
     try std.testing.expectEqual(one_replay.coded_bytes, trial.coded_bytes);
 
+    seek_restarts[0].packet = 0;
+    const warm_only = Replay.ReplayBudget{ .restart = seek_restarts[0], .packet_stop = 3, .coded_bytes = 3 };
+    try std.testing.expect(!try portableWebmReplayFits(&restart_reader, seek_index, &.{0}, warm_only, null));
+    const warm = try video.apple_webm.planReplay(&restart_reader, seek_index, &.{0}, .{ .replay_budget = warm_only }, 2);
+    try std.testing.expect(warm.reuse);
+    try std.testing.expectEqual(@as(usize, 2), warm.restart.packet);
+    try std.testing.expectError(error.AppleReplayPacketLimit, video.apple_webm.planReplay(&restart_reader, seek_index, &.{0}, .{ .decode = .{ .max_decode_packets = 1 } }, null));
+
     try std.testing.expect(index.apple_index_eligible != null);
     if (@import("builtin").os.tag == .macos and index.apple_index_eligible.? and index.apple_packet_layout) {
         const AppleSink = struct {
@@ -2096,33 +2106,47 @@ pub fn planWebmWindow(input: WebmInput, timestamp_policy: video.sampling.Timesta
     defer a.free(selected);
     if (selected.len == 0 or selected.len > 32) return error.InvalidVideoIndex;
     var first = selected[0];
+    var first_packet: usize = std.math.maxInt(usize);
     var last_packet: usize = 0;
     for (selected) |id| {
         if (id >= index.pictures.len) return error.InvalidVideoIndex;
         first = @min(first, id);
-        last_packet = @max(last_packet, index.pictures[id].packet_index orelse return error.InvalidVideoIndex);
+        const packet = index.pictures[id].packet_index orelse return error.InvalidVideoIndex;
+        first_packet = @min(first_packet, packet);
+        last_packet = @max(last_packet, packet);
     }
     const restart = index.restartFor(first);
     if (restart.packet > last_packet or last_packet >= input.reader.packets.len) return error.InvalidVideoIndex;
     const packet_stop = last_packet + 1;
     const payload = try index.packetBytes(input.reader.packets, restart.packet, packet_stop, worker);
     const total = try std.math.add(usize, payload, if (restart.sequence) |sequence| sequence.size else 0);
-    if (total > limit) return error.ResourceLimitExceeded;
-    const replay = video.webm_pictures.ReplayBudget{ .restart = restart, .packet_stop = packet_stop, .coded_bytes = total };
+    const warm_input_bytes: ?usize = if (total <= limit) null else warm: {
+        if (input.continuation == null and input.apple_continuation == null) return error.ResourceLimitExceeded;
+        const selected_span = try index.packetBytes(input.reader.packets, first_packet, packet_stop, worker);
+        if (selected_span > limit) return error.ResourceLimitExceeded;
+        break :warm selected_span;
+    };
+    const replay = video.webm_pictures.ReplayBudget{ .restart = restart, .packet_stop = packet_stop, .coded_bytes = limit };
     const apple_possible = try appleReplayPossible(input, index, selected, replay);
     var result = input;
-    result.window = .{ .index = input.index, .policy = timestamp_policy, .count = selected.len, .replay = replay, .coded_limit = limit, .apple_possible = apple_possible };
+    result.window = .{ .index = input.index, .policy = timestamp_policy, .count = selected.len, .replay = replay, .cold_bytes = total, .warm_input_bytes = warm_input_bytes, .apple_possible = apple_possible };
     @memcpy(result.window.?.ids[0..selected.len], selected);
     return result;
 }
 
 fn appleReplayPossible(input: WebmInput, index: video.webm_pictures.Index, selected: []const usize, replay: video.webm_pictures.ReplayBudget) !bool {
     if (@import("builtin").os.tag != .macos or !index.apple_packet_layout or !(index.apple_index_eligible orelse true)) return false;
-    if (input.apple_continuation) |owner| if (owner.apple_unsupported.load(.acquire)) return false;
-    const published = if (input.apple_continuation) |owner| owner.apple_cursor.load(.acquire) else std.math.maxInt(usize);
-    const cursor = if (published == std.math.maxInt(usize)) null else published;
-    _ = video.apple_webm.planReplay(input.reader, index, selected, .{ .decode = .{ .max_decode_packets = 8192 }, .replay_budget = replay }, cursor) catch |err| switch (err) {
-        error.AppleReplayPacketLimit => return false,
+    const optimistic_cursor = if (input.apple_continuation) |owner| cursor: {
+        if (owner.apple_unsupported.load(.acquire)) return false;
+        if (owner.session == null) break :cursor null;
+        // A preceding worker can advance the cursor after preflight. Bound
+        // the best possible warm span here and resolve it after that wait.
+        var first = selected[0];
+        for (selected[1..]) |id| first = @min(first, id);
+        break :cursor index.pictures[first].packet_index;
+    } else null;
+    _ = video.apple_webm.planReplay(input.reader, index, selected, .{ .decode = .{ .max_decode_packets = 8192 }, .replay_budget = replay }, optimistic_cursor) catch |err| switch (err) {
+        error.AppleReplayPacketLimit, error.ResourceLimitExceeded => return false,
         else => return err,
     };
     return true;
@@ -2145,7 +2169,7 @@ pub fn webmPacketByteCount(input: WebmInput, sampling: Sampling, control: Contro
     const index = try input.boundIndex();
     try control.check();
     try input.reader.input.checkControl();
-    if (try webmWindow(input, sampling)) |window| return window.replay.coded_bytes;
+    if (try webmWindow(input, sampling)) |window| return window.warm_input_bytes orelse window.cold_bytes;
     if (index.coded_bytes) |total| return total;
     const adapter = control.imageWorkControl();
     return video.webm_pictures.codedBytes(input.reader, .{ .context = adapter.context, .check_fn = adapter.check_fn });
@@ -3473,10 +3497,25 @@ fn automaticAppleReplayBudget(reader: *const media.webm.Reader, indexed: video.w
     };
     return trial;
 }
+fn portableWebmReplayFits(reader: *const media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, budget: video.webm_pictures.ReplayBudget, owner: ?*video.webm_pictures.Continuation) !bool {
+    const control = reader.input.control;
+    var first = selected[0];
+    for (selected[1..]) |id| first = @min(first, id);
+    if (owner) |portable| {
+        if ((portable.session != null or portable.vp8_session != null) and first >= portable.logical and
+            try budget.fits(indexed, reader, .{ .packet = portable.packet, .logical = portable.logical }, budget.packet_stop, control)) return true;
+    }
+    _ = budget.coldRestart(indexed, reader, first, budget.packet_stop, control) catch |err| switch (err) {
+        error.ResourceLimitExceeded => return false,
+        else => return err,
+    };
+    return true;
+}
 fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, admitted_count: usize, capture: *Capture, input: ?WebmInput, pins: ?*const CachePins) !void {
     if (capture.prefetch) |producer| try producer.waitForDecoder();
     const window = if (input) |bound| bound.window else null;
     var budget = if (window) |value| try webmReplayForMisses(indexed, selected, value.replay) else null;
+    if (budget) |*remaining| remaining.coded_bytes = std.math.cast(usize, @min(remaining.coded_bytes, reader.input.remaining().max_total_bytes)) orelse std.math.maxInt(usize);
     const admitted_apple = if (window) |value| if (pins) |owner|
         owner.webmApple(.{ .index = value.index, .policy = value.policy }) orelse value.apple_possible
     else
@@ -3493,15 +3532,27 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
     const apple_owner = if (input) |bound| bound.apple_continuation else null;
     var apple_possible = admitted_apple and surface_bytes != 0;
     var trial_budget = budget;
+    var portable_retry = true;
     if (capture.decoder.policy == .automatic and apple_possible) {
         if (apple_owner) |owner| apple_possible = !owner.apple_unsupported.load(.acquire);
-        if (apple_possible) if (budget) |initial| {
-            var total = initial;
-            total.coded_bytes = std.math.cast(usize, @min(window.?.coded_limit, reader.input.remaining().max_total_bytes)) orelse std.math.maxInt(usize);
+        if (apple_possible) if (budget) |total| {
             const published = if (apple_owner) |owner| owner.apple_cursor.load(.acquire) else std.math.maxInt(usize);
-            trial_budget = try automaticAppleReplayBudget(reader, indexed, selected, total, if (published == std.math.maxInt(usize)) null else published);
+            const cursor = if (published == std.math.maxInt(usize)) null else published;
+            trial_budget = try automaticAppleReplayBudget(reader, indexed, selected, total, cursor);
             apple_possible = trial_budget != null;
-            if (apple_possible) budget = total;
+            if (!apple_possible and !try portableWebmReplayFits(reader, indexed, selected, total, if (input) |bound| bound.continuation else null)) {
+                // Only a retained Apple replay can fit. Keep the full window
+                // budget and report the Apple error if that replay fails.
+                const warm = video.apple_webm.planReplay(reader, indexed, selected, .{ .decode = .{ .max_decode_packets = 8192 }, .replay_budget = total }, cursor) catch |err| switch (err) {
+                    error.AppleReplayPacketLimit, error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+                    else => return err,
+                };
+                apple_possible = warm.reuse;
+                if (apple_possible) {
+                    trial_budget = total;
+                    portable_retry = false;
+                }
+            }
         };
     }
     if (capture.decoder.policy == .automatic and !apple_possible) capture.decoder.fallback();
@@ -3510,10 +3561,11 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
         const receipt: ?video.apple_webm.Receipt = decodeAppleWebm(a, reader, indexed, selected, capture, input, trial_budget) catch |err| blk: {
             if (err == error.UnsupportedVideoProfile and capture.apple_published == 0) if (apple_owner) |owner| owner.apple_unsupported.store(true, .release);
             const reason = switch (err) {
-                error.AppleReplayPacketLimit => if (capture.decoder.policy == .automatic) error.UnsupportedVideoProfile else error.ResourceLimitExceeded,
+                error.AppleReplayPacketLimit => if (capture.decoder.policy == .automatic and portable_retry) error.UnsupportedVideoProfile else error.ResourceLimitExceeded,
                 error.AppleWindowAdmissionExceeded => if (capture.decoder.policy == .automatic) error.VideoDecoderUnavailable else error.SharedAdmissionExceeded,
                 else => err,
             };
+            if (!portable_retry) return reason;
             try appleUnavailable(capture, reason);
             // The worker owns this source view. Its counters include packet
             // and sequence bootstrap reads, even when Apple publishes nothing.

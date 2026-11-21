@@ -284,7 +284,7 @@ pub fn planReplay(reader: *const media.webm.Reader, indexed: pictures.Index, sel
 fn checkPacketLimit(options: Options, first: usize, end: usize) !void {
     if (first > end) return error.InvalidVideoIndex;
     if (end - first + 1 > options.decode.max_decode_packets) {
-        return if (options.replay_budget != null) error.AppleReplayPacketLimit else error.ResourceLimitExceeded;
+        return error.AppleReplayPacketLimit;
     }
 }
 
@@ -669,5 +669,5 @@ test "Apple WebM decode budget bounds submitted span rather than source length" 
         return err;
     };
     try std.testing.expectEqual(@as(usize, 1), receipt.submitted_packets);
-    try std.testing.expectError(error.ResourceLimitExceeded, decodeTo(a, &reader, indexed, &.{2}, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 1 } }, .{ .context = &parity, .accept = Parity.accept }));
+    try std.testing.expectError(error.AppleReplayPacketLimit, decodeTo(a, &reader, indexed, &.{2}, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 1 } }, .{ .context = &parity, .accept = Parity.accept }));
 }
