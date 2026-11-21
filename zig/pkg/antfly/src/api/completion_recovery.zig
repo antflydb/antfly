@@ -377,8 +377,12 @@ test "data raft ordered history completion recovery retains guard checkpoints an
                 .acknowledge_many => |value| {
                     try std.testing.expect(self.published[0] and self.published[1]);
                     try std.testing.expectEqualSlices(u8, &self.admission.transaction_id, &value.txn_id);
-                    try std.testing.expectEqual(@as(usize, 1), value.participants.len);
-                    try std.testing.expectEqualStrings(self.admission.participants[1].locator, value.participants[0]);
+                    const coordinator = self.admission.coordinator_namespace;
+                    const expected_count: usize = if (self.state.retain_terminal) 1 else 2;
+                    try std.testing.expectEqual(expected_count, value.participants.len);
+                    const follower = self.admission.participants[if (std.mem.eql(u8, &coordinator, &self.admission.participants[0].namespace)) 1 else 0];
+                    try std.testing.expectEqualStrings(follower.locator, value.participants[0]);
+                    if (!self.state.retain_terminal) try std.testing.expectEqualStrings((try self.admission.member(coordinator)).locator, value.participants[1]);
                 },
                 .publish_completion => |value| {
                     try std.testing.expect(self.resolved[0] and self.resolved[1]);
@@ -402,6 +406,9 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     const recovery: Recovery = .{ .catalog = .{ .ptr = &fake, .vtable = &.{ .admin_snapshot = Fake.admin, .free_admin_snapshot = Fake.freeAdmin, .acquire_routing_generation = Fake.acquire } }, .decisions = .{ .ptr = &fake, .read_fn = Fake.decision }, .resolutions = .{ .ptr = &fake, .read_fn = Fake.resolution }, .publications = .{ .ptr = &fake, .read_fn = Fake.publication }, .participants = .{ .writer = .{ .ptr = &fake, .write_fn = Fake.write } } };
     const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = owners[0].metadata_incarnation, .catalog_revision = 10, .table_id = 7, .topology_epoch = view.topology_epoch, .route = .{ .group_id = 9, .range_id = 9, .identity_namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 9 } } };
     try std.testing.expectEqual(.complete, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
+    fake.state.retain_terminal = false;
+    try std.testing.expectEqual(.complete, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
+    fake.state.retain_terminal = true;
     try std.testing.expectEqual(@as(usize, 1), fake.resolves);
     try std.testing.expectEqual(@as(usize, 2), fake.publishes);
     try std.testing.expectEqual(.complete, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
