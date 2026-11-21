@@ -107,6 +107,10 @@ pub const Sink = struct {
     /// allocated with the given allocator and freed by the caller
     /// immediately after use.
     loadAllAlloc: *const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry,
+    /// Optional: one committed entry read straight from the file, never from
+    /// this backend's mirror. With it, the `tip_namespace` records stay out of
+    /// the mirror and are always read this way (see `tip_namespace`).
+    loadOneAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
     /// Optional (`null` for a `Sink` with no deferred path, e.g. the test
     /// fakes below): like `submit`, but for `durable = false` only, and
     /// never blocks waiting for the underlying group commit to apply --
@@ -135,6 +139,18 @@ pub const Sink = struct {
     pauseMaintenance: ?*const fn (ptr: *anyopaque) void = null,
     resumeMaintenance: ?*const fn (ptr: *anyopaque) void = null,
 };
+
+/// Records a write reads only from the file, never from process memory: the
+/// full-text doc map (one entry per live document), which is too large to
+/// mirror and must always be current. When the sink has `loadOneAlloc`, this
+/// namespace is never loaded into or kept in the mirror; a transaction reads
+/// it from its own staged writes, then the file. See
+/// docs/design/lite-performance/lite-full-text-storage.md.
+pub const tip_namespace = "docmap";
+
+fn isTipNamespace(namespace: ?[]const u8) bool {
+    return if (namespace) |name| std.mem.eql(u8, name, tip_namespace) else false;
+}
 
 /// Durably removes every entry currently committed under `scope`, so a
 /// later `Backend.init` for the same scope -- e.g. after the index that
@@ -291,10 +307,13 @@ pub const Backend = struct {
             allocator.free(entry.key);
             allocator.free(entry.value);
         };
+        const tip_reads = options.sink.loadOneAlloc != null;
         for (loaded) |entry| {
-            const next = try tree.put(allocator, entry.namespace, entry.key, entry.value);
-            tree.release(allocator);
-            tree = next;
+            if (!(tip_reads and isTipNamespace(entry.namespace))) {
+                const next = try tree.put(allocator, entry.namespace, entry.key, entry.value);
+                tree.release(allocator);
+                tree = next;
+            }
             if (entry.namespace) |n| allocator.free(n);
             allocator.free(entry.key);
             allocator.free(entry.value);
@@ -557,6 +576,10 @@ pub const Backend = struct {
     /// pending-mutation bookkeeping `NamespaceTxn` needs for its own
     /// (separate) commit.
     /// See `mirror_invalid`.
+    fn tipReads(self: *const Backend) bool {
+        return self.sink.loadOneAlloc != null;
+    }
+
     pub fn invalidateMirror(self: *Backend) void {
         self.mirror_invalid.store(true, .release);
     }
@@ -572,6 +595,7 @@ pub const Backend = struct {
         var cloned = current.state.clone();
         errdefer cloned.deinit(self.allocator);
         for (mutations) |m| {
+            if (self.tipReads() and isTipNamespace(m.namespace)) continue;
             const namespace: backend_types.Namespace = .{ .name = m.namespace };
             if (m.is_delete) {
                 // Matches `NamespaceTxn.delete`'s own unconditional `try`
@@ -788,13 +812,30 @@ pub const Backend = struct {
         }
 
         pub fn get(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
+            if (self.backend.tipReads() and isTipNamespace(namespace.name)) return self.getAtTip(namespace, key);
             const value = try self.rc.?.state.get(namespace, key);
             self.read_since_write = true;
             return value;
         }
 
+        /// A `tip_namespace` read: this transaction's latest staged write,
+        /// then the file. The value lives until the transaction ends.
+        fn getAtTip(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
+            var i = self.pending.items.len;
+            while (i > 0) {
+                i -= 1;
+                const staged = self.pending.items[i];
+                if (!isTipNamespace(staged.namespace) or !std.mem.eql(u8, staged.key, key)) continue;
+                if (staged.is_delete) return error.NotFound;
+                return staged.value;
+            }
+            const load_one = self.backend.sink.loadOneAlloc.?;
+            return (try load_one(self.backend.sink.ptr, self.pending_arena.allocator(), self.backend.scope, namespace.name, key)) orelse error.NotFound;
+        }
+
         pub fn put(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
             if (self.read_only) return error.ReadOnly;
+            if (self.backend.tipReads() and isTipNamespace(namespace.name)) return self.stage(namespace, key, value, false);
             if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
             self.replaceTree(try self.rc.?.state.tree.put(self.allocator, namespace.name, key, value));
             try self.pending.append(self.pending_arena.allocator(), .{
@@ -804,8 +845,21 @@ pub const Backend = struct {
             });
         }
 
+        /// Stages a `tip_namespace` mutation for the sink without touching
+        /// the mirror.
+        fn stage(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8, is_delete: bool) !void {
+            const arena = self.pending_arena.allocator();
+            try self.pending.append(arena, .{
+                .namespace = try dupeOpt(arena, namespace.name),
+                .key = try arena.dupe(u8, key),
+                .value = if (is_delete) "" else try arena.dupe(u8, value),
+                .is_delete = is_delete,
+            });
+        }
+
         pub fn delete(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8) !void {
             if (self.read_only) return error.ReadOnly;
+            if (self.backend.tipReads() and isTipNamespace(namespace.name)) return self.stage(namespace, key, "", true);
             if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
             self.replaceTree(try self.rc.?.state.tree.remove(self.allocator, namespace.name, key));
             try self.pending.append(self.pending_arena.allocator(), .{

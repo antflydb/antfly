@@ -204,6 +204,7 @@ pub const Sink = struct {
             .ptr = self,
             .submit = submit,
             .loadAllAlloc = loadAllAlloc,
+            .loadOneAlloc = loadOneAlloc,
             .submitDeferred = submitDeferred,
             .pauseMaintenance = pauseMaintenance,
             .resumeMaintenance = resumeMaintenance,
@@ -312,10 +313,28 @@ pub const Sink = struct {
             defer allocator.free(record.key);
             defer allocator.free(record.value);
             if (try decodeAlloc(allocator, scope, record.key, record.value)) |entry| {
+                // Read through `loadOneAlloc` only; never mirrored.
+                if (entry.namespace) |n| if (std.mem.eql(u8, n, native_catalog_backend.tip_namespace)) {
+                    allocator.free(n);
+                    allocator.free(entry.key);
+                    allocator.free(entry.value);
+                    continue;
+                };
                 try result.append(allocator, entry);
             }
         }
         return try result.toOwnedSlice(allocator);
+    }
+
+    /// One committed record, read from the file at its current tip.
+    fn loadOneAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        var txn = try self.store.beginRead();
+        defer txn.abort();
+        const file = try txn.readFile();
+        const durable_key = try durableKeyAlloc(allocator, scope, namespace, key);
+        defer allocator.free(durable_key);
+        return try file.getIndexCatalogRecordAtCheckpointAlloc(allocator, durable_key, txn.checkpoint);
     }
 };
 

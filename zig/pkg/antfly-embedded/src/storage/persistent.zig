@@ -973,6 +973,9 @@ const MainKeyspace = enum {
     segments,
     meta,
     deletions,
+    /// Each live document's current location (see `DocLocation`); read
+    /// only at the tip, never mirrored (`native_catalog_backend.tip_namespace`).
+    docmap,
 };
 
 fn mapRuntimeNamespace(namespace: backend_types.Namespace) !MainKeyspace {
@@ -980,6 +983,7 @@ fn mapRuntimeNamespace(namespace: backend_types.Namespace) !MainKeyspace {
     if (std.mem.eql(u8, namespace.name.?, "segments")) return .segments;
     if (std.mem.eql(u8, namespace.name.?, "meta")) return .meta;
     if (std.mem.eql(u8, namespace.name.?, "deletions")) return .deletions;
+    if (std.mem.eql(u8, namespace.name.?, native_catalog_backend.tip_namespace)) return .docmap;
     return error.InvalidNamespace;
 }
 
@@ -988,6 +992,7 @@ fn runtimeNamespace(keyspace: MainKeyspace) backend_types.Namespace {
         .segments => .{ .name = "segments" },
         .meta => .{ .name = "meta" },
         .deletions => .{ .name = "deletions" },
+        .docmap => .{ .name = native_catalog_backend.tip_namespace },
     };
 }
 
@@ -1176,11 +1181,21 @@ pub const PersistentIndex = struct {
             defer if (publication) |*prepared| prepared.abort();
             var txn = try index.beginWriteMainTxn();
             errdefer txn.abort();
+            var superseded = std.ArrayListUnmanaged(struct { u64, roaring.RoaringBitmap }).empty;
+            defer {
+                for (superseded.items) |*entry| entry[1].deinit();
+                superseded.deinit(index.alloc);
+            }
             for (self.segments.items) |segment| {
                 var range = try extractSegmentDataKeyRange(index.alloc, segment.data);
                 defer range.deinit(index.alloc);
                 const key = std.mem.toBytes(std.mem.nativeToBig(u64, segment.id));
                 if (index.segment_files == null) try txn.put(.segments, &key, segment.data.bytes());
+                if (index.segment_files == null) if (try index.stageDocMapForSegment(&txn, segment.id, segment.data.bytes())) |bitmap| {
+                    var owned = bitmap;
+                    errdefer owned.deinit();
+                    try superseded.append(index.alloc, .{ segment.id, owned });
+                };
                 try index.saveSegmentRange(&txn, segment.id, range);
                 try index.updateActiveSegments(&txn, segment.id, .add);
             }
@@ -1188,6 +1203,10 @@ pub const PersistentIndex = struct {
             try txn.put(.meta, meta_rebuild_cursor, self.cursor);
             try txn.commit();
             if (publication) |*prepared| prepared.publish();
+            for (superseded.items) |*entry| {
+                index.writer.setDeletionBitmap(entry[0], entry[1]);
+                entry[1] = roaring.RoaringBitmap.init(index.alloc);
+            }
             self.segments.clearRetainingCapacity(); // ownership moved to writer
             index.active_rebuild_page = null;
             self.active = false;
@@ -2313,6 +2332,13 @@ pub const PersistentIndex = struct {
         /// infallible step left once the mutations below are durable --
         /// see `indexSegmentOwned`'s identical staged/infallible split.
         writer_publication: index_mod.IndexWriter.PreparedSegmentReplacement,
+        /// The segment's doc map entries (keys and values in `doc_map_arena`).
+        doc_map_arena: std.heap.ArenaAllocator,
+        doc_map_puts: []const native_catalog_backend.Mutation,
+
+        pub fn docMapMutations(self: *const InlineSegmentPublication) []const native_catalog_backend.Mutation {
+            return self.doc_map_puts;
+        }
 
         /// Valid only while `self` stays at this address: every mutation's
         /// `key`/`value` slice points back into one of `self`'s own
@@ -2337,6 +2363,7 @@ pub const PersistentIndex = struct {
             self.writer_publication.abort();
             alloc.free(self.segment_bytes);
             alloc.free(self.range_value);
+            self.doc_map_arena.deinit();
             self.* = undefined;
         }
     };
@@ -2361,6 +2388,15 @@ pub const PersistentIndex = struct {
         const seg_id = self.writer.next_segment_id;
         self.writer.next_segment_id += 1;
         self.writer.mu.unlock();
+
+        var doc_map_arena = std.heap.ArenaAllocator.init(self.alloc);
+        errdefer doc_map_arena.deinit();
+        var doc_map_puts = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+        var superseded = std.ArrayListUnmanaged(u32).empty;
+        try docMapPutsForSegmentAlloc(doc_map_arena.allocator(), seg_id, segment_bytes, null, &doc_map_puts, &superseded);
+        // A key stored twice in one segment needs a tombstone in the new
+        // segment itself; the inline path leaves that to the slow path.
+        if (superseded.items.len != 0) return error.InlineTextPublicationUnsupported;
 
         const range_value = try self.alloc.alloc(u8, 8 + key_range.min_doc_key.len + key_range.max_doc_key.len);
         errdefer self.alloc.free(range_value);
@@ -2387,6 +2423,8 @@ pub const PersistentIndex = struct {
             .range_key = segmentRangeMetaKey(seg_id),
             .active_key = activeSegmentMetaKey(seg_id),
             .writer_publication = writer_publication,
+            .doc_map_arena = doc_map_arena,
+            .doc_map_puts = doc_map_puts.items,
         };
     }
 
@@ -2400,6 +2438,7 @@ pub const PersistentIndex = struct {
     pub fn installInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication) void {
         publication.writer_publication.publish();
         self.alloc.free(publication.range_value);
+        publication.doc_map_arena.deinit();
         publication.* = undefined;
     }
 
@@ -2491,13 +2530,15 @@ pub const PersistentIndex = struct {
         }};
         var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
         defer writer_publication.abort();
+        var superseded: ?roaring.RoaringBitmap = null;
+        defer if (superseded) |*bitmap| bitmap.deinit();
 
         // 4. Persist metadata.
         const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         {
             const wal_trace_scope = wal_trace.scope(.artifact_link);
             defer wal_trace_scope.end();
-            try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn);
+            superseded = try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn);
         }
         if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
 
@@ -2505,6 +2546,10 @@ pub const PersistentIndex = struct {
         // commit. Publication is now infallible and transfers segment_data.
         const writer_publish_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         writer_publication.publish();
+        if (superseded) |bitmap| {
+            superseded = null;
+            self.writer.setDeletionBitmap(seg_id, bitmap);
+        }
         segment_data = null;
         rollback_segment = false;
         if (profile_enabled) writer_publish_ns = platform_time.monotonicNs() - writer_publish_start_ns;
@@ -2973,6 +3018,7 @@ pub const PersistentIndex = struct {
             replacements_initialized += 1;
 
             if (dest.segment_files == null) try dest_txn.put(.segments, &seg_key, seg_bytes);
+            try dest.stageDocMapForCopiedSegment(&dest_txn, entry.seg_id, seg_bytes, if (replacement_deleted[replacements_initialized - 1]) |*bitmap| bitmap else null);
             try dest.saveSegmentRange(&dest_txn, entry.seg_id, .{
                 .seg_id = entry.seg_id,
                 .min_doc_key = entry.min_doc_key,
@@ -3063,6 +3109,11 @@ pub const PersistentIndex = struct {
             return self.delete_infos.len == 0;
         }
 
+        /// Whether this delete tombstones the version at `location`.
+        pub fn tombstones(self: *const PreparedDeleteByIds, location: DocLocation) bool {
+            return tombstonesLocation(self.delete_infos, location);
+        }
+
         pub fn mutationsAlloc(self: *const PreparedDeleteByIds, alloc: Allocator) ![]native_catalog_backend.Mutation {
             const out = try alloc.alloc(native_catalog_backend.Mutation, self.delete_infos.len);
             for (self.delete_infos, self.seg_keys, out) |info, *seg_key, *mutation| {
@@ -3129,6 +3180,7 @@ pub const PersistentIndex = struct {
             const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, delete_info.seg_id));
             try txn.put(.deletions, &seg_key, delete_info.bitmap_bytes);
         }
+        try self.stageDocMapDeletes(&txn, doc_ids, delete_infos);
         try txn.commit();
         persisted = true;
         return delete_infos;
@@ -3509,6 +3561,7 @@ pub const PersistentIndex = struct {
         for (prepared_segments, 0..) |*segment, i| {
             try self.saveSegmentRangeWithAllocator(scratch_alloc, &txn, segment.id, segment.key_range);
             try self.updateActiveSegments(&txn, segment.id, .add);
+            try self.stageDocMapForMergedData(&txn, old_seg_ids, segment.id, segment.data);
             if (replacement_deleted) |deleted| {
                 if (deleted[i]) |*bitmap| {
                     if (!bitmap.isEmpty()) {
@@ -3712,6 +3765,7 @@ pub const PersistentIndex = struct {
 
         const new_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, new_seg_id));
         if (self.segment_files == null) try txn.put(.segments, &new_seg_key, owned);
+        try self.stageDocMapForMergedSegment(&txn, old_seg_ids, new_seg_id, owned);
 
         for (old_seg_ids) |old_id| {
             const old_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, old_id));
@@ -3854,6 +3908,7 @@ pub const PersistentIndex = struct {
         for (segment_bytes_list, 0..) |segment_bytes, i| {
             const new_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, new_seg_ids[i]));
             if (self.segment_files == null) try txn.put(.segments, &new_seg_key, segment_bytes);
+            try self.stageDocMapForMergedSegment(&txn, old_seg_ids, new_seg_ids[i], segment_bytes);
             if (replacement_deleted) |deleted| {
                 if (deleted[i]) |*bitmap| {
                     if (!bitmap.isEmpty()) {
@@ -3937,7 +3992,105 @@ pub const PersistentIndex = struct {
         writer_publication.publish();
     }
 
-    fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64) !void {
+    /// Stages the doc map entries of a segment copied in with its tombstones
+    /// (`deleted`): only live copies are mapped.
+    fn stageDocMapForCopiedSegment(self: *PersistentIndex, txn: *MainTxn, seg_id: u64, segment_bytes: []const u8, deleted: ?*const roaring.RoaringBitmap) !void {
+        if (!self.keepsDocMap()) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var puts = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+        var superseded = std.ArrayListUnmanaged(u32).empty;
+        try docMapPutsForSegmentAlloc(arena.allocator(), seg_id, segment_bytes, deleted, &puts, &superseded);
+        for (puts.items) |put| try txn.put(.docmap, put.key, put.value);
+    }
+
+    /// Drops the doc map entry of each of `doc_ids` whose location is one of
+    /// the versions `delete_infos` tombstones. An entry naming any other
+    /// version (a newer one this process has not loaded) stays.
+    fn stageDocMapDeletes(self: *PersistentIndex, txn: *MainTxn, doc_ids: []const []const u8, delete_infos: []const index_mod.IndexWriter.DeleteInfo) !void {
+        if (!self.keepsDocMap()) return;
+        for (doc_ids) |doc_id| {
+            const raw = txn.get(.docmap, doc_id) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            const location = try DocLocation.decode(raw);
+            if (tombstonesLocation(delete_infos, location)) try txn.delete(.docmap, doc_id);
+        }
+    }
+
+    fn tombstonesLocation(delete_infos: []const index_mod.IndexWriter.DeleteInfo, location: DocLocation) bool {
+        for (delete_infos) |info| {
+            if (info.seg_id != location.seg_id) continue;
+            return std.mem.indexOfScalar(u32, info.local_ids[0..info.applied_count], location.local_id) != null;
+        }
+        return false;
+    }
+
+    /// Repoints the doc map entries of a merged segment's documents from the
+    /// merge's inputs to `seg_id`. An entry naming a version outside the
+    /// inputs (deleted, or rewritten since the merge began) stays, read at
+    /// `txn`'s view.
+    fn stageDocMapForMergedSegment(self: *PersistentIndex, txn: *MainTxn, old_seg_ids: []const u64, seg_id: u64, segment_bytes: []const u8) !void {
+        if (!self.keepsDocMap()) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var reader = try segment_mod.SegmentReader.init(arena.allocator(), segment_bytes);
+        defer reader.deinit();
+        try stageDocMapForMergedReader(txn, arena.allocator(), old_seg_ids, seg_id, &reader);
+    }
+
+    fn stageDocMapForMergedData(self: *PersistentIndex, txn: *MainTxn, old_seg_ids: []const u64, seg_id: u64, data: index_mod.SegmentData) !void {
+        if (!self.keepsDocMap()) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var reader = try data.initReader(arena.allocator());
+        defer reader.deinit();
+        try stageDocMapForMergedReader(txn, arena.allocator(), old_seg_ids, seg_id, &reader);
+    }
+
+    fn stageDocMapForMergedReader(txn: *MainTxn, a: Allocator, old_seg_ids: []const u64, seg_id: u64, reader: *const segment_mod.SegmentReader) !void {
+        var local: u32 = 0;
+        while (local < reader.doc_count) : (local += 1) {
+            const key = (try reader.storedIdAlloc(a, local)) orelse continue;
+            const raw = txn.get(.docmap, key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            const location = try DocLocation.decode(raw);
+            if (std.mem.indexOfScalar(u64, old_seg_ids, location.seg_id) == null) continue;
+            try txn.put(.docmap, key, &(DocLocation{ .seg_id = seg_id, .local_id = local }).encode());
+        }
+    }
+
+    /// Whether this index keeps a doc map (see `DocLocation`).
+    pub fn keepsDocMap(self: *const PersistentIndex) bool {
+        return self.main_backend == .native_catalog;
+    }
+
+    /// Stages `seg_id`'s doc map entries in `txn`. A key the segment stores
+    /// twice keeps its last copy; the earlier copies' tombstones are staged
+    /// too and returned, for the caller to install once committed.
+    fn stageDocMapForSegment(self: *PersistentIndex, txn: *MainTxn, seg_id: u64, segment_bytes: []const u8) !?roaring.RoaringBitmap {
+        if (!self.keepsDocMap()) return null;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var puts = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+        var superseded = std.ArrayListUnmanaged(u32).empty;
+        try docMapPutsForSegmentAlloc(arena.allocator(), seg_id, segment_bytes, null, &puts, &superseded);
+        for (puts.items) |put| try txn.put(.docmap, put.key, put.value);
+        if (superseded.items.len == 0) return null;
+        var bitmap = roaring.RoaringBitmap.init(self.alloc);
+        errdefer bitmap.deinit();
+        for (superseded.items) |local| try bitmap.add(local);
+        const bytes = try bitmap.toBytes(self.alloc);
+        defer self.alloc.free(bytes);
+        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
+        try txn.put(.deletions, &seg_key, bytes);
+        return bitmap;
+    }
+
+    fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64) !?roaring.RoaringBitmap {
         var key_range = try extractSegmentKeyRange(self.alloc, segment_bytes);
         defer key_range.deinit(self.alloc);
 
@@ -3946,6 +4099,8 @@ pub const PersistentIndex = struct {
 
         const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
         if (self.segment_files == null) try txn.put(.segments, &seg_key, segment_bytes);
+        var superseded = try self.stageDocMapForSegment(&txn, seg_id, segment_bytes);
+        errdefer if (superseded) |*bitmap| bitmap.deinit();
 
         try self.saveSegmentRange(&txn, seg_id, key_range);
 
@@ -3958,6 +4113,7 @@ pub const PersistentIndex = struct {
 
         try txn.commit();
         self.committed_lsn = lsn;
+        return superseded;
     }
 
     fn updateActiveSegments(self: *PersistentIndex, txn: *MainTxn, seg_id: u64, op: enum { add, remove }) !void {
@@ -4003,8 +4159,12 @@ pub const PersistentIndex = struct {
         }};
         var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
         defer writer_publication.abort();
-        try self.persistSegment(seg_id, segment_bytes, lsn);
+        var superseded = try self.persistSegment(seg_id, segment_bytes, lsn);
         writer_publication.publish();
+        if (superseded) |bitmap| {
+            superseded = null;
+            self.writer.setDeletionBitmap(seg_id, bitmap);
+        }
         segment_data = null;
         rollback_segment = false;
         try self.wal.truncate(lsn);
@@ -4169,6 +4329,62 @@ fn loadSegmentIdsForMetaPrefix(txn: *PersistentIndex.MainTxn, alloc: Allocator, 
         try seg_ids.append(alloc, std.mem.readInt(u64, item.key[prefix.len..][0..8], .big));
     }
     return try seg_ids.toOwnedSlice(alloc);
+}
+
+/// Where a live document is: the segment holding its current version and its
+/// local id there. The full-text doc map stores one per document key, so a
+/// write finds the version it replaces without scanning segments.
+pub const DocLocation = struct {
+    seg_id: u64,
+    local_id: u32,
+
+    pub const encoded_len = 12;
+
+    pub fn encode(self: DocLocation) [encoded_len]u8 {
+        var out: [encoded_len]u8 = undefined;
+        std.mem.writeInt(u64, out[0..8], self.seg_id, .big);
+        std.mem.writeInt(u32, out[8..12], self.local_id, .big);
+        return out;
+    }
+
+    pub fn decode(bytes: []const u8) !DocLocation {
+        if (bytes.len != encoded_len) return error.InvalidDocMapEntry;
+        return .{ .seg_id = std.mem.readInt(u64, bytes[0..8], .big), .local_id = std.mem.readInt(u32, bytes[8..12], .big) };
+    }
+
+    pub fn eql(a: DocLocation, b: DocLocation) bool {
+        return a.seg_id == b.seg_id and a.local_id == b.local_id;
+    }
+};
+
+/// Doc map puts for every live stored document of a segment: each document
+/// key now lives at `(seg_id, local id)`. Copies `deleted` tombstones are
+/// skipped. A key stored live twice keeps its last copy; `superseded`
+/// receives the earlier local ids, for the caller to tombstone. Keys and
+/// values are owned by `arena`.
+pub fn docMapPutsForSegmentAlloc(
+    arena: Allocator,
+    seg_id: u64,
+    segment_bytes: []const u8,
+    deleted: ?*const roaring.RoaringBitmap,
+    out: *std.ArrayListUnmanaged(native_catalog_backend.Mutation),
+    superseded: *std.ArrayListUnmanaged(u32),
+) !void {
+    var reader = try segment_mod.SegmentReader.init(arena, segment_bytes);
+    defer reader.deinit();
+    var seen = std.StringHashMapUnmanaged(u32).empty;
+    defer seen.deinit(arena);
+    var local: u32 = 0;
+    while (local < reader.doc_count) : (local += 1) {
+        if (deleted) |bitmap| if (bitmap.contains(local)) continue;
+        const key = (try reader.storedIdAlloc(arena, local)) orelse continue;
+        if (try seen.fetchPut(arena, key, local)) |earlier| try superseded.append(arena, earlier.value);
+    }
+    var it = seen.iterator();
+    while (it.next()) |entry| {
+        const value = try arena.dupe(u8, &(DocLocation{ .seg_id = seg_id, .local_id = entry.value_ptr.* }).encode());
+        try out.append(arena, .{ .namespace = native_catalog_backend.tip_namespace, .key = entry.key_ptr.*, .value = value });
+    }
 }
 
 fn segmentRangeMetaKey(seg_id: u64) [meta_segment_range_prefix.len + 8]u8 {
@@ -5217,6 +5433,24 @@ const InlinePublicationTestSink = struct {
         return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
     }
 
+    /// Like Lite's sink: the doc map is read from the "file" (these entries),
+    /// never mirrored.
+    fn tipSink(self: *@This()) NativeCatalogSink {
+        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc, .loadOneAlloc = loadOneAlloc };
+    }
+
+    fn loadOneAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+        _ = scope;
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const i = self.findIndex(namespace, key) orelse return null;
+        return try allocator.dupe(u8, self.entries.items[i].value);
+    }
+
+    fn docLocation(self: *@This(), key: []const u8) !?DocLocation {
+        const i = self.findIndex(native_catalog_backend.tip_namespace, key) orelse return null;
+        return try DocLocation.decode(self.entries.items[i].value);
+    }
+
     fn deinit(self: *@This(), allocator: Allocator) void {
         for (self.entries.items) |e| {
             if (e.namespace) |n| allocator.free(n);
@@ -5226,6 +5460,68 @@ const InlinePublicationTestSink = struct {
         self.entries.deinit(allocator);
     }
 };
+
+// The doc map follows each document through publication, overwrite, merge
+// and delete, so a write finds the version it replaces without a scan.
+test "persistent index doc map tracks each live document's location" {
+    const alloc = std.testing.allocator;
+    var test_sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer test_sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var pi = try PersistentIndex.open(alloc, .{
+        .path = path,
+        .main_backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.tipSink(),
+    });
+    defer pi.close();
+
+    const first = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(first);
+    try pi.indexSegment(first);
+    const first_location = (try test_sink.docLocation("doc:a")).?;
+    try std.testing.expectEqual(@as(u32, 0), first_location.local_id);
+
+    // An overwrite: the old version is tombstoned, the new one mapped.
+    try std.testing.expect(try pi.deleteByIds(&.{"doc:a"}));
+    try std.testing.expect((try test_sink.docLocation("doc:a")) == null);
+    const second = try buildSimpleSegment(alloc, "doc:a", "beta");
+    defer alloc.free(second);
+    try pi.indexSegment(second);
+    const second_location = (try test_sink.docLocation("doc:a")).?;
+    try std.testing.expect(second_location.seg_id != first_location.seg_id);
+
+    const other = try buildSimpleSegment(alloc, "doc:b", "gamma");
+    defer alloc.free(other);
+    try pi.indexSegment(other);
+    const other_location = (try test_sink.docLocation("doc:b")).?;
+
+    // A merge moves both live documents to its output.
+    const merged = try alloc.alloc([]u8, 1);
+    merged[0] = try buildMultiDocSegment(alloc, &.{
+        .{ .doc_id = "doc:a", .term = "beta" },
+        .{ .doc_id = "doc:b", .term = "gamma" },
+    });
+    try std.testing.expect(try pi.replaceSegmentsIfActiveManyOwnedWithDeletes(&.{ second_location.seg_id, other_location.seg_id }, merged, null));
+    const merged_a = (try test_sink.docLocation("doc:a")).?;
+    const merged_b = (try test_sink.docLocation("doc:b")).?;
+    try std.testing.expectEqual(merged_a.seg_id, merged_b.seg_id);
+    try std.testing.expect(merged_a.seg_id != second_location.seg_id and merged_a.seg_id != other_location.seg_id);
+    try std.testing.expect(merged_a.local_id != merged_b.local_id);
+
+    // Deleting a document drops its entry; the other stays.
+    try std.testing.expect(try pi.deleteByIds(&.{"doc:b"}));
+    try std.testing.expect((try test_sink.docLocation("doc:b")) == null);
+    try std.testing.expect(DocLocation.eql(merged_a, (try test_sink.docLocation("doc:a")).?));
+
+    // The doc map stays out of the in-memory mirror.
+    var txn = try pi.beginReadMainTxn();
+    defer txn.abort();
+    var cursor = try txn.openCursor(.docmap);
+    defer cursor.close();
+    try std.testing.expect((try cursor.first()) == null);
+}
 
 test "persistent index prepares an inline segment publication, applies it through an external commit, and installs it" {
     // WS4 phase 2: proves `prepareInlineSegmentPublication` /

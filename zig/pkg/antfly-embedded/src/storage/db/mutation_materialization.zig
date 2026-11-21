@@ -3380,12 +3380,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             segment_count: usize = 0,
             seal: ?persistent_mod.PersistentIndex.SealPublication = null,
             delete: persistent_mod.PersistentIndex.PreparedDeleteByIds = .{ .delete_infos = &.{}, .seg_keys = &.{} },
+            /// The document keys this write replaces or deletes, whose doc map
+            /// entries `stage` drops when they name a version this write
+            /// tombstones.
+            delete_keys: []const []const u8 = &.{},
             progress: apply_state.Progress,
 
             fn mutationsAlloc(self: *const InlineTextPublication, alloc: Allocator) ![]native_catalog_backend.Mutation {
                 var out = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
                 errdefer out.deinit(alloc);
-                for (self.segments[0..self.segment_count]) |*seg| try out.appendSlice(alloc, &seg.mutations());
+                for (self.segments[0..self.segment_count]) |*seg| {
+                    try out.appendSlice(alloc, &seg.mutations());
+                    try out.appendSlice(alloc, seg.docMapMutations());
+                }
                 if (self.seal) |*seal| try out.append(alloc, seal.mutation());
                 const delete_mutations = try self.delete.mutationsAlloc(alloc);
                 defer alloc.free(delete_mutations);
@@ -3398,10 +3405,32 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
                 const self: *InlineTextPublication = @ptrCast(@alignCast(ptr));
                 const scope = self.entry.persistent.nativeCatalogScope() orelse return error.NotNativeCatalogBackend;
+                // Doc map deletes go first: a replaced key's new location,
+                // staged below with the segment, wins.
+                try self.stageDocMapDeletes(view, scope);
                 const mutations = try self.mutationsAlloc(self.alloc);
                 defer self.alloc.free(mutations);
                 if (mutations.len != 0) try view.putIndexCatalog(scope, mutations);
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            fn freeDeleteKeys(self: *InlineTextPublication) void {
+                for (self.delete_keys) |key| self.alloc.free(key);
+                if (self.delete_keys.len != 0) self.alloc.free(self.delete_keys);
+                self.delete_keys = &.{};
+            }
+
+            /// Drops each delete key's doc map entry, read at this
+            /// transaction's tip, when it names a version this write
+            /// tombstones. An entry naming any other version stays.
+            fn stageDocMapDeletes(self: *InlineTextPublication, view: commit_participant.View, scope: []const u8) !void {
+                for (self.delete_keys) |key| {
+                    const raw = (try view.getIndexCatalogAlloc(self.alloc, scope, native_catalog_backend.tip_namespace, key)) orelse continue;
+                    defer self.alloc.free(raw);
+                    const location = try persistent_mod.DocLocation.decode(raw);
+                    if (!self.delete.tombstones(location)) continue;
+                    try view.putIndexCatalog(scope, &.{.{ .namespace = native_catalog_backend.tip_namespace, .key = key, .is_delete = true }});
+                }
             }
 
             /// `commit_participant.Participant.stage` is called BEFORE the
@@ -3434,6 +3463,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 for (self.segments[0..self.segment_count]) |*seg| self.entry.persistent.installInlineSegmentPublication(seg);
                 self.entry.persistent.installInlineDeleteByIdsTracked(self.alloc, &self.delete);
+                self.freeDeleteKeys();
                 // This fast path adds a one-document segment directly and
                 // never goes through `finalizeTextBatchMutations` (the
                 // non-inline batch-apply path's own post-write bookkeeping),
@@ -3464,6 +3494,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.debug.assert(self.apply_guard.locked());
                 for (self.segments[0..self.segment_count]) |*seg| seg.abort(self.alloc);
                 self.entry.persistent.abortInlineDeleteByIdsTracked(self.alloc, &self.delete);
+                self.freeDeleteKeys();
                 self.apply_guard.unlock();
                 self.alloc.destroy(self);
             }
@@ -3595,6 +3626,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const seal_value = try buildInlineProjectionSeal(index_manager, store, entry, batch.sequence);
             const prepared_seal = if (seal_value) |seal| try entry.persistent.prepareInlineProjectionSealMutation(seal) else null;
 
+            const owned_delete_keys: [][]const u8 = if (prepared_delete.isEmpty()) &.{} else try alloc.alloc([]const u8, delete_keys.len);
+            var owned_key_count: usize = 0;
+            errdefer {
+                for (owned_delete_keys[0..owned_key_count]) |key| alloc.free(key);
+                if (owned_delete_keys.len != 0) alloc.free(owned_delete_keys);
+            }
+            if (owned_delete_keys.len != 0) for (delete_keys) |key| {
+                owned_delete_keys[owned_key_count] = try alloc.dupe(u8, key);
+                owned_key_count += 1;
+            };
+
             const result = try alloc.create(InlineTextPublication);
             result.* = .{
                 .alloc = alloc,
@@ -3605,6 +3647,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .segment_count = prepared_segment_count,
                 .seal = prepared_seal,
                 .delete = prepared_delete,
+                .delete_keys = owned_delete_keys,
                 .progress = .{
                     .consumer = index_ref.name,
                     .sequence = batch.sequence,
