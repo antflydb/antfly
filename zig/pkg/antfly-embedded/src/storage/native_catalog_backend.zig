@@ -111,6 +111,9 @@ pub const Sink = struct {
     /// this backend's mirror. With it, the `tip_namespace` records stay out of
     /// the mirror and are always read this way (see `tip_namespace`).
     loadOneAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
+    /// With `loadOneAlloc`: every committed `tip_namespace` entry of `scope`
+    /// (which `loadAllAlloc` leaves out), for removing them all.
+    loadTipAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry = null,
     /// Whether `submit` runs a commit's `Resolver`s itself, while applying
     /// the commit at the file's tip. When false, the backend resolves them
     /// against its own view before submitting (a single-process sink).
@@ -266,7 +269,18 @@ pub const ScopeDeletes = struct {
     mutations: []Mutation,
 
     pub fn load(allocator: Allocator, sink: Sink, scope: []const u8) !ScopeDeletes {
-        const loaded = try sink.loadAllAlloc(sink.ptr, allocator, scope);
+        const mirrored = try sink.loadAllAlloc(sink.ptr, allocator, scope);
+        const loaded = if (sink.loadTipAlloc) |load_tip| blk: {
+            errdefer freeLoaded(allocator, mirrored);
+            const tip = try load_tip(sink.ptr, allocator, scope);
+            defer allocator.free(tip);
+            errdefer for (tip) |entry| freeEntry(allocator, entry);
+            const all = try allocator.alloc(Entry, mirrored.len + tip.len);
+            @memcpy(all[0..mirrored.len], mirrored);
+            @memcpy(all[mirrored.len..], tip);
+            allocator.free(mirrored);
+            break :blk all;
+        } else mirrored;
         errdefer freeLoaded(allocator, loaded);
         const mutations = try allocator.alloc(Mutation, loaded.len);
         for (loaded, 0..) |entry, i| {
@@ -282,12 +296,14 @@ pub const ScopeDeletes = struct {
     }
 
     fn freeLoaded(allocator: Allocator, loaded: []Entry) void {
-        for (loaded) |entry| {
-            if (entry.namespace) |n| allocator.free(n);
-            allocator.free(entry.key);
-            allocator.free(entry.value);
-        }
+        for (loaded) |entry| freeEntry(allocator, entry);
         allocator.free(loaded);
+    }
+
+    fn freeEntry(allocator: Allocator, entry: Entry) void {
+        if (entry.namespace) |n| allocator.free(n);
+        allocator.free(entry.key);
+        allocator.free(entry.value);
     }
 };
 
@@ -665,6 +681,17 @@ pub const Backend = struct {
     /// See `mirror_invalid`.
     fn tipReads(self: *const Backend) bool {
         return self.sink.loadOneAlloc != null;
+    }
+
+    /// Every committed `tip_namespace` entry (empty without tip reads).
+    /// Free with `freeEntries`.
+    pub fn loadTipEntriesAlloc(self: *const Backend, allocator: Allocator) ![]Entry {
+        const load_tip = self.sink.loadTipAlloc orelse return try allocator.alloc(Entry, 0);
+        return try load_tip(self.sink.ptr, allocator, self.scope);
+    }
+
+    pub fn freeEntries(allocator: Allocator, entries: []Entry) void {
+        ScopeDeletes.freeLoaded(allocator, entries);
     }
 
     pub fn invalidateMirror(self: *Backend) void {

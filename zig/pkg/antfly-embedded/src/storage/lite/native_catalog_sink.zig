@@ -230,6 +230,7 @@ pub const Sink = struct {
             .submit = submit,
             .loadAllAlloc = loadAllAlloc,
             .loadOneAlloc = loadOneAlloc,
+            .loadTipAlloc = loadTipAlloc,
             .resolves = true,
             .submitDeferred = submitDeferred,
             .pauseMaintenance = pauseMaintenance,
@@ -316,6 +317,16 @@ pub const Sink = struct {
         // Unconditional: a maintenance snapshot's DB loads its indexes during
         // open, before the snapshot is given its write target.
         self.store.noteLoadedIndexScope(scope);
+        // The doc map is read through `loadOneAlloc` only; never mirrored.
+        return try self.loadScopeAlloc(allocator, scope, .mirrored);
+    }
+
+    fn loadTipAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        return try self.loadScopeAlloc(allocator, scope, .tip);
+    }
+
+    fn loadScopeAlloc(self: *Sink, allocator: Allocator, scope: []const u8, which: enum { mirrored, tip }) ![]native_catalog_backend.Entry {
         var txn = try self.store.beginRead();
         defer txn.abort();
         const file = try txn.readFile();
@@ -339,13 +350,13 @@ pub const Sink = struct {
             defer allocator.free(record.key);
             defer allocator.free(record.value);
             if (try decodeAlloc(allocator, scope, record.key, record.value)) |entry| {
-                // Read through `loadOneAlloc` only; never mirrored.
-                if (entry.namespace) |n| if (std.mem.eql(u8, n, native_catalog_backend.tip_namespace)) {
-                    allocator.free(n);
+                const is_tip = if (entry.namespace) |n| std.mem.eql(u8, n, native_catalog_backend.tip_namespace) else false;
+                if (is_tip != (which == .tip)) {
+                    if (entry.namespace) |n| allocator.free(n);
                     allocator.free(entry.key);
                     allocator.free(entry.value);
                     continue;
-                };
+                }
                 try result.append(allocator, entry);
             }
         }

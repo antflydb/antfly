@@ -3380,38 +3380,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             segments: [max_segments]persistent_mod.PersistentIndex.InlineSegmentPublication = undefined,
             segment_count: usize = 0,
             seal: ?persistent_mod.PersistentIndex.SealPublication = null,
-            delete: persistent_mod.PersistentIndex.PreparedDeleteByIds = .{ .delete_infos = &.{}, .seg_keys = &.{} },
-            /// The document keys this write replaces or deletes, whose doc map
-            /// entries `stage` drops when they name a version this write
-            /// tombstones.
+            /// Keys this write deletes without publishing a new copy, at their
+            /// versions (`DocVersion`).
             delete_keys: []const []const u8 = &.{},
-            /// The index's doc map is complete: `stage` finds old versions,
-            /// tombstones and segment ids at the transaction's tip instead
-            /// of from process memory (`delete` stays empty).
-            tip_deletes: bool = false,
-            /// Built by `stage`: the tombstone records it staged, the
-            /// tombstones to apply in memory once durable, and the segment
-            /// counter. Owned by `stage_arena`.
+            delete_versions: []const u64 = &.{},
+            /// Built by `stage`, owned by `stage_arena`: the doc map and dead
+            /// set mutations decided at the transaction's tip, the versions
+            /// they made dead (applied in memory once durable), and the
+            /// segment counter.
             stage_arena: std.heap.ArenaAllocator,
-            staged_deletions: std.ArrayListUnmanaged(native_catalog_backend.Mutation) = .empty,
-            committed_deletes: std.ArrayListUnmanaged(CommittedDelete) = .empty,
+            decided: std.ArrayListUnmanaged(native_catalog_backend.Mutation) = .empty,
+            newly_dead: std.ArrayListUnmanaged(u64) = .empty,
             counter_value: ?[8]u8 = null,
             progress: apply_state.Progress,
-
-            const CommittedDelete = struct { seg_id: u64, local_ids: []const u32 };
 
             fn mutationsAlloc(self: *const InlineTextPublication, alloc: Allocator) ![]native_catalog_backend.Mutation {
                 var out = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
                 errdefer out.deinit(alloc);
-                for (self.segments[0..self.segment_count]) |*seg| {
-                    try out.appendSlice(alloc, &seg.mutations());
-                    try out.appendSlice(alloc, seg.docMapMutations());
-                }
+                for (self.segments[0..self.segment_count]) |*seg| try out.appendSlice(alloc, &seg.mutations());
                 if (self.seal) |*seal| try out.append(alloc, seal.mutation());
-                const delete_mutations = try self.delete.mutationsAlloc(alloc);
-                defer alloc.free(delete_mutations);
-                try out.appendSlice(alloc, delete_mutations);
-                try out.appendSlice(alloc, self.staged_deletions.items);
+                try out.appendSlice(alloc, self.decided.items);
                 if (self.counter_value) |*value| try out.append(alloc, .{ .namespace = "meta", .key = persistent_mod.PersistentIndex.next_segment_id_key, .value = value });
                 return try out.toOwnedSlice(alloc);
             }
@@ -3421,9 +3409,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
                 const self: *InlineTextPublication = @ptrCast(@alignCast(ptr));
                 const scope = self.entry.persistent.nativeCatalogScope() orelse return error.NotNativeCatalogBackend;
-                // Doc map deletes go first: a replaced key's new location,
-                // staged below with the segment, wins.
-                if (self.tip_deletes) try self.stageTipDeletes(view, scope) else try self.stageDocMapDeletes(view, scope);
+                try self.stageVersions(view, scope);
                 try self.stageSegmentIds(view, scope);
                 const mutations = try self.mutationsAlloc(self.alloc);
                 defer self.alloc.free(mutations);
@@ -3431,36 +3417,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
             }
 
-            /// Finds each delete key's current version through the doc map at
-            /// this transaction's tip (skipping an entry whose segment is no
-            /// longer active there), adds its tombstone to that segment's
-            /// committed bitmap, and drops the entry. Nothing here comes from
+            /// Decides every copy this write publishes and every key it deletes
+            /// against the key's current version at this transaction's tip,
+            /// last writer wins (`resolveVersionsAlloc`). Nothing comes from
             /// process memory, so a stale process can neither miss a version
             /// another process wrote nor drop another process's tombstone.
-            fn stageTipDeletes(self: *InlineTextPublication, view: commit_participant.View, scope: []const u8) !void {
+            fn stageVersions(self: *InlineTextPublication, view: commit_participant.View, scope: []const u8) !void {
                 const a = self.stage_arena.allocator();
-                var per_segment = std.AutoArrayHashMapUnmanaged(u64, std.ArrayListUnmanaged(u32)).empty;
-                for (self.delete_keys) |key| {
-                    const raw = (try view.getIndexCatalogAlloc(a, scope, native_catalog_backend.tip_namespace, key)) orelse continue;
-                    const location = try persistent_mod.DocLocation.decode(raw);
-                    try view.putIndexCatalog(scope, &.{.{ .namespace = native_catalog_backend.tip_namespace, .key = key, .is_delete = true }});
-                    const active_key = persistent_mod.activeSegmentMetaKey(location.seg_id);
-                    if ((try view.getIndexCatalogAlloc(a, scope, "meta", &active_key)) == null) continue;
-                    const slot = try per_segment.getOrPut(a, location.seg_id);
-                    if (!slot.found_existing) slot.value_ptr.* = .empty;
-                    try slot.value_ptr.append(a, location.local_id);
+                var changes = std.ArrayListUnmanaged(persistent_mod.VersionedChange).empty;
+                for (self.segments[0..self.segment_count]) |*seg| try changes.appendSlice(a, seg.copies);
+                for (self.delete_keys, self.delete_versions) |key, version| {
+                    try changes.append(a, .{ .key = key, .version = persistent_mod.DocVersion.deletion(version) });
                 }
-                var it = per_segment.iterator();
-                while (it.next()) |entry| {
-                    const seg_key = try a.dupe(u8, &std.mem.toBytes(std.mem.nativeToBig(u64, entry.key_ptr.*)));
-                    var bitmap = if (try view.getIndexCatalogAlloc(a, scope, "deletions", seg_key)) |bytes|
-                        try roaring.RoaringBitmap.fromBytes(a, bytes)
-                    else
-                        roaring.RoaringBitmap.init(a);
-                    for (entry.value_ptr.items) |local| try bitmap.add(local);
-                    try self.staged_deletions.append(a, .{ .namespace = "deletions", .key = seg_key, .value = try bitmap.toBytes(a) });
-                    try self.committed_deletes.append(a, .{ .seg_id = entry.key_ptr.*, .local_ids = entry.value_ptr.items });
-                }
+                const Tip = struct {
+                    view: commit_participant.View,
+                    scope: []const u8,
+                    fn get(ptr: *anyopaque, allocator: Allocator, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+                        const tip: *@This() = @ptrCast(@alignCast(ptr));
+                        return try tip.view.getIndexCatalogAlloc(allocator, tip.scope, namespace, key);
+                    }
+                };
+                var tip: Tip = .{ .view = view, .scope = scope };
+                try persistent_mod.resolveVersionsAlloc(a, .{ .ptr = &tip, .getFn = Tip.get }, changes.items, &.{}, &self.decided, &self.newly_dead);
             }
 
             /// Takes this write's segment ids from the committed counter at
@@ -3485,20 +3463,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             fn freeDeleteKeys(self: *InlineTextPublication) void {
                 for (self.delete_keys) |key| self.alloc.free(key);
                 if (self.delete_keys.len != 0) self.alloc.free(self.delete_keys);
+                if (self.delete_versions.len != 0) self.alloc.free(self.delete_versions);
                 self.delete_keys = &.{};
-            }
-
-            /// Drops each delete key's doc map entry, read at this
-            /// transaction's tip, when it names a version this write
-            /// tombstones. An entry naming any other version stays.
-            fn stageDocMapDeletes(self: *InlineTextPublication, view: commit_participant.View, scope: []const u8) !void {
-                for (self.delete_keys) |key| {
-                    const raw = (try view.getIndexCatalogAlloc(self.alloc, scope, native_catalog_backend.tip_namespace, key)) orelse continue;
-                    defer self.alloc.free(raw);
-                    const location = try persistent_mod.DocLocation.decode(raw);
-                    if (!self.delete.tombstones(location)) continue;
-                    try view.putIndexCatalog(scope, &.{.{ .namespace = native_catalog_backend.tip_namespace, .key = key, .is_delete = true }});
-                }
+                self.delete_versions = &.{};
             }
 
             /// `commit_participant.Participant.stage` is called BEFORE the
@@ -3530,9 +3497,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     std.log.err("inline text publication install: rebuilding mutations failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
                 }
                 for (self.segments[0..self.segment_count]) |*seg| self.entry.persistent.installInlineSegmentPublication(seg);
-                self.entry.persistent.installInlineDeleteByIdsTracked(self.alloc, &self.delete);
                 // Durable now: only from here may queries see the deletes.
-                for (self.committed_deletes.items) |committed| self.entry.persistent.applyCommittedDeletes(committed.seg_id, committed.local_ids);
+                self.entry.persistent.installDeadVersions(self.newly_dead.items);
                 self.freeDeleteKeys();
                 self.stage_arena.deinit();
                 // This fast path adds a one-document segment directly and
@@ -3547,7 +3513,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // exact needsMerge/schedule/noteComplete sequence
                 // `finalizeTextBatchMutations`/`beginTextMergeTask` already
                 // use for the slow path.
-                if (self.segment_count != 0 or !self.delete.isEmpty() or self.committed_deletes.items.len != 0) {
+                if (self.segment_count != 0 or self.newly_dead.items.len != 0) {
                     self.index_manager.noteInlineTextPublicationSegments(self.entry) catch |err| {
                         std.log.err("inline text publication install: merge-need check failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
                     };
@@ -3564,7 +3530,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             pub fn abort(self: *InlineTextPublication) void {
                 std.debug.assert(self.apply_guard.locked());
                 for (self.segments[0..self.segment_count]) |*seg| seg.abort(self.alloc);
-                self.entry.persistent.abortInlineDeleteByIdsTracked(self.alloc, &self.delete);
                 self.freeDeleteKeys();
                 self.stage_arena.deinit();
                 self.apply_guard.unlock();
@@ -3642,6 +3607,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             defer collected.deinit();
             if (collected.missing_required != 0 or collected.docs.items.len == 0) return error.InlineTextPublicationUnsupported;
+            // Each copy's version: this write's sequence, then its position.
+            for (collected.docs.items, 0..) |*doc, position| doc.doc_version = try persistent_mod.DocVersion.of(batch.sequence, position);
 
             var publication_plan = try index_manager.planTextMapperDocsPublication(
                 index_ref.name,
@@ -3675,17 +3642,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const entry = index_manager.textIndexEntry(index_ref.name) orelse return error.InlineTextPublicationUnsupported;
             if (entry.persistent.main_backend != .native_catalog) return error.InlineTextPublicationUnsupported;
 
+            if (!entry.persistent.versioned) return error.InlineTextPublicationUnsupported;
+
             const delete_keys = try collectTextReplayDeleteKeys(alloc, index_manager, batch, index_ref.name, publication_context);
             defer if (delete_keys.len > 0) alloc.free(delete_keys);
-
-            // With a complete doc map, `stage` finds old versions at the
-            // transaction's tip; nothing is scanned or tombstoned in memory.
-            const tip_deletes = entry.persistent.doc_map_complete;
-            var prepared_delete = if (tip_deletes)
-                persistent_mod.PersistentIndex.PreparedDeleteByIds{ .delete_infos = &.{}, .seg_keys = &.{} }
-            else
-                try entry.persistent.prepareInlineDeleteByIdsTracked(alloc, delete_keys);
-            errdefer entry.persistent.abortInlineDeleteByIdsTracked(alloc, &prepared_delete);
 
             var prepared_segments: [InlineTextPublication.max_segments]persistent_mod.PersistentIndex.InlineSegmentPublication = undefined;
             var prepared_segment_count: usize = 0;
@@ -3704,16 +3664,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const seal_value = try buildInlineProjectionSeal(index_manager, store, entry, batch.sequence);
             const prepared_seal = if (seal_value) |seal| try entry.persistent.prepareInlineProjectionSealMutation(seal) else null;
 
-            const owned_delete_keys: [][]const u8 = if (prepared_delete.isEmpty() and !tip_deletes) &.{} else try alloc.alloc([]const u8, delete_keys.len);
-            var owned_key_count: usize = 0;
+            // A key this write indexes again needs no delete: its new copy
+            // supersedes the old one. The rest are deleted at versions after
+            // every copy's.
+            var indexed = std.StringHashMapUnmanaged(void).empty;
+            defer indexed.deinit(alloc);
+            for (collected.docs.items) |doc| try indexed.put(alloc, doc.key, {});
+            var owned_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
             errdefer {
-                for (owned_delete_keys[0..owned_key_count]) |key| alloc.free(key);
-                if (owned_delete_keys.len != 0) alloc.free(owned_delete_keys);
+                for (owned_delete_keys.items) |key| alloc.free(key);
+                owned_delete_keys.deinit(alloc);
             }
-            if (owned_delete_keys.len != 0) for (delete_keys) |key| {
-                owned_delete_keys[owned_key_count] = try alloc.dupe(u8, key);
-                owned_key_count += 1;
-            };
+            var owned_delete_versions = std.ArrayListUnmanaged(u64).empty;
+            errdefer owned_delete_versions.deinit(alloc);
+            for (delete_keys) |key| {
+                if (indexed.contains(key)) continue;
+                try owned_delete_versions.append(alloc, try persistent_mod.DocVersion.of(batch.sequence, collected.docs.items.len + owned_delete_keys.items.len));
+                try owned_delete_keys.append(alloc, try alloc.dupe(u8, key));
+            }
 
             const result = try alloc.create(InlineTextPublication);
             result.* = .{
@@ -3724,9 +3692,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .segments = prepared_segments,
                 .segment_count = prepared_segment_count,
                 .seal = prepared_seal,
-                .delete = prepared_delete,
-                .delete_keys = owned_delete_keys,
-                .tip_deletes = tip_deletes,
+                .delete_keys = try owned_delete_keys.toOwnedSlice(alloc),
+                .delete_versions = try owned_delete_versions.toOwnedSlice(alloc),
                 .stage_arena = std.heap.ArenaAllocator.init(alloc),
                 .progress = .{
                     .consumer = index_ref.name,
@@ -4561,6 +4528,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
                 defer collected.deinit();
                 if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
+                var replay_versions = try TextReplayVersions.init(ctx.alloc, batch, collected.docs.items);
+                defer replay_versions.deinit();
 
                 const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
                 var write_start: usize = 0;
@@ -4644,10 +4613,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     publication_context,
                                 );
                             defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
+                            const versioned = if (ctx.index_manager.textIndexEntry(index_ref.name)) |entry| entry.persistent.versioned else false;
+                            var deletes = if (versioned) try replay_versions.deletesAlloc(delete_keys) else TextReplayVersions.Deletes{ .keys = delete_keys };
+                            defer if (versioned) deletes.deinit(ctx.alloc);
                             try ctx.index_manager.applyPreparedTextMapperPublicationByNameWithOptions(
                                 ctx.store,
                                 index_ref.name,
-                                delete_keys,
+                                deletes.keys,
+                                deletes.versions,
                                 &prepared_publication,
                                 text_replay_options,
                             );
@@ -6900,6 +6873,74 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 });
             }
         }
+
+        /// Full-text versions for one replayed batch, which may fold several
+        /// journal records: each copy and each delete takes its own record's
+        /// sequence (`DerivedDocument.sequence`, `DerivedBatch.delete_sequences`),
+        /// with positions counted per sequence.
+        pub const TextReplayVersions = struct {
+            alloc: Allocator,
+            batch: derived_types.DerivedBatch,
+            next_position: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+            indexed: std.StringHashMapUnmanaged(void) = .empty,
+
+            pub const Deletes = struct {
+                keys: []const []const u8,
+                versions: []const u64 = &.{},
+
+                pub fn deinit(self: *Deletes, alloc: Allocator) void {
+                    if (self.keys.len != 0) alloc.free(self.keys);
+                    if (self.versions.len != 0) alloc.free(self.versions);
+                }
+            };
+
+            /// Stamps `docs` with their versions.
+            pub fn init(alloc: Allocator, batch: derived_types.DerivedBatch, docs: []mapper.MapperDoc) !TextReplayVersions {
+                var self: TextReplayVersions = .{ .alloc = alloc, .batch = batch };
+                errdefer self.deinit();
+                var sequences = std.StringHashMapUnmanaged(u64).empty;
+                defer sequences.deinit(alloc);
+                for (batch.documents) |doc| try sequences.put(alloc, doc.key, if (doc.sequence != 0) doc.sequence else batch.sequence);
+                for (docs) |*doc| {
+                    doc.doc_version = try self.next(sequences.get(doc.key) orelse batch.sequence);
+                    try self.indexed.put(alloc, doc.key, {});
+                }
+                return self;
+            }
+
+            pub fn deinit(self: *TextReplayVersions) void {
+                self.next_position.deinit(self.alloc);
+                self.indexed.deinit(self.alloc);
+            }
+
+            fn next(self: *TextReplayVersions, sequence: u64) !u64 {
+                const slot = try self.next_position.getOrPut(self.alloc, sequence);
+                if (!slot.found_existing) slot.value_ptr.* = 0;
+                defer slot.value_ptr.* += 1;
+                return try persistent_mod.DocVersion.of(sequence, slot.value_ptr.*);
+            }
+
+            /// The keys this batch deletes without indexing a new copy, at
+            /// their records' versions. A key indexed again needs no delete:
+            /// its new copy supersedes the old one.
+            pub fn deletesAlloc(self: *TextReplayVersions, delete_keys: []const []const u8) !Deletes {
+                var sequences = std.StringHashMapUnmanaged(u64).empty;
+                defer sequences.deinit(self.alloc);
+                if (self.batch.delete_sequences.len == self.batch.overwritten_doc_keys.len) {
+                    for (self.batch.overwritten_doc_keys, self.batch.delete_sequences) |key, sequence| try sequences.put(self.alloc, key, sequence);
+                }
+                var keys = std.ArrayListUnmanaged([]const u8).empty;
+                errdefer keys.deinit(self.alloc);
+                var versions = std.ArrayListUnmanaged(u64).empty;
+                errdefer versions.deinit(self.alloc);
+                for (delete_keys) |key| {
+                    if (self.indexed.contains(key)) continue;
+                    try versions.append(self.alloc, try self.next(sequences.get(key) orelse self.batch.sequence));
+                    try keys.append(self.alloc, key);
+                }
+                return .{ .keys = try keys.toOwnedSlice(self.alloc), .versions = try versions.toOwnedSlice(self.alloc) };
+            }
+        };
 
         pub fn collectTextReplayDeleteKeys(
             alloc: Allocator,

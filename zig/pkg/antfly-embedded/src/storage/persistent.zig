@@ -919,10 +919,14 @@ pub const PreparedMergeSegment = struct {
 const meta_committed_lsn = "committed_lsn";
 const meta_rebuild_cursor = "rebuild_snapshot_cursor";
 const meta_next_seg_id = "next_seg_id";
-/// Present (value `text_storage_format_doc_map`) once the doc map names every
-/// live document; see `upgradeDocMapLocked`.
+/// A rebuild's version allocator: its cut and next document number
+/// (`reserveRebuildVersions`). Cleared when the index is reset.
+const meta_rebuild_versions = "rebuild_versions";
+/// `text_storage_format_versions` once every copy carries a version and the
+/// doc map and dead set decide liveness (see `DocVersion`). A native catalog
+/// index without it is rebuilt (`needs_version_rebuild`).
 const meta_text_storage_format = "text_storage_format";
-const text_storage_format_doc_map: u32 = 1;
+const text_storage_format_versions: u32 = 2;
 const meta_active_segments = "active_segments";
 const meta_active_segment_prefix = "active_segment:";
 const meta_retired_segment_prefix = "retired_segment:";
@@ -977,11 +981,13 @@ const MainKeyspace = enum {
     segments,
     meta,
     deletions,
-    /// Each live document's current location (see `DocLocation`); read
-    /// only at the tip, never mirrored (`native_catalog_backend.tip_namespace`).
+    /// Each key's current version (see `DocVersion`); read only at the tip,
+    /// never mirrored (`native_catalog_backend.tip_namespace`).
     docmap,
     /// A commit's `native_catalog_backend.Resolver`; never stored.
     resolve,
+    /// Superseded and deleted versions (see `DeadVersions`).
+    dead,
 };
 
 fn mapRuntimeNamespace(namespace: backend_types.Namespace) !MainKeyspace {
@@ -989,6 +995,7 @@ fn mapRuntimeNamespace(namespace: backend_types.Namespace) !MainKeyspace {
     if (std.mem.eql(u8, namespace.name.?, "segments")) return .segments;
     if (std.mem.eql(u8, namespace.name.?, "meta")) return .meta;
     if (std.mem.eql(u8, namespace.name.?, "deletions")) return .deletions;
+    if (std.mem.eql(u8, namespace.name.?, dead_namespace)) return .dead;
     if (std.mem.eql(u8, namespace.name.?, native_catalog_backend.tip_namespace)) return .docmap;
     if (std.mem.eql(u8, namespace.name.?, native_catalog_backend.resolve_namespace)) return .resolve;
     return error.InvalidNamespace;
@@ -999,6 +1006,7 @@ fn runtimeNamespace(keyspace: MainKeyspace) backend_types.Namespace {
         .segments => .{ .name = "segments" },
         .meta => .{ .name = "meta" },
         .deletions => .{ .name = "deletions" },
+        .dead => .{ .name = dead_namespace },
         .docmap => .{ .name = native_catalog_backend.tip_namespace },
         .resolve => .{ .name = native_catalog_backend.resolve_namespace },
     };
@@ -1149,10 +1157,16 @@ pub const PersistentIndex = struct {
     main_map_size: usize,
     wal_map_size: usize,
     read_only: bool = false,
-    /// The doc map names every live document (the index was upgraded or
-    /// created with it), so a write may find old versions there instead of
-    /// scanning. See docs/design/lite-performance/lite-full-text-storage.md.
-    doc_map_complete: bool = false,
+    /// Every copy carries a version, and the doc map and dead set decide
+    /// liveness (`text_storage_format_versions`). See
+    /// docs/design/lite-performance/lite-full-text-storage.md.
+    versioned: bool = false,
+    /// A native catalog index from an older format: its owner resets and
+    /// rebuilds it from the primary rows.
+    needs_version_rebuild: bool = false,
+    /// Where each version of a loaded segment sits, for installing newly dead
+    /// versions in memory (`installDeadVersions`).
+    version_locations: VersionLocations = .{},
 
     /// A private candidate publishes all segments produced by one source page
     /// together with its cursor. Until commit they are unreachable orphan files
@@ -1193,21 +1207,14 @@ pub const PersistentIndex = struct {
             defer if (publication) |*prepared| prepared.abort();
             var txn = try index.beginWriteMainTxn();
             errdefer txn.abort();
-            var superseded = std.ArrayListUnmanaged(struct { u64, roaring.RoaringBitmap }).empty;
-            defer {
-                for (superseded.items) |*entry| entry[1].deinit();
-                superseded.deinit(index.alloc);
-            }
+            var resolution = VersionResolution.init(index);
+            defer resolution.deinit();
             for (self.segments.items) |segment| {
                 var range = try extractSegmentDataKeyRange(index.alloc, segment.data);
                 defer range.deinit(index.alloc);
                 const key = std.mem.toBytes(std.mem.nativeToBig(u64, segment.id));
                 if (index.segment_files == null) try txn.put(.segments, &key, segment.data.bytes());
-                if (index.segment_files == null) if (try index.stageDocMapForSegment(&txn, segment.id, segment.data.bytes())) |bitmap| {
-                    var owned = bitmap;
-                    errdefer owned.deinit();
-                    try superseded.append(index.alloc, .{ segment.id, owned });
-                };
+                if (index.resolvesAtTip()) try resolution.addSegment(segment.data.bytes(), null);
                 try index.saveSegmentRange(&txn, segment.id, range);
                 try index.updateActiveSegments(&txn, segment.id, .add);
             }
@@ -1215,12 +1222,10 @@ pub const PersistentIndex = struct {
             defer counter_floor.deinit();
             try index.saveSegmentCounterFloor(&txn, &counter_floor, index.writer.next_segment_id);
             try txn.put(.meta, meta_rebuild_cursor, self.cursor);
+            if (index.resolvesAtTip()) try resolution.stage(&txn);
             try txn.commit();
             if (publication) |*prepared| prepared.publish();
-            for (superseded.items) |*entry| {
-                index.writer.setDeletionBitmap(entry[0], entry[1]);
-                entry[1] = roaring.RoaringBitmap.init(index.alloc);
-            }
+            resolution.install();
             self.segments.clearRetainingCapacity(); // ownership moved to writer
             index.active_rebuild_page = null;
             self.active = false;
@@ -1701,6 +1706,7 @@ pub const PersistentIndex = struct {
 
         // Recovery: load existing segments from metadata plus immutable files.
         var committed_lsn: u64 = 0;
+        var versioned = false;
         {
             var read_txn = try MainTxn.open(&opened_main.store, true);
             defer read_txn.abort();
@@ -1716,6 +1722,15 @@ pub const PersistentIndex = struct {
 
             const active_ids = try loadActiveSegmentIdsFromTxn(&read_txn, alloc);
             defer alloc.free(active_ids);
+            if (opts.main_backend == .native_catalog) {
+                const format = read_txn.get(.meta, meta_text_storage_format) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                versioned = if (format) |bytes| bytes.len == 4 and std.mem.readInt(u32, bytes[0..4], .little) == text_storage_format_versions else false;
+            }
+            var dead_versions: ?DeadVersions = if (versioned) try DeadVersions.load(alloc, &read_txn) else null;
+            defer if (dead_versions) |*dead| dead.deinit();
             for (active_ids) |seg_id| {
                 const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
                 const seg_bytes = read_txn.get(.segments, &seg_key) catch |err| switch (err) {
@@ -1790,6 +1805,11 @@ pub const PersistentIndex = struct {
                     return err;
                 };
 
+                if (dead_versions) |*dead| {
+                    const segments = writer.snapshot().segments;
+                    if (try derivedDeletionBitmap(alloc, &segments[segments.len - 1].reader, dead)) |bitmap| writer.setDeletionBitmap(seg_id, bitmap);
+                    continue;
+                }
                 const deletion_bytes = read_txn.get(.deletions, &seg_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
@@ -1843,6 +1863,7 @@ pub const PersistentIndex = struct {
             .main_map_size = opts.main_map_size,
             .wal_map_size = opts.wal_map_size,
             .read_only = opts.read_only,
+            .versioned = versioned,
         };
 
         // Replay each WAL entry
@@ -1862,7 +1883,7 @@ pub const PersistentIndex = struct {
         if (!opts.read_only) {
             try pi.pruneActiveSegmentsMissingRangesOrDataLocked(path_span);
         }
-        if (pi.keepsDocMap()) try pi.upgradeDocMapLocked();
+        if (pi.keepsDocMap()) try pi.ensureVersionedFormatLocked();
 
         if (pi.segment_files) |*store| {
             pi.retired_segment_file_deleter = try RetiredSegmentFileDeleter.init(alloc, store);
@@ -1883,6 +1904,7 @@ pub const PersistentIndex = struct {
 
     pub fn close(self: *PersistentIndex) void {
         self.lockStorage();
+        self.version_locations.deinit(self.alloc);
         self.writer.deinit();
         self.flushCompletedRetirementMarkersLocked();
         if (self.retired_segment_file_deleter) |deleter| {
@@ -1909,6 +1931,7 @@ pub const PersistentIndex = struct {
             std.debug.assert(deleter.isDisarmed());
             deleter.disarm();
         }
+        self.version_locations.deinit(self.alloc);
         self.writer.deinit();
         self.wal.abandonAfterCrash();
         self.main_store.deinit();
@@ -2094,7 +2117,31 @@ pub const PersistentIndex = struct {
             error.NotFound => {},
             else => return err,
         };
+        // A rebuild starts the version history over: no earlier current or
+        // dead version may outrank or hide the rebuild's own copies.
+        var tip_entries: []native_catalog_backend.Entry = &.{};
+        defer if (tip_entries.len != 0) native_catalog_backend.Backend.freeEntries(self.alloc, tip_entries);
+        if (self.keepsDocMap()) {
+            switch (self.main_store_owner) {
+                .native_catalog => |backend| tip_entries = try backend.loadTipEntriesAlloc(self.alloc),
+                else => {},
+            }
+            for (tip_entries) |entry| try txn.delete(.docmap, entry.key);
+            try deleteAllInKeyspace(self.alloc, &txn, .dead);
+            txn.delete(.meta, meta_rebuild_versions) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            var format: [4]u8 = undefined;
+            std.mem.writeInt(u32, &format, text_storage_format_versions, .little);
+            try txn.put(.meta, meta_text_storage_format, &format);
+        }
         try txn.commit();
+        if (self.keepsDocMap()) {
+            self.versioned = true;
+            self.needs_version_rebuild = false;
+        }
+        self.version_locations.clear(self.alloc);
 
         // The catalog transaction is the logical reset commit. Retaining the
         // committed WAL watermark makes every pre-reset record ineligible for
@@ -2356,13 +2403,10 @@ pub const PersistentIndex = struct {
         /// infallible step left once the mutations below are durable --
         /// see `indexSegmentOwned`'s identical staged/infallible split.
         writer_publication: index_mod.IndexWriter.PreparedSegmentReplacement,
-        /// The segment's doc map entries (keys and values in `doc_map_arena`).
-        doc_map_arena: std.heap.ArenaAllocator,
-        doc_map_puts: []const native_catalog_backend.Mutation,
-
-        pub fn docMapMutations(self: *const InlineSegmentPublication) []const native_catalog_backend.Mutation {
-            return self.doc_map_puts;
-        }
+        /// Every copy the segment publishes (keys in `copies_arena`), decided
+        /// at the transaction's tip by the caller (`resolveVersionsAlloc`).
+        copies_arena: std.heap.ArenaAllocator,
+        copies: []const VersionedChange,
 
         /// Valid only while `self` stays at this address: every mutation's
         /// `key`/`value` slice points back into one of `self`'s own
@@ -2387,7 +2431,7 @@ pub const PersistentIndex = struct {
             self.writer_publication.abort();
             alloc.free(self.segment_bytes);
             alloc.free(self.range_value);
-            self.doc_map_arena.deinit();
+            self.copies_arena.deinit();
             self.* = undefined;
         }
     };
@@ -2403,6 +2447,7 @@ pub const PersistentIndex = struct {
     pub fn prepareInlineSegmentPublication(self: *PersistentIndex, segment_bytes: []u8) !InlineSegmentPublication {
         if (self.read_only) return error.ReadOnly;
         if (self.main_backend != .native_catalog) return error.NotNativeCatalogBackend;
+        if (!self.versioned) return error.InlineTextPublicationUnsupported;
         std.debug.assert(self.segment_files == null);
 
         var key_range = try extractSegmentKeyRange(self.alloc, segment_bytes);
@@ -2413,14 +2458,9 @@ pub const PersistentIndex = struct {
         self.writer.next_segment_id += 1;
         self.writer.mu.unlock();
 
-        var doc_map_arena = std.heap.ArenaAllocator.init(self.alloc);
-        errdefer doc_map_arena.deinit();
-        var doc_map_puts = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
-        var superseded = std.ArrayListUnmanaged(u32).empty;
-        try docMapPutsForSegmentAlloc(doc_map_arena.allocator(), seg_id, segment_bytes, null, &doc_map_puts, &superseded);
-        // A key stored twice in one segment needs a tombstone in the new
-        // segment itself; the inline path leaves that to the slow path.
-        if (superseded.items.len != 0) return error.InlineTextPublicationUnsupported;
+        var copies_arena = std.heap.ArenaAllocator.init(self.alloc);
+        errdefer copies_arena.deinit();
+        const copies = try segmentCopiesAlloc(copies_arena.allocator(), segment_bytes);
 
         const range_value = try self.alloc.alloc(u8, 8 + key_range.min_doc_key.len + key_range.max_doc_key.len);
         errdefer self.alloc.free(range_value);
@@ -2447,14 +2487,14 @@ pub const PersistentIndex = struct {
             .range_key = segmentRangeMetaKey(seg_id),
             .active_key = activeSegmentMetaKey(seg_id),
             .writer_publication = writer_publication,
-            .doc_map_arena = doc_map_arena,
-            .doc_map_puts = doc_map_puts.items,
+            .copies_arena = copies_arena,
+            .copies = copies,
         };
     }
 
     /// Moves an unpublished inline segment to `seg_id` (another writer took
     /// the id it was prepared with): re-prepares its writer publication and
-    /// rewrites its keys and doc map values.
+    /// rewrites its keys. Versions do not name segments, so nothing else moves.
     pub fn rebaseInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication, seg_id: u64) !void {
         if (publication.seg_id == seg_id) return;
         publication.writer_publication.abort();
@@ -2468,10 +2508,6 @@ pub const PersistentIndex = struct {
         publication.seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
         publication.range_key = segmentRangeMetaKey(seg_id);
         publication.active_key = activeSegmentMetaKey(seg_id);
-        for (publication.doc_map_puts) |put| {
-            const value: []u8 = @constCast(put.value);
-            std.mem.writeInt(u64, value[0..8], seg_id, .big);
-        }
     }
 
     /// The committed counter value for a publication of `count` segments
@@ -2505,7 +2541,7 @@ pub const PersistentIndex = struct {
     pub fn installInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication) void {
         publication.writer_publication.publish();
         self.alloc.free(publication.range_value);
-        publication.doc_map_arena.deinit();
+        publication.copies_arena.deinit();
         publication.* = undefined;
     }
 
@@ -2562,12 +2598,16 @@ pub const PersistentIndex = struct {
             break :blk appended_lsn;
         } else self.committed_lsn;
 
-        // 2. Allocate segment ID under writer lock to prevent races
+        // 2. Allocate the segment ID: at the tip for a native catalog index,
+        // where another process may be publishing to it too.
         const reserve_id_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        self.writer.lockMutex();
-        const seg_id = self.writer.next_segment_id;
-        self.writer.next_segment_id += 1;
-        self.writer.mu.unlock();
+        const seg_id = if (self.keepsDocMap()) try self.reserveSegmentId() else blk: {
+            self.writer.lockMutex();
+            defer self.writer.mu.unlock();
+            const id = self.writer.next_segment_id;
+            self.writer.next_segment_id += 1;
+            break :blk id;
+        };
         if (profile_enabled) reserve_id_ns = platform_time.monotonicNs() - reserve_id_start_ns;
 
         // 3. Publish immutable file-backed segment bytes before metadata becomes visible.
@@ -2597,15 +2637,15 @@ pub const PersistentIndex = struct {
         }};
         var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
         defer writer_publication.abort();
-        var superseded: ?roaring.RoaringBitmap = null;
-        defer if (superseded) |*bitmap| bitmap.deinit();
+        var resolution = VersionResolution.init(self);
+        defer resolution.deinit();
 
         // 4. Persist metadata.
         const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         {
             const wal_trace_scope = wal_trace.scope(.artifact_link);
             defer wal_trace_scope.end();
-            superseded = try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn);
+            try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn, &resolution);
         }
         if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
 
@@ -2613,10 +2653,7 @@ pub const PersistentIndex = struct {
         // commit. Publication is now infallible and transfers segment_data.
         const writer_publish_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         writer_publication.publish();
-        if (superseded) |bitmap| {
-            superseded = null;
-            self.writer.setDeletionBitmap(seg_id, bitmap);
-        }
+        resolution.install();
         segment_data = null;
         rollback_segment = false;
         if (profile_enabled) writer_publish_ns = platform_time.monotonicNs() - writer_publish_start_ns;
@@ -3035,6 +3072,12 @@ pub const PersistentIndex = struct {
             for (doc_keys.items) |key| alloc.free(key);
             doc_keys.deinit(alloc);
         }
+        // A versioned source keeps no per-segment tombstones: they derive
+        // from its dead set.
+        var source_dead: ?DeadVersions = if (self.versioned) try DeadVersions.load(alloc, &source_txn) else null;
+        defer if (source_dead) |*dead| dead.deinit();
+        var resolution = VersionResolution.init(dest);
+        defer resolution.deinit();
         for (plan) |entry| {
             if (entry.class != .right_only) continue;
 
@@ -3042,9 +3085,14 @@ pub const PersistentIndex = struct {
             defer alloc.free(seg_bytes);
 
             const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, entry.seg_id));
-            const deletion_bytes = source_txn.get(.deletions, &seg_key) catch |err| switch (err) {
+            const deletion_bytes = if (source_dead != null) null else source_txn.get(.deletions, &seg_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
+            };
+            if (source_dead) |*dead| if (!existing_dest.contains(entry.seg_id)) {
+                var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
+                defer reader.deinit();
+                replacement_deleted[replacements_initialized] = try derivedDeletionBitmap(alloc, &reader, dead);
             };
 
             const already_copied = existing_dest.contains(entry.seg_id);
@@ -3064,7 +3112,12 @@ pub const PersistentIndex = struct {
                 const decoded = try roaring.RoaringBitmap.fromPersistedDeletionBytesWithLayout(alloc, bytes, doc_count.?);
                 var bitmap = decoded.bitmap;
                 defer bitmap.deinit();
-                if (decoded.legacy) {
+                if (dest.resolvesAtTip()) {
+                    if (!bitmap.isEmpty()) {
+                        replacement_deleted[replacements_initialized] = bitmap;
+                        bitmap = roaring.RoaringBitmap.init(alloc);
+                    }
+                } else if (decoded.legacy) {
                     const canonical = try bitmap.toBytes(alloc);
                     defer alloc.free(canonical);
                     try dest_txn.put(.deletions, &seg_key, canonical);
@@ -3085,7 +3138,13 @@ pub const PersistentIndex = struct {
             replacements_initialized += 1;
 
             if (dest.segment_files == null) try dest_txn.put(.segments, &seg_key, seg_bytes);
-            try dest.stageDocMapForCopiedSegment(&dest_txn, entry.seg_id, seg_bytes, if (replacement_deleted[replacements_initialized - 1]) |*bitmap| bitmap else null);
+            if (dest.resolvesAtTip()) {
+                try resolution.addSegment(seg_bytes, if (replacement_deleted[replacements_initialized - 1]) |*bitmap| bitmap else null);
+            } else if (replacement_deleted[replacements_initialized - 1]) |*bitmap| if (source_dead != null) {
+                const bytes = try bitmap.toBytes(alloc);
+                defer alloc.free(bytes);
+                try dest_txn.put(.deletions, &seg_key, bytes);
+            };
             try dest.saveSegmentRange(&dest_txn, entry.seg_id, .{
                 .seg_id = entry.seg_id,
                 .min_doc_key = entry.min_doc_key,
@@ -3106,9 +3165,11 @@ pub const PersistentIndex = struct {
             for (owned_doc_keys) |key| alloc.free(key);
             alloc.free(owned_doc_keys);
         }
+        if (dest.resolvesAtTip() and resolution.changes.items.len + resolution.extra_dead.items.len != 0) try resolution.stage(&dest_txn);
         try dest_txn.commit();
         if (writer_publication) |*publication| publication.publish();
         writer_published = true;
+        resolution.install();
 
         return .{
             .transferred_segments = copied,
@@ -3176,11 +3237,6 @@ pub const PersistentIndex = struct {
             return self.delete_infos.len == 0;
         }
 
-        /// Whether this delete tombstones the version at `location`.
-        pub fn tombstones(self: *const PreparedDeleteByIds, location: DocLocation) bool {
-            return tombstonesLocation(self.delete_infos, location);
-        }
-
         pub fn mutationsAlloc(self: *const PreparedDeleteByIds, alloc: Allocator) ![]native_catalog_backend.Mutation {
             const out = try alloc.alloc(native_catalog_backend.Mutation, self.delete_infos.len);
             for (self.delete_infos, self.seg_keys, out) |info, *seg_key, *mutation| {
@@ -3231,6 +3287,8 @@ pub const PersistentIndex = struct {
     /// `freeDeleteInfos` on this index.
     pub fn deleteByIdsTracked(self: *PersistentIndex, doc_ids: []const []const u8) ![]index_mod.IndexWriter.DeleteInfo {
         if (doc_ids.len == 0) return try self.alloc.alloc(index_mod.IndexWriter.DeleteInfo, 0);
+        // A versioned delete carries its version: `deleteVersioned`.
+        if (self.resolvesAtTip()) return error.MissingDocVersion;
         self.lockStorage();
         defer self.unlockStorage();
 
@@ -3247,10 +3305,34 @@ pub const PersistentIndex = struct {
             const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, delete_info.seg_id));
             try txn.put(.deletions, &seg_key, delete_info.bitmap_bytes);
         }
-        try self.stageDocMapDeletes(&txn, doc_ids, delete_infos);
         try txn.commit();
         persisted = true;
         return delete_infos;
+    }
+
+    /// A versioned index's deletes: `keys[i]` deleted by the write at
+    /// `versions[i]` (`DocVersion.of`), or of whatever is current when
+    /// `versions` is empty, decided at the commit's tip, last writer wins,
+    /// and applied in memory once durable.
+    pub fn deleteVersioned(self: *PersistentIndex, keys: []const []const u8, versions: []const u64) !void {
+        if (versions.len != 0 and keys.len != versions.len) return error.InvalidDocVersion;
+        if (keys.len == 0) return;
+        if (!self.resolvesAtTip()) return error.NotVersioned;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var resolution = VersionResolution.init(self);
+        defer resolution.deinit();
+        for (keys, 0..) |key, i| {
+            if (versions.len == 0) {
+                const a = resolution.arena.allocator();
+                try resolution.changes.append(a, .{ .key = try a.dupe(u8, key), .version = DocVersion.current_deletion });
+            } else try resolution.addDelete(key, versions[i]);
+        }
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try resolution.stage(&txn);
+        try txn.commit();
+        resolution.install();
     }
 
     /// Atomically replace old segments with a newly merged segment.
@@ -3635,7 +3717,6 @@ pub const PersistentIndex = struct {
                 try r.addData(segment.id, segment.data);
                 continue;
             }
-            try self.stageDocMapForMergedData(&txn, old_seg_ids, segment.id, segment.data);
             if (replacement_deleted) |deleted| {
                 if (deleted[i]) |*bitmap| {
                     if (!bitmap.isEmpty()) {
@@ -3854,11 +3935,7 @@ pub const PersistentIndex = struct {
         try self.saveSegmentRange(&txn, new_seg_id, key_range);
         try self.updateActiveSegments(&txn, new_seg_id, .add);
         // After the inputs' tombstone records are removed above.
-        if (resolution) |*r| {
-            try r.addBytes(new_seg_id, owned);
-        } else {
-            try self.stageDocMapForMergedSegment(&txn, old_seg_ids, new_seg_id, owned);
-        }
+        if (resolution) |*r| try r.addBytes(new_seg_id, owned);
         try txn.commit();
 
         writer_publication.publish();
@@ -3992,7 +4069,6 @@ pub const PersistentIndex = struct {
                 try r.addBytes(new_seg_ids[i], segment_bytes);
                 continue;
             }
-            try self.stageDocMapForMergedSegment(&txn, old_seg_ids, new_seg_ids[i], segment_bytes);
             if (replacement_deleted) |deleted| {
                 if (deleted[i]) |*bitmap| {
                     if (!bitmap.isEmpty()) {
@@ -4079,82 +4155,11 @@ pub const PersistentIndex = struct {
         writer_publication.publish();
     }
 
-    /// Stages the doc map entries of a segment copied in with its tombstones
-    /// (`deleted`): only live copies are mapped.
-    fn stageDocMapForCopiedSegment(self: *PersistentIndex, txn: *MainTxn, seg_id: u64, segment_bytes: []const u8, deleted: ?*const roaring.RoaringBitmap) !void {
-        if (!self.keepsDocMap()) return;
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        var puts = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
-        var superseded = std.ArrayListUnmanaged(u32).empty;
-        try docMapPutsForSegmentAlloc(arena.allocator(), seg_id, segment_bytes, deleted, &puts, &superseded);
-        for (puts.items) |put| try txn.put(.docmap, put.key, put.value);
-    }
-
-    /// Drops the doc map entry of each of `doc_ids` whose location is one of
-    /// the versions `delete_infos` tombstones. An entry naming any other
-    /// version (a newer one this process has not loaded) stays.
-    fn stageDocMapDeletes(self: *PersistentIndex, txn: *MainTxn, doc_ids: []const []const u8, delete_infos: []const index_mod.IndexWriter.DeleteInfo) !void {
-        if (!self.keepsDocMap()) return;
-        for (doc_ids) |doc_id| {
-            const raw = txn.get(.docmap, doc_id) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
-            const location = try DocLocation.decode(raw);
-            if (tombstonesLocation(delete_infos, location)) try txn.delete(.docmap, doc_id);
-        }
-    }
-
-    fn tombstonesLocation(delete_infos: []const index_mod.IndexWriter.DeleteInfo, location: DocLocation) bool {
-        for (delete_infos) |info| {
-            if (info.seg_id != location.seg_id) continue;
-            return std.mem.indexOfScalar(u32, info.local_ids[0..info.applied_count], location.local_id) != null;
-        }
-        return false;
-    }
-
-    /// Repoints the doc map entries of a merged segment's documents from the
-    /// merge's inputs to `seg_id`. An entry naming a version outside the
-    /// inputs (deleted, or rewritten since the merge began) stays, read at
-    /// `txn`'s view.
-    fn stageDocMapForMergedSegment(self: *PersistentIndex, txn: *MainTxn, old_seg_ids: []const u64, seg_id: u64, segment_bytes: []const u8) !void {
-        if (!self.keepsDocMap()) return;
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        var reader = try segment_mod.SegmentReader.init(arena.allocator(), segment_bytes);
-        defer reader.deinit();
-        try stageDocMapForMergedReader(txn, arena.allocator(), old_seg_ids, seg_id, &reader);
-    }
-
-    fn stageDocMapForMergedData(self: *PersistentIndex, txn: *MainTxn, old_seg_ids: []const u64, seg_id: u64, data: index_mod.SegmentData) !void {
-        if (!self.keepsDocMap()) return;
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        var reader = try data.initReader(arena.allocator());
-        defer reader.deinit();
-        try stageDocMapForMergedReader(txn, arena.allocator(), old_seg_ids, seg_id, &reader);
-    }
-
-    fn stageDocMapForMergedReader(txn: *MainTxn, a: Allocator, old_seg_ids: []const u64, seg_id: u64, reader: *const segment_mod.SegmentReader) !void {
-        var local: u32 = 0;
-        while (local < reader.doc_count) : (local += 1) {
-            const key = (try reader.storedIdAlloc(a, local)) orelse continue;
-            const raw = txn.get(.docmap, key) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
-            const location = try DocLocation.decode(raw);
-            if (std.mem.indexOfScalar(u64, old_seg_ids, location.seg_id) == null) continue;
-            try txn.put(.docmap, key, &(DocLocation{ .seg_id = seg_id, .local_id = local }).encode());
-        }
-    }
-
     /// Whether this index's merges decide their doc map entries and
     /// tombstones at the commit's tip (`MergeResolution`): a native catalog
     /// index whose doc map is complete.
     fn resolvesAtTip(self: *const PersistentIndex) bool {
-        return self.keepsDocMap() and self.doc_map_complete;
+        return self.keepsDocMap() and self.versioned;
     }
 
     /// `meta/next_seg_id` at a resolver's tip, or 0 when unset.
@@ -4226,42 +4231,133 @@ pub const PersistentIndex = struct {
         return reservation.first;
     }
 
-    /// A merge's publication decided at the commit's tip. Before the commit
-    /// it holds only what the merge built: each output segment's documents.
-    /// At the tip it refuses the merge if any input is no longer active, and
-    /// decides each output document's fate from the doc map: live exactly
-    /// when its key's entry names one of the inputs and the output holds a
-    /// single copy of it (repointed to the output); every other copy, deleted
-    /// or rewritten since the merge read its inputs, by any process, is
-    /// tombstoned. A key live in two copies refuses the merge. Raises the
-    /// segment counter past the outputs. The decided tombstones are installed
-    /// in memory once the commit is durable.
+    /// A background publication's version decisions (a replay or rebuild
+    /// segment, a copied segment, replayed deletes), made at its commit's tip
+    /// (`resolveVersionsAlloc`). The newly dead versions are installed in
+    /// memory once the commit is durable and the publication's segments are
+    /// in the writer snapshot.
+    pub const VersionResolution = struct {
+        index: *PersistentIndex,
+        arena: std.heap.ArenaAllocator,
+        changes: std.ArrayListUnmanaged(VersionedChange) = .empty,
+        extra_dead: std.ArrayListUnmanaged(u64) = .empty,
+        newly_dead: std.ArrayListUnmanaged(u64) = .empty,
+        result_arena: std.heap.ArenaAllocator,
+        resolver: ?native_catalog_backend.Resolver = null,
+
+        pub fn init(index: *PersistentIndex) VersionResolution {
+            return .{ .index = index, .arena = .init(index.alloc), .result_arena = .init(index.alloc) };
+        }
+
+        pub fn deinit(self: *VersionResolution) void {
+            if (self.resolver) |*resolver| resolver.deinit();
+            self.result_arena.deinit();
+            self.arena.deinit();
+        }
+
+        /// Every copy `segment_bytes` publishes, and those its `deleted`
+        /// bitmap tombstones (dead already).
+        pub fn addSegment(self: *VersionResolution, segment_bytes: []const u8, deleted: ?*const roaring.RoaringBitmap) !void {
+            const a = self.arena.allocator();
+            const copies = try segmentCopiesAlloc(a, segment_bytes);
+            for (copies, 0..) |copy, local| {
+                if (deleted) |bitmap| if (bitmap.contains(@intCast(local))) {
+                    try self.extra_dead.append(a, copy.version);
+                    continue;
+                };
+                try self.changes.append(a, copy);
+            }
+        }
+
+        pub fn addDelete(self: *VersionResolution, key: []const u8, version: u64) !void {
+            const a = self.arena.allocator();
+            try self.changes.append(a, .{ .key = try a.dupe(u8, key), .version = DocVersion.deletion(version) });
+        }
+
+        pub fn stage(self: *VersionResolution, txn: *MainTxn) !void {
+            self.resolver = .init(self.index.alloc, self, resolve);
+            try txn.stageResolver(&self.resolver.?);
+        }
+
+        fn resolve(ptr: *anyopaque, tip: native_catalog_backend.TipReader, resolver: *native_catalog_backend.Resolver) anyerror!void {
+            const self: *VersionResolution = @ptrCast(@alignCast(ptr));
+            _ = self.result_arena.reset(.retain_capacity);
+            self.newly_dead = .empty;
+            var dead = std.ArrayListUnmanaged(u64).empty;
+            try resolveVersionsAlloc(resolver.arena.allocator(), tip, self.changes.items, self.extra_dead.items, &resolver.outputs, &dead);
+            try self.newly_dead.appendSlice(self.result_arena.allocator(), dead.items);
+        }
+
+        pub fn install(self: *VersionResolution) void {
+            self.index.installDeadVersions(self.newly_dead.items);
+        }
+    };
+
+    /// Versions for the next `count` documents a rebuild indexes, at the
+    /// rebuild's cut (the replay sequence its rows are read at; the first
+    /// reservation after a reset fixes it): `DocVersion.ofRebuild(cut, first +
+    /// i)`. Reserved at the tip in a commit of their own, so a resumed rebuild
+    /// never reissues one.
+    pub fn reserveRebuildVersions(self: *PersistentIndex, cut: u64, count: u64) !struct { cut: u64, first: u64 } {
+        const Reservation = struct {
+            cut: u64,
+            count: u64,
+            first: u64 = 0,
+            fn resolve(ptr: *anyopaque, tip: native_catalog_backend.TipReader, resolver: *native_catalog_backend.Resolver) anyerror!void {
+                const r: *@This() = @ptrCast(@alignCast(ptr));
+                const meta = runtimeNamespace(.meta).name;
+                if (try tip.get(resolver.arena.allocator(), meta, meta_rebuild_versions)) |bytes| {
+                    if (bytes.len != 16) return error.InvalidRebuildVersions;
+                    r.cut = std.mem.readInt(u64, bytes[0..8], .little);
+                    r.first = std.mem.readInt(u64, bytes[8..16], .little);
+                } else r.first = 0;
+                var value: [16]u8 = undefined;
+                std.mem.writeInt(u64, value[0..8], r.cut, .little);
+                std.mem.writeInt(u64, value[8..16], r.first + r.count, .little);
+                try resolver.put(meta, meta_rebuild_versions, &value);
+            }
+        };
+        var reservation: Reservation = .{ .cut = cut, .count = count };
+        var resolver = native_catalog_backend.Resolver.init(self.alloc, &reservation, Reservation.resolve);
+        defer resolver.deinit();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        txn.setDurable(false);
+        try txn.stageResolver(&resolver);
+        try txn.commit();
+        return .{ .cut = reservation.cut, .first = reservation.first };
+    }
+
+    /// A merge's publication decided at the commit's tip. Versions do not
+    /// move, so a merge writes nothing per document: at the tip it refuses
+    /// when an input is no longer active (another process merged it away),
+    /// removes from the dead set the versions it dropped (no other segment
+    /// can hold them: a version belongs to one copy), and raises the segment
+    /// counter past its outputs. Once durable, each output's deletion bitmap
+    /// is derived from the committed dead set, so a copy that died while the
+    /// merge built is dead in the output too.
     const MergeResolution = struct {
         index: *PersistentIndex,
         old_seg_ids: []const u64,
         arena: std.heap.ArenaAllocator,
-        outputs: std.ArrayListUnmanaged(Output) = .empty,
+        output_ids: std.ArrayListUnmanaged(u64) = .empty,
+        output_versions: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        dropped: std.ArrayListUnmanaged(u64) = .empty,
+        dropped_collected: bool = false,
         resolver: ?native_catalog_backend.Resolver = null,
-
-        const Output = struct {
-            seg_id: u64,
-            copies: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(u32)) = .empty,
-            tombstones: ?roaring.RoaringBitmap = null,
-        };
 
         fn init(index: *PersistentIndex, old_seg_ids: []const u64) MergeResolution {
             return .{ .index = index, .old_seg_ids = old_seg_ids, .arena = .init(index.alloc) };
         }
 
         fn deinit(self: *MergeResolution) void {
-            for (self.outputs.items) |*output| if (output.tombstones) |*bitmap| bitmap.deinit();
             if (self.resolver) |*resolver| resolver.deinit();
             self.arena.deinit();
         }
 
         /// Stages the resolver; it must be the commit's first mutation, so
         /// it reads the inputs' active markers before the commit removes
-        /// them.
+        /// them. Outputs are added after, before the commit.
         fn stage(self: *MergeResolution, txn: *MainTxn) !void {
             self.resolver = .init(self.index.alloc, self, resolve);
             try txn.stageResolver(&self.resolver.?);
@@ -4281,93 +4377,81 @@ pub const PersistentIndex = struct {
 
         fn addReader(self: *MergeResolution, seg_id: u64, reader: *const segment_mod.SegmentReader) !void {
             const a = self.arena.allocator();
-            var output: Output = .{ .seg_id = seg_id };
-            var local: u32 = 0;
-            while (local < reader.doc_count) : (local += 1) {
-                const key = (try reader.storedIdAlloc(a, local)) orelse continue;
-                const slot = try output.copies.getOrPut(a, key);
-                if (!slot.found_existing) slot.value_ptr.* = .empty;
-                try slot.value_ptr.append(a, local);
+            try self.output_ids.append(a, seg_id);
+            const versions = (try reader.docVersionsAlloc(a)) orelse return;
+            for (versions) |version| if (version != 0) try self.output_versions.put(a, version, {});
+        }
+
+        /// The inputs' versions the outputs do not carry.
+        fn collectDropped(self: *MergeResolution) !void {
+            const a = self.arena.allocator();
+            const snap = self.index.writer.acquireSnapshot();
+            defer snap.release();
+            for (snap.segments) |*segment| {
+                if (std.mem.indexOfScalar(u64, self.old_seg_ids, segment.id) == null) continue;
+                const versions = (try segment.reader.docVersionsAlloc(a)) orelse continue;
+                for (versions) |version| {
+                    if (version == 0 or self.output_versions.contains(version)) continue;
+                    try self.dropped.append(a, version);
+                }
             }
-            try self.outputs.append(a, output);
         }
 
         fn resolve(ptr: *anyopaque, tip: native_catalog_backend.TipReader, resolver: *native_catalog_backend.Resolver) anyerror!void {
             const self: *MergeResolution = @ptrCast(@alignCast(ptr));
+            if (!self.dropped_collected) {
+                try self.collectDropped();
+                self.dropped_collected = true;
+            }
             const a = resolver.arena.allocator();
             const meta = runtimeNamespace(.meta).name;
-            const docmap = runtimeNamespace(.docmap).name;
             for (self.old_seg_ids) |old_id| {
                 const marker = activeSegmentMetaKey(old_id);
                 if (try tip.get(a, meta, &marker) == null) return error.IndexScopeChanged;
             }
+            try stageDeadVersionsAlloc(a, tip, self.dropped.items, .remove, &resolver.outputs);
             var counter_floor: u64 = 0;
-            for (self.outputs.items) |*output| {
-                if (output.tombstones) |*bitmap| bitmap.deinit();
-                output.tombstones = null;
-                var tombstones = roaring.RoaringBitmap.init(self.index.alloc);
-                errdefer tombstones.deinit();
-                var it = output.copies.iterator();
-                while (it.next()) |entry| {
-                    const raw = try tip.get(a, docmap, entry.key_ptr.*);
-                    const live_here = if (raw) |bytes| std.mem.indexOfScalar(u64, self.old_seg_ids, (try DocLocation.decode(bytes)).seg_id) != null else false;
-                    if (live_here and entry.value_ptr.items.len != 1) return error.IndexScopeChanged;
-                    if (live_here) {
-                        try resolver.put(docmap, entry.key_ptr.*, &(DocLocation{ .seg_id = output.seg_id, .local_id = entry.value_ptr.items[0] }).encode());
-                        continue;
-                    }
-                    for (entry.value_ptr.items) |dead| try tombstones.add(dead);
-                }
-                const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, output.seg_id));
-                if (tombstones.isEmpty()) {
-                    try resolver.delete(runtimeNamespace(.deletions).name, &seg_key);
-                } else {
-                    try resolver.put(runtimeNamespace(.deletions).name, &seg_key, try tombstones.toBytes(a));
-                }
-                output.tombstones = tombstones;
-                counter_floor = @max(counter_floor, output.seg_id + 1);
-            }
+            for (self.output_ids.items) |seg_id| counter_floor = @max(counter_floor, seg_id + 1);
             const current = try tipSegmentCounter(tip, a);
             if (counter_floor > current) try resolver.put(meta, meta_next_seg_id, &nextSegmentIdValue(counter_floor, 0));
         }
 
         fn install(self: *MergeResolution) void {
-            for (self.outputs.items) |*output| {
-                const bitmap = output.tombstones orelse continue;
-                self.index.writer.setDeletionBitmap(output.seg_id, bitmap);
-                output.tombstones = null;
+            self.installOrError() catch |err| {
+                std.log.err("full-text merge output deletions could not be derived err={s}", .{@errorName(err)});
+            };
+        }
+
+        fn installOrError(self: *MergeResolution) !void {
+            const alloc = self.index.alloc;
+            var txn = try self.index.beginReadMainTxn();
+            defer txn.abort();
+            var dead = try DeadVersions.load(alloc, &txn);
+            defer dead.deinit();
+            const snap = self.index.writer.acquireSnapshot();
+            defer snap.release();
+            for (snap.segments) |*segment| {
+                if (std.mem.indexOfScalar(u64, self.output_ids.items, segment.id) == null) continue;
+                var bitmap = (try derivedDeletionBitmap(alloc, &segment.reader, &dead)) orelse continue;
+                defer bitmap.deinit();
+                var locals = std.ArrayListUnmanaged(u32).empty;
+                defer locals.deinit(alloc);
+                var it = bitmap.iterator();
+                while (it.next()) |local| try locals.append(alloc, local);
+                try self.index.writer.applyCommittedDeletes(segment.id, locals.items);
             }
         }
     };
 
-    /// Whether this index keeps a doc map (see `DocLocation`).
+    /// Whether this index keeps a doc map (see `DocVersion`).
     pub fn keepsDocMap(self: *const PersistentIndex) bool {
         return self.main_backend == .native_catalog;
     }
 
-    /// Stages `seg_id`'s doc map entries in `txn`. A key the segment stores
-    /// twice keeps its last copy; the earlier copies' tombstones are staged
-    /// too and returned, for the caller to install once committed.
-    fn stageDocMapForSegment(self: *PersistentIndex, txn: *MainTxn, seg_id: u64, segment_bytes: []const u8) !?roaring.RoaringBitmap {
-        if (!self.keepsDocMap()) return null;
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        var puts = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
-        var superseded = std.ArrayListUnmanaged(u32).empty;
-        try docMapPutsForSegmentAlloc(arena.allocator(), seg_id, segment_bytes, null, &puts, &superseded);
-        for (puts.items) |put| try txn.put(.docmap, put.key, put.value);
-        if (superseded.items.len == 0) return null;
-        var bitmap = roaring.RoaringBitmap.init(self.alloc);
-        errdefer bitmap.deinit();
-        for (superseded.items) |local| try bitmap.add(local);
-        const bytes = try bitmap.toBytes(self.alloc);
-        defer self.alloc.free(bytes);
-        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
-        try txn.put(.deletions, &seg_key, bytes);
-        return bitmap;
-    }
-
-    fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64) !?roaring.RoaringBitmap {
+    /// Commits `seg_id`. For a versioned index, `resolution` (required) has
+    /// the segment's copies decided at the tip; the caller installs it once
+    /// the segment is in the writer snapshot.
+    fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64, resolution: ?*VersionResolution) !void {
         var key_range = try extractSegmentKeyRange(self.alloc, segment_bytes);
         defer key_range.deinit(self.alloc);
 
@@ -4376,8 +4460,11 @@ pub const PersistentIndex = struct {
 
         const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
         if (self.segment_files == null) try txn.put(.segments, &seg_key, segment_bytes);
-        var superseded = try self.stageDocMapForSegment(&txn, seg_id, segment_bytes);
-        errdefer if (superseded) |*bitmap| bitmap.deinit();
+        if (self.resolvesAtTip()) {
+            const r = resolution orelse return error.MissingDocVersion;
+            try r.addSegment(segment_bytes, null);
+            try r.stage(&txn);
+        }
 
         try self.saveSegmentRange(&txn, seg_id, key_range);
 
@@ -4390,7 +4477,6 @@ pub const PersistentIndex = struct {
 
         try txn.commit();
         self.committed_lsn = lsn;
-        return superseded;
     }
 
     fn updateActiveSegments(self: *PersistentIndex, txn: *MainTxn, seg_id: u64, op: enum { add, remove }) !void {
@@ -4415,107 +4501,144 @@ pub const PersistentIndex = struct {
         };
     }
 
-    /// Builds the doc map of an index written before it existed, in one
-    /// commit: every live document of the active segments, the newest copy
-    /// winning a key stored in several (older live copies are tombstoned, as
-    /// a delete of that key would have), the segment counter, and the format
-    /// marker. A read-only open only learns whether the marker is there.
-    fn upgradeDocMapLocked(self: *PersistentIndex) !void {
-        {
-            var probe = try self.beginReadMainTxn();
-            defer probe.abort();
-            const raw = probe.get(.meta, meta_text_storage_format) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            if (raw) |bytes| if (bytes.len == 4 and std.mem.readInt(u32, bytes[0..4], .little) == text_storage_format_doc_map) {
-                self.doc_map_complete = true;
-                return;
-            };
+    /// A native catalog index opened writable without the versioned format:
+    /// an empty one is stamped now; one with segments is flagged for its
+    /// owner to reset and rebuild from the primary rows. A read-only open
+    /// keeps the older format's stored deletion bitmaps.
+    fn ensureVersionedFormatLocked(self: *PersistentIndex) !void {
+        if (self.versioned or self.read_only) return;
+        if (self.writer.snapshot().segments.len != 0) {
+            self.needs_version_rebuild = true;
+            return;
         }
-        if (self.read_only) return;
-
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const snap = self.writer.acquireSnapshot();
-        defer snap.release();
-
-        const order = try a.alloc(usize, snap.segments.len);
-        for (order, 0..) |*slot, i| slot.* = i;
-        const ById = struct {
-            fn less(segments: []const index_mod.SegmentEntry, lhs: usize, rhs: usize) bool {
-                return segments[lhs].id < segments[rhs].id;
-            }
-        };
-        std.mem.sort(usize, order, snap.segments, ById.less);
-
-        var locations = std.StringHashMapUnmanaged(DocLocation).empty;
-        var superseded = std.AutoArrayHashMapUnmanaged(u64, std.ArrayListUnmanaged(u32)).empty;
-        for (order) |i| {
-            const seg = &snap.segments[i];
-            seg.shared.lockDeletionShared();
-            defer seg.shared.unlockDeletionShared();
-            var local: u32 = 0;
-            while (local < seg.reader.doc_count) : (local += 1) {
-                if (seg.shared.deleted) |deleted| if (deleted.contains(local)) continue;
-                const key = (try seg.reader.storedIdAlloc(a, local)) orelse continue;
-                const here: DocLocation = .{ .seg_id = seg.id, .local_id = local };
-                if (try locations.fetchPut(a, key, here)) |earlier| {
-                    const list = try superseded.getOrPut(a, earlier.value.seg_id);
-                    if (!list.found_existing) list.value_ptr.* = .empty;
-                    try list.value_ptr.append(a, earlier.value.local_id);
-                }
-            }
+        var tip_entries: []native_catalog_backend.Entry = &.{};
+        defer if (tip_entries.len != 0) native_catalog_backend.Backend.freeEntries(self.alloc, tip_entries);
+        switch (self.main_store_owner) {
+            .native_catalog => |backend| tip_entries = try backend.loadTipEntriesAlloc(self.alloc),
+            else => {},
         }
-
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
-        var it = locations.iterator();
-        // Only missing entries: one already there was written by a writer
-        // that keeps the doc map, at or after this snapshot.
-        while (it.next()) |entry| {
-            _ = txn.get(.docmap, entry.key_ptr.*) catch |err| switch (err) {
-                error.NotFound => {
-                    try txn.put(.docmap, entry.key_ptr.*, &entry.value_ptr.encode());
-                    continue;
-                },
-                else => return err,
-            };
-        }
-        var installs = std.ArrayListUnmanaged(struct { u64, roaring.RoaringBitmap }).empty;
-        defer for (installs.items) |*install| install[1].deinit();
-        var superseded_it = superseded.iterator();
-        while (superseded_it.next()) |entry| {
-            const seg_id = entry.key_ptr.*;
-            var bitmap = roaring.RoaringBitmap.init(self.alloc);
-            errdefer bitmap.deinit();
-            for (snap.segments) |*seg| if (seg.id == seg_id) {
-                seg.shared.lockDeletionShared();
-                defer seg.shared.unlockDeletionShared();
-                if (seg.shared.deleted) |deleted| {
-                    var bits = deleted.iterator();
-                    while (bits.next()) |bit| try bitmap.add(bit);
-                }
-            };
-            for (entry.value_ptr.items) |local| try bitmap.add(local);
-            const bytes = try bitmap.toBytes(a);
-            const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
-            try txn.put(.deletions, &seg_key, bytes);
-            try installs.append(a, .{ seg_id, bitmap });
-        }
-        var counter_floor: SegmentCounterFloor = .{ .floor = 0 };
-        defer counter_floor.deinit();
-        try self.saveSegmentCounterFloor(&txn, &counter_floor, self.writer.next_segment_id);
+        for (tip_entries) |entry| try txn.delete(.docmap, entry.key);
+        try deleteAllInKeyspace(self.alloc, &txn, .dead);
         var format: [4]u8 = undefined;
-        std.mem.writeInt(u32, &format, text_storage_format_doc_map, .little);
+        std.mem.writeInt(u32, &format, text_storage_format_versions, .little);
         try txn.put(.meta, meta_text_storage_format, &format);
         try txn.commit();
-        for (installs.items) |*install| {
-            self.writer.setDeletionBitmap(install[0], install[1]);
-            install[1] = roaring.RoaringBitmap.init(self.alloc);
+        self.versioned = true;
+    }
+
+    fn deleteAllInKeyspace(alloc: Allocator, txn: *MainTxn, keyspace: MainKeyspace) !void {
+        var keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (keys.items) |key| alloc.free(key);
+            keys.deinit(alloc);
         }
-        self.doc_map_complete = true;
+        {
+            var cursor = txn.openCursor(keyspace) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+            defer cursor.close();
+            var entry = try cursor.first();
+            while (entry) |item| : (entry = try cursor.next()) try keys.append(alloc, try alloc.dupe(u8, item.key));
+        }
+        for (keys.items) |key| try txn.delete(keyspace, key);
+    }
+
+    /// Where each version of the loaded segments sits. Filled lazily from
+    /// the writer snapshot's version columns, so no publication path needs
+    /// to maintain it; an entry naming a segment no longer in the snapshot
+    /// is stale (a merge moved or dropped the copy) and is looked up again.
+    pub const VersionLocations = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        map: std.AutoHashMapUnmanaged(u64, Location) = .empty,
+        indexed: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+        const Location = struct { seg_id: u64, local_id: u32 };
+
+        fn clear(self: *VersionLocations, alloc: Allocator) void {
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            self.map.clearAndFree(alloc);
+            self.indexed.clearAndFree(alloc);
+        }
+
+        fn deinit(self: *VersionLocations, alloc: Allocator) void {
+            self.map.deinit(alloc);
+            self.indexed.deinit(alloc);
+        }
+    };
+
+    /// Marks each of `versions` deleted in the loaded segment holding it.
+    /// Call only once the commit that made them dead is durable. A version
+    /// in no loaded segment (another process's, or already merged away) is
+    /// skipped: its segment derives the bit when loaded.
+    pub fn installDeadVersions(self: *PersistentIndex, versions: []const u64) void {
+        if (versions.len == 0) return;
+        self.installDeadVersionsOrError(versions) catch |err| {
+            std.log.err("full-text dead versions could not be applied in memory err={s}", .{@errorName(err)});
+        };
+    }
+
+    fn installDeadVersionsOrError(self: *PersistentIndex, versions: []const u64) !void {
+        const locations = &self.version_locations;
+        @import("antfly_platform").sync.lockYielding(&locations.mutex);
+        defer locations.mutex.unlock();
+        const snap = self.writer.acquireSnapshot();
+        defer snap.release();
+        var present = std.AutoHashMapUnmanaged(u64, *const index_mod.SegmentEntry).empty;
+        defer present.deinit(self.alloc);
+        for (snap.segments) |*segment| try present.put(self.alloc, segment.id, segment);
+        var refreshed = false;
+        for (versions) |version| {
+            var location = locations.map.get(version);
+            if (location == null or !present.contains(location.?.seg_id)) {
+                if (!refreshed) {
+                    try self.indexVersionLocationsLocked(snap, &present);
+                    refreshed = true;
+                }
+                location = locations.map.get(version);
+            }
+            const found = location orelse continue;
+            if (!present.contains(found.seg_id)) continue;
+            try self.writer.applyCommittedDeletes(found.seg_id, &.{found.local_id});
+            _ = locations.map.remove(version);
+        }
+    }
+
+    fn indexVersionLocationsLocked(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot, present: *const std.AutoHashMapUnmanaged(u64, *const index_mod.SegmentEntry)) !void {
+        const locations = &self.version_locations;
+        var retired = false;
+        var indexed_it = locations.indexed.keyIterator();
+        while (indexed_it.next()) |seg_id| if (!present.contains(seg_id.*)) {
+            retired = true;
+            break;
+        };
+        if (retired) {
+            var stale = std.ArrayListUnmanaged(u64).empty;
+            defer stale.deinit(self.alloc);
+            var map_it = locations.map.iterator();
+            while (map_it.next()) |entry| if (!present.contains(entry.value_ptr.seg_id)) try stale.append(self.alloc, entry.key_ptr.*);
+            for (stale.items) |version| _ = locations.map.remove(version);
+            stale.clearRetainingCapacity();
+            var seg_it = locations.indexed.keyIterator();
+            while (seg_it.next()) |seg_id| if (!present.contains(seg_id.*)) try stale.append(self.alloc, seg_id.*);
+            for (stale.items) |seg_id| _ = locations.indexed.remove(seg_id);
+        }
+        for (snap.segments) |*segment| {
+            if (locations.indexed.contains(segment.id)) continue;
+            const versions = (try segment.reader.docVersionsAlloc(self.alloc)) orelse {
+                try locations.indexed.put(self.alloc, segment.id, {});
+                continue;
+            };
+            defer self.alloc.free(versions);
+            for (versions, 0..) |version, local| {
+                if (version == 0) continue;
+                try locations.map.put(self.alloc, version, .{ .seg_id = segment.id, .local_id = @intCast(local) });
+            }
+            try locations.indexed.put(self.alloc, segment.id, {});
+        }
     }
 
     fn saveNextSegmentId(txn: *MainTxn, next_segment_id: u64) !void {
@@ -4539,12 +4662,11 @@ pub const PersistentIndex = struct {
         }};
         var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
         defer writer_publication.abort();
-        var superseded = try self.persistSegment(seg_id, segment_bytes, lsn);
+        var resolution = VersionResolution.init(self);
+        defer resolution.deinit();
+        try self.persistSegment(seg_id, segment_bytes, lsn, &resolution);
         writer_publication.publish();
-        if (superseded) |bitmap| {
-            superseded = null;
-            self.writer.setDeletionBitmap(seg_id, bitmap);
-        }
+        resolution.install();
         segment_data = null;
         rollback_segment = false;
         try self.wal.truncate(lsn);
@@ -4711,60 +4833,239 @@ fn loadSegmentIdsForMetaPrefix(txn: *PersistentIndex.MainTxn, alloc: Allocator, 
     return try seg_ids.toOwnedSlice(alloc);
 }
 
-/// Where a live document is: the segment holding its current version and its
-/// local id there. The full-text doc map stores one per document key, so a
-/// write finds the version it replaces without scanning segments.
-pub const DocLocation = struct {
-    seg_id: u64,
-    local_id: u32,
+/// A document copy's version (docs/design/lite-performance/lite-full-text-storage.md):
+/// `sequence << 24 | position`, where `sequence` is the replay sequence of
+/// the write it indexes and `position` tells the write's copies apart. A doc
+/// map value with `delete_flag` set records a delete at that version.
+pub const DocVersion = struct {
+    pub const delete_flag: u64 = @as(u64, 1) << 63;
+    pub const position_bits = 24;
+    pub const max_position: u64 = (@as(u64, 1) << position_bits) - 1;
+    pub const max_sequence: u64 = (@as(u64, 1) << (63 - position_bits)) - 1;
 
-    pub const encoded_len = 12;
+    pub fn of(sequence: u64, position: u64) !u64 {
+        if (sequence == 0 or sequence > max_sequence or position > max_position) return error.InvalidDocVersion;
+        return (sequence << position_bits) | position;
+    }
 
-    pub fn encode(self: DocLocation) [encoded_len]u8 {
-        var out: [encoded_len]u8 = undefined;
-        std.mem.writeInt(u64, out[0..8], self.seg_id, .big);
-        std.mem.writeInt(u32, out[8..12], self.local_id, .big);
+    /// The version a rebuild gives the `n`th document it indexes, reading
+    /// rows at replay sequence `cut`: older than every write after the cut,
+    /// unique across the whole rebuild.
+    pub fn ofRebuild(cut: u64, n: u64) !u64 {
+        const back = n >> position_bits;
+        const sequence = @max(cut, 1);
+        if (back >= sequence) return error.InvalidDocVersion;
+        return try of(sequence - back, n & max_position);
+    }
+
+    pub fn deletion(version: u64) u64 {
+        return version | delete_flag;
+    }
+
+    /// A delete with no write version of its own: whatever version is
+    /// current for the key when the delete commits.
+    pub const current_deletion: u64 = delete_flag;
+
+    pub fn isDeletion(value: u64) bool {
+        return value & delete_flag != 0;
+    }
+
+    /// Orders values by when their write happened.
+    pub fn order(value: u64) u64 {
+        return value & ~delete_flag;
+    }
+
+    pub fn encode(value: u64) [8]u8 {
+        var out: [8]u8 = undefined;
+        std.mem.writeInt(u64, &out, value, .big);
         return out;
     }
 
-    pub fn decode(bytes: []const u8) !DocLocation {
-        if (bytes.len != encoded_len) return error.InvalidDocMapEntry;
-        return .{ .seg_id = std.mem.readInt(u64, bytes[0..8], .big), .local_id = std.mem.readInt(u32, bytes[8..12], .big) };
-    }
-
-    pub fn eql(a: DocLocation, b: DocLocation) bool {
-        return a.seg_id == b.seg_id and a.local_id == b.local_id;
+    pub fn decode(bytes: []const u8) !u64 {
+        if (bytes.len != 8) return error.InvalidDocVersion;
+        return std.mem.readInt(u64, bytes[0..8], .big);
     }
 };
 
-/// Doc map puts for every live stored document of a segment: each document
-/// key now lives at `(seg_id, local id)`. Copies `deleted` tombstones are
-/// skipped. A key stored live twice keeps its last copy; `superseded`
-/// receives the earlier local ids, for the caller to tombstone. Keys and
-/// values are owned by `arena`.
-pub fn docMapPutsForSegmentAlloc(
-    arena: Allocator,
-    seg_id: u64,
-    segment_bytes: []const u8,
-    deleted: ?*const roaring.RoaringBitmap,
+/// One copy published, or one delete, for `key` at `version` (a delete
+/// carries `DocVersion.deletion`).
+pub const VersionedChange = struct {
+    key: []const u8,
+    version: u64,
+};
+
+pub const dead_namespace = "dead";
+
+fn deadKey(high: u32) [4]u8 {
+    var key: [4]u8 = undefined;
+    std.mem.writeInt(u32, &key, high, .big);
+    return key;
+}
+
+/// Decides `changes` against each key's current version at `tip`, last
+/// writer wins by version, and appends the doc map and dead set mutations to
+/// `out` (memory from `a`). `extra_dead` are versions the caller already
+/// knows dead (a copied segment's tombstoned copies). The superseded current version, or a copy older
+/// than the current one (born dead), is added to the dead set and to
+/// `newly_dead`, for the caller to install once the commit is durable.
+/// Republishing a version that is already current changes nothing.
+pub fn resolveVersionsAlloc(
+    a: Allocator,
+    tip: native_catalog_backend.TipReader,
+    changes: []const VersionedChange,
+    extra_dead: []const u64,
     out: *std.ArrayListUnmanaged(native_catalog_backend.Mutation),
-    superseded: *std.ArrayListUnmanaged(u32),
+    newly_dead: *std.ArrayListUnmanaged(u64),
 ) !void {
-    var reader = try segment_mod.SegmentReader.init(arena, segment_bytes);
+    const docmap = native_catalog_backend.tip_namespace;
+    var current = std.StringArrayHashMapUnmanaged(u64).empty;
+    var dirty = std.StringArrayHashMapUnmanaged(void).empty;
+    const dead_start = newly_dead.items.len;
+    for (changes) |change| {
+        const existing: ?u64 = current.get(change.key) orelse if (try tip.get(a, docmap, change.key)) |bytes| try DocVersion.decode(bytes) else null;
+        // A delete of whatever is current (`DocVersion.current_deletion`):
+        // its marker takes the current version's place.
+        if (change.version == DocVersion.current_deletion) {
+            const value = existing orelse continue;
+            if (DocVersion.isDeletion(value)) continue;
+            try newly_dead.append(a, value);
+            try current.put(a, change.key, DocVersion.deletion(value));
+            try dirty.put(a, change.key, {});
+            continue;
+        }
+        if (existing) |value| {
+            if (value == change.version) continue;
+            if (DocVersion.order(change.version) <= DocVersion.order(value)) {
+                if (!DocVersion.isDeletion(change.version)) try newly_dead.append(a, change.version);
+                try current.put(a, change.key, value);
+                continue;
+            }
+            if (!DocVersion.isDeletion(value)) try newly_dead.append(a, value);
+        }
+        try current.put(a, change.key, change.version);
+        try dirty.put(a, change.key, {});
+    }
+    for (dirty.keys()) |key| {
+        const value = try a.dupe(u8, &DocVersion.encode(current.get(key).?));
+        try out.append(a, .{ .namespace = docmap, .key = key, .value = value });
+    }
+    try newly_dead.appendSlice(a, extra_dead);
+    try stageDeadVersionsAlloc(a, tip, newly_dead.items[dead_start..], .add, out);
+}
+
+/// Adds `versions` to, or removes them from, the dead set records at `tip`.
+pub fn stageDeadVersionsAlloc(
+    a: Allocator,
+    tip: native_catalog_backend.TipReader,
+    versions: []const u64,
+    op: enum { add, remove },
+    out: *std.ArrayListUnmanaged(native_catalog_backend.Mutation),
+) !void {
+    if (versions.len == 0) return;
+    const sorted = try a.dupe(u64, versions);
+    std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+    var i: usize = 0;
+    while (i < sorted.len) {
+        const high: u32 = @intCast(sorted[i] >> 32);
+        const key = try a.dupe(u8, &deadKey(high));
+        var bitmap = if (try tip.get(a, dead_namespace, key)) |bytes|
+            try roaring.RoaringBitmap.fromBytes(a, bytes)
+        else
+            roaring.RoaringBitmap.init(a);
+        while (i < sorted.len and sorted[i] >> 32 == high) : (i += 1) {
+            const low: u32 = @truncate(sorted[i]);
+            switch (op) {
+                .add => try bitmap.add(low),
+                .remove => try bitmap.remove(low),
+            }
+        }
+        if (bitmap.isEmpty()) {
+            try out.append(a, .{ .namespace = dead_namespace, .key = key, .is_delete = true });
+        } else {
+            try out.append(a, .{ .namespace = dead_namespace, .key = key, .value = try bitmap.toBytes(a) });
+        }
+    }
+}
+
+/// The dead set as committed in `txn`'s view, for deriving deletion bitmaps.
+pub const DeadVersions = struct {
+    alloc: Allocator,
+    sets: std.AutoHashMapUnmanaged(u32, roaring.RoaringBitmap) = .empty,
+
+    pub fn load(alloc: Allocator, txn: *PersistentIndex.MainTxn) !DeadVersions {
+        var self: DeadVersions = .{ .alloc = alloc };
+        errdefer self.deinit();
+        var cursor = txn.openCursor(.dead) catch |err| switch (err) {
+            error.NotFound => return self,
+            else => return err,
+        };
+        defer cursor.close();
+        var entry = try cursor.first();
+        while (entry) |item| : (entry = try cursor.next()) {
+            if (item.key.len != 4) return error.InvalidDeadVersions;
+            const high = std.mem.readInt(u32, item.key[0..4], .big);
+            var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, item.value);
+            errdefer bitmap.deinit();
+            try self.sets.put(alloc, high, bitmap);
+        }
+        return self;
+    }
+
+    pub fn contains(self: *const DeadVersions, version: u64) bool {
+        const set = self.sets.getPtr(@intCast(version >> 32)) orelse return false;
+        return set.contains(@truncate(version));
+    }
+
+    pub fn deinit(self: *DeadVersions) void {
+        var it = self.sets.valueIterator();
+        while (it.next()) |bitmap| bitmap.deinit();
+        self.sets.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
+/// A versioned segment's deletion bitmap: every copy whose version is dead,
+/// or that has none. Null when nothing in it is deleted.
+pub fn derivedDeletionBitmap(alloc: Allocator, reader: *const segment_mod.SegmentReader, dead: *const DeadVersions) !?roaring.RoaringBitmap {
+    var bitmap = roaring.RoaringBitmap.init(alloc);
+    errdefer bitmap.deinit();
+    const versions = (try reader.docVersionsAlloc(alloc)) orelse {
+        var local: u32 = 0;
+        while (local < reader.doc_count) : (local += 1) try bitmap.add(local);
+        return if (bitmap.isEmpty()) blk: {
+            bitmap.deinit();
+            break :blk null;
+        } else bitmap;
+    };
+    defer alloc.free(versions);
+    for (versions, 0..) |version, local| {
+        if (version == 0 or dead.contains(version)) try bitmap.add(@intCast(local));
+    }
+    if (bitmap.isEmpty()) {
+        bitmap.deinit();
+        return null;
+    }
+    return bitmap;
+}
+
+/// Each published copy of a segment: its stored key and version.
+pub fn segmentCopiesAlloc(a: Allocator, segment_bytes: []const u8) ![]VersionedChange {
+    var reader = try segment_mod.SegmentReader.init(a, segment_bytes);
     defer reader.deinit();
-    var seen = std.StringHashMapUnmanaged(u32).empty;
-    defer seen.deinit(arena);
-    var local: u32 = 0;
-    while (local < reader.doc_count) : (local += 1) {
-        if (deleted) |bitmap| if (bitmap.contains(local)) continue;
-        const key = (try reader.storedIdAlloc(arena, local)) orelse continue;
-        if (try seen.fetchPut(arena, key, local)) |earlier| try superseded.append(arena, earlier.value);
+    return try readerCopiesAlloc(a, &reader);
+}
+
+pub fn readerCopiesAlloc(a: Allocator, reader: *const segment_mod.SegmentReader) ![]VersionedChange {
+    const versions = (try reader.docVersionsAlloc(a)) orelse return error.MissingDocVersion;
+    var copies = try a.alloc(VersionedChange, versions.len);
+    var count: usize = 0;
+    for (versions, 0..) |version, local| {
+        if (version == 0) return error.MissingDocVersion;
+        const key = (try reader.storedIdAlloc(a, @intCast(local))) orelse return error.MissingDocVersion;
+        copies[count] = .{ .key = key, .version = version };
+        count += 1;
     }
-    var it = seen.iterator();
-    while (it.next()) |entry| {
-        const value = try arena.dupe(u8, &(DocLocation{ .seg_id = seg_id, .local_id = entry.value_ptr.* }).encode());
-        try out.append(arena, .{ .namespace = native_catalog_backend.tip_namespace, .key = entry.key_ptr.*, .value = value });
-    }
+    return copies[0..count];
 }
 
 fn segmentRangeMetaKey(seg_id: u64) [meta_segment_range_prefix.len + 8]u8 {
@@ -4943,10 +5244,26 @@ fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
 
 const scorer_mod = @import("../search/scorer.zig");
 
+/// Test writes take increasing replay sequences: a segment built later is a
+/// newer write of its keys.
+var test_write_sequence: u64 = 0;
+
+fn nextTestWriteSequence() u64 {
+    test_write_sequence += 1;
+    return test_write_sequence;
+}
+
 fn buildSimpleSegment(alloc: Allocator, doc_id: []const u8, term: []const u8) ![]u8 {
+    return buildVersionedSegment(alloc, &.{.{ .doc_id = doc_id, .term = term, .version = try DocVersion.of(nextTestWriteSequence(), 0) }});
+}
+
+const TestDoc = struct { doc_id: []const u8, term: []const u8, version: u64 = 0 };
+
+/// Copies at given versions (a merge output carries its inputs' versions).
+fn buildVersionedSegment(alloc: Allocator, docs: []const TestDoc) ![]u8 {
     var inv_builder = inverted_mod.InvertedIndexBuilder.init(alloc, .{});
     defer inv_builder.deinit();
-    try inv_builder.addDocument(0, &.{.{ .term = term, .freq = 1, .norm = 10 }});
+    for (docs, 0..) |doc, i| try inv_builder.addDocument(@intCast(i), &.{.{ .term = doc.term, .freq = 1, .norm = 10 }});
     const inv_data = try inv_builder.build();
     defer alloc.free(inv_data);
 
@@ -4954,8 +5271,13 @@ fn buildSimpleSegment(alloc: Allocator, doc_id: []const u8, term: []const u8) ![
     defer seg_writer.deinit();
     const field_idx = try seg_writer.addField("body");
     try seg_writer.addSection(field_idx, .inverted_text, inv_data);
-    try seg_writer.addStoredDoc(doc_id, "{}");
-
+    const versions = try alloc.alloc(u64, docs.len);
+    defer alloc.free(versions);
+    for (docs, 0..) |doc, i| {
+        try seg_writer.addStoredDoc(doc.doc_id, "{}");
+        versions[i] = doc.version;
+    }
+    try seg_writer.addDocVersions(versions);
     return seg_writer.build();
 }
 
@@ -4969,23 +5291,13 @@ test "tracked empty deletion returns before touching index storage" {
     try std.testing.expectEqual(@as(usize, 0), delete_infos.len);
 }
 
+/// One new write of every doc (later docs newer).
 fn buildMultiDocSegment(alloc: Allocator, docs: []const struct { doc_id: []const u8, term: []const u8 }) ![]u8 {
-    var inv_builder = inverted_mod.InvertedIndexBuilder.init(alloc, .{});
-    defer inv_builder.deinit();
-    for (docs, 0..) |doc, i| {
-        try inv_builder.addDocument(@intCast(i), &.{.{ .term = doc.term, .freq = 1, .norm = 10 }});
-    }
-    const inv_data = try inv_builder.build();
-    defer alloc.free(inv_data);
-
-    var seg_writer = segment_mod.SegmentWriter.init(alloc);
-    defer seg_writer.deinit();
-    const field_idx = try seg_writer.addField("body");
-    try seg_writer.addSection(field_idx, .inverted_text, inv_data);
-    for (docs) |doc| {
-        try seg_writer.addStoredDoc(doc.doc_id, "{}");
-    }
-    return seg_writer.build();
+    const sequence = nextTestWriteSequence();
+    const versioned = try alloc.alloc(TestDoc, docs.len);
+    defer alloc.free(versioned);
+    for (docs, 0..) |doc, i| versioned[i] = .{ .doc_id = doc.doc_id, .term = doc.term, .version = try DocVersion.of(sequence, i) };
+    return buildVersionedSegment(alloc, versioned);
 }
 
 fn buildHighFrequencyKeywordSegmentRange(alloc: Allocator, start: usize, count: usize) ![]u8 {
@@ -5803,10 +6115,17 @@ const InlinePublicationTestSink = struct {
         }
     }
 
+    /// Caller-owned copies, as the `Sink.loadAllAlloc` contract says.
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
         _ = scope;
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try allocator.dupe(native_catalog_backend.Entry, self.entries.items);
+        const out = try allocator.alloc(native_catalog_backend.Entry, self.entries.items.len);
+        for (self.entries.items, out) |e, *copy| copy.* = .{
+            .namespace = if (e.namespace) |n| try allocator.dupe(u8, n) else null,
+            .key = try allocator.dupe(u8, e.key),
+            .value = try allocator.dupe(u8, e.value),
+        };
+        return out;
     }
 
     fn sink(self: *@This()) NativeCatalogSink {
@@ -5816,7 +6135,7 @@ const InlinePublicationTestSink = struct {
     /// Like Lite's sink: the doc map is read from the "file" (these entries),
     /// never mirrored.
     fn tipSink(self: *@This()) NativeCatalogSink {
-        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc, .loadOneAlloc = loadOneAlloc };
+        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc, .loadOneAlloc = loadOneAlloc, .loadTipAlloc = loadTipAlloc };
     }
 
     fn loadOneAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
@@ -5829,7 +6148,7 @@ const InlinePublicationTestSink = struct {
     /// Like Lite's sink, and resolves each commit's resolvers against these
     /// entries (the "file") as it applies them.
     fn resolvingSink(self: *@This()) NativeCatalogSink {
-        return .{ .ptr = self, .submit = resolvingSubmit, .loadAllAlloc = loadAllAlloc, .loadOneAlloc = loadOneAlloc, .resolves = true };
+        return .{ .ptr = self, .submit = resolvingSubmit, .loadAllAlloc = loadAllAlloc, .loadOneAlloc = loadOneAlloc, .loadTipAlloc = loadTipAlloc, .resolves = true };
     }
 
     fn resolvingSubmit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
@@ -5862,9 +6181,30 @@ const InlinePublicationTestSink = struct {
         return try PersistentIndex.decodeNextSegmentId(self.entries.items[i].value);
     }
 
-    fn docLocation(self: *@This(), key: []const u8) !?DocLocation {
+    fn docVersion(self: *@This(), key: []const u8) !?u64 {
         const i = self.findIndex(native_catalog_backend.tip_namespace, key) orelse return null;
-        return try DocLocation.decode(self.entries.items[i].value);
+        return try DocVersion.decode(self.entries.items[i].value);
+    }
+
+    fn isDead(self: *@This(), version: u64) !bool {
+        const key = deadKey(@intCast(version >> 32));
+        const i = self.findIndex(dead_namespace, &key) orelse return false;
+        var bitmap = try roaring.RoaringBitmap.fromBytes(self.allocator, self.entries.items[i].value);
+        defer bitmap.deinit();
+        return bitmap.contains(@truncate(version));
+    }
+
+    fn loadTipAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        _ = scope;
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var out = std.ArrayListUnmanaged(native_catalog_backend.Entry).empty;
+        errdefer out.deinit(allocator);
+        for (self.entries.items) |e| {
+            const ns = e.namespace orelse continue;
+            if (!std.mem.eql(u8, ns, native_catalog_backend.tip_namespace)) continue;
+            try out.append(allocator, .{ .namespace = try allocator.dupe(u8, ns), .key = try allocator.dupe(u8, e.key), .value = try allocator.dupe(u8, e.value) });
+        }
+        return try out.toOwnedSlice(allocator);
     }
 
     fn deinit(self: *@This(), allocator: Allocator) void {
@@ -5877,59 +6217,64 @@ const InlinePublicationTestSink = struct {
     }
 };
 
-// The doc map follows each document through publication, overwrite, merge
-// and delete, so a write finds the version it replaces without a scan.
-test "persistent index doc map tracks each live document's location" {
+fn openVersionedTestIndex(alloc: Allocator, test_sink: *InlinePublicationTestSink, path: anytype) !PersistentIndex {
+    const pi = try PersistentIndex.open(alloc, .{
+        .path = path,
+        .main_backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.resolvingSink(),
+    });
+    try std.testing.expect(pi.versioned);
+    return pi;
+}
+
+// The doc map follows each key's current version through publication,
+// overwrite and delete; merges move no version, so they leave it alone.
+test "persistent index doc map names each key's current version" {
     const alloc = std.testing.allocator;
     var test_sink = InlinePublicationTestSink{ .allocator = alloc };
     defer test_sink.deinit(alloc);
     var path_buf: [256]u8 = undefined;
     const path = persistTmpPath(&path_buf);
     defer cleanupPersistDir(path);
-    var pi = try PersistentIndex.open(alloc, .{
-        .path = path,
-        .main_backend = .native_catalog,
-        .main_native_catalog_sink = test_sink.tipSink(),
-    });
+    var pi = try openVersionedTestIndex(alloc, &test_sink, path);
     defer pi.close();
 
     const first = try buildSimpleSegment(alloc, "doc:a", "alpha");
     defer alloc.free(first);
     try pi.indexSegment(first);
-    const first_location = (try test_sink.docLocation("doc:a")).?;
-    try std.testing.expectEqual(@as(u32, 0), first_location.local_id);
+    const v1 = (try test_sink.docVersion("doc:a")).?;
 
-    // An overwrite: the old version is tombstoned, the new one mapped.
-    try std.testing.expect(try pi.deleteByIds(&.{"doc:a"}));
-    try std.testing.expect((try test_sink.docLocation("doc:a")) == null);
+    // An overwrite: the new copy is current, the old one dead.
     const second = try buildSimpleSegment(alloc, "doc:a", "beta");
     defer alloc.free(second);
     try pi.indexSegment(second);
-    const second_location = (try test_sink.docLocation("doc:a")).?;
-    try std.testing.expect(second_location.seg_id != first_location.seg_id);
+    const v2 = (try test_sink.docVersion("doc:a")).?;
+    try std.testing.expect(v2 > v1);
+    try std.testing.expect(try test_sink.isDead(v1));
+    try std.testing.expect(!try test_sink.isDead(v2));
 
     const other = try buildSimpleSegment(alloc, "doc:b", "gamma");
     defer alloc.free(other);
     try pi.indexSegment(other);
-    const other_location = (try test_sink.docLocation("doc:b")).?;
+    const vb = (try test_sink.docVersion("doc:b")).?;
 
-    // A merge moves both live documents to its output.
-    const merged = try alloc.alloc([]u8, 1);
-    merged[0] = try buildMultiDocSegment(alloc, &.{
-        .{ .doc_id = "doc:a", .term = "beta" },
-        .{ .doc_id = "doc:b", .term = "gamma" },
-    });
-    try std.testing.expect(try pi.replaceSegmentsIfActiveManyOwnedWithDeletes(&.{ second_location.seg_id, other_location.seg_id }, merged, null));
-    const merged_a = (try test_sink.docLocation("doc:a")).?;
-    const merged_b = (try test_sink.docLocation("doc:b")).?;
-    try std.testing.expectEqual(merged_a.seg_id, merged_b.seg_id);
-    try std.testing.expect(merged_a.seg_id != second_location.seg_id and merged_a.seg_id != other_location.seg_id);
-    try std.testing.expect(merged_a.local_id != merged_b.local_id);
+    // A late copy older than the current version is born dead.
+    const late = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:b", .term = "stale", .version = vb - 1 }});
+    defer alloc.free(late);
+    try pi.indexSegment(late);
+    try std.testing.expectEqual(vb, (try test_sink.docVersion("doc:b")).?);
+    try std.testing.expect(try test_sink.isDead(vb - 1));
 
-    // Deleting a document drops its entry; the other stays.
-    try std.testing.expect(try pi.deleteByIds(&.{"doc:b"}));
-    try std.testing.expect((try test_sink.docLocation("doc:b")) == null);
-    try std.testing.expect(DocLocation.eql(merged_a, (try test_sink.docLocation("doc:a")).?));
+    // A delete leaves a marker at its version and kills the current copy.
+    const delete_version = try DocVersion.of(nextTestWriteSequence(), 0);
+    try pi.deleteVersioned(&.{"doc:b"}, &.{delete_version});
+    try std.testing.expectEqual(DocVersion.deletion(delete_version), (try test_sink.docVersion("doc:b")).?);
+    try std.testing.expect(try test_sink.isDead(vb));
+
+    // Queries see exactly the current copies.
+    const snap = pi.writer.acquireSnapshot();
+    defer snap.release();
+    try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
 
     // The doc map stays out of the in-memory mirror.
     var txn = try pi.beginReadMainTxn();
@@ -5939,23 +6284,19 @@ test "persistent index doc map tracks each live document's location" {
     try std.testing.expect((try cursor.first()) == null);
 }
 
-// A merge's doc map decisions are made at the commit's tip, so a write
-// another process commits after the merge read its inputs is kept (its old
-// copy tombstoned in the output) instead of the merge being refused or
-// resurrecting the old version. Output ids are reserved above the other
-// process's counter.
-test "persistent index merge decides at the tip and keeps another process's rewrite" {
+// A merge decides nothing per document: a write another process commits
+// after the merge read its inputs is kept (its old copy dead in the output,
+// through the dead set) instead of the merge being refused or resurrecting
+// the old version. Output ids are reserved above the other process's
+// counter, and the versions the merge dropped leave the dead set.
+test "persistent index merge keeps another process's rewrite and prunes what it dropped" {
     const alloc = std.testing.allocator;
     var test_sink = InlinePublicationTestSink{ .allocator = alloc };
     defer test_sink.deinit(alloc);
     var path_buf: [256]u8 = undefined;
     const path = persistTmpPath(&path_buf);
     defer cleanupPersistDir(path);
-    var pi = try PersistentIndex.open(alloc, .{
-        .path = path,
-        .main_backend = .native_catalog,
-        .main_native_catalog_sink = test_sink.resolvingSink(),
-    });
+    var pi = try openVersionedTestIndex(alloc, &test_sink, path);
     defer pi.close();
     try std.testing.expect(pi.resolvesAtTip());
 
@@ -5965,37 +6306,59 @@ test "persistent index merge decides at the tip and keeps another process's rewr
     const second = try buildSimpleSegment(alloc, "doc:b", "beta");
     defer alloc.free(second);
     try pi.indexSegment(second);
-    const a = (try test_sink.docLocation("doc:a")).?;
-    const b = (try test_sink.docLocation("doc:b")).?;
+    const third = try buildSimpleSegment(alloc, "doc:c", "gamma");
+    defer alloc.free(third);
+    try pi.indexSegment(third);
+    const va = (try test_sink.docVersion("doc:a")).?;
+    const vb = (try test_sink.docVersion("doc:b")).?;
+    const vc = (try test_sink.docVersion("doc:c")).?;
+    // doc:c is deleted before the merge reads its inputs: the merge drops it.
+    try pi.deleteVersioned(&.{"doc:c"}, &.{try DocVersion.of(nextTestWriteSequence(), 0)});
+    try std.testing.expect(try test_sink.isDead(vc));
 
-    // Another process rewrites doc:a into its own segment 900 and advances
-    // the counter past it; this process's memory knows neither.
-    try test_sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &(DocLocation{ .seg_id = 900, .local_id = 0 }).encode());
+    var ids = std.ArrayListUnmanaged(u64).empty;
+    defer ids.deinit(alloc);
+    {
+        const snap = pi.writer.acquireSnapshot();
+        defer snap.release();
+        for (snap.segments) |segment| try ids.append(alloc, segment.id);
+    }
+
+    // Another process rewrites doc:a (killing its version) and advances the
+    // counter; this process's memory knows neither.
+    const foreign = try DocVersion.of(nextTestWriteSequence(), 0);
+    try test_sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(foreign));
+    {
+        var key = deadKey(@intCast(va >> 32));
+        var bitmap = if (test_sink.findIndex(dead_namespace, &key)) |i| try roaring.RoaringBitmap.fromBytes(alloc, test_sink.entries.items[i].value) else roaring.RoaringBitmap.init(alloc);
+        defer bitmap.deinit();
+        try bitmap.add(@truncate(va));
+        const bytes = try bitmap.toBytes(alloc);
+        defer alloc.free(bytes);
+        try test_sink.foreignPut(dead_namespace, &key, bytes);
+    }
     try test_sink.foreignPut("meta", meta_next_seg_id, &PersistentIndex.nextSegmentIdValue(901, 0));
 
     const merged = try alloc.alloc([]u8, 1);
-    merged[0] = try buildMultiDocSegment(alloc, &.{
-        .{ .doc_id = "doc:a", .term = "alpha" },
-        .{ .doc_id = "doc:b", .term = "beta" },
+    merged[0] = try buildVersionedSegment(alloc, &.{
+        .{ .doc_id = "doc:a", .term = "alpha", .version = va },
+        .{ .doc_id = "doc:b", .term = "beta", .version = vb },
     });
-    try std.testing.expect(try pi.replaceSegmentsIfActiveManyOwnedWithDeletes(&.{ a.seg_id, b.seg_id }, merged, null));
+    try std.testing.expect(try pi.replaceSegmentsIfActiveManyOwnedWithDeletes(ids.items, merged, null));
 
-    // doc:a still names the other process's version; doc:b moved.
-    try std.testing.expect(DocLocation.eql(.{ .seg_id = 900, .local_id = 0 }, (try test_sink.docLocation("doc:a")).?));
-    const merged_b = (try test_sink.docLocation("doc:b")).?;
-    try std.testing.expect(merged_b.seg_id >= 901);
-    try std.testing.expect(try test_sink.segmentCounter() > merged_b.seg_id);
+    // The doc map is untouched; the merge's output id is above the counter.
+    try std.testing.expectEqual(foreign, (try test_sink.docVersion("doc:a")).?);
+    try std.testing.expectEqual(vb, (try test_sink.docVersion("doc:b")).?);
+    try std.testing.expect(try test_sink.segmentCounter() > 901);
+    // doc:c's version left the dead set with the input that held it.
+    try std.testing.expect(!try test_sink.isDead(vc));
+    try std.testing.expect(try test_sink.isDead(va));
 
-    // The merged copy of doc:a is tombstoned, durably and in memory.
-    const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, merged_b.seg_id));
-    const i = test_sink.findIndex("deletions", &seg_key) orelse return error.TestExpectedEqual;
-    var durable = try roaring.RoaringBitmap.fromBytes(alloc, test_sink.entries.items[i].value);
-    defer durable.deinit();
-    try std.testing.expectEqual(@as(usize, 1), durable.cardinality());
-    try std.testing.expect(!durable.contains(merged_b.local_id));
+    // The merged copy of doc:a is dead in memory too.
     const snap = pi.writer.acquireSnapshot();
     defer snap.release();
     try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
+    try std.testing.expect(snap.segments[0].id >= 901);
     try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
 }
 
@@ -6007,11 +6370,7 @@ test "persistent index merge is refused when an input is no longer active at the
     var path_buf: [256]u8 = undefined;
     const path = persistTmpPath(&path_buf);
     defer cleanupPersistDir(path);
-    var pi = try PersistentIndex.open(alloc, .{
-        .path = path,
-        .main_backend = .native_catalog,
-        .main_native_catalog_sink = test_sink.resolvingSink(),
-    });
+    var pi = try openVersionedTestIndex(alloc, &test_sink, path);
     defer pi.close();
 
     const first = try buildSimpleSegment(alloc, "doc:a", "alpha");
@@ -6020,19 +6379,25 @@ test "persistent index merge is refused when an input is no longer active at the
     const second = try buildSimpleSegment(alloc, "doc:b", "beta");
     defer alloc.free(second);
     try pi.indexSegment(second);
-    const a = (try test_sink.docLocation("doc:a")).?;
-    const b = (try test_sink.docLocation("doc:b")).?;
-    const marker = activeSegmentMetaKey(a.seg_id);
+    const va = (try test_sink.docVersion("doc:a")).?;
+    const vb = (try test_sink.docVersion("doc:b")).?;
+    var ids: [2]u64 = undefined;
+    {
+        const snap = pi.writer.acquireSnapshot();
+        defer snap.release();
+        for (snap.segments, 0..) |segment, i| ids[i] = segment.id;
+    }
+    const marker = activeSegmentMetaKey(ids[0]);
     try test_sink.foreignDelete("meta", &marker);
 
     const merged = try alloc.alloc([]u8, 1);
-    merged[0] = try buildMultiDocSegment(alloc, &.{
-        .{ .doc_id = "doc:a", .term = "alpha" },
-        .{ .doc_id = "doc:b", .term = "beta" },
+    merged[0] = try buildVersionedSegment(alloc, &.{
+        .{ .doc_id = "doc:a", .term = "alpha", .version = va },
+        .{ .doc_id = "doc:b", .term = "beta", .version = vb },
     });
-    try std.testing.expectError(error.IndexScopeChanged, pi.replaceSegmentsIfActiveManyOwnedWithDeletes(&.{ a.seg_id, b.seg_id }, merged, null));
-    try std.testing.expect(DocLocation.eql(a, (try test_sink.docLocation("doc:a")).?));
-    try std.testing.expect(DocLocation.eql(b, (try test_sink.docLocation("doc:b")).?));
+    try std.testing.expectError(error.IndexScopeChanged, pi.replaceSegmentsIfActiveManyOwnedWithDeletes(&ids, merged, null));
+    try std.testing.expectEqual(va, (try test_sink.docVersion("doc:a")).?);
+    try std.testing.expectEqual(vb, (try test_sink.docVersion("doc:b")).?);
 }
 
 // Background counter writes raise the counter at the tip, never lower it.
@@ -6043,20 +6408,54 @@ test "persistent index never lowers a segment counter another process advanced" 
     var path_buf: [256]u8 = undefined;
     const path = persistTmpPath(&path_buf);
     defer cleanupPersistDir(path);
+    var pi = try openVersionedTestIndex(alloc, &test_sink, path);
+    defer pi.close();
+
+    const first = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(first);
+    try pi.indexSegment(first);
+    var seg_id: u64 = 0;
+    {
+        const snap = pi.writer.acquireSnapshot();
+        defer snap.release();
+        seg_id = snap.segments[0].id;
+    }
+    try test_sink.foreignPut("meta", meta_next_seg_id, &PersistentIndex.nextSegmentIdValue(5000, 0));
+    try pi.removeSegments(&.{seg_id});
+    try std.testing.expectEqual(@as(u64, 5000), try test_sink.segmentCounter());
+}
+
+// An index from before versions is flagged for its owner to rebuild; once
+// reset, it is versioned and holds no version history.
+test "persistent index from an older format is rebuilt into the versioned format" {
+    const alloc = std.testing.allocator;
+    var test_sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer test_sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    {
+        var pi = try openVersionedTestIndex(alloc, &test_sink, path);
+        defer pi.close();
+        const seg = try buildSimpleSegment(alloc, "doc:a", "alpha");
+        defer alloc.free(seg);
+        try pi.indexSegment(seg);
+    }
+    // Rewind the format marker, as an index written before versions has.
+    try test_sink.foreignDelete("meta", meta_text_storage_format);
     var pi = try PersistentIndex.open(alloc, .{
         .path = path,
         .main_backend = .native_catalog,
         .main_native_catalog_sink = test_sink.resolvingSink(),
     });
     defer pi.close();
-
-    const first = try buildSimpleSegment(alloc, "doc:a", "alpha");
-    defer alloc.free(first);
-    try pi.indexSegment(first);
-    const a = (try test_sink.docLocation("doc:a")).?;
-    try test_sink.foreignPut("meta", meta_next_seg_id, &PersistentIndex.nextSegmentIdValue(5000, 0));
-    try pi.removeSegments(&.{a.seg_id});
-    try std.testing.expectEqual(@as(u64, 5000), try test_sink.segmentCounter());
+    try std.testing.expect(!pi.versioned and pi.needs_version_rebuild);
+    try pi.resetAllForRebuild();
+    try std.testing.expect(pi.versioned and !pi.needs_version_rebuild);
+    try std.testing.expect((try test_sink.docVersion("doc:a")) == null);
+    const snap = pi.writer.acquireSnapshot();
+    defer snap.release();
+    try std.testing.expectEqual(@as(usize, 0), snap.segments.len);
 }
 
 test "persistent index prepares an inline segment publication, applies it through an external commit, and installs it" {

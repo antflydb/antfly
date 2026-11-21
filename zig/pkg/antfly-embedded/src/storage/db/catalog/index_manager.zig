@@ -22338,6 +22338,7 @@ pub const IndexManager = struct {
         store: *docstore_mod.DocStore,
         index_name: []const u8,
         delete_keys: []const []const u8,
+        delete_versions: []const u64,
         prepared: *PreparedTextMapperPublication,
         opts: IndexBatchOptions,
     ) !void {
@@ -22347,7 +22348,7 @@ pub const IndexManager = struct {
 
             var stats = TextBatchMutationStats{};
             if (delete_keys.len > 0) {
-                stats.noteDelete((try self.deleteTextBatchEntry(entry, delete_keys)).deleted_any);
+                stats.noteDelete((try self.deleteTextBatchEntryVersioned(entry, delete_keys, delete_versions)).deleted_any);
             }
             if (prepared.observed_field_analyzers.len > 0) {
                 try mergeObservedTextFieldAnalyzers(self, store, entry, prepared.observed_field_analyzers);
@@ -24462,6 +24463,13 @@ pub const IndexManager = struct {
                 defer if (resume_from) |buf| self.alloc.free(buf);
 
                 var rebuild_from_scratch_after_interruption = false;
+                // An index from before per-copy versions is rebuilt from the
+                // primary rows (docs/design/lite-performance/lite-full-text-storage.md).
+                if (allow_full_text_backfill and resume_from == null and entry.persistent.needs_version_rebuild) {
+                    try apply_state.invalidateProjectionCompletion(self.alloc, store);
+                    try entry.persistent.resetAllForRebuild();
+                    rebuild_from_scratch_after_interruption = true;
+                }
                 if (allow_full_text_backfill and resume_from != null) {
                     try apply_state.invalidateProjectionCompletion(self.alloc, store);
                     try entry.persistent.resetAllForRebuild();
@@ -28907,8 +28915,29 @@ pub const IndexManager = struct {
         self: *IndexManager,
         store: *docstore_mod.DocStore,
         entry: *TextIndex,
-        docs: []const mapper.MapperDoc,
+        unversioned_docs: []const mapper.MapperDoc,
     ) !TextBatchMutationStats {
+        // A versioned index needs every copy's version; documents indexed
+        // here without one (rebuilds, keyed batch writes) take rebuild
+        // versions at the store's current replay cut.
+        var versioned_docs: []mapper.MapperDoc = &.{};
+        defer if (versioned_docs.len != 0) self.alloc.free(versioned_docs);
+        const docs = if (entry.persistent.versioned and unversioned_docs.len != 0) blk: {
+            versioned_docs = try self.alloc.dupe(mapper.MapperDoc, unversioned_docs);
+            var missing: u64 = 0;
+            for (versioned_docs) |doc| {
+                if (doc.doc_version == null) missing += 1;
+            }
+            if (missing != 0) {
+                const reserved = try entry.persistent.reserveRebuildVersions(store.lastReplaySequence(0), missing);
+                var n = reserved.first;
+                for (versioned_docs) |*doc| if (doc.doc_version == null) {
+                    doc.doc_version = try persistent_mod.DocVersion.ofRebuild(reserved.cut, n);
+                    n += 1;
+                };
+            }
+            break :blk versioned_docs;
+        } else unversioned_docs;
         const source_target_bytes = textProjectionSourceBuildTargetBytes();
         if (docs.len <= max_text_projection_docs_per_segment_build and estimatedMapperDocsBytes(docs) <= source_target_bytes) {
             return try self.indexTextProjectionDocs(store, entry, docs);
@@ -29552,6 +29581,12 @@ pub const IndexManager = struct {
     }
 
     fn deleteTextBatchEntry(self: *IndexManager, entry: *TextIndex, keys: []const []const u8) !TextBatchMutationStats {
+        return try self.deleteTextBatchEntryVersioned(entry, keys, &.{});
+    }
+
+    /// `versions` (parallel to `keys`, or empty for deletes of whatever is
+    /// current) apply to a versioned index; see `PersistentIndex.deleteVersioned`.
+    fn deleteTextBatchEntryVersioned(self: *IndexManager, entry: *TextIndex, keys: []const []const u8, versions: []const u64) !TextBatchMutationStats {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -29562,6 +29597,10 @@ pub const IndexManager = struct {
             };
             break :blk mapped;
         } else keys;
+        if (entry.persistent.versioned) {
+            try entry.persistent.deleteVersioned(effective, versions);
+            return .{ .deleted_any = effective.len != 0 };
+        }
         const delete_infos = try entry.persistent.deleteByIdsTracked(effective);
         defer entry.persistent.freeDeleteInfos(delete_infos);
         entry.recordCommittedDeletes(delete_infos);
@@ -44632,7 +44671,7 @@ test "text publication admission refreshes a projection revision change" {
     defer prepared.deinit();
     var guard = try manager.lockManagedIndexApply(.{ .name = config.name, .kind = .full_text });
     defer guard.unlock();
-    try manager.applyPreparedTextMapperPublicationByNameWithOptions(&store, config.name, &.{}, &prepared, .{});
+    try manager.applyPreparedTextMapperPublicationByNameWithOptions(&store, config.name, &.{}, &.{}, &prepared, .{});
     try std.testing.expectEqual(@as(u32, 1), manager.textIndex(config.name).?.snapshot().liveDocCount());
 }
 

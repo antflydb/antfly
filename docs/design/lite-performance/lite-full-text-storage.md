@@ -1,6 +1,6 @@
 # Lite full-text index storage
 
-Status: in progress (branch `perf/lwa-mp-corruption`).
+Status: stages 1-5 implemented (branch `perf/lwa-mp-corruption`); qualification in progress.
 
 This document governs how a Lite full-text index keeps its durable state and how
 a write changes it. It replaces the model where an index's in-memory writer state
@@ -209,11 +209,17 @@ authoritative mirror) and algebraic (HLL sketches split into register blocks).
    `View.getIndexCatalogAlloc`.
 2. Done (format 1, superseded). Location-valued doc map, tombstones at the
    tip, tip-resolved merges and segment ids.
-3. Segments carry a version column; merges carry it through.
-4. Format 2 write protocol: version-valued doc map and dead set, for every
-   publisher; derived deletion bitmaps on load and install.
-5. Merges drop dead versions and prune them from the dead set; no per-document
-   merge writes. Rebuild on open for older formats.
+3. Done. Segments carry a version column; merges carry it through.
+4. Done. Format 2 write protocol: version-valued doc map and dead set, for
+   every publisher (inline writes through `View` tip reads; replay
+   segments, rebuild pages and split copies through a resolver; replayed
+   deletes at their records' versions); derived deletion bitmaps on load and
+   install; replay segment ids reserved at the tip.
+5. Done. Merges drop dead versions and prune them from the dead set, with no
+   per-document merge writes; older formats are rebuilt on open. Delete
+   markers stay in the doc map: dropping one is safe only once no older copy
+   can still arrive (the replay cursor is past it and no rebuild runs), which
+   needs the cursor in the persistent layer. Follow-up.
 6. Incremental cross-process refresh; remove the full reopen after a foreign
    index commit.
 7. Prepare/stage/install split; no index guard or writer lease across the fsync.

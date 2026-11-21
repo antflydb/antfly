@@ -49,6 +49,10 @@ pub const DerivedDocument = struct {
     prepared_text_source_bytes: usize = 0,
     prepared_schema_version: u32 = 0,
     prepared_write_plan_generation: u64 = 0,
+    /// Request-local, omitted from the codec: the replay sequence of the
+    /// record this document came from when a batch folds several records
+    /// (0: the batch's own `sequence`). Full-text versions derive from it.
+    sequence: u64 = 0,
 };
 
 pub const DerivedGraphDocClear = struct {
@@ -84,6 +88,10 @@ pub const DerivedBatch = struct {
     generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
     graph_writes: []const graph_edge_types.GraphEdgeWrite = &.{},
     graph_deletes: []const graph_edge_types.GraphEdgeDelete = &.{},
+    /// Request-local, omitted from the codec: when a batch folds several
+    /// records, each `overwritten_doc_keys` entry's record sequence (empty:
+    /// every key at `sequence`).
+    delete_sequences: []const u64 = &.{},
 };
 
 pub const DerivedLogRecord = struct {
@@ -185,6 +193,7 @@ pub fn cloneDerivedDocument(alloc: Allocator, doc: DerivedDocument) !DerivedDocu
         .action = doc.action,
         .cleaned_value = cleaned_value,
         .targets = targets,
+        .sequence = doc.sequence,
     };
 }
 
@@ -339,6 +348,8 @@ pub noinline fn deinitDerivedBatch(alloc: Allocator, batch: *DerivedBatch) void 
 
     for (batch.graph_deletes) |delete| deinitDerivedGraphDelete(alloc, delete);
     if (batch.graph_deletes.len > 0) alloc.free(batch.graph_deletes);
+
+    if (batch.delete_sequences.len > 0) alloc.free(batch.delete_sequences);
 
     batch.* = undefined;
 }
