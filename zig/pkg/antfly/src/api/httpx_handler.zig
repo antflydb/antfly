@@ -12999,12 +12999,14 @@ test "httpx multi batch route uses the batch commit hook and public response con
     defer alloc.free(transaction_url);
     const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
 
+    const batch_body = "{\"tables\":{\"users\":{\"inserts\":{\"user:1\":{\"name\":\"Alice\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}";
+    const transaction_body = "{\"read_set\":[],\"tables\":{\"users\":{\"inserts\":{\"user:3\":{\"name\":\"Carol\"}}}}}";
     var response = try requestWithRetry(
         &client,
         client_io.io(),
         .POST,
         batch_url,
-        "{\"tables\":{\"users\":{\"inserts\":{\"user:1\":{\"name\":\"Alice\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}",
+        batch_body,
         &headers,
         20,
     );
@@ -13043,7 +13045,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
         client_io.io(),
         .POST,
         transaction_url,
-        "{\"read_set\":[],\"tables\":{\"users\":{\"inserts\":{\"user:3\":{\"name\":\"Carol\"}}}}}",
+        transaction_body,
         &headers,
         20,
     );
@@ -13141,8 +13143,8 @@ test "httpx multi batch route uses the batch commit hook and public response con
     try std.testing.expectEqual(@as(usize, 2), writes.cancellation_transaction_calls);
     for ([_]anyerror{ error.TransactionPrepareAbortedRowPolicyDenied, error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable }, [_]u16{ 403, 503, 503 }) |failure, status_code| {
         writes.rejection = failure;
-        for ([_][]const u8{ batch_url, transaction_url }) |url| {
-            var denied = try requestWithRetry(&client, client_io.io(), .POST, url, "{\"tables\":{\"users\":{\"deletes\":[\"user:1\"]}}}", &headers, 20);
+        for ([_][]const u8{ batch_url, transaction_url }, [_][]const u8{ batch_body, transaction_body }) |url, body| {
+            var denied = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
             defer denied.deinit();
             try std.testing.expectEqual(status_code, denied.status.code);
             const Reply = struct { status: []const u8, code: []const u8, retryable: bool };

@@ -6291,14 +6291,19 @@ fn consumerTests() type {
             observation.fence.metadata_incarnation = @splat('2');
             try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("50112233445566778899aabbccddeeff"), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = (&observation)[0..1] }}, .write, null));
             try std.testing.expectEqual(prior_begins, recorder.begins.items.len);
+            // Admit all three writes on the compact generation itself. The
+            // post-prepare check is the only injected routing failure.
+            const recheck_tables = [_]TableCommitRequest{
+                .{ .table_name = "docs", .schema_version = 7, .bound_catalog_incarnation = @splat(0x11), .commit_requires = .direct_enrichments, .writes = &.{.{ .key = "doc:z", .value = "{}" }} },
+                .{ .table_name = "audit", .writes = &.{.{ .key = "log", .value = "{}" }} },
+                .{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
+            };
             for ([_]bool{ true, false }) |fresh| {
                 for ([_]anyerror{ error.CatalogRoutingSnapshotTimeout, error.TopologyChanged }) |failure| {
                     compact.supports_batch = true;
                     compact.checks = 0;
                     compact.recheck_failure = failure;
-                    // The earlier stale-fence case modified this borrowed proof.
-                    observation.fence.metadata_incarnation = @splat('1');
-                    const rechecked = executeMultiTableCommitWithOptions(std.testing.allocator, compact_source, recorder.worker(), @splat(7), 70_000, 70_001, guarded_tables, .write, null, .{ .retain_terminal = true, .fresh_retained_id = fresh });
+                    const rechecked = executeMultiTableCommitWithOptions(std.testing.allocator, compact_source, recorder.worker(), @splat(7), 70_000, 70_001, &recheck_tables, .write, null, .{ .retain_terminal = true, .fresh_retained_id = fresh });
                     if (failure == error.TopologyChanged) {
                         try std.testing.expect((try rechecked) == .conflict);
                     } else try std.testing.expectError(error.TransactionPrepareAbortedUnavailable, rechecked);
