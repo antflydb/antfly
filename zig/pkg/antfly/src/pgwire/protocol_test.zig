@@ -38,6 +38,7 @@ const Mock = struct {
     replication_live_chunks: usize = 0,
     replication_revoke_after_poll: bool = false,
     replication_defer_first_poll: bool = false,
+    replication_defer_first_feedback: bool = false,
     replication_wait_for_feedback: bool = false,
     catalog_rebind: bool = false,
     cached_rename: bool = false,
@@ -195,6 +196,10 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         try request.check();
         self.replication_feedbacks += 1;
+        if (self.replication_defer_first_feedback and self.replication_feedbacks == 1) {
+            try request.io.sleep(.fromMilliseconds(150), .awake);
+            return error.ReplicationFeedbackDeferred;
+        }
         // The real slot authority rounds to complete issued transactions;
         // transport alone must never acknowledge a partial transaction.
         if (@backingInt(feedback.flushed) == 48) self.replication_ack = 48;
@@ -3131,7 +3136,7 @@ fn replicationStatus(writer: *std.Io.Writer, lsn: u64, reply: bool) !void {
 const replication_test_limits: protocol.Limits = .{ .idle_timeout_ms = 1000, .startup_timeout_ms = 3000, .statement_timeout_ms = 3000, .replication_timeout_ms = 3000, .replication_keepalive_ms = 50, .replication_poll_ms = 5, .replication_callback_ms = 1000, .replication_write_ms = 1000 };
 test "pgwire CopyBoth sends committed messages accepts duplex feedback and preserves following commands" {
     for ([_]bool{ false, true }) |acknowledge| {
-        var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .renewable_auth = true, .replication_defer_first_poll = true };
+        var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .renewable_auth = true, .replication_defer_first_poll = true, .replication_defer_first_feedback = true };
         var limits = replication_test_limits;
         limits.replication_callback_ms = 100;
         var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = limits });
@@ -3154,6 +3159,7 @@ test "pgwire CopyBoth sends committed messages accepts duplex feedback and prese
         var writer = socket.writer(std.testing.io, &.{});
         try frame(&writer.interface, 'p', "renewed\x00");
         if (acknowledge) {
+            try replicationStatus(&writer.interface, 48, true);
             try replicationStatus(&writer.interface, 48, true);
             try writer.interface.flush();
             while (true) {
@@ -3184,7 +3190,7 @@ test "pgwire CopyBoth sends committed messages accepts duplex feedback and prese
         try std.testing.expectEqual(@as(usize, 0), mock.replication_live_chunks);
         try std.testing.expect(mock.replication_polls >= 3);
         try std.testing.expectEqual(@as(u64, if (acknowledge) 48 else 0), mock.replication_ack);
-        try std.testing.expectEqual(@as(usize, if (acknowledge) 1 else 0), mock.replication_feedbacks);
+        try std.testing.expectEqual(@as(usize, if (acknowledge) 2 else 0), mock.replication_feedbacks);
         try std.testing.expectEqual(@as(usize, 1), mock.renewals);
         try std.testing.expectEqual(@as(usize, 0), mock.executions);
     }

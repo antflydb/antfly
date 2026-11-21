@@ -36,6 +36,13 @@ pub fn metadataContext(request: backend.Request) !Context {
     return context.platformDeadline();
 }
 
+fn temporaryTransportFailure(err: anyerror) bool {
+    return switch (err) {
+        error.Canceled, error.Cancelled, error.QueryCanceled, error.DeadlineExceeded, error.ReadUnavailable, error.ConcurrencyUnavailable, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionResetByPeer, error.Timeout => true,
+        else => false,
+    };
+}
+
 pub fn Bridge(comptime Host: type) type {
     return struct {
         const Self = @This();
@@ -70,18 +77,17 @@ pub fn Bridge(comptime Host: type) type {
             const self: *Self = @ptrCast(@alignCast(raw));
             if (self.pages != 0) return error.InvalidResult;
             if (comptime @hasDecl(Host, "schedulePublication"))
-                try self.host.schedulePublication(self.owner.session, request);
-            const req = try self.host.request(request);
+                self.host.schedulePublication(self.owner.session, request) catch |err|
+                    return if (temporaryTransportFailure(err)) error.ReplicationReadDeferred else err;
+            const req = self.host.request(request) catch |err|
+                return if (temporaryTransportFailure(err)) error.ReplicationReadDeferred else err;
             // The connection budget can reclaim large transport buffers
             // immediately. A fetch arena would retain them through every
             // nested metadata and artifact read in this poll.
             const backing = request.scratch_allocator orelse a;
-            var page = self.owner.poll(self.host.service, self.host.registry, self.host, backing, @backingInt(after), maximum, req) catch |err| switch (err) {
-                // The retained reader advances its frontier only after it
-                // obtains the complete payload and verifies the live slot.
-                error.Canceled, error.Cancelled, error.DeadlineExceeded, error.ReadUnavailable, error.ConcurrencyUnavailable, error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionResetByPeer, error.Timeout => return error.ReplicationReadDeferred,
-                else => return err,
-            };
+            // A failed read leaves the frontier at the last emitted byte.
+            var page = self.owner.poll(self.host.service, self.host.registry, self.host, backing, @backingInt(after), maximum, req) catch |err|
+                return if (temporaryTransportFailure(err)) error.ReplicationReadDeferred else err;
             defer page.deinit();
             var result: backend.ReplicationPoll = .{ .end_lsn = @fromBackingInt(page.end_lsn) };
             if (page.bytes) |bytes| {
@@ -96,8 +102,12 @@ pub fn Bridge(comptime Host: type) type {
         }
         fn feedback(raw: *anyopaque, a: std.mem.Allocator, request: backend.Request, value: backend.pgoutput.Feedback) !void {
             const self: *Self = @ptrCast(@alignCast(raw));
-            const req = try self.host.request(request);
-            return self.owner.feedback(self.host.service, self.host, request.scratch_allocator orelse a, .{ .written = @backingInt(value.written), .flushed = @backingInt(value.flushed), .applied = @backingInt(value.applied) }, req);
+            const req = self.host.request(request) catch |err|
+                return if (temporaryTransportFailure(err)) error.ReplicationFeedbackDeferred else err;
+            // The next client status update can re-observe any previously
+            // committed acknowledgment under the same session and ceiling.
+            self.owner.feedback(self.host.service, self.host, request.scratch_allocator orelse a, .{ .written = @backingInt(value.written), .flushed = @backingInt(value.flushed), .applied = @backingInt(value.applied) }, req) catch |err|
+                return if (temporaryTransportFailure(err) or err == error.MetadataMutationOutcomeUnknown) error.ReplicationFeedbackDeferred else err;
         }
         fn close(raw: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(raw));

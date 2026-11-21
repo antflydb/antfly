@@ -1099,10 +1099,14 @@ pub const Session = struct {
                             if (@backingInt(feedback.flushed) > @backingInt(feedback_ceiling) or @backingInt(feedback.written) > @backingInt(feedback_ceiling) or @backingInt(feedback.applied) > @backingInt(feedback_ceiling)) return error.ProtocolViolation;
                             var scratch = std.heap.ArenaAllocator.init(self.alloc);
                             defer scratch.deinit();
-                            self.replicationDeadline(@intCast(request_value.deadline.raw.nanoseconds));
+                            self.replicationDeadline(deadline);
                             try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
-                            try stream.feedback(stream.context, scratch.allocator(), request_value, feedback);
-                            try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
+                            stream.feedback(stream.context, scratch.allocator(), self.replicationRequest(statement, deadline), feedback) catch |err| {
+                                if (err != error.ReplicationFeedbackDeferred or self.cancel_requested.load(.acquire) or self.replicationNow() >= deadline) return err;
+                                try select.concurrent(.input, replication_input.read, .{ self.alloc, self.reader, self.identity.?.renewable });
+                                continue;
+                            };
+                            try owner.authorize(owner.context, scratch.allocator(), self.replicationRequest(statement, deadline), command_value);
                             deadline = self.replicationNow() +| @as(i64, limits.replication_timeout_ms) * std.time.ns_per_ms;
                             self.replicationDeadline(deadline);
                             if (feedback.request_reply) {
@@ -1122,7 +1126,7 @@ pub const Session = struct {
                     // reader can report a retryable result.
                     self.replicationDeadline(deadline);
                     try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
-                    var poll = stream.poll(stream.context, scratch.allocator(), request_value, sent, limits.frame_bytes - 30) catch |err| {
+                    var poll = stream.poll(stream.context, scratch.allocator(), self.replicationRequest(statement, deadline), sent, limits.frame_bytes - 30) catch |err| {
                         if (err == error.ReplicationReadDeferred and !self.cancel_requested.load(.acquire) and self.replicationNow() < deadline) {
                             // The backend guarantees that this failure moved
                             // no cursor. Require a fresh authorized read before
@@ -1137,7 +1141,7 @@ pub const Session = struct {
                     defer poll.deinit();
                     if (@backingInt(poll.end_lsn) < @backingInt(observed_end)) return error.InvalidResult;
                     observed_end = poll.end_lsn;
-                    try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
+                    try owner.authorize(owner.context, scratch.allocator(), self.replicationRequest(statement, deadline), command_value);
                     self.replicationDeadline(deadline);
                     if (poll.chunk) |chunk| {
                         if (@backingInt(chunk.start_lsn) != @backingInt(sent) or chunk.bytes.len == 0 or chunk.bytes.len > limits.frame_bytes - 30) return error.InvalidResult;
