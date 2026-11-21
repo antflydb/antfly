@@ -6076,6 +6076,7 @@ pub const ModelManager = struct {
                 count += 1;
             }
         }
+        var matched_static_recipe = false;
         for (if (expected != null and manifest.embedding_style == .embedding_gemma2) ordered[0..count] else candidates) |backend| {
             if (!backend.available() or !backend.supportsDirectSessionLoad()) continue;
             if (modelBackendPolicyError(manifest, backend, load_policy.cache_policy.a4b_request) != null) continue;
@@ -6087,9 +6088,7 @@ pub const ModelManager = struct {
             if (std.mem.indexOfScalar(backends.BackendType, result.backends[0..result.len], backend) != null) continue;
             const quarantined = !include_unavailable and modelBackendIsUnhealthy(self, model_dir, artifacts.installation, backend);
             const revision = if (backend == .cuda and manifest.embedding_style == .embedding_gemma2) resolved: {
-                if (expected) |pin| {
-                    if (result.contains(pin)) continue;
-                }
+                if (matched_static_recipe) continue;
                 if (quarantined) {
                     // Computing a nonresident Gemma CUDA revision requires a
                     // device probe. A quarantined candidate cannot prove a miss.
@@ -6117,6 +6116,7 @@ pub const ModelManager = struct {
             } else durableEmbeddingRevision(manifest, artifact_revision, backend);
             if (expected) |pin| {
                 if (!std.mem.eql(u8, &pin, &revision)) continue;
+                if (backend != .cuda) matched_static_recipe = true;
             }
             if (quarantined) {
                 result.backend_refused = true;
