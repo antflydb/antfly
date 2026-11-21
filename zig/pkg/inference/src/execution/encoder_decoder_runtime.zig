@@ -203,7 +203,7 @@ pub const DecoderInputPlan = struct {
         fn resolve(inputs: []const backends.TensorInfo) !Signature {
             var signature: Signature = .{ .count = inputs.len };
             if (inputs.len > signature.roles.len) return error.InvalidDecoderInput;
-            var seen = std.EnumSet(Role).initEmpty();
+            var seen: std.EnumSet(Role) = .empty;
             for (inputs, signature.roles[0..signature.count]) |info, *role| {
                 role.* = std.meta.stringToEnum(Role, info.name) orelse return error.InvalidDecoderInput;
                 if (seen.contains(role.*)) return error.InvalidDecoderInput;
