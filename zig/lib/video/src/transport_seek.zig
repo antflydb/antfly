@@ -58,6 +58,55 @@ const WireSpan = struct {
     }
 };
 
+/// Walk required physical extents without reading the source or retaining a
+/// per-packet plan. Synthetic length fields and transport headers are skipped.
+const Extents = struct {
+    map: Mapping,
+    id: usize,
+    last: usize,
+    pos: u64,
+    end: u64,
+    run: ?usize = null,
+
+    fn next(self: *Extents) ?WireSpan {
+        while (self.id <= self.last) {
+            const nal = self.map.nals[self.id];
+            const base = nal.logical + 4;
+            self.pos = @max(self.pos, base);
+            const stop = @min(self.end, base + nal.size);
+            if (self.pos >= stop) {
+                self.id += 1;
+                self.run = null;
+                continue;
+            }
+            const es = nal.elementary + (self.pos - base);
+            const k = self.run orelse containing(Run, self.map.runs, "elementary", es);
+            const run = self.map.runs[k];
+            const rel = es - run.elementary;
+            const n = @min(stop - self.pos, run.len - rel, 184 - rel % 184);
+            const wire = run.offset(rel);
+            self.pos += n;
+            self.run = if (rel + n == run.len) k + 1 else k;
+            return .{ .start = wire, .end = wire + n };
+        }
+        return null;
+    }
+
+    fn fits(self: Extents, capacity: usize, budget: media.source.Limits, control: media.source.Control) !bool {
+        if (capacity == 0) return false;
+        var iter = self;
+        var calls: u64 = 0;
+        var bytes: u64 = 0;
+        while (iter.next()) |span| {
+            if (calls % 256 == 0) try control.check();
+            calls += try std.math.divCeil(u64, span.size(), capacity);
+            bytes += span.size();
+            if (calls > budget.max_reads or bytes > budget.max_total_bytes) return false;
+        }
+        return true;
+    }
+};
+
 /// When both the call count and byte budget constrain a gather, choose the
 /// physical ranges before spending either. A group of adjacent extents costs
 /// its wire width in bytes and ceil(width / capacity) calls. Every useful cut
@@ -67,58 +116,23 @@ fn constrainedRanges(a: std.mem.Allocator, map: Mapping, first: usize, last: usi
     var spans: std.ArrayList(WireSpan) = .empty;
     defer spans.deinit(a);
     var payload: u64 = 0;
-    for (map.nals[first .. last + 1]) |nal| {
+    var iter = Extents{ .map = map, .id = first, .last = last, .pos = start, .end = end };
+    while (iter.next()) |span| {
         try control.check();
-        const base = nal.logical + 4;
-        const lo = @max(start, base);
-        const hi = @min(end, base + nal.size);
-        if (lo >= hi) continue;
-        var es = nal.elementary + (lo - base);
-        var needed = hi - lo;
-        var k = containing(Run, map.runs, "elementary", es);
-        while (needed != 0) {
-            if (spans.items.len % 256 == 0) try control.check();
-            const run = map.runs[k];
-            const rel = es - run.elementary;
-            const n = @min(needed, run.len - rel, 184 - rel % 184);
-            const wire = run.offset(rel);
-            if (spans.items.len != 0 and spans.items[spans.items.len - 1].end == wire)
-                spans.items[spans.items.len - 1].end += n
-            else
-                try spans.append(a, .{ .start = wire, .end = wire + n });
-            es += n;
-            needed -= n;
-            payload += n;
-            if (rel + n == run.len) k += 1;
-        }
+        payload += span.size();
+        if (spans.items.len != 0 and spans.items[spans.items.len - 1].end == span.start)
+            spans.items[spans.items.len - 1].end = span.end
+        else
+            try spans.append(a, span);
     }
     if (payload > budget.max_total_bytes or budget.max_reads == 0) return error.ResourceLimitExceeded;
-    const slack = budget.max_total_bytes - payload;
+    // Preserve the request-wide byte allowance for subsequent packets when
+    // these extents already fit the physical call budget individually.
+    var separate_calls: u64 = 0;
+    for (spans.items) |span| separate_calls += try std.math.divCeil(u64, span.size(), capacity);
+    if (separate_calls <= budget.max_reads) return spans.toOwnedSlice(a);
     var ranges: std.ArrayList(WireSpan) = .empty;
     defer ranges.deinit(a);
-    var calls: u64 = 0;
-    var overhead: u64 = 0;
-    // The linear plan normally suffices. Bridge a gap when it saves a call
-    // within the available overhead. Preserve remaining slack otherwise.
-    for (spans.items) |span| {
-        const separate = std.math.divCeil(u64, span.size(), capacity) catch unreachable;
-        if (ranges.getLastOrNull()) |previous| {
-            const before = std.math.divCeil(u64, previous.size(), capacity) catch unreachable;
-            const joined = std.math.divCeil(u64, span.end - previous.start, capacity) catch unreachable;
-            const gap = span.start - previous.end;
-            if (joined < before + separate and gap <= slack - overhead) {
-                ranges.items[ranges.items.len - 1].end = span.end;
-                overhead += gap;
-                calls += joined - before;
-                continue;
-            }
-        }
-        try ranges.append(a, span);
-        calls += separate;
-    }
-    if (calls <= budget.max_reads) return ranges.toOwnedSlice(a);
-    ranges.clearRetainingCapacity();
-
     // Unconstrained by bytes, starting each read at the first uncovered
     // payload byte gives the minimum call count. Rule out impossible maps
     // before exploring byte/call tradeoffs (especially a one-call budget).
@@ -148,7 +162,7 @@ fn constrainedRanges(a: std.mem.Allocator, map: Mapping, first: usize, last: usi
     std.mem.sort(usize, cuts, {}, std.sort.asc(usize));
     var base: usize = 0;
     var minimum_bytes: u64 = 0;
-    calls = 0;
+    var calls: u64 = 0;
     for (0..cuts.len + 1) |i| {
         const stop = if (i == cuts.len) spans.items.len else cuts[i];
         const group = WireSpan{ .start = spans.items[base].start, .end = spans.items[stop - 1].end };
@@ -288,18 +302,12 @@ fn exactRanges(a: std.mem.Allocator, spans: []const WireSpan, capacity: usize, b
 pub const View = struct {
     map: Mapping,
     wire: *media.source.Source,
-    // Reader copies can issue simultaneous normalized reads. The physical
-    // provider and its request-wide byte/read counters have one owner.
-    mutex: std.Io.Mutex = .init,
     pub fn source(self: *View, identity: []const u8, limits: media.source.Limits) media.source.Source {
-        return .{ .allocator = self.wire.allocator, .identity = identity, .control = self.wire.control, .admission_pool = self.wire.admission_pool, .limits = limits, .storage = .{ .range = .{ .context = self, .length = self.map.len, .read_at = read } } };
+        return .{ .allocator = self.wire.allocator, .identity = identity, .control = self.wire.control, .admission_pool = self.wire.admission_pool, .limits = limits, .storage = .{ .range = .{ .concurrent = true, .context = self, .length = self.map.len, .read_at = read } } };
     }
     fn read(raw: *anyopaque, start: u64, out: []u8, control: media.source.Control) !usize {
         const self: *View = @ptrCast(@alignCast(raw));
         if (out.len == 0) return 0;
-        const io = std.Io.Threaded.global_single_threaded.io();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
         if (start >= self.map.len or out.len > self.map.len - start) return error.UnexpectedEndOfSource;
         var pos = start;
         var id = containing(Nal, self.map.nals, "logical", pos);
@@ -323,6 +331,7 @@ pub const View = struct {
         // partial strides. With sufficient calls, skip expensive multiplex gaps.
         const extent_bound = 2 * (physical_runs + final_id - id + 1) + out.len / 184;
         const calls_tight = available.max_reads < extent_bound + out.len / @max(1, hard_capacity);
+        var separate: ?bool = null;
         var scratch = media.admission.TrackedAllocator{ .backing = self.wire.allocator, .limit = std.math.maxInt(usize), .reservation = .{} };
         defer scratch.reservation.deinit();
         var constrained: ?[]WireSpan = null;
@@ -360,9 +369,23 @@ pub const View = struct {
                     const capacity = @min(if (calls_tight) hard_capacity else @min(256 * 1024, hard_capacity), limits.max_retained_bytes, remaining);
                     // Coalesce nearby extents while there is room to pay for
                     // transport overhead in addition to all remaining payload.
-                    const whole_span_fits = final_wire - wire <= remaining;
+                    const width = final_wire - wire;
+                    const whole_span_fits = width <= remaining;
+                    const wide = width > 2 *| (end - pos);
                     const count: usize = physical: {
-                        if (calls_tight and !whole_span_fits and constrained == null) {
+                        if (separate == null) {
+                            const extents = Extents{ .map = self.map, .id = id, .last = final_id, .pos = pos, .end = end };
+                            // Keep regular 184-byte TS strides coalesced. Count
+                            // sparse extents before spending bytes on multiplex
+                            // gaps, or when even the full wire span cannot fit.
+                            separate = (!whole_span_fits or (wide and (calls_tight or remaining < self.wire.length()))) and try extents.fits(capacity, limits, control);
+                        }
+                        if (separate.?) break :physical @intCast(@min(capacity, stop - pos, run.len - relative, 184 - relative % 184));
+                        if (whole_span_fits and limits.max_reads == 1 and final_wire - wire <= capacity) break :physical @intCast(final_wire - wire);
+                        // A dense span that fits both budgets can use the
+                        // streaming coalescer without allocating a range plan.
+                        const dense_fits = !wide and whole_span_fits and width <= capacity *| limits.max_reads;
+                        if (calls_tight and !dense_fits and constrained == null and (physical_runs > 1 or final_id != id or !whole_span_fits)) {
                             if (self.wire.admission_pool) |pool| scratch.reservation = try pool.acquire(.{});
                             constrained = constrainedRanges(scratch.allocator(), self.map, id, final_id, pos, end, hard_capacity, limits, control) catch |err|
                                 return if (err == error.OutOfMemory) scratch.denied orelse err else err;
@@ -604,6 +627,17 @@ test "seekable transport skips multiplexed padding under exact payload budget" {
     var payload = try source.read(0, 7);
     defer payload.deinit();
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 3, 9, 10, 11 }, payload.bytes);
+    try std.testing.expectEqual(@as(u64, 3), wire.total_bytes);
+
+    // Two independent requests share the physical byte and call budgets.
+    wire.limits.max_reads = 3;
+    wire.limits.max_total_bytes = 81;
+    wire.reads = 0;
+    wire.total_bytes = 0;
+    var first_pair = try source.read(4, 2);
+    first_pair.deinit();
+    var third = try source.read(6, 1);
+    third.deinit();
     try std.testing.expectEqual(@as(u64, 3), wire.total_bytes);
 
     // Two NALs in one physical run have a synthetic length between them.

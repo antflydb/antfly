@@ -220,6 +220,16 @@ test "embeddinggemma2 video HEVC AV1 and AVC NVDEC pixels match independent FFmp
         state.count = 0;
         _ = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &state, .consume = ConsumerState.consume }, .gemma4);
         try std.testing.expectEqual(plan.frames, state.count);
+        if (comptime std.mem.eql(u8, name, "av1.mp4")) {
+            var grouped = prepared.reader;
+            grouped.packets = try groupFirstTwoAv1Packets(a, &prepared.reader);
+            defer a.free(grouped.packets);
+            state.count = 0;
+            var decode = DecodeState{ .ctx = &compute.ctx, .consumer = .{ .context = &state, .consume = ConsumerState.consume } };
+            const grouped_stats = try decodeReader(a, &decode, &grouped, .gemma4, null);
+            try std.testing.expectEqual(expected.frames, grouped_stats.decoded_frames);
+            try std.testing.expectEqual(plan.frames, state.count);
+        }
         try std.testing.expectEqual(compute.ctx.video_cache_budget.bytes, admission.snapshot().backend_scratch_bytes);
         // Cancellation after the first selected surface must discard both the
         // decoder and its retained admission, then permit the next codec.
@@ -370,6 +380,56 @@ fn quarterTurns(matrix: [9]i32) !u32 {
     if (std.mem.eql(i32, &basis, &.{ -65536, 0, 0, -65536 })) return 2;
     if (std.mem.eql(i32, &basis, &.{ 0, -65536, 65536, 0 })) return 3;
     return error.UnsupportedVideoFormat;
+}
+
+fn gemma4Av1DisplayPlan(allocator: std.mem.Allocator, reader: *media.mp4.Reader, counts: []const usize) !DisplayPlan {
+    var display = DisplayPlan{ .pictures = try packet_sampling.gemma4Av1FromCounts(allocator, reader, counts) };
+    var visible: usize = 0;
+    var next: usize = 0;
+    for (counts, 0..) |count, id| {
+        if (next < display.pictures.len and id == display.pictures.packet_ids[next]) {
+            display.visible_ordinals[next] = visible;
+            next += 1;
+        }
+        if (count > nvdec_max_samples - visible) return error.DecoderEnvelopeExceeded;
+        visible += count;
+    }
+    if (next != display.pictures.len) return error.UnsupportedVideoFormat;
+    display.visible_count = visible;
+    return display;
+}
+
+test "Gemma4 CUDA AV1 selects identical displays when two frames share one packet" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../../testdata/video/codecs/av1.mp4") }, .identity = "visible-ordinals" };
+    var reader = try media.mp4.Reader.init(a, &source, mp4Limits(true));
+    defer reader.deinit();
+    var merged = reader;
+    merged.packets = try groupFirstTwoAv1Packets(a, &reader);
+    defer a.free(merged.packets);
+    var expected: DisplayPlan = undefined;
+    for ([_]*media.mp4.Reader{ &reader, &merged }, 0..) |input, i| {
+        const counts = try packet_sampling.av1OutputCounts(a, input);
+        defer a.free(counts);
+        try std.testing.expectEqual(i + 1, counts[0]);
+        const plan = try gemma4Av1DisplayPlan(a, input, counts);
+        if (i == 0) expected = plan else {
+            try std.testing.expectEqual(expected.visible_count, plan.visible_count);
+            try std.testing.expectEqualSlices(usize, expected.visible_ordinals[0..expected.pictures.len], plan.visible_ordinals[0..plan.pictures.len]);
+            try std.testing.expectEqualSlices(i64, expected.pictures.timestamps(), plan.pictures.timestamps());
+        }
+    }
+}
+
+fn groupFirstTwoAv1Packets(a: std.mem.Allocator, reader: *const media.mp4.Reader) ![]media.mp4.Packet {
+    const first = reader.packets[0];
+    const second = reader.packets[1];
+    try std.testing.expectEqual(first.offset + first.size, second.offset);
+    const packets = try a.dupe(media.mp4.Packet, reader.packets[1..]);
+    packets[0] = first;
+    packets[0].size += second.size;
+    packets[0].duration += second.duration;
+    return packets;
 }
 
 fn embeddingSelection(a: std.mem.Allocator, reader: *media.mp4.Reader) !DisplayPlan {
@@ -603,19 +663,7 @@ fn decodeReader(allocator: std.mem.Allocator, state: *DecodeState, reader: *medi
                 else => return err,
             };
             defer allocator.free(counts);
-            var display = DisplayPlan{ .pictures = try packet_sampling.gemma4Av1FromCounts(allocator, reader, counts) };
-            var visible: usize = 0;
-            var next: usize = 0;
-            for (counts, 0..) |count, id| {
-                if (next < display.pictures.len and id == display.pictures.packet_ids[next]) {
-                    display.visible_ordinals[next] = visible;
-                    next += 1;
-                }
-                visible += count;
-            }
-            if (next != display.pictures.len) return error.UnsupportedVideoFormat;
-            display.visible_count = visible;
-            break :av1 display;
+            break :av1 try gemma4Av1DisplayPlan(allocator, reader, counts);
         } else .{ .pictures = try packet_sampling.gemma4Pictures(reader, reader.packets, reader.input.control) };
         state.selected_packets = .{ .plan = plan };
         if (track.codec == .avc) state.avc_packet_count = reader.packets.len;
@@ -658,15 +706,17 @@ fn decodeReader(allocator: std.mem.Allocator, state: *DecodeState, reader: *medi
         try reader.input.control.check();
         var lease = try reader.readPacket(index);
         defer lease.deinit();
-        const payload = if (track.codec == .av1) lease.bytes else converted: {
+        const pts = if (state.selected_packets != null) @as(i64, @intCast(index)) else try timestampUs(packet.pts, track.timescale);
+        if (track.codec == .av1) {
+            var units = packet_sampling.Av1FrameUnits{ .bytes = lease.bytes };
+            while (try units.next(reader.input.control)) |unit| {
+                try state.checkStatus(antfly_nvdec_packet(decoder.?, unit.ptr, @intCast(unit.len), pts, .sample));
+            }
+        } else {
             annex.clearRetainingCapacity();
             try annexPacket(allocator, &annex, lease.bytes, track.nal_length_bytes);
-            break :converted annex.items;
-        };
-        const pts = if (state.selected_packets != null) @as(i64, @intCast(index)) else try timestampUs(packet.pts, track.timescale);
-        const result = antfly_nvdec_packet(decoder.?, payload.ptr, @intCast(payload.len), pts, .sample);
-        if (state.failure) |err| return err;
-        try state.checkStatus(result);
+            try state.checkStatus(antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), pts, .sample));
+        }
         state.stats.compressed_bytes += lease.bytes.len;
     }
     const result = antfly_nvdec_packet(decoder.?, null, 0, 0, .end_of_stream);

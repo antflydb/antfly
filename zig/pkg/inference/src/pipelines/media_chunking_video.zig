@@ -75,9 +75,11 @@ const Dependencies = struct {
         self.extend(index, node * 2 + 1, mid, hi, first, stop, end, origin, timescale);
     }
 };
-/// Pure immutable planning metadata. No source, decoder, admission token or
-/// mutable seek cache survives a request. The cache's arena owns every slice.
+/// The cache's arena owns the versioned planning metadata. Packet indices
+/// are immutable. Requests share the atomic AVC candidate probe results.
 pub const Snapshot = struct {
+    static_candidates: ?[]video.decode_plan.SeekCache.Candidate = null,
+
     transport: ?video.transport_seek.Mapping = null,
     registry: ?video.h264_dynamic.Snapshot = null,
     hevc_predecessors: []usize,
@@ -86,16 +88,34 @@ pub const Snapshot = struct {
     dependencies: ?Dependencies,
     origin: i64,
     duration_ns: i64,
+    fn candidateCount(owner: *const Owner) usize {
+        if (owner.reader.track.codec != .avc or owner.registry != null) return 0;
+        var count: usize = 0;
+        for (owner.reader.packets) |packet| count += @intFromBool(packet.sync);
+        return count;
+    }
     pub fn storageBytes(owner: *const Owner) usize {
         var bytes = std.mem.sliceAsBytes(owner.hevc_predecessors).len +| std.mem.sliceAsBytes(owner.timeline.entries).len +| std.mem.sliceAsBytes(owner.timeline.maxima).len;
         if (owner.transport) |map| bytes +|= std.mem.sliceAsBytes(map.nals).len +| std.mem.sliceAsBytes(map.runs).len;
         if (owner.registry) |registry| bytes +|= video.h264_dynamic.Snapshot.storageBytes(registry);
         if (owner.logical) |index| bytes +|= std.mem.sliceAsBytes(index.pictures).len;
         if (owner.dependencies) |deps| bytes +|= std.mem.sliceAsBytes(deps.ids).len +| std.mem.sliceAsBytes(deps.maxima).len;
-        return bytes;
+        return bytes +| candidateCount(owner) *| @sizeOf(video.decode_plan.SeekCache.Candidate);
     }
     pub fn copy(a: std.mem.Allocator, owner: *const Owner) !Snapshot {
         var result: Snapshot = .{ .hevc_predecessors = try a.dupe(usize, owner.hevc_predecessors), .timeline = owner.timeline, .logical = owner.logical, .dependencies = owner.dependencies, .origin = owner.origin, .duration_ns = try owner.durationNs() };
+        if (owner.reader.track.codec == .avc and owner.registry == null) {
+            const candidates = try a.alloc(video.decode_plan.SeekCache.Candidate, candidateCount(owner));
+            var n: usize = 0;
+            for (owner.reader.packets, 0..) |packet, i| {
+                if (i % 256 == 0) try owner.reader.input.control.check();
+                if (packet.sync) {
+                    candidates[n] = .{ .packet = i };
+                    n += 1;
+                }
+            }
+            result.static_candidates = candidates;
+        }
         if (owner.transport) |map| result.transport = try map.copy(a);
         if (owner.registry) |registry| result.registry = try video.h264_dynamic.Snapshot.copy(a, registry);
         result.timeline.entries = try a.dupe(@typeInfo(@TypeOf(owner.timeline.entries)).pointer.child, owner.timeline.entries);
@@ -212,7 +232,8 @@ pub const Owner = struct {
         options.decode.max_dependency_packets = limits.max_dependency_packets;
         const registry = if (snapshot.registry) |*shared| try shared.bind(a, reader, options.decode) else null;
         errdefer if (registry) |session| session.deinit();
-        const seek_cache = if (registry) |session| registrySeekCache(a, reader, session) else if (reader.track.codec == .avc) video.decode_plan.SeekCache.forPage(a, reader, &.{}) else null;
+        var seek_cache = if (registry) |session| registrySeekCache(a, reader, session) else if (reader.track.codec == .avc) video.decode_plan.SeekCache.forPage(a, reader, &.{}) else null;
+        if (seek_cache) |*cache| cache.candidates = snapshot.static_candidates;
         return .{ .hevc_predecessors = snapshot.hevc_predecessors, .borrowed_planning = true, .duration_ns = snapshot.duration_ns, .metadata_reservation = .{}, .dependencies = snapshot.dependencies, .timeline = snapshot.timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .logical = logical, .registry = registry, .origin = snapshot.origin, .pool = pool, .limits = limits };
     }
     pub fn deinit(self: *Owner) void {

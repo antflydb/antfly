@@ -948,6 +948,12 @@ pub const Runner = struct {
                 var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, reader, &self.pool, self.request.limits);
                 defer owner.deinit();
                 if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.rememberPlanned(std.heap.smp_allocator, key, .{ .mp4 = reader.* }, admission, .{ .mp4 = &owner });
+                // Prime the same lazy restart directory the next page will use.
+                const published = if (identity != null and self.request.index_cache != null and owner.seek_cache != null and owner.registry == null) self.request.index_cache.?.get(identity.?) else null;
+                defer if (published) |entry| self.request.index_cache.?.release(entry);
+                if (published) |entry| if (entry.mp4_plan) |plan| {
+                    owner.seek_cache.?.candidates = plan.static_candidates;
+                };
                 if (build) |lease| lease.deinit();
                 build = null;
                 try self.videoWindows(bytes, reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);

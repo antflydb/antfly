@@ -25,6 +25,8 @@ presented picture at or after each one-second target, uniformly cap targets
 at 32, and emit a repeated selection once. MP4 edit bounds apply before
 sampling, and prompt timestamps are relative to the content start. When an
 edit starts mid-frame, the picture already on screen supplies the zero-time target.
+When an AV1 sample contains multiple coded frames, NVDEC receives them
+individually. The first visible output at the selected timestamp supplies the frame.
 
 On CUDA devices with compute capability 8.0 or newer, 16×16 video patches
 with zero mean and unit standard deviation use the same bicubic RGB8 resize
@@ -33,9 +35,11 @@ to select bilinear video resizing on both routes. The image resize setting
 applies to still images. The CUDA resize writes one matrix row per patch,
 with channel-major pixels for the GGUF projector.
 
-Eligible BF16 projector weights convert to F16 in their existing device
-allocation. When residual GEMM scratch exceeds the device memory budget,
-the projector uses the tiled kernel with F32 activations.
+With lossless F16 conversion enabled, eligible BF16 projector weights convert
+in their existing device allocation. In residual precision mode, F16 weights
+use the tiled kernel with F32 activations so large finite inputs keep their
+exponent range. BF16 residual GEMMs also use the tiled fallback when their
+scratch exceeds the device memory budget.
 
 Three rotated comparison rounds put the seven text/image/audio cases within
 1.9% of llama.cpp median latency; video was 15.4% faster. Image and 1-second

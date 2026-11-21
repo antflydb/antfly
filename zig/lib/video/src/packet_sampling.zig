@@ -20,6 +20,7 @@ const h264 = @import("h264.zig");
 const h264_pictures = @import("h264_pictures.zig");
 const sampling_mod = @import("sampling.zig");
 
+pub const Av1FrameUnits = @import("codecs/av1_headers.zig").FrameUnits;
 pub const Sampling = union(enum) { reference, timestamps: sampling_mod.TimestampPolicy, source_timestamps: sampling_mod.TimestampPolicy, gemma4 };
 pub const gemma4_max_input_bytes = 256 * 1024 * 1024;
 pub const gemma4_max_frames = (sampling_mod.TimestampPolicy{}).max_frames;
@@ -44,16 +45,11 @@ pub fn gemma4Av1Packets(a: std.mem.Allocator, reader: *media.mp4.Reader) !Gemma4
     return gemma4Av1FromCounts(a, reader, counts);
 }
 
-pub fn gemma4Av1FromCounts(a: std.mem.Allocator, reader: *media.mp4.Reader, counts: []const usize) !Gemma4Plan {
+pub fn gemma4Av1FromCounts(_: std.mem.Allocator, reader: *media.mp4.Reader, counts: []const usize) !Gemma4Plan {
     if (counts.len != reader.packets.len) return error.InvalidVideoIndex;
-    var visible = try std.DynamicBitSetUnmanaged.initEmpty(a, reader.packets.len);
-    defer visible.deinit(a);
-    for (counts, 0..) |count, i| switch (count) {
-        0 => {},
-        1 => visible.set(i),
-        else => return error.UnsupportedVideoFormat,
-    };
-    return planPictures(reader.track.timescale, reader.track.edit, reader.packets, null, visible, reader.input.control);
+    // Outputs in one sample share its clock. Stable tie breaking selects
+    // its first visible ordinal, including show_existing_frame.
+    return planPictures(reader.track.timescale, reader.track.edit, reader.packets, null, counts, reader.input.control);
 }
 
 pub fn av1OutputCounts(a: std.mem.Allocator, reader: *media.mp4.Reader) ![]usize {
@@ -118,7 +114,7 @@ fn pictureTime(pic: anytype, samples: ?[]const media.webm.SourceTimeline.Sample)
     return .{ .pts = pic.pts, .duration = pic.duration };
 }
 
-fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, samples: ?[]const media.webm.SourceTimeline.Sample, visible: ?std.DynamicBitSetUnmanaged, control: media.source.Control) !Gemma4Plan {
+fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, samples: ?[]const media.webm.SourceTimeline.Sample, visible: ?[]const usize, control: media.source.Control) !Gemma4Plan {
     try control.check();
     if (scale == 0 or pictures.len == 0) return error.EmptyVideo;
     var origin = edit.source_start;
@@ -127,7 +123,7 @@ fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, sample
         var end: i128 = std.math.minInt(i64);
         for (pictures, 0..) |pic, i| {
             if (i % 256 == 0) try control.check();
-            if (visible) |mask| if (!mask.isSet(i)) continue;
+            if (visible) |mask| if (mask[i] == 0) continue;
             const time = try pictureTime(pic, samples);
             origin = @min(origin, time.pts);
             end = @max(end, @as(i128, time.pts) + (time.duration orelse 0));
@@ -142,7 +138,7 @@ fn planPictures(scale: u32, edit: media.timeline.Edit, pictures: anytype, sample
     var held_pts: i64 = std.math.minInt(i64);
     for (pictures, 0..) |pic, id| {
         if (id % 256 == 0) try control.check();
-        if (visible) |mask| if (!mask.isSet(id)) continue;
+        if (visible) |mask| if (mask[id] == 0) continue;
         const time = try pictureTime(pic, samples);
         const pts = time.pts;
         if (pts < origin and @as(i128, pts) + (time.duration orelse 0) > origin and (held == null or pts > held_pts or (pts == held_pts and packetId(pic, id) < packetId(pictures[held.?], held.?)))) {

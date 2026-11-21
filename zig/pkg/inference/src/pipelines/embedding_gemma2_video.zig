@@ -976,37 +976,76 @@ pub fn inspectPixels(bytes: []const u8, control: Control) !u64 {
     return inspectPixelsWithSampling(bytes, control, .reference);
 }
 pub fn inspectPixelsWithSampling(bytes: []const u8, control: Control, sampling: Sampling) !u64 {
-    var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = std.heap.page_allocator, .limit = 512 * 1024 * 1024 };
-    defer std.debug.assert(bounded.live == 0);
-    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
-    defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
-    const plan = inspectPlan(bounded.allocator(), bytes, control, sampling, &pool, false) catch |err| {
-        // Executor-contract validation happens before backend acquisition. It
-        // must count supported CUDA MP4 pixels without requiring the portable
-        // AVC/MJPEG decoder to understand HEVC or AV1. Execution still chooses
-        // and validates its own backend; timestamp-window APIs stay portable.
-        if (err == error.UnsupportedVideoCodec and sampling == .reference) {
-            const adapter = control.imageWorkControl();
-            const clip = try @import("../ops/cuda/video.zig").inspectEmbedding(bounded.allocator(), bytes, .{ .context = adapter.context, .check_fn = adapter.check_fn });
-            if (clip.codec == .hevc or clip.codec == .av1) return @as(u64, clip.width) * clip.height * clip.frames;
-        }
-        return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
-    };
-    if (sampling == .reference) {
-        // Readers choose the first track supported by their route. A portable
-        // AVC/MJPEG track can follow a larger HEVC/AV1 track selected by CUDA.
-        // Charge the maximum across both viable routes before backend selection.
-        const adapter = control.imageWorkControl();
-        const clip = @import("../ops/cuda/video.zig").inspectEmbedding(bounded.allocator(), bytes, .{ .context = adapter.context, .check_fn = adapter.check_fn }) catch |err| {
-            try control.check();
-            if (err == error.OutOfMemory) return if (bounded.denied) error.MemoryBudgetExceeded else err;
-            // CUDA has a narrower envelope than portable decoding (including
-            // WebM/TS, MJPEG, and higher-depth AVC). Execution validates its route.
-            return plan.pixels;
-        };
-        return @max(plan.pixels, @as(u64, clip.width) * clip.height * clip.frames);
+    var inspection = PixelInspection{};
+    defer inspection.deinit();
+    return inspection.inspect(bytes, control, sampling);
+}
+
+/// Request-owned. Keep this object at a stable address until the packet reader
+/// and the allocator it borrows are released. Encoded bytes are caller-owned.
+pub const PixelInspection = struct {
+    pub const limit = 512 * 1024 * 1024;
+    memory: @import("../runtime/bounded_allocator.zig").BoundedAllocator = .{ .backing = std.heap.page_allocator, .limit = limit },
+    prepared: ?@import("../ops/cuda/video.zig").PreparedEmbedding = null,
+    cuda_error: ?anyerror = null,
+    bytes: []const u8 = &.{},
+    pixels: u64 = 0,
+
+    pub fn deinit(self: *PixelInspection) void {
+        if (self.prepared) |*prepared| prepared.deinit();
+        std.debug.assert(self.memory.live == 0);
+        self.* = .{};
     }
-    return plan.pixels;
+
+    pub fn inspect(self: *PixelInspection, bytes: []const u8, control: Control, sampling: Sampling) !u64 {
+        std.debug.assert(self.prepared == null and self.bytes.len == 0);
+        self.bytes = bytes;
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = limit } };
+        defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+        const portable = inspectPlan(self.memory.allocator(), bytes, control, sampling, &pool, false);
+        var missing_portable = false;
+        const pixels = if (portable) |plan| plan.pixels else |err| blk: {
+            if (err != error.UnsupportedVideoCodec or sampling != .reference)
+                return if ((err == error.OutOfMemory and self.memory.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
+            missing_portable = true;
+            break :blk 0;
+        };
+        self.pixels = pixels;
+        if (sampling != .reference) return pixels;
+        const adapter = control.imageWorkControl();
+        self.prepared = @as(@import("../ops/cuda/video.zig").PreparedEmbedding, undefined);
+        self.prepared.?.init(self.memory.allocator(), bytes, .{ .context = adapter.context, .check_fn = adapter.check_fn }) catch |err| {
+            self.prepared = null;
+            self.cuda_error = err;
+            try control.check();
+            if (err == error.OutOfMemory) return if (self.memory.denied) error.MemoryBudgetExceeded else err;
+            if (missing_portable) return err;
+            return pixels;
+        };
+        // The executor supplies its current deadline when binding the reader.
+        self.prepared.?.source.control = .{};
+        const clip = self.prepared.?.inspection;
+        if (missing_portable and clip.codec != .hevc and clip.codec != .av1) return error.UnsupportedVideoCodec;
+        self.pixels = @max(pixels, @as(u64, clip.width) * clip.height * clip.frames);
+        return self.pixels;
+    }
+
+    pub fn matches(self: *const PixelInspection, bytes: []const u8) bool {
+        return self.bytes.ptr == bytes.ptr and self.bytes.len == bytes.len;
+    }
+};
+
+test "embeddinggemma2 video pixel admission retains the execution packet reader" {
+    const bytes = @embedFile("../testdata/video/codecs/av1.mp4");
+    var inspection = PixelInspection{};
+    defer inspection.deinit();
+    const pixels = try inspection.inspect(bytes, .{}, .reference);
+    const prepared = &inspection.prepared.?;
+    try std.testing.expect(inspection.matches(bytes));
+    try std.testing.expect(!inspection.matches(bytes[1..]));
+    try std.testing.expect(prepared.reader.input == &prepared.source);
+    try std.testing.expect(inspection.memory.live >= std.mem.sliceAsBytes(prepared.reader.packets).len);
+    try std.testing.expectEqual(@as(u64, prepared.inspection.frames) * prepared.inspection.width * prepared.inspection.height, pixels);
 }
 
 test "embeddinggemma2 video contract pixel inspection admits CUDA MP4 codecs without portable decoding" {

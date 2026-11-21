@@ -194,7 +194,7 @@ pub fn attachPrefixes(window: *Window, prefixes: []const PacketPrefix, options: 
         offset = try std.math.add(u64, offset, total);
     }
     const overlay = try a.create(ParameterOverlay);
-    overlay.* = .{ .allocator = a, .original = reader.input.view(a, options.stream.admission_pool, options.stream.control), .bytes = bytes, .entries = entries, .reservation = reservation, .input = .{ .allocator = a, .identity = reader.input.identity, .limits = reader.input.limits, .control = options.stream.control, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .context = overlay, .read_at = ParameterOverlay.read, .length = offset } } } };
+    overlay.* = .{ .allocator = a, .original = reader.input.view(a, options.stream.admission_pool, options.stream.control), .bytes = bytes, .entries = entries, .reservation = reservation, .input = .{ .allocator = a, .identity = reader.input.identity, .limits = reader.input.limits, .control = options.stream.control, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .concurrent = true, .context = overlay, .read_at = ParameterOverlay.read, .length = offset } } } };
     for (entries) |entry| {
         reader.packets[entry.index].offset = entry.start;
         reader.packets[entry.index].size = @intCast(entry.prefix.len + entry.packet.size);
@@ -225,7 +225,7 @@ pub fn clone(a: std.mem.Allocator, original: *const Window, options: Options) !W
     const view = try a.create(Segmented);
     // No fallible work between acquiring references and publishing their owner.
     for (owners) |owner| owner.retain();
-    view.* = .{ .allocator = a, .spans = spans, .owners = owners, .reservation = view_reservation, .input = .{ .allocator = a, .identity = identity, .control = options.stream.control, .limits = options.stream.source_limits, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .context = view, .read_at = Segmented.readAt, .borrow_at = Segmented.borrowAt, .length = segmented.input.length() } } } };
+    view.* = .{ .allocator = a, .spans = spans, .owners = owners, .reservation = view_reservation, .input = .{ .allocator = a, .identity = identity, .control = options.stream.control, .limits = options.stream.source_limits, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .concurrent = true, .context = view, .read_at = Segmented.readAt, .borrow_at = Segmented.borrowAt, .length = segmented.input.length() } } } };
     var reader = original.reader;
     reader.allocator = a;
     reader.input = &view.input;
@@ -407,7 +407,7 @@ pub const Builder = struct {
         self.owners.appendAssumeCapacity(segment.backing);
         self.reader.packets = self.packets.items;
         self.input.control = options.stream.control;
-        self.input.storage = .{ .range = .{ .context = self, .read_at = read, .borrow_at = borrowAt, .length = self.bytes } };
+        self.input.storage = .{ .range = .{ .concurrent = true, .context = self, .read_at = read, .borrow_at = borrowAt, .length = self.bytes } };
     }
     fn borrowAt(raw: *anyopaque, offset: u64, size: usize, control: media.source.Control) !?[]const u8 {
         const self: *Builder = @ptrCast(@alignCast(raw));
@@ -503,7 +503,7 @@ pub fn join(a: std.mem.Allocator, identity: []const u8, segments: []const media.
         }
     }
     for (owners) |owner| owner.retain();
-    view.* = .{ .allocator = a, .spans = spans, .owners = owners, .reservation = view_reservation, .input = .{ .allocator = a, .identity = owned_identity, .control = options.stream.control, .limits = options.stream.source_limits, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .context = view, .read_at = Segmented.readAt, .borrow_at = Segmented.borrowAt, .length = size } } } };
+    view.* = .{ .allocator = a, .spans = spans, .owners = owners, .reservation = view_reservation, .input = .{ .allocator = a, .identity = owned_identity, .control = options.stream.control, .limits = options.stream.source_limits, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .concurrent = true, .context = view, .read_at = Segmented.readAt, .borrow_at = Segmented.borrowAt, .length = size } } } };
     return .{ .snapshot = null, .segmented = view, .epoch = first.epoch, .identity = owned_identity, .identity_reservation = identity_reservation, .reader = .{ .allocator = a, .input = &view.input, .metadata = .{ .bytes = &.{}, .source = null }, .track = first.reader.track, .packets = packets, .index_reservation = reservation, .limits = .{} } };
 }
 

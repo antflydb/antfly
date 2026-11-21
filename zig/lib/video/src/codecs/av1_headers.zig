@@ -26,6 +26,64 @@ comptime {
 }
 const Geometry = @import("vp9_header.zig").Geometry;
 pub const Options = struct { max_pixels: usize, operating_point: u5 = 0, all_layers: bool = true, control: media.source.Control = .{} };
+const Obu = struct {
+    kind: u4,
+    temporal: u3 = 0,
+    spatial: u2 = 0,
+    payload: []const u8,
+
+    fn read(bytes: []const u8, position: *usize) !Obu {
+        const tag = bytes[position.*];
+        position.* += 1;
+        if (tag & 0x81 != 0) return error.InvalidVideoData;
+        var obu = Obu{ .kind = @intCast((tag >> 3) & 15), .payload = undefined };
+        if (tag & 4 != 0) {
+            if (position.* == bytes.len) return error.InvalidVideoData;
+            const extension = bytes[position.*];
+            position.* += 1;
+            if (extension & 7 != 0) return error.InvalidVideoData;
+            obu.temporal = @intCast(extension >> 5);
+            obu.spatial = @intCast((extension >> 3) & 3);
+        }
+        const size = if (tag & 2 != 0) try leb(bytes, position) else bytes.len - position.*;
+        if (size > bytes.len - position.*) return error.InvalidVideoData;
+        obu.payload = bytes[position.*..][0..size];
+        position.* += size;
+        return obu;
+    }
+};
+
+/// Split a low-overhead sample into borrowed chunks for parsers that accept
+/// one coded frame per submission. Keep tile groups and redundant headers
+/// with their frame, and sequence headers and delimiters with the next frame.
+pub const FrameUnits = struct {
+    bytes: []const u8,
+    pub fn next(self: *FrameUnits, control: media.source.Control) !?[]const u8 {
+        if (self.bytes.len == 0) return null;
+        var pos: usize = 0;
+        var has_frame = false;
+        while (pos < self.bytes.len) {
+            try control.check();
+            const start = pos;
+            const obu = try Obu.read(self.bytes, &pos);
+            switch (obu.kind) {
+                1, 2, 3, 6 => {
+                    if (has_frame) {
+                        pos = start;
+                        break;
+                    }
+                    has_frame = obu.kind == 3 or obu.kind == 6;
+                },
+                4, 7 => has_frame = true,
+                else => {},
+            }
+        }
+        const unit = self.bytes[0..pos];
+        self.bytes = self.bytes[pos..];
+        return unit;
+    }
+};
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     options: Options,
@@ -85,24 +143,11 @@ pub const Session = struct {
         while (position < bytes.len) {
             const obu_start = position;
             try self.options.control.check();
-            const tag = bytes[position];
-            position += 1;
-            if (tag & 0x81 != 0) return error.InvalidVideoData;
-            const kind = (tag >> 3) & 15;
-            var temporal: u3 = 0;
-            var spatial: u2 = 0;
-            if (tag & 4 != 0) {
-                if (position == bytes.len) return error.InvalidVideoData;
-                const extension = bytes[position];
-                position += 1;
-                if (extension & 7 != 0) return error.InvalidVideoData;
-                temporal = @intCast(extension >> 5);
-                spatial = @intCast((extension >> 3) & 3);
-            }
-            const size = if (tag & 2 != 0) try leb(bytes, &position) else bytes.len - position;
-            if (size > bytes.len - position) return error.InvalidVideoData;
-            const payload = bytes[position..][0..size];
-            position += size;
+            const obu = try Obu.read(bytes, &position);
+            const kind = obu.kind;
+            const temporal = obu.temporal;
+            const spatial = obu.spatial;
+            const payload = obu.payload;
             if (self.have_sequence and kind != 1 and kind != 2 and self.context.operating_point_idc != 0) {
                 const idc = self.context.operating_point_idc;
                 if (idc & (@as(u32, 1) << temporal) == 0 or idc & (@as(u32, 1) << (@as(u5, spatial) + 8)) == 0) continue;

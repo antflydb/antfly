@@ -25951,6 +25951,7 @@ pub const Node = struct {
         for (raw_groups, groups) |raw, *group| {
             group.* = try parseEmbeddingGroup(self, a, manifest, raw, &retained, &budget, .{ .io = io, .control = control }, &.{});
             try grouped.validateGroup(group.*, options);
+            try retained.video_inspections.prepare(self, a, group, control);
             try request_budget.add(try validateEmbeddingGroupContract(self, contract, group.*, groups.len, control));
             try decoded_budget.addGroup(group.*);
         }
@@ -25966,8 +25967,19 @@ pub const Node = struct {
 
     // All frontends execute ordered content against the same acquired model.
     // Native callers retain their revision-fenced handle through this call.
-    fn embedGroupsOnLoadedModel(self: *Node, out: std.mem.Allocator, loaded: *model_manager_mod.LoadedModel, groups: []const @import("../pipelines/embedding_gemma2.zig").Group, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl) ![][]f32 {
+    fn embedGroupsOnLoadedModel(self: *Node, out: std.mem.Allocator, loaded: *model_manager_mod.LoadedModel, input_groups: []const @import("../pipelines/embedding_gemma2.zig").Group, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl) ![][]f32 {
         const grouped = @import("../pipelines/embedding_gemma2.zig");
+        var inspections = GroupVideoInspections{};
+        defer inspections.deinit(out);
+        var copied: ?[]grouped.Group = null;
+        defer if (copied) |values| out.free(values);
+        for (input_groups, 0..) |group, index| {
+            if (group.video_inspection == null and group.content.len == 1 and group.content[0] == .video) {
+                if (copied == null) copied = try out.dupe(grouped.Group, input_groups);
+                try inspections.prepare(self, out, &copied.?[index], control);
+            }
+        }
+        const groups = copied orelse input_groups;
         var request_budget: EmbeddingGroupRequestBudget = .{};
         var frame_cache = grouped.FrameCache{ .allocator = grouped.workspaceBackingAllocator(loaded.session.backend()), .session = loaded.session };
         defer frame_cache.deinit();
@@ -26055,7 +26067,7 @@ pub const Node = struct {
                     groups[index] = null;
                     break :preflight;
                 };
-                const shape = validateEmbeddingGroupContract(self, contract, groups[index].?, groups.len, control) catch |err| {
+                const shape = prepareEmbeddingGroupContract(self, a, &retained.video_inspections, contract, &groups[index].?, groups.len, control) catch |err| {
                     if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err) or err == error.ResourceTemporarilyUnavailable or err == error.MemoryBudgetExceeded or err == error.ImageTooLarge) return err;
                     try errors.append(a, embedItemFailure(index, err, "input"));
                     groups[index] = null;
@@ -39509,10 +39521,38 @@ const ParsedBinaryEmbedInput = struct {
     owned: bool = true,
 };
 
+const GroupVideoInspections = struct {
+    const Inspection = @import("../pipelines/embedding_gemma2_video.zig").PixelInspection;
+    const Owned = struct { inspection: Inspection = .{}, lease: @import("../runtime/tier/memory.zig").AdmissionLease };
+    owned: std.ArrayList(*Owned) = .empty,
+
+    fn prepare(self: *GroupVideoInspections, node: *Node, a: std.mem.Allocator, group: *@import("../pipelines/embedding_gemma2.zig").Group, control: InferenceExecutionControl) !void {
+        if (group.video_inspection != null or group.content.len != 1 or group.content[0] != .video) return;
+        const owner = try a.create(Owned);
+        errdefer a.destroy(owner);
+        owner.* = .{ .lease = try node.model_manager.admitHostPreflight(Inspection.limit) };
+        errdefer owner.lease.release();
+        errdefer owner.inspection.deinit();
+        _ = try owner.inspection.inspect(group.content[0].video, control, .reference);
+        try owner.lease.retain(.{ .host_scratch_bytes = owner.inspection.memory.live });
+        try self.owned.append(a, owner);
+        group.video_inspection = &owner.inspection;
+    }
+    fn deinit(self: *GroupVideoInspections, a: std.mem.Allocator) void {
+        for (self.owned.items) |owner| {
+            owner.inspection.deinit();
+            owner.lease.release();
+            a.destroy(owner);
+        }
+        self.owned.deinit(a);
+    }
+};
+
 const ParsedDenseEmbedInputs = struct {
     texts: std.ArrayListUnmanaged(ParsedTextEmbedInput) = .empty,
     images: std.ArrayListUnmanaged(ParsedBinaryEmbedInput) = .empty,
     audio: std.ArrayListUnmanaged(ParsedBinaryEmbedInput) = .empty,
+    video_inspections: GroupVideoInspections = .{},
     videos: std.ArrayListUnmanaged(ParsedBinaryEmbedInput) = .empty,
     groups: std.ArrayListUnmanaged(ParsedDenseEmbedGroup) = .empty,
     allow_video: bool = false,
@@ -39520,6 +39560,7 @@ const ParsedDenseEmbedInputs = struct {
     total_count: usize = 0,
 
     pub fn deinit(self: *ParsedDenseEmbedInputs, allocator: std.mem.Allocator) void {
+        self.video_inspections.deinit(allocator);
         for (self.groups.items) |group| allocator.free(group.parts);
         self.groups.deinit(allocator);
         self.texts.deinit(allocator);
@@ -40875,6 +40916,11 @@ const EmbeddingGroupRequestBudget = struct {
     }
 };
 
+fn prepareEmbeddingGroupContract(node: *Node, a: std.mem.Allocator, inspections: *GroupVideoInspections, contract: ResolvedInferenceExecutorContract, group: *@import("../pipelines/embedding_gemma2.zig").Group, count: usize, control: InferenceExecutionControl) !InferenceExecutorInvocationShape {
+    try inspections.prepare(node, a, group, control);
+    return validateEmbeddingGroupContract(node, contract, group.*, count, control);
+}
+
 fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecutorContract, group: @import("../pipelines/embedding_gemma2.zig").Group, count: usize, control: InferenceExecutionControl) !InferenceExecutorInvocationShape {
     var text_bytes: usize = if (group.title) |title| title.len else 0;
     var media_bytes: usize = 0;
@@ -40907,14 +40953,21 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
         },
         inline .video, .sampled_video => |payload| {
             try control.check();
-            var preflight = try node.model_manager.admitHostPreflight(512 * 1024 * 1024);
-            defer preflight.release();
             const bytes = if (@TypeOf(payload) == @import("../pipelines/embedding_gemma2.zig").SampledVideo) payload.bytes else payload;
             const sampling: @import("../pipelines/embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == @import("../pipelines/embedding_gemma2.zig").SampledVideo) payload.sampling else .reference;
             media_parts += 1;
             media_bytes = std.math.add(usize, media_bytes, bytes.len) catch return error.InferenceEncodedBytesExceeded;
             has_video = true;
-            pixels = std.math.add(u64, pixels, try @import("../pipelines/embedding_gemma2_video.zig").inspectPixelsWithSampling(bytes, control, sampling)) catch return error.InferenceDecodedPixelsExceeded;
+            const charge = charge: {
+                if (group.content.len == 1 and part == .video) if (group.video_inspection) |inspection| {
+                    if (!inspection.matches(bytes)) return error.InvalidVideoReaderSelection;
+                    break :charge inspection.pixels;
+                };
+                var preflight = try node.model_manager.admitHostPreflight(512 * 1024 * 1024);
+                defer preflight.release();
+                break :charge try @import("../pipelines/embedding_gemma2_video.zig").inspectPixelsWithSampling(bytes, control, sampling);
+            };
+            pixels = std.math.add(u64, pixels, charge) catch return error.InferenceDecodedPixelsExceeded;
         },
         .pcm => |pcm| {
             media_parts += 1;

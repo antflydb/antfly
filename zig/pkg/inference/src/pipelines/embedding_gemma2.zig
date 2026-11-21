@@ -345,7 +345,7 @@ fn partBytes(part: Part) []const u8 {
         inline else => |bytes| bytes,
     };
 }
-pub const Group = struct { title: ?[]const u8 = null, content: []const Part };
+pub const Group = struct { video_inspection: ?*const @import("embedding_gemma2_video.zig").PixelInspection = null, title: ?[]const u8 = null, content: []const Part };
 pub const MediaTimings = struct {
     inspection_ns: u64 = 0,
     media_prepare_ns: u64 = 0,
@@ -932,7 +932,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     try validateGroupContent(group, options, session.backend() == .cuda);
     if (@import("build_options").enable_cuda and session.backend() == .cuda) {
         try validateCudaGroup(group, options);
-        if (group.content.len == 1 and group.content[0] == .video) return embedVideo(a, session, tokenizer, group.content[0].video, options, lock, control);
+        if (group.content.len == 1 and group.content[0] == .video) return embedVideo(a, session, tokenizer, group.content[0].video, group.video_inspection, options, lock, control);
         if (!singleImageGroup(group) or !options.resident_images) return embedCudaGroup(a, session, tokenizer, group, options, lock, control);
     }
     if (options.video_ahead) |ahead| {
@@ -2136,7 +2136,7 @@ fn packCompactPreparedRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows
 
 /// One clip produces one pooled vector. All decoded pixels, projected frame rows,
 /// and encoder inputs remain on CUDA; only the final requested vector is read back.
-fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, bytes: []const u8, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
+fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, bytes: []const u8, cached: ?*const @import("embedding_gemma2_video.zig").PixelInspection, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
     if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.UnsupportedVideoBackend;
     if (session.backend() != .cuda) return error.UnsupportedVideoBackend;
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
@@ -2145,7 +2145,12 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     try effective.check();
     // Bound container metadata before allocating it, without charging the
     // compressed MP4 as device input or opening the decoder before admission.
-    var host_permit = try session.admitHostPreprocess(try std.math.add(usize, bytes.len, 128 * 1024 * 1024));
+    const shared = if (cached) |inspection| blk: {
+        if (!inspection.matches(bytes)) return error.InvalidVideoReaderSelection;
+        if (inspection.prepared) |*prepared| break :blk prepared;
+        return videoInputError(inspection.cuda_error orelse error.InvalidVideoReaderSelection);
+    } else null;
+    var host_permit = try session.admitHostPreprocess(if (shared != null) bytes.len else try std.math.add(usize, bytes.len, 128 * 1024 * 1024));
     defer host_permit.deinit();
     const Check = struct {
         fn check(raw: ?*const anyopaque) anyerror!void {
@@ -2153,13 +2158,16 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
             try c.check();
         }
     };
-    var prepared: @import("../ops/cuda/video.zig").PreparedEmbedding = undefined;
-    prepared.init(a, bytes, .{ .context = &effective, .check_fn = Check.check }) catch |err| return videoInputError(err);
-    var prepared_live = true;
-    defer if (prepared_live) prepared.deinit();
+    var local: @import("../ops/cuda/video.zig").PreparedEmbedding = undefined;
+    const prepared = shared orelse blk: {
+        local.init(a, bytes, .{ .context = &effective, .check_fn = Check.check }) catch |err| return videoInputError(err);
+        break :blk &local;
+    };
+    var local_live = shared == null;
+    defer if (local_live) local.deinit();
     const inspected = prepared.inspection;
     const retained = prepared.retainedBytes();
-    try host_permit.retainHostBytes(retained);
+    if (local_live) try host_permit.retainHostBytes(retained);
     var request = try cudaVideoRequest(inspected, bytes.len, options);
     request.pre_admitted_host_bytes = retained;
     var execution_waiter = Scheduler.Waiter{};
@@ -2191,14 +2199,16 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     const before = MediaTransferSnapshot.init(cb);
     defer observeResidentTransfers(cb, before, options);
     const started = mediaNow();
-    var projected = projector.encodeEmbeddingGemma2VideoResident(cb, a, &prepared, options.max_tokens) catch |err| {
+    var projected = projector.encodeEmbeddingGemma2VideoResident(cb, a, prepared, options.max_tokens) catch |err| {
         std.log.warn("embeddinggemma2 CUDA video failed phase=decode_projection error={s}", .{@errorName(err)});
         return videoInputError(err);
     };
     defer projected.deinit();
-    prepared.deinit();
-    prepared_live = false;
-    try host_permit.retainHostBytes(bytes.len);
+    if (local_live) {
+        local.deinit();
+        local_live = false;
+        try host_permit.retainHostBytes(bytes.len);
+    }
     if (options.timings) |t| {
         t.vision_ns += mediaNow() - started;
         t.resident_cohorts += 1;

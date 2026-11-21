@@ -82,6 +82,40 @@ pub const Plan = struct {
 /// Cached nearest verified IDR for immutable packet metadata and payloads.
 /// Payload leases remain plan-owned; this cache retains indexes only.
 pub const SeekCache = struct {
+    /// Sorted immutable sync-sample directory. Only the result of inspecting
+    /// content is published. Failed or canceled reads remain retryable.
+    pub const Candidate = struct {
+        packet: usize,
+        verified: std.atomic.Value(Status) = .init(.unknown),
+
+        const Status = enum(u32) { unknown, probing, idr, rejected };
+
+        fn isIdr(self: *Candidate, builder: *Builder) !bool {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            while (true) switch (self.verified.load(.acquire)) {
+                .idr => return true,
+                .rejected => return false,
+                .probing => {
+                    try builder.reader.input.control.check();
+                    try std.Io.futexWaitTimeout(io, Status, &self.verified.raw, .probing, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } });
+                },
+                .unknown => {
+                    if (self.verified.cmpxchgStrong(.unknown, .probing, .acq_rel, .acquire) != null) continue;
+                    var status: Status = .unknown;
+                    defer {
+                        self.verified.store(status, .release);
+                        std.Io.futexWake(io, Status, &self.verified.raw, std.math.maxInt(u32));
+                    }
+                    if (builder.probe_candidates >= builder.options.max_probe_candidates or builder.reader.packets[self.packet].size > builder.options.max_packet_bytes) return error.ResourceLimitExceeded;
+                    builder.probe_candidates += 1;
+                    const idr = try builder.probe(self.packet);
+                    status = if (idr) .idr else .rejected;
+                    return idr;
+                },
+            };
+        }
+    };
+    candidates: ?[]Candidate = null,
     allocator: std.mem.Allocator,
     nearest: []usize,
     stamp: Stamp,
@@ -192,6 +226,28 @@ const Builder = struct {
         if (self.options.seek_cache) |cache| {
             if (cache.lookup(selected)) |anchor| return anchor;
         }
+        if (self.options.seek_cache) |cache| if (cache.candidates) |candidates| {
+            // Compare only immutable packet numbers, never copy a concurrently
+            // updated candidate during the binary search.
+            var lo: usize = 0;
+            var hi = candidates.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (candidates[mid].packet <= selected) lo = mid + 1 else hi = mid;
+            }
+            while (lo > 0) {
+                lo -= 1;
+                if (self.search_steps >= self.options.max_search_steps) return error.ResourceLimitExceeded;
+                self.search_steps += 1;
+                try self.reader.input.control.check();
+                const candidate = &candidates[lo];
+                if (!try candidate.isIdr(self)) continue;
+                cache.remember(candidate.packet, selected, candidate.packet);
+                return candidate.packet;
+            }
+            cache.remember(0, selected, 0);
+            return 0;
+        };
         while (true) {
             if (self.search_steps >= self.options.max_search_steps) return error.ResourceLimitExceeded;
             self.search_steps += 1;
@@ -257,13 +313,28 @@ pub fn create(allocator: std.mem.Allocator, reader: *media.mp4.Reader, selection
         if (index - first + 1 > options.max_run_packets) return error.ResourceLimitExceeded;
         if (runs.items.len != 0) {
             const last = &runs.items[runs.items.len - 1];
-            if ((first <= last.last or first - last.last - 1 <= options.merge_gap_packets) and index - last.first + 1 <= options.max_run_packets) {
+            if (first == last.first) {
                 last.last = index;
                 continue;
             }
         }
         try runs.append(allocator, .{ .first = first, .last = index });
     }
+    // First collect each restart's entire dependency interval. Only then can
+    // we bridge neighboring GOPs without splitting a later GOP across runs.
+    var kept: usize = 0;
+    for (runs.items) |run| {
+        if (kept != 0) {
+            const last = &runs.items[kept - 1];
+            if (run.first - last.last - 1 <= options.merge_gap_packets and run.last - last.first + 1 <= options.max_run_packets) {
+                last.last = run.last;
+                continue;
+            }
+        }
+        runs.items[kept] = run;
+        kept += 1;
+    }
+    runs.shrinkRetainingCapacity(kept);
     var submissions: usize = 0;
     for (runs.items) |run| submissions = std.math.add(usize, submissions, run.last - run.first + 1) catch return error.ResourceLimitExceeded;
     if (submissions > options.max_decode_packets) return error.ResourceLimitExceeded;

@@ -457,7 +457,12 @@ pub const Session = struct {
                             // with a complete I picture and an empty prediction DPB.
                             if (independent and slice_type % 5 != 2) return error.UnsupportedDynamicGeometry;
                             if (self.epochs.items.len != 0) self.epochs.items[self.epochs.items.len - 1].end = i;
-                            try self.epochs.ensureTotalCapacityPrecise(allocator, self.epochs.items.len + 1);
+                            // Grow amortized on normal clips. Under a strict admission
+                            // ceiling, retry with only the required epoch's storage.
+                            self.epochs.ensureUnusedCapacity(allocator, 1) catch {
+                                try self.epochs.ensureTotalCapacityPrecise(allocator, self.epochs.items.len + 1);
+                                self.budget.denied = false;
+                            };
                             self.epochs.appendAssumeCapacity(.{ .start = if (self.active == null) 0 else i, .end = self.reader.packets.len, .entry = index, .independent = independent, .max_refs = self.entries.items[index].config.max_refs });
                         }
                         const epoch = &self.epochs.items[self.epochs.items.len - 1];

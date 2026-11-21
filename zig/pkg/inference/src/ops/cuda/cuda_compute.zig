@@ -12495,7 +12495,7 @@ fn tryCublasLtF16Linear(
 }
 
 // Retain the activation's rounding residual when multiplying immutable
-// 16-bit projector weights. Each tensor-core product accumulates into F32.
+// BF16 projector weights. Each tensor-core product accumulates into F32.
 // Three BF16 terms recover approximately the original activation precision;
 // the two-term option is an explicit performance ablation. Decoder weights
 // retain their existing dispatch and training never enters this path.
@@ -12507,16 +12507,13 @@ fn tryCublasLtProjectorResidualLinear(
     rows: usize,
     in_dim: usize,
     out_dim: usize,
-    bf16: bool,
 ) !bool {
     const blas = &(self.cublaslt orelse return false);
     if (self.execution_scope != null or self.debug_cuda_graph_capture_active) return false;
-    if (bf16) {
-        if (!cudaCublasLtEnabled() or self.ctx.info.compute_major < 8) return false;
-    } else if (!canUseF16TensorCoreWeights(self)) return false;
+    if (!cudaCublasLtEnabled() or self.ctx.info.compute_major < 8) return false;
     const count = try checkedMul(rows, in_dim);
     if (input.dtype != .f32 or input.elem_count != count) return false;
-    const terms = if (bf16) self.gemma4_projector_residual_terms else 2;
+    const terms = self.gemma4_projector_residual_terms;
     const output_count = try checkedMul(rows, out_dim);
     const f32_bytes = try checkedMul(count, 4);
     const f16_bytes = try checkedMul(count, 2);
@@ -12535,42 +12532,28 @@ fn tryCublasLtProjectorResidualLinear(
     const correction = buffer_mod.DeviceBuffer{ .ptr = storage.ptr, .len = try checkedMul(output_count, 4) };
     const residual = buffer_mod.DeviceBuffer{ .ptr = storage.ptr + work_bytes, .len = f32_bytes };
     const low = buffer_mod.DeviceBuffer{ .ptr = storage.ptr + low_offset, .len = f16_bytes };
-    const high = if (bf16 and input.bf16_mirror.ptr != 0 and input.bf16_mirror.len >= f16_bytes) mirror: {
+    const high = if (input.bf16_mirror.ptr != 0 and input.bf16_mirror.len >= f16_bytes) mirror: {
         self.stats.bf16_cublaslt_activation_mirror_hits += 1;
         break :mirror input.bf16_mirror;
     } else staged: {
-        if (bf16) {
-            try self.kernels.launchF32ToBf16(&self.ctx, low, input.buffer, count);
-            self.stats.bf16_cublaslt_activation_staging_calls += 1;
-        } else {
-            try self.kernels.launchF32ToF16(&self.ctx, low, input.buffer, count);
-            self.stats.f16_cublaslt_activation_staging_calls += 1;
-        }
+        try self.kernels.launchF32ToBf16(&self.ctx, low, input.buffer, count);
+        self.stats.bf16_cublaslt_activation_staging_calls += 1;
         break :staged low;
     };
-    try self.scalar_clamp_kernel.widen16Bit(&self.ctx, high.ptr, rounded.ptr, count, bf16);
+    try self.scalar_clamp_kernel.widen16Bit(&self.ctx, high.ptr, rounded.ptr, count, true);
     try self.kernels.launchElementwiseF32(&self.ctx, residual, input.buffer, rounded, count, .subtract);
     const workspace = cublasLtWorkspace(self);
-    if (bf16) {
-        blas.matmulBf16WeightF32Out(&self.ctx, dst, high, weight, workspace, rows, in_dim, out_dim) catch return false;
-    } else {
-        blas.matmulF16WeightF32Out(&self.ctx, dst, high, weight, workspace, rows, in_dim, out_dim) catch return false;
-    }
+    blas.matmulBf16WeightF32Out(&self.ctx, dst, high, weight, workspace, rows, in_dim, out_dim) catch return false;
     for (1..terms) |term| {
-        if (bf16) {
-            try self.kernels.launchF32ToBf16(&self.ctx, low, residual, count);
-            blas.matmulBf16WeightF32Out(&self.ctx, correction, low, weight, workspace, rows, in_dim, out_dim) catch return false;
-        } else {
-            try self.kernels.launchF32ToF16(&self.ctx, low, residual, count);
-            blas.matmulF16WeightF32Out(&self.ctx, correction, low, weight, workspace, rows, in_dim, out_dim) catch return false;
-        }
+        try self.kernels.launchF32ToBf16(&self.ctx, low, residual, count);
+        blas.matmulBf16WeightF32Out(&self.ctx, correction, low, weight, workspace, rows, in_dim, out_dim) catch return false;
         try self.kernels.launchElementwiseF32(&self.ctx, dst, dst, correction, rows * out_dim, .add);
         if (term + 1 < terms) {
-            try self.scalar_clamp_kernel.widen16Bit(&self.ctx, low.ptr, rounded.ptr, count, bf16);
+            try self.scalar_clamp_kernel.widen16Bit(&self.ctx, low.ptr, rounded.ptr, count, true);
             try self.kernels.launchElementwiseF32(&self.ctx, residual, residual, rounded, count, .subtract);
         }
     }
-    if (bf16) self.stats.bf16_cublaslt_linear_calls += terms else self.stats.f16_cublaslt_linear_calls += terms;
+    self.stats.bf16_cublaslt_linear_calls += terms;
     self.stats.gemma4_projector_residual_calls += 1;
     return true;
 }
@@ -20778,15 +20761,12 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
         // The QAT checkpoint stores this projection in F16 already. Decode
         // widens each weight exactly while retaining F32 inputs, accumulation,
         // and the original reduction order. Only prefill rounds activations.
-        if (!primitive_training and self.gemma4_projector_residual and weight_tensor.gemma4_projector_weight and
-            !weight_tensor.gemma4_projector_f16_weight)
-        {
-            if (try tryCublasLtProjectorResidualLinear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim, false)) {
-                self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
-            } else {
-                try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
-                self.stats.f16_scalar_linear_calls += 1;
-            }
+        if (!primitive_training and self.gemma4_projector_residual and weight_tensor.gemma4_projector_weight) {
+            // An arbitrary F32 activation has no finite two-F16 decomposition.
+            // Keep its exponent range and widen the compact weights in the GEMM.
+            try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+            self.stats.f16_scalar_linear_calls += 1;
+            self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
         } else if (self.gemma4_e4b_sm89_qualified and rows == 1 and in_dim == 2560 and out_dim == 10752) {
             try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
             self.stats.f16_scalar_linear_calls += 1;
@@ -21044,7 +21024,7 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
         }
     } else if (isBf16Weight(weight_tensor)) {
         if (!primitive_training and self.gemma4_projector_residual and weight_tensor.gemma4_projector_weight) {
-            if (try tryCublasLtProjectorResidualLinear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim, true)) {
+            if (try tryCublasLtProjectorResidualLinear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim)) {
                 self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
             } else {
                 try self.kernels.launchLinearBf16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
@@ -39862,6 +39842,7 @@ test "Gemma4 CUDA projector residual workspace preserves two and three term rect
         const values = try a.alloc(f32, rows * in_dim);
         defer a.free(values);
         for (values, 0..) |*v, n| v.* = @sin(@as(f32, @floatFromInt(n)) * 0.1234);
+        if (!bf16) values[0] = 70000;
         const input = try cb.fromFloat32Shape(values, &.{ rows, @intCast(in_dim) });
         defer cb.free(input);
         compute.gemma4_projector_residual = true;
@@ -39870,7 +39851,7 @@ test "Gemma4 CUDA projector residual workspace preserves two and three term rect
             const before = compute.stats.gemma4_projector_residual_calls;
             const result = try cb.linearNoBias(input, weight, rows, in_dim, out_dim);
             defer cb.free(result);
-            try std.testing.expectEqual(before + 1, compute.stats.gemma4_projector_residual_calls);
+            try std.testing.expectEqual(before + @intFromBool(bf16), compute.stats.gemma4_projector_residual_calls);
             const actual = try cb.toFloat32(result, a);
             defer a.free(actual);
             for (0..rows) |r| for (0..out_dim) |c| {
