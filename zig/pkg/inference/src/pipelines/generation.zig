@@ -4948,18 +4948,17 @@ pub const NativeGenerationPipeline = struct {
                 "executePrefill whole-model fast path seq_len={d} chunk_size={d} ring={}",
                 .{ seq_len, prefill_chunk_size, decode_state.allow_swa_ring },
             );
-            var processed: usize = 0;
-            while (processed < prompt_ids.len) {
-                const chunk_end = @min(prompt_ids.len, processed + prefill_chunk_size);
-                const chunk = prompt_ids[processed..chunk_end];
-                const total_chunk_end = prefilled_tokens + chunk_end;
-                const is_last_chunk = chunk_end == prompt_ids.len;
+            var window = try decoder_prefill.FixedWindow.init(prompt_ids.len, prefilled_tokens, prefill_chunk_size);
+            while (window.next()) |attempt| {
+                const chunk = prompt_ids[attempt.start..attempt.end];
+                const total_chunk_end = attempt.total_end;
+                const is_last_chunk = attempt.final;
                 const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
                 defer phase_timer.finish();
                 const wants_greedy = is_last_chunk and allow_resident_greedy_token and isPureGreedyConfig(config) and config.grammar == null;
                 var compiled_prefill = self.prefillRuntime(decode_state, null);
                 const output = compiled_prefill.runCompiledChunk(.{ .token_ids = chunk, .total_sequence_length = total_chunk_end, .output = if (wants_greedy) .greedy_token else if (is_last_chunk) .last_logits else .kv_only }) catch |err| {
-                    debugGenerationStage("executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}", .{ processed, chunk_end, @errorName(err) });
+                    debugGenerationStage("executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}", .{ attempt.start, attempt.end, @errorName(err) });
                     return err;
                 };
                 if (output.greedy_token != null) {
@@ -4972,7 +4971,6 @@ pub const NativeGenerationPipeline = struct {
                     return .{ .greedy_token = output.greedy_token.? };
                 }
                 if (output.last_logits) |logits| prefill_last_logits = logits;
-                processed = chunk_end;
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         scheduler.notePrefillProgress(lease, total_chunk_end, seq_len);

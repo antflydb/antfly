@@ -634,6 +634,50 @@ pub const PromptPlan = struct {
 
 pub const CompiledPromptPlan = struct { chunk_rows: usize, bounded_swa: bool };
 
+/// Fixed physical windows for compiled tokens and prepared embedding rows.
+/// The enclosing request owns publication and decides the final output intent.
+pub const FixedWindow = struct {
+    processed: usize = 0,
+    query_rows: usize,
+    prefix_rows: usize,
+    limit: usize,
+
+    pub const Chunk = struct {
+        start: usize,
+        end: usize,
+        total_end: usize,
+        final: bool,
+
+        pub fn rows(self: Chunk) usize {
+            return self.end - self.start;
+        }
+    };
+
+    pub fn init(query_rows: usize, prefix_rows: usize, limit: usize) !FixedWindow {
+        if (limit == 0) return error.InvalidPreparedPrompt;
+        _ = try std.math.add(usize, prefix_rows, query_rows);
+        return .{ .query_rows = query_rows, .prefix_rows = prefix_rows, .limit = limit };
+    }
+
+    pub fn next(self: *FixedWindow) ?Chunk {
+        if (self.processed == self.query_rows) return null;
+        const start = self.processed;
+        const end = start + @min(self.limit, self.query_rows - start);
+        self.processed = end;
+        return .{ .start = start, .end = end, .total_end = self.prefix_rows + end, .final = end == self.query_rows };
+    }
+};
+
+test "fixed prefill windows preserve logical prefix and produce the exact final remainder" {
+    var window = try FixedWindow.init(7, 11, 3);
+    try std.testing.expectEqualDeep(FixedWindow.Chunk{ .start = 0, .end = 3, .total_end = 14, .final = false }, window.next().?);
+    try std.testing.expectEqualDeep(FixedWindow.Chunk{ .start = 3, .end = 6, .total_end = 17, .final = false }, window.next().?);
+    try std.testing.expectEqualDeep(FixedWindow.Chunk{ .start = 6, .end = 7, .total_end = 18, .final = true }, window.next().?);
+    try std.testing.expect(window.next() == null);
+    try std.testing.expectError(error.InvalidPreparedPrompt, FixedWindow.init(1, 0, 0));
+    try std.testing.expectError(error.Overflow, FixedWindow.init(1, std.math.maxInt(usize), 1));
+}
+
 pub const EmbeddingRoute = enum { prepared_last_row, ordinary_last_row };
 pub const EmbeddingPromptPlan = struct {
     chunk_rows: usize,
@@ -1161,38 +1205,37 @@ pub const Runtime = struct {
         const cb = self.forward.context.cb;
         const a = self.forward.context.allocator;
         const config = self.forward.context.gpt_config.*;
-        if (request.token_ids.len != request.sequence_length or rows == 0) return error.InvalidPreparedPrompt;
+        if (request.token_ids.len != request.sequence_length) return error.InvalidPreparedPrompt;
         const compiled = self.forward.context.compiled_partition_backend == .metal and
             self.forward.context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null;
         var state = BorrowedDecodeStateRuntime.init(self.state);
         // Disabling the arithmetic optimization cannot waive the admitted
         // physical row bound or the retained full-prompt input reservation.
         const prune_suffix = cb.kind() != .metal or platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true);
-        var start: usize = 0;
-        while (start < request.sequence_length) {
+        var window = try FixedWindow.init(request.sequence_length, 0, rows);
+        while (window.next()) |chunk| {
             if (cb.execution_control) |active| try active.check();
-            const count = @min(rows, request.sequence_length - start);
-            const end = start + count;
-            const part = try cb.sliceRows2D(a, embeddings, start, count, config.hidden_size);
+            const count = chunk.rows();
+            const end = chunk.total_end;
+            const part = try cb.sliceRows2D(a, embeddings, chunk.start, count, config.hidden_size);
             var owns_part = true;
             defer if (owns_part) cb.free(part);
-            const ids = request.token_ids[start..end];
+            const ids = request.token_ids[chunk.start..chunk.end];
             if (compiled) {
                 const result = try self.runCompiledChunkWithOwnedLane(.{
                     .token_ids = ids,
                     .prepared_rows = .{ .source = cb, .tensor = part, .rows = count, .width = config.hidden_size },
                     .total_sequence_length = end,
-                    .output = if (end != request.sequence_length) .kv_only else if (request.output_intent.isGreedy()) .greedy_token else .last_logits,
+                    .output = if (!chunk.final) .kv_only else if (request.output_intent.isGreedy()) .greedy_token else .last_logits,
                 }, self.forward.graph_cache.?, graph_mod.execution.graphForwardCompiledModelOutputWithInputs);
-                if (end == request.sequence_length) return result;
-                start = end;
+                if (chunk.final) return result;
                 continue;
             }
             var decode = state.makeDecodeContext(end, count);
             if (decode.kv_position_offset != 0 or decode.attention_mode == .full_recompute) return error.UnsupportedShape;
             decode.kv_sequence_len = end;
             try self.forward.context.bindDecoderCleanup(&decode);
-            if (end == request.sequence_length) {
+            if (chunk.final) {
                 var numerical = Forward{ .forward = self.forward };
                 owns_part = false;
                 return numerical.forwardPreparedEmbeddingsOutput(part, ids, end, &decode, request.output_intent);
@@ -1200,7 +1243,6 @@ pub const Runtime = struct {
             if (cb.kind() == .metal and count > 1) {
                 var framed = Forward{ .forward = self.forward };
                 if (try framed.tryMetalPreparedEmbeddingChunk(part, ids, end, &decode, .kv_only)) |_| {
-                    start = end;
                     continue;
                 }
             }
@@ -1209,7 +1251,6 @@ pub const Runtime = struct {
             owns_part = false;
             const result = try gpt_arch.forwardFinalHiddenWithSharedKvOutput(cb, a, config, part, .{}, 1, end, &decode, ple, null, null, if (count > 1 and prune_suffix) .kv_only else .all);
             cb.free(result.hidden);
-            start = end;
         }
         return error.InvalidPreparedPrompt;
     }
