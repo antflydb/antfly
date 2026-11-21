@@ -966,6 +966,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "text native constraints treat resolved all-doc exclusion as empty candidates",
             "sort cursor contract classifies arity separately from type",
             "segment doc ordinal sidecar roundtrip and merge preserve live order",
+            "segment doc versions roundtrip and merge carry each live copy version",
             "segment index sort metadata roundtrip",
             "segment merge drops index sort metadata until physical sort is preserved",
             "segment sorted merge normalizes legacy mixed numeric index sort domains",

@@ -43,6 +43,9 @@ pub const Batch = struct {
         stored_data: []const u8,
         fields: []const FieldTerms,
         doc_ordinal: ?u32 = null,
+        /// This copy's version (lite-full-text-storage.md), when indexed
+        /// under one.
+        doc_version: ?u64 = null,
     };
 
     pub const FieldTerms = struct {
@@ -453,12 +456,16 @@ fn buildSegmentWithExtraSections(
     var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
     defer doc_ordinals.deinit(alloc);
     var has_doc_ordinal = false;
+    var doc_versions = std.ArrayListUnmanaged(u64).empty;
+    defer doc_versions.deinit(alloc);
     for (batch.docs) |doc| {
         const ordinal = doc.doc_ordinal orelse 0;
         has_doc_ordinal = has_doc_ordinal or ordinal != 0;
         try doc_ordinals.append(alloc, ordinal);
+        try doc_versions.append(alloc, doc.doc_version orelse 0);
     }
     if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
+    try seg_writer.addDocVersions(doc_versions.items);
 
     // Build inverted indexes and attach to segment
     var fit = field_builders.iterator();
@@ -541,6 +548,8 @@ pub const TextDocument = struct {
     stored_data: []const u8,
     text_fields: []const TextField,
     doc_ordinal: ?u32 = null,
+    /// This copy's version (lite-full-text-storage.md), when indexed under one.
+    doc_version: ?u64 = null,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
     /// Subtrees the document schema declares with `x-antfly-index: false`.
@@ -1082,6 +1091,8 @@ fn writeTextSegmentWithScratch(
     var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
     defer doc_ordinals.deinit(alloc);
     var has_doc_ordinal = false;
+    var doc_versions = std.ArrayListUnmanaged(u64).empty;
+    defer doc_versions.deinit(alloc);
     var min_doc_key: ?[]const u8 = null;
     var max_doc_key: ?[]const u8 = null;
 
@@ -1191,6 +1202,7 @@ fn writeTextSegmentWithScratch(
         const doc_ordinal = text_doc.doc_ordinal orelse 0;
         has_doc_ordinal = has_doc_ordinal or doc_ordinal != 0;
         try doc_ordinals.append(alloc, doc_ordinal);
+        try doc_versions.append(alloc, text_doc.doc_version orelse 0);
 
         if (!try orderTextFields(alloc, &scratch.field_order, text_doc.text_fields)) {
             for (text_doc.text_fields) |tf| {
@@ -1360,6 +1372,7 @@ fn writeTextSegmentWithScratch(
 
     const segment_encode_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
+    try seg_writer.addDocVersions(doc_versions.items);
     if (!options.store_documents) {
         try seg_writer.addDocKeyRange(min_doc_key orelse return error.InvalidSegment, max_doc_key orelse return error.InvalidSegment);
     }

@@ -34,6 +34,29 @@ writer), and forces a full index reload whenever another process commits to the
 index. It also keeps the per-index guard and the writer lease across the fsync,
 so indexed writes never form groups.
 
+## Versions
+
+Every indexed copy of a document carries a **version**, a u64 unique to that
+copy:
+
+    version = (replay sequence of the write) << 20 | (copy's index in its batch)
+
+Replay sequences are unique per batch and increase in commit order across
+processes (the journal refuses an append below its committed cut), so
+versions order copies of one key by when they were written. A version never
+changes: a merge copies it into its output unchanged.
+
+Liveness is a property of the version, not of where the copy sits. A copy is
+live exactly when its version is the current version of its key and that
+version is not dead. Nothing about a document's liveness is stored per
+segment.
+
+The engine's `DocOrdinal` (doc_identity.zig) is not used here. An ordinal
+names a document, not a version: an overwrite keeps it. Its state row's
+`created_generation` drives snapshot visibility, so it cannot record each
+overwrite, and a new document's ordinal is not readable while its batch is
+still being prepared.
+
 ## Durable layout
 
 All records live in the index's native-catalog scope inside the `.aflite` file,
@@ -41,30 +64,31 @@ in the same durability domain as the primary rows. Segment ids are big-endian u6
 
 | Record | Key | Value | Mutable |
 |---|---|---|---|
-| Segment | `segments/<seg>` | AFSM segment bytes | no |
+| Segment | `segments/<seg>` | AFSM segment bytes, with a version column | no |
 | Segment range | `meta/segment_range:<seg>` | min/max doc key | no |
 | Active marker | `meta/active_segment:<seg>` | `{1}` | added/removed only |
-| Tombstones | `deletions/<seg>` | roaring bitmap | yes |
-| Doc map | `docmap/<doc key>` | `<seg be64><local id be32>` | yes |
+| Current version | `docmap/<doc key>` | version u64, high bit set for a delete | yes |
+| Dead versions | `dead/<version >> 32>` | roaring bitmap of `version & 0xffffffff` | yes |
 | Segment counter | `meta/next_seg_id` | u64 | yes |
-| Format | `meta/text_storage_format` | u32 | at upgrade |
+| Format | `meta/text_storage_format` | u32 = 2 | at upgrade |
 
 Rules:
 
 - A segment and its range are written once, when the segment id is allocated,
   and deleted only when the segment is retired. Caches keyed by segment id never
   need invalidating.
-- Tombstones are read and rewritten at the tip, so a stale process cannot drop
-  another's bits. Splitting each bitmap into per-container records
-  (`deletions/<seg><high16>`) is a later size optimization with no effect on
-  correctness.
-- The doc map names each live document's current `(segment, local id)`. It is the
-  only way a write finds an old version; nothing scans segments.
-- `meta/next_seg_id` is read and advanced inside the transaction that publishes
-  the segment, so two processes can never reuse an id.
-- The doc map is kept out of the catalog mirror: `native_catalog_backend`
-  treats its namespace (`tip_namespace`) as read from the transaction's staged
-  writes and then the file (`Sink.loadOneAlloc`), never mirrored.
+- `docmap/<key>` is the key's current version (last writer wins by version).
+  A delete leaves a marker holding the delete's version, so a copy that
+  arrives later from an older write is born dead.
+- `dead/` holds every version that was current and has been superseded or
+  deleted, until a merge drops the last copy of it.
+- A merge writes neither: versions do not move, so the doc map and the dead
+  set are independent of segment layout.
+- Records are read and rewritten at the tip, so a stale process cannot drop
+  another's changes. `meta/next_seg_id` is read and advanced in the
+  publishing transaction, so two processes never reuse an id.
+- The doc map is kept out of the catalog mirror (`native_catalog_backend`
+  `tip_namespace`); the dead set is small and mirrored.
 
 ## Reading at the transaction tip
 
@@ -88,80 +112,75 @@ one index, which preserves that.
 
 ## Write protocol
 
-For a write that changes documents in a full-text index:
+Every publisher (inline write, replay worker, rebuild page, split handoff)
+applies one rule per document copy it publishes, at the tip:
+
+1. Read `docmap/<key>`: the current version `cur` (or none).
+2. If the new copy's version `v` is newer than `cur`: add `cur` to the dead
+   set (unless it is a delete marker) and set `docmap/<key> = v`.
+3. Otherwise the copy is stale: add `v` to the dead set (born dead).
+
+A delete at version `d` does the same with a delete marker as `v`. Equal
+replay sequences are copies from one batch; the later batch index wins.
+
+For the inline path, at `sync_level=full_index`:
 
 1. **Prepare (no locks).** Tokenize the new versions and build the level-0
-   segment bytes for this batch.
-2. **Stage (inside the write transaction, at the tip).**
-   - For each changed or deleted document key: read `docmap/<key>`. If present,
-     read `tomb/<seg><high16>`, set the bit, and stage the container.
-   - Read `meta/next_seg_id`, take the next id, stage the counter.
-   - Stage the segment, its range and its active marker.
-   - For each new version, stage `docmap/<key>` = (new segment, local id). For a
-     deleted document, stage a delete of `docmap/<key>`.
-   - Stage the index's progress record.
-   Every value staged here comes from the transaction's own reads or from this
-   batch's input. Nothing comes from process memory.
+   segment bytes with their version column.
+2. **Stage (inside the write transaction, at the tip).** Apply the rule above
+   for every changed or deleted key; take the next segment id from
+   `meta/next_seg_id`; stage the segment, its range and its active marker.
+   Every value staged comes from the transaction's own reads or this batch's
+   input; nothing comes from process memory.
 3. **Commit.** The index records ride in the same native commit as the primary
    rows: one redo record, one fsync.
-4. **Install (after durability, memory only).** Update the in-memory caches in
-   commit order: add the segment to the writer snapshot, apply the tombstone bits.
-   Queries see a delete only from here on, never before it is durable. A failed
-   install drops the cache; it is rebuilt lazily from the durable records, never
-   treated as authoritative.
+4. **Install (after durability, memory only).** Add the segment to the writer
+   snapshot and mark the newly dead versions in the in-memory deletion bitmaps.
+   Queries see a delete only from here on, never before it is durable.
+
+Background publishers stage the same decisions through a resolver (below),
+which runs inside their commit at the tip.
 
 ## Caches and cross-process refresh
 
-The in-memory writer snapshot (segment list, per-segment deletion bitmaps) is a
-cache of the durable records. After another process commits to the index, a
-process refreshes it incrementally: re-read the active markers and the tombstone
-containers of known segments, and load new segments by id. It never reloads the
-whole scope and never needs a full handle reopen for this. A per-scope version
-published in the shared lock region tells a process cheaply that an index moved
-(planned with the shared-memory refresh work).
+The writer snapshot's per-segment deletion bitmaps are derived: a local doc is
+deleted when its version is in the dead set. A process builds them when it
+loads a segment, from the segment's version column and the dead set (a few
+records), and keeps a per-segment sorted version index so that installing a
+commit can find the copy a dead version names. After another process commits
+to the index, a process reloads the dead set and loads new segments by id; it
+never reloads segments it already holds. A per-scope version published in the
+shared lock region tells a process cheaply that an index moved (planned with
+the shared-memory refresh work).
 
 ## Merges
 
-A merge builds its output segments from its inputs off the write path. What
-depends on the current records is decided inside the merge's commit, at the
-tip, under writer authority: the merge stages a resolver
-(`native_catalog_backend.Resolver`) as the commit's first mutation, and the
-Lite sink runs it while applying the commit, reading the scope as of that
-point (earlier members of the same group commit and every other process's
-commits included). For an index with a complete doc map the resolver:
+A merge builds its output segments from its inputs off the write path, dropping
+copies whose versions are dead in its snapshot and carrying every other
+version through unchanged. Its commit stages a resolver
+(`native_catalog_backend.Resolver`) as its first mutation; the Lite sink runs
+it while applying the commit, at the tip, under writer authority. The resolver
+refuses the merge (`error.IndexScopeChanged`) when an input is no longer
+active, because another process merged it away. Otherwise it removes the
+versions the merge dropped from the dead set (no other segment can hold them:
+versions are unique to a copy) and raises the segment counter past the
+outputs. It writes nothing per live document.
 
-- refuses the merge (`error.IndexScopeChanged`) when an input is no longer
-  active, because another process merged it away;
-- decides each output document from the doc map: live exactly when its key's
-  entry names one of the merge's inputs and the output holds a single copy of
-  it (the entry is repointed to its output location); every other copy,
-  deleted or rewritten since the merge read its inputs, by any process, is
-  tombstoned in the output. Two copies of a live key refuse the merge;
-- raises `meta/next_seg_id` past the outputs.
-
-The decided tombstones are installed in memory once the commit is durable.
-Writes to the index never invalidate a merge: an inline write in another
-process either commits first (the resolver sees its doc map entries) or
-after (its own tip reads see the merge's). The scheduler treats a refusal as
-a stale merge and plans it again. Resolving commits never take the deferred
-ride-along path, so a refusal is seen before the mirror swaps, and the
-resolver's decisions join the mirror only once the commit succeeds.
+A copy that became dead after the merge read its inputs is still dead in the
+output: its version is in the dead set, so the output's derived bitmap marks
+it. Writes never invalidate a merge.
 
 Merge output ids are reserved at the tip, in a small commit of their own,
-before the merge publishes (`reserveSegmentIdRange`), so a process whose
-counter is behind another's never reuses an id. Every other background
+before the merge publishes (`reserveSegmentIdRange`). Every other background
 counter write raises the counter at the tip and never lowers it
 (`SegmentCounterFloor`).
 
 ## Upgrade
 
-Indexes written before this format have whole-bitmap `deletions/<seg>` records and
-no doc map. On first open by a writer, a one-time upgrade in one transaction:
-splits each bitmap into containers, builds the doc map from the active segments'
-stored ids (skipping tombstoned ones; the newest segment wins for a repeated key),
-writes `meta/next_seg_id` as the maximum of the stored value and the highest
-active id + 1, and stamps `meta/text_storage_format`. A reader opening an
-un-upgraded index still uses the old records.
+An index whose `meta/text_storage_format` is not 2 (no version columns, or the
+location-valued doc map of format 1) is rebuilt from the primary rows on its
+first writable open. The format has not been released, so there is no in-place
+migration.
 
 ## Crash and consistency invariants
 
@@ -170,8 +189,10 @@ un-upgraded index still uses the old records.
 - Every value a write stages comes from that transaction's reads at the tip or
   from its own input. Process memory never reaches disk.
 - Install is memory-only and idempotent; a crash before install is repaired by
-  the lazy reload.
-- Merges publish against the tip and never drop a concurrent delete.
+  the reload.
+- A version is current for at most one key, and a copy is live only while its
+  version is current: merges, replays and rebuilds cannot resurrect an old
+  version or hide the newest.
 - Segment ids are never reused, across processes and across crashes.
 
 ## Other index types
@@ -186,20 +207,16 @@ authoritative mirror) and algebraic (HLL sketches split into register blocks).
 
 1. Done. Read surface: `Txn.getIndexCatalogAlloc` and
    `View.getIndexCatalogAlloc`.
-2. Done. Every publisher keeps the doc map (inline, replay worker, merges,
-   rebuild pages, split). Upgrade builds it once and stamps
-   `meta/text_storage_format`.
-3. Done for the inline path: an upgraded index's inline write finds old
-   versions, tombstones and segment ids at the tip; in-memory tombstones are set
-   only after durability.
-4. Done. Merges decide doc map entries, tombstones and the counter at the
-   tip, inside their commit; output ids are reserved at the tip.
-5. Next. The replay worker's deletes and segment ids on the same records,
-   decided at the tip the same way.
+2. Done (format 1, superseded). Location-valued doc map, tombstones at the
+   tip, tip-resolved merges and segment ids.
+3. Segments carry a version column; merges carry it through.
+4. Format 2 write protocol: version-valued doc map and dead set, for every
+   publisher; derived deletion bitmaps on load and install.
+5. Merges drop dead versions and prune them from the dead set; no per-document
+   merge writes. Rebuild on open for older formats.
 6. Incremental cross-process refresh; remove the full reopen after a foreign
    index commit.
 7. Prepare/stage/install split; no index guard or writer lease across the fsync.
-8. Per-container tombstone records.
 
 Each stage keeps the full-text crash sweeps, the multi-process test
 `capi native separate writer processes keep full-text deletes at full_index`, and
