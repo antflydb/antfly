@@ -175,7 +175,10 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         try request.check();
         self.replication_polls += 1;
-        if (self.replication_defer_first_poll and self.replication_polls == 1) return error.ReplicationReadDeferred;
+        if (self.replication_defer_first_poll and self.replication_polls == 1) {
+            try request.io.sleep(.fromMilliseconds(150), .awake);
+            return error.ReplicationReadDeferred;
+        }
         if (self.replication_revoke_after_poll) self.replication_denied = true;
         const offset = @backingInt(after);
         if (self.replication_wait_for_feedback and self.replication_feedbacks == 0) return .{ .end_lsn = @fromBackingInt(48) };
@@ -3129,7 +3132,9 @@ const replication_test_limits: protocol.Limits = .{ .idle_timeout_ms = 1000, .st
 test "pgwire CopyBoth sends committed messages accepts duplex feedback and preserves following commands" {
     for ([_]bool{ false, true }) |acknowledge| {
         var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .renewable_auth = true, .replication_defer_first_poll = true };
-        var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = replication_test_limits });
+        var limits = replication_test_limits;
+        limits.replication_callback_ms = 100;
+        var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = limits });
         defer listener.deinit();
         const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
         defer socket.close(std.testing.io);

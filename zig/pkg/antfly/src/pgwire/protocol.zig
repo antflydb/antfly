@@ -1117,7 +1117,10 @@ pub const Session = struct {
                     try result;
                     var scratch = std.heap.ArenaAllocator.init(self.alloc);
                     defer scratch.deinit();
-                    self.replicationDeadline(@intCast(request_value.deadline.raw.nanoseconds));
+                    // The read has a cooperative callback budget. Timing it
+                    // out must not trigger the connection watchdog before the
+                    // reader can report a retryable result.
+                    self.replicationDeadline(deadline);
                     try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
                     var poll = stream.poll(stream.context, scratch.allocator(), request_value, sent, limits.frame_bytes - 30) catch |err| {
                         if (err == error.ReplicationReadDeferred and !self.cancel_requested.load(.acquire) and self.replicationNow() < deadline) {
