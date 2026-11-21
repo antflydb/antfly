@@ -2775,7 +2775,17 @@ pub const Frame = struct {
         self.stats.replay_decision = .captured;
     }
 
-    pub fn replayOutputs(self: *Frame, allocator: std.mem.Allocator) ![]CT {
+    /// The driver can report a launch failure after accepting work. Keep the
+    /// graph and its address banks alive through completion, then retire them.
+    pub fn launchCommittedReplay(self: *Frame) !void {
+        if (!self.replay_ready or self.retired) return error.InvalidPreparedKernelRoute;
+        self.replay.?.launch() catch |err| {
+            self.retired = true;
+            return err;
+        };
+    }
+
+    pub fn replayOutputs(self: *Frame, allocator: std.mem.Allocator, control: ?@import("../execution_control.zig").InferenceExecutionControl) ![]CT {
         if (!self.hostProofsCurrent()) return error.MissingCurrentHostIndexProof;
         const index = self.pool.replay_backend orelse return error.InvalidShape;
         const cb = &self.pool.backends[index];
@@ -2792,7 +2802,8 @@ pub const Frame = struct {
                 output.* = independent;
             }
         }
-        try self.replay.?.launch();
+        if (control) |active| try active.check();
+        try self.launchCommittedReplay();
         self.stats.graph_replays += 1;
         self.stats.replay_decision = .replayed;
         return outputs;
@@ -3910,6 +3921,39 @@ test "shared host arena shrinks obsolete kernels while preserving real region pr
     defer a.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 42, 43, 44, 45 }, values);
     _ = try frame.finish();
+}
+
+test "prepared physical CUDA replay retires the address bank after a launch error" {
+    const Mock = struct {
+        calls: usize = 0,
+        fn begin(_: *anyopaque, _: []const ?*ops.physical_storage.Lease) !bool {
+            unreachable;
+        }
+        fn commit(_: *anyopaque) !void {
+            unreachable;
+        }
+        fn release(_: *anyopaque) void {
+            unreachable;
+        }
+        fn retains(_: *anyopaque, _: *const ops.physical_storage.Lease) bool {
+            unreachable;
+        }
+        fn launch(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.InvalidCudaState;
+        }
+        const table = ops.physical_storage.Replay.VTable{ .begin = begin, .commit = commit, .abort = release, .launch = launch, .retains = retains, .deinit = release };
+    };
+    var mock: Mock = .{};
+    var frame: Frame = undefined;
+    frame.replay = .{ .ptr = &mock, .vtable = &Mock.table };
+    frame.replay_ready = true;
+    frame.retired = false;
+    try std.testing.expectError(error.InvalidCudaState, frame.launchCommittedReplay());
+    try std.testing.expect(frame.retired);
+    try std.testing.expectError(error.InvalidPreparedKernelRoute, frame.launchCommittedReplay());
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
 }
 
 test "prepared CUDA step completion waits before host reuse and retains failed boundary" {
