@@ -1531,17 +1531,17 @@ test "embeddinggemma2 video reader timestamps and cache binding survive independ
     source.control = .{};
     reader.input = &source;
 
-    var packet = media.mp4.Packet{ .offset = 0, .size = group_max_input_bytes + 1, .dts = 0, .pts = 0, .media_pts = 0, .duration = 1, .sync = true };
-    var range = media.source.Source{ .allocator = a, .identity = "packet-extent", .storage = .{ .range = .{ .context = &counter, .read_at = undefined, .length = packet.size } } };
-    var packet_reader = media.mp4.Reader{ .allocator = a, .input = &range, .track = .{ .id = 1, .width = 16, .height = 16, .timescale = 1, .avcc = &.{}, .nal_length_bytes = 4 }, .metadata = .{ .source = null, .bytes = &.{} }, .packets = @as(*[1]media.mp4.Packet, @ptrCast(&packet)) };
+    var packets = [_]media.mp4.Packet{.{ .offset = 0, .size = group_max_input_bytes + 1, .dts = 0, .pts = 0, .media_pts = 0, .duration = 1, .sync = true }};
+    var range = media.source.Source{ .allocator = a, .identity = "packet-extent", .storage = .{ .range = .{ .context = &counter, .read_at = undefined, .length = packets[0].size } } };
+    var packet_reader = media.mp4.Reader{ .allocator = a, .input = &range, .track = .{ .id = 1, .width = 16, .height = 16, .timescale = 1, .avcc = &.{}, .nal_length_bytes = 4, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } }, .metadata = .{ .source = null, .bytes = &.{} }, .packets = &packets };
     const group = @import("embedding_gemma2.zig");
     try group.validateGroup(.{ .content = &.{.{ .sampled_video = .{ .reader = &packet_reader, .sampling = .gemma4 } }} }, .{});
     try std.testing.expectError(error.ResourceLimitExceeded, packetBytes(&packet_reader));
     var selected = try ReaderSelection.fromPacketIds(a, &packet_reader, .gemma4, &.{0}, null, .{}, @splat(0), 0);
     defer selected.deinit();
-    try std.testing.expectEqual(@as(?u64, packet.size), selected.validated_packet_bytes);
+    try std.testing.expectEqual(@as(?u64, packets[0].size), selected.validated_packet_bytes);
     _ = try sampledPacketBytes(&packet_reader, .gemma4, &selected, .{});
-    var copied = [_]media.mp4.Packet{packet};
+    var copied = packets;
     packet_reader.packets = &copied;
     try std.testing.expectError(error.InvalidVideoReaderSelection, sampledPacketBytes(&packet_reader, .gemma4, &selected, .{}));
 
