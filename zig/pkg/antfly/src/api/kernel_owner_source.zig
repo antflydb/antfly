@@ -2346,6 +2346,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .resolution, .artifact_history, .split_cut, .merge_cut => request.namespace,
             .publication, .admission, .decision => request.owner.namespace,
         };
+        if (comptime kind == .page) {
+            if (request.completion_local_group != 0 and request.completion_local_group != group)
+                return error.InvalidHistoryPageRequest;
+        }
         if (comptime kind == .grant or kind == .bootstrap) try request.validate();
         if (comptime kind == .resolution) {
             try request.validate();

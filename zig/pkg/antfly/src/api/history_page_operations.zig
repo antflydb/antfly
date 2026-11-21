@@ -89,6 +89,10 @@ fn PagePort(comptime Input: type, comptime Page: type) type {
         pub const VTable = struct { read: @FieldType(Self, "read_fn") };
         const Boundary = local.runtime_callback_abi.Boundary(VTable);
         pub fn read(self: Self, a: std.mem.Allocator, fence: metadata.CatalogRouteFence, table: []const u8, input: Input, context: operation.RequestContext) !Page {
+            if (comptime Input == Request) {
+                const group = input.request.completion_local_group;
+                if (group != 0 and group != fence.route.group_id) return error.InvalidHistoryPageRequest;
+            }
             return Boundary.call("read", self.boundary_dispatch, self.read_fn, .{ self.ptr, a, fence, table, input, context });
         }
     };
@@ -186,6 +190,14 @@ test "history page ingress rejects scope mismatches forged pages and late cancel
     var projected_page = try wire.decode(a, projected_reply, projected.request);
     defer projected_page.deinit();
     try std.testing.expect(projected_page.caught_up);
+    projected.request.completion_roots = &.{ namespace, namespace };
+    projected.request.completion_groups = &.{ 17, 18 };
+    projected.request.completion_local_group = 18;
+    const wrong_projection = try std.json.Stringify.valueAlloc(a, projected, .{});
+    defer a.free(wrong_projection);
+    const before_wrong_projection = fake.calls;
+    try std.testing.expectError(error.InvalidHistoryPageRequest, execute(port, a, 17, "docs", wrong_projection, context));
+    try std.testing.expectEqual(before_wrong_projection, fake.calls);
     fake.forged = true;
     try std.testing.expectError(error.HistoryCorrupt, execute(port, a, 17, "docs", body, context));
     fake.forged = false;
