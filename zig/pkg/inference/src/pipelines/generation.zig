@@ -4942,7 +4942,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         if (prompt_plan.compiled_whole_model) {
-            const compiled = try prompt_runtime.prepareCompiledPrompt(request);
+            const compiled = try prompt_runtime.prepareCompiledPrompt(request.compiled());
             const prefill_chunk_size = compiled.chunk_rows;
             debugGenerationStage(
                 "executePrefill whole-model fast path seq_len={d} chunk_size={d} ring={}",
@@ -5203,6 +5203,15 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn beginPreparedPrefillTurn(self: *NativeGenerationPipeline, seq_len: usize) !bool {
+        const scheduler = self.scheduler orelse return false;
+        const lease = self.scheduler_lease orelse return false;
+        scheduler.notePrefillProgress(lease, 0, seq_len);
+        const io = self.io orelse return false;
+        try scheduler.awaitTurnControlled(lease, .prefill, io, self.execution_control);
+        return true;
+    }
+
     fn executePreparedMultimodalPrefill(
         self: *NativeGenerationPipeline,
         prepared: *gemma3_mm.PreparedPrompt,
@@ -5212,39 +5221,18 @@ pub const NativeGenerationPipeline = struct {
         config: GenerationConfig,
     ) !PrefillOutput {
         var numerical = self.prefillRuntime(decode_state, directPrefillExecutionMutex(true, false, false, self.execution_lock));
-        var direct_prefill_turn_acquired = false;
-        defer if (direct_prefill_turn_acquired) {
-            self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
-        };
-        const compiled_media = self.compiled_partition_backend == .metal and self.compiled_attachment_target == .whole_model and self.graph_cache != null;
-        var admitted_chunk_rows = config.prefill_chunk_size;
-        if (compiled_media) {
-            if (prepared.attn_or_mask != null or capture_last_hidden) return error.UnsupportedPreparedRows;
-            const plan = try numerical.prepareCompiledPrompt(self.promptRequest(config, seq_len, seq_len, 0, false, capture_last_hidden));
-            admitted_chunk_rows = @min(plan.chunk_rows, 512);
-        }
+        const plan = try numerical.planEmbeddingPrompt(.{
+            .storage = decoderStorageRequest(config),
+            .query_tokens = seq_len,
+            .configured_chunk_rows = config.prefill_chunk_size,
+            .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
+            .speculative_k = config.speculative_k,
+            .sampled_ring_qualified = exact_hybrid_sampled_ring_qualification_override,
+        }, prepared.attn_or_mask, capture_last_hidden);
         try numerical.resetRecurrentPrompt();
-        if (self.scheduler) |scheduler| {
-            if (self.scheduler_lease) |lease| {
-                scheduler.notePrefillProgress(lease, 0, seq_len);
-            }
-        }
-
-        if (self.scheduler) |scheduler| {
-            if (self.scheduler_lease) |lease| {
-                if (self.io == null) {
-                    if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
-                } else {
-                    try scheduler.awaitTurnControlled(lease, .prefill, self.io.?, self.execution_control);
-                    direct_prefill_turn_acquired = true;
-                    if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
-                }
-            } else {
-                if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
-            }
-        } else {
-            if (!compiled_media) try numerical.prepareWholePrompt(seq_len);
-        }
+        const direct_prefill_turn_acquired = try self.beginPreparedPrefillTurn(seq_len);
+        defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
+        if (plan.reserve_whole_prompt) try numerical.prepareWholePrompt(seq_len);
 
         if (prepared.input_embeddings == null) return error.InvalidPreparedPrompt;
         const logits = try numerical.runEmbeddingsOwned(.{
@@ -5252,7 +5240,7 @@ pub const NativeGenerationPipeline = struct {
             .token_ids = prepared.ple_token_ids orelse prepared.token_ids,
             .sequence_length = seq_len,
             .output_intent = decoder_routes.prefillOutputIntent(true, !capture_last_hidden and self.draft_cb == null and decoder_routes.shouldUsePreparedPrefillGreedyToken(self.cb.kind(), self.gpt_config, decoderRouteRequest(config), true, self.prefillNeedsHostLogits(config), self.cb.kind() != .cuda or (enableCudaPrefillFirstToken() and enableCudaPrefillGreedyToken())), capture_last_hidden),
-            .chunk_rows = admitted_chunk_rows,
+            .chunk_rows = plan.chunk_rows,
             .attention_mask = prepared.attn_or_mask,
         });
         errdefer if (logits.last_logits) |values| self.allocator.free(values);
@@ -5339,26 +5327,9 @@ pub const NativeGenerationPipeline = struct {
             defer self.mergeStepExecutor(&request.executor);
             return hook.run_fn(hook.ptr, &request);
         };
-        var direct_prefill_turn_acquired = false;
+        const direct_prefill_turn_acquired = try self.beginPreparedPrefillTurn(seq_len);
         defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
-        if (self.scheduler) |scheduler| {
-            if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, 0, seq_len);
-        }
-        if (self.scheduler) |scheduler| {
-            if (self.scheduler_lease) |lease| {
-                if (self.io == null) {
-                    try numerical.prepareWholePrompt(seq_len);
-                } else {
-                    try scheduler.awaitTurnControlled(lease, .prefill, self.io.?, self.execution_control);
-                    direct_prefill_turn_acquired = true;
-                    try numerical.prepareWholePrompt(seq_len);
-                }
-            } else {
-                try numerical.prepareWholePrompt(seq_len);
-            }
-        } else {
-            try numerical.prepareWholePrompt(seq_len);
-        }
+        try numerical.prepareWholePrompt(seq_len);
 
         if (prepared.input_embeddings == null) return error.InvalidPreparedPrompt;
         const work_trace = enableGenerationStageDebug();

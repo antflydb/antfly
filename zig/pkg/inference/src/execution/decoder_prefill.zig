@@ -594,6 +594,28 @@ pub const PromptRequest = struct {
     scheduler_chunk_rows: usize,
     speculative_k: u32,
     sampled_ring_qualified: bool,
+
+    pub fn compiled(self: PromptRequest) CompiledPromptRequest {
+        return .{
+            .storage = self.route.storage,
+            .query_tokens = self.query_tokens,
+            .prefilled_tokens = self.prefilled_tokens,
+            .configured_chunk_rows = self.configured_chunk_rows,
+            .scheduler_chunk_rows = self.scheduler_chunk_rows,
+            .speculative_k = self.speculative_k,
+            .sampled_ring_qualified = self.sampled_ring_qualified,
+        };
+    }
+};
+
+pub const CompiledPromptRequest = struct {
+    storage: decoder_storage.Request,
+    query_tokens: usize,
+    prefilled_tokens: usize = 0,
+    configured_chunk_rows: usize,
+    scheduler_chunk_rows: usize,
+    speculative_k: u32,
+    sampled_ring_qualified: bool,
 };
 
 pub const PromptPlan = struct {
@@ -611,6 +633,15 @@ pub const PromptPlan = struct {
 };
 
 pub const CompiledPromptPlan = struct { chunk_rows: usize, bounded_swa: bool };
+
+pub const EmbeddingRoute = enum { prepared_last_row, ordinary_last_row };
+pub const EmbeddingPromptPlan = struct {
+    chunk_rows: usize,
+    /// Ordinary routes reserve the complete logical KV window after obtaining
+    /// their scheduler turn. The compiled path has already bound its window.
+    reserve_whole_prompt: bool,
+};
+const compiled_embedding_chunk_limit = 512;
 
 pub fn firstTokenEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN", true);
@@ -673,11 +704,11 @@ pub const Runtime = struct {
 
     /// Own the complete whole-model physical window before its first chunk.
     /// Scheduler turn/progress publication remains in the caller.
-    pub fn prepareCompiledPrompt(self: *Runtime, request: PromptRequest) !CompiledPromptPlan {
+    pub fn prepareCompiledPrompt(self: *Runtime, request: CompiledPromptRequest) !CompiledPromptPlan {
         if (request.prefilled_tokens != 0) return error.UnsupportedShape;
         const context = self.forward.context;
         const route: decoder_storage.Route = if (context.compiled_partition_backend == .metal and context.cb.kind() == .metal and self.state.isPaged() and context.kv_dtype != null) .metal_whole_model else .standard;
-        const policy = decoder_storage.routeCapacityPolicy(route, context.gpt_config.*, request.route.storage, context.kv_dtype orelse .f16, request.sampled_ring_qualified);
+        const policy = decoder_storage.routeCapacityPolicy(route, context.gpt_config.*, request.storage, context.kv_dtype orelse .f16, request.sampled_ring_qualified);
         const bounded = policy == .split_swa_ring;
         // Reuse the admitted native schedule default instead of substituting the
         // generic 256-row fallback when a tuned prepared family uses 512 rows.
@@ -1027,6 +1058,21 @@ pub const Runtime = struct {
         try self.resetRecurrentPrompt();
     }
 
+    fn usesCompiledEmbeddings(self: *const Runtime, route: EmbeddingRoute) bool {
+        return route == .prepared_last_row and self.forward.context.compiled_partition_backend == .metal and
+            self.forward.context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null;
+    }
+
+    pub fn planEmbeddingPrompt(self: *Runtime, request: CompiledPromptRequest, attention_mask: ?[]const u8, capture_hidden: bool) !EmbeddingPromptPlan {
+        if (!self.usesCompiledEmbeddings(.prepared_last_row)) return .{
+            .chunk_rows = request.configured_chunk_rows,
+            .reserve_whole_prompt = true,
+        };
+        if (attention_mask != null or capture_hidden) return error.UnsupportedPreparedRows;
+        const plan = try self.prepareCompiledPrompt(request);
+        return .{ .chunk_rows = @min(plan.chunk_rows, compiled_embedding_chunk_limit), .reserve_whole_prompt = false };
+    }
+
     pub fn resetRecurrentPrompt(self: *Runtime) !void {
         const config = self.forward.context.gpt_config.*;
         if (config.isQwen35() and self.state.isPaged()) {
@@ -1049,7 +1095,7 @@ pub const Runtime = struct {
         /// Nonzero rows are the caller's existing admitted scratch envelope.
         chunk_rows: usize = 0,
         ensure_device_resident: bool = true,
-        route: enum { prepared_last_row, ordinary_last_row } = .prepared_last_row,
+        route: EmbeddingRoute = .prepared_last_row,
         attention_mask: ?[]const u8 = null,
         positions: ?[]const u32 = null,
         visual_mask: ?[]const bool = null,
@@ -1075,11 +1121,9 @@ pub const Runtime = struct {
         const embeddings = if (request.ensure_device_resident) try cb.ensureDeviceResidentOwned(original) else original;
         var owned = true;
         errdefer if (owned) cb.free(embeddings);
-        const compiled_rows = request.route == .prepared_last_row and self.forward.context.compiled_partition_backend == .metal and
-            self.forward.context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null;
-        if (compiled_rows) {
+        if (self.usesCompiledEmbeddings(request.route)) {
             if (request.output_intent.capturesHidden() or request.attention_mask != null or request.positions != null or request.visual_mask != null or request.deepstack_embeddings != null or request.token_ids.len != request.sequence_length) return error.UnsupportedPreparedRows;
-            const rows = @min(@as(usize, 512), if (request.chunk_rows == 0) @as(usize, 512) else request.chunk_rows);
+            const rows = if (request.chunk_rows == 0) compiled_embedding_chunk_limit else @min(compiled_embedding_chunk_limit, request.chunk_rows);
             owned = false;
             defer cb.free(embeddings);
             return self.runEmbeddingChunks(embeddings, request, rows);
@@ -2137,7 +2181,7 @@ fn checkPromptOwner(cb: ComputeBackend, _: ComputeBackend) !void {
         try std.testing.expectEqual(@as(usize, 0), state.kv_max_inflight_tokens);
         var hit = request;
         hit.prefilled_tokens = 1;
-        try std.testing.expectError(error.UnsupportedShape, physical.prepareCompiledPrompt(hit));
+        try std.testing.expectError(error.UnsupportedShape, physical.prepareCompiledPrompt(hit.compiled()));
         try std.testing.expectEqual(ids.len, state.total_tokens);
     }
 }
