@@ -605,6 +605,17 @@ fn vectorMax(data: []const f32) f32 {
 
 // --- Sampling utilities (shared by generation pipelines) ---
 
+/// Select from caller-owned logits with explicit suppression. Preserve argmax's
+/// tie/NaN/empty conventions and its existing scan; no second vocabulary bank.
+pub fn argmaxSuppressedInPlace(data: []f32, suppressed: []const i32) usize {
+    for (suppressed) |token| {
+        if (token < 0) continue;
+        const index: usize = @intCast(token);
+        if (index < data.len) data[index] = -std.math.inf(f32);
+    }
+    return argmax(data);
+}
+
 /// Return the index of the largest value.
 pub fn argmax(data: []const f32) usize {
     if (data.len == 0) return 0;
@@ -1703,4 +1714,13 @@ test "Native authored GELU parallel binding returns exact joined terminals indep
     try std.testing.expectEqual(@intFromPtr(&geluValue), evidence.records[0].program_identity);
     try std.testing.expectEqual(@as(u64, lanes), evidence.records[0].entries);
     try std.testing.expectEqual(@as(u64, lanes), evidence.records[0].returns);
+}
+
+test "prefill suppressed argmax preserves tie order and ignores invalid duplicate ids" {
+    var logits = [_]f32{ 3, 8, 3, 8 };
+    try std.testing.expectEqual(@as(usize, 0), argmaxSuppressedInPlace(&logits, &.{ -1, 1, 3, 1, 99 }));
+    try std.testing.expectEqual(@as(f32, 3), logits[0]);
+    try std.testing.expectEqual(-std.math.inf(f32), logits[1]);
+    var masked = [_]f32{ 1, 2 };
+    try std.testing.expectEqual(argmax(&.{ -std.math.inf(f32), -std.math.inf(f32) }), argmaxSuppressedInPlace(&masked, &.{ 0, 1 }));
 }

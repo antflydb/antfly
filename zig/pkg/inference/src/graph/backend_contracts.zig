@@ -40,6 +40,24 @@ pub const BackendKind = enum {
     graph,
 };
 
+/// Physical prefill outputs. Tasks choose the consumer contract; native and
+/// compiled providers share it without materializing unused vocabulary rows.
+pub const PrefillOutputIntent = enum {
+    kv_only,
+    last_logits,
+    greedy_token,
+    last_logits_and_hidden,
+    greedy_token_and_hidden,
+
+    pub fn capturesHidden(self: PrefillOutputIntent) bool {
+        return self == .last_logits_and_hidden or self == .greedy_token_and_hidden;
+    }
+
+    pub fn isGreedy(self: PrefillOutputIntent) bool {
+        return self == .greedy_token or self == .greedy_token_and_hidden;
+    }
+};
+
 /// Public residency policy for the qualified Gemma 4 26B-A4B Q4_0 runtime.
 /// The execution backend resolves `auto` once, at model load, so a session
 /// cannot silently change its memory contract while serving requests.

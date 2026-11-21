@@ -610,7 +610,7 @@ pub fn firstTokenCoalesceLimit() usize {
     return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS") orelse 2048;
 }
 
-const PreparedEmbeddingOutput = enum { last_logits, kv_only };
+const PreparedEmbeddingOutput = decoder_routes.PrefillOutputIntent;
 
 pub const Runtime = struct {
     inline fn acquireForObservation(self: *Runtime) !?@import("../ops/execution_scope.zig").Scope {
@@ -754,7 +754,7 @@ pub const Runtime = struct {
         const shared_prefill = if (allow_shared_kv_prefill and
             !(self.forward.context.cb.kind() == .metal and request.prepared_metal_whole_prompt and output_intent != .kv_only) and
             (output_intent == .kv_only or output_intent == .last_logits or output_intent == .greedy_token))
-            try gpt_arch.trySharedKvPrefill(self.forward.context.cb, allocator, self.forward.context.gpt_config.*, chunk, total_chunk_end, &decode_context, output_intent != .kv_only)
+            try gpt_arch.trySharedKvPrefill(self.forward.context.cb, allocator, self.forward.context.gpt_config.*, chunk, total_chunk_end, &decode_context, output_intent)
         else
             null;
         const metal_prepared: ?Output = if (shared_prefill == null and request.prepared_metal_whole_prompt)
@@ -763,6 +763,7 @@ pub const Runtime = struct {
             null;
         if (shared_prefill) |prepared| {
             prefill_last_logits = prepared.last_logits;
+            prefill_greedy_token = prepared.greedy_token;
             debugGenerationStage("executePrefill shared_kv_pruned rows={d} output={s}", .{ chunk.len, @tagName(output_intent) });
         } else if (metal_prepared) |prepared| {
             prefill_last_logits = prepared.last_logits;
@@ -852,13 +853,13 @@ pub const Runtime = struct {
                     .{self.forward.context.gpt_config.*.vocab_size},
                 );
             }
-        } else if (output_intent == .last_logits and prefer_cuda_direct_last_logits) {
+        } else if (output_intent == .last_logits and (prefer_cuda_direct_last_logits or (can_use_typed_prefill_outputs and self.forward.context.cb.kind() == .native))) {
             prefill_last_logits = self.forward.forwardLastLogits(chunk, 1, total_chunk_end, &decode_context) catch |err| {
                 if (try retryAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, request.attempted_chunk_size, &resized_chunk_size, request.allow_resize, err)) return .{ .retry_chunk_size = resized_chunk_size };
                 return err;
             };
             debugGenerationStage(
-                "executePrefill captured CUDA final-row logits vocab_size={d}",
+                "executePrefill captured final-row logits vocab_size={d}",
                 .{self.forward.context.gpt_config.*.vocab_size},
             );
         } else if (output_intent == .kv_only and can_use_typed_prefill_outputs) {
@@ -951,13 +952,24 @@ pub const Runtime = struct {
         var inherited = if (supplied_cleanup == null and cleanup_operation != null) try cleanup_operation.?.retainCleanupEpoch() else null;
         defer if (inherited) |*epoch| epoch.release();
         const cleanup = @import("cleanup_context.zig").Context{ .boundary = supplied_cleanup orelse if (inherited) |*epoch| epoch else null, .operation = cleanup_operation };
-        var output = (try forward_fn(&self.forward.context, cache, request.token_ids, 1, request.total_sequence_length, &context, .{ .prepared_rows = request.prepared_rows, .kv_only = request.output == .kv_only })) orelse return error.MissingCompiledModelRuntime;
+        var output = (try forward_fn(&self.forward.context, cache, request.token_ids, 1, request.total_sequence_length, &context, .{ .prepared_rows = request.prepared_rows, .output_intent = switch (request.output) {
+            .kv_only => .kv_only,
+            .last_logits => .last_logits,
+            .greedy_token => .greedy_token,
+        } })) orelse return error.MissingCompiledModelRuntime;
         defer output.deinitWithCleanup(allocator, cleanup);
         return switch (request.output) {
             .kv_only => .{},
             .last_logits => .{ .last_logits = try output.takeHostLogitsWithCleanup(allocator, cleanup) },
             .greedy_token => blk: {
-                const token = try output.greedyTokenWithCleanup(allocator, self.forward.context.gpt_config.vocab_size, cleanup);
+                const suppressions = self.forward.context.gpt_config.suppressTokenIds();
+                const token = if (suppressions.len == 0 or (if (output.prepared_tail) |tail| tail.greedy_token_id != null else false))
+                    try output.greedyTokenWithCleanup(allocator, self.forward.context.gpt_config.vocab_size, cleanup)
+                else masked: {
+                    const logits = try output.takeHostLogitsWithCleanup(allocator, cleanup);
+                    defer allocator.free(logits);
+                    break :masked @as(i64, @intCast(@import("../backends/activations.zig").argmaxSuppressedInPlace(logits, suppressions)));
+                };
                 if (token < 0) return error.InvalidModelOutput;
                 break :blk .{ .greedy_token = @intCast(token) };
             },
@@ -1021,7 +1033,7 @@ pub const Runtime = struct {
         owner: *?ops.CT,
         token_ids: []const i64,
         sequence_length: usize,
-        capture_hidden: bool = false,
+        output_intent: PreparedEmbeddingOutput = .last_logits,
         /// Nonzero rows are the caller's existing admitted scratch envelope.
         chunk_rows: usize = 0,
         ensure_device_resident: bool = true,
@@ -1044,6 +1056,7 @@ pub const Runtime = struct {
     }
 
     fn runEmbeddingsOwnedUnobserved(self: *Runtime, request: EmbeddingRequest) !Output {
+        if (request.output_intent == .kv_only or (request.route == .ordinary_last_row and request.output_intent != .last_logits)) return error.InvalidPreparedPrompt;
         const original = request.owner.* orelse return error.InvalidPreparedPrompt;
         request.owner.* = null;
         const cb = self.forward.context.cb;
@@ -1053,13 +1066,13 @@ pub const Runtime = struct {
         const compiled_rows = request.route == .prepared_last_row and self.forward.context.compiled_partition_backend == .metal and
             self.forward.context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null;
         if (compiled_rows) {
-            if (request.capture_hidden or request.attention_mask != null or request.positions != null or request.visual_mask != null or request.deepstack_embeddings != null or request.token_ids.len != request.sequence_length) return error.UnsupportedPreparedRows;
+            if (request.output_intent.capturesHidden() or request.attention_mask != null or request.positions != null or request.visual_mask != null or request.deepstack_embeddings != null or request.token_ids.len != request.sequence_length) return error.UnsupportedPreparedRows;
             const rows = @min(@as(usize, 512), if (request.chunk_rows == 0) @as(usize, 512) else request.chunk_rows);
             owned = false;
             defer cb.free(embeddings);
             return self.runEmbeddingChunks(embeddings, request, rows);
         }
-        if (request.route == .prepared_last_row and !request.capture_hidden and request.attention_mask == null and
+        if (request.route == .prepared_last_row and !request.output_intent.capturesHidden() and request.attention_mask == null and
             request.positions == null and request.visual_mask == null and request.deepstack_embeddings == null and
             self.state.isPaged())
         {
@@ -1086,7 +1099,7 @@ pub const Runtime = struct {
         var numerical = Forward{ .forward = self.forward };
         owned = false;
         return switch (request.route) {
-            .prepared_last_row => try numerical.forwardPreparedEmbeddingsLastLogits(embeddings, request.token_ids, request.sequence_length, &decode, request.capture_hidden),
+            .prepared_last_row => try numerical.forwardPreparedEmbeddingsOutput(embeddings, request.token_ids, request.sequence_length, &decode, request.output_intent),
             .ordinary_last_row => .{ .last_logits = try gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(cb, self.forward.context.allocator, self.forward.context.gpt_config.*, embeddings, .{}, 1, request.sequence_length, &decode, null) },
         };
     }
@@ -1118,7 +1131,7 @@ pub const Runtime = struct {
                     .token_ids = ids,
                     .prepared_rows = .{ .source = cb, .tensor = part, .rows = count, .width = config.hidden_size },
                     .total_sequence_length = end,
-                    .output = if (end == request.sequence_length) .last_logits else .kv_only,
+                    .output = if (end != request.sequence_length) .kv_only else if (request.output_intent.isGreedy()) .greedy_token else .last_logits,
                 }, self.forward.graph_cache.?, graph_mod.execution.graphForwardCompiledModelOutputWithInputs);
                 if (end == request.sequence_length) return result;
                 start = end;
@@ -1131,11 +1144,11 @@ pub const Runtime = struct {
             if (end == request.sequence_length) {
                 var numerical = Forward{ .forward = self.forward };
                 owns_part = false;
-                return numerical.forwardPreparedEmbeddingsLastLogits(part, ids, end, &decode, false);
+                return numerical.forwardPreparedEmbeddingsOutput(part, ids, end, &decode, request.output_intent);
             }
             if (cb.kind() == .metal and count > 1) {
                 var framed = Forward{ .forward = self.forward };
-                if (try framed.tryMetalPreparedEmbeddingChunk(part, ids, end, &decode, false, .kv_only)) |_| {
+                if (try framed.tryMetalPreparedEmbeddingChunk(part, ids, end, &decode, .kv_only)) |_| {
                     start = end;
                     continue;
                 }
@@ -1530,48 +1543,42 @@ pub const Forward = struct {
         };
     }
 
-    pub fn forwardPreparedEmbeddingsLastLogits(
+    pub fn forwardPreparedEmbeddingsOutput(
         self: *Forward,
         input_embeddings: ops.CT,
         ple_token_ids: []const i64,
         seq_len: usize,
         provided_decode_context: *const gpt_arch.DecodeContext,
-        capture_last_hidden: bool,
+        intent: PreparedEmbeddingOutput,
     ) !Output {
         var current_decode_context = provided_decode_context.*;
         try self.forward.context.bindDecoderCleanup(&current_decode_context);
         const decode_context = &current_decode_context;
-        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().forwardPreparedEmbeddingsLastLogitsUnobserved, .{ self, input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden });
+        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().forwardPreparedEmbeddingsOutputUnobserved, .{ self, input_embeddings, ple_token_ids, seq_len, decode_context, intent });
     }
 
-    fn forwardPreparedEmbeddingsLastLogitsUnobserved(
+    fn forwardPreparedEmbeddingsOutputUnobserved(
         self: *Forward,
         input_embeddings: ops.CT,
         ple_token_ids: []const i64,
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
-        capture_last_hidden: bool,
+        intent: PreparedEmbeddingOutput,
     ) !Output {
         var owns_input = true;
         defer if (owns_input) self.forward.context.cb.free(input_embeddings);
-        if (try self.tryMetalPreparedEmbeddingChunk(input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden, .last_logits)) |logits| {
+        if (try self.tryMetalPreparedEmbeddingChunk(input_embeddings, ple_token_ids, seq_len, decode_context, intent)) |logits| {
             return logits;
         }
-        if (capture_last_hidden) return error.MultimodalMtpPrefillUnavailable;
+        if (intent.capturesHidden()) return error.MultimodalMtpPrefillUnavailable;
         const ple_vectors = try gpt_arch.computePleVectors(self.forward.context.cb, self.forward.context.allocator, self.forward.context.gpt_config.*, ple_token_ids, input_embeddings, ple_token_ids.len);
         defer if (ple_vectors) |vectors| self.forward.context.cb.free(vectors);
         owns_input = false;
-        return .{ .last_logits = try gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
-            self.forward.context.cb,
-            self.forward.context.allocator,
-            self.forward.context.gpt_config.*,
-            input_embeddings,
-            .{},
-            1,
-            seq_len,
-            decode_context,
-            ple_vectors,
-        ) };
+        const cb = self.forward.context.cb;
+        const hidden = try gpt_arch.forwardPrefillHiddenFromEmbeddingsWithLayer0Overrides(cb, self.forward.context.allocator, self.forward.context.gpt_config.*, input_embeddings, .{}, 1, seq_len, decode_context, ple_vectors);
+        defer cb.free(hidden.hidden);
+        const head = try gpt_arch.projectPrefillHead(cb, self.forward.context.allocator, self.forward.context.gpt_config.*, hidden, intent);
+        return .{ .last_logits = head.last_logits, .greedy_token = head.greedy_token };
     }
 
     /// The planned Gemma prefill frame for a media prompt: the same route
@@ -1585,13 +1592,12 @@ pub const Forward = struct {
         ple_token_ids: []const i64,
         seq_len: usize,
         provided_decode_context: *const gpt_arch.DecodeContext,
-        capture_last_hidden: bool,
         intent: PreparedEmbeddingOutput,
     ) !?Output {
         var current_decode_context = provided_decode_context.*;
         try self.forward.context.bindDecoderCleanup(&current_decode_context);
         const decode_context = &current_decode_context;
-        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().tryMetalPreparedEmbeddingChunkUnobserved, .{ self, input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden, intent });
+        return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().tryMetalPreparedEmbeddingChunkUnobserved, .{ self, input_embeddings, ple_token_ids, seq_len, decode_context, intent });
     }
 
     fn tryMetalPreparedEmbeddingChunkUnobserved(
@@ -1600,14 +1606,12 @@ pub const Forward = struct {
         ple_token_ids: []const i64,
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
-        capture_last_hidden: bool,
         intent: PreparedEmbeddingOutput,
     ) !?Output {
         if (self.forward.context.cb.kind() != .metal) return null;
         if (decode_context.attention_mode != .paged_prefill or decode_context.attn_or_mask != null) return null;
         if (decode_context.total_sequence_len != seq_len or decode_context.query_sequence_len != ple_token_ids.len or
             decode_context.kv_sequence_len != seq_len or decode_context.kv_position_offset != 0 or ple_token_ids.len > seq_len) return null;
-        if (intent == .kv_only and capture_last_hidden) return null;
         const prepared = self.forward.context.cb.decoderRuntimePrepareOrReuseFamily(
             self.forward.context.allocator,
             self.forward.context.gpt_config.*,
@@ -1631,15 +1635,10 @@ pub const Forward = struct {
         const last_hidden = try self.forward.context.cb.sliceRows2D(self.forward.context.allocator, rows.final_hidden, rows.rows - 1, 1, self.forward.context.gpt_config.*.hidden_size);
         var owns_last_hidden = true;
         defer if (owns_last_hidden) self.forward.context.cb.free(last_hidden);
-        const lm_w = try gpt_arch.getLmHeadWeight(self.forward.context.cb, self.forward.context.gpt_config.*);
-        defer self.forward.context.cb.free(lm_w);
-        const last_logits_device = try self.forward.context.cb.linearNoBias(last_hidden, lm_w, 1, self.forward.context.gpt_config.*.hidden_size, self.forward.context.gpt_config.*.vocab_size);
-        defer self.forward.context.cb.free(last_logits_device);
-        const last_logits = try self.forward.context.cb.toFloat32(last_logits_device, self.forward.context.allocator);
-        gpt_arch.applyFinalLogitSoftcapInPlace(self.forward.context.gpt_config.*, last_logits);
+        const head = try gpt_arch.projectPrefillHead(self.forward.context.cb, self.forward.context.allocator, self.forward.context.gpt_config.*, .{ .hidden = last_hidden, .total_rows = 1 }, intent);
         debugGenerationStage("multimodal prefill metal_prepared_frame rows={d}", .{rows.rows});
-        if (capture_last_hidden) owns_last_hidden = false;
-        return .{ .last_logits = last_logits, .last_hidden = if (capture_last_hidden) last_hidden else null, .last_hidden_rows = if (capture_last_hidden) 1 else 0 };
+        if (intent.capturesHidden()) owns_last_hidden = false;
+        return .{ .last_logits = head.last_logits, .greedy_token = head.greedy_token, .last_hidden = if (intent.capturesHidden()) last_hidden else null, .last_hidden_rows = if (intent.capturesHidden()) 1 else 0 };
     }
 };
 pub fn retryAfterMemoryBudgetExceeded(
@@ -1667,7 +1666,7 @@ const CompiledPrefillFixture = @import("testing/decoder.zig");
 
 fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
     const a = std.testing.allocator;
-    const model = CompiledPrefillFixture.config();
+    var model = CompiledPrefillFixture.config();
     const ids = [_]i64{ 0, 1 };
     const expected = try CompiledPrefillFixture.eager(cb, model, &ids);
     defer a.free(expected);
@@ -1680,13 +1679,15 @@ fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
         numerical_calls: usize = 0,
         decline: bool = false,
         fail_after: bool = false,
+        expected_intent: decoder_routes.PrefillOutputIntent,
         fn get(raw: *anyopaque, name: []const u8) !ops.CT {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return gpt_arch.getTracedWeight(std.testing.allocator, &self.backend, self.config, name);
         }
-        fn forward(ctx: *const graph_mod.execution.Context, _: *graph_mod.cache.GraphCache, tokens: []const i64, batch: usize, sequence: usize, decode: *const gpt_arch.DecodeContext, _: graph_mod.execution.CompiledPrefillOptions) !?graph_mod.model_runtime.ModelOutput {
+        fn forward(ctx: *const graph_mod.execution.Context, _: *graph_mod.cache.GraphCache, tokens: []const i64, batch: usize, sequence: usize, decode: *const gpt_arch.DecodeContext, options: graph_mod.execution.CompiledPrefillOptions) !?graph_mod.model_runtime.ModelOutput {
             const self: *@This() = @ptrCast(@alignCast(ctx.weights.?.ptr));
             self.calls += 1;
+            try std.testing.expectEqual(self.expected_intent, options.output_intent);
             try std.testing.expect(@import("allocation_registry.zig").enabled());
             if (!self.lane.owned) return error.CompiledPrefillMissingExecutionLane;
             if (self.mutex.tryLock()) {
@@ -1703,10 +1704,12 @@ fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
             return output;
         }
     };
-    for (0..6) |scenario| {
+    for (0..7) |scenario| {
+        model.suppress_token_ids_len = if (scenario == 6) 1 else 0;
+        model.suppress_token_ids[0] = if (expected[1] > expected[0]) 1 else 0;
         var mutex: std.atomic.Mutex = .unlocked;
         var lane = control.ExecutionLane{};
-        var probe = Probe{ .backend = cb, .config = &model, .mutex = &mutex, .lane = &lane, .decline = scenario == 3, .fail_after = scenario == 4 };
+        var probe = Probe{ .backend = cb, .config = &model, .mutex = &mutex, .lane = &lane, .decline = scenario == 3, .fail_after = scenario == 4, .expected_intent = if (scenario == 0) .kv_only else if (scenario == 2 or scenario == 6) .greedy_token else .last_logits };
         var cache = graph_mod.cache.GraphCache.init(a);
         defer cache.deinit();
         var state = graph_mod.decode_state_runtime.NativeDecodeState.initContiguous(a);
@@ -1715,7 +1718,7 @@ fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
         diagnostics.configureBackend(true, &cb);
         const session = @import("../backends/session.zig").Session{ .ptr = &probe, .vtable = undefined, .invocation_diagnostics = .{ .diagnostics = &diagnostics } };
         var physical = Runtime{ .forward = .{ .context = .{ .session = session, .allocator = a, .cb = &cb, .gpt_config = &model, .weights = .{ .ptr = &probe, .get_fn = Probe.get } }, .graph_cache = &cache }, .state = &state, .execution = .{ .mutex = &mutex, .gate = &lane, .control = if (scenario == 5) .{ .deadline_ns = 0 } else null } };
-        const request = Runtime.CompiledChunk{ .token_ids = &ids, .total_sequence_length = ids.len, .output = if (scenario == 0) .kv_only else if (scenario == 2) .greedy_token else .last_logits };
+        const request = Runtime.CompiledChunk{ .token_ids = &ids, .total_sequence_length = ids.len, .output = if (scenario == 0) .kv_only else if (scenario == 2 or scenario == 6) .greedy_token else .last_logits };
         if (scenario == 5) {
             try std.testing.expectError(error.Timeout, physical.runCompiledChunkWith(request, Probe.forward));
         } else if (scenario == 3) {
@@ -1727,7 +1730,7 @@ fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
             defer if (result.last_logits) |values| a.free(values);
             if (scenario == 0) try std.testing.expect(result.last_logits == null and result.greedy_token == null);
             if (scenario == 1) try std.testing.expectEqualSlices(f32, expected, result.last_logits.?);
-            if (scenario == 2) try std.testing.expectEqual(@as(usize, if (expected[1] > expected[0]) 1 else 0), result.greedy_token.?);
+            if (scenario == 2 or scenario == 6) try std.testing.expectEqual(@as(usize, if (scenario == 6) (if (expected[1] > expected[0]) 0 else 1) else (if (expected[1] > expected[0]) 1 else 0)), result.greedy_token.?);
         }
         try std.testing.expectEqual(@as(usize, if (scenario == 5) 0 else 1), probe.calls);
         try std.testing.expectEqual(@as(usize, if (scenario == 3 or scenario == 5) 0 else 1), probe.numerical_calls);
@@ -1736,7 +1739,7 @@ fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
         try std.testing.expect(!@import("allocation_registry.zig").enabled());
         const observed = diagnostics.snapshot() orelse return error.MissingCompiledPrefillObservation;
         try std.testing.expect(observed.operation == .prefill);
-        if (scenario >= 3) {
+        if (scenario >= 3 and scenario <= 5) {
             try std.testing.expect(observed.outcome == .failed);
             const name: []const u8 = if (scenario == 3) "MissingCompiledModelRuntime" else if (scenario == 4) "InjectedCommittedCompiledPrefill" else "Timeout";
             try std.testing.expectEqualStrings(name, observed.error_name.?.view());
@@ -2466,4 +2469,27 @@ test "positioned request cancellation preserves actual Native prefix and state b
     };
     const helper = @import("../ops/media_residency_test.zig");
     try helper.onNative(helper.noWeights, Case.run);
+}
+
+fn checkBatchLastHeadRows(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cfg = CompiledPrefillFixture.config();
+    const ids = [_]i64{ 0, 1, 0, 1, 0, 1 };
+    const decode = gpt_arch.DecodeContext{ .total_sequence_len = 3, .query_sequence_len = 3, .kv_sequence_len = 3, .attention_mode = .full_recompute };
+    const all = try gpt_arch.forward(&cb, a, cfg, &ids, 2, 3, &decode);
+    defer a.free(all);
+    for ([_][2]usize{ .{ 2, 3 }, .{ 3, 1 } }) |lengths| {
+        const selected = try gpt_arch.forwardBatchLastLogits(&cb, a, cfg, &ids, &lengths, 3, &decode);
+        defer a.free(selected);
+        for (lengths, 0..) |length, item| {
+            const row = (item * 3 + length - 1) * cfg.vocab_size;
+            for (all[row..][0..cfg.vocab_size], selected[item * cfg.vocab_size ..][0..cfg.vocab_size]) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+        }
+    }
+    try std.testing.expectError(error.InvalidShape, gpt_arch.forwardBatchLastLogits(&cb, a, cfg, &ids, &.{ 0, 3 }, 3, &decode));
+    try std.testing.expectError(error.InvalidShape, gpt_arch.forwardBatchLastLogits(&cb, a, cfg, &ids, &.{ 4, 3 }, 3, &decode));
+}
+
+test "prefill compact Native vocabulary rows match full head at unequal actual query ends" {
+    try @import("../ops/media_residency_test.zig").onNative(CompiledPrefillFixture.populate, checkBatchLastHeadRows);
 }

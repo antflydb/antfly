@@ -1538,7 +1538,7 @@ pub const Executor = struct {
                 var decode_runtime = BorrowedDecodeStateRuntime.init(work.decode_state);
                 var context = decode_runtime.makeDecodeContext(work.seq_len, work.query_seq_len);
                 try self.context.bindDecoderCleanup(&context);
-                if (try gpt_arch.trySharedKvPrefill(self.context.cb, self.context.allocator, self.context.gpt_config.*, work.token_ids, work.seq_len, &context, false)) |_| {
+                if (try gpt_arch.trySharedKvPrefill(self.context.cb, self.context.allocator, self.context.gpt_config.*, work.token_ids, work.seq_len, &context, .kv_only)) |_| {
                     return .{ .logits = null, .max_query_seq_len = max_query_seq_len };
                 }
             }
@@ -1678,6 +1678,17 @@ pub const Executor = struct {
             // Only the final prefix row is sampled. Avoid constructing and
             // downloading a vocabulary distribution for every image token.
             const logits = try gpt_arch.forwardLastLogitsWithCudaReplay(self.context.cb, self.context.allocator, self.context.gpt_config.*, input_ids, 1, max_query_seq_len, &owned_ctx.context, "gpt.cuda_lighton_prefill");
+            return .{ .logits = logits, .max_query_seq_len = max_query_seq_len, .last_rows_only = true };
+        }
+        // Preserve batching and physical KV ownership; prune only vocabulary
+        // rows. A compact hidden gather must fit the original logits envelope.
+        if (self.context.cb.kind() == .native and self.graph_cache == null and self.context.compiled_partition_backend == null and
+            claimed.len <= packed_head_rows.capacity and max_query_seq_len > 1 and
+            self.context.gpt_config.hidden_size / self.context.gpt_config.vocab_size < max_query_seq_len - 1)
+        {
+            var lengths: [packed_head_rows.capacity]usize = undefined;
+            for (claimed, 0..) |item, row| lengths[row] = item.query_sequence_len;
+            const logits = try gpt_arch.forwardBatchLastLogits(self.context.cb, self.context.allocator, self.context.gpt_config.*, input_ids, lengths[0..claimed.len], max_query_seq_len, &owned_ctx.context);
             return .{ .logits = logits, .max_query_seq_len = max_query_seq_len, .last_rows_only = true };
         }
         const logits = try self.forwardAllLogits(input_ids, claimed.len, max_query_seq_len, &owned_ctx.context);

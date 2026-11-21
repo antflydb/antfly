@@ -853,7 +853,7 @@ pub fn graphForwardCompiledModelOutput(
 
 pub const CompiledPrefillOptions = struct {
     prepared_rows: ?@import("../execution/resident_rows.zig").Rows = null,
-    kv_only: bool = false,
+    output_intent: @import("backend_contracts.zig").PrefillOutputIntent = .last_logits,
 };
 
 pub fn graphForwardCompiledModelOutputWithInputs(
@@ -885,7 +885,8 @@ pub fn graphForwardCompiledModelOutputWithInputs(
     var request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
     if (request == .prefill) {
         request.prefill.prepared_rows = options.prepared_rows;
-        request.prefill.kv_only = options.kv_only;
+        request.prefill.kv_only = options.output_intent == .kv_only;
+        request.prefill.prefer_greedy_token = options.output_intent.isGreedy();
     }
     switch (request) {
         inline else => |*value| {

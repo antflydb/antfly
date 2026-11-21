@@ -49,13 +49,7 @@ pub fn retainsPreparedPromptInputs(backend: runtime.kv.pool.BackendKind, config:
     return (backend == .cuda or backend == .metal) and config.sharedKvPrefillDonorLayers() != null;
 }
 
-pub const PrefillOutputIntent = enum {
-    kv_only,
-    last_logits,
-    greedy_token,
-    last_logits_and_hidden,
-    greedy_token_and_hidden,
-};
+pub const PrefillOutputIntent = @import("../graph/backend_contracts.zig").PrefillOutputIntent;
 
 pub fn ordinaryMetalGemmaDraftNeedsContiguousState(
     backend: ops.BackendKind,
@@ -270,15 +264,24 @@ pub fn shouldUseCudaPrefillGreedyToken(
     return enabled and
         allow_resident_greedy_token and
         backend_kind == .cuda and
+        !request.has_token_observer and
         request.storage.pure_greedy and
         !request.storage.grammar;
 }
 
+pub fn shouldUsePreparedPrefillGreedyToken(backend: ops.BackendKind, model: gpt_mod.Config, request: Request, allow: bool, needs_host_logits: bool, enabled: bool) bool {
+    if (needs_host_logits or request.has_token_observer or !request.exact_hybrid or request.storage.compaction or
+        !gpt_arch.canUseFastGreedyArgmaxForConfig(model)) return false;
+    return switch (backend) {
+        .cuda => shouldUseCudaPrefillGreedyToken(backend, request, allow, model.suppressTokenIds().len != 0, enabled),
+        .metal => enabled and allow and request.storage.pure_greedy and !request.storage.grammar,
+        else => false,
+    };
+}
+
 pub fn shouldUsePreparedQwenPrefillGreedyToken(backend: ops.BackendKind, model: gpt_mod.Config, request: Request, allow: bool, needs_host_logits: bool, enabled: bool) bool {
-    return !needs_host_logits and model.hasQwen35VisionArchitectureContract() and
-        !request.has_token_observer and request.exact_hybrid and !request.storage.compaction and
-        gpt_arch.canUseFastGreedyArgmaxForConfig(model) and
-        shouldUseCudaPrefillGreedyToken(backend, request, allow, model.suppressTokenIds().len != 0, enabled);
+    return backend == .cuda and model.hasQwen35VisionArchitectureContract() and
+        shouldUsePreparedPrefillGreedyToken(backend, model, request, allow, needs_host_logits, enabled);
 }
 
 pub const default_positioned_prefill_items: usize = 8;
@@ -357,4 +360,25 @@ test "Metal shared KV prefill keeps admitted chunks and isolates unsupported ada
     unsupported.num_hidden_layers = 35;
     try std.testing.expect(metalPreparedEmbeddingChunkRows(unsupported, 512) == null);
     try std.testing.expect(!retainsPreparedPromptInputs(.metal, unsupported));
+}
+
+test "prepared prefill greedy intent excludes logit observers compaction and sampled consumers" {
+    const model = @import("testing/decoder.zig").config();
+    const base = Request{ .storage = .{ .pure_greedy = true, .grammar = false, .prompt_cache = false, .compaction = false, .speculation = false, .draft = false }, .has_token_observer = false, .exact_hybrid = true };
+    for ([_]ops.BackendKind{ .metal, .cuda }) |backend| {
+        try std.testing.expect(shouldUsePreparedPrefillGreedyToken(backend, model, base, true, false, true));
+        try std.testing.expect(!shouldUsePreparedPrefillGreedyToken(backend, model, base, true, true, true));
+        try std.testing.expect(!shouldUsePreparedPrefillGreedyToken(backend, model, base, false, false, true));
+        for (0..4) |mode| {
+            var request = base;
+            switch (mode) {
+                0 => request.has_token_observer = true,
+                1 => request.storage.compaction = true,
+                2 => request.storage.pure_greedy = false,
+                3 => request.storage.grammar = true,
+                else => unreachable,
+            }
+            try std.testing.expect(!shouldUsePreparedPrefillGreedyToken(backend, model, request, true, false, true));
+        }
+    }
 }

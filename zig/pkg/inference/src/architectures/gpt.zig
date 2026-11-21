@@ -26,6 +26,7 @@
 // - Gated FFN with SiLU (LLaMA, Mistral) vs plain FFN with GELU (GPT-2)
 
 const std = @import("std");
+const PrefillOutputIntent = @import("../graph/backend_contracts.zig").PrefillOutputIntent;
 const is_freestanding = @import("builtin").os.tag == .freestanding;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -1271,6 +1272,37 @@ pub fn forwardGreedyLastTokenFromPositionedEmbeddingsWithLayer0Overrides(
 /// Last-logits consumers require one vocabulary row even when their hidden
 /// producer also publishes the complete prompt. Borrow the last hidden view,
 /// project once, and transfer ownership of that one host result to the caller.
+/// Scheduled padded batches need one vocabulary row per item, at its actual
+/// query end, rather than the padding end. The existing layer stack and head
+/// math are unchanged. The caller admits this only when its gather plus head
+/// fits inside the previous all-row vocabulary envelope.
+pub fn forwardBatchLastLogits(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    query_lengths: []const usize,
+    padded_rows: usize,
+    decode: *const DecodeContext,
+) ![]f32 {
+    if (query_lengths.len == 0 or padded_rows == 0) return error.InvalidShape;
+    for (query_lengths) |length| if (length == 0 or length > padded_rows) return error.InvalidShape;
+    const compact = (try cb.allocUninitF32Shape(&.{ @intCast(query_lengths.len), @intCast(config.hidden_size) })) orelse return error.UnsupportedShape;
+    defer cb.free(compact);
+    const hidden = try forwardHiddenTensorWithCudaReplay(cb, allocator, config, input_ids, query_lengths.len, padded_rows, decode, "gpt.batch_last_logits");
+    defer cb.free(hidden);
+    for (query_lengths, 0..) |length, item| {
+        if (!try cb.copyRows2D(allocator, compact, item, hidden, item * padded_rows + length - 1, 1, config.hidden_size)) return error.UnsupportedShape;
+    }
+    const weight = try getLmHeadWeight(cb, config);
+    defer cb.free(weight);
+    const projected = try cb.linearNoBias(compact, weight, query_lengths.len, config.hidden_size, config.vocab_size);
+    defer cb.free(projected);
+    const result = try cb.toFloat32(projected, allocator);
+    applyFinalLogitSoftcap(config, result);
+    return result;
+}
+
 fn projectLastHiddenLogits(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden_result: HiddenTensorResult) ![]f32 {
     if (hidden_result.total_rows == 0) return error.InvalidShape;
     const last = if (hidden_result.total_rows == 1) hidden_result.hidden else try cb.sliceRows2D(allocator, hidden_result.hidden, hidden_result.total_rows - 1, 1, config.hidden_size);
@@ -1353,6 +1385,35 @@ pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) !CT {
+    const hidden_result = try forwardPrefillHiddenFromEmbeddingsWithLayer0Overrides(cb, allocator, config, hidden_input, overrides, batch, seq_len, decode_context, ple_vectors);
+    const hidden = hidden_result.hidden;
+    defer cb.free(hidden);
+
+    const last_hidden = if (hidden_result.total_rows == 1)
+        hidden
+    else
+        try cb.sliceRows2D(allocator, hidden, hidden_result.total_rows - 1, 1, config.hidden_size);
+    defer if (last_hidden != hidden) cb.free(last_hidden);
+
+    const lm_w = try getLmHeadWeight(cb, config);
+    defer cb.free(lm_w);
+
+    return cb.linearNoBias(last_hidden, lm_w, 1, config.hidden_size, config.vocab_size);
+}
+
+/// Shared normalized hidden producer for last-row logits and greedy consumers.
+/// Pruning, precision, position and KV publication policies remain identical.
+pub fn forwardPrefillHiddenFromEmbeddingsWithLayer0Overrides(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    overrides: Layer0DecoderOverrides,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+) !HiddenTensorResult {
     const output: SharedKvPrefillOutput = if (batch == 1 and cb.kind() == .cuda and
         (getenvBool("ANTFLY_INFERENCE_CUDA_MULTIMODAL_SHARED_KV_PREFILL") or
             @import("../ops/cuda/cuda_compute.zig").CudaCompute.nativePrefillPolicySelected(cb) or
@@ -1368,7 +1429,7 @@ pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
     if (output == .last) std.log.info("multimodal_shared_kv_prefill backend={s} rows={d} donor_layers={d}", .{
         @tagName(cb.kind()), seq_len, config.num_hidden_layers - config.num_kv_shared_layers,
     });
-    const hidden_result = try forwardFinalHiddenWithSharedKvOutput(
+    return forwardFinalHiddenWithSharedKvOutput(
         cb,
         allocator,
         config,
@@ -1382,19 +1443,6 @@ pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
         null,
         output,
     );
-    const hidden = hidden_result.hidden;
-    defer cb.free(hidden);
-
-    const last_hidden = if (hidden_result.total_rows == 1)
-        hidden
-    else
-        try cb.sliceRows2D(allocator, hidden, hidden_result.total_rows - 1, 1, config.hidden_size);
-    defer if (last_hidden != hidden) cb.free(last_hidden);
-
-    const lm_w = try getLmHeadWeight(cb, config);
-    defer cb.free(lm_w);
-
-    return cb.linearNoBias(last_hidden, lm_w, 1, config.hidden_size, config.vocab_size);
 }
 
 pub fn forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
@@ -2078,13 +2126,7 @@ pub fn greedyLastTokenTensorFromFinalHiddenRetain(
     const result = try cb.toFloat32(logits, allocator);
     defer allocator.free(result);
     applyFinalLogitSoftcap(config, result);
-    const last = result;
-    for (config.suppressTokenIds()) |token_id| {
-        if (token_id < 0) continue;
-        const idx: usize = @intCast(token_id);
-        if (idx < last.len) last[idx] = -std.math.inf(f32);
-    }
-    return .{ .token_id = activations.argmax(last) };
+    return .{ .token_id = activations.argmaxSuppressedInPlace(result, config.suppressTokenIds()) };
 }
 
 fn greedyLastTokenTensorOnlyFromFinalHiddenRetain(
@@ -3117,7 +3159,25 @@ test "E4B shared KV last row retains absolute positions and full donor KV extent
     try std.testing.expectEqualSlices(i64, &ids, dc.input_ids.?);
 }
 
-pub const SharedKvPrefillResult = struct { last_logits: ?[]f32 = null };
+pub const PrefillHeadResult = struct {
+    last_logits: ?[]f32 = null,
+    greedy_token: ?usize = null,
+};
+
+/// Borrow normalized hidden rows and publish exactly the requested head ABI.
+/// Unsupported fused heads retain the existing projection/selection fallback;
+/// a submitted prefix is never replayed to change its consumer representation.
+pub fn projectPrefillHead(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: HiddenTensorResult, intent: PrefillOutputIntent) !PrefillHeadResult {
+    return switch (intent) {
+        .kv_only => .{},
+        .last_logits, .last_logits_and_hidden => .{ .last_logits = try projectLastHiddenLogits(cb, allocator, config, hidden) },
+        .greedy_token, .greedy_token_and_hidden => blk: {
+            const result = try greedyLastTokenTensorFromFinalHiddenRetain(cb, allocator, config, hidden);
+            defer if (result.token_tensor) |token| cb.free(token);
+            break :blk .{ .greedy_token = result.token_id };
+        },
+    };
+}
 
 /// E4B's shared suffix produces no KV. KV-only chunks can omit it, and a
 /// final-logit chunk only needs its last row. Null always precedes KV writes;
@@ -3129,9 +3189,10 @@ pub fn trySharedKvPrefill(
     input_ids: []const i64,
     seq_len: usize,
     dc: *const DecodeContext,
-    want_last_logits: bool,
-) !?SharedKvPrefillResult {
-    if (disableSharedKvDebug()) return null;
+    intent: PrefillOutputIntent,
+) !?PrefillHeadResult {
+    if (disableSharedKvDebug() or intent.capturesHidden()) return null;
+    const want_last_row = intent != .kv_only;
     const enabled = switch (cb.kind()) {
         .metal => platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true),
         .cuda => if (comptime build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb) else false,
@@ -3150,7 +3211,7 @@ pub fn trySharedKvPrefill(
     _ = sharedKvPrefillBoundary(config, dc.*) orelse return null;
     if (input_ids.len != dc.query_sequence_len or seq_len != dc.total_sequence_len) return null;
     if (cb.kind() == .metal) {
-        if (want_last_logits) return null;
+        if (want_last_row) return null;
         const prepared = cb.decoderRuntimePrepareOrReuseFamily(allocator, config, seq_len, config.num_hidden_layers) catch return null;
         if (!prepared.prepared) return null;
         var rows = (try @import("../backends/decoder_gated_runtime.zig").forwardFinalHiddenRowsKvOnly(cb, allocator, config, config.num_hidden_layers, input_ids, seq_len, dc)) orelse return null;
@@ -3165,8 +3226,8 @@ pub fn trySharedKvPrefill(
     const ple = try computePleVectors(cb, allocator, config, input_ids, hidden, input_ids.len);
     defer if (ple) |tensor| cb.free(tensor);
     std.log.info("shared_kv_prefill backend={s} query_rows={d} donor_layers={d} shared_layers={d} output={s}", .{
-        @tagName(cb.kind()),                                          input_ids.len, config.num_hidden_layers - config.num_kv_shared_layers, config.num_kv_shared_layers,
-        if (want_last_logits) @as([]const u8, "last") else "kv_only",
+        @tagName(cb.kind()), input_ids.len, config.num_hidden_layers - config.num_kv_shared_layers, config.num_kv_shared_layers,
+        @tagName(intent),
     });
     owns_hidden = false;
     const result = try forwardFinalHiddenWithSharedKvOutput(
@@ -3181,18 +3242,12 @@ pub fn trySharedKvPrefill(
         ple,
         null,
         null,
-        if (want_last_logits) .last else .kv_only,
+        if (want_last_row) .last else .kv_only,
     );
     defer cb.free(result.hidden);
-    if (!want_last_logits) return .{};
+    if (!want_last_row) return .{};
     if (result.total_rows != 1) return error.ShapeMismatch;
-    const lm_w = try getLmHeadWeight(cb, config);
-    defer cb.free(lm_w);
-    const logits = try cb.linearNoBias(result.hidden, lm_w, 1, config.hidden_size, config.vocab_size);
-    defer cb.free(logits);
-    const values = try cb.toFloat32(logits, allocator);
-    applyFinalLogitSoftcap(config, values);
-    return .{ .last_logits = values };
+    return try projectPrefillHead(cb, allocator, config, result, intent);
 }
 
 fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(

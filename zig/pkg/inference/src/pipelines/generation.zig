@@ -3831,7 +3831,7 @@ pub const NativeGenerationPipeline = struct {
                 self.gpt_config,
                 config,
                 allow_prefill_greedy_token and !use_speculative and !has_any_grammar,
-                self.checkpoint_prepare != null or config.qwen3vl_parity_json_path != null or config.qwen3vl_parity_logits_path != null or firstTokenTopKTraceCount() > 0 or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE"),
+                self.prefillNeedsHostLogits(config),
                 enableCudaPrefillFirstToken() and enableCudaPrefillGreedyToken(),
             ))
         else if (prepared_multimodal_prompt) |*prepared|
@@ -5193,13 +5193,21 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn prefillNeedsHostLogits(self: *NativeGenerationPipeline, config: GenerationConfig) bool {
+        return self.checkpoint_prepare != null or config.token_observer != null or
+            config.qwen3vl_parity_json_path != null or config.qwen3vl_parity_logits_path != null or
+            firstTokenTopKTraceCount() > 0 or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE") or
+            platform.env.getenv("TERMITE_METAL_DUMP_GENERATE_LOGITS_F32") != null or
+            @import("../backends/decoder_tail_runtime.zig").repackQualityRawLogitsEnabled();
+    }
+
     fn promptRequest(self: *NativeGenerationPipeline, config: GenerationConfig, seq_len: usize, query_tokens: usize, prefilled_tokens: usize, allow_resident_greedy_token: bool, capture_last_hidden: bool) decoder_prefill.PromptRequest {
         return .{
             .route = decoderRouteRequest(config),
             .prompt_tokens = seq_len,
             .query_tokens = query_tokens,
             .prefilled_tokens = prefilled_tokens,
-            .allow_resident_greedy = allow_resident_greedy_token,
+            .allow_resident_greedy = allow_resident_greedy_token and !self.prefillNeedsHostLogits(config),
             .capture_hidden = capture_last_hidden,
             .selected_kv = config.kv_cache_mode == .select_v1,
             .checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null,
@@ -5262,7 +5270,7 @@ pub const NativeGenerationPipeline = struct {
             .owner = &prepared.input_embeddings,
             .token_ids = prepared.ple_token_ids orelse prepared.token_ids,
             .sequence_length = seq_len,
-            .capture_hidden = capture_last_hidden,
+            .output_intent = decoder_routes.prefillOutputIntent(true, !capture_last_hidden and self.draft_cb == null and decoder_routes.shouldUsePreparedPrefillGreedyToken(self.cb.kind(), self.gpt_config, decoderRouteRequest(config), true, self.prefillNeedsHostLogits(config), self.cb.kind() != .cuda or (enableCudaPrefillFirstToken() and enableCudaPrefillGreedyToken())), capture_last_hidden),
             .chunk_rows = admitted_chunk_rows,
             .attention_mask = prepared.attn_or_mask,
         });
@@ -5291,7 +5299,7 @@ pub const NativeGenerationPipeline = struct {
         capture_last_hidden: bool,
     ) !PrefillOutput {
         var numerical = decoder_prefill.Forward{ .forward = self.physicalDecoder() };
-        return numerical.forwardPreparedEmbeddingsLastLogits(input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden);
+        return numerical.forwardPreparedEmbeddingsOutput(input_embeddings, ple_token_ids, seq_len, decode_context, if (capture_last_hidden) .last_logits_and_hidden else .last_logits);
     }
 
     // Uniform-length pages only; the caller reserves the complete group peak.
