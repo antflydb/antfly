@@ -9188,8 +9188,7 @@ test "SQL session metadata for a retained reader checks the shared session and l
         fn openReadScope(self: *@This(), _: std.mem.Allocator) anyerror!*@This() {
             return self;
         }
-        fn getRange(self: *@This(), _: []const u8, offset: u64, length: usize) anyerror![]const u8 {
-            try std.testing.expectEqual(@as(u64, 0), offset);
+        fn probePrefix(self: *@This(), _: []const u8, length: usize) anyerror![]const u8 {
             try std.testing.expectEqual(self.prefix.len, length);
             return self.prefix;
         }
