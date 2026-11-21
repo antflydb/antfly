@@ -14951,20 +14951,28 @@ pub const DataServer = struct {
                         route.visibility_cancellation,
                     );
                 }
-                // The unpublished child has no public write route. Its
-                // topology control carries no document mutation, and the
-                // exact private owner was checked before reaching Raft.
-                if (req.restore_staging_scope == null and route.initial_child_bootstrap == null and needsDenseRepairWritePreflight(req))
+                // A split destination is admitted by its exact transition,
+                // including before the public catalog contains its range.
+                if (comptime linked_storage) {
+                    if (req.split_replication) |replication| {
+                        if (req.restore_staging_scope != null or route.initial_child_bootstrap != null or route.write_route_fence != null)
+                            return error.InvalidBatchRequest;
+                        storage_owner_descriptor = try self.loadSplitRaftDestinationDescriptor(try self.ensureKernelOwnerSource(), alloc, group_id, table_name, replication, route.visibility_cancellation);
+                    }
+                }
+                // Ordinary owner preflight uses public range routing. The
+                // private child bootstrap and verified split replication
+                // already carry their own structural admission.
+                if (req.restore_staging_scope == null and route.initial_child_bootstrap == null and
+                    storage_owner_descriptor == null and needsDenseRepairWritePreflight(req))
                     try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
                 if (req.restore_staging_scope == null and route.initial_child_bootstrap == null and req.merge_page == null and req.split_replication == null and req.merge_replication == null and (req.writes.len != 0 or req.transforms.len != 0))
                     try admission_source.preflightGroupedSourceWriteAdmission(alloc, group_id, table_name, req);
                 if (comptime linked_storage) {
-                    if (restore_owner_descriptor == null) {
+                    if (restore_owner_descriptor == null and storage_owner_descriptor == null) {
                         const owner_source = try self.ensureKernelOwnerSource();
                         storage_owner_descriptor = if (route.initial_child_bootstrap) |bootstrap|
                             try owner_source.loadInitialChildDescriptor(alloc, group_id, table_name, bootstrap)
-                        else if (req.split_replication) |replication|
-                            try self.loadSplitRaftDestinationDescriptor(owner_source, alloc, group_id, table_name, replication, route.visibility_cancellation)
                         else if (completion_command)
                             try owner_source.loadCompletionDescriptor(alloc, group_id, table_name, completion_context)
                         else
