@@ -437,8 +437,9 @@ pub const Adapter = struct {
                     break :zig017_failure error.SqlTransactionOutcomeUnknown;
                 };
                 if (commit.outcome == .aborted and !already_failed) return zig017_failure: {
-                    zig017_return_error = error.SqlWriteConflict;
-                    break :zig017_failure error.SqlWriteConflict;
+                    const cause = commit.abort_cause orelse error.SqlWriteConflict;
+                    zig017_return_error = cause;
+                    break :zig017_failure cause;
                 };
                 if (commit.outcome == .aborted) result.output.command_tag = "ROLLBACK";
                 result.output.mutation_outcome = switch (commit.outcome) {
@@ -618,8 +619,9 @@ pub const Adapter = struct {
                     .committed_pending => .committed_pending,
                     .committed_repair_required => .committed_repair_required,
                     .aborted => return zig017_failure: {
-                        zig017_return_error = error.SqlWriteConflict;
-                        break :zig017_failure error.SqlWriteConflict;
+                        const cause = commit.abort_cause orelse error.SqlWriteConflict;
+                        zig017_return_error = cause;
+                        break :zig017_failure cause;
                     },
                     .unknown => return zig017_failure: {
                         zig017_return_error = error.SqlTransactionOutcomeUnknown;

@@ -1374,6 +1374,7 @@ fn executeMultiTableCommitOnce(
         return err;
     };
 
+    defer if (admitted) |stamp| alloc.free(stamp.enlisted);
     const participant_ids = try alloc.alloc([]const u8, participants.items.len);
     var participant_ids_initialized: usize = 0;
     defer {
@@ -2197,7 +2198,8 @@ const TableRoutes = struct {
     const manager = @import("../metadata/table_manager.zig");
     requirements: TableCommitRequest,
     descriptor: ?*const manager.TableRecord = null,
-    ranges: std.ArrayList(*const manager.RangeRecord) = .empty,
+    range_builder: std.ArrayList(*const manager.RangeRecord) = .empty,
+    ranges: []const *const manager.RangeRecord = &.{},
     epoch: u64 = 0,
     groups: ParticipantGroups = .empty,
     guard_owners: std.AutoHashMapUnmanaged(u64, range_reads.ProofMap) = .empty,
@@ -2230,7 +2232,16 @@ const TableRoutes = struct {
 const range_reads = @import("antfly_local_sources").api_range_read_guards;
 const RoutingIdentity = struct {
     group_id: u64,
+    verified_revision: ?u64 = null,
+    enlisted: []const AdmissionRequest.TableCheck = &.{},
     incarnation: ?@import("../metadata/api.zig").MetadataClusterIncarnation,
+
+    fn requireIncarnation(self: RoutingIdentity, bound: ?[16]u8) !void {
+        if (bound) |id| {
+            const actual = self.incarnation orelse return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, &actual, &std.fmt.bytesToHex(id, .lower))) return error.CatalogGenerationChanged;
+        }
+    }
 
     fn from(snapshot: *const @import("../metadata/api.zig").AdminSnapshot) RoutingIdentity {
         return .{ .group_id = snapshot.status.metadata_group_id, .incarnation = snapshot.status.metadata_incarnation };
@@ -2267,11 +2278,12 @@ fn loadTableRoutes(a: std.mem.Allocator, by_name: *RoutesByName, snapshot: *cons
     for (snapshot.ranges) |*range| {
         const routes = by_id.get(range.table_id) orelse continue;
         if (legacy_groups.contains(range.group_id)) return error.TopologyChanged;
-        try routes.ranges.append(a, range);
+        try routes.range_builder.append(a, range);
     }
     for (by_name.values()) |*routes| {
-        if (routes.ranges.items.len == 0) return error.TableNotFound;
-        routes.epoch = table_catalog.sortedTransactionTopologyEpoch(routes.descriptor.?.*, routes.ranges.items);
+        routes.ranges = routes.range_builder.items;
+        if (routes.ranges.len == 0) return error.TableNotFound;
+        routes.epoch = table_catalog.sortedTransactionTopologyEpoch(routes.descriptor.?.*, routes.ranges);
     }
 }
 
@@ -2296,8 +2308,26 @@ test "distributed txn batched admission checks legacy owner groups and ignores t
     }
 }
 
+const AdmissionRequest = @import("../metadata/api.zig").DecisionAdmissionRequest;
+
+fn validateTableBatch(catalog: table_catalog.CatalogSource, identity: RoutingIdentity, tables: []const AdmissionRequest.TableCheck) !?u64 {
+    const capture = catalog.vtable.decision_admission orelse return null;
+    const check = capture(catalog.ptr, .{
+        .table_name = tables[0].table_name,
+        .table_id = tables[0].table_id,
+        .table_batch = .{ .tables = tables, .verified_revision = identity.verified_revision.? },
+    }, catalog.budget(null)) catch |err| if (err == error.UnsupportedOperation) return null else return err;
+    // An older metadata peer can answer only for the first table.
+    if (!check.tables_checked) return null;
+    if (check.metadata_group_id != identity.group_id or !std.meta.eql(check.metadata_incarnation, identity.incarnation)) return error.CatalogGenerationChanged;
+    if (!check.stable) return error.TopologyChanged;
+    return check.catalog_revision;
+}
+
 fn validateParticipantEpochs(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, participants: []const ParticipantTxn, admitted: ?RoutingIdentity) !void {
     if (participants.len == 0) return;
+    const identity = admitted orelse return error.CatalogGenerationChanged;
+    if (identity.enlisted.len != 0 and (try validateTableBatch(table_catalog.decisionCatalog(catalog), identity, identity.enlisted)) != null) return;
     var workspace = std.heap.ArenaAllocator.init(alloc);
     defer workspace.deinit();
     const a = workspace.allocator();
@@ -2308,7 +2338,7 @@ fn validateParticipantEpochs(alloc: std.mem.Allocator, catalog: table_catalog.Ca
     }
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    if (!std.meta.eql(admitted orelse return error.CatalogGenerationChanged, RoutingIdentity.from(&snapshot))) return error.CatalogGenerationChanged;
+    if (identity.group_id != snapshot.status.metadata_group_id or !std.meta.eql(identity.incarnation, snapshot.status.metadata_incarnation)) return error.CatalogGenerationChanged;
     try loadTableRoutes(a, &by_name, &snapshot);
     for (participants) |participant| {
         if (participant.topology_epoch != 0 and by_name.getPtr(participant.table_name).?.epoch != participant.topology_epoch) return error.TopologyChanged;
@@ -2331,13 +2361,38 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
             table.predicates.len != 0 or table.transforms.len != 0 or table.integrity.len != 0 or table.integrity_commands.len != 0 or
             table.relational_activation != null or table.relational_retirement != null or table.relational_index_maintenance != null;
     }
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    if (bound_incarnation) |incarnation| {
-        const actual = snapshot.status.metadata_incarnation orelse return error.CatalogGenerationChanged;
-        if (!std.mem.eql(u8, &actual, &std.fmt.bytesToHex(incarnation, .lower))) return error.CatalogGenerationChanged;
-    }
-    try loadTableRoutes(a, &by_name, &snapshot);
+    const authority = table_catalog.decisionCatalog(catalog);
+    var generation: ?*table_catalog.RoutingGeneration = null;
+    defer if (generation) |g| g.release();
+    var admin: ?@import("../metadata/api.zig").AdminSnapshot = null;
+    defer if (admin) |*snapshot| catalog.freeAdminSnapshot(snapshot);
+    const identity: RoutingIdentity = selected: {
+        if (authority.vtable.decision_admission != null) if (authority.vtable.acquire_routing_generation) |acquire| {
+            const budget = authority.budget(null);
+            generation = try acquire(authority.ptr, budget, true);
+            const indexed = &generation.?.indexed;
+            const view = indexed.snapshot.value;
+            var id: RoutingIdentity = .{ .group_id = view.metadata_group_id, .incarnation = view.metadata_incarnation, .verified_revision = view.catalog_revision };
+            try id.requireIncarnation(bound_incarnation);
+            const checks = try a.alloc(AdmissionRequest.TableCheck, by_name.count());
+            for (by_name.keys(), by_name.values(), checks) |name, *routes, *check| {
+                const table = try indexed.tableRoutingView(name, budget);
+                routes.ranges = indexed.tableRanges(table.table_id);
+                if (routes.ranges.len == 0) return error.TableNotFound;
+                routes.epoch = table.topology_epoch;
+                check.* = .{ .table_id = table.table_id, .table_name = name, .topology_epoch = table.topology_epoch };
+            }
+            if (try validateTableBatch(authority, id, checks)) |revision| {
+                id.verified_revision = revision;
+                break :selected id;
+            }
+        };
+        admin = try catalog.adminSnapshot();
+        const id = RoutingIdentity.from(&admin.?);
+        try id.requireIncarnation(bound_incarnation);
+        try loadTableRoutes(a, &by_name, &admin.?);
+        break :selected id;
+    };
     // Enlist in original request order: the first participant is the coordinator.
     for (tables) |table| {
         const routes = by_name.getPtr(table.table_name).?;
@@ -2346,8 +2401,8 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
         try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
         for (table.range_guards) |owner| {
             const fence = owner.fence;
-            if (snapshot.status.metadata_group_id != fence.metadata_group_id or
-                !std.meta.eql(snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
+            if (identity.group_id != fence.metadata_group_id or
+                !std.meta.eql(identity.incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
                 return error.TopologyChanged;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, fence.route.group_id, topology_epoch);
             if (participant.route_fence) |*existing| {
@@ -2368,59 +2423,59 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
         }
 
         for (table.writes) |write| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, write.key) orelse return error.UnknownGroup;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, write.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
             try participant.writes.append(alloc, write);
         }
         for (table.deletes) |key| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, key) orelse return error.UnknownGroup;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
             try participant.deletes.append(alloc, key);
         }
         for (table.graph_writes) |edge| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, edge.source) orelse return error.UnknownGroup;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, edge.source) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
             try participant.graph_writes.append(alloc, edge);
         }
         for (table.graph_deletes) |edge| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, edge.source) orelse return error.UnknownGroup;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, edge.source) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
             try participant.graph_deletes.append(alloc, edge);
         }
         for (table.predicates) |predicate| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, predicate.key) orelse return error.UnknownGroup;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, predicate.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
             try participant.predicates.append(alloc, predicate);
         }
         for (table.transforms) |transform| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, transform.key) orelse return error.UnknownGroup;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, transform.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
             try participant.transforms.append(alloc, transform);
         }
         for (table.integrity) |operation| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, operation.routing_key) orelse return error.UnknownGroup;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, operation.routing_key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
             try participant.integrity.append(alloc, operation);
         }
         for (table.integrity_commands) |command| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, &command.address.routing) orelse return error.UnknownGroup;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, &command.address.routing) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
             try participant.integrity_commands.append(alloc, command);
         }
         if (table.relational_activation) |command| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, command.routing_key) orelse return error.UnknownGroup;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, command.routing_key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
             if (participant.relational_activation != null) return error.InvalidTxnRequest;
             participant.relational_activation = command;
         }
         if (table.relational_retirement) |command| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, command.routing_key) orelse return error.UnknownGroup;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, command.routing_key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
             if (participant.relational_retirement != null) return error.InvalidTxnRequest;
             participant.relational_retirement = command;
         }
         if (table.relational_index_maintenance) |command| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, command.routing_key) orelse return error.UnknownGroup;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(routes.ranges, command.routing_key) orelse return error.UnknownGroup;
             if (group_id != command.owner_group_id) return error.PreparedGenerationChanged;
             const participant = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, group_id, topology_epoch);
             if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
@@ -2429,28 +2484,34 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
         // Stable IDs may already have an ordered participant list on disk
         // from an earlier binary. Reconstruct its first-enlistment order.
         if ((retain_terminal or !routes.has_addressed_work) and table.commit_requires == .direct_enrichments and groups.count() == 0) {
-            _ = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, table_catalog.resolveGroupForKeyFromRanges(routes.ranges.items, "") orelse return error.UnknownGroup, topology_epoch);
+            _ = try ensureParticipantTxn(alloc, a, participants, groups, table.table_name, table_catalog.resolveGroupForKeyFromRanges(routes.ranges, "") orelse return error.UnknownGroup, topology_epoch);
         }
     }
+    // Only the enlisted table stamps outlive planning; the generation and
+    // routing workspace can both be released while participants prepare.
+    var enlisted: std.ArrayList(AdmissionRequest.TableCheck) = .empty;
+    defer enlisted.deinit(alloc);
     for (by_name.values()) |*routes| {
         const table = routes.requirements;
         const groups = &routes.groups;
         const topology_epoch = routes.epoch;
-        const decision_epoch = table_catalog.transactionDecisionEpoch(&snapshot, topology_epoch);
+        if (identity.verified_revision != null and groups.count() != 0)
+            try enlisted.append(alloc, .{ .table_name = table.table_name, .table_id = routes.ranges[0].table_id, .topology_epoch = topology_epoch });
+        const decision_epoch = table_catalog.decisionEpochForAuthority(identity.group_id, identity.incarnation, topology_epoch);
         // Match all enlisted owner proofs in one traversal of this table's
         // ranges. Guarded reads keep their observed fence and bound writes get
         // a fence from the same routing snapshot used to choose their group.
         if (bound_incarnation != null or routes.guard_owners.count() != 0) {
             var remaining = groups.count();
-            for (routes.ranges.items) |range| {
+            for (routes.ranges) |range| {
                 if (remaining == 0) break;
                 const index = groups.get(range.group_id) orelse continue;
                 const participant = &participants.items[index];
                 const manager = @import("../metadata/table_manager.zig");
                 const range_id = manager.rangeDocIdentityRangeId(range.*);
                 const fence: @import("../metadata/api.zig").CatalogRouteFence = .{
-                    .metadata_group_id = snapshot.status.metadata_group_id,
-                    .metadata_incarnation = snapshot.status.metadata_incarnation,
+                    .metadata_group_id = identity.group_id,
+                    .metadata_incarnation = identity.incarnation,
                     .catalog_revision = 0,
                     .table_id = range.table_id,
                     .topology_epoch = topology_epoch,
@@ -2483,7 +2544,9 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
             try validateRestorePlan(participant.restore_staging_scope, participant.restore_staging_plan_id);
         }
     }
-    return RoutingIdentity.from(&snapshot);
+    var result = identity;
+    result.enlisted = try enlisted.toOwnedSlice(alloc);
+    return result;
 }
 
 const ParticipantGroups = std.AutoArrayHashMapUnmanaged(u64, usize);
@@ -6086,6 +6149,48 @@ fn consumerTests() type {
             try std.testing.expect(guarded == .committed);
             // Routing and the post-prepare fence each take one fresh catalog snapshot.
             try std.testing.expectEqual(snapshots_before + 2, FakeCatalog.snapshots);
+
+            // A production-capable source must use one generation for placement
+            // and a fresh, batched stability check on either side of prepare.
+            const Compact = struct {
+                generation: *table_catalog.RoutingGeneration,
+                checks: usize = 0,
+                supports_batch: bool = true,
+                fn acquire(ptr: *anyopaque, _: table_catalog.RoutingBudget, authoritative: bool) !*table_catalog.RoutingGeneration {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(authoritative);
+                    self.generation.retain();
+                    return self.generation;
+                }
+                fn check(ptr: *anyopaque, request: AdmissionRequest, _: table_catalog.RoutingBudget) !@import("../metadata/api.zig").DecisionAdmission {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (!self.supports_batch) return error.UnsupportedOperation;
+                    const batch = request.table_batch orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(@as(usize, 2), batch.tables.len);
+                    try std.testing.expectEqual(@as(u64, if (self.checks == 0) 9 else 10), batch.verified_revision);
+                    self.checks += 1;
+                    return .{ .tables_checked = true, .stable = true, .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 10 };
+                }
+            };
+            const original = try FakeCatalog.adminSnapshot(undefined);
+            const generation = try table_catalog.RoutingGeneration.create(std.testing.allocator, .{ .tables = original.tables, .ranges = original.ranges, .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 9 }, .{});
+            defer generation.release();
+            var compact = Compact{ .generation = generation };
+            const before_compact = FakeCatalog.snapshots;
+            const compact_source: table_catalog.CatalogSource = .{ .ptr = &compact, .vtable = &.{ .admin_snapshot = FakeCatalog.adminSnapshot, .free_admin_snapshot = FakeCatalog.freeAdminSnapshot, .acquire_routing_generation = Compact.acquire, .decision_admission = Compact.check } };
+            for ([_]bool{ true, false }) |supports_batch| {
+                compact.supports_batch = supports_batch;
+                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena.deinit();
+                var enlisted_participants: std.ArrayListUnmanaged(ParticipantTxn) = .empty;
+                const stamp = try routeParticipants(arena.allocator(), compact_source, &.{
+                    .{ .table_name = "docs", .writes = &.{.{ .key = "a", .value = "{}" }} },
+                    .{ .table_name = "audit", .writes = &.{.{ .key = "b", .value = "{}" }} },
+                }, &enlisted_participants, true);
+                try validateParticipantEpochs(arena.allocator(), compact_source, enlisted_participants.items, stamp);
+                try std.testing.expectEqual(@as(usize, 2), compact.checks);
+                try std.testing.expectEqual(before_compact + @as(usize, if (supports_batch) 0 else 2), FakeCatalog.snapshots);
+            }
             try std.testing.expectEqual(@as(usize, 3), guarded.committed.participant_count);
             try std.testing.expectEqual(@as(usize, 3), recorder.bound_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.range_prepares);

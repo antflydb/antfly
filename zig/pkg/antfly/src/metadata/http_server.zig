@@ -2092,6 +2092,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_routing_token, httpx.Handler.bind(self, metadataRoutingToken));
         try server.post(routes.Routes.internal_owner_readiness, httpx.Handler.bind(self, metadataOwnerReadiness));
         try server.post(routes.Routes.internal_decision_admission, httpx.Handler.bind(self, metadataDecisionAdmission));
+        try server.post(routes.Routes.internal_transaction_admission, httpx.Handler.bind(self, metadataDecisionAdmission));
         try server.post(routes.Routes.internal_privacy_policy_binding, httpx.Handler.bind(self, metadataPrivacyPolicyBinding));
         try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_routing_authority, httpx.Handler.bind(self, metadataRoutingChange));

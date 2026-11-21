@@ -473,6 +473,9 @@ test "HTTP connection recovers a durable pre-response BEGIN fence without an esc
     try std.testing.expect(recovered.value.active_txn == null);
     try std.testing.expectEqual(@as(usize, 0), try mutate(&store, .{ .discard = id }, "alice", 7, 2));
 
+    try std.testing.expectError(error.SqlConnectionChanged, registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id));
+    try std.testing.expect((try registry.getSqlState(alloc, txn_id)) == null);
+
     // Expired non-idle roots must not occupy the bounded directory forever.
     const replacement: [32]u8 = @splat('d');
     _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = 2, .txn_id = txn_id } }, "alice", 7, 2);

@@ -491,9 +491,10 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn fetchDecisionAdmission(self: *MetadataHttpClient, base_uri: []const u8, request: metadata_api.DecisionAdmissionRequest, budget: ?RequestBudget) !std.json.Parsed(metadata_api.DecisionAdmission) {
-        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(body);
-        return self.fetchCatalogReadAt(metadata_api.DecisionAdmission, base_uri, .POST, routes.Routes.internal_decision_admission, body, budget) catch |err| switch (err) {
+        const path = if (request.table_batch != null) routes.Routes.internal_transaction_admission else routes.Routes.internal_decision_admission;
+        return self.fetchCatalogReadAt(metadata_api.DecisionAdmission, base_uri, .POST, path, body, budget) catch |err| switch (err) {
             error.OutOfMemory, error.CatalogRoutingSnapshotTimeout, error.Canceled, error.DeadlineExceeded, error.UnsupportedOperation => return err,
             error.Cancelled => return error.Canceled,
             // Older peers cannot certify transition stability.

@@ -6643,6 +6643,12 @@ pub const ApiHttpServer = struct {
                         else
                             commit.sync_level,
                     ) catch |err| switch (err) {
+                        error.TransactionPrepareAbortedRowPolicyDenied, error.TransactionPrepareAbortedUnavailable => {
+                            self.txn_sessions.publishAbortAndRetire(self.alloc, txn_id, null) catch |persist_err| {
+                                std.log.warn("stable transaction abort persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                            };
+                            continue;
+                        },
                         error.EnrichmentWorkerFailed => {
                             // Older records and third-party sources may expose a
                             // committed terminal repair only as an error. Persist

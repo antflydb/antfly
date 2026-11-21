@@ -6324,12 +6324,14 @@ pub const AntflyApiHandler = struct {
         ) catch |err| rejected: {
             const rejection = transactions_api.classifyCommitRejection(execution_plan.?.firstAttempt(), err);
             if (rejection == .ambiguous) return textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying");
-            if (rejection == .fresh) {
+            if (rejection == .fresh or rejection == .confirmed) {
                 // Publish the abort and settle consumers before attempting
                 // payload retirement or returning a safe rejection to callers.
-                self.api_server.txn_sessions.publishAbortAndRetire(alloc, txn_id, execution_plan.?.publication) catch return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
+                self.api_server.txn_sessions.publishAbortAndRetire(alloc, txn_id, if (rejection == .fresh) execution_plan.?.publication else null) catch return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
             }
             break :rejected switch (err) {
+                error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
+                error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "transaction_precommit_aborted", .message = "Participant temporarily unavailable.", .retryable = true }),
                 error.TransactionTooLarge => {
                     return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions");
                 },
@@ -6468,7 +6470,7 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(503);
                     return ctx.text("transaction outcome is unknown; retry this transaction id");
                 },
-                error.AbortDecisionNotDurable, error.TransactionBeginFailed, error.TransactionPrepareAbortedUnavailable => {
+                error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
                     _ = ctx.status(503);
                     return ctx.text("transaction coordinator is temporarily unavailable");
                 },
@@ -22820,17 +22822,19 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     defer storage.close();
     var durable = transactions_api.DurableSessionStore.init(a, &storage);
     const Source = struct {
+        calls: usize = 0,
+        failure: anyerror = error.TableNotFound,
         fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
             return error.TestUnexpectedResult;
         }
         fn commit(ptr: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
-            const calls: *usize = @ptrCast(@alignCast(ptr));
-            calls.* += 1;
-            return error.TableNotFound;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self.failure;
         }
     };
-    var calls: usize = 0;
-    var api = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, .{ .ptr = &calls, .vtable = &.{ .batch = Source.batch, .commit_transaction_with_id = Source.commit } });
+    var source: Source = .{};
+    var api = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, .{ .ptr = &source, .vtable = &.{ .batch = Source.batch, .commit_transaction_with_id = Source.commit } });
     defer api.deinit();
     var handler: AntflyApiHandler = .{ .api_server = &api };
     const session = try api.txn_sessions.begin(a, .{}, 0);
@@ -22863,7 +22867,7 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     const completion = try AntflyApiHandler.requestCompletion(&ctx);
     try std.testing.expect(!completion.unknown and completion.outcomes.items.len == 1);
     try std.testing.expect(!try @import("sql_completion.zig").settled(&api, a, .{ .outcomes = completion.outcomes.items }, .{}));
-    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
     // The process can lose the response between publishing abort and retiring the session.
     _ = (try api.txn_sessions.recordTerminalAbort(a, session.txn_id)).?;
     var retry = httpx.Context.init(a, std.testing.io, &request);
@@ -22871,7 +22875,25 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     var aborted = try handler.commitTransactionSession(&retry, &id);
     defer aborted.deinit();
     try std.testing.expectEqual(@as(u16, 409), aborted.status.code);
-    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    for ([_]anyerror{ error.TransactionPrepareAbortedRowPolicyDenied, error.TransactionPrepareAbortedUnavailable }, [_]u16{ 403, 503 }) |failure, expected| {
+        source.failure = failure;
+        const another = try api.txn_sessions.begin(a, .{}, 0);
+        _ = (try api.txn_sessions.stage(a, another.txn_id, &staged)).?;
+        var bound = (try api.txn_sessions.cloneCommitRequest(a, another.txn_id, null)).?;
+        defer bound.deinit(a);
+        var plan = (try api.txn_sessions.sealExecutionPlan(a, another.txn_id, api.localSessionNodeId(), tables.tables)).?;
+        defer plan.deinit();
+        var req = try httpx.Request.init(a, .POST, "/");
+        defer req.deinit();
+        try req.setBody("{}");
+        var attempt = httpx.Context.init(a, std.testing.io, &req);
+        defer attempt.deinit();
+        var rejected = try handler.commitTransactionSession(&attempt, &std.fmt.bytesToHex(another.txn_id, .lower));
+        defer rejected.deinit();
+        try std.testing.expectEqual(expected, rejected.status.code);
+        try std.testing.expect((try durable.load(another.txn_id)) == null);
+    }
 }
 
 test "distributed SQL API worker RPC requires signed service authority even during legacy migration" {

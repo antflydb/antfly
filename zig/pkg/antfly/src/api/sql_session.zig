@@ -74,9 +74,10 @@ pub const Coordinator = struct {
         // Once the durable plan is sealed, no error is safe to turn into a
         // replay invitation. Maintenance owns completion under this same id.
         const outcome = (source.commitTransactionAttempt(alloc, id, info.begin_timestamp, plan.value, info.sync_level, plan.firstAttempt(), self.context.cancellation) catch |err| {
-            if (transactions.classifyCommitRejection(plan.firstAttempt(), err) == .fresh) {
-                _ = (server.txn_sessions.recordAttemptAbort(alloc, id, plan.publication) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
-                return .{ .outcome = .aborted, .reconciliation_id = id };
+            const rejection = transactions.classifyCommitRejection(plan.firstAttempt(), err);
+            if (rejection == .fresh or rejection == .confirmed) {
+                _ = (server.txn_sessions.recordAttemptAbort(alloc, id, if (rejection == .fresh) plan.publication else null) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
+                return .{ .outcome = .aborted, .abort_cause = transactions.confirmedAbortCause(err), .reconciliation_id = id };
             }
             if (err == error.EnrichmentWorkerFailed) {
                 // Persist terminal repair debt before exposing it. The legacy

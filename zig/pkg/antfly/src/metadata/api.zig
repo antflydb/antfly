@@ -315,6 +315,10 @@ pub const DecisionAdmissionRequest = struct {
     table_id: u64,
     table_name: []const u8,
     route_check: ?RouteCheck = null,
+    table_batch: ?TableBatch = null,
+
+    pub const TableCheck = struct { table_id: u64, table_name: []const u8, topology_epoch: u64 };
+    pub const TableBatch = struct { verified_revision: u64, tables: []const TableCheck };
 
     pub const RouteCheck = struct {
         topology_epoch: u64,
@@ -329,6 +333,7 @@ pub const DecisionAdmission = struct {
     catalog_revision: u64,
     stable: bool,
     route_checked: bool = false,
+    tables_checked: bool = false,
 };
 
 pub const OwnerReadinessRequest = struct {

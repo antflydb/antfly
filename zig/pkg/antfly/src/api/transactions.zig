@@ -1197,6 +1197,10 @@ pub const DurableSessionStore = struct {
     }
 
     fn saveChecked(self: *DurableSessionStore, session: Session, max_record_bytes: ?usize, expected: ?Version, ttl_ns: ?u64) !void {
+        return self.saveRecord(session, max_record_bytes, expected, ttl_ns, false);
+    }
+
+    fn saveRecord(self: *DurableSessionStore, session: Session, max_record_bytes: ?usize, expected: ?Version, ttl_ns: ?u64, creating: bool) !void {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
@@ -1212,13 +1216,13 @@ pub const DurableSessionStore = struct {
             .docstore => |store| {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                try putSessionAndExpiryTxn(self, &txn, key, value, session, expected, ttl_ns);
+                try putSessionAndExpiryTxn(self, &txn, key, value, session, expected, ttl_ns, creating);
                 try txn.commit();
             },
             .runtime => |store| {
                 var txn = try store.beginWrite();
                 errdefer txn.abort();
-                try putSessionAndExpiryTxn(self, &txn, key, value, session, expected, ttl_ns);
+                try putSessionAndExpiryTxn(self, &txn, key, value, session, expected, ttl_ns, creating);
                 try txn.commit();
             },
         }
@@ -1292,7 +1296,10 @@ pub const DurableSessionStore = struct {
             defer current.deinit(self.alloc);
             if (!std.meta.eql(Version.of(current), version)) return false;
             previous_needs_recovery = sessionNeedsRecovery(current);
-        } else if (current_raw != null) return false;
+        } else {
+            if (current_raw != null) return false;
+            try self.requireBeginningConnection(txn, session);
+        }
 
         const owner_id = try ownerLeaseId(self.alloc, session.owner_node_id);
         defer self.alloc.free(owner_id);
@@ -1810,12 +1817,26 @@ pub const DurableSessionStore = struct {
         return try decodeSessionRecord(self.alloc, txn_id, raw);
     }
 
-    fn putSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, value: []const u8, session: Session, expected: ?Version, ttl_ns: ?u64) !void {
+    fn requireBeginningConnection(self: *DurableSessionStore, txn: anytype, session: Session) !void {
+        const id = session.connection_id orelse return;
+        var connection = sql_connection_record.loadTxn(txn, self.alloc, &id) catch |err| switch (err) {
+            error.SqlConnectionNotFound => return error.SqlConnectionChanged,
+            else => return err,
+        };
+        defer connection.deinit();
+        if (connection.value.state != .beginning or !std.meta.eql(connection.value.active_txn, @as(?[16]u8, session.txn_id)) or
+            connection.value.owner_node_id != session.owner_node_id or !std.mem.eql(u8, connection.value.principal, session.principal orelse ""))
+            return error.SqlConnectionChanged;
+    }
+
+    fn putSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, value: []const u8, session: Session, expected: ?Version, ttl_ns: ?u64, creating: bool) !void {
+        if (creating) try self.requireBeginningConnection(txn, session);
         var previous_needs_recovery = false;
         if (txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         }) |raw| {
+            if (creating) return error.CypherWriteRequestAlreadyUsed;
             var previous = try decodeSessionRecord(self.alloc, session.txn_id, raw);
             defer previous.deinit(self.alloc);
             if (expected) |version| {
@@ -2316,9 +2337,18 @@ pub const SessionLeaseStore = struct {
 // Typed native rejection outcomes that public stable-COMMIT already reports
 // as safe failures. Never infer abort from transport, cancellation, allocation,
 // propagation or generic execution errors.
-pub const CommitRejection = enum { none, fresh, ambiguous };
+pub const CommitRejection = enum { none, fresh, confirmed, ambiguous };
+
+pub fn confirmedAbortCause(err: anyerror) ?error{ RowPolicyDenied, StorageReadTemporarilyUnavailable } {
+    return switch (err) {
+        error.TransactionPrepareAbortedRowPolicyDenied => error.RowPolicyDenied,
+        error.TransactionPrepareAbortedUnavailable => error.StorageReadTemporarilyUnavailable,
+        else => null,
+    };
+}
 
 pub fn classifyCommitRejection(first_attempt: bool, err: anyerror) CommitRejection {
+    if (confirmedAbortCause(err) != null) return .confirmed;
     if (err == error.CatalogGenerationChanged) return .ambiguous;
     const rejected = switch (err) {
         error.PreDispatchCatalogGenerationChanged, error.TransactionTooLarge, error.InvalidBatchRequest, error.InvalidArgument, error.InvalidGraphEdges, error.UnsupportedTransformOperation, error.TopologyChanged, error.DecisionConflict, error.DocIdentityNamespaceMismatch, error.UnsupportedOperation, error.TableNotFound, error.UnknownGroup => true,
@@ -2465,6 +2495,7 @@ pub const SessionRegistry = struct {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
+        if (connection_id != null and self.durable == null) return error.SqlConnectionUnavailable;
         if (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) |existing| {
             var duplicate = existing;
             duplicate.deinit(alloc);
@@ -2510,7 +2541,7 @@ pub const SessionRegistry = struct {
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
             if (!(try self.durable.?.saveWithLease(session, null, now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return error.SessionLeaseLost;
         } else {
-            try self.persistLocked(session);
+            if (self.durable) |durable| try durable.saveRecord(session, self.max_record_bytes, null, null, true);
             try self.renewLeaseLocked(txn_id, owner_node_id);
         }
         self.mutex.lock();
@@ -3424,6 +3455,9 @@ pub const SessionRegistry = struct {
         };
         defer candidate.deinit(if (self.durable) |durable| durable.alloc else alloc);
 
+        // The scan is advisory. A foreground attempt may have settled this ID
+        // before we acquired the execution guard.
+        if (!sessionNeedsRecovery(candidate)) return null;
         if (candidate.owner_node_id != owner_node_id) {
             const durable = self.durable orelse return null;
             if (self.durable_scope != .cluster_shared or self.lease_store == null or self.owner_lease_ttl_ns == null or owner_node_id == 0) return null;
@@ -8748,6 +8782,11 @@ test "SQL pgwire native commit rejection requires a fresh execution" {
         try std.testing.expectEqual(CommitRejection.ambiguous, classifyCommitRejection(false, err));
     }
     inline for (.{ true, false }) |fresh| try std.testing.expectEqual(CommitRejection.ambiguous, classifyCommitRejection(fresh, error.CatalogGenerationChanged));
+    inline for (.{ true, false }) |first| {
+        inline for (.{ error.TransactionPrepareAbortedRowPolicyDenied, error.TransactionPrepareAbortedUnavailable }) |err|
+            try std.testing.expectEqual(CommitRejection.confirmed, classifyCommitRejection(first, err));
+        try std.testing.expectEqual(CommitRejection.none, classifyCommitRejection(first, error.AbortDecisionNotDurable));
+    }
     try std.testing.expectEqual(CommitRejection.none, classifyCommitRejection(true, error.CommitDecisionUnknown));
     const session: Session = .{ .txn_id = @splat(1), .owner_node_id = 0, .begin_timestamp = 1, .last_touched_timestamp = 1, .sync_level = .write, .commit_execution_started = true };
     try std.testing.expect(session.info().commit_execution_started);
@@ -8885,7 +8924,13 @@ test "durable session mutations publish only after persistence succeeds: shared 
             try one.await(std.testing.io);
             try two.await(std.testing.io);
             try std.testing.expect(!escaped);
+            const listed = try registry.listPendingRecoveryIds(a, 16);
+            defer a.free(listed);
+            try std.testing.expect(for (listed) |id| {
+                if (std.meta.eql(id, session.txn_id)) break true;
+            } else false);
             _ = (try registry.recordTerminalAbort(a, session.txn_id)).?;
+            try std.testing.expect((try registry.claimPendingRecovery(a, session.txn_id, session.version.owner, nextTxnTimestamp())) == null);
             _ = try registry.cleanupExpired(a, std.math.maxInt(u64));
             const settled_a = try original.completionReferenceSettled(session.txn_id, ref_a);
             const settled_b = try original.completionReferenceSettled(session.txn_id, ref_b);

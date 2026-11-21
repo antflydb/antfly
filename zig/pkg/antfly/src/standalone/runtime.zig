@@ -2132,6 +2132,17 @@ const LocalStandaloneMetadata = struct {
         const generation = try acquireRoutingGeneration(ptr, budget, true);
         defer generation.release();
         const catalog = generation.indexed.snapshot.value;
+        if (request.table_batch) |batch| {
+            if (request.route_check != null or batch.tables.len == 0) return error.InvalidArgument;
+            const stable = stable: {
+                for (batch.tables) |expected| {
+                    const view = generation.indexed.tableRoutingView(expected.table_name, budget) catch |err| if (err == error.TableNotFound) break :stable false else return err;
+                    if (view.table_id != expected.table_id or view.topology_epoch != expected.topology_epoch) break :stable false;
+                }
+                break :stable true;
+            };
+            return .{ .stable = stable, .tables_checked = true, .catalog_revision = catalog.catalog_revision, .metadata_group_id = catalog.metadata_group_id, .metadata_incarnation = catalog.metadata_incarnation };
+        }
         const view = try generation.indexed.tableRoutingView(request.table_name, budget);
         var stable = view.table_id == request.table_id;
         if (stable) if (request.route_check) |check| {

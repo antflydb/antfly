@@ -627,6 +627,10 @@ pub const RoutingSession = struct {
 
     const RepairRoutingView = struct { table_id: u64, fence: u64 };
 
+    pub fn tableRanges(self: *const RoutingSession, table_id: u64) []const *const metadata_table_manager.RangeRecord {
+        return if (self.table_range_refs.get(table_id)) |index| index.ranges else &.{};
+    }
+
     /// Full-span repair fence, calculated once with the same ordered group
     /// IDs as the persisted repair job cursor.
     fn repairRoutingView(self: *const RoutingSession, table_name: []const u8, budget: RoutingBudget) !?RepairRoutingView {
@@ -1731,7 +1735,7 @@ pub fn transactionDecisionEpoch(snapshot: *const metadata_api.AdminSnapshot, top
     return decisionEpochForAuthority(snapshot.status.metadata_group_id, snapshot.status.metadata_incarnation, topology_epoch);
 }
 
-fn decisionEpochForAuthority(metadata_group: u64, incarnation: ?metadata_api.MetadataClusterIncarnation, topology_epoch: u64) u64 {
+pub fn decisionEpochForAuthority(metadata_group: u64, incarnation: ?metadata_api.MetadataClusterIncarnation, topology_epoch: u64) u64 {
     var hash = std.hash.Wyhash.init(topology_epoch);
     hash.update("antfly/txn-decision/v1");
     var group: [8]u8 = undefined;
@@ -1741,7 +1745,7 @@ fn decisionEpochForAuthority(metadata_group: u64, incarnation: ?metadata_api.Met
     return @max(1, hash.final());
 }
 
-fn decisionCatalog(catalog: CatalogSource) CatalogSource {
+pub fn decisionCatalog(catalog: CatalogSource) CatalogSource {
     if (catalog.vtable == &RoutingSession.vtable) return decisionCatalog(RoutingSession.cast(catalog.ptr).base);
     return catalog;
 }
@@ -4058,6 +4062,19 @@ fn consumerTests() type {
             try std.testing.expect((try delegated.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .aborted, 0, decision, .write, token)) != null);
             delegated.local_write_source.?.validates_local_decision_route = false;
             try std.testing.expectError(error.DecisionNotProposed, delegated.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .aborted, 0, decision, .write, token));
+            try std.testing.expectEqual(@as(usize, 1), local.calls);
+            const CancelWait = struct {
+                calls: usize = 0,
+                fn check(ptr: *const anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+                    self.calls += 1;
+                    if (self.calls > 1) return error.Canceled;
+                }
+            };
+            var waiting: CancelWait = .{};
+            delegated.testingMarkGroupOperationActive("rows", 2);
+            try std.testing.expectError(error.Canceled, delegated.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 2, "rows", @splat(1), .aborted, 0, decision, .write, .{ .ptr = &waiting, .check_fn = CancelWait.check }));
+            try std.testing.expectEqual(@as(usize, 0), delegated.testingGroupOperationWaiterCount("rows", 2));
             try std.testing.expectEqual(@as(usize, 1), local.calls);
             try std.testing.expectError(error.TopologyChanged, validateTransactionEpoch(std.testing.allocator, source, "rows", decision, true));
             try validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch);

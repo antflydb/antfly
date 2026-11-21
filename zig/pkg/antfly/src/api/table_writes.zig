@@ -10645,28 +10645,39 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_ready.broadcast(io);
     }
 
-    fn beginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+    fn waitForGroupOperation(self: *ProvisionedTableWriteSource, io: Io, cancellation: db_mod.types.CancellationToken) !void {
+        if (cancellation.ptr == null) return self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+        // Condition signals wake admitted work immediately. A bounded wait
+        // also observes tokens that cannot signal this condition.
+        self.table_activity_ready.waitTimeout(io, &self.table_activity_mutex, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| if (err != error.Timeout) return err;
+        self.table_activity_mutex.unlock(io);
+        defer self.table_activity_mutex.lockUncancelable(io);
+        try cancellation.check();
+    }
+
+    fn beginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64, cancellation: db_mod.types.CancellationToken) !void {
         const io = self.tableActivityIo();
         while (self.retiring_replica_groups.contains(group_id)) {
-            self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+            try self.waitForGroupOperation(io, cancellation);
         }
         self.activityEntryLocked(table_name, group_id).operation_waiters += 1;
+        errdefer self.cancelGroupOperationWaiterLocked(table_name, group_id);
         while (true) {
             if (self.retiring_replica_groups.contains(group_id)) {
-                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                try self.waitForGroupOperation(io, cancellation);
                 continue;
             }
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
                 if (entry.structural_active or entry.restore_preparations > 0 or entry.read_request_active > 0 or entry.status_request_active > 0) {
-                    self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                    try self.waitForGroupOperation(io, cancellation);
                     continue;
                 }
             }
             if (self.findTableActivityLocked(table_name, group_id)) |index| {
                 const entry = self.active_table_activities.items[index];
                 if (entry.operation_active or entry.transition_waiters > 0 or entry.generation_preparation_active) {
-                    self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                    try self.waitForGroupOperation(io, cancellation);
                     continue;
                 }
             }
@@ -11054,7 +11065,15 @@ pub const ProvisionedTableWriteSource = struct {
         const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
-        self.beginGroupOperationLocked(table_name, group_id);
+        self.beginGroupOperationLocked(table_name, group_id, .none) catch unreachable;
+    }
+
+    fn beginDecisionOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64, cancellation: db_mod.types.CancellationToken) !void {
+        try cancellation.check();
+        const io = self.tableActivityIo();
+        try self.table_activity_mutex.lock(io);
+        defer self.table_activity_mutex.unlock(io);
+        try self.beginGroupOperationLocked(table_name, group_id, cancellation);
     }
 
     pub fn testingMarkTableRequestActive(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -23817,7 +23836,7 @@ pub const ProvisionedTableWriteSource = struct {
                 fence.admission_cancellation = cancellation;
                 try batcher.batchGroupRoutedWithCancellation(alloc, fence, table_name, req, cancellation);
             } else {
-                self.beginGroupOperation(table_name, group_id);
+                try self.beginDecisionOperation(table_name, group_id, cancellation);
                 defer self.endGroupOperation(table_name, group_id);
                 try batcher.batchGroupWithCancellation(alloc, group_id, table_name, req, cancellation);
             }
@@ -23827,7 +23846,7 @@ pub const ProvisionedTableWriteSource = struct {
         // admission. If a transition is already waiting, it wins admission;
         // otherwise this resolve remains ahead of the transition until the
         // durable decision has been applied.
-        self.beginGroupOperation(table_name, group_id);
+        try self.beginDecisionOperation(table_name, group_id, cancellation);
         defer self.endGroupOperation(table_name, group_id);
         const local_owner = self.groupLocalWriteSource();
         if (topology_epoch != 0 and (local_owner == null or !local_owner.?.validates_local_decision_route))

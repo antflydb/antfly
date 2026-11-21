@@ -1673,6 +1673,7 @@ pub const Session = struct {
                 var scratch = std.heap.ArenaAllocator.init(self.alloc);
                 defer scratch.deinit();
                 try check(stream.context, scratch.allocator(), req);
+                try req.check();
             }
         };
         var remaining: usize = if (requested == 0) std.math.maxInt(usize) else @intCast(requested);

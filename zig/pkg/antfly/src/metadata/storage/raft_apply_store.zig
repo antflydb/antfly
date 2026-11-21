@@ -12495,33 +12495,41 @@ pub const RaftApplyStore = struct {
         var txn = try self.beginOwnerReadinessTxn(group);
         defer txn.abort();
         const cut = try readCatalogCursorTxn(&txn, group);
-        var name: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(request.table_name, &name, .{});
+        const Admission = @import("../api.zig").DecisionAdmissionRequest;
+        const single = [_]Admission.TableCheck{.{ .table_id = request.table_id, .table_name = request.table_name, .topology_epoch = 0 }};
+        const tables = if (request.table_batch) |batch| batch.tables else &single;
+        if (tables.len == 0 or (request.route_check != null and request.table_batch != null)) return error.InvalidArgument;
+        var cursor = try txn.openCursor();
+        defer cursor.close();
         var buf: [224]u8 = undefined;
         const stable = stable: {
-            var cursor = try txn.openCursor();
-            defer cursor.close();
-            for (0..3) |kind| {
+            for (tables) |table| {
                 try budget.checkpoint();
-                const prefix = switch (kind) {
-                    0 => try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:id:{d}:", .{ group, request.table_id }),
-                    1 => try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:name:{x}:", .{ group, &name }),
-                    else => try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:legacy:", .{group}),
+                const id_prefix = try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:id:{d}:", .{ group, table.table_id });
+                if (try cursor.seekAtOrAfter(id_prefix)) |kv| if (std.mem.startsWith(u8, kv.key, id_prefix)) break :stable false;
+                var name: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(table.table_name, &name, .{});
+                const name_prefix = try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:name:{x}:", .{ group, &name });
+                if (try cursor.seekAtOrAfter(name_prefix)) |kv| if (std.mem.startsWith(u8, kv.key, name_prefix)) break :stable false;
+            }
+            const legacy = try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:legacy:", .{group});
+            var entry = try cursor.seekAtOrAfter(legacy);
+            var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer ids.deinit(alloc);
+            while (entry) |kv| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, kv.key, legacy)) break;
+                try budget.checkpoint();
+                if (kv.value.len != 16) return error.InvalidDerivedCatalogIndex;
+                if (tables.len > 1 and ids.count() == 0) for (tables) |table| {
+                    try ids.put(alloc, table.table_id, {});
                 };
-                var entry = try cursor.seekAtOrAfter(prefix);
-                while (entry) |kv| : (entry = try cursor.next()) {
-                    if (!std.mem.startsWith(u8, kv.key, prefix)) break;
-                    if (kind != 2) break :stable false;
-                    try budget.checkpoint();
-                    if (kv.value.len != 16) return error.InvalidDerivedCatalogIndex;
-                    const owners = [2]u64{ std.mem.readInt(u64, kv.value[0..8], .little), std.mem.readInt(u64, kv.value[8..16], .little) };
-                    for (owners) |owner| {
-                        var key: [160]u8 = undefined;
-                        const raw = txn.get(try rangeKeyForGroup(&key, group, owner)) catch |err| if (err == error.NotFound) continue else return err;
-                        const range = try decodeRangeRecord(alloc, raw);
-                        defer metadata_table_manager.freeRange(alloc, range);
-                        if (range.table_id == request.table_id) break :stable false;
-                    }
+                const owners = [2]u64{ std.mem.readInt(u64, kv.value[0..8], .little), std.mem.readInt(u64, kv.value[8..16], .little) };
+                for (owners) |owner| {
+                    var key: [160]u8 = undefined;
+                    const raw = txn.get(try rangeKeyForGroup(&key, group, owner)) catch |err| if (err == error.NotFound) continue else return err;
+                    const range = try decodeRangeRecord(alloc, raw);
+                    defer metadata_table_manager.freeRange(alloc, range);
+                    if (range.table_id == tables[0].table_id or ids.contains(range.table_id)) break :stable false;
                 }
             }
             break :stable true;
@@ -12547,7 +12555,29 @@ pub const RaftApplyStore = struct {
                     p.groups.len == 1 and std.meta.eql(p.groups[0], check.route) else false;
             }
         };
-        return .{ .stable = admitted, .route_checked = request.route_check != null, .metadata_group_id = group, .metadata_incarnation = cut.metadata_incarnation, .catalog_revision = cut.revision };
+        if (admitted) if (request.table_batch) |batch| {
+            if (batch.verified_revision == 0 or batch.verified_revision != cut.revision) {
+                for (tables) |table| {
+                    try budget.checkpoint();
+                    var scratch = std.heap.ArenaAllocator.init(alloc);
+                    defer scratch.deinit();
+                    const a = scratch.allocator();
+                    const point = try self.catalogTableProjectionTxn(a, &txn, group, table.table_name, budget);
+                    const plan = try @import("../../api/table_catalog.zig").routePlanFromSnapshotWithBudget(a, .{
+                        .tables = point.tables,
+                        .ranges = point.ranges,
+                        .metadata_group_id = group,
+                        .metadata_incarnation = cut.metadata_incarnation,
+                        .catalog_revision = cut.revision,
+                    }, table.table_name, .table, budget);
+                    if (plan == null or plan.?.table_id != table.table_id or plan.?.topology_epoch != table.topology_epoch) {
+                        admitted = false;
+                        break;
+                    }
+                }
+            }
+        };
+        return .{ .stable = admitted, .tables_checked = request.table_batch != null, .route_checked = request.route_check != null, .metadata_group_id = group, .metadata_incarnation = cut.metadata_incarnation, .catalog_revision = cut.revision };
     }
 
     fn putOwnerMergeIndexTxn(txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.MergeTransitionRecord) !void {
@@ -46176,6 +46206,17 @@ test "selected owner readiness admits the unchanged decision route across unrela
     }
     const current = try store.decisionAdmission(a, 21, request, .{});
     try std.testing.expect(current.catalog_revision != first.catalog_revision and current.stable and current.route_checked);
+    const Admission = @import("../api.zig").DecisionAdmissionRequest;
+    var checks = [_]Admission.TableCheck{
+        .{ .table_id = table.table_id, .table_name = table.name, .topology_epoch = request.route_check.?.topology_epoch },
+        .{ .table_id = 8, .table_name = "unrelated", .topology_epoch = 0 },
+    };
+    var batch: Admission = .{ .table_id = table.table_id, .table_name = table.name, .table_batch = .{ .tables = checks[0..1], .verified_revision = first.catalog_revision } };
+    const batch_result = try store.decisionAdmission(a, 21, batch, .{});
+    try std.testing.expect(batch_result.tables_checked and batch_result.stable);
+    batch.table_batch.?.tables = &checks;
+    const changed = try store.decisionAdmission(a, 21, batch, .{});
+    try std.testing.expect(changed.tables_checked and !changed.stable);
     request.route_check.?.topology_epoch ^= 1;
     try std.testing.expect(!(try store.decisionAdmission(a, 21, request, .{})).stable);
 }

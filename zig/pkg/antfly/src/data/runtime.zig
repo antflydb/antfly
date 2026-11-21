@@ -27843,6 +27843,9 @@ const RemoteMetadataSource = struct {
             var parsed = (if (Result == antfly.metadata_api.OwnerReadiness) client.fetchOwnerReadiness(self.base_uris[index], input, budget) else client.fetchDecisionAdmission(self.base_uris[index], input, budget)) catch |err| {
                 try routing_budget.checkpoint();
                 if (err == error.Cancelled or err == error.Canceled) return error.Canceled;
+                if (comptime Result == antfly.metadata_api.DecisionAdmission) {
+                    if (input.table_batch != null and err == error.UnsupportedOperation) return err;
+                }
                 last_err = if (err == error.UnsupportedOperation) error.StorageReadTemporarilyUnavailable else normalizeCatalogRoutingSnapshotError(err);
                 continue;
             };

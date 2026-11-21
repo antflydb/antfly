@@ -1807,6 +1807,23 @@ test "stream handoff preserves cancellation and retained portal authority" {
     }
 }
 
+test "repeated Execute checks cancellation after validating an exhausted portal" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "q", "SELECT n FROM t", false);
+    try bind(&input.writer, "p", "q", null);
+    try execute(&input.writer, "p", 0);
+    try execute(&input.writer, "p", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 1, .cancel_during_validation = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_validations);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "57014") != null);
+}
+
 test "Describe Portal accepts cancellation during retained-reader validation" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
