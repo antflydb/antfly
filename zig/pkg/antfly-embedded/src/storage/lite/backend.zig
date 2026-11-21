@@ -997,9 +997,7 @@ fn nativeVacuumReport(handle: *Handle, cancel: ?*const maintenance.CancelToken) 
 
 fn nativeStableSnapshot(handle: *Handle, dest_path: []const u8, replace: bool) !StableSnapshotReport {
     const store = handle.native_docstore.?;
-    store.mutex.lock();
-    defer store.mutex.unlock();
-    return try store.file.copyStableSnapshotToPath(dest_path, replace);
+    return try store.copyStableSnapshot(dest_path, replace);
 }
 
 fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {

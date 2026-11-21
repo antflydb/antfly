@@ -3558,7 +3558,10 @@ pub const Store = struct {
         // of the budget, floored at 64 KiB so there is still a usable log
         // -- rather than the flat default; an unbounded (`0`) budget, the
         // common/production case, keeps the full default untouched.
-        const redo_log_capacity_bytes = native.NativeFile.redoLogCapacityForBudget(opts.reclamation.max_storage_bytes);
+        const redo_log_capacity_bytes = if (opts.no_sync)
+            native.NativeFile.redoLogCapacityForBudget(opts.reclamation.max_storage_bytes)
+        else
+            native.NativeFile.segmentedRedoCapacityForBudget(opts.reclamation.max_storage_bytes);
         const frontier_bytes = if (opts.no_sync) 0 else native.NativeFile.default_redo_frontier_reservation_bytes;
         const redo_reservation = if (use_redo_log) redo_log_capacity_bytes *| @as(u64, if (opts.no_sync) 1 else 2) +| frontier_bytes else 0;
         const minimum = native.NativeFile.minimumOwnerStorageBytes(opts.reclamation.page_reuse) +| redo_reservation;
@@ -4499,7 +4502,8 @@ pub const Store = struct {
     fn needsProtectedRedoUpgrade(self: *const Store) bool {
         const header = self.file.header;
         if (header.redo_log_capacity == 0 or self.file.no_sync) return false;
-        return !header.segmented_redo or native.NativeFile.redoLogCapacityForBudget(self.file.redo_log_budget_bytes) < header.redo_log_capacity;
+        const budget = self.maintenance_policy.options.max_storage_bytes;
+        return !header.segmented_redo or (budget != 0 and native.NativeFile.segmentedRedoCapacityForBudget(budget) < header.redo_log_capacity);
     }
 
     // Adoption discards the cached ledger. This probe can therefore replay a
@@ -4601,7 +4605,12 @@ pub const Store = struct {
                 // retirement pressure still reclaims durably through
                 // reclaimRetirementPressure, called separately from
                 // applyMutationGroup before a foreground transaction opens.
-                _ = try self.file.reclaimPagesForMaintenanceWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel, false);
+                _ = self.file.reclaimPagesForMaintenanceWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel, false) catch |err| blk: {
+                    if (err != error.LiteStorageBudgetExceeded or !self.maintenance_policy.options.enabled or !self.needsProtectedRedoUpgrade()) return err;
+                    // The replacement image can release reservation space
+                    // that the current generation cannot allocate around.
+                    break :blk 0;
+                };
                 self.maintenance_policy.status.state = if (self.maintenance_policy.options.enabled) .idle else .disabled;
                 self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
                 self.maintenance_policy.status.last_error = null;
@@ -4754,16 +4763,37 @@ pub const Store = struct {
         self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redoReservation());
     }
 
+    // The rewrite of an oversized or legacy redo reservation needs a
+    // temporary second inode. Bound that image by its compact data and
+    // target reservation, then enforce the normal cap on retained files
+    // and the installed generation before the swap.
+    fn canUseRedoRewriteWorkspace(self: *Store) !bool {
+        if (!self.needsProtectedRedoUpgrade() or self.currentGenerationHasReaders()) return false;
+        const region = (try self.file.regionForInode()) orelse return false;
+        return region.minimumUncoveredPinnedSequence(antfly_platform.process.currentId() orelse 0, 0) == null;
+    }
+
+    fn vacuumWorkspaceBytes(self: *Store, compact: u64) u64 {
+        const budget = self.maintenance_policy.options.max_storage_bytes;
+        if (budget != 0 and self.needsProtectedRedoUpgrade()) {
+            return compact *| 2 +| self.file.vacuumRedoReservation(budget);
+        }
+        return @max(compact *| 2, self.maintenance_policy.options.assessment_bytes);
+    }
+
     fn admitShrinkWorkspaceAssumeLocked(self: *Store, compact: u64, cancel: ?*const maintenance.CancelToken) !?u64 {
         const accounting = try self.reclamationStatusAssumeLockedWithCancel(cancel);
-        const workspace = @max(compact *| 2, self.maintenance_policy.options.assessment_bytes);
         const budget = self.maintenance_policy.options.max_storage_bytes;
-        if (budget != 0 and accounting.totalBytes() +| workspace > budget) {
+        const workspace = self.vacuumWorkspaceBytes(compact);
+        const needs_exception = budget != 0 and accounting.totalBytes() +| workspace > budget;
+        const redo_rewrite = needs_exception and try self.canUseRedoRewriteWorkspace();
+        if (needs_exception and !redo_rewrite) {
             self.maintenance_policy.status.state = .deferred;
             self.maintenance_policy.status.reason = .storage_budget;
             return null;
         }
-        self.admitEstimatedGenerationAssumeLocked(compact, accounting.current_file_bytes) catch |err| {
+        const estimated = compact +| if (budget != 0 and self.needsProtectedRedoUpgrade()) self.file.vacuumRedoReservation(budget) else 0;
+        self.admitEstimatedGenerationAssumeLocked(estimated, accounting.current_file_bytes) catch |err| {
             if (err != error.LiteStorageBudgetExceeded) return err;
             self.maintenance_policy.status.state = .deferred;
             self.maintenance_policy.status.reason = .storage_budget;
@@ -4917,6 +4947,12 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         return try self.reclamationStatusAssumeLocked();
+    }
+
+    pub fn copyStableSnapshot(self: *Store, dest_path: []const u8, replace: bool) !native.StableSnapshotReport {
+        lockStoreExclusive(self);
+        defer self.mutex.unlock();
+        return self.file.copyStableSnapshotToPath(dest_path, replace);
     }
 
     pub fn reclamationStatusAssumeLocked(self: *Store) !reclamation.Status {
@@ -5132,7 +5168,7 @@ pub const Store = struct {
             var snapshot = try self.file.captureFullReadSnapshot();
             snapshot.page_cache_policy = .metadata_only;
             snapshot.vacuum_target_indexed = self.file.vacuum_target_indexed;
-            snapshot.redo_log_budget_bytes = self.file.redo_log_budget_bytes;
+            snapshot.redo_log_budget_bytes = self.maintenance_policy.options.max_storage_bytes;
             self.file.change_capture = &capture;
             break :blk snapshot;
         };
@@ -5153,14 +5189,19 @@ pub const Store = struct {
             break :blk self.maintenance_policy.status.temporary_bytes;
         };
         const compact = if (workspace_reservation == 0) (try source.liveStats(cancel)).compact_size else 0;
+        var redo_rewrite = false;
         {
             lockStore(self);
             defer self.mutex.unlock();
             const status = try self.reclamationStatusAssumeLockedWithCancel(cancel);
-            const workspace = if (status.temporary_bytes != 0) status.temporary_bytes else @max(compact *| 2, self.maintenance_policy.options.assessment_bytes);
             const budget = self.maintenance_policy.options.max_storage_bytes;
-            if (budget != 0 and status.current_file_bytes +| status.retired_file_bytes +| self.artifactBytes() +| workspace > budget) return error.LiteStorageBudgetExceeded;
-            try self.admitEstimatedGenerationAssumeLocked(if (compact != 0) compact else self.maintenance_policy.status.compact_size_estimate orelse workspace / 2, status.current_file_bytes);
+            const compact_estimate = if (compact != 0) compact else self.maintenance_policy.status.compact_size_estimate orelse workspace_reservation / 2;
+            const occupied = status.current_file_bytes +| status.retired_file_bytes +| self.artifactBytes();
+            const workspace = if (workspace_reservation != 0) workspace_reservation else self.vacuumWorkspaceBytes(compact_estimate);
+            redo_rewrite = budget != 0 and occupied +| workspace > budget;
+            if (redo_rewrite and !try self.canUseRedoRewriteWorkspace()) return error.LiteStorageBudgetExceeded;
+            const estimated = compact_estimate +| if (budget != 0 and self.needsProtectedRedoUpgrade()) self.file.vacuumRedoReservation(budget) else 0;
+            try self.admitEstimatedGenerationAssumeLocked(estimated, status.current_file_bytes);
             if (try self.availableDiskBytes()) |available| {
                 self.maintenance_policy.status.available_disk_bytes = available;
                 if (available < workspace +| self.futureArtifactBytes() +| self.maintenance_policy.options.disk_headroom_bytes) return error.LiteInsufficientDiskSpace;
@@ -5172,8 +5213,10 @@ pub const Store = struct {
         defer {
             // The image defer closes its retired descriptor first. Release
             // this additional old-inode descriptor before returning capacity.
-            source.close();
-            source_open = false;
+            if (source_open) {
+                source.close();
+                source_open = false;
+            }
             lockStore(self);
             self.maintenance_policy.status.temporary_bytes = 0;
             self.admission_refresh_size = 0;
@@ -5182,6 +5225,10 @@ pub const Store = struct {
         if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .copy);
         var image = try source.prepareVacuum(cancel);
         defer image.deinit();
+        if (redo_rewrite) {
+            source.close();
+            source_open = false;
+        }
         image.prepared.no_sync = true;
         image.prepared.allocator_cancel_token = cancel;
         const initial_sequence = blk: {
@@ -5291,7 +5338,17 @@ pub const Store = struct {
                     try image.prepared.finishPublicationSequence(self.file.activeCheckpoint().commit_sequence + 1, image.prepared.activeCheckpoint());
                     image.report.after_size = (try image.prepared.file.stat(io)).size;
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
-                    try self.admitPreparedGenerationAssumeLockedWithCancel(&image.prepared, image.report.before_size, cancel);
+                    var retirement_fence: ?inode_lock.Handle = null;
+                    defer if (retirement_fence) |fence| fence.release(io);
+                    const replaces_redo = redo_rewrite and image.prepared.header.segmented_redo and
+                        (!self.file.header.segmented_redo or image.prepared.header.redoReservation() < self.file.header.redoReservation());
+                    if (replaces_redo) {
+                        retirement_fence = try self.file.tryFenceGenerationRetirement();
+                        if (self.currentGenerationHasReaders()) return error.FileBusy;
+                        const region = (try self.file.regionForInode()) orelse return error.FileBusy;
+                        if (region.minimumPinnedSequence() != null) return error.FileBusy;
+                    }
+                    try self.admitPreparedGenerationAssumeLockedWithCancel(&image.prepared, if (replaces_redo) 0 else image.report.before_size, cancel);
                     const old_handle = self.file.file.handle;
                     const retained_old = self.currentGenerationHasReaders();
                     defer if (self.file.file.handle != old_handle) {
@@ -11236,7 +11293,7 @@ test "lite maintenance upgrades a v11 redo file without reclamation debt" {
         try legacy.file.sync(io);
     }
 
-    var store = try Store.openWithOptions(alloc, path, .{ .io = io });
+    var store = try Store.openWithOptions(alloc, path, .{ .io = io, .reclamation = .{ .max_storage_bytes = 512 * 1024 } });
     defer store.close();
     try std.testing.expectEqual(native.format_version, store.file.header.diskFormatVersion());
     try store.maintainOnce(false);
@@ -11244,6 +11301,26 @@ test "lite maintenance upgrades a v11 redo file without reclamation debt" {
     var read = try store.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("old", try read.get("doc"));
+}
+
+test "lite redo maintenance shrinks a segmented reservation under a lowered cap" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "maintenance-shrink-redo.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io, .use_redo_log = true });
+    defer store.close();
+    const cap = 512 * 1024;
+    try std.testing.expect((try store.file.file.stat(io)).size > cap);
+
+    store.maintenance_policy.options.max_storage_bytes = cap;
+    try store.maintainOnce(true);
+    try std.testing.expectEqual(native.NativeFile.segmentedRedoCapacityForBudget(cap), store.file.header.redo_log_capacity);
+    try std.testing.expect((try store.file.file.stat(io)).size < cap);
+    try store.putCatalogRecord("after-shrink", "value");
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
 // Regression: `NativeFile.prepareVacuum`/`replaceWithPreparedGeneration`
