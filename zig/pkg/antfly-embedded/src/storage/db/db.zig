@@ -162491,6 +162491,16 @@ test "db split finalization records the predecessor committed history frontier t
     try std.testing.expectEqual(@as(?u64, 2), drained.floor);
     try std.testing.expectEqual(@as(?u8, 0), drained.active_consumers);
     try std.testing.expect(drained.retirementReady());
+    const late = try db.applyOrderedHistoryConsumerControl(.{ .enroll = .{
+        .namespace = namespace,
+        .authority = @splat(1),
+        .sequence = 2,
+        .consumer = @splat(4),
+        .definition = @splat(5),
+        .expires_at_seconds = 200,
+        .policy_revision = 1,
+    } }, .{ .term = 2, .index = 13 }, false);
+    try std.testing.expect(late == .rejected and late.rejected == .resynchronization);
 }
 
 test "db ordered empty split destination seeds history before its first write" {

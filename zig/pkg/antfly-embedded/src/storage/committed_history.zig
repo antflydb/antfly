@@ -124,6 +124,7 @@ pub const SplitCut = struct {
 
 /// The ordered end of a merge donor's committed journal.
 pub const MergeCut = struct {
+    pub const admission_fence_key = "\x00\x00__committed_history__:merge_admission_fence";
     const prefix = "\x00\x00__committed_history__:merge_cut:";
     pub const Key = [prefix.len + 8]u8;
     pub const Request = struct {
@@ -162,6 +163,10 @@ pub const MergeCut = struct {
     pub fn retirementReady(self: MergeCut) bool {
         return self.active_consumers == 0 and self.outstanding_reservations == 0 and
             self.floor != null and self.floor.? >= self.latest;
+    }
+
+    pub fn admissionFenced(txn: anytype) !bool {
+        return (try optional(txn, admission_fence_key)) != null;
     }
 
     pub fn key(transition: u64) Key {

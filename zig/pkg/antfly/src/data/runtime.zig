@@ -19317,13 +19317,54 @@ pub const DataServer = struct {
         }
     }
 
+    fn mergeHistoryRetirementReady(self: *DataServer, donor: u64, receiver: u64, transition: u64, contract: antfly.metadata.TransitionTableContract) !bool {
+        if (comptime !linked_storage) return true;
+        const route = try antfly.public_api.table_catalog.routedGroupIdSnapshotUntil(self.alloc, self.write_source.catalog, contract.table_name, donor, null);
+        // Once metadata has removed the donor there is no further publication
+        // to fence. The controller checks this while the donor is still routed.
+        const fence = route.fence() orelse return true;
+        if (fence.metadata_incarnation == null) return true;
+        const source = self.historyRootsSource();
+        const owners = source.artifact_owners orelse return error.ReadUnavailable;
+        const port = source.merge_cut orelse return error.ReadUnavailable;
+        const identity = fence.route.identity_namespace;
+        if (identity.table_id != contract.table_id or identity.shard_id != contract.source_identity.shard_id or
+            identity.range_id != contract.source_identity.range_id) return error.TopologyChanged;
+        var snapshot = (try antfly.public_api.table_catalog.authoritativeTableRoutingSnapshot(self.alloc, self.write_source.catalog, contract.table_name, null)) orelse return error.TopologyChanged;
+        defer snapshot.deinit(self.alloc);
+        const table = for (snapshot.snapshot.value.tables) |candidate| {
+            if (candidate.table_id == contract.table_id) break candidate;
+        } else return error.TopologyChanged;
+        const binding = @import("../metadata/changefeed_control.zig").tableBinding(table);
+        const qualified = owners.read(self.alloc, fence, contract.table_name, .{ .version = 1, .expected_table_binding = binding }, .{}) catch |err| switch (err) {
+            error.ChangefeedCapabilityUnsupported => return true,
+            else => return err,
+        };
+        const cut = (try port.read(self.alloc, fence, contract.table_name, .{
+            .namespace = qualified.owner.namespace,
+            .transition = transition,
+            .receiver_group = receiver,
+            .root_generation = qualified.owner.root_generation,
+        }, .{})) orelse return true;
+        return cut.retirementReady();
+    }
+
     fn observeReplicatedMerge(
         self: *DataServer,
         record: antfly.metadata.MergeTransitionRecord,
     ) !antfly.metadata.transition_state.MergeObservation {
         const store = self.localTransitionApplyStore() orelse
             return error.MissingMergeSourceStore;
-        return try deriveReplicatedMergeObservation(self.alloc, store, record);
+        var observation = try deriveReplicatedMergeObservation(self.alloc, store, record);
+        if (record.phase != .finalized and observation.donor.phase == .finalized and observation.receiver.phase == .finalized and
+            !try self.mergeHistoryRetirementReady(record.donor_group_id, record.receiver_group_id, record.transition_id, record.table_contract))
+        {
+            observation.donor.phase = .cutover_ready;
+            observation.receiver.phase = .cutover_ready;
+            observation.donor.cutover_ready = true;
+            observation.receiver.cutover_ready = true;
+        }
+        return observation;
     }
 
     fn deriveReplicatedMergeObservation(
@@ -19640,6 +19681,8 @@ pub const DataServer = struct {
                 op.allow_doc_identity_reassignment,
                 op.table_contract,
             )) {
+                if (!try self.mergeHistoryRetirementReady(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract))
+                    return error.TransitionOperationBusy;
                 try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
                 return;
             }
@@ -19706,6 +19749,8 @@ pub const DataServer = struct {
                 ),
                 op.table_contract,
             );
+            if (!try self.mergeHistoryRetirementReady(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract))
+                return error.TransitionOperationBusy;
             try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });

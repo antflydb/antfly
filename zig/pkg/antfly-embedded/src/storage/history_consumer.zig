@@ -170,6 +170,7 @@ pub fn enroll(txn: anytype, grant: Grant) !history.Consumer {
         }
         return consumer;
     }
+    if (try history.MergeCut.admissionFenced(txn)) return error.HistoryResynchronizationRequired;
     if (grant.sequence <= state.floor) return error.HistoryResynchronizationRequired;
     const slot = for (&state.leases) |*lease| {
         if (lease.epoch == 0) break lease;

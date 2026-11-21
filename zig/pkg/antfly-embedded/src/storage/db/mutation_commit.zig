@@ -3137,6 +3137,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const receipt = opts.ordered_apply_receipt.?;
                     const core = S.ownerField(self, "core").*;
                     const namespace = @import("online_source_contract.zig").namespaceBytes(core.identity_namespace);
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = history.MergeCut.admission_fence_key, .value = "1" });
                     var read = try core.store.beginReadTxn();
                     defer read.abort();
                     if (try history.MergeCut.load(&read, transition.transition_id)) |previous| {
