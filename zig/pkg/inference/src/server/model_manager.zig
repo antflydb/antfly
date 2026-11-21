@@ -6057,7 +6057,7 @@ pub const ModelManager = struct {
             (try session_factory.resolveCudaA4bInferenceConfigForModelListing(self.allocator, model_dir, manifest, null)) != null;
         // Acquisition still recognizes a device that disappeared after a lease
         // was issued, so the caller can fail over on a backend refusal.
-        const candidates = if (include_unavailable)
+        const candidates = if (include_unavailable or expected != null)
             manager.requiredBackendCandidates(load_policy.preferred_backends, &required) catch return result
         else
             effective;
@@ -6080,7 +6080,7 @@ pub const ModelManager = struct {
             if (!backend.available() or !backend.supportsDirectSessionLoad()) continue;
             if (modelBackendPolicyError(manifest, backend, load_policy.cache_policy.a4b_request) != null) continue;
             if (!modelBackendMeetsJitPolicy(manager, manifest, backend)) continue;
-            if (!include_unavailable and self.pinnedBackendIsUnavailable(model_dir, artifacts.installation, backend)) continue;
+            if (!include_unavailable and modelBackendIsUnhealthy(self, model_dir, artifacts.installation, backend)) continue;
             if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) continue;
             if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
             if (manifest.embedding_style == .embedding_gemma2 and backend != .native and backend != .metal and backend != .cuda) continue;
@@ -6090,6 +6090,14 @@ pub const ModelManager = struct {
                 if (expected) |pin| {
                     if (result.contains(pin)) continue;
                 }
+                if (!include_unavailable) if (backends.knownCudaDeviceState()) |state| switch (state) {
+                    .available => {},
+                    .unavailable => continue,
+                    .retryable => {
+                        result.cuda_probe_refused = true;
+                        continue;
+                    },
+                };
                 if (try self.residentCudaEmbeddingRevision(model_dir, artifacts.installation, load_policy.cache_policy)) |resident|
                     break :resolved resident;
                 const policy = (self.cuda_gemma_policy.resolve(self.allocator, artifacts.io, control) catch |err| switch (err) {
@@ -6108,11 +6116,18 @@ pub const ModelManager = struct {
             // Probe only after resolving the exact recipe, so a CPU pin never
             // waits for the CUDA driver.
             if (!include_unavailable and backend == .cuda and manifest.embedding_style != .embedding_gemma2) {
-                const available_device = backends.probeCudaDeviceWithControl(control) catch |err| switch (err) {
-                    error.ProcessIsolationRequired => false,
+                const state = backends.probeCudaDeviceStateWithControl(control) catch |err| switch (err) {
+                    error.ProcessIsolationRequired => .retryable,
                     else => return err,
                 };
-                if (!available_device) continue;
+                switch (state) {
+                    .available => {},
+                    .unavailable => continue,
+                    .retryable => {
+                        result.cuda_probe_refused = true;
+                        continue;
+                    },
+                }
             }
             result.backends[result.len] = backend;
             result.revisions[result.len] = revision;

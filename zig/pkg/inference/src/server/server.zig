@@ -4116,6 +4116,7 @@ const RequestWorkTestCounters = struct {
     model_resolution_attempts: usize = 0,
     model_load_attempts: usize = 0,
     scoped_execution_manifest_loads: usize = 0,
+    scoped_embedding_candidate_enumerations: usize = 0,
     compatibility_checkpoint_samples: usize = 0,
     media_fetch_attempts: usize = 0,
     batch_materialized_items: usize = 0,
@@ -27920,25 +27921,35 @@ pub const Node = struct {
                     _ = std.fmt.hexToBytes(&requested, required) catch return embeddingRevisionFailureResponse(ctx);
                     break :pin requested;
                 } else null;
-                var declared = if (pin_scope) |scope|
-                    self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, control, &scope.artifacts, expected_pin) catch |err| {
+                var lookup_revision = expected_pin;
+                if (lookup_revision == null and !include_revisions) {
+                    if (cached_model) |handle| lookup_revision = handle.get().durable_embedding_revision;
+                }
+                var declared: model_manager_mod.ModelManager.EmbeddingRevisions = .{};
+                var rejected: model_manager_mod.ModelManager.EmbeddingRevisions = .{};
+                if (pin_scope) |scope| while (true) {
+                    if (comptime builtin.is_test) {
+                        if (lookup_revision == null) request_work_test_counters.scoped_embedding_candidate_enumerations += 1;
+                    }
+                    declared = self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, control, &scope.artifacts, lookup_revision) catch |err| {
                         if (isPinnedCatalogArtifactFailure(err)) {
-                            // A checksum refusal can arrive after discovery
-                            // captured healthy-looking size and path stamps.
-                            if (scoped_publication) |*captured| captured.borrow.invalidate();
+                            scope.borrow.invalidate();
                             return embeddingArtifactFailureResponse(ctx);
                         }
                         return modelLoadFailureResponse(ctx, err);
-                    }
-                else
-                    model_manager_mod.ModelManager.EmbeddingRevisions{};
-                const rejected = if (pin_scope) |scope|
-                    scope.borrow.filterEmbeddingRevisions(&scope.artifacts, &declared, self.config.allow_unknown_models, control) catch |err| return modelLoadFailureResponse(ctx, err)
-                else
-                    model_manager_mod.ModelManager.EmbeddingRevisions{};
+                    };
+                    rejected = scope.borrow.filterEmbeddingRevisions(&scope.artifacts, &declared, self.config.allow_unknown_models, control) catch |err|
+                        return modelLoadFailureResponse(ctx, err);
+                    if (declared.len != 0 or expected_pin != null or lookup_revision == null) break;
+                    // The resident recipe can be retired or quarantined.
+                    // Look for the current default only if its proof failed.
+                    lookup_revision = null;
+                };
                 if (declared.len == 0 and rejected.len != 0) return embeddingArtifactFailureResponse(ctx);
-                if (declared.len == 0 and declared.cuda_probe_refused)
+                if (declared.len == 0 and declared.cuda_probe_refused) {
+                    if (expected_pin) |requested| return (try pinnedEmbeddingPreflightFailure(ctx, requested, error.PinnedEmbeddingBackendUnavailable)).?;
                     return modelResourceBusyResponse(ctx);
+                }
                 var revision: ?[32]u8 = if (cached_model) |*handle| loaded: {
                     // The held runtime supplies both geometry and revision.
                     const serving = handle.get();
@@ -27976,7 +27987,6 @@ pub const Node = struct {
                 if (expected_pin) |requested| {
                     if (rejected.contains(requested) and !declared.contains(requested)) return embeddingArtifactFailureResponse(ctx);
                     if (!std.meta.eql(durable_revision, @as(?[32]u8, requested)) and !declared.contains(requested)) {
-                        if (declared.cuda_probe_refused) return (try pinnedEmbeddingPreflightFailure(ctx, requested, error.PinnedEmbeddingBackendUnavailable)).?;
                         return embeddingRevisionFailureResponse(ctx);
                     }
                     durable_revision = requested;
@@ -52878,6 +52888,13 @@ test "scoped model discovery resolves dense geometry without loading weights" {
         try node.model_manager.loaded.put(a, managed_path, &resident);
         defer _ = node.model_manager.loaded.remove(managed_path);
         const previous_loads = request_work_test_counters.scoped_execution_manifest_loads;
+        const previous_enumerations = request_work_test_counters.scoped_embedding_candidate_enumerations;
+        var primary_ctx = httpx.Context.init(a, counted_io, &managed_request);
+        defer primary_ctx.deinit();
+        var primary_response = try node.listModels(&primary_ctx);
+        defer primary_response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), primary_response.status.code);
+        try std.testing.expectEqual(previous_enumerations, request_work_test_counters.scoped_embedding_candidate_enumerations);
         var resident_request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=acme%2Fother&task=embed&model_revision_candidates=1");
         defer resident_request.deinit();
         for (0..2) |attempt| {

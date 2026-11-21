@@ -754,26 +754,36 @@ fn backendOrderWithCudaAvailability(scratch: *[backend_order_capacity]BackendTyp
 }
 
 const cuda_probe_time = @import("antfly_platform").time;
+pub const CudaDeviceState = enum { available, unavailable, retryable };
+
 const CudaDeviceEvidence = struct {
-    // Zero is unobserved, maxInt records successful initialization, and
-    // every other value is the deadline for retrying a negative observation.
+    // A single atomic publishes the classification and deadline together.
+    // Zero is unobserved and maxInt records successful initialization.
     const present = std.math.maxInt(u64);
+    const retryable_bit = @as(u64, 1) << 63;
+    const deadline_mask = retryable_bit - 1;
     until: std.atomic.Value(u64) = .init(0),
 
-    fn known(self: *const CudaDeviceEvidence, now: ?u64) ?bool {
-        const until = self.until.load(.acquire);
-        if (until == present) return true;
-        if (until == 0) return null;
-        if ((now orelse cuda_probe_time.monotonicNs()) < until) return false;
-        return null;
+    fn known(self: *const CudaDeviceEvidence, now: ?u64) ?CudaDeviceState {
+        const encoded = self.until.load(.acquire);
+        if (encoded == present) return .available;
+        const deadline = encoded & deadline_mask;
+        if (deadline == 0 or (now orelse cuda_probe_time.monotonicNs()) >= deadline) return null;
+        return if (encoded & retryable_bit != 0) .retryable else .unavailable;
     }
 
-    fn remember(self: *CudaDeviceEvidence, now: u64, failure: ?anyerror) void {
-        const ttl: u64 = if (failure) |err| switch (err) {
-            error.CudaUnavailable, error.CudaSymbolMissing, error.CudaDriverTooOld, error.CudaArtifactUnsupportedDevice => 60 * std.time.ns_per_s,
-            else => std.time.ns_per_s,
-        } else 0;
-        self.until.store(if (failure == null) present else @min(now +| ttl, present - 1), .release);
+    fn remember(self: *CudaDeviceEvidence, now: u64, failure: ?anyerror) CudaDeviceState {
+        const state: CudaDeviceState = if (failure) |err| switch (err) {
+            error.CudaUnavailable, error.NoCudaDevices, error.CudaSymbolMissing, error.CudaDriverTooOld, error.CudaArtifactUnsupportedDevice => .unavailable,
+            else => .retryable,
+        } else .available;
+        const encoded = switch (state) {
+            .available => present,
+            .unavailable => @min(now +| (60 * std.time.ns_per_s), deadline_mask - 1),
+            .retryable => @min(now +| std.time.ns_per_s, deadline_mask - 1) | retryable_bit,
+        };
+        self.until.store(encoded, .release);
+        return state;
     }
 };
 
@@ -787,19 +797,27 @@ pub fn cudaDeviceAvailable() bool {
 
 /// Read cached device evidence without initializing a driver on discovery.
 pub fn knownCudaDeviceAvailability() ?bool {
+    return if (knownCudaDeviceState()) |state| state == .available else null;
+}
+
+pub fn knownCudaDeviceState() ?CudaDeviceState {
     return cuda_device_evidence.known(null);
 }
 
 pub fn probeCudaDeviceWithControl(control: ?execution_control.InferenceExecutionControl) !bool {
-    if (comptime !build_options.enable_cuda) return false;
-    if (knownCudaDeviceAvailability()) |available| return available;
+    return (try probeCudaDeviceStateWithControl(control)) == .available;
+}
+
+pub fn probeCudaDeviceStateWithControl(control: ?execution_control.InferenceExecutionControl) !CudaDeviceState {
+    if (comptime !build_options.enable_cuda) return .unavailable;
+    if (knownCudaDeviceState()) |state| return state;
     while (!cuda_probe_mutex.tryLock()) {
         if (control) |active| try active.check();
-        if (knownCudaDeviceAvailability()) |available| return available;
+        if (knownCudaDeviceState()) |state| return state;
         cuda_probe_time.sleepNs(std.time.ns_per_ms);
     }
     defer cuda_probe_mutex.unlock();
-    if (knownCudaDeviceAvailability()) |available| return available;
+    if (knownCudaDeviceState()) |state| return state;
     var guard: execution_control.UninterruptibleGuard = if (control) |active| guarded: {
         try active.check();
         break :guarded try active.enterUninterruptible(.uninterruptible);
@@ -812,18 +830,19 @@ pub fn probeCudaDeviceWithControl(control: ?execution_control.InferenceExecution
         std.log.info("CUDA is not in the automatic backend order: {s}", .{@errorName(err)});
     }
     if (control) |active| try active.check();
-    cuda_device_evidence.remember(cuda_probe_time.monotonicNs(), failure);
-    return failure == null;
+    return cuda_device_evidence.remember(cuda_probe_time.monotonicNs(), failure);
 }
 
 test "model selection CUDA device evidence recovers after a transient driver failure" {
     var evidence: CudaDeviceEvidence = .{};
-    try std.testing.expectEqual(@as(?bool, null), evidence.known(0));
-    evidence.remember(0, error.CudaDriverError);
-    try std.testing.expectEqual(@as(?bool, false), evidence.known(std.time.ns_per_s - 1));
-    try std.testing.expectEqual(@as(?bool, null), evidence.known(std.time.ns_per_s));
-    evidence.remember(std.time.ns_per_s, null);
-    try std.testing.expectEqual(@as(?bool, true), evidence.known(120 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(?CudaDeviceState, null), evidence.known(0));
+    try std.testing.expectEqual(.retryable, evidence.remember(0, error.CudaDriverError));
+    try std.testing.expectEqual(@as(?CudaDeviceState, .retryable), evidence.known(std.time.ns_per_s - 1));
+    try std.testing.expectEqual(@as(?CudaDeviceState, null), evidence.known(std.time.ns_per_s));
+    try std.testing.expectEqual(.unavailable, evidence.remember(std.time.ns_per_s, error.NoCudaDevices));
+    try std.testing.expectEqual(@as(?CudaDeviceState, .unavailable), evidence.known(2 * std.time.ns_per_s));
+    try std.testing.expectEqual(.available, evidence.remember(2 * std.time.ns_per_s, null));
+    try std.testing.expectEqual(@as(?CudaDeviceState, .available), evidence.known(120 * std.time.ns_per_s));
 }
 
 fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
