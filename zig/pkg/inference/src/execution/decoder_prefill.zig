@@ -32,6 +32,18 @@ const runtime = @import("../runtime/root.zig");
 const cuda_compute = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 const BorrowedDecodeStateRuntime = graph_mod.decode_state_runtime.BorrowedDecodeStateRuntime;
 
+/// Resolve the native physical row bound for text and prepared embeddings.
+pub fn nativeChunkRows(cb: *const ComputeBackend, config: gpt_arch.Config, prompt_rows: usize, requested_rows: usize) ?usize {
+    return switch (cb.kind()) {
+        .metal => decoder_routes.metalPreparedEmbeddingChunkRows(config, requested_rows),
+        .cuda => if (comptime build_options.enable_cuda)
+            cuda_compute.CudaCompute.nativePrefillChunkRows(cb, prompt_rows, requested_rows)
+        else
+            null,
+        else => null,
+    };
+}
+
 /// A single owned F32 row destination for a prepared embedding layout. Task
 /// code supplies semantic text/image ordering; physical copies never rebuild or
 /// export the already assembled prefix. Capability decline occurs before writes.
@@ -1076,12 +1088,7 @@ pub const Runtime = struct {
             request.positions == null and request.visual_mask == null and request.deepstack_embeddings == null and
             self.state.isPaged())
         {
-            const rows = if (cb.kind() == .metal)
-                decoder_routes.metalPreparedEmbeddingChunkRows(self.forward.context.gpt_config.*, request.chunk_rows)
-            else if (comptime build_options.enable_cuda)
-                cuda_compute.CudaCompute.nativePrefillChunkRows(cb, request.sequence_length, request.chunk_rows)
-            else
-                null;
+            const rows = nativeChunkRows(cb, self.forward.context.gpt_config.*, request.sequence_length, request.chunk_rows);
             if (rows) |bounded_rows| if (request.sequence_length > bounded_rows) {
                 owned = false;
                 defer cb.free(embeddings);

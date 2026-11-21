@@ -5008,15 +5008,7 @@ pub const NativeGenerationPipeline = struct {
                 .leased_plan = if (self.scheduler_lease) |lease| if (lease.prefill_chunk_plan.isAdmitted()) lease.prefill_chunk_plan else null else null,
                 .configured_chunk_rows = config.prefill_chunk_size,
                 .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
-                .default_chunk_rows = if (self.cb.kind() == .metal)
-                    decoder_routes.metalPreparedEmbeddingChunkRows(self.gpt_config, 0) orelse 0
-                else if (comptime build_options.enable_cuda) bounded: {
-                    if (self.cb.kind() == .cuda) {
-                        if (@import("../ops/cuda/cuda_compute.zig").CudaCompute.nativePrefillChunkRows(&self.cb, seq_len, 0)) |rows|
-                            break :bounded rows;
-                    }
-                    break :bounded 0;
-                } else 0,
+                .default_chunk_rows = decoder_prefill.nativeChunkRows(&self.cb, self.gpt_config, seq_len, 0) orelse 0,
                 .selected_kv = config.kv_cache_mode == .select_v1,
                 .checkpoint_resume = self.checkpoint_resume != null,
                 .backend = self.cb.kind(),
