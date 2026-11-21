@@ -13714,6 +13714,13 @@ pub const NativeFile = struct {
             const external = !mutation.is_delete and
                 (mutation.external_value_root_page != 0 or !self.documentEntryFitsInline(mutation.key, mutation.value));
             bytes +|= logicalMutationWireBytes(mutation.key.len, if (mutation.is_delete) 0 else mutation.value.len, external);
+            // putDocumentBatch may stage a metadata record alongside each
+            // tracked key. Count repeated scopes conservatively here.
+            if (self.header.indexed_reclamation) {
+                if (recovery_agenda.namespace(mutation.key)) |scope| {
+                    bytes +|= logicalMutationWireBytes(recovery_agenda.prefix.len +| scope.len, 0, false);
+                }
+            }
         }
         for (catalog) |mutation| {
             const external = !mutation.is_delete and

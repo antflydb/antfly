@@ -3775,6 +3775,7 @@ pub const DocStore = struct {
         {
             var cursor = try txn.openPhysicalCursorAdapter();
             defer cursor.close();
+            cursor.boundPersistedRunBlockResidency();
             // Keep hinted lanes ahead of the all-record lane.
             for (1..replay_credit_lanes.len + 1) |turn| {
                 const lane = turn % replay_credit_lanes.len;
