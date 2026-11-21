@@ -11229,10 +11229,10 @@ pub const DB = struct {
                 return true;
             }
         };
-        var scan = Scan{ .alloc = alloc, .dependent = dependent_table_id };
+        var outbox_scan = Scan{ .alloc = alloc, .dependent = dependent_table_id };
         const outbox = context_dependency_store.familyPrefix(notices_mod.outbox_family);
-        try reader.reader().scanPrefix(alloc, &outbox, .{ .ptr = &scan, .visit_fn = Scan.visit });
-        if (scan.pending) return true;
+        try reader.reader().scanPrefix(alloc, &outbox, .{ .ptr = &outbox_scan, .visit_fn = Scan.visit });
+        if (outbox_scan.pending) return true;
         var markers = struct {
             found: bool = false,
             fn visit(p: *anyopaque, _: []const u8, _: []const u8) anyerror!bool {

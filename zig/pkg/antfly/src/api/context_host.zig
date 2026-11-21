@@ -308,6 +308,8 @@ pub const Primitives = struct {
 };
 
 pub const max_scan_rows: u32 = 100_000;
+/// Notices one inbox command may carry.
+const max_inbox_notices = command_mod.max_inbox_notices;
 
 pub const Host = struct {
     primitives: Primitives,
@@ -413,15 +415,21 @@ pub const Host = struct {
             },
             .is_leader => return alloc.dupe(u8, if (p.is_leader_fn(p.ptr, group_id)) "1" else "0"),
             .deliver => {
-                const body = try std.json.parseFromSliceLeaky(struct { dependent: []const u8, notice: []const u8 }, a, request, .{ .allocate = .alloc_always });
+                // One call carries a batch of notices for one dependent table
+                // (`notices`, at most one inbox command's worth) or a single
+                // `notice`.
+                const body = try std.json.parseFromSliceLeaky(struct { dependent: []const u8, notice: []const u8 = "", notices: []const []const u8 = &.{} }, a, request, .{ .allocate = .alloc_always });
+                const batch: []const []const u8 = if (body.notices.len != 0) body.notices else if (body.notice.len != 0) &.{body.notice} else return alloc.dupe(u8, "");
+                if (batch.len > max_inbox_notices) return error.ContextBudgetExceeded;
                 const dependent = if (body.dependent.len == 0) table_name else blk: {
                     const tables = try p.tables_fn(p.ptr, a);
                     break :blk (findByIdentity(tables, body.dependent) orelse return error.ContextDependentUnavailable).name;
                 };
                 // Every group holds part of the dependent table's dependents;
-                // inbox appends are idempotent (keyed by notice digest).
+                // inbox appends are idempotent (keyed by notice digest), so one
+                // proposal per group carries the whole batch.
                 const groups = try p.groups_fn(p.ptr, a, dependent);
-                for (groups) |g| try p.propose_fn(p.ptr, alloc, g, dependent, .{ .inbox = &.{body.notice} }, true);
+                for (groups) |g| try p.propose_fn(p.ptr, alloc, g, dependent, .{ .inbox = batch }, true);
                 return alloc.dupe(u8, "");
             },
             .lookup => {

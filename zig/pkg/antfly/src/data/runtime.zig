@@ -6902,15 +6902,24 @@ pub const DataServer = struct {
             if (status.deliveries.len != 0) {
                 const host = if (server.context_host) |*value| value else return;
                 var acks = std.ArrayListUnmanaged([]const u8).empty;
-                for (status.deliveries) |d| {
-                    const request = try std.json.Stringify.valueAlloc(a, .{ .dependent = d.dependent, .notice = d.notice }, .{});
-                    const out = host.call(a, @backingInt(@import("antfly_local_sources").storage_db_context_host_wire.Op.deliver), job.group_id, job.table, request) catch |err| {
+                // Batch consecutive notices for the same dependent table: one
+                // inbox proposal per dependent group per batch, not per notice.
+                var batch_start: usize = 0;
+                while (batch_start < status.deliveries.len) {
+                    const dependent = status.deliveries[batch_start].dependent;
+                    var batch_end = batch_start + 1;
+                    while (batch_end < status.deliveries.len and batch_end - batch_start < 256 and std.mem.eql(u8, status.deliveries[batch_end].dependent, dependent)) batch_end += 1;
+                    const batch = status.deliveries[batch_start..batch_end];
+                    batch_start = batch_end;
+                    const notices = try a.alloc([]const u8, batch.len);
+                    for (batch, notices) |d, *n| n.* = d.notice;
+                    const request = try std.json.Stringify.valueAlloc(a, .{ .dependent = dependent, .notices = notices }, .{});
+                    _ = host.call(a, @backingInt(@import("antfly_local_sources").storage_db_context_host_wire.Op.deliver), job.group_id, job.table, request) catch |err| {
                         // Undelivered entries stay in the outbox for the next pass.
                         std.log.warn("context notice delivery deferred table={s} group_id={d} err={s}", .{ job.table, job.group_id, @errorName(err) });
                         continue;
                     };
-                    _ = out;
-                    try acks.append(a, d.ack);
+                    for (batch) |d| try acks.append(a, d.ack);
                 }
                 if (acks.items.len != 0) try contextPropose(server, a, job.group_id, job.table, .{ .acks = acks.items }, false);
             }
