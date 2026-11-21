@@ -3202,14 +3202,15 @@ pub const Session = struct {
         defer if (protection) |*scope| scope.deinit();
         var metadata = std.heap.ArenaAllocator.init(allocator);
         defer metadata.deinit();
-        const info = try metadata.allocator().alloc(TensorInfo, inputs.len);
+        var stage_info: [8]TensorInfo = undefined;
+        const info = if (inputs.len <= stage_info.len) stage_info[0..inputs.len] else try metadata.allocator().alloc(TensorInfo, inputs.len);
         for (inputs, self.inputInfo(), info) |input, declared, *actual| {
             actual.* = switch (input) {
                 .host => |host| .{ .name = host.name, .dtype = host.dtype, .shape = host.shape },
                 .resident => |value| .{
                     .name = declared.name,
                     .dtype = declared.dtype,
-                    .shape = try value.backend.tensorShape(value.value, metadata.allocator()),
+                    .shape = try stageInputShape(value, metadata.allocator()),
                 },
             };
         }
@@ -3223,6 +3224,14 @@ pub const Session = struct {
         permit.lease = null;
         self.pinResident(&outputs);
         return outputs;
+    }
+
+    fn stageInputShape(value: ResidentInput, allocator: std.mem.Allocator) ![]const i64 {
+        // Reuse the producer's existing dimensions only after the receiving
+        // call verifies them against the actual tensor. A backend without a
+        // metadata match hook keeps the ordinary shape query.
+        if (value.shape.len != 0 and (try value.backend.tensorShapeMatches(value.value, value.shape) orelse false)) return value.shape;
+        return value.backend.tensorShape(value.value, allocator);
     }
 
     /// Multi-entry models declare their logical stage ABI alongside the
@@ -5762,8 +5771,10 @@ pub const RunPermit = struct {
     fn runStageInputsWithinBoundary(self: *RunPermit, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
         const shared = self.session.shared_compute_context.?;
         const backend = shared.stableBackend();
-        const resident = try allocator.alloc(ResidentInput, inputs.len);
-        defer allocator.free(resident);
+        var stage_inputs: [8]ResidentInput = undefined;
+        const allocate = inputs.len > stage_inputs.len;
+        const resident = if (allocate) try allocator.alloc(ResidentInput, inputs.len) else stage_inputs[0..inputs.len];
+        defer if (allocate) allocator.free(resident);
         var initialized: usize = 0;
         defer for (inputs[0..initialized], resident[0..initialized]) |input, value| {
             if (input == .host) backend.free(value.value);
