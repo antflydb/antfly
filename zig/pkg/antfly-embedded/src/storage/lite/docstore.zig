@@ -2916,6 +2916,7 @@ const MutationRequest = struct {
     durable: bool = true,
     index_only: bool = false,
     artifact_lease: bool = false,
+    fold_before_apply: bool = false,
     /// Never closes a group by becoming its leader, and never durable on
     /// its own: it joins whichever group a foreground (non-ride-along)
     /// member next forms, or `forceDrainDurable`'s forced group if none
@@ -5560,6 +5561,7 @@ pub const Store = struct {
         durable: bool = true,
         index_only: bool = false,
         artifact_lease: bool = false,
+        fold_before_apply: bool = false,
         /// Estimated size of this member's writes. Used only to bound group
         /// formation (`group_max_bytes`); never required to be exact. Also
         /// what `stageRideAlong` tracks against `ride_along_byte_threshold`.
@@ -5726,6 +5728,7 @@ pub const Store = struct {
             .durable = !ride_along and plan.durable,
             .index_only = plan.index_only,
             .artifact_lease = plan.artifact_lease,
+            .fold_before_apply = plan.fold_before_apply,
             .ride_along = ride_along,
             .estimated_bytes = plan.estimated_bytes,
         };
@@ -6457,11 +6460,15 @@ pub const Store = struct {
     }
 
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true, false);
+        return self.submitScopedMutation(context, apply, durable, true, false, false);
     }
 
     /// A durability barrier allocates no pages and requires no allocator
     /// admission, retirement service, or synthetic mutation transaction.
+    pub fn submitIndexScopeDeletion(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitScopedMutation(context, apply, true, true, false, true);
+    }
+
     pub fn syncIndexContents(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .index);
@@ -6478,7 +6485,7 @@ pub const Store = struct {
     }
 
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, false, false);
+        return self.submitScopedMutation(context, apply, durable, false, false, false);
     }
 
     /// WS7/WS5 interim ride-along commit, one named helper so every caller
@@ -6498,7 +6505,7 @@ pub const Store = struct {
     /// Immutable source aliases are read-path metadata, not authored writes.
     /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        return self.submitScopedMutation(context, apply, true, false, true);
+        return self.submitScopedMutation(context, apply, true, false, true, false);
     }
 
     /// `submitIndexMutation` for one native-catalog index scope. Through a
@@ -6617,7 +6624,7 @@ pub const Store = struct {
         value.* = @max(value.*, sequence);
     }
 
-    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
+    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool, fold_before_apply: bool) !void {
         // A forwarded request commits in the writer store's group, which
         // enters that store's admission, not this one's. The detached work
         // that built it must still hold the writer lease and pass this
@@ -6630,7 +6637,7 @@ pub const Store = struct {
         const forwarded_admission = if (self.write_target != null) self.writer_admission else null;
         if (forwarded_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease) .artifact_lease else if (index_only) .index else .primary);
         defer if (forwarded_admission) |admission| admission.leave(admission.ptr);
-        const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
+        const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease, .fold_before_apply = fold_before_apply });
         ticket.wait() catch |err| {
             // §9.7f: a redo-log file's own fixed log-capacity reservation
             // can go stale -- frozen at whatever it was sized to when
@@ -6658,7 +6665,7 @@ pub const Store = struct {
                 // request), and retry only if the reservation shrank.
                 const shrank = (if (forwarded_admission != null) self.reclaimOversizedRedoReservationAdmitted() else self.reclaimOversizedRedoReservation()) catch false;
                 if (shrank) {
-                    const retry_ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
+                    const retry_ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease, .fold_before_apply = fold_before_apply });
                     return retry_ticket.wait();
                 }
             }
@@ -6699,10 +6706,12 @@ pub const Store = struct {
         if (!self.ride_along_flush_started.load(.acquire) and self.file.redo != null) self.ensureRideAlongFlushStarted();
         var index_only = true;
         var artifact_lease_only = true;
+        var fold_before_apply = false;
         var member: ?*MutationRequest = head;
         while (member) |item| : (member = item.next) {
             index_only = index_only and item.index_only;
             artifact_lease_only = artifact_lease_only and item.artifact_lease;
+            fold_before_apply = fold_before_apply or item.fold_before_apply;
         }
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease_only) .artifact_lease else if (index_only) .index else .primary);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
@@ -6715,6 +6724,10 @@ pub const Store = struct {
         if (artifact_lease_only) {
             try self.file.beginArtifactLeaseTransaction();
         } else {
+            // Large scope deletes switch from logical redo to physical
+            // updates mid-transaction. Fold older overlay entries first so
+            // physical deletes cannot be shadowed by those older versions.
+            if (fold_before_apply and self.file.redo != null) try self.file.checkpointRedoLog();
             try self.file.reclaimRetirementPressure();
             try self.file.beginTransaction();
         }
@@ -7768,11 +7781,17 @@ pub const Txn = struct {
             const first_key = if (mutations.len != 0) mutations[0].key else "<none>";
             std.debug.print("[native-recovery] Txn.commitStaged ride_along={} mutation_count={d} first_key={s} index_catalog_mutation_count={d}\n", .{ self.ride_along, mutations.len, first_key, self.index_catalog_pending.items.len });
         }
+        const plan = Store.MutationPlan{
+            .context = context,
+            .apply = PrimaryCommitContext.apply,
+            .estimated_bytes = estimated_bytes,
+            .fold_before_apply = self.index_catalog_delete_prefix != null,
+        };
         var ride_along_ticket: ?Store.Ticket = null;
         const staged: ?Store.Staged = if (self.ride_along) staged: {
-            ride_along_ticket = try store.stageRideAlong(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });
+            ride_along_ticket = try store.stageRideAlong(plan);
             break :staged null;
-        } else try store.enqueue(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });
+        } else try store.enqueue(plan);
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {
             // Keep `writer_admission` held past this point: staging is not
@@ -10465,7 +10484,10 @@ test "lite native docstore deletes a large index scope in one publication" {
     }
     var cursor = try store.file.indexCatalogCursor(store.file.activeCheckpoint(), prefix);
     defer cursor.deinit();
-    try std.testing.expect((try cursor.next()) == null);
+    if (try cursor.next()) |record| {
+        store.file.allocator.free(record.key);
+        return error.TestUnexpectedResult;
+    }
     const keep = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "idx-neighbor", null, "keep");
     defer allocator.free(keep);
     const value = (try store.file.getIndexCatalogRecordAlloc(allocator, keep)).?;

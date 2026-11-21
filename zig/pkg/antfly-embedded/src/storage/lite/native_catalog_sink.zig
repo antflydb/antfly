@@ -302,7 +302,7 @@ pub const Sink = struct {
             }
         };
         var request = Request{ .prefix = prefix };
-        try self.store.submitIndexMutationForScope(scope, &request, Request.run, true);
+        try self.store.submitIndexScopeDeletion(&request, Request.run);
     }
 
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {

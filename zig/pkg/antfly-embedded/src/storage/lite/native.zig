@@ -3301,6 +3301,7 @@ pub const CatalogCursor = struct {
     /// future caller over a root outside TransactionWrites.Root's three
     /// has a documented, explicit opt-out rather than a silent mismatch).
     overlay_root: ?TransactionWrites.Root = null,
+    overlay_mark: u64 = 0,
     overlay: NativeFile.OverlayScanState = .{ .allocator = undefined },
     overlay_started: bool = false,
     /// The tree's own already-fetched candidate, held here whenever the
@@ -3333,7 +3334,7 @@ pub const CatalogCursor = struct {
             // absent key, so this stays a hard error rather than quietly
             // skipping (which `nextRecordAlloc`'s own one-key-at-a-time
             // contract has no loop to do safely).
-            const entry = (try file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key.key)) orelse return error.InvalidNativeRedoRecord;
+            const entry = (try file.redoOverlayEntryAt(self.overlay_root.?, self.overlay_mark, self.index.checkpoint.redo_folded_through, key.key)) orelse return error.InvalidNativeRedoRecord;
             defer file.allocator.free(entry.value);
             break :blk try file.catalogEntryValueAtCheckpointAlloc(allocator, entry, self.index.checkpoint);
         } else blk: {
@@ -3404,7 +3405,7 @@ pub const CatalogCursor = struct {
                 // (same bug class as `MergedCursor.advance`'s own fix).
                 const checkpoint = self.index.checkpoint;
                 const deleted = if (file.redo) |redo|
-                    redo.shared.resolveDeletion(file.runtimeIo(), @backingInt(self.overlay_root.?), key, file.readMark(checkpoint), checkpoint.redo_folded_through)
+                    redo.shared.resolveDeletion(file.runtimeIo(), @backingInt(self.overlay_root.?), key, self.overlay_mark, checkpoint.redo_folded_through)
                 else
                     null;
                 _ = try self.overlay.takeFront();
@@ -14744,7 +14745,7 @@ pub const NativeFile = struct {
         const overlay_root: TransactionWrites.Root = if (root == .metadata) .metadata else .index;
         var overlay = try OverlayScanState.initForPrefix(self.allocator, self, overlay_root, checkpoint, prefix);
         errdefer overlay.deinit();
-        return .{ .index = CheckpointedTree.init(self, indexed), .prefix = prefix, .overlay_root = overlay_root, .overlay = overlay };
+        return .{ .index = CheckpointedTree.init(self, indexed), .prefix = prefix, .overlay_root = overlay_root, .overlay_mark = self.readMark(checkpoint), .overlay = overlay };
     }
 
     fn snapshotCatalogRecordsFromRootAlloc(self: *NativeFile, allocator: Allocator, root: CatalogRoot) ![]OwnedCatalogRecord {

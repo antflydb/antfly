@@ -1550,7 +1550,7 @@ test "writer rejects a record that would overflow the region" {
     try testing.expectError(error.LogFull, writer.append(2, "e"));
 }
 
-test "replay stops at a torn tail and reports the valid prefix" {
+test "replay reports the valid prefix before an impossible header" {
     const io = testing.io;
     const capacity: u64 = 4096;
     var region = try makeTempRegion(io, capacity);
@@ -1562,16 +1562,8 @@ test "replay stops at a torn tail and reports the valid prefix" {
     try writer.sync();
     const good_tail = writer.tail;
 
-    // Simulate a crash mid-append of a third record whose header landed
-    // (the magic/version/header_len fields are intact and well-formed) but
-    // whose claimed payload length is physically impossible for the
-    // remaining region -- the one way `replay` can tell "this header is
-    // real but the record behind it never finished landing" apart from
-    // "this header is garbage" without being able to checksum bytes that
-    // were never written. A real torn write can produce exactly this: the
-    // header is a single small write that lands atomically more often than
-    // not, while the much larger payload write that follows it is what the
-    // crash interrupts.
+    // An impossible length in a complete-looking header is ambiguous
+    // without a durable watermark. Do not recover it as a torn append.
     var header_buf: [header_len]u8 = undefined;
     const torn: RecordHeader = .{ .payload_len = @intCast(capacity), .commit_sequence = 3, .crc32 = 0, .salt = writer.salt.? };
     torn.encode(&header_buf);
@@ -1581,17 +1573,7 @@ test "replay stops at a torn tail and reports the valid prefix" {
     try testing.expectEqual(@as(u64, 2), outcome.valid_count);
     try testing.expectEqual(@as(u64, 2), outcome.last_sequence.?);
     try testing.expectEqual(good_tail, outcome.valid_bytes);
-    try testing.expectEqual(StopReason.torn_tail, outcome.stop_reason);
-
-    // A writer resuming from this outcome must be able to append right
-    // where the valid prefix ended, overwriting the torn record.
-    var resumed = Writer.initAt(region.file, io, 0, capacity, outcome.valid_bytes, outcome.last_sequence);
-    try resumed.append(3, "three");
-    try resumed.sync();
-    const resumed_outcome = try replay(testing.allocator, region.file, io, 0, capacity, null, null, null);
-    try testing.expectEqual(@as(u64, 3), resumed_outcome.valid_count);
-    try testing.expectEqual(@as(u64, 3), resumed_outcome.last_sequence.?);
-    try testing.expectEqual(StopReason.end_of_region, resumed_outcome.stop_reason);
+    try testing.expectEqual(StopReason.corrupt_record, outcome.stop_reason);
 }
 
 test "replay stops at a torn tail when the file is physically shorter than the region" {
