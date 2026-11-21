@@ -58,7 +58,7 @@ pub fn safetensorsWithControl(allocator: std.mem.Allocator, filename: []const u8
     if (weights != .object or weights.object.count() == 0) return error.InvalidSafetensorsIndex;
     for (weights.object.values()) |value| {
         try control.check();
-        if (value != .string or !std.mem.endsWith(u8, value.string, ".safetensors")) return error.InvalidSafetensorsIndex;
+        if (value != .string) return error.InvalidSafetensorsIndex;
         try paths.add(filename, value.string);
     }
     return paths;
@@ -164,7 +164,7 @@ pub fn onnxWithControl(allocator: std.mem.Allocator, filename: []const u8, bytes
 
 test "safetensors index selects arbitrary shard names and deduplicates references" {
     var paths = try safetensors(std.testing.allocator, "weights/model.safetensors.index.json",
-        \\{"weight_map":{"a":"custom.safetensors","b":"custom.safetensors","c":"parts/other.safetensors"}}
+        \\{"weight_map":{"a":"custom.safetensors","b":"custom.safetensors","c":"parts/other"}}
     );
     defer paths.deinit();
     try std.testing.expectEqual(@as(u32, 2), paths.items.count());

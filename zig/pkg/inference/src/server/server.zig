@@ -27066,7 +27066,7 @@ pub const Node = struct {
                 const manifest = if (cached_model) |*handle| &handle.get().manifest else inspected_manifest orelse &cold_manifest.?;
                 const dense_output = manifest.denseEmbeddingOutput();
                 var durable_revision: ?[32]u8 = null;
-                const declared = if (embedding and manifest.managed_publication != null and (cached_model == null or include_revisions or requested_revision != null))
+                var declared = if (embedding and manifest.managed_publication != null and (cached_model == null or include_revisions or requested_revision != null or inspected_manifest != null))
                     (if (scoped_artifacts) |artifacts|
                         self.model_manager.declaredEmbeddingRevisionsFromArtifacts(path, manifest.*, control, artifacts)
                     else
@@ -27076,13 +27076,21 @@ pub const Node = struct {
                     }
                 else
                     model_manager_mod.ModelManager.EmbeddingRevisions{};
+                const rejected = if (scoped_publication) |*captured|
+                    if (captured.inspection_valid)
+                        captured.borrow.filterEmbeddingRevisions(&captured.artifacts, manifest, &declared, control) catch |err| return modelLoadFailureResponse(ctx, err)
+                    else
+                        model_manager_mod.ModelManager.EmbeddingRevisions{}
+                else
+                    model_manager_mod.ModelManager.EmbeddingRevisions{};
+                if (declared.len == 0 and rejected.len != 0) return embeddingArtifactFailureResponse(ctx);
                 var revision: ?[32]u8 = if (cached_model) |*handle| loaded: {
                     // The held runtime supplies both geometry and revision.
                     const serving = handle.get();
                     if (embedding) {
                         durable_revision = serving.durable_embedding_revision;
                         if (serving.managed_publication != null) {
-                            if (replica_probe) {
+                            if (replica_probe or rejected.len != 0) {
                                 const retained = if (durable_revision) |active| declared.contains(active) else false;
                                 if (!retained) durable_revision = if (declared.len > 0) declared.revisions[0] else null;
                             }
@@ -27117,6 +27125,7 @@ pub const Node = struct {
                     var requested: [32]u8 = undefined;
                     if (required.len != 64) return embeddingRevisionFailureResponse(ctx);
                     _ = std.fmt.hexToBytes(&requested, required) catch return embeddingRevisionFailureResponse(ctx);
+                    if (rejected.contains(requested) and !declared.contains(requested)) return embeddingArtifactFailureResponse(ctx);
                     if (!std.meta.eql(durable_revision, @as(?[32]u8, requested)) and !declared.contains(requested))
                         return embeddingRevisionFailureResponse(ctx);
                     durable_revision = requested;
@@ -51254,14 +51263,22 @@ test "model selection reuses the verified resident installation for embedding re
     try std.testing.expectEqual(@as(?[32]u8, null), try node.model_manager.residentManagedPublication(io, selected.path, selected.publication));
 }
 
-test "scoped model discovery reuses compatibility and refuses a truncated nested shard" {
+test "scoped model discovery reuses compatibility and refuses a truncated extensionless shard" {
+    try testScopedShardedDiscovery(false);
+}
+
+test "scoped model discovery keeps native revisions when an alternate ONNX dependency is invalid" {
+    try testScopedShardedDiscovery(true);
+}
+
+fn testScopedShardedDiscovery(comptime with_onnx: bool) !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const managed = @import("../registry/managed_receipt.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = "embedders/acme/sharded";
-    const shard_path = "parts/weight.safetensors";
+    const shard_path = "parts/weight";
     const index_path = "model.safetensors.index.json";
     const config = @embedFile("../architectures/embedding_gemma2_config.json");
     const index = "{\"weight_map\":{\"model.embed_tokens.weight\":\"" ++ shard_path ++ "\"}}";
@@ -51269,7 +51286,10 @@ test "scoped model discovery reuses compatibility and refuses a truncated nested
     try tmp.dir.createDirPath(io, path ++ "/parts");
     const dir = try tmp.dir.openDir(io, path, .{});
     defer dir.close(io);
-    const files = .{ .{ "config.json", config }, .{ index_path, index }, .{ shard_path, weights } };
+    // ModelProto.graph.initializer.external_data stores a missing location.
+    const graph = "\x3a\x1d\x2a\x1b\x6a\x17\x0a\x08location\x12\x0bmissing.bin\x70\x01";
+    const native_files = .{ .{ "config.json", config }, .{ index_path, index }, .{ shard_path, weights } };
+    const files = if (with_onnx) native_files ++ .{.{ "model.onnx", graph }} else native_files;
     var entries: [files.len]managed.ArtifactReceipt = undefined;
     var sums: [files.len][64]u8 = undefined;
     inline for (files, 0..) |file, i| {
@@ -51307,6 +51327,30 @@ test "scoped model discovery reuses compatibility and refuses a truncated nested
         const model = parsed.value.object.get("embedders").?.object.get("acme/sharded").?;
         try std.testing.expect(model.object.get("model_revision_pinning").?.bool);
         try std.testing.expectEqual(before, request_work_test_counters.compatibility_checkpoint_samples);
+    }
+
+    if (with_onnx) {
+        const model_dir = try std.fs.path.join(a, &.{ root, path });
+        defer a.free(model_dir);
+        const control = InferenceExecutionControl{ .io = io };
+        const model_publication = try managed.publicationGeneration(a, io, model_dir);
+        var publication = (try ScopedCatalogPublication.open(&node.scoped_catalog_cache, a, a, io, model_dir, model_publication, control)).?;
+        defer publication.deinit();
+        var listing = try manifest_mod.loadFromPublishedArtifacts(a, model_dir, &publication.artifacts, true);
+        defer listing.deinit();
+        var required: [1]backends_mod.BackendType = undefined;
+        const order = try compatibilityBackendsForSessionManager(&node.session_manager, &required);
+        _ = try publication.borrow.compatibility(&publication.artifacts, model_dir, &listing, order, control);
+        const manifest = publication.borrow.executionManifest().?;
+        try std.testing.expect(manifest.onnx_path != null);
+        var candidates: model_manager_mod.ModelManager.EmbeddingRevisions = .{};
+        candidates.backends[0..2].* = .{ .wasm, .native };
+        candidates.revisions[0..2].* = .{ @splat(1), @splat(2) };
+        candidates.len = 2;
+        const rejected = try publication.borrow.filterEmbeddingRevisions(&publication.artifacts, manifest, &candidates, control);
+        try std.testing.expectEqual(@as(usize, 1), candidates.len);
+        try std.testing.expect(candidates.contains(@splat(2)));
+        try std.testing.expect(rejected.contains(@splat(1)));
     }
 
     // An in-place write to a nested shard leaves the model root and completion

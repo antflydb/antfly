@@ -473,7 +473,9 @@ fn loadValidatedSource(
         initialized += 1;
         if (std.mem.endsWith(u8, artifact.path, ".gguf") or
             std.mem.endsWith(u8, artifact.path, ".onnx") or
-            std.mem.endsWith(u8, artifact.path, ".safetensors"))
+            std.mem.endsWith(u8, artifact.path, ".safetensors") or
+            std.mem.eql(u8, artifact.path, "model.safetensors.index.json") or
+            std.mem.eql(u8, artifact.path, "pytorch_model.safetensors.index.json"))
         {
             has_supported_payload = true;
         }

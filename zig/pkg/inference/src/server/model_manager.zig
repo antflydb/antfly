@@ -540,6 +540,10 @@ const ArtifactCandidateKind = enum {
     component_bundle,
 };
 
+pub fn embeddingBackendUsesOnnxPrimary(manifest: manifest_mod.ModelManifest, backend: backends.BackendType) bool {
+    return artifactCandidateForBackend(manifest, backend) == .onnx;
+}
+
 fn artifactCandidateForBackend(
     man: manifest_mod.ModelManifest,
     backend: backends.BackendType,

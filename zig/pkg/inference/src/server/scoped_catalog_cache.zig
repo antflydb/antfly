@@ -25,8 +25,9 @@ const c_file = @import("../util/c_file.zig");
 const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 const max_cached_bytes_per_slot = 4 * 1024 * 1024;
-const max_safetensors_index_bytes = @import("../models/safetensors.zig").max_header_size;
+const safetensors = @import("../models/safetensors.zig");
 const revalidate_after_ns = 60 * std.time.ns_per_s;
+const dependency_retry_ns = std.time.ns_per_s;
 
 pub const Cache = struct {
     slots: [16]Slot = @splat(.{}),
@@ -46,7 +47,9 @@ pub const Cache = struct {
             defer self.mutex.unlock();
             const current = self.current orelse return null;
             const age = now.nanoseconds - current.checked_at.nanoseconds;
+            const inspection = current.inspection.load(.acquire);
             if (age >= revalidate_after_ns or
+                (if (inspection) |built| built.retry_at != null and now.nanoseconds >= built.retry_at.? else false) or
                 !std.mem.eql(u8, path, current.artifacts.root) or
                 !std.mem.eql(u8, canonical, current.artifacts.physical_root) or
                 !std.meta.eql(stamp, current.root_stamp) or
@@ -76,16 +79,32 @@ pub const Cache = struct {
         };
         try control.check();
         retained = true;
-        return .{ .snapshot = current, .slot = slot, .reused = true };
+        return .{ .snapshot = current, .slot = slot };
     }
 
     const Inspection = struct {
         const Member = struct { path: []const u8, stamp: managed.ArtifactStamp };
+        const Members = std.StringHashMapUnmanaged(managed.ArtifactStamp);
+        const Primary = enum { native, onnx };
+        const PrimaryDependencies = union(enum) {
+            members: []const Member,
+            unavailable,
+
+            fn validate(self: PrimaryDependencies, artifacts: *const PublishedArtifacts, control: ExecutionControl) !void {
+                switch (self) {
+                    .members => |members| try Inspection.validate(members, artifacts, control),
+                    .unavailable => return error.InvalidManagedDownload,
+                }
+            }
+        };
         arena: std.heap.ArenaAllocator,
         members: []const Member,
+        native: PrimaryDependencies,
+        onnx: PrimaryDependencies,
         backend_order: []const backends.BackendType,
         execution_manifest: manifest_mod.ModelManifest,
         summary: model_manager.CompatibilitySummary,
+        retry_at: ?i96,
 
         fn add(members: *std.StringHashMapUnmanaged(managed.ArtifactStamp), a: std.mem.Allocator, artifacts: *const PublishedArtifacts, path: []const u8) !void {
             if (members.contains(path)) return;
@@ -99,16 +118,10 @@ pub const Cache = struct {
             result.arena = .init(owner);
             errdefer result.arena.deinit();
             const a = result.arena.allocator();
-            var members: std.StringHashMapUnmanaged(managed.ArtifactStamp) = .empty;
             const execution_manifest = try manifest_mod.loadFromPublishedArtifacts(a, path, artifacts, false);
-            try collect(&members, a, artifacts, &execution_manifest, control);
-
-            const checks = try a.alloc(Member, members.count());
-            var it = members.iterator();
-            for (checks) |*member| {
-                const entry = it.next().?;
-                member.* = .{ .path = entry.key_ptr.*, .stamp = entry.value_ptr.* };
-            }
+            const checks = try collectCommon(a, artifacts, &execution_manifest, control);
+            result.native = try collectPrimary(a, artifacts, &execution_manifest, .native, control);
+            result.onnx = try collectPrimary(a, artifacts, &execution_manifest, .onnx, control);
             const order = try a.dupe(backends.BackendType, backend_order);
             const summary = model_manager.compatibilitySummaryForBackendsWithControl(artifacts.allocator, path, manifest, backend_order, control) catch |err| switch (err) {
                 error.OutOfMemory, error.Timeout, error.Cancelled, error.Canceled => return err,
@@ -119,56 +132,102 @@ pub const Cache = struct {
             result.backend_order = order;
             result.execution_manifest = execution_manifest;
             result.summary = summary;
+            result.retry_at = if (result.native == .unavailable or result.onnx == .unavailable)
+                std.Io.Timestamp.now(artifacts.io, .awake).nanoseconds + dependency_retry_ns
+            else
+                null;
             return result;
         }
 
-        fn collect(members: *std.StringHashMapUnmanaged(managed.ArtifactStamp), a: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, control: ExecutionControl) !void {
+        fn freeze(a: std.mem.Allocator, members: *const Members) ![]const Member {
+            const checks = try a.alloc(Member, members.count());
+            var it = members.iterator();
+            for (checks) |*member| {
+                const entry = it.next().?;
+                member.* = .{ .path = entry.key_ptr.*, .stamp = entry.value_ptr.* };
+            }
+            return checks;
+        }
+
+        fn collectCommon(a: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, control: ExecutionControl) ![]const Member {
+            var members: Members = .empty;
             inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {
-                if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest.*, field)) == ?[]const u8) {
+                if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest.*, field)) == ?[]const u8 and
+                    !std.mem.eql(u8, field, "onnx_path") and !std.mem.eql(u8, field, "onnx_logical_path") and
+                    !std.mem.eql(u8, field, "gguf_path") and !std.mem.eql(u8, field, "safetensors_path") and
+                    !std.mem.eql(u8, field, "safetensors_index_path"))
+                {
                     if (@field(manifest.*, field)) |member| {
                         try control.check();
-                        try add(members, a, artifacts, member);
+                        try add(&members, a, artifacts, member);
                     }
                 }
             }
-
-            if (manifest.safetensors_path == null) if (manifest.safetensors_index_path) |index_path| {
-                try control.check();
-                const bytes = try artifacts.readPath(index_path, max_safetensors_index_bytes);
-                defer artifacts.allocator.free(bytes);
-                var shards = dependencies.safetensorsWithControl(artifacts.allocator, index_path, bytes, control) catch |err| switch (err) {
-                    error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
-                    else => return error.InvalidManagedDownload,
-                };
-                defer shards.deinit();
-                var it = shards.items.keyIterator();
-                while (it.next()) |shard| {
-                    try control.check();
-                    try add(members, a, artifacts, shard.*);
-                }
+            const components = [_]?[]const u8{
+                manifest.visual_model_path,      manifest.audio_model_path,      manifest.text_projection_path,
+                manifest.visual_projection_path, manifest.audio_projection_path,
             };
+            for (components) |component| {
+                const graph = component orelse continue;
+                if (std.mem.endsWith(u8, graph, ".onnx"))
+                    try collectOnnx(&members, a, artifacts, graph, graph, control);
+            }
+            return freeze(a, &members);
+        }
 
-            const onnx_paths = [_]?[]const u8{
-                manifest.onnx_path,            manifest.visual_model_path,      manifest.audio_model_path,
-                manifest.text_projection_path, manifest.visual_projection_path, manifest.audio_projection_path,
+        fn collectPrimary(a: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, primary: Primary, control: ExecutionControl) !PrimaryDependencies {
+            var members: Members = .empty;
+            collectPrimaryMembers(&members, a, artifacts, manifest, primary, control) catch |err| switch (err) {
+                error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+                else => return .unavailable,
             };
-            for (onnx_paths, 0..) |maybe_graph, i| {
-                const graph = maybe_graph orelse continue;
-                if (i != 0 and !std.mem.endsWith(u8, graph, ".onnx")) continue;
+            const checks = try freeze(a, &members);
+            validate(checks, artifacts, control) catch |err| switch (err) {
+                error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+                else => return .unavailable,
+            };
+            return .{ .members = checks };
+        }
+
+        fn collectPrimaryMembers(members: *Members, a: std.mem.Allocator, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, primary: Primary, control: ExecutionControl) !void {
+            try control.check();
+            switch (primary) {
+                .onnx => if (manifest.onnx_path) |graph| {
+                    try collectOnnx(members, a, artifacts, graph, manifest.onnx_logical_path orelse graph, control);
+                },
+                .native => switch (manifest.nativeWeightArtifactKind() orelse return) {
+                    .gguf => try add(members, a, artifacts, manifest.gguf_path.?),
+                    .safetensors => try add(members, a, artifacts, manifest.safetensors_path.?),
+                    .sharded_safetensors => {
+                        const index = manifest.safetensors_index_path.?;
+                        try add(members, a, artifacts, index);
+                        const bytes = try artifacts.readPath(index, safetensors.max_header_size);
+                        defer artifacts.allocator.free(bytes);
+                        var shards = try safetensors.inspectIndexDependencies(artifacts.allocator, index, bytes, control);
+                        defer shards.deinit();
+                        for (shards.paths[1..]) |shard| {
+                            try control.check();
+                            try add(members, a, artifacts, shard);
+                        }
+                    },
+                },
+            }
+        }
+
+        fn collectOnnx(members: *Members, a: std.mem.Allocator, artifacts: *const PublishedArtifacts, graph: []const u8, logical: []const u8, control: ExecutionControl) !void {
+            try control.check();
+            try add(members, a, artifacts, logical);
+            var mapped = try c_file.MmapRegion.init(artifacts.allocator, graph);
+            defer mapped.deinit();
+            var tensors = dependencies.onnxWithControl(artifacts.allocator, logical, mapped.data, control) catch |err| switch (err) {
+                error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+                else => return error.InvalidManagedDownload,
+            };
+            defer tensors.deinit();
+            var it = tensors.items.keyIterator();
+            while (it.next()) |tensor| {
                 try control.check();
-                const logical = if (i == 0) manifest.onnx_logical_path orelse graph else graph;
-                var mapped = try c_file.MmapRegion.init(artifacts.allocator, graph);
-                defer mapped.deinit();
-                var tensors = dependencies.onnxWithControl(artifacts.allocator, logical, mapped.data, control) catch |err| switch (err) {
-                    error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
-                    else => return error.InvalidManagedDownload,
-                };
-                defer tensors.deinit();
-                var it = tensors.items.keyIterator();
-                while (it.next()) |tensor| {
-                    try control.check();
-                    try add(members, a, artifacts, tensor.*);
-                }
+                try add(members, a, artifacts, tensor.*);
             }
         }
 
@@ -220,7 +279,7 @@ pub const Cache = struct {
     pub const Borrow = struct {
         snapshot: *Snapshot,
         slot: *Slot,
-        reused: bool,
+        request_inspection: ?*Inspection = null,
 
         /// These views are only used by read-only catalog consumers. All
         /// temporary allocations and I/O belong to the borrowing request.
@@ -228,11 +287,10 @@ pub const Cache = struct {
             var artifacts = self.snapshot.artifacts;
             artifacts.allocator = a;
             artifacts.io = io;
-            artifacts.revalidate_catalog_members = self.reused;
             return artifacts;
         }
 
-        pub fn compatibility(self: Borrow, artifacts: *const PublishedArtifacts, path: []const u8, manifest: *const manifest_mod.ModelManifest, backend_order: []const backends.BackendType, control: ExecutionControl) !model_manager.CompatibilitySummary {
+        pub fn compatibility(self: *Borrow, artifacts: *const PublishedArtifacts, path: []const u8, manifest: *const manifest_mod.ModelManifest, backend_order: []const backends.BackendType, control: ExecutionControl) !model_manager.CompatibilitySummary {
             const snapshot = self.snapshot;
             if (snapshot.inspection.load(.acquire)) |cached| {
                 if (std.mem.eql(backends.BackendType, backend_order, cached.backend_order)) {
@@ -260,13 +318,48 @@ pub const Cache = struct {
                 snapshot.inspection.store(inspection, .release);
                 return inspection.summary;
             }
-            defer inspection.destroy(owner);
+            self.request_inspection = inspection;
             return inspection.summary;
         }
 
         pub fn executionManifest(self: Borrow) ?*const manifest_mod.ModelManifest {
-            const inspection = self.snapshot.inspection.load(.acquire) orelse return null;
+            const inspection = self.request_inspection orelse self.snapshot.inspection.load(.acquire) orelse return null;
             return &inspection.execution_manifest;
+        }
+
+        pub fn filterEmbeddingRevisions(self: Borrow, artifacts: *const PublishedArtifacts, manifest: *const manifest_mod.ModelManifest, revisions: *model_manager.ModelManager.EmbeddingRevisions, control: ExecutionControl) !model_manager.ModelManager.EmbeddingRevisions {
+            var rejected: model_manager.ModelManager.EmbeddingRevisions = .{};
+            const inspection = self.request_inspection orelse self.snapshot.inspection.load(.acquire) orelse return rejected;
+            var verified: [2]?bool = @splat(null);
+            var kept: usize = 0;
+            for (revisions.backends[0..revisions.len], revisions.revisions[0..revisions.len]) |backend, revision| {
+                const primary: Inspection.Primary = if (model_manager.embeddingBackendUsesOnnxPrimary(manifest.*, backend)) .onnx else .native;
+                const i = @backingInt(primary);
+                if (verified[i] == null) {
+                    const checks = switch (primary) {
+                        .native => inspection.native,
+                        .onnx => inspection.onnx,
+                    };
+                    verified[i] = if (checks.validate(artifacts, control)) |_| true else |err| switch (err) {
+                        error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => return err,
+                        else => invalid: {
+                            if (checks == .members) self.invalidate();
+                            break :invalid false;
+                        },
+                    };
+                }
+                if (verified[i].?) {
+                    revisions.backends[kept] = backend;
+                    revisions.revisions[kept] = revision;
+                    kept += 1;
+                } else {
+                    rejected.backends[rejected.len] = backend;
+                    rejected.revisions[rejected.len] = revision;
+                    rejected.len += 1;
+                }
+            }
+            revisions.len = kept;
+            return rejected;
         }
 
         fn invalidate(self: Borrow) void {
@@ -278,6 +371,7 @@ pub const Cache = struct {
         }
 
         pub fn release(self: Borrow) void {
+            if (self.request_inspection) |inspection| inspection.destroy(self.snapshot.artifacts.allocator);
             self.snapshot.release();
         }
     };
@@ -315,6 +409,6 @@ pub const Cache = struct {
         const snapshot = try owner.create(Snapshot);
         snapshot.* = .{ .artifacts = artifacts, .root_stamp = stamp, .checked_at = std.Io.Timestamp.now(io, .awake) };
         if (snapshot.cacheable()) slot.publish(snapshot);
-        return .{ .snapshot = snapshot, .slot = slot, .reused = false };
+        return .{ .snapshot = snapshot, .slot = slot };
     }
 };
