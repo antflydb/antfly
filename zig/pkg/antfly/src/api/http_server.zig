@@ -15206,7 +15206,7 @@ pub const ApiHttpServer = struct {
             // This marker exists only after every contacted participant has
             // a durable abort. Unlike generic 503, the batch cannot later
             // commit, so callers may safely retry with a new attempt.
-            error.TransactionPrepareAbortedRowPolicyDenied => return error.Forbidden,
+            error.TransactionPrepareAbortedRowPolicyDenied => return error.TransactionPrepareAbortedRowPolicyDenied,
             error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable => return error.WriteDefinitelyAbortedUnavailable,
             error.PreDecisionReadUnavailable => return error.WritePrecommitReadUnavailable,
             // Coverage is checked before coordinator admission. Preserve that
@@ -43894,16 +43894,23 @@ test "api http server routes table batches through the batch commit hook" {
         try std.testing.expectEqual(calls_before + 1, writes.batch_commit_calls);
     }
 
-    writes.commit_error = error.TransactionPrepareAbortedUnavailable;
-    var aborted_resp = try executeHttpxTestRequest(&server, .{
-        .method = .POST,
-        .uri = "/tables/docs/batch",
-        .content_type = "application/json",
-        .body = batch_body,
-    });
-    defer aborted_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 503), aborted_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, aborted_resp.body, "transaction_precommit_aborted") != null);
+    const abort_causes = [_]anyerror{ error.TransactionPrepareAbortedUnavailable, error.TransactionPrepareAbortedRowPolicyDenied };
+    for (abort_causes, [_]u16{ 503, 403 }) |failure, expected_status| {
+        writes.commit_error = failure;
+        var aborted = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = "/tables/docs/batch",
+            .content_type = "application/json",
+            .body = batch_body,
+        });
+        defer aborted.deinit(std.testing.allocator);
+        try std.testing.expectEqual(expected_status, aborted.status);
+        const result = try std.json.parseFromSlice(struct { status: []const u8, code: []const u8, retryable: bool }, std.testing.allocator, aborted.body, .{ .ignore_unknown_fields = true });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("aborted", result.value.status);
+        try std.testing.expectEqualStrings(if (expected_status == 403) "row_policy_denied" else "transaction_precommit_aborted", result.value.code);
+        try std.testing.expectEqual(expected_status == 503, result.value.retryable);
+    }
 
     for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress }) |wait_err| {
         writes.commit_error = wait_err;
@@ -43979,7 +43986,7 @@ test "api http server routes table batches through the batch commit hook" {
     defer legacy_pending_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), legacy_pending_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, legacy_pending_resp.body, "\"status\":\"committed_pending\"") != null);
-    try std.testing.expectEqual(@as(usize, 12) + descriptor_pressures.len, writes.batch_commit_calls);
+    try std.testing.expectEqual(@as(usize, 11) + abort_causes.len + descriptor_pressures.len, writes.batch_commit_calls);
     for ([_]anyerror{ error.StorageBusy, error.GenerationTransitionActive }) |unavailable| {
         writes.commit_error = unavailable;
         const calls_before = writes.batch_commit_calls;
@@ -62922,7 +62929,7 @@ test "SQL pgwire native ordinary rollback leaves no permanent completion proofs"
     for (&ids) |*id| {
         const session = try registry.begin(a, .{}, 0);
         id.* = session.txn_id;
-        try std.testing.expect(registry.retireBeforeExecution(a, session.txn_id, session.version, false));
+        try std.testing.expect(try registry.retireBeforeExecution(a, try registry.mutation(a, session.txn_id, session.version.owner), session.version, false));
     }
     try std.testing.expectEqual(@as(usize, 0), registry.sessions.count());
     for (ids) |id| {

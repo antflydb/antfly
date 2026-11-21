@@ -11696,6 +11696,19 @@ export interface components {
             current_version?: number;
             participant?: components["schemas"]["TransactionConflictParticipant"];
         };
+        /** @description A classified write failure. An aborted status confirms that the transaction did not commit. */
+        TransactionWriteError: {
+            /** @description Set to aborted for a confirmed transaction abort. */
+            status?: string;
+            /** @description Machine-readable cause, including row_policy_denied and transaction_precommit_aborted. */
+            code: string;
+            message: string;
+            retryable: boolean;
+            /** @description The transaction ID for session commit responses. */
+            transaction_id?: string;
+            /** Format: int64 */
+            retry_after_ms?: number;
+        };
         /** @description Result of an OCC transaction commit attempt. */
         TransactionCommitResponse: {
             /**
@@ -32559,6 +32572,26 @@ export interface components {
                 "application/json": components["schemas"]["InferenceCapacityError"];
             };
         };
+        /** @description Write permission was denied, or a row policy rejected the transaction. */
+        WriteForbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["TransactionWriteError"] | components["schemas"]["Error"];
+                "text/plain": string;
+            };
+        };
+        /** @description Write admission or preparation is temporarily unavailable. A transaction_precommit_aborted response confirms that the transaction did not commit. */
+        WriteTemporarilyUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["TransactionWriteError"] | components["schemas"]["Error"];
+                "text/plain": string;
+            };
+        };
         /**
          * @description Internal transaction failure. If the response says that the outcome is
          *     unknown, the request may already have committed and the stateless
@@ -34268,6 +34301,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
             /** @description Transaction aborted because a predicate, topology fence, or participant state conflicted */
             409: {
@@ -34279,15 +34313,7 @@ export interface operations {
                 };
             };
             500: components["responses"]["StatelessTransactionFailure"];
-            /** @description The coordinator was unavailable before a commit decision; retry is safe */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     executeGraphMetricAction: {
@@ -34444,6 +34470,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
             /** @description Transaction aborted due to version conflict */
             409: {
@@ -34455,15 +34482,7 @@ export interface operations {
                 };
             };
             500: components["responses"]["StatelessTransactionFailure"];
-            /** @description The coordinator was unavailable before a commit decision; retry is safe */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     listTransactionSessions: {
@@ -34803,6 +34822,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
             /** @description Session commit conflict */
             409: {
@@ -34814,6 +34834,7 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     abortTransactionSession: {
@@ -36370,6 +36391,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
             /**
              * @description The atomic batch conflicted, the serving replica is fenced, or the
@@ -36387,15 +36409,7 @@ export interface operations {
             };
             429: components["responses"]["DenseRepairBackpressure"];
             500: components["responses"]["StatelessTransactionFailure"];
-            /** @description Write routing, document identity, or the coordinator is temporarily unavailable before a commit decision */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     linearMerge: {
@@ -39091,6 +39105,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
@@ -39100,6 +39115,7 @@ export interface operations {
                 };
                 content?: never;
             };
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     updateNamespaceTableSchema: {

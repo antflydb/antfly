@@ -3433,14 +3433,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionCommitResponse'
+        '403':
+          $ref: '#/components/responses/WriteForbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '503':
-          description: The coordinator was unavailable before a commit decision; retry is safe
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: '#/components/responses/WriteTemporarilyUnavailable'
         '500':
           $ref: '#/components/responses/StatelessTransactionFailure'
       security:
@@ -3696,6 +3694,8 @@ paths:
                 $ref: '#/components/schemas/TransactionCommitResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/WriteForbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -3705,11 +3705,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/TransactionCommitResponse'
         '503':
-          description: The coordinator was unavailable before a commit decision; retry is safe
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: '#/components/responses/WriteTemporarilyUnavailable'
         '500':
           $ref: '#/components/responses/StatelessTransactionFailure'
       security:
@@ -4077,6 +4073,8 @@ paths:
                 $ref: '#/components/schemas/TransactionSessionCommitResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/WriteForbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -4085,6 +4083,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionSessionCommitResponse'
+        '503':
+          $ref: '#/components/responses/WriteTemporarilyUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -6195,6 +6195,8 @@ paths:
                 $ref: '#/components/schemas/BatchResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/WriteForbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -6213,12 +6215,7 @@ paths:
         '429':
           $ref: '#/components/responses/DenseRepairBackpressure'
         '503':
-          description: Write routing, document identity, or the coordinator is temporarily unavailable
-            before a commit decision
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: '#/components/responses/WriteTemporarilyUnavailable'
         '500':
           $ref: '#/components/responses/StatelessTransactionFailure'
       security:
@@ -9543,8 +9540,12 @@ paths:
                 $ref: '#/components/schemas/BatchResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/WriteForbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/WriteTemporarilyUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
         '501':
@@ -32076,6 +32077,32 @@ components:
           description: Version observed while validating the transaction predicate.
         participant:
           $ref: '#/components/schemas/TransactionConflictParticipant'
+    TransactionWriteError:
+      type: object
+      description: A classified write failure. An aborted status confirms that the transaction did not
+        commit.
+      required:
+        - code
+        - message
+        - retryable
+      properties:
+        status:
+          type: string
+          description: Set to aborted for a confirmed transaction abort.
+        code:
+          type: string
+          description: Machine-readable cause, including row_policy_denied and transaction_precommit_aborted.
+        message:
+          type: string
+        retryable:
+          type: boolean
+        transaction_id:
+          type: string
+          description: The transaction ID for session commit responses.
+        retry_after_ms:
+          type: integer
+          format: int64
+          minimum: 0
     TransactionCommitResponse:
       type: object
       description: Result of an OCC transaction commit attempt.
@@ -73602,6 +73629,29 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/InferenceCapacityError'
+    WriteForbidden:
+      description: Write permission was denied, or a row policy rejected the transaction.
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/TransactionWriteError'
+              - $ref: '#/components/schemas/Error'
+        text/plain:
+          schema:
+            type: string
+    WriteTemporarilyUnavailable:
+      description: Write admission or preparation is temporarily unavailable. A transaction_precommit_aborted
+        response confirms that the transaction did not commit.
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/TransactionWriteError'
+              - $ref: '#/components/schemas/Error'
+        text/plain:
+          schema:
+            type: string
     StatelessTransactionFailure:
       description: >
         Internal transaction failure. If the response says that the outcome is

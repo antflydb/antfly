@@ -12502,15 +12502,22 @@ pub const RaftApplyStore = struct {
         var cursor = try txn.openCursor();
         defer cursor.close();
         var buf: [224]u8 = undefined;
+        var rejected_table_id: ?u64 = null;
         const stable = stable: {
             for (tables) |table| {
                 try budget.checkpoint();
                 const id_prefix = try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:id:{d}:", .{ group, table.table_id });
-                if (try cursor.seekAtOrAfter(id_prefix)) |kv| if (std.mem.startsWith(u8, kv.key, id_prefix)) break :stable false;
+                if (try cursor.seekAtOrAfter(id_prefix)) |kv| if (std.mem.startsWith(u8, kv.key, id_prefix)) {
+                    rejected_table_id = table.table_id;
+                    break :stable false;
+                };
                 var name: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(table.table_name, &name, .{});
                 const name_prefix = try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:name:{x}:", .{ group, &name });
-                if (try cursor.seekAtOrAfter(name_prefix)) |kv| if (std.mem.startsWith(u8, kv.key, name_prefix)) break :stable false;
+                if (try cursor.seekAtOrAfter(name_prefix)) |kv| if (std.mem.startsWith(u8, kv.key, name_prefix)) {
+                    rejected_table_id = table.table_id;
+                    break :stable false;
+                };
             }
             const legacy = try std.fmt.bufPrint(&buf, decision_prefix ++ "{d}:legacy:", .{group});
             var entry = try cursor.seekAtOrAfter(legacy);
@@ -12529,7 +12536,10 @@ pub const RaftApplyStore = struct {
                     const raw = txn.get(try rangeKeyForGroup(&key, group, owner)) catch |err| if (err == error.NotFound) continue else return err;
                     const range = try decodeRangeRecord(alloc, raw);
                     defer metadata_table_manager.freeRange(alloc, range);
-                    if (range.table_id == tables[0].table_id or ids.contains(range.table_id)) break :stable false;
+                    if (range.table_id == tables[0].table_id or ids.contains(range.table_id)) {
+                        rejected_table_id = range.table_id;
+                        break :stable false;
+                    }
                 }
             }
             break :stable true;
@@ -12571,13 +12581,14 @@ pub const RaftApplyStore = struct {
                         .catalog_revision = cut.revision,
                     }, table.table_name, .table, budget);
                     if (plan == null or plan.?.table_id != table.table_id or plan.?.topology_epoch != table.topology_epoch) {
+                        rejected_table_id = table.table_id;
                         admitted = false;
                         break;
                     }
                 }
             }
         };
-        return .{ .stable = admitted, .tables_checked = request.table_batch != null, .route_checked = request.route_check != null, .metadata_group_id = group, .metadata_incarnation = cut.metadata_incarnation, .catalog_revision = cut.revision };
+        return .{ .stable = admitted, .tables_checked = request.table_batch != null, .rejected_table_id = if (request.table_batch != null) rejected_table_id else null, .route_checked = request.route_check != null, .metadata_group_id = group, .metadata_incarnation = cut.metadata_incarnation, .catalog_revision = cut.revision };
     }
 
     fn putOwnerMergeIndexTxn(txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.MergeTransitionRecord) !void {
@@ -46217,6 +46228,7 @@ test "selected owner readiness admits the unchanged decision route across unrela
     batch.table_batch.?.tables = &checks;
     const changed = try store.decisionAdmission(a, 21, batch, .{});
     try std.testing.expect(changed.tables_checked and !changed.stable);
+    try std.testing.expectEqual(checks[1].table_id, changed.rejected_table_id.?);
     request.route_check.?.topology_epoch ^= 1;
     try std.testing.expect(!(try store.decisionAdmission(a, 21, request, .{})).stable);
 }

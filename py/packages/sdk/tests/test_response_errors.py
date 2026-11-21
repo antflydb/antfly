@@ -40,3 +40,30 @@ def test_successful_oversized_reply_is_typed():
         assert caught.value.status_code == 200
     finally:
         client.close()
+
+
+@pytest.mark.parametrize(
+    "status,code,retryable", [(403, "row_policy_denied", False), (503, "transaction_precommit_aborted", True)]
+)
+def test_generated_commit_errors_preserve_content_type(status, code, retryable):
+    from antfly.client_generated.api.data_operations import commit_transaction
+    from antfly.client_generated.client import Client
+    from antfly.client_generated.models import Error, TransactionWriteError
+
+    client = Client(base_url="http://test")
+    parsed = commit_transaction._parse_response(
+        client=client,
+        response=httpx.Response(
+            status, json={"status": "aborted", "code": code, "message": "rejected", "retryable": retryable}
+        ),
+    )
+    assert isinstance(parsed, TransactionWriteError)
+    assert (parsed.status, parsed.code, parsed.retryable) == ("aborted", code, retryable)
+    legacy = commit_transaction._parse_response(
+        client=client, response=httpx.Response(status, json={"error": "unavailable"})
+    )
+    assert isinstance(legacy, Error)
+    assert (
+        commit_transaction._parse_response(client=client, response=httpx.Response(status, text="unavailable"))
+        == "unavailable"
+    )

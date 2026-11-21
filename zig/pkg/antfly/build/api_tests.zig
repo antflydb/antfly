@@ -771,7 +771,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "session maintenance activation follows current range leadership without follower RPCs",
             "api http server serves status using control metadata without diagnostic transfers",
             "transaction commit execution yields through caller io and preserves ownership on cancellation",
-            "durable session limits bound count and encoded record size",
+            "durable session limits",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",
             "transaction session registry reports status and cleans expired durable sessions",

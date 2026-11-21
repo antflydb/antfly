@@ -29,6 +29,13 @@ SCOPED_MERGE_BODY = re.compile(
 SCOPED_MERGE_HEADER = 'headers["Content-Type"] = "application/vnd.antfly.scoped-merge.v1+json"'
 NDJSON_HEADER = 'headers["Content-Type"] = "application/x-ndjson"'
 RELATIONAL_QUERY = Path("api/data_operations/query_relational_rows.py")
+WRITE_OPERATIONS = (
+    "batch_write",
+    "batch_namespace_table",
+    "multi_batch_write",
+    "commit_transaction",
+    "commit_transaction_session",
+)
 SQL_OPERATIONS = [
     Path(f"api/data_operations/{operation}.py")
     for operation in ("execute_sql", "prepare_sql", "execute_prepared_sql", "close_prepared_sql")
@@ -168,6 +175,32 @@ def fix_generated_client(root: Path) -> None:
     ):
         raise RuntimeError("unexpected generated shape in dictate: required binary/JSON body")
     updates[path] = REQUIRED_BODY.sub(r"\1", source)
+
+    # openapi-python-client selects only the first media type for each status.
+    # These operations also serve text/plain denials and routing failures.
+    for operation in WRITE_OPERATIONS:
+        path = root / f"api/data_operations/{operation}.py"
+        source = path.read_text(encoding="utf-8")
+        for status in (403, 503):
+            branch = f"    if response.status_code == {status}:"
+            if source.count(branch) != 1 or "TransactionWriteError.from_dict" not in source:
+                raise RuntimeError(f"unexpected generated write response in {operation}: {status}")
+            source = source.replace(
+                branch,
+                branch
+                + '\n        if response.headers.get("content-type", "").partition(";")[0].strip().lower() == "text/plain":\n            return response.text',
+            )
+
+        def include_text(match: re.Match[str]) -> str:
+            types = list(dict.fromkeys(match.group().split(" | ")))
+            if "TransactionWriteError" in types and "str" not in types:
+                types.insert(types.index("None") if "None" in types else len(types), "str")
+            return " | ".join(types)
+
+        updates[path] = "\n".join(
+            re.sub(r"\b\w+(?: \| \w+)+", include_text, line) if "def _parse_response_" not in line else line
+            for line in source.split("\n")
+        )
 
     path = root / SCOPED_MERGE
     source = path.read_text(encoding="utf-8")

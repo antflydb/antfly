@@ -29,9 +29,10 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         std.log.warn("graph receipt admission failed err={s}", .{@errorName(err)});
         return err;
     };
+    const guard = try registry.mutation(owned, id, server.localSessionNodeId());
     var unexecuted: ?sessions.DurableSessionStore.Version = info.version;
     errdefer if (unexecuted) |version| {
-        _ = registry.retireBeforeExecution(owned, id, version, false);
+        _ = registry.retireBeforeExecution(owned, guard, version, false) catch false;
     };
     const lease = registry.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
     defer lease.release();
@@ -52,7 +53,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         };
         try entry.predicates.appendSlice(input_alloc, table.predicates);
     }
-    var staged = (try registry.cloneOwnedCommitRequest(owned, id, server.localSessionNodeId(), &input)) orelse return error.InvalidTransactionSessionRecord;
+    var staged = (try registry.cloneOwnedCommitRequest(owned, guard, &input)) orelse return error.InvalidTransactionSessionRecord;
     defer staged.deinit(owned);
     unexecuted = staged.session_version;
     var prepared = server.preparePublicCommitWithIntegrity(alloc, tables, context) catch |err| {
@@ -67,7 +68,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         return err;
     };
     unexecuted = null;
-    var plan = (registry.sealExecutionPlan(owned, id, server.localSessionNodeId(), signed) catch return .{ .status = .unknown }) orelse return .{ .status = .unknown };
+    var plan = (registry.sealExecutionPlan(owned, guard, signed) catch return .{ .status = .unknown }) orelse return .{ .status = .unknown };
     defer plan.deinit();
     const writer = server.table_writes orelse return .{ .status = .unknown };
     const normalized = context.platformDeadline() catch return .{ .status = .unknown };

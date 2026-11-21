@@ -88,6 +88,7 @@ const Mock = struct {
     revoke_on_buffered_resume: bool = false,
     deny_describe_at: ?usize = null,
     deny_stream_validation: bool = false,
+    stream_lease_lost: bool = false,
     stream_fail_at: ?usize = null,
     failed_transactions: usize = 0,
     canceled: std.atomic.Value(bool) = .init(false),
@@ -192,6 +193,7 @@ const Mock = struct {
             const session = self.session.?;
             if (session.executing.load(.acquire)) session.cancel_requested.store(true, .release);
         }
+        if (self.stream_lease_lost) return error.SessionLeaseLost;
         if (self.cursor_revoked or self.deny_stream_validation) return error.Forbidden;
     }
     fn nextPage(raw: *anyopaque, alloc: std.mem.Allocator, request: backend.Request, wanted: u32) !backend.StreamPage {
@@ -1035,6 +1037,27 @@ test "pgwire failed cursor fetch marks transaction aborted and releases retained
     try std.testing.expectEqual(@as(usize, 1), mock.failed_transactions);
     try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
     try std.testing.expectEqual(@as(usize, 2), mock.executions);
+}
+
+test "pgwire stale portal detaches without failing the current lease" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try parse(&input.writer, "q", "SELECT n FROM t", false);
+    try bind(&input.writer, "p", "q", null);
+    try execute(&input.writer, "p", 1);
+    try frame(&input.writer, 'D', "Pp\x00");
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 2, .stream_lease_lost = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observed, "E"));
+    try std.testing.expectEqual(@as(usize, 0), mock.failed_transactions);
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "Z\x00\x00\x00\x05I"));
 }
 
 test "pgwire scroll hold cursor materializes before commit and retains exact position" {

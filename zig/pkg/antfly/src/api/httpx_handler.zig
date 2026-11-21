@@ -5590,8 +5590,8 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(500);
                 return ctx.text("transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits");
             },
-            error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .status = "aborted", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
-            error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .status = "aborted", .code = "transaction_precommit_aborted", .message = "Transaction admission or preparation unavailable.", .retryable = true }),
+            error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .status = "aborted", .@"error" = "row_policy_denied", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
+            error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .status = "aborted", .@"error" = "transaction_precommit_aborted", .code = "transaction_precommit_aborted", .message = "Transaction admission or preparation unavailable.", .retryable = true }),
             error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
                 _ = ctx.status(503);
                 return ctx.text("transaction coordinator is temporarily unavailable");
@@ -6191,6 +6191,10 @@ pub const AntflyApiHandler = struct {
         };
         if (session.version.owner != owner) return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
         if (session.terminal_abort) return abortedSessionResponse(ctx, txn_id);
+        const guard = self.api_server.txn_sessions.mutation(alloc, txn_id, owner) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
+            return err;
+        };
         var parsed_req: ?transactions_api.OwnedTransactionCommitRequest = null;
         defer if (parsed_req) |*commit_req| commit_req.deinit(alloc);
         if (!transactions_api.isEmptySessionCommitBody(body_data)) {
@@ -6206,7 +6210,7 @@ pub const AntflyApiHandler = struct {
             self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), request, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
             if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, request.*))) return textResponse(ctx, 403, "forbidden");
         }
-        var commit_req = (self.api_server.txn_sessions.cloneOwnedCommitRequest(alloc, txn_id, owner, if (parsed_req) |*value| value else null) catch |err| switch (err) {
+        var commit_req = (self.api_server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, if (parsed_req) |*value| value else null) catch |err| switch (err) {
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
             error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
             error.TransactionCommitRequestMismatch => {
@@ -6270,7 +6274,7 @@ pub const AntflyApiHandler = struct {
             return ctx.openApiJson(response);
         }
 
-        var execution_plan = self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id, owner) catch |err| switch (err) {
+        var execution_plan = self.api_server.txn_sessions.getExecutionPlan(alloc, guard) catch |err| switch (err) {
             error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
             error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
             else => return err,
@@ -6298,8 +6302,8 @@ pub const AntflyApiHandler = struct {
                 else => return err,
             };
             if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
-                if (!self.api_server.txn_sessions.retireBeforeExecution(alloc, txn_id, commit_req.session_version.?, false)) {
-                    execution_plan = (self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id, owner) catch |err| switch (err) {
+                if (!(self.api_server.txn_sessions.retireBeforeExecution(alloc, guard, commit_req.session_version.?, false) catch false)) {
+                    execution_plan = (self.api_server.txn_sessions.getExecutionPlan(alloc, guard) catch |err| switch (err) {
                         error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
                         error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
                         else => return err,
@@ -6330,7 +6334,7 @@ pub const AntflyApiHandler = struct {
             var prepared = self.api_server.preparePublicCommitWithIntegrity(alloc, distributed_tables, commit_request) catch |err|
                 return self.transactionPreparationError(ctx, err);
             defer prepared.deinit();
-            execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, txn_id, owner, prepared.tables) catch |err| switch (err) {
+            execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, guard, prepared.tables) catch |err| switch (err) {
                 error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
                 error.SessionLeaseLost, error.TransactionCommitSealed => return textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
                 else => return self.transactionPreparationError(ctx, err),
@@ -6353,9 +6357,9 @@ pub const AntflyApiHandler = struct {
                 self.api_server.txn_sessions.publishAbortAndRetire(alloc, txn_id, if (rejection == .fresh) execution_plan.?.publication else null) catch return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
             }
             break :rejected switch (err) {
-                error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
-                error.PreDispatchDecisionAdmissionUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "transaction_precommit_aborted", .message = "Metadata decision admission unavailable.", .retryable = true }),
-                error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "transaction_precommit_aborted", .message = "Commit preparation temporarily unavailable.", .retryable = true }),
+                error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .transaction_id = transaction_id, .status = "aborted", .@"error" = "row_policy_denied", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
+                error.PreDispatchDecisionAdmissionUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .@"error" = "transaction_precommit_aborted", .code = "transaction_precommit_aborted", .message = "Metadata decision admission unavailable.", .retryable = true }),
+                error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .@"error" = "transaction_precommit_aborted", .code = "transaction_precommit_aborted", .message = "Commit preparation temporarily unavailable.", .retryable = true }),
                 error.TransactionTooLarge => {
                     return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions");
                 },
@@ -6602,7 +6606,14 @@ pub const AntflyApiHandler = struct {
         const info = registry.getInfo(txn_id) orelse return textResponse(ctx, 404, "not found");
         if (info.version.owner != self.api_server.localSessionNodeId())
             return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
-        if (!info.terminal_abort and !registry.retireBeforeExecution(self.api_server.alloc, txn_id, info.version, false)) {
+        const retired = info.terminal_abort or retired: {
+            const guard = registry.mutation(self.api_server.alloc, txn_id, info.version.owner) catch |err| {
+                if (err == error.SessionLeaseLost) return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
+                return err;
+            };
+            break :retired registry.retireBeforeExecution(self.api_server.alloc, guard, info.version, false) catch false;
+        };
+        if (!retired) {
             if (try registry.getTerminalCommit(self.api_server.alloc, txn_id)) |terminal_value| {
                 var terminal = terminal_value;
                 defer terminal.deinit(self.api_server.alloc);
@@ -13147,10 +13158,11 @@ test "httpx multi batch route uses the batch commit hook and public response con
             var denied = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
             defer denied.deinit();
             try std.testing.expectEqual(status_code, denied.status.code);
-            const Reply = struct { status: []const u8, code: []const u8, retryable: bool };
+            const Reply = struct { status: []const u8, code: []const u8, @"error": []const u8, retryable: bool };
             var parsed_error = try std.json.parseFromSlice(Reply, alloc, denied.body.?, .{ .ignore_unknown_fields = true });
             defer parsed_error.deinit();
             try std.testing.expectEqualStrings("aborted", parsed_error.value.status);
+            try std.testing.expectEqualStrings(parsed_error.value.code, parsed_error.value.@"error");
             try std.testing.expectEqual(status_code == 503, parsed_error.value.retryable);
             try std.testing.expectEqualStrings(if (status_code == 503) "transaction_precommit_aborted" else "row_policy_denied", parsed_error.value.code);
         }
@@ -22896,7 +22908,7 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     defer committed.deinit(a);
     const tables = try committed.distributedTables(a);
     defer tables.deinit();
-    var sealed = (try api.txn_sessions.sealExecutionPlan(a, session.txn_id, api.localSessionNodeId(), tables.tables)).?;
+    var sealed = (try api.txn_sessions.sealExecutionPlan(a, try api.txn_sessions.mutation(a, session.txn_id, api.localSessionNodeId()), tables.tables)).?;
     defer sealed.deinit();
     const id = std.fmt.bytesToHex(session.txn_id, .lower);
     const uri = try std.fmt.allocPrint(a, "http://localhost/db/v1/transactions/{s}/commit", .{id});
@@ -22933,7 +22945,7 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
         _ = (try api.txn_sessions.stage(a, try api.txn_sessions.mutation(a, another.txn_id, api.localSessionNodeId()), &staged)).?;
         var bound = (try api.txn_sessions.cloneCommitRequest(a, another.txn_id, null)).?;
         defer bound.deinit(a);
-        var plan = (try api.txn_sessions.sealExecutionPlan(a, another.txn_id, api.localSessionNodeId(), tables.tables)).?;
+        var plan = (try api.txn_sessions.sealExecutionPlan(a, try api.txn_sessions.mutation(a, another.txn_id, api.localSessionNodeId()), tables.tables)).?;
         defer plan.deinit();
         var req = try httpx.Request.init(a, .POST, "/");
         defer req.deinit();

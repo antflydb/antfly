@@ -212,7 +212,7 @@ pub const Action = union(enum) {
     begin: struct { id: [32]u8, expected_revision: u64, txn_id: [16]u8 },
     abort_begin: struct { id: [32]u8, txn_id: [16]u8 },
     bind: struct { id: [32]u8, txn_id: [16]u8 },
-    uncertain: struct { id: [32]u8, txn_id: [16]u8 },
+    uncertain: struct { id: [32]u8, guard: transactions.Mutation },
     terminal: struct { id: [32]u8, txn_id: [16]u8 },
     overlay: struct { id: [32]u8, expected_revision: u64, entries: []const settings.OverlayEntry },
 };
@@ -388,7 +388,9 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             break :blk 0;
         },
         .uncertain => |binding| blk: {
-            if (next.state != .active or !std.mem.eql(u8, &next.active_txn.?, &binding.txn_id)) return error.SqlConnectionBusy;
+            if (next.state != .active or !std.mem.eql(u8, &next.active_txn.?, &binding.guard.id)) return error.SqlConnectionBusy;
+            if (binding.guard.owner != owner_node_id) return error.SessionLeaseLost;
+            try binding.guard.checkLeaseTxn(alloc, txn);
             next.state = .uncertain;
             try record.putTxn(txn, alloc, next);
             break :blk 0;
@@ -456,7 +458,7 @@ test "HTTP connection DISCARD fences only its prepared resources and active owne
     try attached.value.verifyExecutionSession(&attached_hex);
     try std.testing.expectError(error.SqlTransactionNotActive, attached.value.verifyExecutionSession(null));
     try std.testing.expectError(error.SqlConnectionBusy, mutate(&store, .{ .discard = alice }, "alice", 7, 2));
-    _ = try mutate(&store, .{ .uncertain = .{ .id = alice, .txn_id = @splat(3) } }, "alice", 7, 2);
+    _ = try mutate(&store, .{ .uncertain = .{ .id = alice, .guard = .{ .id = @splat(3), .owner = 7, .tenure = null } } }, "alice", 7, 2);
     try std.testing.expectError(error.SqlConnectionBusy, mutate(&store, .{ .discard = alice }, "alice", 7, 2));
     var aborted_session: transactions.Session = .{
         .txn_id = @splat(3),
@@ -569,6 +571,12 @@ test "HTTP connection keeps a referenced durable transaction through session GC"
     _ = try mutate(&store, .{ .begin = .{ .id = id, .expected_revision = 1, .txn_id = txn_id } }, "alice", 7, 2);
     const begun = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
     _ = try mutate(&store, .{ .bind = .{ .id = id, .txn_id = txn_id } }, "alice", 7, 2);
+    const original = try registry.mutation(alloc, txn_id, 7);
+    const status = (try registry.getStatus(alloc, txn_id)).?;
+    _ = try registry.renewOwnedLeases(7, status.lease_expires_at + std.time.ns_per_ms);
+    try std.testing.expectError(error.SessionLeaseLost, registry.retireBeforeExecution(alloc, original, begun.version, true));
+    try std.testing.expectError(error.SessionLeaseLost, registry.retireBeforeExecution(alloc, original, begun.version, false));
+    try std.testing.expectError(error.SessionLeaseLost, mutate(&store, .{ .uncertain = .{ .id = id, .guard = original } }, "alice", 7, 2));
     store.fail_writes_for_test = true;
     try std.testing.expectError(error.InjectedSessionStoreFailure, registry.rollbackConnectionBeforeExecution(txn_id, id, begun.version, .active));
     store.fail_writes_for_test = false;

@@ -334,6 +334,8 @@ pub const DecisionAdmission = struct {
     stable: bool,
     route_checked: bool = false,
     tables_checked: bool = false,
+    /// Enlisted table that failed a batched check, when the failure is table-specific.
+    rejected_table_id: ?u64 = null,
 };
 
 pub const OwnerReadinessRequest = struct {

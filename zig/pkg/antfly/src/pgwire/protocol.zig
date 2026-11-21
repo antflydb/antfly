@@ -250,6 +250,9 @@ pub const Session = struct {
                 }
                 if (err == error.Canceled) return err;
                 self.skip_until_sync = tag != 'Q';
+                // The socket no longer owns this transaction. Drop its local
+                // attachment before error handling or disconnect can mutate it.
+                if (err == error.SessionLeaseLost) self.diagnostic.transaction_status = .idle;
                 if (self.diagnostic.transaction_status) |status| {
                     self.status = status;
                     if (status == .idle) {

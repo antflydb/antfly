@@ -190,7 +190,7 @@ pub const Adapter = struct {
         var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
         defer state.deinit(self.server.alloc);
         if (state.terminal != null or !std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
-        const guard = try self.server.txn_sessions.mutation(self.server.alloc, id, self.server.localSessionNodeId());
+        const guard = try credential.transactionGuard(id);
         try self.server.txn_sessions.setSqlFailed(self.server.alloc, guard, true);
     }
 
@@ -357,7 +357,7 @@ pub const Adapter = struct {
                 // maintenance retains it after this connection disappears.
                 const info = job.server.txn_sessions.getInfo(job.id) orelse return;
                 if (info.version.owner != job.server.localSessionNodeId()) return;
-                job.credential.session_cleanup_complete = job.server.txn_sessions.retireBeforeExecution(job.server.alloc, job.id, info.version, false);
+                job.credential.session_cleanup_complete = job.server.txn_sessions.retireBeforeExecution(job.server.alloc, job.credential.transactionGuard(job.id) catch return, info.version, false) catch false;
             }
         };
         var job = Cleanup{ .server = self.server, .principal = credential.sessionPrincipal(), .id = id, .completion_io = network_io, .credential = credential };
@@ -513,6 +513,7 @@ const OwnedRead = struct {
             const id = @import("distributed_txn.zig").parseTxnIdHex(id_hex) catch return error.SqlTransactionNotActive;
             transaction_lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
             tenure = try server.txn_sessions.sqlReaderTenure(alloc, id, credential.sessionPrincipal(), server.localSessionNodeId());
+            if (credential.transaction_guard) |guard| if (!std.mem.eql(u8, &guard.id, &id) or guard.tenure != tenure) return error.SessionLeaseLost;
             var state = (try server.txn_sessions.readSqlState(alloc, id, &self.staged)) orelse return error.SqlTransactionNotActive;
             defer state.deinit(alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
@@ -985,6 +986,13 @@ const Credential = struct {
     trusted_expires: i64 = 0,
     trusted_revision: u64 = 1,
     session_cleanup_complete: bool = true,
+    transaction_guard: ?@import("transactions.zig").Mutation = null,
+
+    fn transactionGuard(self: *const Credential, id: [16]u8) !@import("transactions.zig").Mutation {
+        const guard = self.transaction_guard orelse return error.SessionLeaseLost;
+        if (!std.mem.eql(u8, &id, &guard.id)) return error.SessionLeaseLost;
+        return guard;
+    }
 
     fn sessionPrincipal(self: *const Credential) []const u8 {
         // Durable Basic SQL sessions use the username across mixed-version
@@ -1212,6 +1220,7 @@ const Job = struct {
             .lake_visibility = @fromBackingInt(@intCast(@backingInt(self.request.lake_visibility))),
             .ddl_search_path = if (self.request.search_path) |*path| path else null,
             .session_id = self.request.session_id,
+            .connection_mutation = self.credential.transaction_guard,
             .session_namespace = self.request.session_namespace,
             .setting_overlay = self.request.setting_overlay,
             .setting_overlay_source = .connection,
@@ -1301,6 +1310,9 @@ const Job = struct {
         };
         var transferred = false;
         defer if (!transferred) result.deinit();
+        if (native_adapter.result_session_id != null) {
+            self.credential.transaction_guard = native_adapter.admitted_mutation orelse return error.SessionLeaseLost;
+        } else self.credential.transaction_guard = null;
         if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
         errdefer if (native_adapter.result_session_id) |id| {
             const transaction_id = @import("distributed_txn.zig").parseTxnIdHex(&id) catch unreachable;

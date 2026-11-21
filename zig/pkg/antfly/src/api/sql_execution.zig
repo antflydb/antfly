@@ -193,6 +193,7 @@ pub const Adapter = struct {
     result_session_id: ?[32]u8 = null,
     transaction_status: @import("antfly_local_sources").sql_session.Status = .idle,
     active_transaction: ?[16]u8 = null,
+    connection_mutation: ?@import("transactions.zig").Mutation = null,
     admitted_mutation: ?@import("transactions.zig").Mutation = null,
     accepted_lake_repeatable: bool = false,
     staged: ?*@import("transactions.zig").OwnedTransactionCommitRequest = null,
@@ -329,6 +330,10 @@ pub const Adapter = struct {
             self.admitted_mutation = self.server.txn_sessions.mutation(self.server.alloc, id, self.server.localSessionNodeId()) catch |err| {
                 if (err == error.SessionLeaseLost) self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
                 return err;
+            };
+            if (self.connection_mutation) |guard| if (!std.meta.eql(guard, self.admitted_mutation.?)) {
+                self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
+                return error.SessionLeaseLost;
             };
             inherited = ((self.server.txn_sessions.getSqlState(self.server.alloc, id) catch |zig017_err| {
                 zig017_return_error = zig017_err;
