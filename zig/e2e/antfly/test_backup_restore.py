@@ -1736,7 +1736,7 @@ class ThreeByThreeBackupCluster:
             url, path = self.metadata_admin_urls[index], "/metadata/v1/status"
         else:
             command = self._data_command(index)
-            ports = (self.data_ports[index], self.data_raft_ports[index])
+            ports = self._data_listener_ports(index)
             log = self.data_log_files[index]
             url, path = self.data_api_urls[index], "/status"
         for port in ports:
@@ -1750,9 +1750,14 @@ class ThreeByThreeBackupCluster:
                 cwd=REPO_ROOT,
             ),
         )
-        assert wait_for_server(url, path=path, timeout=startup_timeout_s), (
-            self.debug_logs()
-        )
+        assert wait_for_server(
+            url,
+            path=path,
+            timeout=startup_timeout_s,
+            allow_unauthorized=not metadata
+            and bool(os.environ.get("ANTFLY_TRUSTED_PRINCIPAL_SECRET")),
+            processes=[(f"restarted node {index}", procs[index])],
+        ), self.debug_logs()
 
     def debug_logs(self) -> str:
         try:
