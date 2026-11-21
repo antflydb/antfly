@@ -25,6 +25,7 @@ const allocation_ledger = @import("allocation_ledger.zig");
 const CacheQuota = @import("cache_quota.zig").Quota;
 const CacheCleanup = @import("../../execution/cleanup_context.zig").Context;
 const driver_mod = @import("driver.zig");
+const graph_mod = @import("graph.zig");
 const embedding_gemma2_global = @import("embedding_gemma2_global.zig");
 const embedding_gemma2_policy_mod = @import("embedding_gemma2_policy.zig");
 const execution_plan = @import("execution_plan.zig");
@@ -3907,7 +3908,7 @@ pub const CudaCompute = struct {
                 compute.execution_scope = null;
                 owner.active = false;
                 if (capture_active) {
-                    owner.pending_graph = compute.ctx.endStreamCapture() catch platform.inference_process_supervisor.restartWorker();
+                    owner.pending_graph = graph_mod.endRecording(&compute.ctx) catch null;
                 }
                 owner.disabled_epoch = owner.epoch_id;
                 compute.clearCapturedGraphWithCleanup(.{ .boundary = if (cleanup_owner) |source| source.epoch() else cleanup_epoch }) catch platform.inference_process_supervisor.restartWorker();
@@ -3940,8 +3941,8 @@ pub const CudaCompute = struct {
                 } else owner.phase = .capture;
             } else if (capture) {
                 const matches = scope.valid and scope.cursor == owner.plan.?.event_count and compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
-                owner.pending_graph = try compute.ctx.endStreamCapture();
                 capture_active = false;
+                owner.pending_graph = try graph_mod.endRecording(&compute.ctx);
                 if (!matches) return error.InvalidExecutionPlan;
                 owner.graph = try compute.ctx.instantiateGraph(owner.pending_graph);
                 try compute.ctx.destroyGraphChecked(&owner.pending_graph);
@@ -8363,7 +8364,7 @@ pub const CudaCompute = struct {
                 };
                 self.stats.cuda_graph_capture_begins += 1;
                 @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control) catch |err| {
-                    if (self.ctx.endStreamCapture()) |graph| self.ctx.destroyGraph(graph) else |_| {}
+                    graph_mod.discardRecording(&self.ctx);
                     entry.captureFailed(err);
                     if (err == error.Cancelled or err == error.Timeout) return err;
                     // Capture records rather than executes these layers. A
@@ -8371,13 +8372,7 @@ pub const CudaCompute = struct {
                     try @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control);
                     break :capture;
                 };
-                const graph = self.ctx.endStreamCapture() catch {
-                    entry.disabled = true;
-                    try @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control);
-                    break :capture;
-                };
-                defer self.ctx.destroyGraph(graph);
-                entry.graph = self.ctx.instantiateGraph(graph) catch {
+                entry.graph = graph_mod.endCaptureExec(&self.ctx) catch {
                     entry.disabled = true;
                     try @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control);
                     break :capture;
@@ -19428,14 +19423,7 @@ fn abortDebugCudaGraphCaptureWithCleanup(self: *CudaCompute, slot_idx: usize, cu
     self.capturing_physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
     self.debug_cuda_graph_slots[slot_idx].physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
     self.stats.cuda_graph_capture_discards += 1;
-    if (self.ctx.debug_graph_capture_active) {
-        if (self.ctx.endStreamCapture()) |graph| {
-            var pending = graph;
-            self.ctx.destroyGraphChecked(&pending) catch platform.inference_process_supervisor.restartWorker();
-        } else |_| {
-            @import("graph.zig").requireCaptureEnded(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
-        }
-    }
+    if (self.ctx.debug_graph_capture_active) graph_mod.discardRecording(&self.ctx);
     resetCudaGraphReplaySlotMetadataWithCleanup(self, &self.debug_cuda_graph_slots[slot_idx], current);
     self.capturing_physical_storage.deinitWithCleanup(self.allocator, current);
     clearDebugCudaGraphCaptureState(self);
@@ -20326,8 +20314,7 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
         }
     }
 
-    var graph = self.ctx.endStreamCapture() catch |err| {
-        @import("graph.zig").requireCaptureEnded(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
+    var graph = graph_mod.endRecording(&self.ctx) catch |err| {
         self.stats.cuda_graph_capture_discards += 1;
         // A caller requesting replay relies on this function to execute the
         // captured work. Never report success after end-capture failed: doing
@@ -20694,7 +20681,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         const result = run(context, stable[0..count]) catch |err| {
             self.execution_scope = null;
             if (capture) {
-                if (self.ctx.endStreamCapture()) |g| self.ctx.destroyGraph(g) else |_| {}
+                graph_mod.discardRecording(&self.ctx);
             }
             arena.captureFailed(err);
             entry.disabled = err != error.Cancelled and err != error.Timeout;
@@ -20705,24 +20692,17 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         self.execution_scope = null;
         const result_tensor = tensorFromCt(result);
         const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.valid and scope.cursor == storage.events and result_tensor.buffer.ptr == arena.buffers[0].ptr + output.offset;
-        result_tensor.owns_buffer = false;
+        if (!matches and capture) graph_mod.discardRecording(&self.ctx);
+        if (scope.owns(result_tensor.buffer.ptr)) result_tensor.owns_buffer = false;
         freeTensor(self, result);
         if (!matches) {
-            if (capture) {
-                if (self.ctx.endStreamCapture()) |g| self.ctx.destroyGraph(g) else |_| {}
-            }
             entry.disabled = true;
             // The ordinary callback may already have submitted numerical work.
             if (!capture) return error.AudioPlanChanged;
             return null;
         }
         if (capture) {
-            const graph = self.ctx.endStreamCapture() catch {
-                entry.disabled = true;
-                return null;
-            };
-            defer self.ctx.destroyGraph(graph);
-            arena.graph = self.ctx.instantiateGraph(graph) catch {
+            arena.graph = graph_mod.endCaptureExec(&self.ctx) catch {
                 entry.disabled = true;
                 return null;
             };
@@ -30184,19 +30164,13 @@ fn runEmbeddingGemma2VisionTowerImpl(ctx: *anyopaque, input_ct: CT, logical_sequ
                 break :capture;
             };
             run.execute() catch |err| {
-                if (self.ctx.endStreamCapture()) |graph| self.ctx.destroyGraph(graph) else |_| {}
+                graph_mod.discardRecording(&self.ctx);
                 entry.captureFailed(err);
                 if (err == error.Cancelled or err == error.Timeout) return err;
                 try run.execute();
                 break :capture;
             };
-            const graph = self.ctx.endStreamCapture() catch {
-                entry.disabled = true;
-                try run.execute();
-                break :capture;
-            };
-            defer self.ctx.destroyGraph(graph);
-            entry.graph = self.ctx.instantiateGraph(graph) catch {
+            entry.graph = graph_mod.endCaptureExec(&self.ctx) catch {
                 entry.disabled = true;
                 try run.execute();
                 break :capture;
@@ -38919,17 +38893,7 @@ const PhysicalReplay = struct {
         if (!self.active) return;
         const compute = self.compute;
         compute.capturing_physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
-        if (compute.ctx.endStreamCapture()) |graph| {
-            // Publish the SDK handle before checked destruction. A failed
-            // destruction must not let the captured address owners unwind.
-            self.graph = .{ .graph = graph };
-            self.graph.?.deinitChecked(&compute.ctx) catch platform.inference_process_supervisor.restartWorker();
-            self.graph = null;
-        } else |_| {
-            // A failed end-capture is safe to discard only when the actual
-            // stream confirms it is no longer capturing.
-            @import("graph.zig").requireCaptureEnded(&compute.ctx) catch platform.inference_process_supervisor.restartWorker();
-        }
+        graph_mod.discardRecording(&compute.ctx);
         compute.capturing_physical_storage.deinitWithCleanup(compute.allocator, current);
         compute.debug_cuda_graph_capture_active = false;
         compute.debug_cuda_graph_capture_disabled = self.disabled_before;

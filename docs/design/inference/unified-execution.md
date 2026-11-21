@@ -407,8 +407,16 @@ preparation API do not by themselves complete these remaining requirements:
   errors propagate. Captures retain address leases; published outputs and foreign
   captures prevent mutable frame reuse. Cancellation and unsupported signatures
   retain ordinary execution with explicit replay decisions in diagnostics.
-  Learned decoder/audio arenas remain compatibility owners where their complete
-  temporary recipes have not migrated; capture alone grants no ownership credit.
+  Bounded CUDA decoder and audio execution seal their stream workspace recipes
+  in `execution/stream_workspace.zig`. Admission and dispatch consume the same
+  size, alignment, event sequence and published span. The providers own learning,
+  shape-specific backing and retirement. Legacy arenas with incomplete recipes
+  retain their compatibility accounting. Physical replay, bounded decoder replay
+  and EmbeddingGemma2 capture share a checked recording end before reclaiming or
+  reusing addresses.
+  Qualified CUDA projection and head-normalization regions attest assigned
+  outputs and temporary banks through the physical coverage check. Synchronous
+  Metal regions skip legacy partition graph and output banks after selection.
 - `model_definition.zig` owns artifact loading. Native and PJRT sessions share
   one failure-atomic host preparation path for normalization, resident/lazy
   weights and prefetch ownership. CUDA reuses its admitted manifest snapshot
@@ -540,6 +548,12 @@ preparation API do not by themselves complete these remaining requirements:
   Metal and generation reuse it while explicitly preserving architectural versus
   compact stored-layer layouts and host-mirror choices. Remaining specialized
   task transitions and compatibility arenas retain their explicit owners.
+  Decoder storage installs the request-local replay bound before CUDA KV writes.
+  Prepared-media and text prefill share chunk policy, and decoder prefill
+  selects the prepared-media KV window before numerical submission.
+  Merged seq2seq ONNX decoders resolve input/cache bindings at construction.
+  After shape validation they commit the ordered outputs directly, keep the
+  previous cross KV for declared empty outputs, and publish the logits owner.
   Canonical KV owners prepare unpublished attachment, full prefill, generated-token page growth,
   shared-tail copies, window trimming, replay reservations and view metadata
   before committing either owner. The unchanged-ID path preserves the existing
@@ -674,8 +688,12 @@ preparation API do not by themselves complete these remaining requirements:
   pending-phase observations: transfers and bytes, accepted dispatch/submission
   and wait units, specialization decisions, selected Native bodies and workers,
   known fallback producers, and registered host/device allocation owners. Batch
-  participants and pending outcomes survive model retirement. Registered owner
-  intervals can include concurrent activity; lifetime peaks are labelled as such.
+  participants and pending outcomes survive model retirement. Each pending
+  owner sums the instrumented transfer and submission counters from its observed
+  callbacks through readback and cleanup. Reports retain the initiating failure
+  and count the observed callbacks. Inter-phase work and GPU completion remain
+  outside the sums. Registered owner intervals can include concurrent activity,
+  and lifetime peaks are labelled as such.
   Successful frames and entered Native calls copy their prepared payload admission
   coverage into the report, including the existing compatibility reason. This
   describes prepared accounting rather than a numerical fallback or quota grant.
