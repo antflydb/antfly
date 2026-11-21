@@ -6060,10 +6060,13 @@ pub const CudaCompute = struct {
             platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_SMALL_DECODE_TILES", false);
         self.gemma4_chunked_upload = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_CHUNKED_UPLOAD", true);
         self.gemma4_temp_lru = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_TEMP_LRU", true);
-        self.gemma4_projector_cache_enabled = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_CACHE", true);
         const projector_supported = self.gemma4_e4b_sm89_qualified or (qualified and e4b and self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1);
         self.gemma4_projector_lossless_f16 = projector_supported and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_LOSSLESS_F16", false);
         self.gemma4_projector_residual = projector_supported and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL", false);
+        // Compact inference keeps immutable, admitted weights across requests.
+        // The ordinary GB10 profile continues to use its original loading path.
+        self.gemma4_projector_cache_enabled = (self.gemma4_e4b_sm89_qualified or self.gemma4_projector_residual or self.gemma4_projector_lossless_f16) and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_CACHE", true);
         if (self.gemma4_projector_residual) {
             self.gemma4_projector_residual_terms = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL_TERMS") orelse 3;
             if (self.gemma4_projector_residual_terms != 2 and self.gemma4_projector_residual_terms != 3) return error.InvalidShape;
@@ -39757,6 +39760,29 @@ test "Gemma4 CUDA projector optional scratch leaves graph slots available after 
     var required = try allocDeviceBufferOrdinaryWithPolicy(&compute, 256, .required);
     defer releaseDeviceBuffer(&compute, &required);
     try std.testing.expectEqual(required.ptr, compute.temp_pinned_slots.items[0].buffer.ptr);
+}
+
+test "Gemma4 CUDA projector opt-in shares GB10 weights without enabling SM89 decode kernels" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var residual = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL");
+    defer residual.restore(a);
+    var cache = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_CACHE");
+    defer cache.restore(a);
+    var lossless = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_LOSSLESS_F16");
+    defer lossless.restore(a);
+    var compute = try CudaCompute.initWithKernelJitForProfile(a, .{}, .gemma4);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    try compute.configureGemma4Dense(true, true);
+    try std.testing.expect(!compute.gemma4_projector_cache_enabled);
+    try std.testing.expectEqual(@as(c_int, 0), setenv(residual.name.ptr, "1", 1));
+    try compute.configureGemma4Dense(true, true);
+    try std.testing.expect(compute.gemma4_projector_residual and compute.gemma4_projector_cache_enabled);
+    try std.testing.expect(!compute.kernels.gemma4_small_decode_tiles);
+    try std.testing.expectEqual(@as(c_int, 0), setenv(cache.name.ptr, "0", 1));
+    try compute.configureGemma4Dense(true, true);
+    try std.testing.expect(compute.gemma4_projector_residual and !compute.gemma4_projector_cache_enabled);
 }
 
 test "Gemma4 CUDA projector fits the weight-only budget and falls back under residual scratch pressure" {
