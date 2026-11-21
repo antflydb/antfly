@@ -256,9 +256,14 @@ pub const Routed = struct {
         const shared_storage = for (positions) |position| {
             if (position.storage_namespace != null) break true;
         } else false;
-        const completion_roots = try a.alloc(control.Namespace, if (project_completion and !shared_storage) positions.len else 0);
+        const completion_roots = try a.alloc(control.Namespace, if (project_completion) positions.len else 0);
         defer a.free(completion_roots);
-        for (completion_roots, positions[0..completion_roots.len]) |*namespace, position| namespace.* = position.namespace;
+        const completion_groups = try a.alloc(u64, if (shared_storage) completion_roots.len else 0);
+        defer a.free(completion_groups);
+        for (completion_roots, positions[0..completion_roots.len], 0..) |*namespace, position, ordinal| {
+            namespace.* = position.storageNamespace();
+            if (shared_storage) completion_groups[ordinal] = if (position.physical) |physical| physical.group_id else 0;
+        }
         var page = try self.source.pages.read(a, selected.fence, selected.table_name, .{
             .version = 1,
             .request = .{
@@ -276,6 +281,8 @@ pub const Routed = struct {
                 .max_bytes = max_bytes,
                 .include_completion = true,
                 .completion_roots = completion_roots,
+                .completion_groups = completion_groups,
+                .completion_local_group = if (completion_groups.len != 0) selected.fence.route.group_id else 0,
             },
         }, request);
         errdefer page.deinit();
@@ -286,7 +293,6 @@ pub const Routed = struct {
         }
         if (page.header) |header| {
             if (header.transaction_scope == .coordinated) {
-                if (shared_storage and project_completion) return error.ChangefeedCapabilityUnsupported;
                 if (page.completion == null) return error.ReadUnavailable;
             }
         }

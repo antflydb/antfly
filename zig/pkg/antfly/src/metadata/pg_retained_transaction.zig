@@ -84,7 +84,8 @@ pub fn encode(a: A, state: feeds.State, frames: []const Frame, issued_at: u64, b
             if (effect == null) continue;
             if (member >= frames.len) return error.ReadUnavailable;
             const matched = frames[member].page.header orelse return error.InvalidPgSpool;
-            if (!std.meta.eql(root.namespace, matched.namespace) or effect.?.sequence != matched.sequence)
+            if (!std.meta.eql(root.namespace, frames[member].stream orelse matched.namespace) or
+                !std.meta.eql(root.storageNamespace(), matched.namespace) or effect.?.sequence != matched.sequence)
                 return error.HistoryCorrupt;
             member += 1;
         }
@@ -250,7 +251,7 @@ pub fn Producer(comptime Policy: type) type {
             const scratch = arena.allocator();
             var frames: std.ArrayList(Frame) = .empty;
             defer for (frames.items) |*frame| {
-                if (!std.meta.eql(frame.page.header.?.namespace, first_header.namespace)) frame.page.deinit();
+                if (!std.meta.eql(frame.stream.?, positions[seed].namespace)) frame.page.deinit();
             };
 
             if (first.completion == null or positions.len == 1) {

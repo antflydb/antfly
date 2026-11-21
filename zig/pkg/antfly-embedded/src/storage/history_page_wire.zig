@@ -48,6 +48,16 @@ fn checksum(prefix: []const u8, payload: []const u8, request: pages.Request) [32
         hash.update(&bytes);
     }
     for (request.completion_roots) |root| hash.update(&root);
+    if (request.completion_groups.len != 0) {
+        hash.update("physical-completion-groups");
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, request.completion_local_group, .little);
+        hash.update(&encoded);
+        for (request.completion_groups) |group| {
+            std.mem.writeInt(u64, &encoded, group, .little);
+            hash.update(&encoded);
+        }
+    }
     hash.update(prefix);
     hash.update(payload);
     return hash.finalResult();
@@ -60,8 +70,8 @@ pub fn validate(page: pages.Page, request: pages.Request) !void {
         const header = page.header orelse return error.HistoryCorrupt;
         if (!request.include_completion or header.transaction_scope != .coordinated or
             std.mem.allEqual(u8, &proof.certificate_digest, 0) or proof.commit_version == 0 or page.completion_effects.len != request.completion_roots.len) return error.HistoryCorrupt;
-        for (page.completion_effects, request.completion_roots) |effect, root| {
-            const local = std.mem.eql(u8, &root, &header.namespace);
+        for (page.completion_effects, request.completion_roots, 0..) |effect, root, index| {
+            const local = if (request.completion_groups.len == 0) std.mem.eql(u8, &root, &header.namespace) else request.completion_groups[index] == request.completion_local_group;
             if (effect) |value| {
                 if (value.sequence == 0 or std.mem.allEqual(u8, &value.frame_digest, 0) or (local and value.sequence != header.sequence)) return error.HistoryCorrupt;
             } else if (local) return error.HistoryCorrupt;
@@ -221,6 +231,17 @@ fn completionRoundTrip() !void {
     var decoded_projection = try decode(a, projected_raw, projection);
     defer decoded_projection.deinit();
     try std.testing.expectEqualDeep(projected.completion_effects, decoded_projection.completion_effects);
+    var physical = projection;
+    physical.completion_roots = &.{ @splat(1), @splat(1), @splat(3) };
+    physical.completion_groups = &.{ 7, 8, 9 };
+    physical.completion_local_group = 7;
+    const physical_raw = try encode(a, projected, physical);
+    defer a.free(physical_raw);
+    var physical_page = try decode(a, physical_raw, physical);
+    defer physical_page.deinit();
+    try std.testing.expectEqualDeep(projected.completion_effects, physical_page.completion_effects);
+    physical.completion_groups = &.{ 7, 10, 9 };
+    try std.testing.expectError(error.HistoryCorrupt, decode(a, physical_raw, physical));
     try std.testing.expectError(error.HistoryCorrupt, decode(a, projected_raw, request));
     projection.completion_roots = &.{ @splat(1), @splat(2), @splat(4) };
     try std.testing.expectError(error.HistoryCorrupt, decode(a, projected_raw, projection));

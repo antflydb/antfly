@@ -474,6 +474,28 @@ pub const Certificate = struct {
             }
         }
     }
+    /// Preserve subscriber stream order while binding each effect to the
+    /// original physical group authenticated by the certificate.
+    pub fn projectPhysicalEffects(self: Certificate, namespaces: []const Namespace, groups: []const u64, effects: []?Effects) !void {
+        if (namespaces.len == 0 or namespaces.len > max_projection_roots or groups.len != namespaces.len or effects.len != namespaces.len)
+            return error.InvalidTxnRecord;
+        try self.validate();
+        if (self.manifest.version != 3) return error.ChangefeedCapabilityUnsupported;
+        for (namespaces, groups, effects, 0..) |namespace, group, *effect, index| {
+            if (!nonzero(namespace) or (group != 0 and std.mem.indexOfScalar(u64, groups[0..index], group) != null))
+                return error.InvalidTxnRecord;
+            effect.* = null;
+            for (self.manifest.participants, self.resolutions) |member, resolution| {
+                if (!same(member.namespace, namespace) or member.routed_owner.?.group_id != group) continue;
+                effect.* = switch (resolution.outcome) {
+                    .effects => |value| value,
+                    .no_effect => null,
+                };
+                break;
+            }
+        }
+    }
+
     pub fn digest(self: Certificate) Digest {
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
         sha.update("antfly:transaction-completion-certificate:v1");
@@ -734,6 +756,12 @@ test "completion admission v3 retains authenticated original owners through rest
     var parsed_certificate = try parse(a, certificate);
     defer parsed_certificate.deinit();
     try std.testing.expectEqual(first, try parsed_certificate.value.certificate.manifest.admission().recoveryOwner(first.namespace));
+    resolutions[0].outcome = .{ .effects = .{ .sequence = 9, .frame_digest = @splat(12) } };
+    const projection: Certificate = .{ .manifest = manifest, .resolutions = &resolutions };
+    var projected: [3]?Effects = undefined;
+    try projection.projectPhysicalEffects(&.{ first.namespace, second.namespace, first.namespace }, &.{ 11, second.group_id, first.group_id }, &projected);
+    try std.testing.expectEqualDeep([3]?Effects{ null, null, resolutions[0].outcome.effects }, projected);
+    try std.testing.expectError(error.InvalidTxnRecord, projection.projectPhysicalEffects(&.{ first.namespace, second.namespace, first.namespace }, &.{ 11, second.group_id, 11 }, &projected));
     members[0].routed_owner.?.root_generation += 1;
     try std.testing.expectError(error.InvalidTxnRecord, admission.validate());
     members[0].routed_owner = null;

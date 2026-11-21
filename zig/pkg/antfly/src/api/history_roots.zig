@@ -461,10 +461,14 @@ pub const Source = struct {
         const shared_storage = for (state.roots) |position| {
             if (position.storage_namespace != null) break true;
         } else false;
-        const projection_count = if (!shared_storage and state.roots.len > 1) state.roots.len else 0;
+        const projection_count = if (state.roots.len > 1) state.roots.len else 0;
         if (projection_count > history.pages.max_projection_roots) return error.ChangefeedCapabilityUnsupported;
         const completion_roots = try scratch.alloc(control.Namespace, projection_count);
-        for (completion_roots, state.roots[0..projection_count]) |*namespace, selected| namespace.* = selected.namespace;
+        const completion_groups = try scratch.alloc(u64, if (shared_storage) projection_count else 0);
+        for (completion_roots, state.roots[0..projection_count], 0..) |*namespace, selected, index| {
+            namespace.* = selected.storageNamespace();
+            if (shared_storage) completion_groups[index] = if (selected.physical) |physical| physical.group_id else (try captured.findInstalled(selected)).fence.route.group_id;
+        }
         var input: history.Request = .{ .version = 1, .request = .{
             .reference = .{
                 .namespace = item.storageNamespace(),
@@ -480,6 +484,8 @@ pub const Source = struct {
             .max_bytes = read.max_frame_bytes,
             .include_completion = true,
             .completion_roots = completion_roots,
+            .completion_groups = completion_groups,
+            .completion_local_group = if (completion_groups.len != 0) root.fence.route.group_id else 0,
         } };
         var header: ?frame.Header = null;
         var completion: @FieldType(history.pages.Page, "completion") = null;
@@ -508,7 +514,6 @@ pub const Source = struct {
             switch (current.transaction_scope) {
                 .root_local => {},
                 .coordinated => {
-                    if (shared_storage) return error.ChangefeedCapabilityUnsupported;
                     if (page.completion == null) return error.ReadUnavailable;
                 },
                 .unknown => return error.ChangefeedCapabilityUnsupported,

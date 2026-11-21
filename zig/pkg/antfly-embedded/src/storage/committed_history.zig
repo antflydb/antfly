@@ -693,6 +693,8 @@ pub const max_completion_projection_roots = completion.max_projection_roots;
 pub const CompletionEffect = completion.Effects;
 pub const CompletionProjection = struct {
     roots: []const frame.Namespace,
+    groups: []const u64 = &.{},
+    local_group: u64 = 0,
     effects: []?completion.Effects,
 };
 
@@ -736,7 +738,14 @@ pub fn readProjectedFrameCompletion(a: A, txn: anytype, root_generation: u64, he
         if (effects.sequence != header.sequence or
             !std.mem.eql(u8, &effects.frame_digest, &frame.digest(descriptor.raw)) or
             !std.mem.eql(u8, &resolution.source_position, &header.source_position)) return error.HistoryCorrupt;
-        if (projection) |selected| try certificate.projectEffects(selected.roots, selected.effects);
+        if (projection) |selected| {
+            if (selected.groups.len == 0) {
+                try certificate.projectEffects(selected.roots, selected.effects);
+            } else {
+                if (selected.local_group != owner.group_id) return error.HistoryResynchronizationRequired;
+                try certificate.projectPhysicalEffects(selected.roots, selected.groups, selected.effects);
+            }
+        }
         return .{ .certificate_digest = publication.digest, .commit_version = manifest.commit_version };
     }
     return error.HistoryCorrupt;

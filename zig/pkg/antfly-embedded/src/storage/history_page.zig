@@ -43,9 +43,24 @@ pub const Request = struct {
     max_bytes: u32 = 1024 * 1024,
     include_completion: bool = false,
     completion_roots: []const frame.Namespace = &.{},
+    completion_groups: []const u64 = &.{},
+    completion_local_group: u64 = 0,
 
     pub fn validateCompletionRoots(self: Request) !void {
         if (self.completion_roots.len > max_projection_roots or (self.completion_roots.len != 0 and !self.include_completion)) return error.InvalidHistoryAdmission;
+        if (self.completion_groups.len != 0) {
+            if (self.completion_groups.len != self.completion_roots.len or self.completion_local_group == 0)
+                return error.InvalidHistoryAdmission;
+            var local_found = false;
+            for (self.completion_roots, self.completion_groups, 0..) |root, group, i| {
+                if (std.mem.allEqual(u8, &root, 0) or (group != 0 and std.mem.indexOfScalar(u64, self.completion_groups[0..i], group) != null))
+                    return error.InvalidHistoryAdmission;
+                if (group == self.completion_local_group) local_found = std.mem.eql(u8, &root, &self.reference.namespace);
+            }
+            if (!local_found) return error.InvalidHistoryAdmission;
+            return;
+        }
+        if (self.completion_local_group != 0) return error.InvalidHistoryAdmission;
         for (self.completion_roots, 0..) |root, i| {
             if (std.mem.allEqual(u8, &root, 0) or (i != 0 and std.mem.order(u8, &self.completion_roots[i - 1], &root) != .lt)) return error.InvalidHistoryAdmission;
         }
@@ -64,6 +79,12 @@ pub const Request = struct {
         if (self.completion_roots.len != 0) {
             try jw.objectField("completion_roots");
             try jw.write(self.completion_roots);
+        }
+        if (self.completion_groups.len != 0) {
+            try jw.objectField("completion_groups");
+            try jw.write(self.completion_groups);
+            try jw.objectField("completion_local_group");
+            try jw.write(self.completion_local_group);
         }
         try jw.endObject();
     }
@@ -185,7 +206,7 @@ pub fn readWithCompletion(a: std.mem.Allocator, txn: anytype, request: Request, 
     else
         &.{};
     const completion = if (request.include_completion and header.transaction_scope == .coordinated)
-        try history.readProjectedFrameCompletion(a, txn, root_generation.?, header, descriptor, if (effects.len == 0) null else .{ .roots = request.completion_roots, .effects = effects })
+        try history.readProjectedFrameCompletion(a, txn, root_generation.?, header, descriptor, if (effects.len == 0) null else .{ .roots = request.completion_roots, .groups = request.completion_groups, .local_group = request.completion_local_group, .effects = effects })
     else
         null;
     const capacity = @min(request.max_events, descriptor.events - request.after.event);
