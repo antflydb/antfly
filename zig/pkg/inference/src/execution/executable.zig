@@ -145,6 +145,7 @@ pub fn prepareWithOptions(allocator: std.mem.Allocator, program: *const ModelPro
             if (binding.kind == .state_input or binding.kind == .state_output) {
                 pool.cuda_frame_dispatch = false;
                 pool.metal_frame_dispatch = false;
+                pool.metal_projection_region_candidate = false;
             }
         };
     }
@@ -478,7 +479,7 @@ test "prepared physical workspace is declared once reused and owned by its frame
     const a = std.testing.allocator;
     const ScratchKernel = struct {
         fn requirement(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) !ops.kernel_descriptor.WorkspaceRequirement {
-            return .{ .byte_size = descriptor.elements() * @sizeOf(f32) };
+            return .{ .byte_size = descriptor.elements() * @sizeOf(f32), .alignment = 8 };
         }
         fn run(raw: *anyopaque, request: ops.kernel_descriptor.Invocation) !bool {
             const compute: *Native = @ptrCast(@alignCast(raw));
@@ -521,6 +522,7 @@ test "prepared physical workspace is declared once reused and owned by its frame
     const allocation = executable.runtime.buffer_plan.?.allocations[scratch_id];
     try std.testing.expectEqual(@import("../graph/buffer_plan.zig").AllocationKind.workspace, allocation.kind);
     try std.testing.expectEqual(@as(u64, 32), allocation.byte_size);
+    try std.testing.expectEqual(@as(u32, 8), allocation.alignment);
     try std.testing.expect(allocation.first_use == 0 and allocation.last_use >= program.graph.nodeCount());
     const input = try cb.fromFloat32Shape(&.{ -4, -3, -2, -1, 0, 1, 2, 3 }, &.{ 2, 4 });
     defer cb.free(input);
@@ -2688,6 +2690,7 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
     pool.native_frame_dispatch = false;
     pool.cuda_frame_dispatch = false;
     pool.metal_frame_dispatch = false;
+    pool.metal_projection_region_candidate = false;
     pool.coverage_backend = .{ .ptr = executable.runtime.default_backend.ptr, .vtable = executable.runtime.default_backend.vtable };
     if (comptime @import("build_options").enable_metal) {
         if (executable.runtime.default_backend.kind() == .metal and @import("device_owned_coverage.zig").services(executable.runtime.default_backend.*) != null) {
@@ -2705,31 +2708,49 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 }
             }
             if (targets != 1) return;
-            // Nonblocking compatibility decline if this cold executable was built
-            // beneath an external owner. Never wait while an unknown outer lane is
-            // held, and never reinterpret its legacy scope as managed authority.
-            var metadata = @import("backend_operation.zig").enter(executable.runtime.default_backend.*, graph, null, .metadata) catch |err| switch (err) {
-                error.QueueFull => return,
-                else => return err,
-            };
+            const Executor = @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor;
+            const projection_head = if (ops.kernel_descriptor.projectionHead(graph)) |head|
+                head.linears[0].operation.linear.rows > 1 or head.form == .independent
+            else
+                false;
+            const operation = @import("backend_operation.zig");
+            var metadata: operation.Scope = .{};
             defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-            if (metadata.token() == null) return;
+            if (!projection_head) {
+                // Primitive attestation reads the executor's live cached
+                // plans. A projection only checks immutable owner identity
+                // here. Its actual region is attested under metadata during
+                // variant preparation, after any weight construction ends.
+                operation.enterInto(executable.runtime.default_backend, graph, null, .metadata, &metadata) catch |err| switch (err) {
+                    error.QueueFull => return,
+                    else => return err,
+                };
+                if (metadata.token() == null) return;
+            }
+            var active_partitions: usize = 0;
             for (plan.base.partitions, 0..) |part, index| {
                 var active = false;
+                var active_compute = false;
                 for (part.node_ids) |id| {
                     if (id >= analysis.reachable.len) return;
                     if (!analysis.reachable[id]) continue;
                     if (plan.base.node_assignment[id] != index or graph.node(id).op == .fused_from_float32) return;
                     active = true;
+                    active_compute = active_compute or graph.node(id).op != .parameter;
                 }
                 if (!active) continue;
                 if (part.backend != .metal or plan.device_assignment[index] != 0) return;
+                if (projection_head and !active_compute) continue;
+                active_partitions += 1;
                 const actual = part.executor orelse return;
                 var owned = false;
                 for (compiled) |cached| if (cached.partition_idx == index and actual.ptr == cached.executor.ptr and actual.vtable == cached.executor.vtable) {
                     owned = true;
                 };
-                if (!owned or !try @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor.attestOwnedFrameDispatch(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) return;
+                if (!owned) return;
+                if (projection_head) {
+                    if (active_partitions != 1 or !Executor.ownsPartition(actual, graph, executable.runtime.default_backend)) return;
+                } else if (!try Executor.attestOwnedFrameDispatch(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) return;
             }
             for (analysis.reachable, 0..) |active, id| {
                 if (!active) continue;
@@ -2741,7 +2762,8 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 };
                 if (count != 1) return;
             }
-            pool.metal_frame_dispatch = true;
+            pool.metal_projection_region_candidate = projection_head and active_partitions == 1;
+            pool.metal_frame_dispatch = !projection_head;
             return;
         }
     }

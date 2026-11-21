@@ -88,6 +88,19 @@ pub fn Program(comptime Recipe: type) type {
             completion: driver.CUevent = null,
             pending: bool = false,
             fence_valid: bool = false,
+            /// Ambiguous driver failure makes this graph ineligible for reuse.
+            /// Retire it after the stream completes and keep the funded banks
+            /// available to the existing ordinary schedule.
+            pub fn launch(self: *Arena, ctx: *Context) !void {
+                if (self.graph == null) return error.InvalidCudaState;
+                ctx.launchGraph(self.graph) catch |err| {
+                    ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                    self.invalidateGraph(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                    self.disabled = true;
+                    return err;
+                };
+            }
+
             pub fn invalidateGraph(self: *Arena, ctx: *Context) !void {
                 // Bank allocation and quota stay untouched. Publish no replacement
                 // captured-argument stamp until the actual eager/capture path succeeds.

@@ -25,9 +25,10 @@ const allocation_ledger = @import("allocation_ledger.zig");
 const CacheQuota = @import("cache_quota.zig").Quota;
 const CacheCleanup = @import("../../execution/cleanup_context.zig").Context;
 const driver_mod = @import("driver.zig");
+const graph_mod = @import("graph.zig");
 const embedding_gemma2_global = @import("embedding_gemma2_global.zig");
 const embedding_gemma2_policy_mod = @import("embedding_gemma2_policy.zig");
-const execution_plan = @import("execution_plan.zig");
+const periodic_workspace = @import("../../execution/periodic_workspace.zig");
 const kernels_mod = @import("kernels.zig");
 const cublaslt_mod = @import("cublaslt.zig");
 const cudnn_sdpa_mod = @import("cudnn_sdpa.zig");
@@ -3895,15 +3896,19 @@ pub const CudaCompute = struct {
             }
             const phase = owner.phase;
             if (phase == .disabled) return error.InvalidExecutionPlan;
-            var scope = @import("execution_arena.zig").Scope{ .plan = owner.plan.?, .base = if (phase == .capture) owner.arena.ptr else 0 };
+            const WorkspaceScope = @import("../../execution/stream_workspace.zig").Scope;
             const capture = phase == .capture;
+            var scope = if (capture)
+                try WorkspaceScope.bind(owner.plan.?, try owner.arenaLayout(), owner.arena.ptr, owner.arena.len)
+            else
+                WorkspaceScope{ .plan = owner.plan.? };
             var capture_active = false;
             errdefer {
                 std.log.warn("LightOn decoder graph aborted: phase={s} event={d}/{d}", .{ @tagName(phase), scope.cursor, owner.plan.?.event_count });
                 compute.execution_scope = null;
                 owner.active = false;
                 if (capture_active) {
-                    owner.pending_graph = compute.ctx.endStreamCapture() catch platform.inference_process_supervisor.restartWorker();
+                    owner.pending_graph = graph_mod.endRecording(&compute.ctx) catch null;
                 }
                 owner.disabled_epoch = owner.epoch_id;
                 compute.clearCapturedGraphWithCleanup(.{ .boundary = if (cleanup_owner) |source| source.epoch() else cleanup_epoch }) catch platform.inference_process_supervisor.restartWorker();
@@ -3936,8 +3941,8 @@ pub const CudaCompute = struct {
                 } else owner.phase = .capture;
             } else if (capture) {
                 const matches = scope.valid and scope.cursor == owner.plan.?.event_count and compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
-                owner.pending_graph = try compute.ctx.endStreamCapture();
                 capture_active = false;
+                owner.pending_graph = try graph_mod.endRecording(&compute.ctx);
                 if (!matches) return error.InvalidExecutionPlan;
                 owner.graph = try compute.ctx.instantiateGraph(owner.pending_graph);
                 try compute.ctx.destroyGraphChecked(&owner.pending_graph);
@@ -4215,7 +4220,7 @@ pub const CudaCompute = struct {
         if (owner.phase == .disabled) return .unsupported;
         if (owner.phase == .capture and owner.arena.ptr == 0) {
             if (try self.ctx.streamCaptureActive()) return .unsupported;
-            if (owner.plan == null or !owner.plan.?.valid or owner.plan.?.peak == 0 or owner.plan.?.peak > @import("execution_arena.zig").limit) return error.InvalidExecutionPlan;
+            _ = try owner.arenaLayout();
             phase.mode = .arena;
             return .outside;
         }
@@ -6178,7 +6183,7 @@ pub const CudaCompute = struct {
     temp_buffer_mutex: std.atomic.Mutex = .unlocked,
     temp_buffers: @import("buffer_cache.zig").Cache(buffer_mod.DeviceBuffer) = .empty,
     temp_pinned_slots: std.ArrayListUnmanaged(TempPinnedSlot) = .empty,
-    temp_arena_planner: execution_plan.TempArenaPlanner = .{},
+    temp_arena_planner: periodic_workspace.TempArenaPlanner = .{},
     temp_arena_generation: u64 = 1,
     deferred_device_frees: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     deferred_device_free_bytes: usize = 0,
@@ -6304,7 +6309,7 @@ pub const CudaCompute = struct {
     embedding_gemma2_constant_misses: u64 = 0,
     audio_plans: @import("audio_execution_plan.zig").Cache = .{},
     audio_execution_active: bool = false,
-    execution_scope: ?*@import("execution_arena.zig").Scope = null,
+    execution_scope: ?*@import("../../execution/stream_workspace.zig").Scope = null,
     bounded_decode_graph: @import("bounded_decode_graph.zig").Module = .{},
     captured_cache_roots: ?*CapturedCacheRoots = null,
     // Armed only by real managed cold publication after legacy roots upgraded.
@@ -7899,8 +7904,7 @@ pub const CudaCompute = struct {
         }
         return .{ .key = hash.final(), .input_bytes = input_bytes };
     }
-    fn audioArenaRequestFromPlan(self: *const CudaCompute, base: AudioCacheBase, plan: *const @import("audio_execution_plan.zig").Plan) !CacheFunding.Request {
-        const bytes = try checkedAdd(base.input_bytes, plan.peak);
+    fn audioArenaRequestFromPlan(self: *const CudaCompute, base: AudioCacheBase, plan: *const @import("audio_execution_plan.zig").Plan, storage: @import("../../execution/stream_workspace.zig").Layout) CacheFunding.Request {
         var layout = std.hash.Wyhash.init(base.key);
         for (plan.events[0..plan.event_count]) |event| {
             layout.update(std.mem.asBytes(&event.slot));
@@ -7910,7 +7914,7 @@ pub const CudaCompute = struct {
             layout.update(std.mem.asBytes(&allocation.bytes));
             layout.update(std.mem.asBytes(&allocation.offset));
         }
-        return .{ .arena = .{ .kind = .audio, .batch = 1, .sequence = 1, .grid_x = @intCast(layout.final()), .sizes = .{ bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
+        return .{ .arena = .{ .kind = .audio, .batch = 1, .sequence = 1, .grid_x = @intCast(layout.final()), .sizes = .{ storage.bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
     }
     /// Read the SAME already learned allocation/event layout without creating a
     /// cache entry, touching its LRU, or replaying numerical work for planning.
@@ -7920,8 +7924,9 @@ pub const CudaCompute = struct {
         if (base.input_bytes > 128 * 1024 * 1024) return null;
         for (self.audio_plans.entries) |entry| if (entry.stamp != 0 and entry.key == base.key and entry.warmed and !entry.disabled) {
             const plan = entry.plan orelse return null;
-            if (try checkedAdd(base.input_bytes, plan.peak) > @import("audio_execution_plan.zig").limit) return null;
-            return try self.audioArenaRequestFromPlan(base, plan);
+            const storage = plan.layout(base.input_bytes) catch return null;
+            if (storage.output == null) return null;
+            return self.audioArenaRequestFromPlan(base, plan, storage);
         };
         return null;
     }
@@ -8347,7 +8352,7 @@ pub const CudaCompute = struct {
             if (entry.graph != null) {
                 const replay = graph_action == .replay;
                 if (replay) {
-                    try self.ctx.launchGraph(entry.graph);
+                    try entry.launch(&self.ctx);
                     self.stats.cuda_graph_capture_replays += 1;
                 } else try @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control);
                 replay_sample = replay;
@@ -8359,7 +8364,7 @@ pub const CudaCompute = struct {
                 };
                 self.stats.cuda_graph_capture_begins += 1;
                 @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control) catch |err| {
-                    if (self.ctx.endStreamCapture()) |graph| self.ctx.destroyGraph(graph) else |_| {}
+                    graph_mod.discardRecording(&self.ctx);
                     entry.captureFailed(err);
                     if (err == error.Cancelled or err == error.Timeout) return err;
                     // Capture records rather than executes these layers. A
@@ -8367,19 +8372,13 @@ pub const CudaCompute = struct {
                     try @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control);
                     break :capture;
                 };
-                const graph = self.ctx.endStreamCapture() catch {
-                    entry.disabled = true;
-                    try @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control);
-                    break :capture;
-                };
-                defer self.ctx.destroyGraph(graph);
-                entry.graph = self.ctx.instantiateGraph(graph) catch {
+                entry.graph = graph_mod.endCaptureExec(&self.ctx) catch {
                     entry.disabled = true;
                     try @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control);
                     break :capture;
                 };
                 self.stats.cuda_graph_capture_instantiates += 1;
-                try self.ctx.launchGraph(entry.graph);
+                try entry.launch(&self.ctx);
             } else {
                 try @import("../../backends/embedding_gemma2_cuda.zig").runEncoder(EncoderOperations, self, module, policy, config, batch, encoder_sequence, sequence, source_mask_kind == 0, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, attention_workspace, logical_metadata, control);
                 entry.warm = true;
@@ -9464,7 +9463,7 @@ pub const CudaCompute = struct {
     /// The same bound is installed in NativeDecodeState before any KV write.
     /// allow_default additionally requires the caller's pure-greedy contract.
     pub fn configureGemma4RequestReplayCapacity(cb: *const ops.ComputeBackend, prompt: usize, output: usize, allow_default: bool) !?usize {
-        if (cb.kind() != .cuda or cb.execution_owner != 0) return null;
+        if (!acceptsPhysicalImplementation(cb.vtable) or cb.execution_owner != 0) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const explicit_mode = platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") != null;
         // Installed artifact-qualified automatic plans and explicit experiments
@@ -16663,8 +16662,6 @@ fn tryCublasLtF16Qkv(
     return true;
 }
 
-const default_temp_arena_admission_budget_bytes: usize = 512 * 1024 * 1024;
-
 fn cudaTempCacheMaxBuffers(self: *const CudaCompute) usize {
     return self.runtime_policy.bufferLimit(self.resident_training_cache);
 }
@@ -16686,88 +16683,11 @@ fn cudaConfiguredTempArenaAdmissionBudgetBytes() ?usize {
     return std.math.mul(usize, mb, 1024 * 1024) catch 0;
 }
 
-/// Resolve a non-optional physical-footprint ceiling. An explicit arena limit
-/// can narrow, but never widen, request-level scratch or backend/combined
-/// memory policy. Without a request budget (diagnostic backends and unit
-/// tests), retain a conservative bounded default instead of treating zero as
-/// unlimited.
-fn tempArenaAdmissionBudgetFor(
-    configured_bytes: ?usize,
-    run_budget: ?*const run_memory.RunBudget,
-) usize {
-    var admission_budget = configured_bytes orelse default_temp_arena_admission_budget_bytes;
-    const budget = run_budget orelse return admission_budget;
-
-    const scratch_limit = budget.limits.scratch_limit_bytes;
-    if (configured_bytes == null and scratch_limit != 0) {
-        admission_budget = scratch_limit;
-    } else if (scratch_limit != 0) {
-        admission_budget = @min(admission_budget, scratch_limit);
-    }
-
-    // `backend_scratch_bytes` is the request's estimate for this same scratch
-    // domain and would double-count the arena. We only subtract independently
-    // resident weight/KV reservations when calculating remaining headroom.
-    const backend_non_scratch = std.math.add(
-        usize,
-        budget.backend_weight_bytes,
-        budget.backend_kv_bytes,
-    ) catch std.math.maxInt(usize);
-    if (budget.limits.backend_limit_bytes != 0) {
-        admission_budget = @min(
-            admission_budget,
-            budget.limits.backend_limit_bytes -| backend_non_scratch,
-        );
-    }
-    if (budget.limits.combined_limit_bytes != 0) {
-        const combined_non_arena = std.math.add(
-            usize,
-            budget.hostTotalBytes(),
-            backend_non_scratch,
-        ) catch std.math.maxInt(usize);
-        admission_budget = @min(
-            admission_budget,
-            budget.limits.combined_limit_bytes -| combined_non_arena,
-        );
-    }
-    return admission_budget;
-}
-
 fn cudaTempArenaAdmissionBudgetBytes(self: *const CudaCompute) usize {
-    return tempArenaAdmissionBudgetFor(
+    return periodic_workspace.admissionBudget(
         cudaConfiguredTempArenaAdmissionBudgetBytes(),
         self.run_budget,
     );
-}
-
-test "CUDA temp arena admission budget is bounded without a run budget" {
-    try std.testing.expectEqual(
-        default_temp_arena_admission_budget_bytes,
-        tempArenaAdmissionBudgetFor(null, null),
-    );
-    try std.testing.expectEqual(@as(usize, 0), tempArenaAdmissionBudgetFor(0, null));
-    try std.testing.expectEqual(@as(usize, 1234), tempArenaAdmissionBudgetFor(1234, null));
-}
-
-test "CUDA temp arena admission budget cannot widen request memory policy" {
-    var budget = run_memory.RunBudget.init(.{
-        .host_limit_bytes = 1_000,
-        .backend_limit_bytes = 300,
-        .combined_limit_bytes = 250,
-        .scratch_limit_bytes = 200,
-    });
-    budget.host_kv_bytes = 30;
-    budget.backend_weight_bytes = 100;
-    budget.backend_kv_bytes = 50;
-    // Combined non-arena bytes are 30 + 100 + 50, leaving 70. The scratch,
-    // backend, and explicit ceilings are all wider and therefore cannot win.
-    try std.testing.expectEqual(@as(usize, 70), tempArenaAdmissionBudgetFor(null, &budget));
-    try std.testing.expectEqual(@as(usize, 70), tempArenaAdmissionBudgetFor(500, &budget));
-    try std.testing.expectEqual(@as(usize, 40), tempArenaAdmissionBudgetFor(40, &budget));
-
-    budget.limits.combined_limit_bytes = 0;
-    // Backend non-arena bytes leave 150, narrower than the 200 scratch cap.
-    try std.testing.expectEqual(@as(usize, 150), tempArenaAdmissionBudgetFor(null, &budget));
 }
 
 fn cudaDeferredFreeEnabled() bool {
@@ -17427,9 +17347,13 @@ fn ensureTempPinnedSlots(self: *CudaCompute, period: usize) !void {
     }
 }
 
+fn pinnedWorkspaceBytes(buffer: buffer_mod.DeviceBuffer) usize {
+    return @max(buffer.len, buffer.allocation_bytes);
+}
+
 fn findExactTempBufferIndex(self: *const CudaCompute, len: usize) ?usize {
     for (self.temp_buffers.buffers.items, 0..) |buffer, i| {
-        if (buffer.len == len) return i;
+        if (buffer.len == len and pinnedWorkspaceBytes(buffer) == len and !buffer.borrowed) return i;
     }
     return null;
 }
@@ -17453,13 +17377,16 @@ fn allocPinnedTempSlot(
         return null;
     }
     if ((slot.requested_len != 0 and slot.requested_len != len) or
-        (slot.buffer.ptr != 0 and slot.buffer.len != len))
+        (slot.buffer.ptr != 0 and (slot.buffer.len != len or pinnedWorkspaceBytes(slot.buffer) != len)))
     {
         if (self.temp_slot_config.autoplan_enabled) self.temp_arena_planner.markPinnedValidationFailure();
         traceCudaTempAlloc(self, seq, "alloc_slot_shape_fallback", len, .{});
         return null;
     }
     if (slot.buffer.ptr == 0) {
+        // Every captured slot was bound by a completed ordinary validation
+        // iteration. An empty slot means the plan changed before recording.
+        if (self.debug_cuda_graph_capture_active) return null;
         slot.requested_len = len;
         if (findExactTempBufferIndex(self, len)) |i| {
             slot.buffer = self.temp_buffers.orderedRemove(i);
@@ -17533,12 +17460,12 @@ fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute, reuse: TempSlotReuse) !voi
     const retained_budget = if (reuse == .none or max_buffers == 0) 0 else @min(cache_budget, cudaTempArenaAdmissionBudgetBytes(self));
     var retained_bytes: usize = 0;
     for (self.temp_pinned_slots.items, 0..) |*slot, index| {
+        const physical_bytes = pinnedWorkspaceBytes(slot.buffer);
         const requested_len: ?usize = switch (reuse) {
             .none => null,
             .idle => 0,
-            .plan => |lengths| if (index < lengths.len and slot.buffer.len == lengths[index]) lengths[index] else null,
+            .plan => |lengths| if (index < lengths.len and slot.buffer.len == lengths[index] and physical_bytes == lengths[index]) lengths[index] else null,
         };
-        const physical_bytes = @max(slot.buffer.len, slot.buffer.allocation_bytes);
         if (requested_len != null and slot.buffer.ptr != 0 and
             !slot.buffer.borrowed and physical_bytes <= retained_budget -| retained_bytes)
         {
@@ -19376,6 +19303,16 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     try std.testing.expectEqual(@as(usize, 64), self.temp_pinned_slots.items[0].requested_len);
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), self.temp_pinned_slots.items[1].buffer.ptr);
     try std.testing.expectEqual(@as(usize, 1), self.temp_buffers.buffers.items.len);
+    // A logical view can describe fewer bytes than its backing. The installed
+    // plan must charge, and bind, the physical bytes of each ordinal.
+    self.temp_buffers.buffers.items[0].len = 64;
+    self.temp_buffers.buffers.items[0].allocation_bytes = 128;
+    try std.testing.expect(findExactTempBufferIndex(&self, 64) == null);
+    self.temp_slot_config.configured_period = 2;
+    self.debug_cuda_graph_capture_active = true;
+    try std.testing.expect((try allocPinnedTempSlot(&self, 1, 64)) == null);
+    self.debug_cuda_graph_capture_active = false;
+
     // Discarding a plan unpins every backing through ordinary bounded
     // recycling, including buffers that matched the preceding plan.
     try recycleTempPinnedSlotsUnlocked(&self, .none);
@@ -19424,14 +19361,7 @@ fn abortDebugCudaGraphCaptureWithCleanup(self: *CudaCompute, slot_idx: usize, cu
     self.capturing_physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
     self.debug_cuda_graph_slots[slot_idx].physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
     self.stats.cuda_graph_capture_discards += 1;
-    if (self.ctx.debug_graph_capture_active) {
-        if (self.ctx.endStreamCapture()) |graph| {
-            var pending = graph;
-            self.ctx.destroyGraphChecked(&pending) catch platform.inference_process_supervisor.restartWorker();
-        } else |_| {
-            @import("graph.zig").requireCaptureEnded(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
-        }
-    }
+    if (self.ctx.debug_graph_capture_active) graph_mod.discardRecording(&self.ctx);
     resetCudaGraphReplaySlotMetadataWithCleanup(self, &self.debug_cuda_graph_slots[slot_idx], current);
     self.capturing_physical_storage.deinitWithCleanup(self.allocator, current);
     clearDebugCudaGraphCaptureState(self);
@@ -20106,7 +20036,10 @@ fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
 
     var profile_scope = beginDecodeProfile(self, .graph_replay, 1);
     defer if (profile_scope) |*scope| scope.end();
-    try self.ctx.launchGraph(exec);
+    self.ctx.launchGraph(exec) catch |err| {
+        resetCudaGraphReplaySlotMetadata(self, slot);
+        return err;
+    };
     self.debug_cuda_graph_prepared_output_kind = .tensor;
     try noteCapturedTempAllocationsReplayed(self, slot.captured_temp_allocation_count);
     if (slot.decode_scalars_auto_advance) markDecodeScalarsDeviceMatchesHost(self);
@@ -20207,7 +20140,10 @@ fn debugCudaGraphReplayFinalHiddenDiscard(ctx: *anyopaque, input: CT) !bool {
 
     var profile_scope = beginDecodeProfile(self, .graph_replay, 1);
     defer if (profile_scope) |*scope| scope.end();
-    try self.ctx.launchGraph(exec);
+    self.ctx.launchGraph(exec) catch |err| {
+        resetCudaGraphReplaySlotMetadata(self, slot);
+        return err;
+    };
     self.debug_cuda_graph_prepared_output_kind = .tensor;
     try noteCapturedTempAllocationsReplayed(self, slot.captured_temp_allocation_count);
     if (slot.decode_scalars_auto_advance) markDecodeScalarsDeviceMatchesHost(self);
@@ -20229,7 +20165,10 @@ fn replayCapturedDebugGraphOneShot(self: *CudaCompute, graph: driver_mod.CUgraph
     var exec = try self.ctx.instantiateGraph(graph);
     defer self.ctx.destroyGraphExecChecked(&exec) catch platform.inference_process_supervisor.restartWorker();
     self.stats.cuda_graph_capture_instantiates += 1;
-    try self.ctx.launchGraph(exec);
+    self.ctx.launchGraph(exec) catch |err| {
+        self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+        return err;
+    };
     self.stats.cuda_graph_capture_replays += 1;
     if (cudaDebugGraphCaptureProbeTraceEnabled()) {
         std.log.info("cuda_graph_capture_probe: replayed", .{});
@@ -20322,8 +20261,7 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
         }
     }
 
-    var graph = self.ctx.endStreamCapture() catch |err| {
-        @import("graph.zig").requireCaptureEnded(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
+    var graph = graph_mod.endRecording(&self.ctx) catch |err| {
         self.stats.cuda_graph_capture_discards += 1;
         // A caller requesting replay relies on this function to execute the
         // captured work. Never report success after end-capture failed: doing
@@ -20630,11 +20568,14 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         return out;
     }
     const plan = entry.plan.?;
-    const bytes = try std.math.add(usize, input_bytes, plan.peak);
-    if (bytes > plan_mod.limit) return null;
+    const storage = plan.layout(input_bytes) catch return null;
+    const output = storage.output orelse return null;
+    const first_input = tensorFromCt(inputs[0]);
+    const output_bytes = first_input.elem_count * @sizeOf(f32);
+    if (output_bytes > output.bytes) return null;
     // The same complete event ABI drives preflight and actual arena lookup.
-    const cache_request = try self.audioArenaRequestFromPlan(cache_base, plan);
-    const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), bytes)) orelse return null;
+    const cache_request = self.audioArenaRequestFromPlan(cache_base, plan, storage);
+    const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), storage.bytes)) orelse return null;
     defer arena.noteUse(&self.ctx);
     var stable: [20]CT = undefined;
     var count: usize = 0;
@@ -20668,14 +20609,14 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const capture_sample = arena.graph == null;
     const replay = arena.graph != null and arena.preferReplay();
     if (replay) {
-        try self.ctx.launchGraph(arena.graph);
+        try arena.launch(&self.ctx);
         self.audio_graph_replays += 1;
     } else {
         // Subsampling has recreated the ordinary source-linear bank in this
         // invocation. Complete its queued producer and retire it BEFORE the
         // bounded arena host body, especially before CUDA capture starts.
         try prepareSourceLinearArenaScope(self);
-        var scope = plan_mod.Scope{ .plan = plan, .base = arena.buffers[0].ptr + input_bytes };
+        var scope = try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
         const capture = arena.graph == null and !arena.disabled;
         if (capture) self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED) catch {
             arena.disabled = true;
@@ -20687,37 +20628,32 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         const result = run(context, stable[0..count]) catch |err| {
             self.execution_scope = null;
             if (capture) {
-                if (self.ctx.endStreamCapture()) |g| self.ctx.destroyGraph(g) else |_| {}
+                graph_mod.discardRecording(&self.ctx);
             }
             arena.captureFailed(err);
             entry.disabled = err != error.Cancelled and err != error.Timeout;
             if (err == error.Cancelled or err == error.Timeout) return err;
-            if (!capture and err != error.AudioPlanChanged and err != error.CudaGraphCaptureUnsafeHostCopy) return err;
+            if (!capture) return err;
             return null;
         };
         self.execution_scope = null;
         const result_tensor = tensorFromCt(result);
-        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.valid and scope.cursor == plan.event_count and result_tensor.buffer.ptr == scope.base + plan.allocations[plan.output].offset;
-        result_tensor.owns_buffer = false;
+        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.valid and scope.cursor == storage.events and result_tensor.buffer.ptr == arena.buffers[0].ptr + output.offset;
+        if (!matches and capture) graph_mod.discardRecording(&self.ctx);
+        if (scope.owns(result_tensor.buffer.ptr)) result_tensor.owns_buffer = false;
         freeTensor(self, result);
         if (!matches) {
-            if (capture) {
-                if (self.ctx.endStreamCapture()) |g| self.ctx.destroyGraph(g) else |_| {}
-            }
             entry.disabled = true;
+            // The ordinary callback may already have submitted numerical work.
+            if (!capture) return error.AudioPlanChanged;
             return null;
         }
         if (capture) {
-            const graph = self.ctx.endStreamCapture() catch {
+            arena.graph = graph_mod.endCaptureExec(&self.ctx) catch {
                 entry.disabled = true;
                 return null;
             };
-            defer self.ctx.destroyGraph(graph);
-            arena.graph = self.ctx.instantiateGraph(graph) catch {
-                entry.disabled = true;
-                return null;
-            };
-            try self.ctx.launchGraph(arena.graph);
+            try arena.launch(&self.ctx);
         }
     }
     self.audio_arena_executes += 1;
@@ -20725,11 +20661,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         try self.ctx.recordProfileEnd(pair);
         arena.timing_replay = if (capture_sample) null else replay;
     };
-    const t = tensorFromCt(inputs[0]);
-    const out = try self.createEmbeddingGemma2Tensor(t.shape, .f32);
+    const out = try self.createEmbeddingGemma2Tensor(first_input.shape, .f32);
     errdefer freeTensor(self, out);
-    const result = try audioBufferView(arena.buffers[0], input_bytes + plan.allocations[plan.output].offset, t.elem_count * 4);
-    try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, t.elem_count * 4);
+    const result = try audioBufferView(arena.buffers[0], output.offset, output_bytes);
+    try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, output_bytes);
     return out;
 }
 fn audioBatchLayoutsEnabledOp(ctx: *anyopaque) bool {
@@ -30167,7 +30102,7 @@ fn runEmbeddingGemma2VisionTowerImpl(ctx: *anyopaque, input_ct: CT, logical_sequ
             entry.warm = false;
         }
         if (entry.graph != null) {
-            try self.ctx.launchGraph(entry.graph);
+            try entry.launch(&self.ctx);
             self.embedding_gemma2_vision_graph_replays += 1;
         } else if (entry.warm and !entry.disabled and (try run.captureReady())) capture: {
             self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED) catch {
@@ -30176,24 +30111,18 @@ fn runEmbeddingGemma2VisionTowerImpl(ctx: *anyopaque, input_ct: CT, logical_sequ
                 break :capture;
             };
             run.execute() catch |err| {
-                if (self.ctx.endStreamCapture()) |graph| self.ctx.destroyGraph(graph) else |_| {}
+                graph_mod.discardRecording(&self.ctx);
                 entry.captureFailed(err);
                 if (err == error.Cancelled or err == error.Timeout) return err;
                 try run.execute();
                 break :capture;
             };
-            const graph = self.ctx.endStreamCapture() catch {
+            entry.graph = graph_mod.endCaptureExec(&self.ctx) catch {
                 entry.disabled = true;
                 try run.execute();
                 break :capture;
             };
-            defer self.ctx.destroyGraph(graph);
-            entry.graph = self.ctx.instantiateGraph(graph) catch {
-                entry.disabled = true;
-                try run.execute();
-                break :capture;
-            };
-            try self.ctx.launchGraph(entry.graph);
+            try entry.launch(&self.ctx);
             self.embedding_gemma2_vision_graph_replays += 1;
         } else {
             try run.execute();
@@ -36106,6 +36035,29 @@ fn gqaPagedAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct
     return gqaDenseAttention(ctx, q_ct, k_ct, v_ct, attn_bias_ct, attention.attn_or_mask, batch, attention.query_sequence_len, attention.kv_sequence_len, num_heads, num_kv_heads, head_dim, query_position_offset, attention.kv_position_offset, attention.sliding_window, attention.total_sequence_len);
 }
 
+fn observePeriodicWorkspace(self: *CudaCompute) ?@import("../../execution/runtime_telemetry.zig").PeriodicWorkspace {
+    const config = self.temp_slot_config;
+    if ((!config.autoplan_enabled and config.configured_period == 0) or !self.temp_buffer_mutex.tryLock()) return null;
+    defer self.temp_buffer_mutex.unlock();
+    const plan = &self.temp_arena_planner;
+    var physical_bytes: usize = 0;
+    for (self.temp_pinned_slots.items) |slot| {
+        if (slot.buffer.ptr != 0) physical_bytes +|= pinnedWorkspaceBytes(slot.buffer);
+    }
+    const learned = config.configured_period == 0;
+    return .{
+        .state = if (!learned) .fixed else if (plan.disabled) .disabled else if (plan.ready_for_capture) .capture_ready else if (plan.active) .validating else if (plan.observing) .observing else .idle,
+        .slots = cudaEffectiveTempSlotPeriod(self),
+        .live_backing_bytes = physical_bytes,
+        .planned_bytes = if (learned and plan.active) plan.planned_physical_high_water_bytes else null,
+        .admission_limit_bytes = if (learned and plan.active) plan.admission_budget_bytes else null,
+        .trace_observations = plan.observations,
+        .activations = plan.activations,
+        .invalidations = plan.invalidations,
+        .admission_denials = plan.admission_denials,
+    };
+}
+
 fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     var provider = ops.NativeQuantTimingStats{};
@@ -36120,7 +36072,7 @@ fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
     }
     const memory = self.ctx.device_allocations.snapshot();
     return .{
-        .runtime = .{ .cuda = self.ctx.runtimeObservation(), .counters = .{ .kernel_dispatches = null, .graph_submissions = if (self.ctx.observation.load(.acquire)) |state| state.counterValue("known_graph_submissions") +| state.counterValue("opaque_graph_submissions") else null, .synchronizations = if (self.ctx.observation.load(.acquire)) |state| state.counterValue("host_stream_synchronizations") +| state.counterValue("host_event_synchronizations") else null, .physical_allocations = memory.allocations, .physical_frees = memory.frees }, .memory = .{ .scope = .backend_device_buffers, .excludes_detached_owners = true, .live_bytes = memory.physical_live, .lifetime_peak_bytes = memory.physical_peak } },
+        .runtime = .{ .cuda = self.ctx.runtimeObservation(), .cuda_periodic_workspace = observePeriodicWorkspace(self), .counters = .{ .kernel_dispatches = null, .graph_submissions = if (self.ctx.observation.load(.acquire)) |state| state.counterValue("known_graph_submissions") +| state.counterValue("opaque_graph_submissions") else null, .synchronizations = if (self.ctx.observation.load(.acquire)) |state| state.counterValue("host_stream_synchronizations") +| state.counterValue("host_event_synchronizations") else null, .physical_allocations = memory.allocations, .physical_frees = memory.frees }, .memory = .{ .scope = .backend_device_buffers, .excludes_detached_owners = true, .live_bytes = memory.physical_live, .lifetime_peak_bytes = memory.physical_peak } },
         .native_quant_null = false,
         .provider = provider,
         .quant = .{},
@@ -38846,7 +38798,7 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     try std.testing.expect(try audioExecutionOp(&compute, 0, undefined, undefined, undefined) == null);
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.evictEmbeddingGemma2Caches());
     var plan: @import("audio_execution_plan.zig").Plan = undefined;
-    var scope = @import("execution_arena.zig").Scope{ .plan = &plan, .base = 1 };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 1 };
     compute.execution_scope = &scope;
     var bytes = [_]u8{0};
     const device = buffer_mod.DeviceBuffer{ .ptr = 1, .len = bytes.len };
@@ -38866,7 +38818,12 @@ const PhysicalReplay = struct {
     fn begin(raw: *anyopaque, leases: []const ?*ops.physical_storage.Lease) !bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const compute = self.compute;
-        if (self.graph != null or self.active or compute.execution_scope != null or compute.debug_cuda_graph_capture_active or compute.capturing_physical_storage.values.items.len != 0 or try compute.ctx.streamCaptureActive()) return false;
+        if (self.graph != null or self.active or compute.execution_scope != null or compute.debug_cuda_graph_capture_active or compute.capturing_physical_storage.values.items.len != 0) return false;
+        for (leases) |maybe| if (maybe) |lease| {
+            if (lease.backend.ptr != @as(*anyopaque, @ptrCast(compute))) continue;
+            if (!acceptsPhysicalImplementation(lease.backend.vtable)) return false;
+        };
+        if (try compute.ctx.streamCaptureActive()) return false;
         errdefer compute.capturing_physical_storage.deinitWithCleanup(compute.allocator, physicalScopeCleanup(compute));
         for (leases) |maybe| if (maybe) |lease| {
             if (lease.backend.ptr == @as(*anyopaque, @ptrCast(compute))) try compute.capturing_physical_storage.retain(compute.allocator, lease);
@@ -38906,17 +38863,7 @@ const PhysicalReplay = struct {
         if (!self.active) return;
         const compute = self.compute;
         compute.capturing_physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
-        if (compute.ctx.endStreamCapture()) |graph| {
-            // Publish the SDK handle before checked destruction. A failed
-            // destruction must not let the captured address owners unwind.
-            self.graph = .{ .graph = graph };
-            self.graph.?.deinitChecked(&compute.ctx) catch platform.inference_process_supervisor.restartWorker();
-            self.graph = null;
-        } else |_| {
-            // A failed end-capture is safe to discard only when the actual
-            // stream confirms it is no longer capturing.
-            @import("graph.zig").requireCaptureEnded(&compute.ctx) catch platform.inference_process_supervisor.restartWorker();
-        }
+        graph_mod.discardRecording(&compute.ctx);
         compute.capturing_physical_storage.deinitWithCleanup(compute.allocator, current);
         compute.debug_cuda_graph_capture_active = false;
         compute.debug_cuda_graph_capture_disabled = self.disabled_before;
@@ -39131,6 +39078,14 @@ fn retainPhysicalCaptureTensor(self: *CudaCompute, value: CT) !void {
     if (!self.debug_cuda_graph_capture_active) return;
     if (tensorFromCt(value).physical_lease) |lease| try self.capturing_physical_storage.retain(self.allocator, lease);
     for (tensorFromCt(value).auxiliary_leases) |maybe_lease| if (maybe_lease) |lease| try self.capturing_physical_storage.retain(self.allocator, lease);
+}
+
+inline fn retainAssignedCaptureOperands(self: *CudaCompute, request: ops.kernel_descriptor.Invocation, output: CT) !void {
+    if (!self.debug_cuda_graph_capture_active) return;
+    for (request.inputs) |input| try retainPhysicalCaptureTensor(self, input);
+    try retainPhysicalCaptureTensor(self, output);
+    if (request.workspace) |workspace| try retainPhysicalCaptureTensor(self, workspace);
+    for (request.auxiliaries) |auxiliary| try retainPhysicalCaptureTensor(self, auxiliary.tensor);
 }
 
 fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
@@ -39845,6 +39800,8 @@ fn runAssignedDenseAttention(self: *CudaCompute, request: ops.kernel_descriptor.
     if (bytes != 0) {
         const workspace = tensorFromCt(request.workspace orelse return error.MissingAssignedWorkspace);
         if (workspace.physical_lease == null or workspace.dtype != .f32 or workspace.buffer.len < bytes or cudaTensorReadOnly(workspace)) return error.InvalidShape;
+        const alignment: usize = if (plan.grouped) @alignOf(f32) else @alignOf(i64);
+        if (workspace.buffer.ptr % alignment != 0) return error.UnsupportedPhysicalWorkspaceAlignment;
         scratch = .{ .ptr = workspace.buffer.ptr, .len = bytes };
         if (kernel_geometry.byteRangesOverlap(scratch.ptr, bytes, output.buffer.ptr, try checkedMul(output.elem_count, 4))) return error.InvalidAssignedAlias;
     }
@@ -39853,6 +39810,8 @@ fn runAssignedDenseAttention(self: *CudaCompute, request: ops.kernel_descriptor.
         const span = try checkedMul(tensor.elem_count, 4);
         if (kernel_geometry.byteRangesOverlap(output.buffer.ptr, try checkedMul(output.elem_count, 4), tensor.buffer.ptr, span) or (bytes != 0 and kernel_geometry.byteRangesOverlap(scratch.ptr, bytes, tensor.buffer.ptr, span))) return error.InvalidAssignedAlias;
     }
+    if (self.debug_cuda_graph_capture_active and !plan.grouped) return error.CudaGraphCaptureUnsafeHostCopy;
+    try retainAssignedCaptureOperands(self, request, out_ct);
     var mask_device = buffer_mod.DeviceBuffer{};
     if (mask) |values| if (!allOnesI64(values)) {
         const mask_bytes = try checkedMul(keys, @sizeOf(i64));
@@ -40032,10 +39991,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         }
     }
     if (descriptor.operation == .gather and host_gather == null) try validateAssignedGatherIndices(self, tensorFromCt(request.inputs[1]), descriptor.operation.gather.geometry.extent, request.host_workspace);
-    for (request.inputs) |input| try retainPhysicalCaptureTensor(self, input);
-    try retainPhysicalCaptureTensor(self, output_ct);
-    if (request.workspace) |workspace| try retainPhysicalCaptureTensor(self, workspace);
-    for (request.auxiliaries) |auxiliary| try retainPhysicalCaptureTensor(self, auxiliary.tensor);
+    try retainAssignedCaptureOperands(self, request, output_ct);
     const a = tensorFromCt(request.inputs[0]);
     switch (descriptor.operation) {
         .paged_attention, .dense_attention_prefix, .dense_attention_rows => return false,
@@ -40551,6 +40507,13 @@ test "CUDA physical capture scopes reject nesting and retain operand addresses" 
     compute.allocator = a;
     defer compute.capturing_physical_storage.deinit(a);
     const leases = [_]?*ops.physical_storage.Lease{lease};
+    var wrong_provider = lease.*;
+    wrong_provider.backend.ptr = &compute;
+    var replay = PhysicalReplay{ .compute = &compute };
+    // A reused context pointer does not identify the numerical provider.
+    // Reject before sampling a CUDA context or retaining any storage.
+    try std.testing.expect(!try PhysicalReplay.begin(&replay, &.{&wrong_provider}));
+    try std.testing.expectEqual(@as(usize, 0), compute.capturing_physical_storage.values.items.len);
     try physicalExecutionScopeOp(&compute, &leases);
     try std.testing.expectError(error.PhysicalExecutionScopeActive, physicalExecutionScopeOp(&compute, &leases));
     try physicalExecutionScopeOp(&compute, null);
@@ -44639,7 +44602,7 @@ test "LightOnOCR3 CUDA wide graph head has independent admission and never enter
     const head_pointer = owner.head.ptr;
     const cached = compute.temp_buffers.buffers.items.len;
     for ([_]usize{ 0, 0x1000 }) |base| {
-        var scope = @import("execution_arena.zig").Scope{
+        var scope = @import("../../execution/stream_workspace.zig").Scope{
             .plan = owner.plan.?,
             .base = base,
             .output_ptr = owner.head.ptr,
@@ -51896,7 +51859,30 @@ const owned_payload_services = @import("../kernel_backend.zig").OwnedPayloadServ
     .available = ownedPayloadAvailable,
     .input = ownedPayloadInput,
     .route = ownedPayloadRoute,
+    .region = ownedPayloadRegion,
 };
+fn ownedPayloadRegion(ctx: *anyopaque, owned: *const @import("../../execution/region_route.zig").Owned) bool {
+    if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table)) return false;
+    const compute: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const need = owned.requirements;
+    if (need.dispatch_workspace.host_byte_size != 0 or need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0) return false;
+    if (owned.vtable == &AssignedHeadNormRope.table) {
+        const program: *const AssignedHeadNormRope = @ptrCast(@alignCast(owned.context));
+        return program.compute == compute and program.policy_key == owned.policy_key and need.dispatch_workspace.byte_size == 0 and
+            owned.covered_nodes.ptr == &program.program.covered and owned.covered_nodes.len == program.program.covered.len and
+            owned.input_nodes.ptr == &program.inputs and owned.input_nodes.len == program.inputs.len and
+            need.outputs.ptr == &program.outputs and need.outputs.len == program.outputs.len;
+    }
+    if (owned.vtable != &AssignedProjectionGroup.table and owned.vtable != &AssignedProjectionGroup.q4_table) return false;
+    const program: *const AssignedProjectionGroup = @ptrCast(@alignCast(owned.context));
+    return program.compute == compute and program.policy_key == owned.policy_key and
+        need.dispatch_workspace.byte_size == program.workspace_bytes and
+        need.dispatch_workspace.alignment == buffer_mod.DeviceBuffer.allocation_alignment and
+        owned.covered_nodes.ptr == &program.head.covered and owned.covered_nodes.len == program.head.covered_count and
+        owned.input_nodes.ptr == &program.inputs and owned.input_nodes.len == program.weightCount() + 1 and
+        need.outputs.ptr == &program.outputs and need.outputs.len == program.output_count;
+}
+
 fn ownedPayloadAvailable(ctx: *anyopaque) bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     // Init-once owner link, not a mutable capture/mirror/route snapshot.
@@ -59585,11 +59571,11 @@ test "source linear bank metadata reuses only its audio owner or exact captured 
     }
     // The real graph-plan allocator owns one complete bank interval; source
     // slices never become independent free events or claimed output slots.
-    var plan: @import("execution_arena.zig").Plan = .{};
+    var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
     plan.allocate(layout.bytes, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("execution_arena.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = layout.bytes };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = layout.bytes };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
     var captured = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
@@ -59817,11 +59803,11 @@ test "source local relative temporary follows the actual learned and captured ba
         try std.testing.expect(q.ptr + q.len <= ws.ptr);
     }
     try std.testing.expect(!compute.source_linear_scratch.in_use);
-    var plan: @import("execution_arena.zig").Plan = .{};
+    var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
     plan.allocate(layout.bytes, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("execution_arena.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = layout.bytes };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = layout.bytes };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
     var temporary = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
@@ -59883,11 +59869,11 @@ test "source local relative actual external capture rejects before module or out
     try std.testing.expectEqual(@as(usize, 4), Fake.queries);
     // Actual capture with a funded arena keeps the exact bank lease and does
     // not consume the independently assigned output or allocate another bank.
-    var plan: @import("execution_arena.zig").Plan = .{};
+    var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
     plan.allocate(256, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("execution_arena.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = 256 };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = 256 };
     compute.execution_scope = &scope;
     compute.source_linear_scratch = .{};
     compute.embedding_gemma2 = null;
@@ -60004,8 +59990,10 @@ test "source bias workspace policy isolates audio warm and arena plan identities
     // The old plan would overflow funding if inspected under the new policy.
     try std.testing.expect((try compute.audioCacheRequest(42, &inputs)) == null);
     var plan: @import("audio_execution_plan.zig").Plan = .{};
-    const old_arena = try compute.audioArenaRequestFromPlan(original, &plan);
-    const new_arena = try compute.audioArenaRequestFromPlan(candidate, &plan);
+    plan.allocate(1024, 0x1000);
+    try std.testing.expect(plan.finish(0x1000));
+    const old_arena = compute.audioArenaRequestFromPlan(original, &plan, try plan.layout(original.input_bytes));
+    const new_arena = compute.audioArenaRequestFromPlan(candidate, &plan, try plan.layout(candidate.input_bytes));
     try std.testing.expect(old_arena.arena.grid_x != new_arena.arena.grid_x);
 }
 
@@ -60885,10 +60873,12 @@ test "CUDA borrowed quantized metadata preserves logical shape without physical 
 fn qualifyCapturedProjectionPair(comptime gated: bool, comptime q8: bool, comptime independent: bool, comptime vendor: bool, comptime bf16_gated: bool, comptime down: bool) !void {
     if (comptime !cuda_enabled) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const compute = try a.create(CudaCompute);
-    defer a.destroy(compute);
-    compute.* = try CudaCompute.testing.init(a);
-    defer compute.deinit();
+    const shared = @import("../../backends/compute_context.zig").SharedBackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer shared.release();
+    const compute = shared.ctx.cuda;
     // Generic BF16 regions must work without any model-specific native plan.
     if (!bf16_gated) compute.gemma4_native_plan = .{ .projection = .packed_q4, .geometry = .{ .donor_layers = 24 } };
     compute.tuned_route_gates.q4_0_cublas_prefill = vendor;
@@ -61007,8 +60997,15 @@ fn qualifyCapturedProjectionPair(comptime gated: bool, comptime q8: bool, compti
             var selected_groups = false;
             if (pool.variant_cache) |variants| for (variants.entries.items) |variant| {
                 if (variant.pool.regions.len != 8) continue;
+                if (vendor and !independent) {
+                    try std.testing.expect(variant.pool.completeOwnedPayload() != null);
+                }
                 var complete = true;
                 for (variant.pool.regions) |installed| {
+                    try std.testing.expect(ownedPayloadRegion(compute, installed.owner));
+                    var changed = installed.owner.*;
+                    changed.requirements.dispatch_workspace.byte_size +|= 4;
+                    try std.testing.expect(!ownedPayloadRegion(compute, &changed));
                     complete = complete and installed.owner.requirements.outputs.len == (if (bf16_gated) @as(usize, 1) else if (independent) 3 else 2);
                     if (bf16_gated) {
                         const program: *const AssignedProjectionGroup = @ptrCast(@alignCast(installed.owner.context));
@@ -62402,6 +62399,11 @@ test "Gemma4 CUDA learned scratch backing survives requests without retaining th
     try compute.ctx.synchronize();
     const allocations = compute.stats.device_alloc_calls;
     const frees = compute.stats.device_free_calls;
+    const observed = observePeriodicWorkspace(&compute).?;
+    try std.testing.expectEqual(.fixed, observed.state);
+    try std.testing.expectEqual(@as(usize, 2), observed.slots);
+    try std.testing.expectEqual(@as(usize, 192), observed.live_backing_bytes);
+    try std.testing.expect(observed.planned_bytes == null);
     try resetTempPinnedSlotsForRequest(&compute);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items[0].requested_len);
@@ -62424,6 +62426,7 @@ test "Gemma4 CUDA learned scratch backing survives requests without retaining th
     compute.runtime_policy.temp_cache_mb = 0;
     try resetTempPinnedSlotsForRequest(&compute);
     for (compute.temp_pinned_slots.items) |slot| try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), slot.buffer.ptr);
+    try std.testing.expectEqual(@as(usize, 0), observePeriodicWorkspace(&compute).?.live_backing_bytes);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
     try synchronizeAndDrainDeferredDeviceFrees(&compute);
     try std.testing.expect(compute.stats.device_free_calls >= frees + 2);

@@ -34444,14 +34444,6 @@ fn packedExpertRowBlockBase(
 
 const decodeFp16Le = quant_codec.decodeFp16Le;
 
-fn decodeF32Le(b0: u8, b1: u8, b2: u8, b3: u8) f32 {
-    const bits: u32 = @as(u32, b0) |
-        (@as(u32, b1) << 8) |
-        (@as(u32, b2) << 16) |
-        (@as(u32, b3) << 24);
-    return @bitCast(bits);
-}
-
 fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     var owned_output = try OwnedDenseOutput.copy(self, getData(input));
@@ -40677,6 +40669,19 @@ fn tensorDTypeOp(ctx: *anyopaque, tensor: CT) anyerror!tensor_mod.DType {
     if (buf.declared_dtype) |dtype| return dtype;
     if (buf.data.len > 0) return .f32;
     if (buf.quantized_storage != null) return .f32;
+    // Native can publish a dense F32 tensor whose logical extent is empty.
+    // Zero backing bytes do not erase its dtype or turn a lazy weight into
+    // a materialized activation.
+    if (buf.lazy_entry == null and !buf.cached_weight and weightOrigin(buf) == null) {
+        if (buf.logical_shape) |shape| {
+            var empty = false;
+            for (shape) |dimension| {
+                if (dimension < 0) return error.UnsupportedTensorType;
+                empty = empty or dimension == 0;
+            }
+            if (empty) return .f32;
+        }
+    }
     return error.UnsupportedTensorType;
 }
 
@@ -57732,7 +57737,7 @@ test "Native transpose broadcast and full slice retain lazy alias schedules" {
 /// Physical banks guarantee the alignment of every qualified logical view.
 /// DenseStorage records the original allocation contract for its final free;
 /// ordinary/adopted F32 buffers continue to use their original alignment.
-const physical_storage_policy: ops.physical_storage.Policy = .{ .allocate = allocatePhysicalRequest };
+const physical_storage_policy: ops.physical_storage.Policy = .{ .minimum_alignment = 8, .allocate = allocatePhysicalRequest };
 fn allocatePhysicalRequest(ctx: *anyopaque, request: ops.physical_storage.Request) anyerror!?CT {
     // Existing Native/CUDA input banks have the same storage representation.
     return allocateNativePhysicalStorageOp(ctx, request.byte_size);

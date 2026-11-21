@@ -26,6 +26,7 @@ pub const OwnedPayloadServices = struct {
     available: *const fn (*anyopaque) bool,
     input: *const fn (*anyopaque, @import("../execution/kernel_route.zig").Binding, @import("ml").graph.Shape) anyerror!bool,
     route: *const fn (*anyopaque, *const @import("../execution/kernel_route.zig").Owned) bool,
+    region: ?*const fn (*anyopaque, *const @import("../execution/region_route.zig").Owned) bool = null,
 };
 /// Target-owned preparation of the original unfused F32 dense decoder.
 /// All queries are metadata-only. Projection application writes only the

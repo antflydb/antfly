@@ -102,6 +102,7 @@ pub const PhysicalAllocation = struct {
     first_use: u32,
     last_use: u32,
     reusable: bool,
+    alignment: u32 = 1,
     slot_count: u32 = 0,
 };
 
@@ -191,7 +192,7 @@ pub const BufferPlan = struct {
     /// command submission. Its lifetime spans the executable's entire graph.
     pub fn addWorkspace(self: *BufferPlan, backend: BackendKind, bytes: usize, alignment: u32) !AllocationId {
         if (bytes == 0 or bytes % @sizeOf(f32) != 0) return error.InvalidWorkspaceSize;
-        if (alignment == 0 or !std.math.isPowerOfTwo(alignment) or alignment > @alignOf(f32)) return error.UnsupportedPhysicalWorkspaceAlignment;
+        if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.UnsupportedPhysicalWorkspaceAlignment;
         if (self.allocations.len >= invalid_allocation) return error.TooManyPhysicalAllocations;
         const storage: TensorStorageClass = switch (backend) {
             .native => .host_f32,
@@ -201,14 +202,15 @@ pub const BufferPlan = struct {
         };
         const id: AllocationId = @intCast(self.allocations.len);
         self.allocations = try self.allocator.realloc(self.allocations, self.allocations.len + 1);
-        self.allocations[id] = .{ .id = id, .kind = .workspace, .backend = backend, .storage = storage, .byte_size = bytes, .first_use = 0, .last_use = @intCast(self.node_slots.len), .reusable = true };
+        self.allocations[id] = .{ .id = id, .kind = .workspace, .backend = backend, .storage = storage, .byte_size = bytes, .alignment = alignment, .first_use = 0, .last_use = @intCast(self.node_slots.len), .reusable = true };
         return id;
     }
 
     /// Explicit byte-addressed host control workspace, even in a device-only
     /// partition. It shares the plan's allocation identity and frame lifetime.
     pub fn addHostWorkspace(self: *BufferPlan, bytes: usize) !AllocationId {
-        const id = try self.addWorkspace(.native, bytes, 1);
+        const rounded = try std.math.add(usize, bytes, @sizeOf(f32) - 1);
+        const id = try self.addWorkspace(.native, std.mem.alignBackward(usize, rounded, @sizeOf(f32)), 1);
         self.allocations[id].storage = .host_dense;
         return id;
     }

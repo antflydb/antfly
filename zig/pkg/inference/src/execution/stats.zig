@@ -35,7 +35,16 @@ pub const PhysicalReplayDecision = enum {
     busy_frame,
 };
 
+/// Assigned region callbacks observed in one successfully published Frame.
+/// A callback may encode a CUDA recording. Graph launches count separately.
+pub const AssignedRegions = struct {
+    selected: usize,
+    accepted_callbacks: u64,
+    covered_callback_nodes: u64,
+};
+
 pub const ExecutionStats = struct {
+    assigned_regions: ?AssignedRegions = null,
     /// Last successfully finished Frame's cold admission coverage metadata.
     /// Compatibility reasons do not mean the numerical path fell back.
     prepared_payload_coverage: ?@import("owned_coverage.zig").Coverage = null,

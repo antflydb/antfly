@@ -131,7 +131,7 @@ fn resources(pool: *const physical.Pool, kernel: physical.KernelPlan, owned: rou
     const device = @max(needed.workspace.byte_size, needed.probe_workspace.byte_size);
     const host = @max(needed.workspace.host_byte_size, needed.probe_workspace.host_byte_size);
     if (kernel.workspace_bytes != device or kernel.host_workspace_bytes != host) return false;
-    if (device != 0 and (kernel.backend_index >= pool.workspace_allocations.len or !allocation(pool, pool.workspace_allocations[kernel.backend_index], device, .workspace, false))) return false;
+    if (device != 0 and pool.workspaceBank(kernel.backend_index, device, @max(needed.workspace.alignment, needed.probe_workspace.alignment)) == null) return false;
     if (host != 0 and (!allocation(pool, pool.host_workspace_allocation, host, .workspace, true) or pool.host_alignment.toByteUnits() < @max(needed.host_alignment, needed.probe_host_alignment))) return false;
     var count: usize = 0;
     for (kernel.auxiliaries) |maybe| if (maybe) |aux| {
@@ -143,6 +143,48 @@ fn resources(pool: *const physical.Pool, kernel: physical.KernelPlan, owned: rou
     };
     return count == needed.auxiliaries.count;
 }
+fn completeRegion(pool: *const physical.Pool, installed: *const @import("region_binding.zig").Installed, backend: ops.ComputeBackend, epoch: u64, graph: *const ml.graph.Graph, reachable: []const bool) bool {
+    const owner = installed.owner;
+    const need = owner.requirements;
+    if (installed.epoch != epoch or installed.key != owner.key or installed.backend_index >= pool.backends.len or
+        !need.replacementEligible() or need.payload_claim_required or need.literals.len != 0 or
+        owner.covered_nodes.len == 0 or installed.outputs.len != need.outputs.len) return false;
+    const synchronous_projection = backend.kind() == .metal and pool.metal_projection_region_candidate and
+        pool.region_execution_profile == .synchronous;
+    if (need.requires_execution_profile != synchronous_projection) return false;
+    const target = pool.backends[installed.backend_index];
+    if (target.ptr != backend.ptr or target.vtable != backend.vtable or owner.implementation.context != backend.ptr or owner.implementation.table != @as(*const anyopaque, @ptrCast(backend.vtable))) return false;
+    if (pool.regionForNode(owner.entry_node) != installed) return false;
+    for (owner.covered_nodes) |node| {
+        if (node >= reachable.len or !reachable[node] or pool.regionForNode(node) != installed) return false;
+        switch (graph.node(node).op) {
+            .parameter, .constant => return false,
+            else => {},
+        }
+    }
+    for (owner.input_nodes) |node| {
+        if (node >= reachable.len or !reachable[node] or pool.regionForNode(node) == installed) return false;
+    }
+    for (installed.outputs, need.outputs) |output, declared| {
+        const slot = pool.plan.slotForNode(declared.node) orelse return false;
+        if (pool.regionForNode(declared.node) != installed or slot.kind != .allocation or slot.allocation != output.slot.allocation or
+            declared.alias_of != null or output.alias_index != null or output.slot.epoch != epoch or output.slot.node != declared.node or
+            !output.slot.logical.eq(declared.logical) or !slot.desc.shape.eq(declared.logical) or output.slot.writable_bytes != declared.bytes or
+            !allocation(pool, output.slot.allocation, declared.bytes, .tensor, false)) return false;
+        if (declared.alignment > (ops.physical_storage.minimumAlignment(target) catch return false)) return false;
+    }
+    const scratch = @max(need.dispatch_workspace.byte_size, need.preparation_workspace.byte_size);
+    if (scratch != installed.workspace_bytes) return false;
+    if (scratch != 0) {
+        const alignment = @max(need.dispatch_workspace.alignment, need.preparation_workspace.alignment);
+        if (pool.workspaceBank(installed.backend_index, scratch, alignment) != installed.workspace_allocation) return false;
+    }
+    const host = @max(need.dispatch_workspace.host_byte_size, need.preparation_workspace.host_byte_size);
+    if (host != installed.host_workspace_bytes) return false;
+    return host == 0 or (allocation(pool, pool.host_workspace_allocation, host, .workspace, true) and
+        pool.host_alignment.toByteUnits() >= @max(need.host_alignment, need.preparation_host_alignment));
+}
+
 pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: ?@import("backend_operation.zig").Borrowed) coverage.Coverage {
     const service = services(target) orelse return .{ .compatibility = .execution_path };
     const authority = metadata orelse return .{ .compatibility = .execution_path };
@@ -156,12 +198,22 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
         .metal => pool.metal_frame_dispatch,
         else => false,
     }) or reachable.len != graph.nodeCount() or pool.plan.node_slots.len != graph.nodeCount() or graph.outputs.items.len == 0) return .{ .compatibility = .execution_path };
-    if (pool.regions.len != 0) return .{ .compatibility = .backend_region };
+    if (pool.regions.len != 0) {
+        const attestsRegion = service.region orelse return .{ .compatibility = .backend_region };
+        for (pool.regions) |*installed| {
+            if (!attestsRegion(target.ptr, installed.owner) or !completeRegion(pool, installed, target, selected.epoch, graph, reachable)) return .{ .compatibility = .backend_region };
+        }
+    }
     if (pool.plan.transfers.len != 0) return .{ .compatibility = .transfer };
     for (pool.host_input_plans) |plan| if (plan.node >= reachable.len or !reachable[plan.node] or !ingress(pool, plan.node, plan.shape, target)) return .{ .compatibility = .input_representation };
     var result = coverage.Complete{ .epoch = selected.epoch, .accounting_class = .device };
     for (reachable, 0..) |active, id| {
         if (!active) continue;
+        if (pool.regionForNode(@intCast(id))) |installed| {
+            if (std.mem.indexOfScalar(ml.graph.NodeId, installed.owner.covered_nodes, @intCast(id)) == null) return .{ .compatibility = .backend_region };
+            if (installed.owner.entry_node == id) result.operations += installed.owner.covered_nodes.len;
+            continue;
+        }
         const slot = (pool.plan.slotForNode(@intCast(id)) orelse return .{ .compatibility = .operation }).*;
         const node = graph.node(@intCast(id));
         if (slot.node_id != id or slot.id >= pool.plan.slots.len or pool.plan.node_slots[id] != slot.id or slot.backend != target.kind() or !slot.desc.shape.eq(node.output_shape)) return .{ .compatibility = .backend_region };
@@ -170,7 +222,9 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
             .runtime_input => {
                 if (node.op != .parameter or slot.roles.graph_output) return .{ .compatibility = .input_representation };
                 if (selected.inputs.find(@intCast(id))) |binding| {
-                    if ((binding != .imported_host and binding != .imported_device) or !ingress(pool, @intCast(id), slot.desc.shape, target)) return .{ .compatibility = .input_representation };
+                    if (binding == .resident and target.kind() == .metal and pool.metal_projection_region_candidate and pool.region_execution_profile == .synchronous) {
+                        if (!(service.input(target.ptr, binding, slot.desc.shape) catch false)) return .{ .compatibility = .input_representation };
+                    } else if ((binding != .imported_host and binding != .imported_device) or !ingress(pool, @intCast(id), slot.desc.shape, target)) return .{ .compatibility = .input_representation };
                 } else {
                     const immutable = pool.immutable_bindings orelse return .{ .compatibility = .input_representation };
                     const binding = immutable.find(@intCast(id)) orelse return .{ .compatibility = .input_representation };
@@ -205,6 +259,11 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
     }
     for (graph.outputs.items) |id| {
         if (id >= reachable.len or !reachable[id]) return .{ .compatibility = .output_publication };
+        if (pool.regionForNode(id)) |installed| {
+            var published = false;
+            for (installed.outputs) |output| published = published or output.slot.node == id;
+            if (!published) return .{ .compatibility = .output_publication };
+        }
         const slot = pool.plan.slotForNode(id) orelse return .{ .compatibility = .output_publication };
         if (!slot.roles.graph_output) return .{ .compatibility = .output_publication };
     }

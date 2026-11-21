@@ -43,16 +43,7 @@ pub const KvCache = struct {
 
     pub fn replace(self: *KvCache, allocator: std.mem.Allocator, output_info: []const TensorInfo, outputs_opt: ?[]Tensor) !void {
         _ = output_info;
-        return self.replaceImpl(allocator, outputs_opt, false);
-    }
 
-    /// Merged seq2seq exports can emit empty cross-attention outputs after
-    /// prefill. Those outputs mean reuse the request's immutable encoder K/V.
-    pub fn replaceSeq2Seq(self: *KvCache, allocator: std.mem.Allocator, outputs: []Tensor) !void {
-        return self.replaceImpl(allocator, outputs, true);
-    }
-
-    fn replaceImpl(self: *KvCache, allocator: std.mem.Allocator, outputs_opt: ?[]Tensor, preserve_cross: bool) !void {
         const outputs = outputs_opt orelse {
             for (self.tensors) |*tensor| tensor.deinit();
             if (self.tensors.len > 0) allocator.free(self.tensors);
@@ -70,19 +61,9 @@ pub const KvCache = struct {
         var idx: usize = 0;
         for (outputs, 0..) |tensor, out_idx| {
             if (!std.mem.startsWith(u8, tensor.name, "present.")) continue;
-            var moved = tensor;
-            if (preserve_cross and tensor.data.len == 0 and std.mem.indexOf(u8, tensor.name, ".encoder.") != null) {
-                for (self.tensors) |*old| {
-                    if (!std.mem.eql(u8, old.name, tensor.name)) continue;
-                    moved = old.*;
-                    old.* = old.borrowedView(old.name);
-                    break;
-                }
-            }
-            tensors[idx] = moved;
+            tensors[idx] = tensor;
             idx += 1;
-            if (moved.data.ptr == tensor.data.ptr and moved.shape.ptr == tensor.shape.ptr)
-                outputs[out_idx] = tensor.borrowedView(tensor.name);
+            outputs[out_idx] = tensor.borrowedView(tensor.name);
         }
         self.pending_outputs = null;
         for (self.tensors) |*tensor| tensor.deinit();

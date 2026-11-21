@@ -52,19 +52,35 @@ pub fn beginCapture(ctx: *context_mod.CudaContext) Error!void {
     try ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
 }
 
-pub fn endCapture(ctx: *context_mod.CudaContext) Error!CapturedGraph {
-    var owner = CapturedGraph{
-        .graph = ctx.endStreamCapture() catch |err| {
-            // Caller error defers may retire captured addresses. An SDK error alone
-            // does not prove recording ended; refuse all unwind while still active
-            // or while the actual stream status cannot be established.
-            requireCaptureEnded(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-            return err;
-        },
+pub fn endRecording(ctx: *context_mod.CudaContext) Error!driver_mod.CUgraph {
+    return ctx.endStreamCapture() catch |err| {
+        // An SDK error alone grants no permission to retire captured addresses
+        // or to submit eager work on this stream.
+        requireCaptureEnded(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        return err;
     };
+}
+
+pub fn discardRecording(ctx: *context_mod.CudaContext) void {
+    var graph = endRecording(ctx) catch return;
+    ctx.destroyGraphChecked(&graph) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+}
+
+pub fn endCapture(ctx: *context_mod.CudaContext) Error!CapturedGraph {
+    var owner = CapturedGraph{ .graph = try endRecording(ctx) };
     errdefer owner.deinit(ctx);
     owner.exec = try ctx.instantiateGraph(owner.graph);
     return owner;
+}
+
+/// Stage arenas retain just the instantiated handle, alongside their stable
+/// banks. Destroy the recording successfully before that ownership transfers.
+pub fn endCaptureExec(ctx: *context_mod.CudaContext) Error!driver_mod.CUgraphExec {
+    var owner = try endCapture(ctx);
+    const exec = owner.exec;
+    owner.exec = null;
+    owner.deinit(ctx);
+    return exec;
 }
 
 pub fn requireCaptureEnded(ctx: *context_mod.CudaContext) !void {
@@ -123,4 +139,8 @@ test "CUDA allocation failed end capture requires actual inactive stream before 
     try std.testing.expectError(error.CudaDriverError, endCapture(&ctx));
     try std.testing.expectEqual(@as(usize, 1), Mock.ends);
     try std.testing.expectEqual(@as(usize, 2), Mock.queries);
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+    discardRecording(&ctx);
+    try std.testing.expectEqual(@as(usize, 2), Mock.ends);
+    try std.testing.expectEqual(@as(usize, 3), Mock.queries);
 }

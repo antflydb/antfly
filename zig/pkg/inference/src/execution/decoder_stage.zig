@@ -31,12 +31,24 @@ pub const Row = struct {
     stats: ?ops.WhisperLogitsStatsRaw = null,
     owned_logits: ?[]f32 = null,
     host_outputs: []backends.Tensor = &.{},
+    host_logits: ?backends.Tensor = null,
 
     pub fn deinit(self: *Row) void {
         if (self.owned_logits) |values| self.allocator.free(values);
+        if (self.host_logits) |*output| output.deinit();
         for (self.host_outputs) |*value| value.deinit();
         if (self.host_outputs.len != 0) self.allocator.free(self.host_outputs);
         self.* = undefined;
+    }
+
+    fn selectHostRow(self: *Row, output: backends.Tensor, full_prefix_rows: ?usize) !void {
+        if (output.dtype != .f32 or output.shape.len < 3 or output.shape[2] <= 0) return error.InvalidLogitsShape;
+        const logits = output.asFloat32();
+        const vocab = std.math.cast(usize, output.shape[2]) orelse return error.InvalidLogitsShape;
+        const end = if (full_prefix_rows) |rows| std.math.mul(usize, rows, vocab) catch return error.InvalidLogitsShape else logits.len;
+        if (end < vocab or end > logits.len) return error.InvalidLogitsShape;
+        self.vocab_size = vocab;
+        self.logits = logits[end - vocab .. end];
     }
 };
 
@@ -72,6 +84,7 @@ pub const Decoder = struct {
     native: ?Native.State,
     options: Options,
     incremental: ?merged.State,
+    full_prefix: ?stages.DecoderInputPlan,
     compiled: ?@import("resident_decoder.zig").Decoder = null,
 
     pub fn init(allocator: std.mem.Allocator, session: backends.Session, encoder: *const stages.EncoderOutputs, encoder_length: usize, encoder_mask: []const i64, vocab_size: usize, control: ?Control) !Decoder {
@@ -116,7 +129,11 @@ pub const Decoder = struct {
         errdefer if (native) |*value| value.deinit();
         var compiled = if (native == null and options.allow_native and host != null) try @import("resident_decoder.zig").Decoder.initEncoderDecoder(allocator, session, encoder_length, options.compiled_cache, control) else null;
         errdefer if (compiled) |*value| value.deinit();
-        const incremental = if (options.allow_merged and native == null and compiled == null and host != null) merged.State.init(allocator, session, host.?, encoder_mask, vocab_size) else null;
+        const incremental = if (options.allow_merged and native == null and compiled == null and host != null) try merged.State.init(allocator, session, host.?, encoder_mask, vocab_size) else null;
+        const full_prefix = if (native == null and compiled == null and incremental == null)
+            try stages.DecoderInputPlan.init(allocator, try session.inputInfoForStage(.decoder))
+        else
+            null;
         observeRoute(session, encoder, options, if (native != null) .native_incremental else if (compiled != null) .compiled_incremental else if (incremental != null) .merged_incremental else .full_prefix, null);
         return .{
             .allocator = allocator,
@@ -129,6 +146,7 @@ pub const Decoder = struct {
             .compiled = compiled,
             .options = options,
             .incremental = incremental,
+            .full_prefix = full_prefix,
         };
     }
 
@@ -141,6 +159,13 @@ pub const Decoder = struct {
             .encoder_storage = switch (encoder.*) {
                 .host => .host,
                 .resident => .resident,
+            },
+            .cache_custody = switch (selected) {
+                .failed => .unavailable,
+                .full_prefix => .none,
+                .merged_incremental => .host_tensor_dispatch,
+                .native_incremental => .native_runtime,
+                .compiled_incremental => .compiled_runtime,
             },
             .native_allowed = options.allow_native,
             .merged_allowed = options.allow_merged,
@@ -163,6 +188,7 @@ pub const Decoder = struct {
         if (self.native) |*value| value.deinit();
         if (self.compiled) |*value| value.deinit();
         if (self.incremental) |*value| value.deinit();
+        if (self.full_prefix) |*value| value.deinit();
         self.* = undefined;
     }
 
@@ -172,7 +198,9 @@ pub const Decoder = struct {
         var row = Row{ .allocator = self.allocator, .vocab_size = self.vocab_size };
         errdefer row.deinit();
         if (self.native) |*decoder| {
-            const pending = prefix[decoder.positions()..];
+            const processed = decoder.positions();
+            if (prefix.len <= processed) return error.InvalidDecoderPosition;
+            const pending = prefix[processed..];
             if (stats_request) |request| {
                 switch (try decoder.stepWith(pending, .{ .stats = request })) {
                     .stats => |stats| row.stats = stats,
@@ -194,36 +222,25 @@ pub const Decoder = struct {
             row.logits = row.owned_logits.?;
             return row;
         }
-        switch (self.encoder.*) {
+        if (self.incremental) |*state| {
+            row.host_logits = try state.step(prefix, dispatch, self.control);
+            try row.selectHostRow(row.host_logits.?, null);
+            return row;
+        }
+        var inputs: stages.DecoderInputs = undefined;
+        const plan = if (self.full_prefix) |*value| value else return error.InvalidDecoderInput;
+        const hidden = try stages.decoderHiddenInput(self.encoder, self.encoder_mask.len);
+        try plan.bind(&inputs, prefix, self.encoder_mask, hidden);
+        switch (hidden) {
             .resident => {
-                row.owned_logits = try stages.finalVocabularyRow(self.allocator, self.session, self.encoder, prefix, self.encoder_mask, self.vocab_size, self.control);
+                row.owned_logits = try stages.finalVocabularyRow(self.allocator, self.session, inputs.stageInputs(), prefix.len, self.vocab_size, self.control);
                 row.logits = row.owned_logits.?;
             },
-            .host => |outputs| {
-                if (self.incremental) |*state| {
-                    row.host_outputs = try state.stepOutputs(prefix, dispatch, self.control);
-                } else {
-                    var inputs: stages.DecoderInputs = undefined;
-                    try inputs.init(self.allocator, try self.session.inputInfoForStage(.decoder), prefix, self.encoder_mask, .{ .host = outputs[0] });
-                    defer inputs.deinit();
-                    const host_inputs = try inputs.hostInputs();
-                    row.host_outputs = try @import("tensor_dispatch.zig").run(self.allocator, self.session, null, null, host_inputs, self.control, dispatch);
-                }
+            .host => {
+                const host_inputs = try inputs.hostInputs();
+                row.host_outputs = try @import("tensor_dispatch.zig").run(self.allocator, self.session, null, null, host_inputs, self.control, dispatch);
                 if (row.host_outputs.len == 0) return error.NoDecoderOutput;
-                if (row.host_outputs[0].dtype != .f32) return error.InvalidLogitsShape;
-                const logits = row.host_outputs[0].asFloat32();
-                const vocab = if (row.host_outputs[0].shape.len >= 3)
-                    @as(usize, @intCast(row.host_outputs[0].shape[2]))
-                else
-                    return error.InvalidLogitsShape;
-                if (vocab == 0 or logits.len < vocab) return error.InvalidLogitsShape;
-                row.vocab_size = vocab;
-                const end = switch (self.options.output_rows) {
-                    .final_available => logits.len,
-                    .full_prefix => if (self.incremental != null) logits.len else std.math.mul(usize, prefix.len, vocab) catch return error.InvalidLogitsShape,
-                };
-                if (end < vocab or end > logits.len) return error.InvalidLogitsShape;
-                row.logits = logits[end - vocab .. end];
+                try row.selectHostRow(row.host_outputs[0], if (self.options.output_rows == .full_prefix) prefix.len else null);
             },
         }
         return row;
@@ -256,6 +273,7 @@ test "decoder route retains actual host output rows without copies and cancels b
     const route = diagnostics.snapshot().?.report.?.decoder_route.?;
     try std.testing.expectEqual(@import("diagnostics.zig").DecoderRoute.Selection.full_prefix, route.selected);
     try std.testing.expectEqual(backends.BackendType.native, route.backend);
+    try std.testing.expectEqual(.none, route.cache_custody);
     try std.testing.expect(diagnostics.snapshot().?.execution == null);
     const missing = stages.EncoderOutputs{ .host = &.{} };
     try std.testing.expectError(error.NoEncoderOutput, Decoder.init(a, session, &missing, 2, &.{ 1, 1 }, 4, null));

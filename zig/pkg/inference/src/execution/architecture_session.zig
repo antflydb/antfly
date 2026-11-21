@@ -12712,7 +12712,7 @@ test "foreign Metal public Whisper encoder final norm promotes before receiver a
     defer cleanup.finish();
     var permit = try encoder.admitInputs(&features, request_allocator, control);
     defer permit.deinit();
-    try stages.prepareEncoderPermit(encoder, destination, null, control, true, &permit);
+    try stages.prepareEncoderPermit(encoder, destination, null, control, .incremental, &permit);
     var encoded = try stages.encodeForIncrementalWithPermit(request_allocator, encoder, destination, &features, null, control, &permit);
     var encoded_open = true;
     defer if (encoded_open) encoded.deinit(request_allocator);
@@ -15434,7 +15434,7 @@ test "actual Native source geometry preserves declared packed rows and refuses u
     session.run_admission = .{ .controller = controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 341 * 1024 * 1024, .scratch_limit_bytes = 341 * 1024 * 1024 }, .static_workspace_bytes = 128 * 1024 * 1024, .check_live_memory = false };
     var workspace = Admitted{ .backing = a, .session = session };
     defer workspace.deinit();
-    const declared: source_mod.RunRequest = .{ .batch = 1, .sequence = 2, .input_bytes = 8192 * 2 * @sizeOf(i64), .output_bytes = 2 * 768 * @sizeOf(f32), .workspace_bytes = try @import("../pipelines/embedding_gemma2_admission.zig").textEncoderWorkspace(2) };
+    const declared: source_mod.RunRequest = .{ .batch = 1, .sequence = 2, .input_bytes = 8192 * 2 * @sizeOf(i64), .output_bytes = 2 * 768 * @sizeOf(f32), .workspace_bytes = try @import("embedding_gemma2_admission.zig").textEncoderWorkspace(2) };
     const full_info = [_]TensorInfo{
         .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, 8192 } },
         .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ 1, 8192 } },

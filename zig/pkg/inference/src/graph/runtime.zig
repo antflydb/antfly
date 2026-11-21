@@ -435,6 +435,7 @@ pub const Runtime = struct {
 
     fn addPhysicalStats(stats: *partition_mod.PartitionExecutor.ExecutionStats, physical: @import("../execution/physical_buffers.zig").Stats) void {
         stats.prepared_payload_coverage = physical.prepared_payload_coverage;
+        stats.assigned_regions = physical.assigned_regions;
         stats.planned_storage = physical.storage_usage;
         stats.physical_replay = physical.replay_decision;
         stats.assigned_kernel_dispatches += physical.dispatches;
@@ -467,7 +468,7 @@ pub const Runtime = struct {
             if (!capturing.*) return err;
             frame.?.abortReplayCapture(err);
             capturing.* = false;
-            if (frame.?.storage_admission_failed) return err;
+            if (frame.?.storage_admission_failed or err == error.Cancelled or err == error.Timeout) return err;
             break :recover try multi_executor.executeDeviceOutputs(allocator, graph, plan, mesh, options, stats);
         };
         if (!capturing.*) return result;
@@ -478,12 +479,14 @@ pub const Runtime = struct {
             active.abortReplayCapture(err);
             capturing.* = false;
             result.deinit(mesh);
+            if (err == error.Cancelled or err == error.Timeout) return err;
             return multi_executor.executeDeviceOutputs(allocator, graph, plan, mesh, options, stats);
         };
         capturing.* = false;
         errdefer result.deinit(mesh);
         // A submission error is an execution error and must propagate.
-        try active.replay.?.launch();
+        if (options.execution_control) |control| try control.check();
+        try active.launchCommittedReplay();
         return result;
     }
 
@@ -614,7 +617,7 @@ pub const Runtime = struct {
                 if (replay_inputs) |inputs| planned_options.runtime_inputs = inputs;
                 if (frame) |active| if (replay_inputs != null and active.replay_ready) {
                     output.stats = .{};
-                    output.outputs = try active.replayOutputs(allocator);
+                    output.outputs = try active.replayOutputs(allocator, options.execution_control);
                     output.owner_backend = durableBackend(self.default_backend.*);
                     errdefer output.deinitWithCleanup(self, physical_cleanup);
                     frame_finished = true;

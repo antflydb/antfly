@@ -336,6 +336,18 @@ implementation for their production stage interfaces. Direct encoder/decoder
 tasks qualify resident incremental receivers through `decoder_stage`; custom
 dispatchers retain their scheduling contract. Encoder placement decisions publish
 exact capability/ABI fallback reasons through the uniform diagnostic report.
+Full-prefix host and resident decoders share one input signature bound per
+request. Token and encoder-mask slices remain borrowed. An optional all-ones
+query mask grows in the request owner and is reused at later steps.
+
+`execution/qwen_embedding_workspace.zig` owns bounded Qwen embedding workspace
+geometry, declared admission, receiving banks, and retirement. The task supplies
+token rows, pooling intent, and its numerical lane. Source cohort admission and
+backend gates retain their order. A stale cold description can retry before
+numerical execution, and a submitted operation keeps its original failure.
+The EmbeddingGemma2 execution planner shares cohort limits across direct text
+and prepared media. The text packet sizing and physical encoder row geometry
+share one admission calculation for compact and padded schedules.
 
 `execution/audio_schedule.zig` owns the existing audio instruction tape and its
 arena layout. Alias lifetime propagation uses ML's same allocation-free liveness
@@ -349,17 +361,22 @@ projection remains first choice; an unfused fallback consumes the supplied span
 without allocating a clamp tensor. Optional scratch pressure preserves the old
 output bank. A staged, backed-off upgrade can later fund a separate scratch bank
 without invalidating queued output references or resetting replay selection.
-Partial upgrades retire only their own quota and views before retry.
+Both placements use the same checked view geometry and byte bounds. Partial
+upgrades retire only their own quota and views before retry.
 Merged seq2seq caches and full-prefix host decoders use the same execution-owned
 stage entry as encoders. That entry preserves an installed dispatcher's exact
 permit, gate and cancellation contract, propagates its failures without serial
 replay, and rejects a foreign prepaid model permit on the serial path. Host
 outputs leave through the same prepared Source custody and retirement boundary.
 
-Decoder construction publishes the actual native, compiled, merged-graph or
-full-prefix state route and requested policy through the uniform report. Failed
-construction publishes an owned error and no numerical counters or completion
-claim. These are request-construction observations, not a backend memory census.
+Decoder construction publishes the selected route, encoder storage, cache
+owner, and requested policy through the uniform report. The generic merged ONNX
+route uses the host-tensor dispatch ABI. Its typed control, self K/V, and cross K/V
+remain available to the batching callback. A verified optional merged artifact
+with an unsupported operator selects the ordinary decoder at load time. Receipt
+or checksum failure remains an error. Native and compiled resident caches
+report their actual runtime owner. Failed construction publishes the initiating
+error, with cache ownership and numerical counters unavailable.
 
 Metal reports the device's instantaneous worker-process allocation gauge alongside
 tracked project allocations. It includes vendor resources visible to the driver;
@@ -407,8 +424,16 @@ preparation API do not by themselves complete these remaining requirements:
   errors propagate. Captures retain address leases; published outputs and foreign
   captures prevent mutable frame reuse. Cancellation and unsupported signatures
   retain ordinary execution with explicit replay decisions in diagnostics.
-  Learned decoder/audio arenas remain compatibility owners where their complete
-  temporary recipes have not migrated; capture alone grants no ownership credit.
+  Bounded CUDA decoder and audio execution seal their stream workspace recipes
+  in `execution/stream_workspace.zig`. Admission and dispatch consume the same
+  size, alignment, event sequence and published span. The providers own learning,
+  shape-specific backing and retirement. Legacy arenas with incomplete recipes
+  retain their compatibility accounting. Physical replay, bounded decoder replay
+  and EmbeddingGemma2 capture share a checked recording end before reclaiming or
+  reusing addresses.
+  Qualified CUDA projection and head-normalization regions attest assigned
+  outputs and temporary banks through the physical coverage check. Synchronous
+  Metal regions skip legacy partition graph and output banks after selection.
 - `model_definition.zig` owns artifact loading. Native and PJRT sessions share
   one failure-atomic host preparation path for normalization, resident/lazy
   weights and prefetch ownership. CUDA reuses its admitted manifest snapshot
@@ -540,6 +565,12 @@ preparation API do not by themselves complete these remaining requirements:
   Metal and generation reuse it while explicitly preserving architectural versus
   compact stored-layer layouts and host-mirror choices. Remaining specialized
   task transitions and compatibility arenas retain their explicit owners.
+  Decoder storage installs the request-local replay bound before CUDA KV writes.
+  Prepared-media and text prefill share chunk policy, and decoder prefill
+  selects the prepared-media KV window before numerical submission.
+  Merged seq2seq ONNX decoders resolve input/cache bindings at construction.
+  After shape validation they commit the ordered outputs directly, keep the
+  previous cross KV for declared empty outputs, and publish the logits owner.
   Canonical KV owners prepare unpublished attachment, full prefill, generated-token page growth,
   shared-tail copies, window trimming, replay reservations and view metadata
   before committing either owner. The unchanged-ID path preserves the existing
@@ -653,7 +684,12 @@ preparation API do not by themselves complete these remaining requirements:
   refunds. Models sharing a backend and admission Domain share the same cache
   binding, counted once by held-model conservation snapshots. Mixed graphs,
   MPS/MPP selectors, raw receivers and direct decoder APIs retain compatibility
-  ownership. These regions receive no complete-payload quota credit.
+  ownership. Canonical single-partition pair and QKV heads use complete
+  payload accounting when the synchronous region owns every output and either
+  imports the activation into its assigned bank or verifies the exact resident
+  input. The packed multirow variant attests the live pack and uses its planned
+  split workspace. The retained weight pack keeps independent cache admission.
+  Mixed scopes and entries without an attested region keep conservative admission.
 - CUDA prepared projections describe eligible BF16-rounded output separately
   from F32 publication, activation conversion and vendor workspace. Cold
   preparation loads the original widening program; dispatch retains the
@@ -674,13 +710,20 @@ preparation API do not by themselves complete these remaining requirements:
   pending-phase observations: transfers and bytes, accepted dispatch/submission
   and wait units, specialization decisions, selected Native bodies and workers,
   known fallback producers, and registered host/device allocation owners. Batch
-  participants and pending outcomes survive model retirement. Registered owner
-  intervals can include concurrent activity; lifetime peaks are labelled as such.
+  participants and pending outcomes survive model retirement. Each pending
+  owner sums the instrumented transfer, submission and callback host wall time
+  through readback and cleanup. A ready Metal serial audio schedule reports its
+  actual eager/replay choice and latest planned, bound and charged bank sizes. Reports retain the initiating failure
+  and count the observed callbacks. Inter-phase work and GPU completion remain
+  outside the sums. Registered owner intervals can include concurrent activity,
+  and lifetime peaks are labelled as such.
   Successful frames and entered Native calls copy their prepared payload admission
   coverage into the report, including the existing compatibility reason. This
   describes prepared accounting rather than a numerical fallback or quota grant.
-  Instrumented Metal region-policy counters remain absent until their actual
-  planner runs.
+  Assigned regions report selected regions, accepted callbacks, and covered
+  nodes from the finished Frame across CUDA and Metal. A recorded callback
+  is separate from a graph launch. Instrumented Metal legacy region-policy
+  counters remain absent until their actual planner runs.
   Unobserved fallback reasons and opaque vendor/private allocation domains remain
   unavailable. These scoped observations do not claim a whole-backend census or
   an exclusive invocation memory peak.

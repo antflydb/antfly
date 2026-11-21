@@ -12934,6 +12934,17 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     const stats = session.executionDiagnostics().?.execution.?;
     try std.testing.expectEqual(@as(u64, 1), stats.runtime_region_plan_dispatches);
     try std.testing.expectEqual(if (count == 2) @as(u64, 2) else 6, stats.runtime_region_plan_covered_nodes);
+    const physical = stats.prepared_payload_coverage orelse return error.MissingPreparedPayloadCoverage;
+    switch (physical) {
+        .complete => |owned| {
+            try std.testing.expectEqual(.device, owned.accounting_class);
+            try std.testing.expectEqual(stats.runtime_region_plan_covered_nodes, @as(u64, @intCast(owned.operations)));
+        },
+        .compatibility => |reason| {
+            std.debug.print("Metal packed projection coverage declined: {s}\n", .{@tagName(reason)});
+            return error.MissingOwnedPayloadWitness;
+        },
+    }
     try std.testing.expect(compute.packed_projection_entries != null);
     try std.testing.expect(!metal.hasActiveFrame(compute.provider_impl.raw_decode_runtime) and !metal.hasSubmittedFrame(compute.provider_impl.raw_decode_runtime));
     const after = controller.snapshot();
@@ -13443,7 +13454,7 @@ test "model selection composite ignores unlisted merged decoders and preserves l
     var signature_arena = std.heap.ArenaAllocator.init(a);
     defer signature_arena.deinit();
     const signature = try backends.imported_onnx_session.inspectSignature(signature_arena.allocator(), raw);
-    try std.testing.expect(@import("../pipelines/seq2seq_decode.zig").qualifiedSignature(signature.inputs, signature.outputs));
+    try std.testing.expect(@import("../execution/seq2seq_runtime.zig").qualifiedSignature(signature.inputs, signature.outputs));
     const paths = try encoder_decoder.findEncoderDecoderPaths(a, root);
     defer a.free(paths.encoder);
     defer a.free(paths.decoder);
@@ -13477,6 +13488,29 @@ test "model selection composite ignores unlisted merged decoders and preserves l
     corrupt[0] ^= 1;
     try @import("../registry/download.zig").writeFileAtomically(a, io, raw, corrupt);
     try std.testing.expectError(error.ChecksumMismatch, manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, included.bind(InferenceExecutionControl{ .io = io, .request_owned = false, .native_call_policy = .in_process })));
+
+    // An authentic publication can have the right merged signature and an
+    // unsupported body. It must still select the admitted ordinary decoder.
+    @memcpy(corrupt, merged_bytes);
+    const cast = std.mem.indexOf(u8, corrupt, "Cast") orelse return error.InvalidMergedDecoderFixture;
+    @memcpy(corrupt[cast..][0..4], "Xxyz");
+    try @import("../registry/download.zig").writeFileAtomically(a, io, raw, corrupt);
+    const old_digest = std.fmt.bytesToHex(merged_digest, .lower);
+    std.crypto.hash.sha2.Sha256.hash(corrupt, &merged_digest, .{});
+    const new_digest = std.fmt.bytesToHex(merged_digest, .lower);
+    const updated = try a.dupe(u8, expanded);
+    defer a.free(updated);
+    const digest_start = std.mem.indexOf(u8, updated, &old_digest) orelse return error.InvalidMergedDecoderFixture;
+    @memcpy(updated[digest_start..][0..new_digest.len], &new_digest);
+    const receipt_path = try std.fs.path.join(a, &.{ root, managed_receipt.complete_filename });
+    defer a.free(receipt_path);
+    try @import("../registry/download.zig").writeFileAtomically(a, io, receipt_path, updated);
+    const unsupported = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    var compatibility = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, unsupported.bind(InferenceExecutionControl{ .io = io, .request_owned = false, .native_call_policy = .in_process }));
+    defer compatibility.release();
+    try std.testing.expect(compatibility.get().considered_merged_decoder);
+    try std.testing.expectEqual(.full_prefix, compatibility.get().decoder_execution);
+    try manager.validateCompositeAssetsCurrent(&compatibility, root, &.{ paths.encoder, paths.decoder });
 }
 
 test "host admission reclaims idle VAD residency but preserves active owners" {

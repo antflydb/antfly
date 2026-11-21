@@ -1587,13 +1587,18 @@ pub const MetalPartitionExecutor = struct {
         return &self.pe;
     }
 
+    pub fn ownsPartition(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend) bool {
+        if (actual.vtable != &vtable or backend.kind() != .metal or !ownedFramePolicyAvailable()) return false;
+        const self: *const MetalPartitionExecutor = @ptrCast(@alignCast(actual.ptr));
+        return self.owned and self.graph == graph and self.backend.ptr == backend.ptr and self.backend.vtable == backend.vtable;
+    }
+
     /// Cold canonical-executor proof. The caller owns the actual provider's
     /// metadata operation before touching the cached region plan. This reuses
     /// the plan and reachability authority already used by real execution.
     pub fn attestOwnedFrameDispatch(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32) !bool {
-        if (actual.vtable != &vtable or backend.kind() != .metal or !ownedFramePolicyAvailable()) return false;
+        if (!ownsPartition(actual, graph, backend) or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return false;
         const self: *MetalPartitionExecutor = @ptrCast(@alignCast(actual.ptr));
-        if (!self.owned or self.graph != graph or self.backend.ptr != backend.ptr or self.backend.vtable != backend.vtable or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return false;
         for (nodes) |id| {
             if (id >= reachable.len) return false;
             if (!reachable[id]) continue;
@@ -1836,12 +1841,21 @@ pub const MetalPartitionExecutor = struct {
             );
         }
 
+        const options = exec_ctx.options orelse interpreter.ExecuteOptions{
+            .attention = if (exec_ctx.attention) |attention| attention.* else null,
+            .embedding_ids = exec_ctx.embedding_ids,
+        };
+
+        // A synchronous physical region owns its output and workspace banks.
+        // Avoid the legacy partition's reservations and metadata caches before
+        // entering that region. Its full coverage and profile are checked below.
+        const synchronous_regions = usesSynchronousPhysicalRegions(options);
         const chunk_ops = frameChunkOpsForExecution(exec_ctx.options);
         const planned_primitives = if (exec_ctx.options) |opts| opts.planned_device_execution else false;
-        const owned_frame = if (exec_ctx.options) |options| if (options.physical_frame) |frame| frame.pool.completeOwnedPayload() != null and frame.pool.metal_frame_dispatch else false else false;
+        const owned_frame = if (options.physical_frame) |frame| frame.pool.completeOwnedPayload() != null and frame.pool.metal_frame_dispatch else false;
         if (owned_frame and !ownedFramePolicyAvailable()) return error.PreparedMetalFramePolicyChanged;
         const graph_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        if (!owned_frame and (reservePartitionGraphPlanForExecution(chunk_ops) or
+        if (!owned_frame and !synchronous_regions and (reservePartitionGraphPlanForExecution(chunk_ops) or
             (planned_primitives and !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_GRAPH_PLAN", false))))
         {
             var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
@@ -1862,15 +1876,15 @@ pub const MetalPartitionExecutor = struct {
 
         // Phase-0 slot-bound output pool (persistent executor only). Binds
         // node outputs to fixed device buffers reused across steps.
-        const slot_bound_outputs = self.owned and cb.kind() == .metal and slotBoundOutputsEnabled();
+        const slot_bound_outputs = !synchronous_regions and self.owned and cb.kind() == .metal and slotBoundOutputsEnabled();
         if (slot_bound_outputs) self.ensureOutputPool(cb, buffer_plan) catch {};
-        const eager_arena_outputs = self.owned and cb.kind() == .metal and metalEagerArenaEnabled();
+        const eager_arena_outputs = !synchronous_regions and self.owned and cb.kind() == .metal and metalEagerArenaEnabled();
         var eager_arena = MetalEagerArena{};
         defer eager_arena.deinit(allocator, cb);
         if (eager_arena_outputs) {
             eager_arena.init(allocator, buffer_plan.allocations.len) catch {};
         }
-        const chunk_local_outputs = self.owned and cb.kind() == .metal and chunk_ops > 0 and metalChunkLocalOutputsEnabled();
+        const chunk_local_outputs = !synchronous_regions and self.owned and cb.kind() == .metal and chunk_ops > 0 and metalChunkLocalOutputsEnabled();
         var chunk_local_pool = ChunkLocalOutputPool{};
         defer chunk_local_pool.deinit(allocator, cb);
         if (chunk_local_outputs) {
@@ -1878,7 +1892,7 @@ pub const MetalPartitionExecutor = struct {
         }
         var resident_input_cache = ResidentInputCache{};
         defer resident_input_cache.deinit(allocator, cb);
-        const resident_input_cache_enabled = self.owned and cb.kind() == .metal and (gatherPromoteInputEnabled() or reducePromoteInputEnabled());
+        const resident_input_cache_enabled = !synchronous_regions and self.owned and cb.kind() == .metal and (gatherPromoteInputEnabled() or reducePromoteInputEnabled());
         if (resident_input_cache_enabled) {
             try resident_input_cache.init(allocator, graph, node_ids);
         }
@@ -1886,11 +1900,6 @@ pub const MetalPartitionExecutor = struct {
             &resident_input_cache
         else
             null;
-
-        const options = exec_ctx.options orelse interpreter.ExecuteOptions{
-            .attention = if (exec_ctx.attention) |attention| attention.* else null,
-            .embedding_ids = exec_ctx.embedding_ids,
-        };
 
         var local_owned_runtime_transfers = std.AutoHashMapUnmanaged(NodeId, void).empty;
         defer local_owned_runtime_transfers.deinit(allocator);
@@ -1943,7 +1952,10 @@ pub const MetalPartitionExecutor = struct {
         // A complete explicitly synchronous projection partition owns all
         // numerical nodes. Validate the actual operation Claim and full cover
         // BEFORE changing the ordinary frame/fusion path or writing any output.
-        if (try executeSynchronousPhysicalRegions(allocator, graph, cb, node_ids, reachable, values, value_device, device_id, options, exec_ctx.stats)) return;
+        if (synchronous_regions) {
+            try executeSynchronousPhysicalRegions(graph, cb, node_ids, reachable, values, value_device, device_id, options, exec_ctx.stats);
+            return;
+        }
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_constants_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_begin partition={d}\n", .{partition_index});
@@ -22862,11 +22874,16 @@ pub fn ownedFramePolicyAvailable() bool {
     return !metalPartitionFrameDisabled() and !metalPartitionRuntimeCommandsDisabled() and !runtimeRegionPlanDisabled();
 }
 
-fn executeSynchronousPhysicalRegions(allocator: std.mem.Allocator, graph: *const Graph, cb: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, values: []?CT, devices: []DeviceId, device_id: DeviceId, options: interpreter.ExecuteOptions, stats: ?*PartitionExecutor.ExecutionStats) !bool {
+fn usesSynchronousPhysicalRegions(options: interpreter.ExecuteOptions) bool {
     const profile = options.region_execution_profile orelse return false;
     if (profile.profile != .synchronous) return false;
     const frame = options.physical_frame orelse return false;
-    if (frame.pool.regions.len == 0) return false;
+    return frame.pool.regions.len != 0;
+}
+
+fn executeSynchronousPhysicalRegions(graph: *const Graph, cb: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, values: []?CT, devices: []DeviceId, device_id: DeviceId, options: interpreter.ExecuteOptions, stats: ?*PartitionExecutor.ExecutionStats) !void {
+    const profile = options.region_execution_profile.?;
+    const frame = options.physical_frame.?;
     if (frame.pool.region_execution_profile != .synchronous or !profile.held or profile.phase != .active) return error.RegionExecutionProfileChanged;
     try profile.validate(.{ .operation = .graph_execution, .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .program = graph });
     // A missing member can never fall back after the region recolored output
@@ -22893,8 +22910,6 @@ fn executeSynchronousPhysicalRegions(allocator: std.mem.Allocator, graph: *const
             actual.runtime_region_plan_elided_nodes += installed.owner.covered_nodes.len - 1;
         }
     }
-    _ = allocator;
-    return true;
 }
 
 test "shared grouped projection matcher preserves rank one legacy activation and unreachable slice selection" {

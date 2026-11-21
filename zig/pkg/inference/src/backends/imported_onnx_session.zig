@@ -857,7 +857,7 @@ fn validatePreparedShapes(target: *const ImportedOnnxSession, shapes: session_mo
         if ((target.shape_key != null and !std.mem.eql(u8, expected.name, actual.name)) or
             (expected.dtype != actual.dtype and !reduced_host) or expected.shape.len != actual.shape.len) return error.PreparedInvocationShapeMismatch;
         for (expected.shape, actual.shape) |declared, concrete| {
-            if (concrete < 0 or (target.shape_key != null and concrete == 0) or (declared > 0 and declared != concrete)) return error.PreparedInvocationShapeMismatch;
+            if (!validConcreteExtent(declared, concrete)) return error.PreparedInvocationShapeMismatch;
         }
     }
     if (target.shape_key) |key| if (!shapeKeyMatches(key, shapes)) return error.PreparedInvocationShapeMismatch;
@@ -878,7 +878,7 @@ fn validatePreparedInputs(target: *ImportedOnnxSession, inputs: prepared_mod.Inp
                 defer allocator.free(shape);
                 if (shape.len != expected.shape.len) return error.PreparedInvocationShapeMismatch;
                 for (expected.shape, shape) |declared, concrete| {
-                    if (concrete < 0 or (target.shape_key != null and concrete == 0) or (declared > 0 and declared != concrete)) return error.PreparedInvocationShapeMismatch;
+                    if (!validConcreteExtent(declared, concrete)) return error.PreparedInvocationShapeMismatch;
                 }
                 if (target.shape_key) |key| {
                     if (cursor >= key.len or key[cursor] != @as(i64, @intCast(shape.len))) return error.PreparedInvocationShapeMismatch;
@@ -1196,6 +1196,12 @@ fn shapeKeyMatches(key: []const i64, inputs: session_mod.ShapeInputs) bool {
     return cursor == key.len;
 }
 
+fn validConcreteExtent(declared: i64, actual: i64) bool {
+    // Zero is a concrete extent. Empty and populated shapes use distinct
+    // specialization keys, including for incremental cache inputs.
+    return actual >= 0 and (declared < 0 or declared == actual);
+}
+
 fn specializeForInputs(self: *ImportedOnnxSession, inputs: session_mod.ShapeInputs) !*ImportedOnnxSession {
     var detached: ?*ImportedOnnxSession = null;
     defer if (detached) |old| old.deinit();
@@ -1209,7 +1215,7 @@ fn specializeForInputsDetached(self: *ImportedOnnxSession, inputs: session_mod.S
         if (!std.mem.eql(u8, input.name, info.name) or input.dtype != info.dtype or input.shape.len != info.shape.len or input.shape.len > ml.graph.shape.max_rank)
             return error.InvalidTensorShape;
         for (input.shape, info.shape) |actual, declared| {
-            if (actual <= 0 or (declared > 0 and declared != actual)) return error.InvalidTensorShape;
+            if (!validConcreteExtent(declared, actual)) return error.InvalidTensorShape;
         }
     }
     for (self.specializations.entries.items) |entry| {
@@ -4069,19 +4075,23 @@ test "imported ONNX prepared shape pins evicted program and returns warm charged
 }
 
 test "imported ONNX static positional alias matches its legacy callback route" {
-    try expectStaticPositionalInputCompatibility(&.{ 1, 4 }, "caller_alias", &.{ 1, 2, 3, 4 });
+    try expectPositionalInputCompatibility(&.{ 1, 4 }, &.{ 1, 4 }, "caller_alias", &.{ 1, 2, 3, 4 });
 }
 
 test "imported ONNX static empty identity matches its legacy callback route" {
-    try expectStaticPositionalInputCompatibility(&.{ 0, 4 }, "x", &.{});
+    try expectPositionalInputCompatibility(&.{ 0, 4 }, &.{ 0, 4 }, "x", &.{});
 }
 
-fn expectStaticPositionalInputCompatibility(dimensions: []const i64, input_name: []const u8, values: []const f32) !void {
+test "imported ONNX can specialize an empty symbolic input without reusing its nonempty plan" {
+    try expectPositionalInputCompatibility(&.{ -1, 4 }, &.{ 0, 4 }, "x", &.{});
+}
+
+fn expectPositionalInputCompatibility(declared_dimensions: []const i64, dimensions: []const i64, input_name: []const u8, values: []const f32) !void {
     const a = std.testing.allocator;
     var graph = Graph.init(a);
     defer graph.deinit();
     var b = ml.graph.Builder.init(&graph);
-    try graph.markOutput(try b.parameter("x", Shape.init(.f32, dimensions)));
+    try graph.markOutput(try b.parameter("x", Shape.init(.f32, declared_dimensions)));
     const bytes = try onnx_graph.exportGraph(a, &graph, .{});
     defer a.free(bytes);
     var dir = std.testing.tmpDir(.{});
@@ -4092,11 +4102,11 @@ fn expectStaticPositionalInputCompatibility(dimensions: []const i64, input_name:
     const session = try createSessionWithOptions(a, path, .native, .{ .graph_runtime_strategy = .interpreter });
     defer session.close();
     const impl: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
-    try std.testing.expect(impl.source_path == null);
+    const symbolic = !std.mem.eql(i64, declared_dimensions, dimensions);
+    try std.testing.expectEqual(symbolic, impl.source_path != null);
     var input = try Tensor.initFloat32(a, input_name, dimensions, values);
     defer input.deinit();
-    // This is the retained legacy callback path: static inputs bind by index,
-    // without the new prepared-validation layer. It must first prove support.
+    // Compare the retained legacy callback and the normal prepared route.
     const legacy = try session.vtable.run(session.ptr, &.{input}, a);
     defer {
         for (legacy) |*output| output.deinit();
@@ -4111,6 +4121,26 @@ fn expectStaticPositionalInputCompatibility(dimensions: []const i64, input_name:
     try std.testing.expectEqual(legacy[0].dtype, prepared[0].dtype);
     try std.testing.expectEqualSlices(i64, legacy[0].shape, prepared[0].shape);
     try std.testing.expectEqualSlices(u8, legacy[0].data, prepared[0].data);
+    if (symbolic) {
+        try std.testing.expectEqual(@as(usize, 1), impl.specializations.entries.items.len);
+        var source = (try session.runResident(&.{input}, a)) orelse return error.MissingResidentResult;
+        defer source.deinit();
+        const resident_input = ResidentInput{ .value = source.outputs[0], .backend = source.backend, .shape = dimensions };
+        var empty = (try session.runResidentInputs(&.{resident_input}, a)) orelse return error.MissingResidentResult;
+        defer empty.deinit();
+        const empty_shape = try empty.backend.tensorShape(empty.outputs[0], a);
+        defer a.free(empty_shape);
+        try std.testing.expectEqualSlices(i64, dimensions, empty_shape);
+        var nonempty = try Tensor.initFloat32(a, input_name, &.{ 1, 4 }, &.{ 1, 2, 3, 4 });
+        defer nonempty.deinit();
+        const output = try session.run(&.{nonempty}, a);
+        defer {
+            for (output) |*tensor| tensor.deinit();
+            a.free(output);
+        }
+        try std.testing.expectEqualSlices(f32, nonempty.asFloat32(), output[0].asFloat32());
+        try std.testing.expectEqual(@as(usize, 2), impl.specializations.entries.items.len);
+    }
 }
 
 const kernel_routes = @import("../execution/kernel_route.zig");
@@ -5119,13 +5149,18 @@ fn prepareProjectionPackBeforeProfile(session: *const Session, target: *Imported
     return null;
 }
 
-fn selectPhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator) !void {
-    return selectPhysicalInvocationWithCleanup(prepared, session, target, root_pool, inputs, allocator, .{});
+fn projectionHostIngress(target: *const ImportedOnnxSession, inputs: []const kernel_routes.InputBinding) ?kernel_routes.InputBinding {
+    if (inputs.len != 1 or inputs[0].value != .imported_host) return null;
+    var binding = inputs[0];
+    const host = &binding.value.imported_host;
+    if (host.target != .metal or host.owned_ingress) return null;
+    for (target.static_runtime_inputs) |input| if (input.node_id == binding.node_id) return null;
+    const kernels = target.cb.vtable.kernels orelse return null;
+    if (!kernels.accepts(target.cb.vtable) or kernels.createHostInput == null or kernels.hostInputRequirements == null) return null;
+    host.owned_ingress = true;
+    return binding;
 }
 
-inline fn selectPhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
-    return selectPhysicalInvocationControlled(prepared, session, target, root_pool, inputs, allocator, cleanup, null);
-}
 fn selectPhysicalInvocationControlled(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?InferenceExecutionControl) !void {
     var known = true;
     for (inputs) |fact| if (fact.value == .unknown) {
@@ -5140,12 +5175,34 @@ fn selectPhysicalInvocationControlled(prepared: *prepared_mod.PreparedInvocation
     const profile = if (prepared.region_execution_profile) |claim| claim.profile else .unknown;
     var selection_policy: @import("../execution/region_route.zig").SelectionPolicy = .select_regions;
     while (true) {
+        var selected_inputs = inputs;
+        var promoted: [1]kernel_routes.InputBinding = undefined;
         if (known) {
-            prepared.routes = try root_pool.prepareRoutesWithProfileAndCleanup(inputs, selection_policy, profile, cleanup);
+            if (root_pool.metal_projection_region_candidate and profile == .synchronous and selection_policy == .select_regions) {
+                if (projectionHostIngress(target, inputs)) |binding| {
+                    promoted[0] = binding;
+                    // Bank requirements are queried under the candidate's
+                    // actual Metal metadata operation. An unavailable bank
+                    // leaves the original admitted import in service.
+                    prepared.routes = root_pool.prepareRoutesWithProfileAndCleanup(&promoted, selection_policy, profile, cleanup) catch |err| switch (err) {
+                        error.PreparedHostIngressBindingChanged => null,
+                        else => return err,
+                    };
+                    if (prepared.routes) |route| {
+                        if (route.pool.completeOwnedPayload() != null) {
+                            selected_inputs = &promoted;
+                        } else {
+                            prepared.routes = null;
+                            route.releaseWithCleanup(cleanup);
+                        }
+                    }
+                }
+            }
+            if (prepared.routes == null) prepared.routes = try root_pool.prepareRoutesWithProfileAndCleanup(inputs, selection_policy, profile, cleanup);
         } else prepared.routes = null;
         const pool = if (prepared.routes) |routes| routes.pool else root_pool;
         if (session.run_admission) |admission| prepared.frame_claim = try pool.claimWarm(.{ .controller = admission.controller, .backend_class = admission.backend_class });
-        const acquisition = try pool.claimRegions(allocator, if (prepared.frame_claim) |*claim| claim else null, inputs);
+        const acquisition = try pool.claimRegions(allocator, if (prepared.frame_claim) |*claim| claim else null, selected_inputs);
         switch (acquisition) {
             .no_regions => {
                 // A private packed prefill frame is meaningful only when its
@@ -5205,10 +5262,6 @@ noinline fn prepareDevicePhysicalInvocation(prepared: *prepared_mod.PreparedInvo
     return selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, if (control) |active| active.* else null);
 }
 
-fn preparePhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator) !void {
-    return preparePhysicalInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, .{}, null);
-}
-
 fn preparePhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?InferenceExecutionControl) !void {
     if (InvocationInputFacts.needsResidentStorage(shapes)) return preparePhysicalResidentInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, cleanup, control);
     var facts: InvocationInputFacts = undefined;
@@ -5219,10 +5272,6 @@ fn preparePhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocati
 
 // Resident planes remain allocation-free for ordinary small input sets, but
 // their large scratch frame is never entered for a dense host invocation.
-noinline fn preparePhysicalResidentInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator) !void {
-    return preparePhysicalResidentInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, .{}, null);
-}
-
 noinline fn preparePhysicalResidentInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?InferenceExecutionControl) !void {
     var storage: InvocationInputFacts.ResidentStorage = undefined;
     var facts: InvocationInputFacts = undefined;
