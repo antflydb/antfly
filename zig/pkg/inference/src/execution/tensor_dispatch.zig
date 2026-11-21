@@ -107,9 +107,23 @@ pub fn eligible(session: session_mod.Session, inputs: []const Tensor) bool {
     return true;
 }
 
+/// One stage entry for task-installed scheduling and the serial Source owner.
+/// A custom dispatcher is authoritative; never replay it on a different route.
+pub fn run(allocator: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: ?*std.atomic.Mutex, inputs: []const Tensor, control: ?Control, dispatch: anytype) ![]Tensor {
+    if (comptime @TypeOf(dispatch) != @TypeOf(null)) {
+        if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) {
+            if (dispatch) |selected| return selected.run(allocator, session, permit, gate, inputs, control);
+        } else return dispatch.run(allocator, session, permit, gate, inputs, control);
+    }
+    if (permit) |owned| {
+        if (owned.session.ptr != session.ptr or owned.session.vtable != session.vtable) return error.InvalidStagePermit;
+        return owned.runWithControl(inputs, allocator, control);
+    }
+    return runHost(allocator, session, gate orelse session.execution_gate, inputs, control);
+}
+
 pub fn runSerial(allocator: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, inputs: []const Tensor, control: ?Control) ![]Tensor {
-    if (permit) |owned| return owned.runWithControl(inputs, allocator, control);
-    return runHost(allocator, session, session.execution_gate, inputs, control);
+    return run(allocator, session, permit, null, inputs, control, null);
 }
 
 /// Fresh host dispatch shares the same Source owner as the task pipelines.
@@ -169,4 +183,51 @@ pub fn runHost(allocator: std.mem.Allocator, session: session_mod.Session, gate:
         return result;
     }
     return outputs;
+}
+
+test "tensor stage dispatch preserves explicit scheduling and never replays a provider failure" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        serial_calls: usize = 0,
+        dispatch_calls: usize = 0,
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .native;
+        }
+        fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{};
+        }
+        fn close(_: *anyopaque) void {}
+        fn serial(raw: *anyopaque, _: []const Tensor, _: std.mem.Allocator) ![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.serial_calls += 1;
+            return error.UnexpectedSerialReplay;
+        }
+        const table = session_mod.Session.VTable{ .run = serial, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+    };
+    const Dispatcher = struct {
+        probe: *Probe,
+        permit: *session_mod.RunPermit,
+        gate: *std.atomic.Mutex,
+        fn run(self: *@This(), _: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: ?*std.atomic.Mutex, inputs: []const Tensor, control: ?Control) ![]Tensor {
+            try std.testing.expect(session.ptr == @as(*anyopaque, @ptrCast(self.probe)) and permit == self.permit and gate == self.gate);
+            try std.testing.expect(inputs.len == 0 and control != null);
+            self.probe.dispatch_calls += 1;
+            return error.InjectedStageFailure;
+        }
+    };
+    var probe = Probe{};
+    const session = session_mod.Session{ .ptr = &probe, .vtable = &Probe.table };
+    var permit = session_mod.RunPermit{ .session = session, .lease = null };
+    defer permit.deinit();
+    var gate: std.atomic.Mutex = .unlocked;
+    var dispatcher = Dispatcher{ .probe = &probe, .permit = &permit, .gate = &gate };
+    try std.testing.expectError(error.InjectedStageFailure, run(a, session, &permit, &gate, &.{}, .{}, &dispatcher));
+    try std.testing.expectError(error.InjectedStageFailure, run(a, session, &permit, &gate, &.{}, .{}, @as(?*Dispatcher, &dispatcher)));
+    try std.testing.expectEqual(@as(usize, 2), probe.dispatch_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.serial_calls);
+    var foreign = Probe{};
+    const other = session_mod.Session{ .ptr = &foreign, .vtable = &Probe.table };
+    try std.testing.expectError(error.InvalidStagePermit, runSerial(a, other, &permit, &.{}, null));
+    try std.testing.expectEqual(@as(usize, 0), foreign.serial_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.serial_calls);
 }

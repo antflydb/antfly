@@ -350,6 +350,11 @@ without allocating a clamp tensor. Optional scratch pressure preserves the old
 output bank. A staged, backed-off upgrade can later fund a separate scratch bank
 without invalidating queued output references or resetting replay selection.
 Partial upgrades retire only their own quota and views before retry.
+Merged seq2seq caches and full-prefix host decoders use the same execution-owned
+stage entry as encoders. That entry preserves an installed dispatcher's exact
+permit, gate and cancellation contract, propagates its failures without serial
+replay, and rejects a foreign prepaid model permit on the serial path. Host
+outputs leave through the same prepared Source custody and retirement boundary.
 
 Decoder construction publishes the actual native, compiled, merged-graph or
 full-prefix state route and requested policy through the uniform report. Failed

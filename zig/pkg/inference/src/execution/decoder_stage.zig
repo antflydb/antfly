@@ -201,12 +201,7 @@ pub const Decoder = struct {
                     try inputs.init(self.allocator, try self.session.inputInfoForStage(.decoder), prefix, self.encoder_mask, .{ .host = outputs[0] });
                     defer inputs.deinit();
                     const host_inputs = try inputs.hostInputs();
-                    row.host_outputs = if (comptime @TypeOf(dispatch) == @TypeOf(null))
-                        try self.session.runWithControl(host_inputs, self.allocator, self.control)
-                    else if (comptime @typeInfo(@TypeOf(dispatch)) == .optional)
-                        if (dispatch) |provider| try provider.run(self.allocator, self.session, null, null, host_inputs, self.control) else try self.session.runWithControl(host_inputs, self.allocator, self.control)
-                    else
-                        try dispatch.run(self.allocator, self.session, null, null, host_inputs, self.control);
+                    row.host_outputs = try @import("tensor_dispatch.zig").run(self.allocator, self.session, null, null, host_inputs, self.control, dispatch);
                 }
                 if (row.host_outputs.len == 0) return error.NoDecoderOutput;
                 if (row.host_outputs[0].dtype != .f32) return error.InvalidLogitsShape;

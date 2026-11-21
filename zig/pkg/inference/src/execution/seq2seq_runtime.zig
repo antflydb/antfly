@@ -148,12 +148,7 @@ pub const State = struct {
             };
             inputs.appendAssumeCapacity(tensor);
         }
-        const outputs = if (comptime @TypeOf(dispatch) == @TypeOf(null))
-            try self.session.runWithControl(inputs.items, self.allocator, control)
-        else if (comptime @typeInfo(@TypeOf(dispatch)) == .optional)
-            if (dispatch) |d| try d.run(self.allocator, self.session, null, self.session.execution_gate, inputs.items, control) else try self.session.runWithControl(inputs.items, self.allocator, control)
-        else
-            try dispatch.run(self.allocator, self.session, null, self.session.execution_gate, inputs.items, control);
+        const outputs = try @import("tensor_dispatch.zig").run(self.allocator, self.session, null, self.session.execution_gate, inputs.items, control, dispatch);
         var owned = true;
         errdefer if (owned) kv.freeTensorSlice(self.allocator, outputs);
         // Validate before committing state; errors never replay the model call.

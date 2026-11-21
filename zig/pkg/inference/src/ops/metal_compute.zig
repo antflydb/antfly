@@ -59760,6 +59760,20 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
     defer cb.free(destination);
     const workspace = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&zeros, &.{ rows, width }));
     defer cb.free(workspace);
+    const bytes = rows * width * @sizeOf(f32);
+    var shared_bank = try MetalTensor.deviceAllocate(runtime, 2 * bytes, .private, &.{ 2 * rows, width });
+    defer shared_bank.deinit();
+    const View = struct {
+        fn bind(target: *MetalCompute, bank: *const MetalTensor, offset: usize, size: usize) !CT {
+            var value = try bank.retainedView(offset, size, &.{ rows, width });
+            errdefer value.deinit();
+            return target.ctFromOwnedMetalTensor(value);
+        }
+    };
+    const shared_output = try View.bind(&compute, &shared_bank, 0, bytes);
+    defer cb.free(shared_output);
+    const shared_workspace = try View.bind(&compute, &shared_bank, bytes, bytes);
+    defer cb.free(shared_workspace);
     const params = ops.ClippedLinearParams{ .rows = rows, .in_dim = width, .out_dim = width, .flags = 3 | 4 | 8 | 16, .input_min = -0.75, .input_max = 0.75, .output_min = -0.5, .output_max = 0.5 };
     const source = MetalCompute.denseDeviceF32(input).?;
     const result = MetalCompute.denseDeviceF32(destination).?;
@@ -59768,19 +59782,23 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
     try std.testing.expectEqual(reference, (try MetalCompute.audioPreparedLinearOp(&compute, &request)).?);
     const expected = try cb.toFloat32(reference, a);
     defer a.free(expected);
-    request.output = destination;
-    request.input_workspace = workspace;
-    for (0..4) |_| {
-        const before = metal_tensor_mod.memoryStatsSnapshot();
-        try std.testing.expectEqual(destination, (try MetalCompute.audioPreparedLinearOp(&compute, &request)).?);
-        const after = metal_tensor_mod.memoryStatsSnapshot();
-        // Counts only project-owned MetalTensor device allocations, never
-        // opaque MPS allocations or driver-wide completion/ownership.
-        try std.testing.expectEqual(before.device_owned_buffers_created, after.device_owned_buffers_created);
-        const actual = try cb.toFloat32(destination, a);
-        defer a.free(actual);
-        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+    const Binding = struct { output: CT, workspace: CT };
+    for ([_]Binding{ .{ .output = destination, .workspace = workspace }, .{ .output = shared_output, .workspace = shared_workspace } }) |binding| {
+        request.output = binding.output;
+        request.input_workspace = binding.workspace;
+        for (0..4) |_| {
+            const before = metal_tensor_mod.memoryStatsSnapshot();
+            try std.testing.expectEqual(binding.output, (try MetalCompute.audioPreparedLinearOp(&compute, &request)).?);
+            const after = metal_tensor_mod.memoryStatsSnapshot();
+            // Counts only project-owned MetalTensor device allocations, never
+            // opaque MPS allocations or driver-wide completion/ownership.
+            try std.testing.expectEqual(before.device_owned_buffers_created, after.device_owned_buffers_created);
+            const actual = try cb.toFloat32(binding.output, a);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+        }
     }
+    request.output = destination;
     request.input_workspace = input;
     try std.testing.expectError(error.InvalidPreparedProjectionWorkspace, MetalCompute.audioPreparedLinearOp(&compute, &request));
     request.input_workspace = destination;

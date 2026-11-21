@@ -186,12 +186,7 @@ fn callResidentDispatch(dispatch: anytype, allocator: std.mem.Allocator, encoder
 }
 
 fn encodeHost(allocator: std.mem.Allocator, encoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
-    if (comptime @TypeOf(dispatch) != @TypeOf(null)) {
-        if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) {
-            if (dispatch) |selected| return .{ .host = try selected.run(allocator, encoder, supplied, null, inputs, control) };
-        } else return .{ .host = try dispatch.run(allocator, encoder, supplied, null, inputs, control) };
-    }
-    return .{ .host = try @import("tensor_dispatch.zig").runSerial(allocator, encoder, supplied, inputs, control) };
+    return .{ .host = try @import("tensor_dispatch.zig").run(allocator, encoder, supplied, null, inputs, control, dispatch) };
 }
 
 /// Address-stable borrowed inputs for the common full-prefix decoder ABI.
