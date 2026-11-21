@@ -120,6 +120,7 @@ pub const Adapter = struct {
     alloc: std.mem.Allocator,
     registry: *transactions.SessionRegistry,
     node_id: u64,
+    admitted: ?transactions.Mutation = null,
     commit_context: *anyopaque,
     commit_fn: *const fn (*anyopaque, sql.Scope, sql.Id) anyerror!sql.CommitResult,
     supports_range_guards: bool = false,
@@ -147,7 +148,11 @@ pub const Adapter = struct {
         errdefer state.deinit(self.alloc);
         if (!std.meta.eql(state.connection_id, self.connection_id)) return error.SqlConnectionNotFound;
         if (state.owner_node_id != self.node_id) return error.SessionLeaseLost;
-        try self.registry.validateSqlLease(self.alloc, id, self.node_id);
+        const current = try self.registry.mutation(self.alloc, id, self.node_id);
+        if (self.admitted) |prior| {
+            if (std.mem.eql(u8, &prior.id, &id) and prior.tenure != current.tenure) return error.SessionLeaseLost;
+        }
+        self.admitted = current;
         if (!std.mem.eql(u8, state.metadata.database, scope.database) or !std.mem.eql(u8, state.metadata.namespace, scope.namespace)) return error.SqlTransactionNotActive;
         return state;
     }
@@ -176,7 +181,7 @@ pub const Adapter = struct {
             // No transaction ID has escaped to the caller. A proven local
             // rollback permits release; otherwise retain the beginning fence
             // for explicit recovery instead of allowing DISCARD to race it.
-            self.registry.rollbackConnectionBeforeExecution(self.alloc, info.txn_id, connection, info.version, .beginning) catch {};
+            self.registry.rollbackConnectionBeforeExecution(info.txn_id, connection, info.version, .beginning) catch {};
             return err;
         };
         return .{ .id = info.txn_id, .state = .active, .isolation = options.isolation, .mode = options.mode };
@@ -215,7 +220,7 @@ pub const Adapter = struct {
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
         if (self.connection_id) |connection|
-            try self.registry.rollbackConnectionBeforeExecution(self.alloc, id, connection, state.version, .active)
+            try self.registry.rollbackConnectionBeforeExecution(id, connection, state.version, .active)
         else if (!self.registry.retireBeforeExecution(self.alloc, id, state.version, false))
             return error.SqlTransactionOutcomeUnknown;
     }
@@ -224,28 +229,28 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        _ = (try self.registry.createNamedSavepoint(self.alloc, id, name)) orelse return error.SqlTransactionNotActive;
+        _ = (try self.registry.createNamedSavepoint(self.alloc, self.admitted.?, name)) orelse return error.SqlTransactionNotActive;
     }
 
     fn rollbackTo(ptr: *anyopaque, scope: sql.Scope, id: sql.Id, name: []const u8) !void {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        _ = (try self.registry.rollbackToNamedSavepoint(self.alloc, id, name)) orelse return error.SqlSavepointNotFound;
+        _ = (try self.registry.rollbackToNamedSavepoint(self.alloc, self.admitted.?, name)) orelse return error.SqlSavepointNotFound;
     }
 
     fn release(ptr: *anyopaque, scope: sql.Scope, id: sql.Id, name: []const u8) !void {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        _ = (try self.registry.releaseNamedSavepoint(self.alloc, id, name)) orelse return error.SqlSavepointNotFound;
+        _ = (try self.registry.releaseNamedSavepoint(self.alloc, self.admitted.?, name)) orelse return error.SqlSavepointNotFound;
     }
 
     fn failed(ptr: *anyopaque, scope: sql.Scope, id: sql.Id) !void {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        try self.registry.setSqlFailed(self.alloc, id, true);
+        try self.registry.setSqlFailed(self.alloc, self.admitted.?, true);
     }
 
     fn abandon(ptr: *anyopaque, scope: sql.Scope, id: sql.Id) void {

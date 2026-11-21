@@ -15206,6 +15206,7 @@ pub const ApiHttpServer = struct {
             // This marker exists only after every contacted participant has
             // a durable abort. Unlike generic 503, the batch cannot later
             // commit, so callers may safely retry with a new attempt.
+            error.TransactionPrepareAbortedRowPolicyDenied => return error.Forbidden,
             error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable => return error.WriteDefinitelyAbortedUnavailable,
             error.PreDecisionReadUnavailable => return error.WritePrecommitReadUnavailable,
             // Coverage is checked before coordinator admission. Preserve that

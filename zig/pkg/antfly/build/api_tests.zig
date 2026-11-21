@@ -747,7 +747,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     api_session_maintenance_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const retained_quota_tests = b.addTest(.{
         .root_module = api_session_maintenance_test_mod,
-        .filters = &.{ "retained quota", "api http server routes table batches through the batch commit hook", "api http client preserves public batch retry safety classifications", "internal routed batch preserves typed validation across the HTTP forwarding hop", "typed routed batch preserves forwarding cancellation and identity conflicts", "httpx antfly reads preserve availability and terminal failures" },
+        .filters = &.{ "httpx multi batch route uses the batch commit hook", "retained quota", "api http server routes table batches through the batch commit hook", "api http client preserves public batch retry safety classifications", "internal routed batch preserves typed validation across the HTTP forwarding hop", "typed routed batch preserves forwarding cancellation and identity conflicts", "httpx antfly reads preserve availability and terminal failures" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-retained-quota-test", "Run retained-effects pressure outcome and retry contracts").dependOn(&addFilteredTestRunArtifact(b, retained_quota_tests).step);
@@ -771,6 +771,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "session maintenance activation follows current range leadership without follower RPCs",
             "api http server serves status using control metadata without diagnostic transfers",
             "transaction commit execution yields through caller io and preserves ownership on cancellation",
+            "durable session limits bound count and encoded record size",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",
             "transaction session registry reports status and cleans expired durable sessions",

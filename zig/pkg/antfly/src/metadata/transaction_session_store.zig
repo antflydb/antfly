@@ -169,7 +169,14 @@ const Write = struct {
             else => return err,
         };
         const expected = if (actual) |value| try self.own(value) else null;
-        try self.changes.append(a, .{ .key = try self.own(key), .expected = expected, .value = expected });
+        var value = expected;
+        if (std.mem.eql(u8, key, record.count_key)) {
+            // A legacy writer can change membership without touching the
+            // counter. Fence the epoch and rebuild a stale count in this cut.
+            self.scanned = true;
+            if (expected != null and !try record.countIsCurrent(&self.read.physical, a, self.read.store.group, self.epoch)) value = null;
+        }
+        try self.changes.append(a, .{ .key = try self.own(key), .expected = expected, .value = value });
         return &self.changes.items[self.changes.items.len - 1];
     }
     fn own(self: *Write, bytes: []const u8) ![]const u8 {
@@ -416,6 +423,27 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         try std.testing.expectError(error.TransactionCursorActive, txn.commit());
         txn.abort();
         try std.testing.expectEqualStrings("receipt", (try cursor.first()).?.key);
+    }
+    {
+        const one = std.mem.toBytes(std.mem.nativeToLittle(u64, 1));
+        var seed = try logical.beginWrite();
+        errdefer seed.abort();
+        try seed.put(record.count_key, &one);
+        try seed.commit();
+    }
+    {
+        var legacy = try logical.beginWrite();
+        errdefer legacy.abort();
+        try legacy.put(record.session_prefix ++ "legacy", "session");
+        try legacy.commit();
+    }
+    {
+        var repair = try logical.beginWrite();
+        errdefer repair.abort();
+        try std.testing.expectError(error.NotFound, repair.get(record.count_key));
+        const two = std.mem.toBytes(std.mem.nativeToLittle(u64, 2));
+        try repair.put(record.count_key, &two);
+        try repair.commit();
     }
     var current = try logical.beginRead();
     defer current.abort();

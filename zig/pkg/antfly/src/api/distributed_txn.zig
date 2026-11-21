@@ -1579,7 +1579,11 @@ fn executeMultiTableCommitOnce(
         validateParticipantEpochs(alloc, catalog, participants.items, admitted) catch |err| {
             abort_on_error = false;
             try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
-            return if (err == error.CatalogGenerationChanged and options.fresh_retained_id) error.TopologyChanged else err;
+            // The abort above is durable even when this invocation is a replay.
+            return switch (err) {
+                error.TopologyChanged, error.CatalogGenerationChanged, error.TableNotFound => .{ .conflict = .{ .table_name = participants.items[0].table_name, .key = "", .message = "topology changed", .phase = .prepare, .retryable = true } },
+                else => error.TransactionPrepareAbortedUnavailable,
+            };
         };
     }
 
@@ -6012,7 +6016,7 @@ fn consumerTests() type {
 
                 fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnResolveRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    try std.testing.expect(req.topology_epoch != 0);
+                    if (req.status == .committed) try std.testing.expect(req.topology_epoch != 0);
                     try self.resolves.append(std.testing.allocator, .{
                         .group_id = group_id,
                         .status = req.status,
@@ -6164,11 +6168,12 @@ fn consumerTests() type {
             recorder.coordinator_group = 7002;
             recorder.includes_audit = true;
             const snapshots_before = FakeCatalog.snapshots;
-            const guarded = try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("40112233445566778899aabbccddeeff"), 50_000, 50_001, &.{
+            const guarded_tables: []const TableCommitRequest = &.{
                 .{ .table_name = "docs", .commit_requires = .none, .schema_version = 7, .bound_catalog_incarnation = @splat(0x11), .range_guards = (&observation)[0..1] },
                 .{ .table_name = "audit", .writes = &.{.{ .key = "log", .value = "{}" }} },
                 .{ .table_name = "docs", .commit_requires = .direct_enrichments, .range_guards = &.{observation}, .writes = &.{.{ .key = "doc:a", .value = "{}" }} },
-            }, .write, null);
+            };
+            const guarded = try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("40112233445566778899aabbccddeeff"), 50_000, 50_001, guarded_tables, .write, null);
             try std.testing.expect(guarded == .committed);
             // Routing and the post-prepare fence each take one fresh catalog snapshot.
             try std.testing.expectEqual(snapshots_before + 2, FakeCatalog.snapshots);
@@ -6178,6 +6183,7 @@ fn consumerTests() type {
             const Compact = struct {
                 generation: *table_catalog.RoutingGeneration,
                 checks: usize = 0,
+                recheck_failure: ?anyerror = null,
                 supports_batch: bool = true,
                 supports_single: bool = true,
                 fn acquire(ptr: *anyopaque, _: table_catalog.RoutingBudget, authoritative: bool) !*table_catalog.RoutingGeneration {
@@ -6195,6 +6201,7 @@ fn consumerTests() type {
                     try std.testing.expectEqual(@as(usize, 2), batch.tables.len);
                     try std.testing.expectEqual(@as(u64, if (self.checks == 0) 9 else 10), batch.verified_revision);
                     self.checks += 1;
+                    if (self.checks == 2) if (self.recheck_failure) |err| return err;
                     return .{ .tables_checked = true, .stable = true, .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 10 };
                 }
             };
@@ -6284,6 +6291,20 @@ fn consumerTests() type {
             observation.fence.metadata_incarnation = @splat('2');
             try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("50112233445566778899aabbccddeeff"), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = (&observation)[0..1] }}, .write, null));
             try std.testing.expectEqual(prior_begins, recorder.begins.items.len);
+            for ([_]bool{ true, false }) |fresh| {
+                for ([_]anyerror{ error.CatalogRoutingSnapshotTimeout, error.TopologyChanged }) |failure| {
+                    compact.supports_batch = true;
+                    compact.checks = 0;
+                    compact.recheck_failure = failure;
+                    // The earlier stale-fence case modified this borrowed proof.
+                    observation.fence.metadata_incarnation = @splat('1');
+                    const rechecked = executeMultiTableCommitWithOptions(std.testing.allocator, compact_source, recorder.worker(), @splat(7), 70_000, 70_001, guarded_tables, .write, null, .{ .retain_terminal = true, .fresh_retained_id = fresh });
+                    if (failure == error.TopologyChanged) {
+                        try std.testing.expect((try rechecked) == .conflict);
+                    } else try std.testing.expectError(error.TransactionPrepareAbortedUnavailable, rechecked);
+                    try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, recorder.resolves.items[recorder.resolves.items.len - 1].status);
+                }
+            }
         }
 
         test "stable distributed transaction retry resumes a durable commit decision" {

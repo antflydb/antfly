@@ -190,7 +190,8 @@ pub const Adapter = struct {
         var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
         defer state.deinit(self.server.alloc);
         if (state.terminal != null or !std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
-        try self.server.txn_sessions.setSqlFailed(self.server.alloc, id, true);
+        const guard = try self.server.txn_sessions.mutation(self.server.alloc, id, self.server.localSessionNodeId());
+        try self.server.txn_sessions.setSqlFailed(self.server.alloc, guard, true);
     }
 
     fn evaluateParameters(_: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request, expressions: []const []const u8) ![]const std.json.Value {
@@ -522,6 +523,7 @@ const OwnedRead = struct {
             }
             self.native_adapter.accepted_lake_repeatable = self.native_adapter.lake_visibility == .accepted and (state.metadata.isolation != .serializable or state.metadata.mode == .read_only);
             self.native_adapter.active_transaction = id;
+            self.native_adapter.admitted_mutation = .{ .id = id, .owner = server.localSessionNodeId(), .tenure = tenure };
             self.native_adapter.staged = &self.staged;
             if (state.metadata.isolation != .read_committed) self.native_adapter.range_reads = &self.range_guards;
         }
@@ -564,10 +566,9 @@ const OwnedRead = struct {
         };
         errdefer self.stream.close();
         self.retained = opening.captured orelse return error.InvalidSqlBackendResponse;
-        if (self.session_id) |id_hex| if (self.range_guards.tables.len != 0) {
-            const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
-            _ = (try server.txn_sessions.stage(server.alloc, id, &self.range_guards)) orelse return error.SqlTransactionNotActive;
-        };
+        if (self.session_id != null and self.range_guards.tables.len != 0) {
+            _ = (try server.txn_sessions.stage(server.alloc, self.native_adapter.admitted_mutation.?, &self.range_guards)) orelse return error.SqlTransactionNotActive;
+        }
         if (transaction_lease) |lease| {
             lease.release();
             transaction_lease = null;
@@ -1303,7 +1304,9 @@ const Job = struct {
         if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
         errdefer if (native_adapter.result_session_id) |id| {
             const transaction_id = @import("distributed_txn.zig").parseTxnIdHex(&id) catch unreachable;
-            server.txn_sessions.setSqlFailed(server.alloc, transaction_id, true) catch {};
+            if (native_adapter.admitted_mutation) |guard| {
+                if (std.mem.eql(u8, &guard.id, &transaction_id)) server.txn_sessions.setSqlFailed(server.alloc, guard, true) catch {};
+            }
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = .failed;
         };
         // After a durable commit, even acknowledgement-allocation failure must

@@ -15,6 +15,7 @@
 
 //! Atomic, binary-safe session changes carried by metadata Raft.
 const std = @import("std");
+pub const count_key = "\x00session-count-v1";
 pub const session_prefix = "\x00\x00__api_txn_sessions__:";
 pub const bound_session_header = "{\"session_format\":2,";
 fn frameVersion(changes: []const Change) u8 {
@@ -41,6 +42,7 @@ pub const epoch_key = "\x00epoch";
 // its logical API. Old binaries advance epoch_key on every successful write.
 // A discontinuity starts a new generation, invalidating every pre-gap prefix.
 pub const cache_namespace = "\x00reader_v1/";
+const count_watermark = cache_namespace ++ "count-epoch";
 const watermark_key = cache_namespace ++ "epoch";
 const entry_prefix = cache_namespace ++ "record/";
 pub const cached_prefix_bytes = 128;
@@ -58,6 +60,17 @@ fn optionalGet(txn: anytype, key: []const u8) !?[]const u8 {
         error.NotFound => null,
         else => return err,
     };
+}
+
+// Older metadata binaries still advance epoch_key. Never trust a count
+// across an unobserved apply. The next capped BEGIN bootstraps from the
+// actual session prefix under a scan fence.
+pub fn countIsCurrent(txn: anytype, a: std.mem.Allocator, group: u64, epoch: u64) !bool {
+    const key = try keyAlloc(a, group, count_watermark);
+    defer a.free(key);
+    const stamp = (try optionalGet(txn, key)) orelse return false;
+    if (stamp.len != 8) return error.InvalidTransactionSessionRecord;
+    return std.mem.readInt(u64, stamp[0..8], .little) == epoch;
 }
 
 fn generation(txn: anytype, marker_key: []const u8, epoch: u64) !?u64 {
@@ -163,13 +176,21 @@ pub fn apply(txn: anytype, a: std.mem.Allocator, group: u64, bytes: []const u8) 
         break :blk std.mem.readInt(u64, value[0..8], .little);
     } else 0;
     if (record.scan_epoch) |expected| if (expected != epoch) return false;
+    var supplied_count = false;
+    var writes_count = false;
+    var membership_changed = false;
     for (record.changes) |change| {
         const key = try keyAlloc(a, group, change.key);
         defer a.free(key);
-        const actual = txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const is_count = std.mem.eql(u8, change.key, count_key);
+        if (is_count) {
+            supplied_count = true;
+            writes_count = change.value != null;
+        }
+        if (std.mem.startsWith(u8, change.key, session_prefix) and (change.expected == null) != (change.value == null)) membership_changed = true;
+        // CAS always uses the canonical bytes, including on replicas whose
+        // derived watermark was last maintained by a different binary.
+        const actual = try optionalGet(txn, key);
         if (change.expected) |expected| {
             if (actual == null or !std.mem.eql(u8, actual.?, expected)) return false;
         } else if (actual != null) return false;
@@ -179,10 +200,15 @@ pub fn apply(txn: anytype, a: std.mem.Allocator, group: u64, bytes: []const u8) 
     const marker_key = try keyAlloc(a, group, watermark_key);
     defer a.free(marker_key);
     const gen = (try generation(txn, marker_key, epoch)) orelse next;
+    const count_stamp = try keyAlloc(a, group, count_watermark);
+    defer a.free(count_stamp);
+    const carry_count = !supplied_count and !membership_changed and try countIsCurrent(txn, a, group, epoch);
     for (record.changes) |change| {
         const key = try keyAlloc(a, group, change.key);
         defer a.free(key);
-        if (change.value) |value| try txn.put(key, value) else try txn.delete(key);
+        if (change.value) |value| try txn.put(key, value) else txn.delete(key) catch |err| {
+            if (err != error.NotFound) return err;
+        };
         if (std.mem.startsWith(u8, change.key, session_prefix)) {
             const entry_key = try cacheKey(a, group, change.key);
             defer a.free(entry_key);
@@ -203,6 +229,7 @@ pub fn apply(txn: anytype, a: std.mem.Allocator, group: u64, bytes: []const u8) 
     std.mem.writeInt(u64, marker[8..16], gen, .little);
     try txn.put(epoch_physical, marker[0..8]);
     try txn.put(marker_key, &marker);
+    if (writes_count or carry_count) try txn.put(count_stamp, marker[0..8]);
     return true;
 }
 test "replicated session records preserve binary values and reject malformed changes" {
@@ -312,4 +339,26 @@ test "replicated session compare and set rejects lost updates and scan phantoms 
     defer a.free(remove);
     try std.testing.expect(try apply(&map, a, 9, remove));
     try std.testing.expect((try cachedRange(&scoped, a, 9, session, 0, 7)) == null);
+    // A pre-counter writer can change membership, and a pre-counter apply
+    // binary can advance the epoch without touching the count watermark.
+    const one = std.mem.toBytes(std.mem.nativeToLittle(u64, 1));
+    const bootstrap = try encode(a, .{ .changes = &.{.{ .key = count_key, .expected = null, .value = &one }} });
+    defer a.free(bootstrap);
+    try std.testing.expect(try apply(&map, a, 9, bootstrap));
+    const physical_count = try keyAlloc(a, 9, count_key);
+    defer a.free(physical_count);
+    const before = std.mem.readInt(u64, (try map.get(epoch))[0..8], .little);
+    try std.testing.expect(try countIsCurrent(&map, a, 9, before));
+    try std.testing.expect(try apply(&map, a, 9, create));
+    try std.testing.expect(!try countIsCurrent(&map, a, 9, before + 1));
+    try std.testing.expectEqualSlices(u8, &one, try map.get(physical_count));
+    // Repair uses the same raw CAS on followers with and without a watermark.
+    const two = std.mem.toBytes(std.mem.nativeToLittle(u64, 2));
+    const repair = try encode(a, .{ .scan_epoch = before + 1, .changes = &.{.{ .key = count_key, .expected = &one, .value = &two }} });
+    defer a.free(repair);
+    try std.testing.expect(try apply(&map, a, 9, repair));
+    try std.testing.expect(try countIsCurrent(&map, a, 9, before + 2));
+    const legacy_epoch = std.mem.toBytes(std.mem.nativeToLittle(u64, 100));
+    try map.put(epoch, &legacy_epoch);
+    try std.testing.expect(!try countIsCurrent(&map, a, 9, 100));
 }

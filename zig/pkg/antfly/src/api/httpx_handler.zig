@@ -5590,7 +5590,9 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(500);
                 return ctx.text("transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits");
             },
-            error.AbortDecisionNotDurable, error.TransactionBeginFailed, error.TransactionPrepareAbortedUnavailable => {
+            error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .status = "aborted", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
+            error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .status = "aborted", .code = "transaction_precommit_aborted", .message = "Transaction admission or preparation unavailable.", .retryable = true }),
+            error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
                 _ = ctx.status(503);
                 return ctx.text("transaction coordinator is temporarily unavailable");
             },
@@ -5780,6 +5782,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
+        const guard = self.api_server.txn_sessions.mutation(self.api_server.alloc, txn_id, self.api_server.localSessionNodeId()) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        };
         const alloc = self.api_server.alloc;
         var stage_req = transactions_api.parseCommitRequest(alloc, body_data) catch |err| switch (err) {
             error.InvalidTransactionCommitRequest => {
@@ -5795,7 +5801,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
         var validator: SessionStatementValidator = .{ .server = self.api_server, .context = tableMutationContext(ctx, &authenticated_identity) };
-        const session = (self.api_server.txn_sessions.stageValidated(alloc, txn_id, &stage_req, validator.port()) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stageValidated(alloc, guard, &stage_req, validator.port()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -5833,6 +5839,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
+        const guard = self.api_server.txn_sessions.mutation(self.api_server.alloc, txn_id, self.api_server.localSessionNodeId()) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        };
         const alloc = self.api_server.alloc;
         var read_req = transactions_api.parseStageReadPayload(alloc, body_data) catch {
             _ = ctx.status(400);
@@ -5903,7 +5913,7 @@ pub const AntflyApiHandler = struct {
             return ctx.openApiJson(response);
         }
 
-        const session = (self.api_server.txn_sessions.stageRead(alloc, txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stageRead(alloc, guard, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -5961,6 +5971,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
+        const guard = self.api_server.txn_sessions.mutation(self.api_server.alloc, txn_id, self.api_server.localSessionNodeId()) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        };
         const alloc = self.api_server.alloc;
         var stage_req = switch (kind) {
             .write => transactions_api.parseStageWriteRequest(alloc, body_data) catch {
@@ -5979,7 +5993,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
         var validator: SessionStatementValidator = .{ .server = self.api_server, .context = tableMutationContext(ctx, &authenticated_identity) };
-        const session = (self.api_server.txn_sessions.stageValidated(alloc, txn_id, &stage_req, validator.port()) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stageValidated(alloc, guard, &stage_req, validator.port()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -6017,7 +6031,11 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        const info = (self.api_server.txn_sessions.createSavepoint(self.api_server.alloc, txn_id) catch |err| switch (err) {
+        const guard = self.api_server.txn_sessions.mutation(self.api_server.alloc, txn_id, self.api_server.localSessionNodeId()) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        };
+        const info = (self.api_server.txn_sessions.createSavepoint(self.api_server.alloc, guard) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -6060,7 +6078,11 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        const info = (self.api_server.txn_sessions.rollbackToSavepoint(self.api_server.alloc, txn_id, parsed_savepoint_id) catch |err| switch (err) {
+        const guard = self.api_server.txn_sessions.mutation(self.api_server.alloc, txn_id, self.api_server.localSessionNodeId()) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        };
+        const info = (self.api_server.txn_sessions.rollbackToSavepoint(self.api_server.alloc, guard, parsed_savepoint_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -6333,7 +6355,7 @@ pub const AntflyApiHandler = struct {
             break :rejected switch (err) {
                 error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
                 error.PreDispatchDecisionAdmissionUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "transaction_precommit_aborted", .message = "Metadata decision admission unavailable.", .retryable = true }),
-                error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "transaction_precommit_aborted", .message = "Participant temporarily unavailable.", .retryable = true }),
+                error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .code = "transaction_precommit_aborted", .message = "Commit preparation temporarily unavailable.", .retryable = true }),
                 error.TransactionTooLarge => {
                     return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions");
                 },
@@ -7058,18 +7080,14 @@ pub const AntflyApiHandler = struct {
         const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
         const owner_node_id = self.api_server.localSessionNodeId();
         const principal = http_server_mod.transactionPrincipal(identity) orelse "";
-        @import("sql_connections.zig").reconcileExpired(store, &self.api_server.txn_sessions, self.api_server.alloc, now_ms) catch |err| {
-            var buffer: [256]u8 = undefined;
-            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
-        };
-        _ = @import("sql_connections.zig").mutate(store, .{ .create = .{
+        @import("sql_connections.zig").create(store, &self.api_server.txn_sessions, .{
             .id = connection_id,
             .principal = principal,
             .owner_node_id = owner_node_id,
             .expires_at_ms = now_ms +| @import("sql_connection_record.zig").ttl_ms,
             .database = parsed.value.database,
             .namespace = parsed.value.namespace,
-        } }, principal, owner_node_id, now_ms) catch |err| {
+        }, now_ms) catch |err| {
             var buffer: [256]u8 = undefined;
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
         };
@@ -12849,6 +12867,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const FakeWrites = struct {
+        rejection: ?anyerror = null,
         batch_calls: usize = 0,
         transaction_calls: usize = 0,
         batch_commit_calls: usize = 0,
@@ -12911,6 +12930,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.cancellation_transaction_calls += 1;
             try std.testing.expect(cancellation.ptr != null);
+            if (self.rejection) |err| return err;
             if (self.cancel_transaction_visibility_wait) return error.EnrichmentWaitCanceled;
             return commitTransaction(ptr, alloc_, tables, sync_level);
         }
@@ -12948,6 +12968,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.cancellation_batch_calls += 1;
             try std.testing.expect(cancellation.ptr != null);
+            if (self.rejection) |err| return err;
             if (self.cancel_batch_visibility_wait) return error.EnrichmentWaitCanceled;
             return commitBatch(ptr, alloc_, tables, sync_level);
         }
@@ -13118,6 +13139,20 @@ test "httpx multi batch route uses the batch commit hook and public response con
     defer canceled_transaction_parsed.deinit();
     try std.testing.expectEqualStrings("committed_visibility_pending", canceled_transaction_parsed.value.status);
     try std.testing.expectEqual(@as(usize, 2), writes.cancellation_transaction_calls);
+    for ([_]anyerror{ error.TransactionPrepareAbortedRowPolicyDenied, error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable }, [_]u16{ 403, 503, 503 }) |failure, status_code| {
+        writes.rejection = failure;
+        for ([_][]const u8{ batch_url, transaction_url }) |url| {
+            var denied = try requestWithRetry(&client, client_io.io(), .POST, url, "{\"tables\":{\"users\":{\"deletes\":[\"user:1\"]}}}", &headers, 20);
+            defer denied.deinit();
+            try std.testing.expectEqual(status_code, denied.status.code);
+            const Reply = struct { status: []const u8, code: []const u8, retryable: bool };
+            var parsed_error = try std.json.parseFromSlice(Reply, alloc, denied.body.?, .{ .ignore_unknown_fields = true });
+            defer parsed_error.deinit();
+            try std.testing.expectEqualStrings("aborted", parsed_error.value.status);
+            try std.testing.expectEqual(status_code == 503, parsed_error.value.retryable);
+            try std.testing.expectEqualStrings(if (status_code == 503) "transaction_precommit_aborted" else "row_policy_denied", parsed_error.value.code);
+        }
+    }
 }
 
 test "httpx stable transaction commit durably hands off recovery before acknowledgement" {
@@ -22854,7 +22889,7 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     const session = try api.txn_sessions.begin(a, .{}, 0);
     var staged = try transactions_api.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"n\":1}}}}}");
     defer staged.deinit(a);
-    _ = (try api.txn_sessions.stage(a, session.txn_id, &staged)).?;
+    _ = (try api.txn_sessions.stage(a, try api.txn_sessions.mutation(a, session.txn_id, api.localSessionNodeId()), &staged)).?;
     var committed = (try api.txn_sessions.cloneCommitRequest(a, session.txn_id, null)).?;
     defer committed.deinit(a);
     const tables = try committed.distributedTables(a);
@@ -22893,7 +22928,7 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     for ([_]anyerror{ error.TransactionPrepareAbortedRowPolicyDenied, error.TransactionPrepareAbortedUnavailable }, [_]u16{ 403, 503 }) |failure, expected| {
         source.failure = failure;
         const another = try api.txn_sessions.begin(a, .{}, 0);
-        _ = (try api.txn_sessions.stage(a, another.txn_id, &staged)).?;
+        _ = (try api.txn_sessions.stage(a, try api.txn_sessions.mutation(a, another.txn_id, api.localSessionNodeId()), &staged)).?;
         var bound = (try api.txn_sessions.cloneCommitRequest(a, another.txn_id, null)).?;
         defer bound.deinit(a);
         var plan = (try api.txn_sessions.sealExecutionPlan(a, another.txn_id, api.localSessionNodeId(), tables.tables)).?;
