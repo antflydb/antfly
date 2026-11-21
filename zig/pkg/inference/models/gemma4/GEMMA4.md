@@ -85,6 +85,12 @@ at token 102, and video at tokens 55 and 61. Image matched all 64 decisions.
 Median image and video latency on the shared GB10 was 2.72 s and 2.79 s,
 respectively. [GB10 native-plan qualification receipt](../../scripts/gemma4/qualification/e4b-qat-gb10-projector-native-plan-20261121.json)
 
+At `0275381f84`, all eight first-step logit rows were byte-identical to
+`0b94bdff50`, and all 24 timed runs matched its prompt counts and output
+tokens. On the shared GB10, three warm runs gave median image and video
+latencies of 1.22 s and 1.26 s. The one-second audio case took 1.09 s
+against 1.06 s in the earlier run. [GB10 checkpoint receipt](../../scripts/gemma4/qualification/e4b-qat-gb10-projector-0275381f84.json)
+
 At the earlier `94ae2691eb` checkpoint, the compact projector matched 578 of
 585 CPU decisions through EOS or the output budget. The original
 GB10 route matched 579. Both routes missed the same four text and two video
