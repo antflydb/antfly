@@ -494,6 +494,12 @@ preparation API do not by themselves complete these remaining requirements:
   masked rows. Retained native targets keep their existing launch resources.
   Migrating every remaining task to resident chaining and moving all
   KV/recurrent execution choices behind runtime owners remains incremental.
+  Reranking, GLiNER, NER, classification, sparse embeddings and the explicit
+  host encoder API share the tensor-stage dispatch entry. Prepaid serial stages
+  retain explicitly supplied guards; custom dispatchers retain gate ownership.
+  Cancellation before acquiring a guard never releases another owner's lock,
+  and a failed numerical call releases its guard without replay. Wider task
+  guards and stateful cache scopes keep their existing lifetimes.
   `graph/decode_batch.zig` now owns uniform, mixed prefill/decode and packed
   batch metadata assembly, including per-sequence physical KV views, recurrent
   caches and position ownership. Generation retains compatibility exports and

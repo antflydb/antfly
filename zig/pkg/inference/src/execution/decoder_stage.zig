@@ -81,8 +81,14 @@ pub const Decoder = struct {
     /// Promote a qualified resident encoder source under runtime ownership.
     /// The task supplies its initial-query contract and keeps only token policy.
     pub fn initForEncoder(allocator: std.mem.Allocator, session: backends.Session, encoder: *stages.EncoderOutputs, encoder_length: usize, encoder_mask: []const i64, vocab_size: usize, control: ?Control, options: Options) !Decoder {
-        if (control) |active| try active.check();
-        var source = if (options.allow_native) try retainIncrementalSource(allocator, encoder, session) else null;
+        if (control) |active| active.check() catch |err| {
+            observeRoute(session, encoder, options, .failed, err);
+            return err;
+        };
+        var source = if (options.allow_native) retainIncrementalSource(allocator, encoder, session) catch |err| {
+            observeRoute(session, encoder, options, .failed, err);
+            return err;
+        } else null;
         defer if (source) |*value| value.deinit();
         return initWithSource(allocator, session, encoder, encoder_length, encoder_mask, vocab_size, control, options, if (source) |*value| value else null);
     }
@@ -242,7 +248,7 @@ test "decoder route retains actual host output rows without copies and cancels b
     var hidden = try backends.Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 2, 4 }, &.{ -2, 1, 2, -1, 3, -1, 1, 0 });
     defer hidden.deinit();
     var tensors = [_]backends.Tensor{hidden};
-    const encoder = stages.EncoderOutputs{ .host = &tensors };
+    var encoder = stages.EncoderOutputs{ .host = &tensors };
     var decoder = try Decoder.init(a, session, &encoder, 2, &.{ 1, 1 }, 4, null);
     var decoder_open = true;
     defer if (decoder_open) decoder.deinit();
@@ -269,6 +275,11 @@ test "decoder route retains actual host output rows without copies and cancels b
         }
     };
     decoder.control = .{ .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, Decoder.initForEncoder(a, session, &encoder, 2, &.{ 1, 1 }, 4, decoder.control, .{}));
+    const cancelled = diagnostics.snapshot().?;
+    try std.testing.expectEqual(@import("diagnostics.zig").DecoderRoute.Selection.failed, cancelled.report.?.decoder_route.?.selected);
+    try std.testing.expectEqualStrings("Cancelled", cancelled.report.?.failure.bytes[0..cancelled.report.?.failure.len]);
+    try std.testing.expect(cancelled.execution == null and cancelled.report.?.transfers == null);
     try std.testing.expectError(error.Cancelled, decoder.step(&.{ 0, 1 }, null, null));
     decoder.deinit();
     decoder_open = false;

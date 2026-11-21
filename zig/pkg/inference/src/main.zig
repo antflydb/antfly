@@ -571,6 +571,9 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
             allow_insecure_public_bind = true;
         } else if (std.mem.eql(u8, args[i], "--allow-unknown-models")) {
             allow_unknown_models = true;
+        } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
+            print("{s}", .{run_usage_options});
+            return;
         } else {
             return error.InvalidArguments;
         }

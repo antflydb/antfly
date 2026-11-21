@@ -170,7 +170,7 @@ pub const NerPipeline = struct {
 
         // Run inference
         if (texts.len > 1 and !@import("../execution/tensor_dispatch.zig").eligible(self.session, inputs)) return error.UnsupportedBatchShape;
-        var outputs = if (self.batch_dispatch) |dispatch| try dispatch.run(alloc, self.session, &run_permit, null, inputs, self.execution_control) else try run_permit.runWithControl(inputs, alloc, self.execution_control);
+        var outputs = try @import("../execution/tensor_dispatch.zig").run(alloc, self.session, &run_permit, null, inputs, self.execution_control, self.batch_dispatch);
         defer {
             for (outputs) |*o| o.deinit();
             alloc.free(outputs);

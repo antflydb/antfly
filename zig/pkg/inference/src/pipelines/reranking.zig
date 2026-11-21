@@ -20,7 +20,6 @@
 
 const text_inputs = @import("../execution/text_inputs.zig");
 const std = @import("std");
-const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const tokenizer_mod = @import("inference_tokenizer");
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -903,15 +902,7 @@ pub const RerankingPipeline = struct {
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) ![]Tensor {
-        if (self.batch_dispatch) |dispatch| return dispatch.run(allocator, self.session, permit, self.execution_lock, inputs, self.execution_control);
-        if (self.execution_lock) |mutex| {
-            if (self.execution_control) |control|
-                try control.lock(mutex)
-            else
-                platform.sync.lockYielding(mutex);
-        }
-        defer if (self.execution_lock) |mutex| mutex.unlock();
-        return permit.runWithControl(inputs, allocator, self.execution_control);
+        return @import("../execution/tensor_dispatch.zig").run(allocator, self.session, permit, self.execution_lock, inputs, self.execution_control, self.batch_dispatch);
     }
 
     fn admitTextRun(

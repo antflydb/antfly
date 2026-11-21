@@ -479,14 +479,7 @@ pub const GlinerPipeline = struct {
         alloc: std.mem.Allocator,
     ) ![]Tensor {
         if (self.execution_control) |control| try control.update(.executing, 0, 1);
-        if (self.execution_lock) |mutex| {
-            if (self.execution_control) |control|
-                try control.lock(mutex)
-            else
-                platform.sync.lockYielding(mutex);
-        }
-        defer if (self.execution_lock) |mutex| mutex.unlock();
-        return permit.runWithControl(inputs, alloc, self.execution_control);
+        return @import("../execution/tensor_dispatch.zig").run(alloc, self.session, permit, self.execution_lock, inputs, self.execution_control, null);
     }
 
     pub fn usesDistributedGpuHosted(self: *const GlinerPipeline) bool {

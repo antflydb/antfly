@@ -117,6 +117,13 @@ pub fn run(allocator: std.mem.Allocator, session: session_mod.Session, permit: ?
     }
     if (permit) |owned| {
         if (owned.session.ptr != session.ptr or owned.session.vtable != session.vtable) return error.InvalidStagePermit;
+        // A prepaid legacy stage may have an explicit task-supplied guard.
+        // Do not infer another guard from Session: prepared permits already
+        // retain their own source/cohort contract. Dispatchers own their gate.
+        if (gate) |mutex| {
+            if (control) |active| try active.lock(mutex) else platform.sync.lockYielding(mutex);
+        }
+        defer if (gate) |mutex| mutex.unlock();
         return owned.runWithControl(inputs, allocator, control);
     }
     return runHost(allocator, session, gate orelse session.execution_gate, inputs, control);
@@ -211,6 +218,8 @@ test "tensor stage dispatch preserves explicit scheduling and never replays a pr
         fn run(self: *@This(), _: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: ?*std.atomic.Mutex, inputs: []const Tensor, control: ?Control) ![]Tensor {
             try std.testing.expect(session.ptr == @as(*anyopaque, @ptrCast(self.probe)) and permit == self.permit and gate == self.gate);
             try std.testing.expect(inputs.len == 0 and control != null);
+            try std.testing.expect(self.gate.tryLock());
+            self.gate.unlock();
             self.probe.dispatch_calls += 1;
             return error.InjectedStageFailure;
         }
@@ -230,4 +239,45 @@ test "tensor stage dispatch preserves explicit scheduling and never replays a pr
     try std.testing.expectError(error.InvalidStagePermit, runSerial(a, other, &permit, &.{}, null));
     try std.testing.expectEqual(@as(usize, 0), foreign.serial_calls);
     try std.testing.expectEqual(@as(usize, 0), probe.serial_calls);
+}
+
+test "prepaid tensor stages own explicit guards and release them on failure and cancellation" {
+    const Probe = struct {
+        gate: std.atomic.Mutex = .unlocked,
+        calls: usize = 0,
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .native;
+        }
+        fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{};
+        }
+        fn close(_: *anyopaque) void {}
+        fn cancelled(_: ?*anyopaque) bool {
+            return true;
+        }
+        fn execute(raw: *anyopaque, _: []const Tensor, _: std.mem.Allocator) ![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.gate.tryLock()) {
+                self.gate.unlock();
+                return error.MissingStageGuard;
+            }
+            self.calls += 1;
+            return error.InjectedStageFailure;
+        }
+        const table = session_mod.Session.VTable{ .run = execute, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+    };
+    var probe = Probe{};
+    const session = session_mod.Session{ .ptr = &probe, .vtable = &Probe.table };
+    var permit = session_mod.RunPermit{ .session = session, .lease = null };
+    defer permit.deinit();
+    try std.testing.expectError(error.InjectedStageFailure, run(std.testing.allocator, session, &permit, &probe.gate, &.{}, null, null));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(probe.gate.tryLock());
+    defer probe.gate.unlock();
+    // Cancellation while waiting must neither enter the backend nor unlock
+    // another owner's guard. The owning caller remains responsible for it.
+    const control = Control{ .cancellation = .{ .is_cancelled_fn = Probe.cancelled } };
+    try std.testing.expectError(error.Cancelled, run(std.testing.allocator, session, &permit, &probe.gate, &.{}, control, null));
+    try std.testing.expect(!probe.gate.tryLock());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }

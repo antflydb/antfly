@@ -146,8 +146,7 @@ pub const EncoderDecoderPipeline = struct {
         defer mask_tensor.deinit();
 
         if (self.execution_control) |control| try control.update(.executing, 0, 1);
-        if (self.batch_dispatch) |dispatch| return dispatch.run(allocator, self.encoder, null, null, &.{ input_ids_tensor, mask_tensor }, self.execution_control);
-        return try self.encoder.runWithControl(&.{ input_ids_tensor, mask_tensor }, allocator, self.execution_control);
+        return @import("../execution/tensor_dispatch.zig").run(allocator, self.encoder, null, null, &.{ input_ids_tensor, mask_tensor }, self.execution_control, self.batch_dispatch);
     }
 
     /// Default task entry point. Stage placement is decided before encoding;
