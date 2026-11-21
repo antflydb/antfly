@@ -190,7 +190,9 @@ pub const Recovery = struct {
             } else complete = false;
         }
         try self.checkpoint(context);
-        return if (complete) .complete else .incomplete;
+        if (!complete) return .incomplete;
+        try self.participants.acknowledgePublished(a, request.binding(), observed.value, coordinator_fence, context);
+        return .complete;
     }
 };
 
@@ -371,6 +373,12 @@ test "data raft ordered history completion recovery retains guard checkpoints an
                     }
                     self.resolves += 1;
                     if (!self.suppress_resolution) self.resolved[index] = true;
+                },
+                .acknowledge_many => |value| {
+                    try std.testing.expect(self.published[0] and self.published[1]);
+                    try std.testing.expectEqualSlices(u8, &self.admission.transaction_id, &value.txn_id);
+                    try std.testing.expectEqual(@as(usize, 1), value.participants.len);
+                    try std.testing.expectEqualStrings(self.admission.participants[1].locator, value.participants[0]);
                 },
                 .publish_completion => |value| {
                     try std.testing.expect(self.resolved[0] and self.resolved[1]);
@@ -591,7 +599,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(preparation_reads, fake.decision_reads);
     try std.testing.expectEqual(preparation_writes, fake.resolves);
     const writes_before_visibility = fake.resolves;
-    const incomplete_visibility = (try coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{})).?;
+    const incomplete_visibility = (try coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, true, .{})).?;
     try std.testing.expect(!incomplete_visibility.propagation_pending);
     try std.testing.expect(incomplete_visibility.visibility_pending);
     try std.testing.expect(incomplete_visibility.visibility_retry_pending);
@@ -614,13 +622,13 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     // Failed admission never reaches a decision read or participant mutation.
     const decision_reads_before_rejection = fake.decision_reads;
     fake.unsupported_owners[1] = true;
-    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{}));
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, true, .{}));
     fake.unsupported_owners[0] = true;
-    try std.testing.expectEqual(@as(?admission_mod.Result, null), try coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{}));
+    try std.testing.expectEqual(@as(?admission_mod.Result, null), try coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, true, .{}));
     try std.testing.expectError(error.ChangefeedCapabilityUnsupported, coordinator.prepare(a, admission.transaction_id, 10, &source_inputs, .{}));
     fake.unsupported_owners = .{ false, false };
     fake.retention_limit_bytes = 1;
-    try std.testing.expectError(error.HistoryTooLarge, coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{}));
+    try std.testing.expectError(error.HistoryTooLarge, coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, true, .{}));
     try std.testing.expectEqual(decision_reads_before_rejection, fake.decision_reads);
     try std.testing.expectEqualDeep([_]usize{ 2, 2 }, fake.visibility_calls);
     try std.testing.expectEqual(publications_after_completion, fake.publishes);

@@ -2019,7 +2019,7 @@ pub const TxnManager = struct {
 
     pub fn retainsCoordinatorAcknowledgement(self: *TxnManager, txn_id: TxnId) !bool {
         const record = try self.loadTransactionRecord(txn_id);
-        return record.coordinator and record.retain_terminal;
+        return record.coordinator and (record.retain_terminal or try self.keyExists(&makeSidecarKey(completion_admission_prefix, txn_id)));
     }
 
     pub fn listTransactions(self: *TxnManager, alloc: Allocator) ![]TxnSummary {
@@ -3911,7 +3911,7 @@ pub fn requireCompletionResolvedRecord(raw: []const u8, commit_version: u64) !vo
 /// explicitly owned completion records qualify for restart decision recovery.
 pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_wire.zig").Record {
     const record = try decodeRecord(raw);
-    if (!record.coordinator_known or !record.coordinator or !record.retain_terminal_known or !record.retain_terminal or !record.prepared_known or (record.status != .pending and !record.intents_resolved_known)) return error.InvalidTxnRecord;
+    if (!record.coordinator_known or !record.coordinator or !record.retain_terminal_known or !record.prepared_known or (record.status != .pending and !record.intents_resolved_known)) return error.InvalidTxnRecord;
     const result: @import("history_decision_wire.zig").Record = .{
         .status = switch (record.status) {
             .pending => .pending,
@@ -3925,6 +3925,7 @@ pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_w
         .prepared = record.prepared,
         .intents_resolved = record.intents_resolved,
         .digest = completion.bytesDigest(raw),
+        .retain_terminal = record.retain_terminal,
         .source_purpose = record.source_purpose,
         .source_scope = record.source_scope,
     };

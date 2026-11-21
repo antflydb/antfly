@@ -45,6 +45,7 @@ pub const Plan = struct {
     participant_ids: []const []const u8,
     begin_timestamp: u64,
     created_at_ns: u64,
+    retain_terminal: bool = true,
     ordinary_producer: bool = false,
     legacy_producer: bool = false,
     source_purpose: ?[32]u8,
@@ -291,7 +292,7 @@ pub const Plan = struct {
         if (index >= self.participants.len) return error.InvalidTxnRecord;
         const owner = self.participants[index].owner;
         try self.admission.requireRoutedOwner(owner);
-        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .ordinary_producer = self.ordinary_producer, .legacy_producer = self.legacy_producer, .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = true, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner, .source_purpose = self.source_purpose, .source_scope = self.source_scope, .source_checkpoint = self.source_checkpoint, .source_checkpoint_receipts = self.source_checkpoint_receipts } } };
+        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .ordinary_producer = self.ordinary_producer, .legacy_producer = self.legacy_producer, .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = self.retain_terminal, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner, .source_purpose = self.source_purpose, .source_scope = self.source_scope, .source_checkpoint = self.source_checkpoint, .source_checkpoint_receipts = self.source_checkpoint_receipts } } };
     }
 
     /// Parsed retry input has independent ownership and can outlive this plan.

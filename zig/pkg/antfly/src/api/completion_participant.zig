@@ -120,6 +120,40 @@ pub const Port = struct {
         return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
     }
 
+    pub fn acknowledgePublished(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, fence: metadata.CatalogRouteFence, original: operation.RequestContext) !void {
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        try observation.validate(lookup);
+        const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
+        if (decision.record.status != .committed) return error.SourceOutcomeUnresolved;
+        const admission = decision.admission.admission;
+        const owner = try admission.recoveryOwner(admission.coordinator_namespace);
+        const coordinator = try admission.member(admission.coordinator_namespace);
+        const locator = local.api_local_transaction_contract.parseParticipantRef(coordinator.locator) orelse return error.InvalidParticipant;
+        try validateParticipantFence(owner, locator.group_id, fence);
+        var pending: [64][]const u8 = undefined;
+        var count: usize = 0;
+        for (admission.participants) |member| {
+            if (std.mem.eql(u8, &member.namespace, &admission.coordinator_namespace)) continue;
+            pending[count] = member.locator;
+            count += 1;
+            if (count == pending.len) {
+                try self.acknowledgeParticipants(a, owner, fence, locator.table_name, admission.transaction_id, pending[0..count], context, scope.deadline_ns);
+                count = 0;
+            }
+        }
+        // Keep the coordinator's own lease until every follower was confirmed.
+        if (!decision.record.retain_terminal) {
+            pending[count] = coordinator.locator;
+            count += 1;
+        }
+        if (count != 0) try self.acknowledgeParticipants(a, owner, fence, locator.table_name, admission.transaction_id, pending[0..count], context, scope.deadline_ns);
+    }
+
+    fn acknowledgeParticipants(self: Port, a: A, owner: completion.RoutedOwner, fence: metadata.CatalogRouteFence, table: []const u8, txn_id: types.TxnId, participants: []const []const u8, context: operation.RequestContext, deadline_ns: u64) !void {
+        return self.writeRequest(a, fence, owner, table, .{ .sync_level = .write, .transaction = .{ .acknowledge_many = .{ .txn_id = txn_id, .participants = participants } } }, context, deadline_ns);
+    }
+
     /// Only the original coordinator can win the first terminal decision.
     /// A raced COMMIT is a conflict, never permission to propagate an abort.
     pub fn abortExpired(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, fence: metadata.CatalogRouteFence, cutoff_ns: u64, timestamp_ns: u64, original: operation.RequestContext) !void {

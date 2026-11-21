@@ -194,10 +194,11 @@ pub const Coordinator = struct {
         return .{ .arena = arena, .plan = plan, .routes = routes, .coordinator_index = coordinator_index orelse return error.InvalidParticipant };
     }
 
-    pub fn commit(self: Coordinator, a: A, transaction_id: [16]u8, begin_timestamp: u64, commit_version: u64, inputs: []const Input, sync_level: types.SyncLevel, original: Context) !?Result {
+    pub fn commit(self: Coordinator, a: A, transaction_id: [16]u8, begin_timestamp: u64, commit_version: u64, inputs: []const Input, sync_level: types.SyncLevel, retain_terminal: bool, original: Context) !?Result {
         if (commit_version <= begin_timestamp) return error.InvalidTxnRecord;
         var prepared = (try self.prepare(a, transaction_id, begin_timestamp, inputs, original)) orelse return null;
         defer prepared.deinit();
+        prepared.plan.retain_terminal = retain_terminal;
         var result = try self.commitPrepared(a, &prepared, commit_version, sync_level, original);
         // Preserve commit's borrowed-input name contract after Prepared dies.
         for (inputs) |input| if (input.group_id == result.coordinator_group_id and std.mem.eql(u8, input.table_name, result.coordinator_table_name)) {

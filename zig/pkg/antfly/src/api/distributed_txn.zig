@@ -1651,7 +1651,7 @@ fn executeMultiTableCommitOnce(
             .topology_epoch = participant.topology_epoch,
             .intent = participant.intentRequest(),
         };
-        if (try completion_coordinator.commit(alloc, txn_id, begin_timestamp, commit_version, inputs, sync_level, options.completion_context)) |completed| {
+        if (try completion_coordinator.commit(alloc, txn_id, begin_timestamp, commit_version, inputs, sync_level, options.retain_terminal, options.completion_context)) |completed| {
             if (options.report_post_commit_failure) {
                 if (completed.propagation_pending) return error.CommitPropagationIncomplete;
                 if (completed.visibility_retry_pending) return error.CommitVisibilityNotSatisfied;
