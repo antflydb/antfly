@@ -40,7 +40,7 @@ pub const Picture = struct {
 };
 pub const Restart = struct { packet: usize = 0, logical: usize = 0, sequence: ?struct { packet: usize, offset: usize, size: usize } = null };
 pub const ReplayStats = struct { first_packet: usize = 0, packets_decoded: usize = 0, bootstrap_bytes: usize = 0, output_copy_bytes: u64 = 0, outputs_skipped: usize = 0 };
-pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 65536, decoder: codecs.Options = .{}, strategy: enum { headers, reconstruct } = .headers, replay_stats: ?*ReplayStats = null, copy_unselected_outputs: bool = false };
+pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 65536, decoder: codecs.Options = .{}, strategy: enum { headers, reconstruct } = .headers, replay_stats: ?*ReplayStats = null, copy_unselected_outputs: bool = false, packet_stop: ?usize = null };
 pub const Index = struct {
     allocator: std.mem.Allocator,
     pictures: []Picture,
@@ -48,6 +48,7 @@ pub const Index = struct {
     reader: ?*const media.webm.Reader = null,
     apple_packet_layout: bool = false,
     coded_bytes: ?usize = null,
+    packet_byte_prefix: []usize = &.{},
     frame_units: usize = 0,
     largest_picture: u64 = 0,
     operating_point: u5 = 0,
@@ -57,9 +58,33 @@ pub const Index = struct {
     pub fn deinit(self: *Index) void {
         self.allocator.free(self.pictures);
         self.allocator.free(self.restarts);
+        self.allocator.free(self.packet_byte_prefix);
         self.reservation.deinit();
         self.* = undefined;
     }
+    pub fn restartFor(self: Index, first: usize) Restart {
+        var lo: usize = 0;
+        var hi = self.restarts.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.restarts[mid].logical <= first) lo = mid + 1 else hi = mid;
+        }
+        return if (lo == 0) .{} else self.restarts[lo - 1];
+    }
+
+    pub fn packetBytes(self: Index, packets: []const media.webm.Packet, first: usize, stop: usize, control: media.source.Control) !usize {
+        if (first > stop or stop > packets.len) return error.InvalidPacketIndex;
+        if (self.packet_byte_prefix.len == packets.len + 1) {
+            return self.packet_byte_prefix[stop] - self.packet_byte_prefix[first];
+        }
+        var bytes: usize = 0;
+        for (packets[first..stop], 0..) |packet, i| {
+            if (i % 256 == 0) try control.check();
+            bytes = try std.math.add(usize, bytes, packet.size);
+        }
+        return bytes;
+    }
+
     pub fn sourceTimeline(self: Index) ?media.webm.SourceTimeline {
         return if (self.reader) |reader| reader.source_timeline else null;
     }
@@ -168,6 +193,11 @@ const Collect = struct {
     }
 };
 pub fn codedBytes(reader: *const media.webm.Reader, control: media.source.Control) !usize {
+    return sumPacketExtents(reader, control, null);
+}
+
+fn sumPacketExtents(reader: *const media.webm.Reader, control: media.source.Control, prefix: ?[]usize) !usize {
+    if (prefix) |offsets| offsets[0] = 0;
     const length = reader.input.length();
     var total: usize = 0;
     for (reader.packets, 0..) |packet, i| {
@@ -177,6 +207,7 @@ pub fn codedBytes(reader: *const media.webm.Reader, control: media.source.Contro
         }
         if (packet.offset > length or packet.size > length - packet.offset) return error.UnexpectedEndOfSource;
         total = try std.math.add(usize, total, packet.size);
+        if (prefix) |offsets| offsets[i + 1] = total;
     }
     return total;
 }
@@ -184,17 +215,21 @@ pub fn codedBytes(reader: *const media.webm.Reader, control: media.source.Contro
 pub fn index(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options) !Index {
     if (options.max_pictures > std.math.maxInt(usize) / @sizeOf(Picture)) return error.ResourceLimitExceeded;
     if (reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
-    const coded_bytes = try codedBytes(reader, options.decoder.control);
     var memory = media.admission.TrackedAllocator{
         .backing = a,
         .reservation = if (options.decoder.admission_pool) |pool| try pool.acquire(.{}) else .{},
         .limit = std.math.maxInt(usize),
     };
     errdefer memory.reservation.deinit();
+    const metadata = memory.allocator();
+    const prefix = metadata.alloc(usize, try std.math.add(usize, reader.packets.len, 1)) catch |err| return memory.denied orelse err;
+    errdefer metadata.free(prefix);
+    const coded_bytes = try sumPacketExtents(reader, options.decoder.control, prefix);
     var result = buildIndex(memory.allocator(), a, reader, options) catch |err|
         return if (err == error.OutOfMemory) memory.denied orelse err else err;
     result.allocator = a;
     result.coded_bytes = coded_bytes;
+    result.packet_byte_prefix = prefix;
     result.reservation = memory.reservation;
     return result;
 }
@@ -304,10 +339,7 @@ pub fn walkIndexed(a: std.mem.Allocator, reader: *media.webm.Reader, options: Op
             if (id >= indexed.pictures.len) return error.InvalidPacketIndex;
             first = @min(first, id);
         }
-        for (indexed.restarts) |point| {
-            if (point.logical > first) break;
-            restart = point;
-        }
+        restart = indexed.restartFor(first);
     }
     return walkFrom(a, reader, options, restart, selected, context, accept, null, null);
 }
@@ -354,10 +386,7 @@ pub const Continuation = struct {
         var restart = Restart{ .packet = self.packet, .logical = self.logical };
         const warm = self.vp8_session != null or self.session != null;
         if (!warm) {
-            for (indexed.restarts) |point| {
-                if (point.logical > first) break;
-                restart = point;
-            }
+            restart = indexed.restartFor(first);
             self.packet = restart.packet;
             self.logical = restart.logical;
         }
@@ -408,10 +437,7 @@ pub fn walkRecoveringIndexed(a: std.mem.Allocator, reader: *media.webm.Reader, o
             if (id >= indexed.pictures.len) return error.InvalidPacketIndex;
             first = @min(first, id);
         }
-        for (indexed.restarts) |point| {
-            if (point.logical > first) break;
-            restart = point;
-        }
+        restart = indexed.restartFor(first);
     }
     var stats = RecoveryStats{};
     while (true) {
@@ -471,7 +497,8 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
     if (selected) |ids| for (ids) |id| {
         last = @max(last, id);
     };
-    if (restart.packet > reader.packets.len or restart.logical > options.max_pictures) return error.InvalidPacketIndex;
+    const packet_stop = options.packet_stop orelse reader.packets.len;
+    if (packet_stop > reader.packets.len or restart.packet > packet_stop or restart.logical > options.max_pictures) return error.InvalidPacketIndex;
     if (options.replay_stats) |stats| stats.* = .{ .first_packet = restart.packet };
     var logical: usize = restart.logical;
     defer if (retained) |owner| {
@@ -485,7 +512,7 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
             owner.packet = session.next_index;
         };
         session.next_index = restart.packet;
-        while (session.next_index < reader.packets.len) {
+        while (session.next_index < packet_stop) {
             try options.decoder.control.check();
             if (options.replay_stats) |stats| stats.packets_decoded += 1;
             const packet_id = session.next_index;
@@ -531,7 +558,7 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
         };
         try session.initializeWebm(reader);
         if (if (cold) restart.sequence else null) |span| {
-            if (span.packet >= reader.packets.len) return error.InvalidPacketIndex;
+            if (span.packet >= packet_stop) return error.InvalidPacketIndex;
             const packet = reader.packets[span.packet];
             if (span.offset > packet.size or span.size > packet.size - span.offset) return error.InvalidVideoData;
             if (span.size > options.decoder.max_packet_bytes) return error.ResourceLimitExceeded;
@@ -543,7 +570,7 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
             defer initialization.deinit();
             if (initialization.frames.len != 0) return error.InvalidVideoData;
         }
-        for (reader.packets[restart.packet..], restart.packet..) |packet, packet_id| {
+        for (reader.packets[restart.packet..packet_stop], restart.packet..) |packet, packet_id| {
             if (options.replay_stats) |stats| stats.packets_decoded += 1;
             try options.decoder.control.check();
             if (packet.size > options.decoder.max_packet_bytes) return error.ResourceLimitExceeded;

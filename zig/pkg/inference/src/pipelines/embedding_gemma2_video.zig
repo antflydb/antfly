@@ -89,6 +89,7 @@ pub const WebmInput = struct {
         ids: [32]usize = @splat(0),
         count: usize,
         first_packet: usize,
+        packet_stop: usize,
         coded_bytes: usize,
     };
 
@@ -1536,6 +1537,22 @@ test "embeddinggemma2 video reader timestamps and cache binding survive independ
     defer a.free(expected_ids);
     try std.testing.expectEqualSlices(usize, expected_ids, planned_ids);
 
+    const span = planned.window.?;
+    var bytes_in_span: usize = 0;
+    for (reader.packets[span.first_packet..span.packet_stop]) |packet| bytes_in_span += packet.size;
+    try std.testing.expectEqual(bytes_in_span, try index.packetBytes(reader.packets, span.first_packet, span.packet_stop, .{}));
+    const Sink = struct {
+        fn frame(_: *anyopaque, _: usize, _: *const video.codecs.Frame) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var marker: u8 = 0;
+    var bounded_replay = webmDecodeOptions(.{}, null);
+    bounded_replay.packet_stop = index.restartFor(0).packet;
+    const reads_before_replay = source.reads;
+    try std.testing.expectError(error.InvalidPacketIndex, video.webm_pictures.walkIndexed(a, &reader, bounded_replay, index, &.{0}, &marker, Sink.frame));
+    try std.testing.expectEqual(reads_before_replay, source.reads);
+
     var cancelled_scope = InspectionScope{ .allocator = a };
     defer cancelled_scope.deinit();
     const scoped_config = Configuration{ .webm = input, .sampling = .gemma4, .inspection_scope = &cancelled_scope };
@@ -1983,26 +2000,14 @@ pub fn planWebmWindow(input: WebmInput, timestamp_policy: video.sampling.Timesta
         first = @min(first, id);
         last_packet = @max(last_packet, index.pictures[id].packet_index orelse return error.InvalidVideoIndex);
     }
-    // Find the same codec restart used by indexed replay.
-    var lo: usize = 0;
-    var hi = index.restarts.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (index.restarts[mid].logical <= first) lo = mid + 1 else hi = mid;
-    }
-    const restart = if (lo == 0) video.webm_pictures.Restart{} else index.restarts[lo - 1];
+    const restart = index.restartFor(first);
     if (restart.packet > last_packet or last_packet >= input.reader.packets.len) return error.InvalidVideoIndex;
-    var total: usize = if (restart.sequence) |sequence| sequence.size else 0;
-    for (input.reader.packets[restart.packet .. last_packet + 1], 0..) |packet, i| {
-        if (i % 256 == 0) {
-            try worker.check();
-            try input.reader.input.checkControl();
-        }
-        total = try std.math.add(usize, total, packet.size);
-        if (total > limit) return error.ResourceLimitExceeded;
-    }
+    const packet_stop = last_packet + 1;
+    const payload = try index.packetBytes(input.reader.packets, restart.packet, packet_stop, worker);
+    const total = try std.math.add(usize, payload, if (restart.sequence) |sequence| sequence.size else 0);
+    if (total > limit) return error.ResourceLimitExceeded;
     var result = input;
-    result.window = .{ .index = input.index, .policy = timestamp_policy, .count = selected.len, .first_packet = restart.packet, .coded_bytes = total };
+    result.window = .{ .index = input.index, .policy = timestamp_policy, .count = selected.len, .first_packet = restart.packet, .packet_stop = packet_stop, .coded_bytes = total };
     @memcpy(result.window.?.ids[0..selected.len], selected);
     return result;
 }
@@ -3273,7 +3278,10 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
         }
     }
     capture.decoder.record(.portable);
-    const options = webmDecodeOptions(reader.input.control, capture.pool);
+    var options = webmDecodeOptions(reader.input.control, capture.pool);
+    if (input) |bound| if (bound.window) |window| {
+        options.packet_stop = window.packet_stop;
+    };
     if (if (input) |bound| bound.continuation else null) |owner| {
         // Model preparation borrows a reader copy with per-window cancellation.
         // Retained codec state stays bound to the request's immutable reader.

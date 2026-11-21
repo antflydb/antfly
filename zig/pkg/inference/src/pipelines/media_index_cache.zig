@@ -89,6 +89,7 @@ pub const Cache = struct {
             result.index.allocator = a;
             result.index.pictures = try a.dupe(video.webm_pictures.Picture, value.index.pictures);
             result.index.restarts = try a.dupe(video.webm_pictures.Restart, value.index.restarts);
+            result.index.packet_byte_prefix = try a.dupe(usize, value.index.packet_byte_prefix);
             result.timeline.allocator = a;
             result.timeline.entries = try a.dupe(@typeInfo(@TypeOf(value.timeline.entries)).pointer.child, value.timeline.entries);
             result.timeline.maxima = try a.dupe(i128, value.timeline.maxima);
@@ -307,7 +308,7 @@ pub const Cache = struct {
         };
         const planning_bytes = if (planning) |plan| switch (plan) {
             .mp4 => |owner| video_owner.Snapshot.storageBytes(owner),
-            .webm => |snapshot| std.mem.sliceAsBytes(snapshot.index.pictures).len +| std.mem.sliceAsBytes(snapshot.index.restarts).len +| std.mem.sliceAsBytes(snapshot.timeline.entries).len +| std.mem.sliceAsBytes(snapshot.timeline.maxima).len,
+            .webm => |snapshot| std.mem.sliceAsBytes(snapshot.index.pictures).len +| std.mem.sliceAsBytes(snapshot.index.restarts).len +| std.mem.sliceAsBytes(snapshot.index.packet_byte_prefix).len +| std.mem.sliceAsBytes(snapshot.timeline.entries).len +| std.mem.sliceAsBytes(snapshot.timeline.maxima).len,
         } else 0;
         if (estimate +| planning_bytes > max_bytes - @sizeOf(Entry)) return null;
         var header_lease = admission.acquire(admission.context, @sizeOf(Entry)) catch return null;
