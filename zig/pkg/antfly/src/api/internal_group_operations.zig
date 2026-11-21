@@ -442,7 +442,14 @@ pub const Operations = struct {
             error.MergeSourceProjectionNotReady,
             error.MergeSourceProjectionAdvanced,
             error.StorageBusy,
-            => return error.GroupLeaderUnavailable,
+            => {
+                std.log.debug("transition temporarily unavailable group_id={} action={s} err={s}", .{
+                    group_id,
+                    @tagName(action),
+                    @errorName(err),
+                });
+                return error.GroupLeaderUnavailable;
+            },
             else => {
                 logUnknownTransitionFailure(group_id, action, err);
                 return error.Internal;
