@@ -44,8 +44,8 @@ in the same durability domain as the primary rows. Segment ids are big-endian u6
 | Segment | `segments/<seg>` | AFSM segment bytes | no |
 | Segment range | `meta/segment_range:<seg>` | min/max doc key | no |
 | Active marker | `meta/active_segment:<seg>` | `{1}` | added/removed only |
-| Tombstone container | `tomb/<seg><high16>` | one roaring container | yes |
-| Doc map | `docmap/<doc key>` | `<seg><local id u32>` | yes |
+| Tombstones | `deletions/<seg>` | roaring bitmap | yes |
+| Doc map | `docmap/<doc key>` | `<seg be64><local id be32>` | yes |
 | Segment counter | `meta/next_seg_id` | u64 | yes |
 | Format | `meta/text_storage_format` | u32 | at upgrade |
 
@@ -54,15 +54,17 @@ Rules:
 - A segment and its range are written once, when the segment id is allocated,
   and deleted only when the segment is retired. Caches keyed by segment id never
   need invalidating.
-- Tombstones are stored per roaring container (`high16` = local id >> 16). A
-  write that deletes one document rewrites one small container, never the whole
-  bitmap.
+- Tombstones are read and rewritten at the tip, so a stale process cannot drop
+  another's bits. Splitting each bitmap into per-container records
+  (`deletions/<seg><high16>`) is a later size optimization with no effect on
+  correctness.
 - The doc map names each live document's current `(segment, local id)`. It is the
   only way a write finds an old version; nothing scans segments.
 - `meta/next_seg_id` is read and advanced inside the transaction that publishes
   the segment, so two processes can never reuse an id.
-- The doc map is kept out of the catalog mirror (it is read only through
-  transactions), so the mirror does not hold every document key.
+- The doc map is kept out of the catalog mirror: `native_catalog_backend`
+  treats its namespace (`tip_namespace`) as read from the transaction's staged
+  writes and then the file (`Sink.loadOneAlloc`), never mirrored.
 
 ## Reading at the transaction tip
 
@@ -120,20 +122,21 @@ published in the shared lock region tells a process cheaply that an index moved
 
 ## Merges
 
-A merge reads its input segments, builds output segments, and publishes in its own
-transaction at the tip:
+A merge builds its output segments from its inputs off the write path. For an
+index with a complete doc map, its publication decides each output document's
+fate from the doc map rather than carrying tombstones from memory: a document is
+live exactly when its key's entry names one of the merge's inputs and the output
+holds a single copy of it; it is repointed to its output location. Every other
+copy (deleted or rewritten since the merge read its inputs, by any process) is
+tombstoned in the output. Two copies of a live key abort the merge.
 
-- Validate that every input's active marker is still present.
-- Read every input's tombstone containers at the tip; a document deleted since
-  the merge began is dropped from the output's doc map and tombstoned in the
-  output, using the merge's source map.
-- Rewrite `docmap/<key>` for every live document to its output location, and
-  only if the doc map still names the input location (a newer version wins).
-- Allocate output ids from `meta/next_seg_id`; retire inputs (segments, ranges,
-  markers, tombstone containers).
-
-There are no in-memory deletion deltas and no "deleted count changed, discard the
-merge" check: a concurrent delete is carried forward from the durable records.
+Those doc map reads are guarded. The publication carries the index scope's
+sequence as read (`native_catalog_backend.scopeGuard`); the Lite sink checks it
+under writer authority at the file's tip and refuses the commit
+(`error.IndexScopeChanged`) when any commit changed the scope since. The merge
+scheduler treats that as a stale merge and plans it again. Guarded commits never
+take the deferred ride-along path, so a refusal is seen before the mirror swaps.
+The segment counter advances in the same commit.
 
 ## Upgrade
 
@@ -166,17 +169,20 @@ authoritative mirror) and algebraic (HLL sketches split into register blocks).
 
 ## Implementation stages
 
-1. Read surface: `Txn.getIndexCatalog` and `View.getIndexCatalog`, with tests
-   for staged-over-committed reads and deletes.
-2. Durable records and the transactional delete: doc map, tombstone containers,
-   counter key; the inline path stages from transaction reads; install applies
-   tombstones after durability. Upgrade of existing indexes.
-3. Worker (derived replay) path on the same records.
-4. Merges validate and carry deletes at the tip; remove the in-memory deletion
-   deltas.
-5. Incremental cross-process refresh; remove the full reopen after a foreign
+1. Done. Read surface: `Txn.getIndexCatalogAlloc` and
+   `View.getIndexCatalogAlloc`.
+2. Done. Every publisher keeps the doc map (inline, replay worker, merges,
+   rebuild pages, split). Upgrade builds it once and stamps
+   `meta/text_storage_format`.
+3. Done for the inline path: an upgraded index's inline write finds old
+   versions, tombstones and segment ids at the tip; in-memory tombstones are set
+   only after durability.
+4. Done. Merges decide tombstones from the doc map at a guarded tip.
+5. Next. The replay worker's deletes on the same records (guarded).
+6. Incremental cross-process refresh; remove the full reopen after a foreign
    index commit.
-6. Prepare/stage/install split; no index guard or writer lease across the fsync.
+7. Prepare/stage/install split; no index guard or writer lease across the fsync.
+8. Per-container tombstone records.
 
 Each stage keeps the full-text crash sweeps, the multi-process test
 `capi native separate writer processes keep full-text deletes at full_index`, and
