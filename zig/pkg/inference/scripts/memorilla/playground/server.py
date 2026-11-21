@@ -23,7 +23,8 @@ inference server (``run.sh`` starts both):
 1. every chunk is split into sentence-greedy passages of at most 64 encoder
    tokens (Qwen3-Embedding tokenizer, no special tokens; the rule of the Zig
    pooled-pass chunker ``chunkDocument``);
-2. the passages are ranked for the question by dense cosine between stock
+2. ranking averages each raw passage score and its score with the source
+   opening sentence prepended. Dense scores use cosine between stock
    Qwen3-Embedding-4B vectors from the server's ``/ai/v1/embed`` route (the
    upstream Memorilla retrieval the cascade studies' candidate lists used,
    ``qwen_hybrid_eval.retrieval_order``); ``--ranking bm25`` is a CPU
@@ -40,6 +41,7 @@ Stdlib only, except ``tokenizers`` for exact passage token counts. Binds to
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import re
@@ -291,7 +293,7 @@ def segments(
             cuts.update(r)
     cuts = sorted(c for c in cuts if 0 <= c <= len(text))
     out = []
-    for a, b in zip(cuts, cuts[1:]):
+    for a, b in itertools.pairwise(cuts):
         if a == b:
             continue
         kind = "plain"
@@ -311,7 +313,7 @@ class Playground:
         self.args = args
         self.zig = Zig(args.zig_url, args.timeout_ms)
         self.count = TokenCounter(args.tokenizer)
-        self.vectors: dict[str, list[float]] = {}
+        self.vectors: dict[tuple[str, str], list[float]] = {}
         self.identity: str | None = args.encoder_identity
         self.lock = threading.Lock()
         self.samples = json.loads((HERE / "samples.json").read_text())
@@ -368,16 +370,39 @@ class Playground:
 
     def rank(self, passages: list[dict], question: str) -> tuple[list[dict], dict]:
         texts = [p["text"] for p in passages]
+        # A later passage may name the key holder without naming the site.
+        # Use the opening sentence of its own chunk as retrieval context.
+        # The reader and its citation offsets still use the original slices.
+        openings = {
+            p["chunk"]: re.split(
+                r"(?<=[.!?])[ \t\n\r\x0b\x0c]|\n", p["text"], maxsplit=1
+            )[0]
+            for p in passages
+            if p["index"] == 0
+        }
+        contextual = [
+            openings[p["chunk"]] + "\n" + p["text"] if p["index"] else p["text"]
+            for p in passages
+        ]
         started = time.perf_counter()
         method = self.args.ranking
         if method == "dense":
-            vectors = self.embed(texts, "RETRIEVAL_DOCUMENT")
             query = self.embed([question], "RETRIEVAL_QUERY")[0]
-            scores = cosine_order(vectors, query)
-            label = "dense cosine, stock Qwen3-Embedding-4B (server /ai/v1/embed)"
+
+            def score(documents):
+                return cosine_order(self.embed(documents, "RETRIEVAL_DOCUMENT"), query)
+
+            label = "dense cosine, stock Qwen3-Embedding-4B"
         else:
-            scores = bm25_scores(texts, question)
-            label = "BM25 (k1 1.5, b 0.75) over the passages"
+
+            def score(documents):
+                return bm25_scores(documents, question)
+
+            label = "BM25 (k1 1.5, b 0.75)"
+        scores = score(texts)
+        if contextual != texts:
+            scores = [(raw + ctx) / 2 for raw, ctx in zip(scores, score(contextual))]
+        label += ", mean passage and source-context scores"
         order = sorted(range(len(passages)), key=lambda i: (-scores[i], i))
         ranked = []
         for rank, i in enumerate(order):
@@ -549,7 +574,7 @@ class Handler(BaseHTTPRequestHandler):
     playground: Playground
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
+        sys.stderr.write(f"{self.log_date_time_string()} {fmt % args}\n")
 
     def send_json(self, status: int, payload: dict):
         raw = json.dumps(payload, ensure_ascii=False).encode()

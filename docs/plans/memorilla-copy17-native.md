@@ -2782,8 +2782,14 @@ Findings:
   another site's key-holder passage #2. The narrow read answers
   "Anouk Fennimore" (from another site's record) at margin +5.1, and every
   mode is wrong.
-  - A per-passage context prefix (chunk title or first sentence) is the
-    obvious fix. It is not built.
+  - Follow-up: the playground averages the ranking scores with and without
+    the source opening sentence. The reader receives the original slices.
+    With the default dense ranking and auto read, Bellmoor's key-holder
+    passage enters the first two and the answer is Marisol Teague, cited
+    from Bellmoor. On the nine built-in questions, seven answers stayed
+    identical and the crane answer changed from "Climbs" to "By adding mast
+    sections." Using only the prefixed score lost the Ordway alarm code;
+    averaging retained 6192.
 - `wide` alone is worse than `auto` on exact recall (4 vs 6 of 8). With up to
   9 passages read, the head picks a span in another site's record
   (Lindqvist and Rowe for Tamsin Reach; Bellmoor's gate code for the Ordway

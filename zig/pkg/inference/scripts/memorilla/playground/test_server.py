@@ -17,10 +17,11 @@
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import server  # noqa: E402
+import server
 
 
 def words(text: str) -> int:
@@ -99,3 +100,22 @@ def test_bm25_prefers_the_matching_passage():
 def test_cosine_order():
     scores = server.cosine_order([[1.0, 0.0], [0.6, 0.8], [0.0, 2.0]], [0.0, 1.0])
     assert [round(s, 3) for s in scores] == [0.0, 0.8, 1.0]
+
+
+def test_rank_disambiguates_key_holders_and_preserves_citable_source_text():
+    playground = server.Playground.__new__(server.Playground)
+    playground.args = SimpleNamespace(passage_tokens=6, ranking="bm25")
+    playground.count = words
+    chunks = [
+        "Site record: Oak Yard. The key holder is Pat.",
+        "Site record: Willow Yard. The key holder is Jo.",
+    ]
+    passages = playground.passages(chunks)
+    question = "Who is the key holder for Willow Yard?"
+    scores = server.bm25_scores([p["text"] for p in passages], question)
+    assert scores[1] == scores[3]  # Both holder passages lost their subject.
+    ranked, _ = playground.rank(passages, question)
+    assert ranked[0]["text"] == "The key holder is Jo."
+    for p in ranked:
+        assert chunks[p["chunk"]][p["start"] : p["end"]] == p["text"]
+        assert p["tokens"] == words(p["text"])
