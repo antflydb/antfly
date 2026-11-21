@@ -117,9 +117,9 @@ fn authenticate(api: *http.ApiHttpServer, credential: http.AuthenticatedRequest)
 }
 
 pub fn durableOwner(identity: http.AuthenticatedIdentity) !control.Digest {
-    if (identity.is_internal_service or identity.live_user_manager == null or identity.credential_principal.len == 0)
-        return error.Forbidden;
-    const manager = identity.live_user_manager.?;
+    if (identity.is_internal_service or identity.credential_principal.len == 0) return error.Forbidden;
+    if (identity.trusted_changefeed_owner) |owner| return owner;
+    const manager = identity.live_user_manager orelse return error.Forbidden;
     const subject = control.hash(.{
         .domain = "antfly:changefeed-owner:v1",
         .username = identity.username,

@@ -2064,6 +2064,9 @@ pub const AuthenticatedIdentity = struct {
     /// Multiple API keys owned by one user must not become interchangeable
     /// transaction-session capabilities.
     credential_principal: []u8 = &.{},
+    /// Stable binding for a user token verified against the configured
+    /// upstream issuer and signing authority.
+    trusted_changefeed_owner: ?[32]u8 = null,
     /// True only for an audience-bound node/service credential. A generic
     /// trusted upstream user is deliberately not an internal service.
     is_internal_service: bool = false,
@@ -9102,8 +9105,23 @@ pub const ApiHttpServer = struct {
         else
             try self.alloc.dupe(u8, "{}");
 
+        const trusted_user_authority = self.cfg.trusted_principal_secret orelse "";
+        const trusted_changefeed_owner = if (!is_internal_service and expected_issuer != null and
+            std.mem.eql(u8, trusted_user_authority, secret))
+        blk: {
+            const digest = @import("../metadata/changefeed_control.zig").hash(.{
+                .domain = "antfly:trusted-changefeed-owner:v1",
+                .issuer = expected_issuer.?,
+                .subject = subject,
+                .tenant = jsonStringField(payload.get("tenant")) orelse "",
+            });
+            var owner: [32]u8 = undefined;
+            std.crypto.auth.hmac.sha2.HmacSha256.create(&owner, &digest, secret);
+            break :blk owner;
+        } else null;
         return .{
             .username = try self.alloc.dupe(u8, subject),
+            .trusted_changefeed_owner = trusted_changefeed_owner,
             .credential_principal = try std.fmt.allocPrint(
                 self.alloc,
                 "trusted:{s}:{s}",
@@ -60403,6 +60421,7 @@ pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedId
     errdefer owned.deinit(alloc);
     owned.user_instance_id = value.user_instance_id;
     owned.is_internal_service = value.is_internal_service;
+    owned.trusted_changefeed_owner = value.trusted_changefeed_owner;
     owned.mcp_creation_discovery = value.mcp_creation_discovery;
     owned.live_user_manager = value.live_user_manager;
     owned.bound_policy_roles = value.bound_policy_roles;

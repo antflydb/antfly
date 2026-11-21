@@ -15,6 +15,7 @@
 
 """Exercise coordinated SQL writes with stock PostgreSQL logical replication."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -24,16 +25,63 @@ from pathlib import Path
 
 import conftest as harness
 import pytest
+from helpers import wait_until
 from port_reservations import find_free_port
+from test_backup_restore import ThreeByThreeBackupCluster
+from test_standalone_trusted_principal import _token
+
+
+class PgwireFailoverCluster(ThreeByThreeBackupCluster):
+    def __init__(self, binary, spool_config):
+        self.spool_config = spool_config
+        super().__init__(binary)
+
+    def _write_config(self):
+        super()._write_config()
+        self.pgwire_ports = self.port_reservations.reserve_many(3)
+        self.data_configs = []
+        for index, port in enumerate(self.pgwire_ports):
+            config = json.loads(self.config_path.read_text())
+            config["pgwire"] = {
+                "enabled": True,
+                "bind_port": port,
+                "replication_publication": "changes",
+                "replication_spool": self.spool_config,
+            }
+            path = self.root / f"pgwire-data-{index}.json"
+            path.write_text(json.dumps(config))
+            self.data_configs.append(path)
+
+    def _data_listener_ports(self, index):
+        return (*super()._data_listener_ports(index), self.pgwire_ports[index])
+
+    def _data_command(self, index):
+        command = super()._data_command(index)
+        command[command.index("--config") + 1] = str(self.data_configs[index])
+        return command
 
 
 @pytest.mark.e2e_resource("antfly_process")
 @pytest.mark.parametrize(
-    "export_snapshot, multi_table",
-    [(False, False), (True, False), (False, True), (True, True)],
-    ids=["stream-only", "exported-snapshot", "multi-table", "multi-table-snapshot"],
+    "export_snapshot, multi_table, cross_node",
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (True, True, False),
+        (False, False, True),
+    ],
+    ids=[
+        "stream-only",
+        "exported-snapshot",
+        "multi-table",
+        "multi-table-snapshot",
+        "cross-node",
+    ],
 )
-def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot, multi_table):
+def test_pg_recvlogical_resume_after_restart(
+    tmp_path, monkeypatch, export_snapshot, multi_table, cross_node
+):
     binary = harness.resolve_binary_path(
         os.environ.get("ANTFLY_BIN", str(harness.DEFAULT_ANTFLY_BIN))
     )
@@ -154,11 +202,14 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot, multi_ta
         ]
 
     @contextmanager
-    def stream(output):
+    def stream(output, *, expect_disconnect=False):
         with output.with_suffix(".log").open("wb") as log:
             reader = subprocess.Popen(stream_command(output), env=env, stderr=log)
             try:
                 yield reader
+            except Exception as exc:
+                exc.add_note(output.with_suffix(".log").read_text())
+                raise
             finally:
                 if reader.poll() is None:
                     reader.terminate()
@@ -167,23 +218,39 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot, multi_ta
                 except subprocess.TimeoutExpired:
                     reader.kill()
                     reader.wait()
-                assert reader.returncode == 0, output.with_suffix(".log").read_text()
+            output_log = output.with_suffix(".log").read_text()
+            if expect_disconnect:
+                assert reader.returncode != 0 and "disconnected" in output_log
+            else:
+                assert reader.returncode == 0, output_log
 
-    server = harness.StatefulAntflyServer(
-        binary,
-        "127.0.0.1",
-        0,
-        auth_enabled=True,
-        data_config={
-            "pgwire": {
-                "enabled": True,
-                "bind_port": port,
-                "replication_publication": "changes",
-                "replication_spool": {"directory": str(spool), "namespace": namespace},
-            }
-        },
-    )
-    try:
+    spool_config = {"directory": str(spool), "namespace": namespace}
+    if cross_node:
+        secret = "pgwire-failover-principal-authority-secret-v1"
+        issuer = "pgwire-failover"
+        monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_SECRET", secret)
+        monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_ISSUER", issuer)
+        server = PgwireFailoverCluster(binary, spool_config)
+        connection[3] = str(server.pgwire_ports[0])
+        connection[5] = "__antfly_trusted_principal__"
+        env["PGPASSWORD"] = _token(secret, issuer=issuer, subject="admin", admin=True)
+    else:
+        server = harness.StatefulAntflyServer(
+            binary,
+            "127.0.0.1",
+            0,
+            auth_enabled=True,
+            data_config={
+                "pgwire": {
+                    "enabled": True,
+                    "bind_port": port,
+                    "replication_publication": "changes",
+                    "replication_spool": spool_config,
+                }
+            },
+        )
+
+    def check_catalog_discovery():
         memberships = (
             "ARRAY(SELECT b.rolname FROM pg_catalog.pg_auth_members m "
             "JOIN pg_catalog.pg_roles b ON (m.roleid = b.oid) WHERE m.member = r.oid)"
@@ -302,6 +369,10 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot, multi_ta
             "app",
             "2200|public",
         ]
+
+    try:
+        if not cross_node:
+            check_catalog_discovery()
         sql("CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT)")
         if multi_table:
             sql("CREATE TABLE smoke_other (id BIGINT PRIMARY KEY, content TEXT)")
@@ -514,7 +585,7 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot, multi_ta
         assert created[5] == "reserved"
         assert catalog_slot(plugin="wrong_plugin") == []
         first = tmp_path / "first.bin"
-        with stream(first) as reader:
+        with stream(first, expect_disconnect=cross_node) as reader:
             insert = (
                 "INSERT INTO smoke (id, content) VALUES (7, 'retained-stream-smoke')"
             )
@@ -557,10 +628,83 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot, multi_ta
 
             # Give the client time to flush and report the complete frame.
             time.sleep(12)
+            if cross_node:
+                (checkpointed,) = catalog_slot()
+                assert checkpointed[2] == "t"
+                assert checkpointed[4] != created[4]
+                failed = server.data_procs[0]
+                failed.kill()
+                failed.wait(timeout=25)
+                reader.wait(timeout=10)
 
-        server.restart()
+        if cross_node:
+            connection[3] = str(server.pgwire_ports[1])
+            rejected = subprocess.run(
+                [psql, *connection, "-XAt", "-c", "SELECT 1"],
+                env={**env, "PGPASSWORD": "invalid-failover-password"},
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert rejected.returncode != 0
+            assert "authentication failed" in rejected.stderr.lower()
+            wrong_owner = subprocess.run(
+                stream_command(tmp_path / "wrong-owner.bin"),
+                env={
+                    **env,
+                    "PGPASSWORD": _token(
+                        secret, issuer=issuer, subject="other", admin=True
+                    ),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert wrong_owner.returncode != 0
+            assert "forbidden" in wrong_owner.stderr.lower()
+            env["PGPASSWORD"] = _token(
+                secret, issuer=issuer, subject="admin", admin=True
+            )
+        else:
+            server.restart()
         assert catalog_publication() == ["f|t|t|t|f"]
         (recovered,) = catalog_slot()
+        if cross_node:
+            deadline = time.monotonic() + 65
+            while recovered[2] == "t" and time.monotonic() < deadline:
+                time.sleep(0.5)
+                (recovered,) = catalog_slot()
+            assert recovered[4] == checkpointed[4]
+
+            def row_matches(statement, expected):
+                result = subprocess.run(
+                    [
+                        psql,
+                        *connection,
+                        "-XAt",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "-c",
+                        statement,
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    return result.stdout.strip() == expected
+                if "A consistent SQL statement read" in result.stderr:
+                    return False
+                raise AssertionError(result.stderr)
+
+            assert wait_until(
+                lambda: row_matches(
+                    "SELECT content FROM smoke", "retained-stream-smoke"
+                ),
+                timeout_s=30,
+                interval_s=0.5,
+            )
         assert recovered[:3] == ["smoke_slot", "pgoutput", "f"]
         assert recovered[4] != created[4]
         resumed = tmp_path / "resumed.bin"
@@ -568,8 +712,30 @@ def test_pg_recvlogical_resume_after_restart(tmp_path, export_snapshot, multi_ta
             time.sleep(4)
             assert reader.poll() is None
             assert resumed.is_file()
-        assert resumed.read_bytes() == b""
-        if not export_snapshot and not multi_table:
+            assert resumed.read_bytes() == b""
+            if cross_node:
+                sql(
+                    "BEGIN",
+                    "INSERT INTO smoke (id, content) VALUES (101, 'after-node-failover')",
+                    "COMMIT",
+                    retry_uncommitted=True,
+                )
+                assert wait_until(
+                    lambda: row_matches(
+                        "SELECT content FROM smoke WHERE id = 101",
+                        "after-node-failover",
+                    ),
+                    timeout_s=15,
+                    interval_s=0.3,
+                )
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline and reader.poll() is None:
+                    if b"after-node-failover" in resumed.read_bytes():
+                        break
+                    time.sleep(0.2)
+                assert resumed.read_bytes().count(b"after-node-failover") == 1
+                assert all(marker not in resumed.read_bytes() for marker in markers)
+        if not export_snapshot and not multi_table and not cross_node:
             # Change the replica identity after the slot persisted its
             # immutable binding. Old images cannot use the new contract.
             sql("ALTER TABLE smoke REPLICA IDENTITY FULL")

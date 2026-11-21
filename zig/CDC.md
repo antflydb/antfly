@@ -31,6 +31,9 @@ end-to-end suite. Single-table and two-table cases cover feedback, restart,
 resume, and slot drop. The exported-snapshot cases read pre-cut rows using
 `psql` and verify that `pg_recvlogical` receives the post-cut changes. The
 two-table cases also exercise transaction rollback and rollback to savepoint.
+The cross-node case kills a data node mid-stream, verifies the confirmed LSN
+on a surviving node, and streams a later commit with stock `pg_recvlogical`.
+The fixture uses three metadata nodes and three data nodes on a single host.
 Changing replica identity invalidates the old slot binding and returns a
 resynchronization error before streaming. Schema changes require the
 publication and slot to be created for the new relation definition.
@@ -77,6 +80,13 @@ Keep the namespace and the fencing inventory with the spool volume. At startup,
 a missing or different spool incarnation prevents the node from serving that
 configuration. A replacement spool requires resynchronizing consumers that were
 bound to the original incarnation.
+
+For cross-node connections, configure the same trusted principal issuer and
+signing authority on each data node. Connect with username
+`__antfly_trusted_principal__` and supply a current signed user token as the
+password. The issuer, subject, tenant, and signing authority bind publication
+and slot ownership. Rotating the signing authority changes that ownership
+binding. Local credentials bind ownership to the authenticated user instance.
 
 ## Public HTTP changefeeds
 

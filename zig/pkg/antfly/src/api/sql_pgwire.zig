@@ -674,6 +674,32 @@ pub const CatalogRetainedStream = struct {
     const retained = @import("../metadata/pg_spool_stream.zig");
     const Registry = @import("../metadata/pg_spool_artifacts.zig").Registry;
     const history_lease_seconds = 3600;
+
+    fn publicationRetryable(err: anyerror) bool {
+        return switch (err) {
+            error.ChangefeedConflict,
+            error.ChangefeedBackpressure,
+            error.MetadataMutationOutcomeUnknown,
+            error.ReadUnavailable,
+            error.ReadIndexTimeout,
+            error.GroupLeaderUnavailable,
+            error.LeaderUnavailable,
+            error.NotLeader,
+            error.StorageReadTemporarilyUnavailable,
+            error.CatalogRoutingUnavailable,
+            error.CatalogRoutingSnapshotTimeout,
+            error.ConnectionRefused,
+            error.ConnectionResetByPeer,
+            error.NetworkUnreachable,
+            error.Timeout,
+            error.SqlWriteCapacityUnavailable,
+            error.DeadlineExceeded,
+            error.Canceled,
+            error.Cancelled,
+            => true,
+            else => false,
+        };
+    }
     const control = publication_control;
 
     allocator: std.mem.Allocator,
@@ -813,7 +839,12 @@ pub const CatalogRetainedStream = struct {
             policy.identity = identity;
             policy.resolver = resolver.resolver();
             const cleanup_registry: CleanupRegistry = .{ .storage = host.registry, .policy = &policy, .session = self.session };
-            try self.reclaimHistory(cleanup_registry);
+            // An unconfirmed native collection keeps history pinned. The
+            // publisher independently rechecks the slot and can still admit
+            // new work within its retained-history and spool budgets.
+            self.reclaimHistory(cleanup_registry) catch |err| {
+                if (!publicationRetryable(err)) return err;
+            };
             const cleanup = try @import("../metadata/pg_spool_cleanup.zig").cleanup(host.service, cleanup_registry, allocator, host.id, .{}, self.context);
             switch (cleanup.status) {
                 .checkpointed, .collected => return,
@@ -848,13 +879,12 @@ pub const CatalogRetainedStream = struct {
             const failure = previous.failure;
             previous.deinit();
             self.publication_worker = null;
-            if (failure) |err| switch (err) {
-                error.ChangefeedConflict, error.ChangefeedBackpressure, error.MetadataMutationOutcomeUnknown, error.ReadUnavailable, error.SqlWriteCapacityUnavailable, error.DeadlineExceeded, error.Canceled, error.Cancelled => {},
-                else => {
+            if (failure) |err| {
+                if (!publicationRetryable(err)) {
                     std.log.warn("logical slot publication failed: {s}", .{@errorName(err)});
                     return err;
-                },
-            };
+                }
+            }
         }
         var context = try Bridge.metadataContext(request_value);
         const worker = try PublicationWorker.allocator.create(PublicationWorker);
@@ -1661,7 +1691,10 @@ pub const Adapter = struct {
         const next = try Credential.authenticateTrusted(alloc, self.server, self.server.cfg.user_manager, token);
         defer Credential.release(next, alloc);
         // Renewal never changes the owner of prepared statements or transactions.
-        if (!std.mem.eql(u8, current.principal, next.principal) or !std.mem.eql(u8, current.username, next.username) or !std.meta.eql(current.user_instance_id, next.user_instance_id)) return error.Unauthorized;
+        if (!std.mem.eql(u8, current.principal, next.principal) or !std.mem.eql(u8, current.username, next.username) or
+            !std.meta.eql(current.user_instance_id, next.user_instance_id) or
+            !std.meta.eql(current.trusted_identity.?.trusted_changefeed_owner, next.trusted_identity.?.trusted_changefeed_owner))
+            return error.Unauthorized;
         std.mem.swap(?http.AuthenticatedIdentity, &current.trusted_identity, &next.trusted_identity);
         std.mem.swap(?[]u8, &current.trusted_issuer, &next.trusted_issuer);
         current.trusted_revision += 1;
@@ -4818,9 +4851,15 @@ test "SQL pgwire native trusted-only renewal preserves owners without native boo
         try std.testing.expect(!no_decode.has_induced_failure);
     }
     const original_revision = try credential.descriptionRevision();
+    const durableOwner = @import("changefeed_public.zig").durableOwner;
+    const owner = try durableOwner(credential.trusted_identity.?);
     credential.trusted_expires = 0;
     try std.testing.expectError(error.Unauthorized, credential.validate());
     try Adapter.refresh(&adapter, a, authenticated, token);
+    try std.testing.expectEqual(owner, try durableOwner(credential.trusted_identity.?));
+    const other_tenant = try testTrustedToken(a, "renewal-key", "{\"iss\":\"cloudaf\",\"sub\":\"key-1\",\"tenant\":\"other\",\"admin\":true,\"exp\":4102444800}");
+    defer a.free(other_tenant);
+    try std.testing.expectError(error.Unauthorized, Adapter.refresh(&adapter, a, authenticated, other_tenant));
     try std.testing.expect(original_revision != try credential.descriptionRevision());
     try credential.validate();
     try std.testing.expectEqualStrings("trusted:cloudaf:key-1", credential.sessionPrincipal());

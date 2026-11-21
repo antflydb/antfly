@@ -1365,6 +1365,9 @@ class ThreeByThreeBackupCluster:
             command.extend(["--metadata-api", url])
         return command
 
+    def _data_listener_ports(self, index):
+        return (self.data_ports[index], self.data_raft_ports[index])
+
     def _start(self) -> None:
         for i in range(3):
             command = self._metadata_command(i + 1)
@@ -1418,7 +1421,7 @@ class ThreeByThreeBackupCluster:
         for i, data_api_url in enumerate(self.data_api_urls):
             data_command = self._data_command(i)
             proc = self.port_reservations.handoff_to(
-                (self.data_ports[i], self.data_raft_ports[i]),
+                self._data_listener_ports(i),
                 lambda command=data_command, log_file=self.data_log_files[i]: (
                     subprocess.Popen(
                         debuggable_command(command),

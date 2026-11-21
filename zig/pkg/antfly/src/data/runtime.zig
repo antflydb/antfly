@@ -33655,6 +33655,30 @@ pub fn runFromIterator(
     );
     defer if (trusted_principal_issuer) |value| alloc.free(value);
 
+    // Trusted pgwire uses a durable completion outbox for SQL commands.
+    // The issuing data node owns this registry and its recovery lifecycle.
+    const pgwire_config = if (loaded_config) |*cfg| cfg.pgwire else null;
+    const trusted_pgwire = trusted_principal_secret != null and trusted_principal_issuer != null and
+        if (pgwire_config) |pgwire| pgwire.enabled else false;
+    const session_config = if (trusted_pgwire) loaded_config.?.transaction_sessions else null;
+    const session_root = if (trusted_pgwire)
+        try std.fmt.allocPrint(alloc, "{s}/api-transaction-sessions", .{resolved.replica_root_dir})
+    else
+        null;
+    defer if (session_root) |path| alloc.free(path);
+    var session_backend: ?antfly.lsm_backend.BackendHandle =
+        if (session_root) |path| try antfly.lsm_backend.BackendHandle.open(alloc, path, .{}) else null;
+    defer if (session_backend) |*backend| backend.close();
+    var session_store = if (session_backend) |*backend|
+        try backend.backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" })
+    else
+        null;
+    defer if (session_store) |*store| store.deinit();
+    var durable_sessions = if (session_store) |*store|
+        antfly.public_api.transactions.DurableSessionStore.initRuntime(alloc, store)
+    else
+        null;
+
     var native_reader: @import("../common/secret_delivery.zig").Remote = undefined;
     if (secret_store_initialized) {
         if (secret_store.native_config) |native| {
@@ -33686,7 +33710,12 @@ pub fn runFromIterator(
             .auth_enabled = effective_auth_enabled,
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
-            .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
+            .session_store = if (durable_sessions) |*store| store else null,
+            .session_ttl_ns = if (session_config) |cfg| cfg.ttl_seconds * std.time.ns_per_s else null,
+            .session_cleanup_interval_ns = if (session_config) |cfg| cfg.cleanup_interval_seconds * std.time.ns_per_s else null,
+            .session_max_count = if (session_config) |cfg| cfg.max_count else null,
+            .session_max_record_bytes = if (session_config) |cfg| cfg.max_record_bytes else null,
+            .pgwire = pgwire_config,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.query.admission.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.resources.query.request_limits.graph else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.write.admission.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
