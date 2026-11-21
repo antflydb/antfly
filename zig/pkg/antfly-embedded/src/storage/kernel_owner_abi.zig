@@ -2097,6 +2097,11 @@ pub extern fn antfly_storage_owner_split_history_cut(
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
+pub extern fn antfly_storage_owner_merge_history_cut(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
 pub extern fn antfly_storage_owner_ordered_history_page(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,

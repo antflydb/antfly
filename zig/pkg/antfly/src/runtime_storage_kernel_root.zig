@@ -192,6 +192,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryControlJson, "antfly_storage_owner_ordered_history_control_json");
     exportInternal(&storage_kernel_exports.storageOwnerArtifactPublicationHistory, "antfly_storage_owner_artifact_publication_history");
     exportInternal(&storage_kernel_exports.storageOwnerSplitHistoryCut, "antfly_storage_owner_split_history_cut");
+    exportInternal(&storage_kernel_exports.storageOwnerMergeHistoryCut, "antfly_storage_owner_merge_history_cut");
     exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryPage, "antfly_storage_owner_ordered_history_page");
     exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryBootstrapPage, "antfly_storage_owner_ordered_history_bootstrap_page");
     exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryOutcome, "antfly_storage_owner_ordered_history_outcome");

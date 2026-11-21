@@ -1277,6 +1277,12 @@ fn orderedSplitHistoryCut(self: *DB, request: SplitHistoryCut.Request, minimum_a
     return .{ .value = self.orderedSplitHistoryCut(request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+const MergeHistoryCut = @import("committed_history.zig").MergeCut;
+
+fn orderedMergeHistoryCut(self: *DB, request: MergeHistoryCut.Request, minimum_applied_index: u64) engine.Outcome(?MergeHistoryCut) {
+    return .{ .value = self.orderedMergeHistoryCut(request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn orderedHistoryPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request, minimum_applied_index: u64) engine.Outcome(@import("history_page.zig").Page) {
     return .{ .value = self.orderedHistoryPage(allocator, request, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

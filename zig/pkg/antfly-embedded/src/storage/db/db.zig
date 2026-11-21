@@ -27367,6 +27367,29 @@ pub const DB = struct {
         return cut;
     }
 
+    const MergeHistoryCut = @import("../committed_history.zig").MergeCut;
+
+    /// Observe the merge cut using the donor's frozen Raft ReadIndex.
+    /// A missing cut at that barrier is distinct from an invalid proof.
+    pub fn orderedMergeHistoryCut(self: *DB, request: MergeHistoryCut.Request, minimum_applied_index: u64) !?MergeHistoryCut {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedMergeHistoryCut", .{ self, request, minimum_applied_index });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (minimum_applied_index == 0 or request.transition == 0 or request.receiver_group == 0)
+            return error.InvalidHistoryAdmission;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.namespace) or request.root_generation != self.core.root_generation)
+            return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
+        const applied = try orderedHistoryReadCut(&txn, minimum_applied_index);
+        const cut = (try MergeHistoryCut.load(&txn, request.transition)) orelse return null;
+        if (!request.matches(cut)) return error.HistoryResynchronizationRequired;
+        if (cut.index > applied.index or cut.term > applied.term) return error.HistoryCorrupt;
+        return cut;
+    }
+
     /// The Raft owner supplies a frozen ReadIndex. Standalone readers use the
     /// same namespace and physical generation checks without a Raft barrier.
     pub fn artifactPublicationHistory(self: *DB, allocator: Allocator, request: @import("artifact_publication.zig").HistoryRead, minimum_applied_index: ?u64) !@import("artifact_publication.zig").HistoryObservation {
@@ -162434,6 +162457,11 @@ test "db split finalization records the predecessor committed history frontier t
     try std.testing.expectEqual(merge.receiver_group_id, donor.receiver_group);
     try std.testing.expectEqual(@as(u64, 12), donor.index);
     try std.testing.expectEqual(@as(u64, 2), donor.latest);
+    var donor_request: history.MergeCut.Request = .{ .namespace = namespace, .transition = merge.transition_id, .receiver_group = merge.receiver_group_id, .root_generation = donor.root_generation };
+    try std.testing.expectEqualDeep(donor, (try db.orderedMergeHistoryCut(donor_request, donor.index)).?);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedMergeHistoryCut(donor_request, donor.index + 1));
+    donor_request.receiver_group += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedMergeHistoryCut(donor_request, donor.index));
 }
 
 test "db ordered empty split destination seeds history before its first write" {

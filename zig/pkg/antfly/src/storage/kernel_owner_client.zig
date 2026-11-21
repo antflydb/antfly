@@ -921,6 +921,22 @@ pub const Owner = struct {
         return parsed.value;
     }
 
+    const merge_cut = @import("antfly_local_sources").storage_committed_history.MergeCut;
+    pub fn mergeHistoryCut(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: merge_cut.Request, minimum_applied_index: u64) !?merge_cut {
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        const json = try std.json.Stringify.valueAlloc(alloc, merge_cut.OrderedRead{ .request = request, .minimum_applied_index = minimum_applied_index }, .{});
+        defer alloc.free(json);
+        if (json.len > merge_cut.max_read_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_merge_history_cut(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        if (response.bytes().len > merge_cut.max_read_bytes) return error.HistoryCorrupt;
+        var parsed = try std.json.parseFromSlice(?merge_cut, alloc, response.bytes(), .{});
+        defer parsed.deinit();
+        if (parsed.value) |cut| if (!request.matches(cut)) return error.HistoryCorrupt;
+        return parsed.value;
+    }
+
     /// Decode into caller-owned page storage before releasing the ABI buffer.
     pub fn orderedHistoryPage(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.Request, minimum_applied_index: u64) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.Page {
         if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;

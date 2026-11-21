@@ -126,6 +126,20 @@ pub const SplitCut = struct {
 pub const MergeCut = struct {
     const prefix = "\x00\x00__committed_history__:merge_cut:";
     pub const Key = [prefix.len + 8]u8;
+    pub const Request = struct {
+        namespace: frame.Namespace,
+        transition: u64,
+        receiver_group: u64,
+        root_generation: u64,
+
+        pub fn matches(self: Request, cut: MergeCut) bool {
+            return cut.term != 0 and cut.index != 0 and cut.reclaimed <= cut.latest and
+                std.mem.eql(u8, &self.namespace, &cut.namespace) and self.transition == cut.transition and
+                self.receiver_group == cut.receiver_group and self.root_generation == cut.root_generation;
+        }
+    };
+    pub const OrderedRead = struct { request: Request, minimum_applied_index: u64 };
+    pub const max_read_bytes = 4096;
     pub const encoded_size = 124;
     namespace: frame.Namespace,
     transition: u64,
