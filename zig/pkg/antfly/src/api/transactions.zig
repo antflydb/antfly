@@ -2935,7 +2935,7 @@ pub const SessionRegistry = struct {
             entry.deinitOwned();
             entry.* = value;
         } else {
-            try self.reserveSessionSlotLocked(durable.alloc);
+            try self.reserveSessionSlotLocked(alloc);
             self.sessions.putAssumeCapacity(id, value);
         }
         retain = true;
@@ -7976,7 +7976,11 @@ test "SQL session metadata mutation requires the admitted owner and exact tenure
     defer backend.close();
     var native = try backend.runtimeStore(a, .{ .name = "session-fence-test" });
     defer native.deinit();
-    var durable = DurableSessionStore.initRuntime(a, &native);
+    // Cold admission transfers decoded values from the store while the
+    // registry retains ownership of its map allocation.
+    var storage_arena = std.heap.ArenaAllocator.init(a);
+    defer storage_arena.deinit();
+    var durable = DurableSessionStore.initRuntime(storage_arena.allocator(), &native);
     const leases = SessionLeaseStore.initFromDurable(&durable);
     var former = SessionRegistry.initWithLeaseTtl(&durable, leases, 60 * std.time.ns_per_s);
     defer former.deinit(a);
