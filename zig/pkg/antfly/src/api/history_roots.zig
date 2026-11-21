@@ -101,6 +101,14 @@ pub const Captured = struct {
         return error.ChangefeedResynchronizationRequired;
     }
 
+    pub fn findInstalled(self: *const Captured, root: control.Root) !Root {
+        const physical = root.physical orelse return self.find(root.namespace);
+        const table = std.mem.readInt(u64, root.namespace[0..8], .big);
+        const route = try self.findPhysical(table, physical.group_id, physical.range_id);
+        if (!std.mem.eql(u8, &route.namespace, &root.namespace)) return error.ChangefeedResynchronizationRequired;
+        return route;
+    }
+
     /// Caller persists this complete vector before any root dispatch. The
     /// ownership counter belongs to feed metadata, not a hash of topology.
     pub fn initialPlans(self: *const Captured, a: A) ![]control.RootPlan {
@@ -115,7 +123,7 @@ pub const Captured = struct {
 
     pub fn validateInstalledRoutes(self: *const Captured, state: control.State) !void {
         const definition = state.definition orelse return error.ChangefeedResynchronizationRequired;
-        var route_index: usize = 0;
+        var covered_routes: usize = 0;
         for (state.roots) |root| {
             const table_id = std.mem.readInt(u64, root.namespace[0..8], .big);
             const table = for (definition.tables) |candidate| {
@@ -126,11 +134,15 @@ pub const Captured = struct {
                 if (!std.mem.eql(u8, &root.namespace, &control.catalogRootNamespace(table))) return error.ChangefeedResynchronizationRequired;
                 continue;
             }
-            if (route_index >= self.roots.len or !std.mem.eql(u8, &root.namespace, &self.roots[route_index].namespace) or !self.roots[route_index].matchesPhysical(root))
-                return error.ChangefeedResynchronizationRequired;
-            route_index += 1;
+            _ = try self.findInstalled(root);
+            covered_routes += 1;
+            if (root.split_handoff) |handoff| {
+                const successor = try self.findPhysical(table_id, handoff.successor.group_id, handoff.successor.range_id);
+                if (!std.mem.eql(u8, &successor.namespace, &root.namespace)) return error.ChangefeedResynchronizationRequired;
+                covered_routes += 1;
+            }
         }
-        if (route_index != self.roots.len) return error.ChangefeedResynchronizationRequired;
+        if (covered_routes != self.roots.len) return error.ChangefeedResynchronizationRequired;
     }
 
     /// Initial ownership only. A replacement root needs a verified handoff
@@ -332,7 +344,7 @@ pub const Source = struct {
         try captured.validateInstalledRoutes(state);
         const item = state.roots[read.root_index];
         if (item.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
-        const root = try captured.find(item.namespace);
+        const root = try captured.findInstalled(item);
         for (definition.tables) |table| {
             if (table.table_id != root.fence.table_id) continue;
             if (table.contract != .native_relational) return error.ChangefeedCapabilityUnsupported;
@@ -764,6 +776,33 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectError(error.ChangefeedResynchronizationRequired, split_fixture.source().prepareSplitHandoff(a, &physical, stored, transition, .{}));
         transition.split_key = "m";
         try std.testing.expectError(error.ChangefeedCapabilityUnsupported, split_fixture.source().prepareSplitHandoff(a, &physical, stored, transition, .{}));
+        var installed = [_]control.Root{
+            stored,
+            .{ .namespace = captured.roots[2].namespace, .ownership_epoch = 1, .grant_sequence = 2 },
+        };
+        const installed_state: control.State = .{ .definition = definition, .roots = &installed };
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, physical.validateInstalledRoutes(installed_state));
+        installed[0].split_handoff = .{
+            .predecessor = parent.physicalIdentity().?,
+            .successor = child.physicalIdentity().?,
+            .cut = .{
+                .namespace = parent.namespace,
+                .transition = transition.transition_id,
+                .attempt = transition.attempt_epoch,
+                .successor_group = 72,
+                .term = 1,
+                .index = 2,
+                .latest = 1,
+                .reclaimed = 0,
+                .root_generation = 0,
+                .reserved_bytes = 0,
+                .boundary = @splat(1),
+            },
+        };
+        try physical.validateInstalledRoutes(installed_state);
+        try std.testing.expectEqual(@as(u64, 71), (try physical.findInstalled(installed[0])).fence.route.group_id);
+        installed[0].split_handoff.?.successor.range_id = 73;
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, physical.validateInstalledRoutes(installed_state));
         var replaced = records;
         replaced[0].table_id = 9;
         var replacement_ranges = ranges;

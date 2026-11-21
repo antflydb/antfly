@@ -98,7 +98,7 @@ const IcebergScheduler = struct {
             if (partial) |namespace| {
                 if (!std.mem.eql(u8, &root.namespace, &namespace)) continue;
             }
-            if (native_pending) _ = self.native_factory.?.captured.find(root.namespace) catch continue;
+            if (native_pending) _ = self.native_factory.?.captured.findInstalled(root) catch continue;
             const page = self.loadPage(a, state, root.namespace, before, null, limits, request) catch |err| switch (err) {
                 error.ReadUnavailable => {
                     unavailable = true;
@@ -123,7 +123,7 @@ const IcebergScheduler = struct {
 
     fn loadPage(self: *IcebergScheduler, a: A, state: control.State, namespace: control.Namespace, before: control.Digest, original: ?control.Delivery, limits: delivery.Limits, request: Context) !delivery.Prepared {
         if (self.native_factory) |factory| {
-            if (factory.captured.find(namespace)) |_| {
+            if (factory.captured.findInstalled(state.roots[try state.rootIndex(namespace)])) |_| {
                 var root = try factory.open(namespace);
                 var provider: native.ProviderFor(roots.Routed, Policy) = .{ .root = &root, .policy = self.policy };
                 return mixedProviderPage(a, state, before, original, .native, &provider, limits, request);
@@ -723,16 +723,16 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     const source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
     if (hasIceberg(definition)) {
         const native_definition = try nativeDefinition(scratch, definition);
-        var catalog_routes = try source.capture(a, native_definition, internal);
+        var catalog_routes = try source.capturePhysical(a, native_definition, internal);
         defer catalog_routes.deinit();
         try catalog_routes.validateInstalledRoutes(state.value);
         const access = try authorizedIcebergTables(api, scratch, identity, definition, internal);
         var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
         return executeIceberg(&client, a, selection, limits, &policy, .{ .source = source, .captured = &catalog_routes }, internal);
     }
-    var captured = try source.capture(a, definition, internal);
+    var captured = try source.capturePhysical(a, definition, internal);
     defer captured.deinit();
-    try captured.validateInitialRoutes(state.value.roots);
+    try captured.validateInstalledRoutes(state.value);
     if (captured.roots.len == 0) return error.ChangefeedResynchronizationRequired;
     const access = try authorizedTableAccess(api, scratch, identity, definition, &captured, internal);
     var policy: Policy = .{ .api = api, .credential = credential, .tables = access };
@@ -754,12 +754,14 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         if (active.phase != .streaming or active.epoch != confirmed.value.epoch or !same(active.acknowledged_cursor, selection.after))
             return error.MetadataMutationOutcomeUnknown;
     }
-    for (captured.roots, active.roots) |root, item| {
+    for (active.roots) |item| {
+        const root = try captured.findInstalled(item);
         if (item.snapshot == null or item.snapshot_released) continue;
         try releaseStreamingSnapshot(&client, &driver_policy, a, active, root, internal);
         break; // Maintenance resumes any remaining releases against fresh metadata.
     }
-    for (captured.roots) |root| {
+    for (active.roots) |item| {
+        const root = try captured.findInstalled(item);
         _ = try source_api.flushAcknowledged(&client, &driver_policy, a, active, root, internal);
     }
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };

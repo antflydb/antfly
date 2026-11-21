@@ -173,7 +173,9 @@ pub const Routed = struct {
     }
 
     pub fn initForRoot(source: roots.Source, captured: *const roots.Captured, namespace: control.Namespace) !Routed {
-        _ = try captured.find(namespace);
+        for (captured.roots) |candidate| {
+            if (same(candidate.namespace, namespace)) break;
+        } else return error.ChangefeedResynchronizationRequired;
         return .{ .namespace = namespace, .source = source, .captured = captured };
     }
 
@@ -183,7 +185,7 @@ pub const Routed = struct {
         if ((definition.start == .snapshot_then_changes and self.source.bootstrap_pages == null) or definition.events != 1)
             return error.ChangefeedCapabilityUnsupported;
         try self.captured.validateInstalledRoutes(state);
-        const selected = try self.captured.find(self.namespace);
+        const selected = try self.captured.findInstalled(state.roots[try state.rootIndex(self.namespace)]);
         const table = for (definition.tables) |table| {
             if (selected.fence.table_id == table.table_id) break table;
         } else return error.ChangefeedResynchronizationRequired;
@@ -200,7 +202,7 @@ pub const Routed = struct {
         const pin = root.snapshot orelse return error.ChangefeedResynchronizationRequired;
         if (root.snapshot_released or root.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
         if (now == 0 or now >= state.expires_at or now >= pin.expires_at) return error.ChangefeedLeaseExpired;
-        const selected = try self.captured.find(self.namespace);
+        const selected = try self.captured.findInstalled(root);
         const port = self.source.bootstrap_pages orelse return error.ChangefeedCapabilityUnsupported;
         var page = try port.read(a, selected.fence, selected.table_name, .{
             .version = 1,
@@ -241,10 +243,19 @@ pub const Routed = struct {
         const index = try state.rootIndex(self.namespace);
         const root = state.roots[index];
         if (root.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
-        const selected = try self.captured.find(self.namespace);
+        const selected = try self.captured.findInstalled(root);
         const positions = try state.rootsAt(a, cursor);
         defer a.free(positions);
         const after = positions[index].delivered;
+        if (root.split_handoff) |handoff| {
+            if (after.sequence > handoff.cut.latest or (after.sequence == handoff.cut.latest and after.event != 0)) return error.ChangefeedResynchronizationRequired;
+            if (after.sequence == handoff.cut.latest and after.event == 0) return .{
+                .arena = std.heap.ArenaAllocator.init(a),
+                .next = .{ .sequence = after.sequence },
+                .observed_latest = handoff.cut.latest,
+                .caught_up = true,
+            };
+        }
         const completion_roots = try a.alloc(control.Namespace, if (project_completion) positions.len else 0);
         defer a.free(completion_roots);
         for (completion_roots, positions[0..completion_roots.len]) |*namespace, position| namespace.* = position.namespace;
@@ -268,6 +279,11 @@ pub const Routed = struct {
             },
         }, request);
         errdefer page.deinit();
+        if (root.split_handoff) |handoff| {
+            if (page.next.sequence > handoff.cut.latest) return error.ChangefeedResynchronizationRequired;
+            page.observed_latest = @min(page.observed_latest, handoff.cut.latest);
+            page.caught_up = page.next.sequence == handoff.cut.latest and page.next.event == 0;
+        }
         if (page.header) |header| {
             if (header.transaction_scope == .coordinated and page.completion == null) return error.ReadUnavailable;
         }
